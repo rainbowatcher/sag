@@ -2,4 +2,16 @@
 name = "sag-core"
 version = "0.1.0"
 edition = "2024"
-description = "Core library for sag"
+description = "Core data types, errors, and utilities for SAG (Smart AI Gateway)"
+
+[dependencies]
+axum = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
