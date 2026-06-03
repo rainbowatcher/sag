@@ -1,0 +1,10 @@
+[package]
+name = "sag-analytics"
+version = "0.1.0"
+edition = "2024"
+description = "Usage analytics and call logging for SAG"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+sag-core = { path = "../sag-core" }
