@@ -1,0 +1,85 @@
+# ============================================================
+# SAG — Smart AI Gateway Configuration
+# Copy this to gateway.toml and fill in your keys.
+# ============================================================
+
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[analytics]
+enabled = true
+storage_dsn = "sqlite://analytics.db"
+
+# Gateway client authentication (optional — remove the block to disable)
+[gateway_auth]
+api_keys = [
+    "sag-key-1",
+    "sag-key-2",
+]
+
+# ============================================================
+# LLM Provider configurations
+# ============================================================
+
+[providers.openai]
+api_key = "sk-your-openai-api-key"
+base_url = "https://api.openai.com/v1"
+priority = 1
+max_retries = 2
+timeout_secs = 120
+supported_params = [
+    "model", "messages", "temperature", "top_p", "n",
+    "stream", "stop", "max_tokens", "presence_penalty",
+    "frequency_penalty", "seed", "tools", "tool_choice",
+    "response_format",
+]
+
+[providers.anthropic]
+api_key = "sk-ant-your-anthropic-api-key"
+base_url = "https://api.anthropic.com/v1"
+priority = 2
+max_retries = 2
+timeout_secs = 120
+supported_params = [
+    "model", "messages", "temperature", "top_p",
+    "stream", "stop", "max_tokens", "tools", "tool_choice",
+]
+
+# ============================================================
+# Model routing table
+# Requested model -> [provider targets ordered by priority]
+# ============================================================
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 1 },
+]
+
+[[routes]]
+model_name = "gpt-4o-mini"
+targets = [
+    { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
+]
+
+[[routes]]
+model_name = "claude-sonnet"
+targets = [
+    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 1 },
+    # Fallback: if Anthropic fails, try OpenAI with gpt-4o-mini
+    { provider = "openai", real_model = "gpt-4o-mini", priority = 2 },
+]
+
+[[routes]]
+model_name = "claude-opus"
+targets = [
+    { provider = "anthropic", real_model = "claude-3-opus-20240229", priority = 1 },
+]
+
+# Catch-all: any model not listed above will be forwarded directly to OpenAI
+[[routes]]
+model_name = "*"
+targets = [
+    { provider = "openai", real_model = "<passthrough>", priority = 1 },
+]
