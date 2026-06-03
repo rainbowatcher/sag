@@ -1,0 +1,16 @@
+[package]
+name = "sag-router"
+version = "0.1.0"
+edition = "2024"
+description = "Axum routing and middleware for SAG"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sag-core = { path = "../sag-core" }
+sag-config = { path = "../sag-config" }
