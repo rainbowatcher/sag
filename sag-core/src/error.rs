@@ -76,3 +76,151 @@ impl IntoResponse for AppError {
         (status, Json(body)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    /// Helper: extract status code and JSON body from an `AppError` response.
+    async fn extract(app_error: AppError) -> (StatusCode, serde_json::Value) {
+        let response: Response = app_error.into_response();
+        let status = response.status();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn config_error_returns_500() {
+        let (status, body) = extract(AppError::Config("missing field".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "CONFIG_ERROR");
+        assert_eq!(body["error"]["message"], "missing field");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_returns_401() {
+        let (status, body) = extract(AppError::Unauthorized("bad token".into())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        assert_eq!(body["error"]["message"], "bad token");
+    }
+
+    #[tokio::test]
+    async fn bad_request_returns_400() {
+        let (status, body) = extract(AppError::BadRequest("unsupported param seed".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported"));
+    }
+
+    #[tokio::test]
+    async fn model_not_found_returns_404() {
+        let (status, body) =
+            extract(AppError::ModelNotFound("unknown-model".into())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "MODEL_NOT_FOUND");
+        assert_eq!(body["error"]["message"], "unknown-model");
+    }
+
+    #[tokio::test]
+    async fn upstream_error_preserves_status() {
+        let (status, body) = extract(AppError::Upstream {
+            provider: "openai".into(),
+            status: 429,
+            body: "rate limited".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "UPSTREAM_ERROR");
+        assert_eq!(body["error"]["message"], "rate limited");
+
+        // Invalid status code (0 is not a valid HTTP status) falls back to 502
+        let (status, _) = extract(AppError::Upstream {
+            provider: "openai".into(),
+            status: 0,
+            body: "weird".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn all_providers_exhausted_returns_502() {
+        let (status, body) = extract(AppError::AllProvidersExhausted {
+            model: "gpt-4".into(),
+            reason: "all timed out".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "ALL_PROVIDERS_EXHAUSTED");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("all timed out"));
+    }
+
+    #[tokio::test]
+    async fn network_error_returns_502() {
+        // Construct a reqwest error by connecting to an unreachable port
+        // on localhost with a minimal timeout.
+        let err = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(5))
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        let app_err = AppError::from(err);
+        let (status, body) = extract(app_err).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "NETWORK_ERROR");
+        assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_error_returns_500() {
+        let (status, body) = extract(AppError::Internal("unexpected state".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+        assert_eq!(body["error"]["message"], "unexpected state");
+    }
+
+    #[tokio::test]
+    async fn anyhow_error_returns_500() {
+        let anyhow_err = anyhow::anyhow!("something went wrong");
+        let app_err = AppError::from(anyhow_err);
+        let (status, body) = extract(app_err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("something went wrong"));
+    }
+
+    #[test]
+    fn display_format_includes_context() {
+        let err = AppError::ModelNotFound("claude-99".into());
+        assert!(err.to_string().contains("claude-99"));
+        assert!(err.to_string().contains("model not found"));
+
+        let err2 = AppError::Upstream {
+            provider: "anthropic".into(),
+            status: 500,
+            body: "boom".into(),
+        };
+        let msg = err2.to_string();
+        assert!(msg.contains("anthropic"));
+        assert!(msg.contains("500"));
+        assert!(msg.contains("boom"));
+    }
+}
