@@ -1,0 +1,8 @@
+[workspace]
+members = ["sag-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = ""
