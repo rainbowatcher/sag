@@ -4,7 +4,7 @@ port = 3000
 
 [analytics]
 enabled = true
-storage_dsn = "sqlite:///Users/rainbowatcher/w/i/sag/analytics.db"
+storage_dsn = "sqlite:analytics.db"
 
 [gateway_auth]
 api_keys = ["sag-test-key"]
