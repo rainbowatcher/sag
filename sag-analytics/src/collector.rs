@@ -1,5 +1,6 @@
 use sag_core::CallLog;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -12,15 +13,19 @@ pub struct CallLogCollector {
 
 impl CallLogCollector {
     /// Create a new collector with a SQLite pool and spawn background persistence.
+    /// `dsn` is a simple path (e.g. `analytics.db`) or `:memory:` for in-memory.
     pub async fn new(dsn: &str) -> Result<Self, sqlx::Error> {
-        let db_path = dsn
-            .strip_prefix("sqlite://")
-            .or_else(|| dsn.strip_prefix("sqlite:"))
-            .unwrap_or("analytics.db");
+        let options = if dsn == ":memory:" {
+            SqliteConnectOptions::from_str("sqlite::memory:")?
+        } else {
+            SqliteConnectOptions::new()
+                .filename(dsn)
+                .create_if_missing(true)
+        };
 
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
-            .connect(db_path)
+            .connect_with(options)
             .await?;
 
         // Auto-create schema
@@ -107,7 +112,7 @@ impl CallLogCollector {
 
     /// Create a new collector with an in-memory SQLite database (for testing / development).
     pub async fn new_memory() -> Result<Self, sqlx::Error> {
-        Self::new("sqlite://:memory:").await
+        Self::new(":memory:").await
     }
 
     /// Return a cloneable sender for other crates to push call logs.
