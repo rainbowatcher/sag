@@ -1,15 +1,16 @@
 use std::time::Instant;
 
 use axum::{
+    body::Body,
     extract::{Query, State},
     http::StatusCode,
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json,
     Router,
 };
-use sag_core::{CallLog, Usage};
+use sag_core::{CallLog, ImageGenerationRequest, Usage};
 use serde_json::json;
 use tracing::{error, info, instrument, warn};
 
@@ -25,10 +26,17 @@ pub fn build_router(state: AppState) -> Router {
             gateway_auth,
         ));
 
+    let admin_routes = crate::admin::build_admin_routes(state.clone())
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            gateway_auth,
+        ));
+
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/analytics/stats", get(analytics_stats_handler))
         .nest("/v1/chat/completions", chat_route)
+        .nest("/api", admin_routes)
         .with_state(state)
 }
 
@@ -36,24 +44,25 @@ pub fn build_router(state: AppState) -> Router {
 ///
 /// Full request lifecycle with multi-provider fallback:
 /// 1. Parse request body
-/// 2. Match model → route (exact → wildcard `*`)
-/// 3. Sort route targets by priority (ascending)
-/// 4. Try each target: parameter validation → dispatch
-/// 5. On 4xx error: return immediately (don't retry)
-/// 6. On 5xx / network / timeout: try next target
-/// 7. If all exhausted: return AllProvidersExhausted
-/// 8. Log analytics via CallLogCollector
+/// 2. Match model -> route (exact -> wildcard `*`)
+/// 3. If api_endpoint is image-based, dispatch as image generation
+/// 4. Sort route targets by priority (ascending)
+/// 5. Try each target: parameter validation -> dispatch
+/// 6. On 4xx error: return immediately (don't retry)
+/// 7. On 5xx / network / timeout: try next target
+/// 8. If all exhausted: return AllProvidersExhausted
+/// 9. Log analytics via CallLogCollector
 #[instrument(skip(state), fields())]
 async fn chat_completions_handler(
     State(state): State<AppState>,
     Json(request): Json<sag_core::ChatCompletionRequest>,
-) -> impl IntoResponse {
+) -> Response<Body> {
     let start = Instant::now();
     let request_id = uuid::Uuid::new_v4();
     let is_stream = request.stream.unwrap_or(false);
 
-    // Resolve model → sorted targets from routing table
-    let targets = {
+    // Resolve model -> sorted targets + api_endpoint from routing table
+    let (targets, api_endpoint) = {
         let config_guard = state.config.read().await;
 
         let route = config_guard
@@ -62,8 +71,26 @@ async fn chat_completions_handler(
             .find(|r| r.model_name == request.model)
             .or_else(|| config_guard.routes.iter().find(|r| r.model_name == "*"));
 
-        let targets = match route {
-            Some(r) => r.targets.clone(),
+        match route {
+            Some(r) => {
+                let mut sorted = r.targets.clone();
+                sorted.sort_by_key(|t| t.priority);
+
+                // Resolve passthrough
+                let resolved: Vec<(String, String, u32)> = sorted
+                    .into_iter()
+                    .map(|t| {
+                        let rm = if t.real_model == "<passthrough>" {
+                            request.model.clone()
+                        } else {
+                            t.real_model
+                        };
+                        (t.provider, rm, t.priority)
+                    })
+                    .collect();
+
+                (resolved, r.api_endpoint.clone())
+            }
             None => {
                 let err = sag_core::AppError::ModelNotFound(request.model.clone());
                 let log = CallLog {
@@ -81,35 +108,56 @@ async fn chat_completions_handler(
                 state.collector.log(log);
                 return err.into_response();
             }
-        };
-
-        // Sort by priority ascending (lower = higher priority)
-        let mut sorted = targets;
-        sorted.sort_by_key(|t| t.priority);
-
-        // Resolve passthrough
-        sorted
-            .into_iter()
-            .map(|t| {
-                let rm = if t.real_model == "<passthrough>" {
-                    request.model.clone()
-                } else {
-                    t.real_model
-                };
-                (t.provider, rm, t.priority)
-            })
-            .collect::<Vec<_>>()
-        // config_guard dropped here
+        }
     };
 
     info!(
         model = %request.model,
         num_targets = targets.len(),
+        api_endpoint = %api_endpoint,
         stream = is_stream,
         "dispatching request with fallback"
     );
 
     let mut errors = Vec::new();
+
+    // -- Image generation path --
+    if api_endpoint.ends_with("/images/generations") {
+        let prompt = request
+            .messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        // Forward relevant extra keys from the chat request
+        let mut extra = serde_json::Map::new();
+        for key in &["size", "quality", "response_format", "style"] {
+            if let Some(v) = request.extra.get(*key) {
+                extra.insert(key.to_string(), v.clone());
+            }
+        }
+
+        let img_request = ImageGenerationRequest {
+            model: request.model.clone(),
+            prompt,
+            n: request.n,
+            size: None,
+            quality: None,
+            response_format: None,
+            extra,
+        };
+
+        return dispatch_image_request(
+            &state,
+            img_request,
+            &targets,
+            &request_id,
+            &request.model,
+            start,
+            &mut errors,
+        )
+        .await;
+    }
 
     for (provider_name, real_model, priority) in &targets {
         let provider = match state.get_provider(provider_name).await {
@@ -131,12 +179,12 @@ async fn chat_completions_handler(
         // Dispatch to this provider
         let result = if is_stream {
             provider
-                .chat_stream(&request, real_model)
+                .chat_stream(&request, real_model, &api_endpoint)
                 .await
                 .map(|resp| (resp.into_response(), None::<Usage>))
         } else {
             provider
-                .chat(&request, real_model)
+                .chat(&request, real_model, &api_endpoint)
                 .await
                 .map(|resp| {
                     let usage = resp.usage.clone();
@@ -149,7 +197,7 @@ async fn chat_completions_handler(
 
         match result {
             Ok((response, usage)) => {
-                // Success — log and return
+                // Success - log and return
                 let log = CallLog {
                     request_id,
                     provider: provider_name.clone(),
@@ -178,7 +226,7 @@ async fn chat_completions_handler(
                 errors.push(format!("{provider_name}: {e}"));
 
                 if !is_retryable {
-                    // Non-retryable (4xx/BadRequest) — stop fallback immediately
+                    // Non-retryable (4xx/BadRequest) - stop fallback immediately
                     break;
                 }
                 // Otherwise, try next target
@@ -211,6 +259,89 @@ async fn chat_completions_handler(
     err.into_response()
 }
 
+/// Image generation fallback loop - mirrors the chat fallback pattern.
+async fn dispatch_image_request(
+    state: &AppState,
+    img_request: ImageGenerationRequest,
+    targets: &[(String, String, u32)],
+    request_id: &uuid::Uuid,
+    model: &str,
+    start: Instant,
+    errors: &mut Vec<String>,
+) -> Response<Body> {
+    for (provider_name, real_model, priority) in targets {
+        let provider = match state.get_provider(provider_name).await {
+            Some(p) => p,
+            None => {
+                warn!(provider = %provider_name, "provider not found in registry");
+                errors.push(format!("{provider_name}: not found"));
+                continue;
+            }
+        };
+
+        info!(
+            provider = %provider_name,
+            real_model = %real_model,
+            priority = priority,
+            "trying provider for image generation"
+        );
+
+        match provider.chat_image(&img_request, real_model).await {
+            Ok(resp) => {
+                let log = CallLog {
+                    request_id: *request_id,
+                    provider: provider_name.clone(),
+                    model: model.to_string(),
+                    real_model: real_model.clone(),
+                    stream: false,
+                    status_code: 200,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    usage: None,
+                    error: None,
+                    timestamp: chrono::Utc::now(),
+                };
+                state.collector.log(log);
+                return (StatusCode::OK, Json(resp)).into_response();
+            }
+            Err(e) => {
+                let is_retryable = is_retryable_error(&e);
+                warn!(
+                    provider = %provider_name,
+                    error = %e,
+                    retryable = is_retryable,
+                    "provider image generation error"
+                );
+                errors.push(format!("{provider_name}: {e}"));
+                if !is_retryable {
+                    break;
+                }
+            }
+        }
+    }
+
+    let reason = errors.join("; ");
+    let err = sag_core::AppError::AllProvidersExhausted {
+        model: model.to_string(),
+        reason,
+    };
+
+    error!(model = %model, "all providers exhausted for image generation");
+    let log = CallLog {
+        request_id: *request_id,
+        provider: String::new(),
+        model: model.to_string(),
+        real_model: String::new(),
+        stream: false,
+        status_code: 502,
+        duration_ms: start.elapsed().as_millis() as u64,
+        usage: None,
+        error: Some(err.to_string()),
+        timestamp: chrono::Utc::now(),
+    };
+    state.collector.log(log);
+    err.into_response()
+}
+
 /// Determine if an error should trigger fallback to the next provider.
 fn is_retryable_error(e: &sag_core::AppError) -> bool {
     match e {
@@ -233,7 +364,7 @@ struct StatsQuery {
 async fn analytics_stats_handler(
     State(state): State<AppState>,
     Query(params): Query<StatsQuery>,
-) -> impl IntoResponse {
+) -> Response<Body> {
     match sag_analytics::query_stats(
         state.collector.pool(),
         params.provider.as_deref(),
