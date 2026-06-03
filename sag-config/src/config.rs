@@ -49,6 +49,9 @@ pub struct GatewayAuthConfig {
 /// Upstream LLM provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// Provider adapter type: "openai" (default) or "anthropic".
+    #[serde(default = "default_provider_type")]
+    pub provider_type: String,
     /// API key for this provider (injected into requests).
     pub api_key: String,
     /// Base URL for the provider's API.
@@ -67,6 +70,10 @@ pub struct ProviderConfig {
     /// Requests containing parameters not in this set will be rejected with 400.
     #[serde(default)]
     pub supported_params: Vec<String>,
+}
+
+fn default_provider_type() -> String {
+    "openai".into()
 }
 
 fn default_base_url() -> String {
