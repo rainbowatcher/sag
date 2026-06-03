@@ -7,4 +7,6 @@ description = "Usage analytics and call logging for SAG"
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true }
 sag-core = { path = "../sag-core" }
