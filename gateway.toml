@@ -1,0 +1,25 @@
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[analytics]
+enabled = true
+storage_dsn = "sqlite://analytics.db"
+
+[gateway_auth]
+api_keys = ["sag-test-key"]
+
+[providers.openai]
+provider_type = "openai"
+api_key = "sk-fake-test-key"
+base_url = "https://api.openai.com/v1"
+priority = 1
+max_retries = 1
+timeout_secs = 30
+supported_params = ["model", "messages", "temperature", "top_p", "stream", "max_tokens"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 1 },
+]
