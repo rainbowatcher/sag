@@ -1,0 +1,36 @@
+{
+  "name": "sag-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "oxlint src/",
+    "format": "oxlint --fix src/"
+  },
+  "dependencies": {
+    "vue": "^3.5",
+    "vue-router": "^4.5",
+    "pinia": "^2.3",
+    "radix-vue": "^1.9",
+    "lucide-vue-next": "^0.468",
+    "clsx": "^2.1",
+    "tailwind-merge": "^2.6",
+    "class-variance-authority": "^0.7",
+    "axios": "^1.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2",
+    "vite": "^6.1",
+    "vue-tsc": "^2.2",
+    "typescript": "~5.7",
+    "tailwindcss": "^3.4",
+    "tailwindcss-animate": "^1.0",
+    "postcss": "^8.5",
+    "autoprefixer": "^10.4",
+    "oxlint": "^0.15",
+    "@types/node": "^22"
+  }
+}
