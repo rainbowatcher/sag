@@ -57,7 +57,7 @@ pub struct ProviderConfig {
     /// Base URL for the provider's API.
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    /// Provider-level priority — lower = higher priority (used as fallback).
+    /// Provider-level priority — higher = higher priority (used as fallback).
     #[serde(default = "default_priority")]
     pub priority: u32,
     /// Maximum number of retries before giving up on this provider.
@@ -114,7 +114,7 @@ pub struct RouteTarget {
     pub provider: String,
     /// The real model name to send to this provider.
     pub real_model: String,
-    /// Model-level priority within this route — lower = higher priority.
+    /// Model-level priority within this route — higher = higher priority.
     #[serde(default = "default_priority")]
     pub priority: u32,
 }

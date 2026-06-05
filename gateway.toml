@@ -13,7 +13,7 @@ api_keys = ["sag-test-key"]
 provider_type = "openai"
 api_key = "sk-fake-test-key"
 base_url = "https://api.openai.com/v1"
-priority = 1
+priority = 10
 max_retries = 1
 timeout_secs = 30
 supported_params = ["model", "messages", "temperature", "top_p", "stream", "max_tokens"]
@@ -21,5 +21,5 @@ supported_params = ["model", "messages", "temperature", "top_p", "stream", "max_
 [[routes]]
 model_name = "gpt-4o"
 targets = [
-    { provider = "openai", real_model = "gpt-4o", priority = 1 },
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
 ]

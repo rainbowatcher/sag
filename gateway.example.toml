@@ -25,7 +25,7 @@ api_keys = [
 [providers.openai]
 api_key = "sk-your-openai-api-key"
 base_url = "https://api.openai.com/v1"
-priority = 1
+priority = 10
 max_retries = 2
 timeout_secs = 120
 supported_params = [
@@ -38,7 +38,7 @@ supported_params = [
 [providers.anthropic]
 api_key = "sk-ant-your-anthropic-api-key"
 base_url = "https://api.anthropic.com/v1"
-priority = 2
+priority = 1
 max_retries = 2
 timeout_secs = 120
 supported_params = [
@@ -54,32 +54,32 @@ supported_params = [
 [[routes]]
 model_name = "gpt-4o"
 targets = [
-    { provider = "openai", real_model = "gpt-4o", priority = 1 },
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
 ]
 
 [[routes]]
 model_name = "gpt-4o-mini"
 targets = [
-    { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
+    { provider = "openai", real_model = "gpt-4o-mini", priority = 10 },
 ]
 
 [[routes]]
 model_name = "claude-sonnet"
 targets = [
-    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 1 },
+    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10 },
     # Fallback: if Anthropic fails, try OpenAI with gpt-4o-mini
-    { provider = "openai", real_model = "gpt-4o-mini", priority = 2 },
+    { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
 ]
 
 [[routes]]
 model_name = "claude-opus"
 targets = [
-    { provider = "anthropic", real_model = "claude-3-opus-20240229", priority = 1 },
+    { provider = "anthropic", real_model = "claude-3-opus-20240229", priority = 10 },
 ]
 
 # Catch-all: any model not listed above will be forwarded directly to OpenAI
 [[routes]]
 model_name = "*"
 targets = [
-    { provider = "openai", real_model = "<passthrough>", priority = 1 },
+    { provider = "openai", real_model = "<passthrough>", priority = 10 },
 ]

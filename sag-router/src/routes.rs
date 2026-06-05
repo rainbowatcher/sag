@@ -53,7 +53,7 @@ pub fn build_router(state: AppState) -> Router {
 /// 1. Parse request body
 /// 2. Match model -> route (exact -> wildcard `*`)
 /// 3. If api_endpoint is image-based, dispatch as image generation
-/// 4. Sort route targets by priority (ascending)
+/// 4. Sort route targets by priority (descending — higher value wins)
 /// 5. Try each target: parameter validation -> dispatch
 /// 6. On 4xx error: return immediately (don't retry)
 /// 7. On 5xx / network / timeout: try next target
@@ -81,7 +81,7 @@ async fn chat_completions_handler(
         match route {
             Some(r) => {
                 let mut sorted = r.targets.clone();
-                sorted.sort_by_key(|t| t.priority);
+                sorted.sort_by_key(|t| std::cmp::Reverse(t.priority));
 
                 // Resolve passthrough
                 let resolved: Vec<(String, String, u32)> = sorted
