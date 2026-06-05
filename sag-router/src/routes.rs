@@ -10,6 +10,7 @@ use axum::{
     Json,
     Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use sag_core::{CallLog, ImageGenerationRequest, Usage};
 use serde_json::json;
 use tracing::{error, info, instrument, warn};
@@ -32,11 +33,17 @@ pub fn build_router(state: AppState) -> Router {
             gateway_auth,
         ));
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/analytics/stats", get(analytics_stats_handler))
         .nest("/v1/chat/completions", chat_route)
         .nest("/api", admin_routes)
+        .layer(cors)
         .with_state(state)
 }
 
