@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let config_handle = sag_config::load_config(&config_path)?;
 
     // 4. Start config hot-reload watcher
-    let hot_reload_task = sag_config::spawn_hot_reload(config_handle.clone());
+    let hot_reload_handle = sag_config::spawn_hot_reload(config_handle.clone());
 
     // 5. Determine analytics storage DSN from config
     let config = config_handle.read().await;
@@ -86,10 +86,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("gateway shut down");
 
-    // 12. Abort hot-reload watcher — it runs an infinite loop waiting for
-    //     file events and would otherwise block the process from exiting.
-    hot_reload_task.abort();
-    info!("hot-reload watcher stopped");
+    // 12. Gracefully shut down the hot-reload watcher.
+    //     This MUST happen after the server stops because the watcher
+    //     uses `notify` which spawns OS-level threads (FSEvents on macOS).
+    //     Using `abort()` on the JoinHandle would skip the Watcher's Drop
+    //     implementation, leaving those threads alive and blocking process exit.
+    //
+    //     The router (and its internal AppState) was dropped when axum::serve
+    //     completed above, which already closes the analytics channel and lets
+    //     the SQLite background task exit.
+    hot_reload_handle.shutdown().await;
+
+    info!("all subsystems shut down");
 
     Ok(())
 }

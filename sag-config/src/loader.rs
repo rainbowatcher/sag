@@ -61,13 +61,37 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
     })
 }
 
+/// Handle for the hot-reload background task, including a shutdown signal.
+pub struct HotReloadHandle {
+    /// The spawned tokio task.
+    pub task: tokio::task::JoinHandle<()>,
+    /// Send `()` to request graceful shutdown of the watcher.
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl HotReloadHandle {
+    /// Signal the watcher to shut down gracefully and wait for it to finish.
+    ///
+    /// This ensures the `notify::Watcher` is properly dropped, which stops
+    /// OS-level file-watching threads (FSEvents on macOS, inotify on Linux).
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.task,
+        )
+        .await;
+    }
+}
+
 /// Spawn a background task that watches the config file for changes and reloads it.
 /// The returned handle will reflect the latest config.
-pub fn spawn_hot_reload(handle: ConfigHandle) -> tokio::task::JoinHandle<()> {
+pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
     let inner = handle.inner.clone();
     let path = handle.config_path.clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<notify::Event, notify::Error>>(16);
 
         let mut watcher = match RecommendedWatcher::new(
@@ -93,37 +117,56 @@ pub fn spawn_hot_reload(handle: ConfigHandle) -> tokio::task::JoinHandle<()> {
         // Debounce: wait 500ms after last event before reloading
         let mut debounce = tokio::time::Instant::now();
 
-        while let Some(event_res) = rx.recv().await {
-            match event_res {
-                Ok(event) => {
-                    if is_modify_event(&event) {
-                        let now = tokio::time::Instant::now();
-                        if now.duration_since(debounce).as_millis() < 500 {
-                            continue; // debounce
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("hot-reload watcher shutting down");
+                    // Drop the watcher explicitly — this stops OS file-watch threads.
+                    drop(watcher);
+                    return;
+                }
+                event_res = rx.recv() => {
+                    match event_res {
+                        Some(Ok(event)) => {
+                            if is_modify_event(&event) {
+                                let now = tokio::time::Instant::now();
+                                if now.duration_since(debounce).as_millis() < 500 {
+                                    continue; // debounce
+                                }
+                                debounce = now;
+
+                                // Small delay to let the file system settle
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                                match reload_config(&path).await {
+                                    Ok(new_config) => {
+                                        let mut guard = inner.write().await;
+                                        *guard = new_config;
+                                        info!("configuration hot-reloaded");
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to reload config: {e}");
+                                    }
+                                }
+                            }
                         }
-                        debounce = now;
-
-                        // Small delay to let the file system settle
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                        match reload_config(&path).await {
-                            Ok(new_config) => {
-                                let mut guard = inner.write().await;
-                                *guard = new_config;
-                                info!("configuration hot-reloaded");
-                            }
-                            Err(e) => {
-                                warn!("failed to reload config: {e}");
-                            }
+                        Some(Err(e)) => {
+                            error!("file watcher error: {e}");
+                        }
+                        None => {
+                            // All senders dropped — watcher was destroyed.
+                            // This is a belt-and-suspenders safety net; in
+                            // practice the shutdown signal arm handles exit.
+                            info!("file watcher channel closed, exiting");
+                            return;
                         }
                     }
                 }
-                Err(e) => {
-                    error!("file watcher error: {e}");
-                }
             }
         }
-    })
+    });
+
+    HotReloadHandle { task, shutdown_tx }
 }
 
 fn is_modify_event(event: &Event) -> bool {
