@@ -1,18 +1,17 @@
 use std::time::Instant;
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Query, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json,
-    Router,
 };
-use tower_http::cors::{Any, CorsLayer};
 use sag_core::{CallLog, ImageGenerationRequest, Usage};
 use serde_json::json;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, instrument, warn};
 
 use crate::auth::gateway_auth;
@@ -22,16 +21,10 @@ use crate::state::AppState;
 pub fn build_router(state: AppState) -> Router {
     let chat_route = Router::new()
         .route("/", post(chat_completions_handler))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            gateway_auth,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
 
     let admin_routes = crate::admin::build_admin_routes(state.clone())
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            gateway_auth,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -195,10 +188,7 @@ async fn chat_completions_handler(
                 .await
                 .map(|resp| {
                     let usage = resp.usage.clone();
-                    (
-                        (StatusCode::OK, Json(resp)).into_response(),
-                        usage,
-                    )
+                    ((StatusCode::OK, Json(resp)).into_response(), usage)
                 })
         };
 

@@ -245,6 +245,28 @@ export const useApiStore = defineStore('api', () => {
     }
   }
 
+  /**
+   * Delete a provider from the gateway. The server cascades the deletion
+   * by removing any `RouteTarget` entries that reference the provider and
+   * dropping routes that would otherwise end up with no targets.
+   *
+   * On success, refreshes both the provider and route lists so the UI
+   * reflects the cascade.
+   */
+  async function deleteProvider(name: string): Promise<void> {
+    try {
+      await api.delete(`/api/providers/${encodeURIComponent(name)}`, {
+        headers: headers(),
+      })
+      // The server cascaded the deletion; refresh both lists so the UI
+      // shows the updated routes (some may have been dropped entirely).
+      await Promise.all([fetchProviders(), fetchRoutes()])
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
+      throw e
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════
   // Routes
   // ═══════════════════════════════════════════════════════════════
@@ -333,7 +355,7 @@ export const useApiStore = defineStore('api', () => {
     loadConnection, connect, disconnect, validateConnection,
     setRouter,
     // Providers
-    providers, providersLoading, fetchProviders, addProvider,
+    providers, providersLoading, fetchProviders, addProvider, deleteProvider,
     // Routes
     routes, routesLoading, fetchRoutes, addRoute,
     // Health

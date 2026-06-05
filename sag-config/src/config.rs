@@ -57,7 +57,10 @@ pub struct ProviderConfig {
     /// Base URL for the provider's API.
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    /// Provider-level priority — higher = higher priority (used as fallback).
+    /// Provider-level priority — higher = higher priority, used for fallback
+    /// ordering across providers. When a route target references this provider,
+    /// targets are sorted in descending priority order so that higher-priority
+    /// providers are tried first. Defaults to `10`.
     #[serde(default = "default_priority")]
     pub priority: u32,
     /// Maximum number of retries before giving up on this provider.
@@ -79,6 +82,10 @@ fn default_provider_type() -> String {
 fn default_base_url() -> String {
     "https://api.openai.com/v1".into()
 }
+/// Default priority value (`10`).
+///
+/// When no priority is specified, targets default to `10`, which places them
+/// at a moderate priority level. Values range from `0` to `u32::MAX`.
 fn default_priority() -> u32 {
     10
 }
@@ -91,6 +98,10 @@ fn default_timeout_secs() -> u64 {
 
 /// Per-model routing configuration.
 /// Maps a requested model name to one or more provider targets.
+///
+/// When a request matches this route, the targets are sorted by priority in
+/// descending order (higher = higher priority) and tried sequentially until
+/// one succeeds or all fail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// The model name as requested by the client (supports glob-like patterns e.g. "gpt-image-*").
@@ -99,7 +110,7 @@ pub struct RouteConfig {
     /// Examples: `/v1/chat/completions`, `/v1/images/generations`, `/v1/responses`.
     #[serde(default = "default_api_endpoint")]
     pub api_endpoint: String,
-    /// Ordered list of targets — first matching/reachable target wins.
+    /// Ordered list of targets — tried in descending priority order.
     pub targets: Vec<RouteTarget>,
 }
 
@@ -108,13 +119,18 @@ fn default_api_endpoint() -> String {
 }
 
 /// A routing target: maps a logical model to a specific provider + real model name.
+///
+/// Multiple targets in a route are sorted by priority (descending) and tried
+/// sequentially. Targets with the same priority maintain their declaration order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Provider name (must match a key in `providers`).
     pub provider: String,
     /// The real model name to send to this provider.
     pub real_model: String,
-    /// Model-level priority within this route — higher = higher priority.
+    /// Priority within this route — higher = higher priority. Targets are
+    /// sorted in descending order, so a target with priority `20` is tried
+    /// before one with priority `10`. Defaults to `10`.
     #[serde(default = "default_priority")]
     pub priority: u32,
 }
@@ -237,14 +253,14 @@ supported_params = ["model", "messages", "stream"]
 [[routes]]
 model_name = "gpt-4o"
 targets = [
-    { provider = "openai", real_model = "gpt-4o", priority = 1 },
-    { provider = "anthropic", real_model = "claude-opus", priority = 2 },
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+    { provider = "anthropic", real_model = "claude-opus", priority = 1 },
 ]
 
 [[routes]]
 model_name = "claude-sonnet"
 targets = [
-    { provider = "anthropic", real_model = "claude-sonnet", priority = 1 },
+    { provider = "anthropic", real_model = "claude-sonnet", priority = 10 },
 ]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
@@ -253,8 +269,8 @@ targets = [
         // First route
         assert_eq!(config.routes[0].model_name, "gpt-4o");
         assert_eq!(config.routes[0].targets.len(), 2);
-        assert_eq!(config.routes[0].targets[0].priority, 1);
-        assert_eq!(config.routes[0].targets[1].priority, 2);
+        assert_eq!(config.routes[0].targets[0].priority, 10);
+        assert_eq!(config.routes[0].targets[1].priority, 1);
 
         // Second route
         assert_eq!(config.routes[1].model_name, "claude-sonnet");

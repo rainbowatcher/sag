@@ -4,7 +4,10 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::StreamExt;
 use reqwest::header::CONTENT_TYPE;
-use sag_core::{AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ImageGenerationRequest, ImageGenerationResponse, Usage};
+use sag_core::{
+    AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    ImageGenerationRequest, ImageGenerationResponse, Usage,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, instrument, warn};
 
@@ -126,10 +129,7 @@ impl AnthropicProvider {
     }
 
     /// Convert an OpenAI-format request to Anthropic Messages API format.
-    fn to_anthropic_request(
-        request: &ChatCompletionRequest,
-        real_model: &str,
-    ) -> AnthropicRequest {
+    fn to_anthropic_request(request: &ChatCompletionRequest, real_model: &str) -> AnthropicRequest {
         let system = request
             .messages
             .iter()
@@ -169,10 +169,7 @@ impl AnthropicProvider {
     }
 
     /// Convert an Anthropic response back to the standard format.
-    fn from_anthropic_response(
-        response: AnthropicResponse,
-        model: &str,
-    ) -> ChatCompletionResponse {
+    fn from_anthropic_response(response: AnthropicResponse, model: &str) -> ChatCompletionResponse {
         let text = response
             .content
             .iter()
@@ -254,10 +251,8 @@ impl LlmProvider for AnthropicProvider {
             });
         }
 
-        let anthropic_resp: AnthropicResponse =
-            serde_json::from_str(&body_text).map_err(|e| {
-                AppError::Internal(format!("failed to parse anthropic response: {e}"))
-            })?;
+        let anthropic_resp: AnthropicResponse = serde_json::from_str(&body_text)
+            .map_err(|e| AppError::Internal(format!("failed to parse anthropic response: {e}")))?;
 
         Ok(Self::from_anthropic_response(anthropic_resp, real_model))
     }

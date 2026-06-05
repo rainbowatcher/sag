@@ -24,32 +24,39 @@ pub async fn gateway_auth(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.trim().to_string());
 
-    let config_guard = state.config.read().await;
-
-    match &config_guard.gateway_auth {
-        Some(auth_config) => {
-            let provided_key = match auth_header {
-                Some(key) => key,
-                None => {
-                    warn!("request missing Authorization header");
-                    return (StatusCode::UNAUTHORIZED, Json(json!({
-                        "error": { "code": "UNAUTHORIZED", "message": "missing Authorization header" }
-                    })))
-                    .into_response();
-                }
-            };
-
-            if !auth_config.api_keys.iter().any(|k| k == &provided_key) {
-                warn!("invalid gateway API key");
-                return (StatusCode::UNAUTHORIZED, Json(json!({
-                    "error": { "code": "UNAUTHORIZED", "message": "invalid API key" }
-                })))
-                .into_response();
+    // Auth check: take the read lock only for the duration of the lookup,
+    // then release it. Holding the lock across `next.run` would deadlock
+    // any handler that needs to acquire a write lock (e.g. the admin
+    // `POST/DELETE` endpoints that mutate `config.providers`).
+    let key_valid: bool = {
+        let config_guard = state.config.read().await;
+        match &config_guard.gateway_auth {
+            Some(auth_config) => {
+                let provided_key = match auth_header {
+                    Some(key) => key,
+                    None => {
+                        warn!("request missing Authorization header");
+                        return (StatusCode::UNAUTHORIZED, Json(json!({
+                            "error": { "code": "UNAUTHORIZED", "message": "missing Authorization header" }
+                        })))
+                        .into_response();
+                    }
+                };
+                auth_config.api_keys.iter().any(|k| k == &provided_key)
+            }
+            None => {
+                // No gateway auth configured — allow all requests
+                true
             }
         }
-        None => {
-            // No gateway auth configured — allow all requests
-        }
+    };
+
+    if !key_valid {
+        warn!("invalid gateway API key");
+        return (StatusCode::UNAUTHORIZED, Json(json!({
+            "error": { "code": "UNAUTHORIZED", "message": "invalid API key" }
+        })))
+        .into_response();
     }
 
     next.run(request).await

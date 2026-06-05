@@ -4,7 +4,10 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use sag_core::{AppError, ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse};
+use sag_core::{
+    AppError, ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest,
+    ImageGenerationResponse,
+};
 use tracing::{debug, error, instrument, warn};
 
 use crate::LlmProvider;
@@ -122,10 +125,8 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        let completion: ChatCompletionResponse =
-            serde_json::from_str(&body_text).map_err(|e| AppError::Internal(format!(
-                "failed to parse upstream response: {e}"
-            )))?;
+        let completion: ChatCompletionResponse = serde_json::from_str(&body_text)
+            .map_err(|e| AppError::Internal(format!("failed to parse upstream response: {e}")))?;
 
         Ok(completion)
     }
@@ -177,14 +178,12 @@ impl LlmProvider for OpenAiProvider {
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive");
 
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| {
-                result.map_err(|e| {
-                    error!(?e, "error reading upstream stream chunk");
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                })
-            });
+        let byte_stream = response.bytes_stream().map(|result| {
+            result.map_err(|e| {
+                error!(?e, "error reading upstream stream chunk");
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })
+        });
 
         let body = Body::from_stream(byte_stream);
 

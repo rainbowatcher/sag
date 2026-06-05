@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json,
     Router,
 };
@@ -17,6 +17,10 @@ use crate::state::AppState;
 pub fn build_admin_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/providers", get(list_providers).post(add_provider))
+        .route(
+            "/providers/{name}",
+            delete(delete_provider),
+        )
         .route(
             "/providers/{name}/routes",
             post(add_route_for_provider),
@@ -272,4 +276,650 @@ async fn add_route_for_provider(
         })),
     )
         .into_response()
+}
+
+/// DELETE /api/providers/{name} — remove a provider from the gateway.
+///
+/// Cascading behavior:
+/// 1. Removes the provider entry from `config.providers`.
+/// 2. Removes any `RouteTarget` in `config.routes[].targets` that references
+///    the deleted provider. Routes that become empty are also dropped, since
+///    an empty `targets` list is functionally equivalent to "no route" and
+///    would silently swallow matching model requests with no fallback.
+/// 3. Persists the updated config to disk if the config is file-backed.
+/// 4. Removes the runtime provider adapter from the in-memory registry so
+///    in-flight lookups immediately fail-soft (the next request matching a
+///    removed target will surface "provider not found" instead of dispatching
+///    to a deleted adapter).
+async fn delete_provider(
+    State(state): State<AppState>,
+    Path(provider_name): Path<String>,
+) -> impl IntoResponse {
+    // ── Stage 1: update config + persist ─────────────────────────────
+    // Collect (model_name, removed_target_count) for every route that lost
+    // at least one target, so we can report it back to the caller.
+    let (cascaded_routes, removed_targets) = {
+        let mut config = state.config.write().await;
+
+        if !config.providers.contains_key(&provider_name) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": format!("provider '{provider_name}' not found"),
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        // Cascade: walk every route, drop targets pointing at the deleted
+        // provider, and remember which routes were touched.
+        let mut cascaded_routes: Vec<String> = Vec::new();
+        let mut removed_targets: usize = 0;
+        for route in config.routes.iter_mut() {
+            let before = route.targets.len();
+            route
+                .targets
+                .retain(|t| t.provider != provider_name);
+            let dropped = before - route.targets.len();
+            if dropped > 0 {
+                removed_targets += dropped;
+                cascaded_routes.push(route.model_name.clone());
+            }
+        }
+
+        // Drop routes that ended up with no targets at all — keeping an
+        // empty `targets` list would just create a dead route that matches
+        // a model but has no fallback, silently failing every request.
+        config
+            .routes
+            .retain(|r| !r.targets.is_empty());
+
+        // Remove the provider from the config map.
+        config.providers.remove(&provider_name);
+
+        // Persist to disk while we still hold the write lock.
+        if state.config.is_file_backed() {
+            if let Err(e) =
+                sag_config::save_config_to_file(&config, state.config.path())
+            {
+                warn!(
+                    ?e,
+                    "failed to persist config after deleting provider"
+                );
+            }
+        }
+
+        (cascaded_routes, removed_targets)
+    };
+
+    // ── Stage 2: remove the runtime adapter ──────────────────────────
+    // Done after the config write lock is released to minimize lock
+    // contention. Any in-flight request that already snapshotted the
+    // Arc<dyn LlmProvider> will continue to use it; new lookups will see
+    // the absence and surface a clear "provider not found" error.
+    {
+        let mut providers = state.providers.write().await;
+        providers.remove(&provider_name);
+    }
+
+    info!(
+        name = %provider_name,
+        cascaded_routes = cascaded_routes.len(),
+        removed_targets = removed_targets,
+        "provider deleted via admin API"
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": provider_name,
+            "cascaded_routes": cascaded_routes,
+            "removed_targets": removed_targets,
+        })),
+    )
+        .into_response()
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        Router,
+    };
+    use sag_analytics::CallLogCollector;
+    use sag_config::{
+        ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig,
+        RouteTarget, ServerConfig,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    /// Helper: build an in-memory `AppState` populated with the given
+    /// providers and routes. The runtime provider registry is also
+    /// pre-populated with `OpenAiProvider` adapters for every provider.
+    async fn build_state(
+        providers: HashMap<String, ProviderConfig>,
+        routes: Vec<RouteConfig>,
+    ) -> AppState {
+        let config = GatewayConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 3000,
+            },
+            analytics: None,
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["test-key".into()],
+            }),
+            providers,
+            routes,
+        };
+        let handle = ConfigHandle::from_config(config);
+
+        let cfg_read = handle.read().await;
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> =
+            HashMap::new();
+        for (name, pc) in cfg_read.providers.iter() {
+            let provider: Arc<dyn sag_providers::LlmProvider> =
+                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+            registry.insert(name.clone(), provider);
+        }
+        drop(cfg_read);
+
+        AppState {
+            config: handle,
+            providers: Arc::new(RwLock::new(registry)),
+            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+        }
+    }
+
+    /// Build a small test app that mounts only the admin routes.
+    /// We don't add the gateway_auth middleware here so tests can focus on
+    /// the route logic itself.
+    fn test_app(state: AppState) -> Router {
+        Router::new()
+            .nest("/api", build_admin_routes(state.clone()))
+            .with_state(state)
+    }
+
+    fn one_provider_config(
+        name: &str,
+        routes: Vec<(&str, &str, u32)>,
+    ) -> (HashMap<String, ProviderConfig>, Vec<RouteConfig>) {
+        let mut providers = HashMap::new();
+        providers.insert(
+            name.to_string(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: "sk-test".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                priority: 10,
+                max_retries: 2,
+                timeout_secs: 120,
+                supported_params: vec![],
+            },
+        );
+        let routes = routes
+            .into_iter()
+            .map(|(model, real_model, prio)| RouteConfig {
+                model_name: model.into(),
+                api_endpoint: "/v1/chat/completions".into(),
+                targets: vec![RouteTarget {
+                    provider: name.into(),
+                    real_model: real_model.into(),
+                    priority: prio,
+                }],
+            })
+            .collect();
+        (providers, routes)
+    }
+
+    // 1. Happy path
+    #[tokio::test]
+    async fn delete_provider_success() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state; // keep state alive
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/providers/openai")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["name"], "openai");
+        assert_eq!(body["removed_targets"], 1);
+        assert_eq!(body["cascaded_routes"], serde_json::json!(["gpt-4o"]));
+
+        let cfg = state.config.read().await;
+        assert!(!cfg.providers.contains_key("openai"));
+        assert!(cfg.routes.is_empty());
+        let reg = state.providers.read().await;
+        assert!(!reg.contains_key("openai"));
+    }
+
+    // 2. 404
+    #[tokio::test]
+    async fn delete_provider_not_found() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/providers/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "NOT_FOUND");
+        assert!(body["error"]["message"].as_str().unwrap().contains("nonexistent"));
+
+        let cfg = state.config.read().await;
+        assert!(cfg.providers.contains_key("openai"));
+    }
+
+    // 3. Cascade
+    #[tokio::test]
+    async fn delete_provider_cascades_routes() {
+        let mut providers = HashMap::new();
+        for name in ["openai", "anthropic"] {
+            providers.insert(
+                name.to_string(),
+                ProviderConfig {
+                    provider_type: if name == "openai" { "openai" } else { "anthropic" }.into(),
+                    api_key: format!("sk-{name}"),
+                    base_url: "https://example.com".into(),
+                    priority: 10,
+                    max_retries: 2,
+                    timeout_secs: 120,
+                    supported_params: vec![],
+                },
+            );
+        }
+
+        let routes = vec![
+            RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/v1/chat/completions".into(),
+                targets: vec![
+                    RouteTarget { provider: "openai".into(), real_model: "gpt-4o".into(), priority: 1 },
+                    RouteTarget { provider: "anthropic".into(), real_model: "claude-3-5-sonnet".into(), priority: 2 },
+                ],
+            },
+            RouteConfig {
+                model_name: "claude-sonnet".into(),
+                api_endpoint: "/v1/chat/completions".into(),
+                targets: vec![RouteTarget {
+                    provider: "anthropic".into(),
+                    real_model: "claude-3-5-sonnet".into(),
+                    priority: 1,
+                }],
+            },
+        ];
+
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/providers/openai")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["removed_targets"], 1);
+        assert_eq!(body["cascaded_routes"], serde_json::json!(["gpt-4o"]));
+
+        let cfg = state.config.read().await;
+        assert!(!cfg.providers.contains_key("openai"));
+        assert!(cfg.providers.contains_key("anthropic"));
+
+        let gpt = cfg.routes.iter().find(|r| r.model_name == "gpt-4o").unwrap();
+        assert_eq!(gpt.targets.len(), 1);
+        assert_eq!(gpt.targets[0].provider, "anthropic");
+
+        let claude = cfg.routes.iter().find(|r| r.model_name == "claude-sonnet").unwrap();
+        assert_eq!(claude.targets.len(), 1);
+        assert_eq!(claude.targets[0].provider, "anthropic");
+
+        let reg = state.providers.read().await;
+        assert!(!reg.contains_key("openai"));
+        assert!(reg.contains_key("anthropic"));
+    }
+
+    // 4. Persistence
+    #[tokio::test]
+    async fn delete_provider_persists_to_disk() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sag-delete-test-{}.toml", std::process::id()));
+
+        let initial = r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[gateway_auth]
+api_keys = ["test-key"]
+
+[providers.openai]
+api_key = "sk-test"
+base_url = "https://api.openai.com/v1"
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_key = "sk-ant"
+base_url = "https://api.anthropic.com"
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o" },
+    { provider = "anthropic", real_model = "claude-3-5-sonnet" },
+]
+"#;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(initial.as_bytes()).unwrap();
+        }
+
+        let handle = sag_config::load_config(&path).unwrap();
+        assert!(handle.is_file_backed());
+
+        let cfg_read = handle.read().await;
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+        for (name, pc) in cfg_read.providers.iter() {
+            let provider: Arc<dyn sag_providers::LlmProvider> =
+                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+            registry.insert(name.clone(), provider);
+        }
+        drop(cfg_read);
+
+        let state = AppState {
+            config: handle,
+            providers: Arc::new(RwLock::new(registry)),
+            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+        };
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/providers/openai")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // The [providers] section is serialized as an inline table
+        // (`anthropic = { ... }`).
+        let providers_block = content
+            .split("\n\n")
+            .find(|s| s.starts_with("[providers]") || s.trim_start().starts_with("providers."))
+            .unwrap_or("");
+        assert!(!providers_block.contains("openai"),
+            "openai should not appear in [providers] block: {providers_block}");
+        assert!(providers_block.contains("anthropic"),
+            "anthropic should be preserved in [providers] block: {providers_block}");
+
+        assert!(!content.contains("real_model = \"gpt-4o\""),
+            "the openai→gpt-4o target should be removed: {content}");
+        assert!(content.contains("real_model = \"claude-3-5-sonnet\""),
+            "the anthropic→claude target should be preserved: {content}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 5. Sanity: GET /api/providers still works
+    #[tokio::test]
+    async fn list_providers_still_works_after_adding_delete_route() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/providers")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let arr = body["providers"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "openai");
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Auth-regression tests — verify the auth middleware doesn't deadlock
+// write-locking handlers.
+// ═══════════════════════════════════════════════════════════════════
+//
+// Earlier versions of `sag-router/src/auth.rs::gateway_auth` held a
+// read lock on the config for the entire request lifecycle, which
+// deadlocked any handler that needed to acquire the write lock. These
+// tests wrap the admin routes with the real auth middleware and
+// exercise every write-locking handler with a hard timeout, so a
+// regression would surface as a clear test failure rather than a
+// production hang.
+
+#[cfg(test)]
+mod auth_regression_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::delete as axum_delete,
+        Router,
+    };
+    use sag_analytics::CallLogCollector;
+    use sag_config::{
+        ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig,
+        RouteTarget, ServerConfig,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    async fn build_protected_state() -> AppState {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: "sk-test".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                priority: 10,
+                max_retries: 2,
+                timeout_secs: 120,
+                supported_params: vec![],
+            },
+        );
+        let config = GatewayConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 3000,
+            },
+            analytics: None,
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["regression-key".into()],
+            }),
+            providers,
+            routes: vec![RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/v1/chat/completions".into(),
+                targets: vec![RouteTarget {
+                    provider: "openai".into(),
+                    real_model: "gpt-4o".into(),
+                    priority: 1,
+                }],
+            }],
+        };
+        let handle = ConfigHandle::from_config(config);
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> =
+            HashMap::new();
+        let cfg_read = handle.read().await;
+        for (name, pc) in cfg_read.providers.iter() {
+            let provider: Arc<dyn sag_providers::LlmProvider> =
+                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+            registry.insert(name.clone(), provider);
+        }
+        drop(cfg_read);
+        AppState {
+            config: handle,
+            providers: Arc::new(RwLock::new(registry)),
+            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+        }
+    }
+
+    fn protected_app(state: AppState) -> Router {
+        let admin = Router::new()
+            .route("/providers", get(list_providers).post(add_provider))
+            .route("/providers/{name}", axum_delete(delete_provider))
+            .route("/providers/{name}/routes", post(add_route_for_provider))
+            .route("/routes", get(list_routes))
+            .with_state(state.clone())
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::super::auth::gateway_auth,
+            ));
+        Router::new().nest("/api", admin).with_state(state)
+    }
+
+    async fn bounded<F>(label: &str, fut: F) -> axum::response::Response
+    where
+        F: std::future::Future<Output = axum::response::Response>,
+    {
+        let start = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(3), fut).await;
+        assert!(
+            result.is_ok(),
+            "[{label}] request did not complete in 3s — \
+             this strongly suggests the auth middleware is still \
+             holding a read lock across the handler (deadlock). \
+             See sag-router/src/auth.rs."
+        );
+        let resp = result.unwrap();
+        eprintln!("[{label}] completed in {:?}", start.elapsed());
+        resp
+    }
+
+    #[tokio::test]
+    async fn auth_regression_delete_completes_through_auth_middleware() {
+        let state = build_protected_state().await;
+        let app = protected_app(state);
+        let resp = bounded("DELETE", async {
+            app.oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/providers/openai")
+                    .header("Authorization", "Bearer regression-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_regression_add_provider_completes_through_auth_middleware() {
+        let state = build_protected_state().await;
+        let app = protected_app(state);
+        let resp = bounded("POST", async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("Authorization", "Bearer regression-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"anthropic","api_key":"sk-ant","provider_type":"anthropic"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn auth_regression_add_route_completes_through_auth_middleware() {
+        let state = build_protected_state().await;
+        let app = protected_app(state);
+        let resp = bounded("POST route", async {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers/openai/routes")
+                    .header("Authorization", "Bearer regression-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"gpt-4o-mini","real_model":"gpt-4o-mini"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn auth_regression_list_providers_completes_through_auth_middleware() {
+        let state = build_protected_state().await;
+        let app = protected_app(state);
+        let resp = bounded("GET", async {
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/providers")
+                    .header("Authorization", "Bearer regression-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

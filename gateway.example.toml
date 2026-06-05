@@ -48,7 +48,7 @@ supported_params = [
 
 # ============================================================
 # Model routing table
-# Requested model -> [provider targets ordered by priority]
+# Requested model -> [provider targets sorted by priority descending]
 # ============================================================
 
 [[routes]]

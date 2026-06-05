@@ -48,8 +48,9 @@ impl ConfigHandle {
 /// Load the initial configuration from a TOML file and return a `ConfigHandle`.
 pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::AppError> {
     let path = path.as_ref().to_path_buf();
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| sag_core::AppError::Config(format!("failed to read config {}: {e}", path.display())))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        sag_core::AppError::Config(format!("failed to read config {}: {e}", path.display()))
+    })?;
 
     let config: GatewayConfig = toml::from_str(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
@@ -76,11 +77,7 @@ impl HotReloadHandle {
     /// OS-level file-watching threads (FSEvents on macOS, inotify on Linux).
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.task,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await;
     }
 }
 
@@ -170,17 +167,15 @@ pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
 }
 
 fn is_modify_event(event: &Event) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Modify(_) | EventKind::Create(_)
-    )
+    matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
 }
 
 async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core::AppError> {
     let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
     })?;
-    toml::from_str(&content).map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))
+    toml::from_str(&content)
+        .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))
 }
 
 /// Persist the in-memory `GatewayConfig` back to the TOML file using `toml_edit`.
@@ -213,8 +208,9 @@ pub fn save_config_to_file(
     } else {
         let mut routes_array = toml_edit::ArrayOfTables::new();
         for route in &config.routes {
-            let route_doc = toml_edit::ser::to_document(route)
-                .map_err(|e| sag_core::AppError::Config(format!("failed to serialize route: {e}")))?;
+            let route_doc = toml_edit::ser::to_document(route).map_err(|e| {
+                sag_core::AppError::Config(format!("failed to serialize route: {e}"))
+            })?;
             let route_tbl = (*route_doc).clone();
             routes_array.push(route_tbl);
         }
@@ -295,7 +291,12 @@ api_keys = ["test-key"]
         let path = temp_toml("[server]\n");
         let result = load_config(&path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to parse config"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("failed to parse config")
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 /// Unified error type for the entire gateway.
@@ -50,7 +50,11 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = match &self {
-            AppError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR", msg.clone()),
+            AppError::Config(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CONFIG_ERROR",
+                msg.clone(),
+            ),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.clone()),
             AppError::Upstream { status, body, .. } => {
                 let s = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -58,12 +62,22 @@ impl IntoResponse for AppError {
             }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg.clone()),
             AppError::ModelNotFound(msg) => (StatusCode::NOT_FOUND, "MODEL_NOT_FOUND", msg.clone()),
-            AppError::AllProvidersExhausted { reason, .. } => {
-                (StatusCode::BAD_GATEWAY, "ALL_PROVIDERS_EXHAUSTED", reason.clone())
-            }
+            AppError::AllProvidersExhausted { reason, .. } => (
+                StatusCode::BAD_GATEWAY,
+                "ALL_PROVIDERS_EXHAUSTED",
+                reason.clone(),
+            ),
             AppError::Network(e) => (StatusCode::BAD_GATEWAY, "NETWORK_ERROR", e.to_string()),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg.clone()),
-            AppError::Anyhow(e) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e.to_string()),
+            AppError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                msg.clone(),
+            ),
+            AppError::Anyhow(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                e.to_string(),
+            ),
         };
 
         let body = json!({
@@ -114,16 +128,17 @@ mod tests {
         let (status, body) = extract(AppError::BadRequest("unsupported param seed".into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "BAD_REQUEST");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported")
+        );
     }
 
     #[tokio::test]
     async fn model_not_found_returns_404() {
-        let (status, body) =
-            extract(AppError::ModelNotFound("unknown-model".into())).await;
+        let (status, body) = extract(AppError::ModelNotFound("unknown-model".into())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "MODEL_NOT_FOUND");
         assert_eq!(body["error"]["message"], "unknown-model");
@@ -160,10 +175,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"]["code"], "ALL_PROVIDERS_EXHAUSTED");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("all timed out"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("all timed out")
+        );
     }
 
     #[tokio::test]
@@ -201,10 +218,12 @@ mod tests {
         let (status, body) = extract(app_err).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("something went wrong"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("something went wrong")
+        );
     }
 
     #[test]

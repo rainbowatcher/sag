@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::response::Response;
-use sag_core::types::{ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse};
+use sag_core::types::{
+    ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse,
+};
 
 /// Unified trait for LLM provider adapters.
 #[async_trait]

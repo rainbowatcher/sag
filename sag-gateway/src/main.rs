@@ -39,19 +39,24 @@ async fn main() -> anyhow::Result<()> {
     drop(config);
 
     // 6. Initialize analytics collector with SQLite persistence
-    let collector = Arc::new(
-        sag_analytics::CallLogCollector::new(&analytics_dsn).await?,
-    );
+    let collector = Arc::new(sag_analytics::CallLogCollector::new(&analytics_dsn).await?);
 
     // 7. Initialize provider registry from config
     let config = config_handle.read().await;
     let mut providers: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
 
     for (name, provider_config) in &config.providers {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str() {
-            "anthropic" => Arc::new(sag_providers::AnthropicProvider::new(name.clone(), provider_config)),
-            _ => Arc::new(sag_providers::OpenAiProvider::new(name.clone(), provider_config)),
-        };
+        let provider: Arc<dyn sag_providers::LlmProvider> =
+            match provider_config.provider_type.as_str() {
+                "anthropic" => Arc::new(sag_providers::AnthropicProvider::new(
+                    name.clone(),
+                    provider_config,
+                )),
+                _ => Arc::new(sag_providers::OpenAiProvider::new(
+                    name.clone(),
+                    provider_config,
+                )),
+            };
         providers.insert(name.clone(), provider);
         info!(name, provider_type = %provider_config.provider_type, base_url = %provider_config.base_url, "provider registered");
     }
@@ -108,8 +113,9 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         async move { sigterm.recv().await }
     };
 

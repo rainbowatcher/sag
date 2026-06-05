@@ -202,7 +202,16 @@ pub async fn query_stats(
     Ok(rows
         .into_iter()
         .map(
-            |(provider, model, call_count, total_prompt_tokens, total_completion_tokens, total_tokens, avg_duration_ms, error_count)| {
+            |(
+                provider,
+                model,
+                call_count,
+                total_prompt_tokens,
+                total_completion_tokens,
+                total_tokens,
+                avg_duration_ms,
+                error_count,
+            )| {
                 StatsRow {
                     provider,
                     model,

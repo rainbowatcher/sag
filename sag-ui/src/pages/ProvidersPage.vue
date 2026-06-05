@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useApiStore } from '@/stores/api'
-import { Plus, RefreshCw, Loader2, X, ChevronDown } from 'lucide-vue-next'
+import { Plus, RefreshCw, Loader2, X, ChevronDown, Trash2, AlertTriangle } from 'lucide-vue-next'
 
 const store = useApiStore()
 const showAdd = ref(false)
@@ -43,6 +43,40 @@ async function handleAdd() {
   } finally {
     adding.value = false
   }
+}
+
+// ── Delete flow ──────────────────────────────────────────────────
+// `confirmingDelete` holds the name of the provider awaiting final
+// confirmation. `deleting` is true while the DELETE request is in flight.
+const confirmingDelete = ref<string | null>(null)
+const deleting = ref(false)
+const deleteError = ref('')
+
+// Open the inline confirm bar for a provider. Toggling off if the same
+// row is clicked again — handy for cancelling with a single click.
+function startDelete(name: string) {
+  deleteError.value = ''
+  confirmingDelete.value = confirmingDelete.value === name ? null : name
+}
+
+async function confirmDelete(name: string) {
+  deleting.value = true
+  deleteError.value = ''
+  try {
+    await store.deleteProvider(name)
+    confirmingDelete.value = null
+    // Make sure the expanded panel for the deleted provider is reset.
+    delete expanded.value[name]
+  } catch (e: any) {
+    deleteError.value = e.response?.data?.error?.message ?? e.message
+  } finally {
+    deleting.value = false
+  }
+}
+
+function cancelDelete() {
+  confirmingDelete.value = null
+  deleteError.value = ''
 }
 </script>
 
@@ -131,20 +165,76 @@ async function handleAdd() {
 
     <div v-else class="space-y-3">
       <div v-for="p in store.providers" :key="p.name" class="rounded-lg border bg-card overflow-hidden">
-        <button @click="expanded[p.name] = !expanded[p.name]" class="w-full flex items-center justify-between p-4 text-left hover:bg-muted/30 transition-colors">
-          <div class="flex items-center gap-3">
+        <div class="flex items-center justify-between hover:bg-muted/30 transition-colors">
+          <button @click="expanded[p.name] = !expanded[p.name]" class="flex-1 flex items-center gap-3 p-4 text-left">
             <div class="h-8 w-8 rounded bg-primary/10 flex items-center justify-center text-primary text-xs font-bold uppercase">{{ p.name[0] }}</div>
             <div>
               <p class="font-medium text-sm">{{ p.name }}</p>
               <p class="text-xs text-muted-foreground">{{ p.provider_type }} · {{ p.base_url }}</p>
             </div>
+          </button>
+          <div class="flex items-center gap-2 pr-3">
+            <span class="text-xs text-muted-foreground rounded-full border px-2 py-0.5">priority: {{ p.priority }}</span>
+            <!--
+              Delete trigger. Clicking once reveals an inline confirm bar
+              (rendered below); clicking again cancels it. The stop
+              propagation keeps the parent collapse toggle from firing.
+            -->
+            <button
+              @click.stop="startDelete(p.name)"
+              :class="confirmingDelete === p.name ? 'text-destructive bg-destructive/10' : 'text-muted-foreground hover:text-destructive'"
+              class="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors"
+              :title="confirmingDelete === p.name ? 'Cancel delete' : 'Delete provider'"
+              :aria-label="confirmingDelete === p.name ? 'Cancel delete' : 'Delete provider'"
+            >
+              <Trash2 class="h-3.5 w-3.5" />
+            </button>
+            <button @click.stop="expanded[p.name] = !expanded[p.name]" class="text-muted-foreground inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-muted transition-colors" :aria-label="expanded[p.name] ? 'Collapse' : 'Expand'">
+              <ChevronDown class="h-4 w-4 transition-transform" :class="expanded[p.name] ? 'rotate-180' : ''" />
+            </button>
           </div>
-          <div class="flex items-center gap-3 text-xs text-muted-foreground">
-            <span class="rounded-full border px-2 py-0.5">priority: {{ p.priority }}</span>
-            <ChevronDown class="h-4 w-4 transition-transform" :class="expanded[p.name] ? 'rotate-180' : ''" />
+        </div>
+        <!--
+          Inline confirm bar. Renders only for the row whose trash was
+          clicked. Surfaces the cascade side-effect to the user so they
+          understand what will happen, and lets them back out with one
+          click.
+        -->
+        <div
+          v-if="confirmingDelete === p.name"
+          class="border-t bg-destructive/5 px-4 py-3 text-xs space-y-2"
+        >
+          <div class="flex items-start gap-2 text-destructive">
+            <AlertTriangle class="h-4 w-4 mt-0.5 shrink-0" />
+            <div>
+              <p class="font-medium">Delete provider &quot;{{ p.name }}&quot;?</p>
+              <p class="text-muted-foreground mt-0.5">
+                Any route that uses this provider will lose its target. Routes with no remaining targets will be removed entirely.
+              </p>
+            </div>
           </div>
-        </button>
-        <div v-if="expanded[p.name]" class="border-t px-4 py-3 bg-muted/20 text-xs space-y-1.5">
+          <div v-if="deleteError" class="text-destructive bg-destructive/10 rounded-md px-2 py-1.5">
+            {{ deleteError }}
+          </div>
+          <div class="flex justify-end gap-2">
+            <button
+              @click="cancelDelete"
+              :disabled="deleting"
+              class="h-7 px-3 text-xs rounded-md border hover:bg-accent disabled:opacity-50 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              @click="confirmDelete(p.name)"
+              :disabled="deleting"
+              class="inline-flex items-center gap-1.5 h-7 px-3 text-xs rounded-md bg-destructive text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50 transition-colors"
+            >
+              <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
+              {{ deleting ? 'Deleting…' : 'Delete' }}
+            </button>
+          </div>
+        </div>
+        <div v-if="expanded[p.name] && confirmingDelete !== p.name" class="border-t px-4 py-3 bg-muted/20 text-xs space-y-1.5">
           <div class="flex gap-2">
             <span class="text-muted-foreground w-20 shrink-0">Base URL:</span>
             <span class="font-mono">{{ p.base_url }}</span>
