@@ -32,17 +32,23 @@ pub async fn gateway_auth(
         let config_guard = state.config.read().await;
         match &config_guard.gateway_auth {
             Some(auth_config) => {
-                let provided_key = match auth_header {
-                    Some(key) => key,
-                    None => {
-                        warn!("request missing Authorization header");
-                        return (StatusCode::UNAUTHORIZED, Json(json!({
-                            "error": { "code": "UNAUTHORIZED", "message": "missing Authorization header" }
-                        })))
-                        .into_response();
-                    }
-                };
-                auth_config.api_keys.iter().any(|k| k == &provided_key)
+                if auth_config.api_keys.is_empty() {
+                    // Empty api_keys list means "no auth" — same as removing
+                    // the [gateway_auth] section entirely.
+                    true
+                } else {
+                    let provided_key = match auth_header {
+                        Some(key) => key,
+                        None => {
+                            warn!("request missing Authorization header");
+                            return (StatusCode::UNAUTHORIZED, Json(json!({
+                                "error": { "code": "UNAUTHORIZED", "message": "missing Authorization header" }
+                            })))
+                            .into_response();
+                        }
+                    };
+                    auth_config.api_keys.iter().any(|k| k == &provided_key)
+                }
             }
             None => {
                 // No gateway auth configured — allow all requests
@@ -210,6 +216,20 @@ mod tests {
         let request = Request::builder()
             .uri("/test")
             .header(header::AUTHORIZATION, "Bearer   my-key  ")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_empty_key_list_allows_all() {
+        let state = test_state(Some(vec![])).await;
+        let app = test_app(state);
+
+        let request = Request::builder()
+            .uri("/test")
             .body(Body::empty())
             .unwrap();
 
