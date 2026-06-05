@@ -13,7 +13,7 @@ const form = ref({
   api_key: '',
   provider_type: 'openai',
   base_url: 'https://api.openai.com/v1',
-  priority: 10,
+  priority: 0,
   supported_params: 'model,messages,temperature,max_tokens,stream',
 })
 
