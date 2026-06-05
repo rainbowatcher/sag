@@ -1,0 +1,9 @@
+{
+  "name": "mdbook-beautiful-mermaid",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "beautiful-mermaid": "^1.1.3"
+  }
+}
