@@ -2,15 +2,16 @@
 """SAG 开发环境启动脚本 — 一键启动 Rust 后端 + Vue 前端.
 
 用法:
-    python3 dev.py                    # 默认配置
-    python3 dev.py --config my.toml   # 指定配置文件
-    python3 dev.py --skip-ui          # 只启动后端
-    python3 dev.py --skip-backend     # 只启动前端
-    python3 dev.py --release          # release 模式启动后端
+    python3 scripts/dev.py                    # 默认配置
+    python3 scripts/dev.py --config my.toml   # 指定配置文件
+    python3 scripts/dev.py --skip-ui          # 只启动后端
+    python3 scripts/dev.py --skip-backend     # 只启动前端
+    python3 scripts/dev.py --release          # release 模式启动后端
 """
 
 import argparse
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -19,7 +20,6 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_BIN = "sag-gateway"  # cargo crate name (not the binary)
 
 
 def log(tag: str, msg: str) -> None:
@@ -32,17 +32,25 @@ def log(tag: str, msg: str) -> None:
 
 
 def start_backend(config: str, release: bool) -> subprocess.Popen:
-    """启动 Rust 后端进程."""
-    profile = "--release" if release else ""
-    cmd = f"cargo run {profile} -- {config}".strip().split()
-    log("SYS", f"Starting backend: {' '.join(cmd)}")
+    """启动 Rust 后端二进制."""
+    profile_dir = "release" if release else "debug"
+    binary = PROJECT_ROOT / "target" / profile_dir / "sag"
+    if not binary.exists():
+        log("SYS", f"Binary not found at {binary}, building first...")
+        subprocess.run(
+            ["cargo", "build"] + (["--release"] if release else []),
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+    log("SYS", f"Starting backend: {binary} {config}")
     return subprocess.Popen(
-        cmd,
+        [str(binary), config],
         cwd=PROJECT_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
 
 
@@ -61,41 +69,103 @@ def start_ui() -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
 
 
 def stream_output(proc: subprocess.Popen, tag: str) -> None:
     """将子进程输出实时打印到终端."""
-    for line in proc.stdout:  # type: ignore[union-attr]
+    assert proc.stdout is not None
+    for line in proc.stdout:
         log(tag, line.rstrip())
+
+
+def kill_process_group(proc: subprocess.Popen, sig: int) -> None:
+    """Send a signal to the entire process group of the child process."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass  # already exited
+
+
+def shutdown(procs: list[subprocess.Popen]) -> None:
+    """Gracefully terminate all child processes and their descendants."""
+    log("SYS", "Shutting down...")
+
+    for p in procs:
+        if p.poll() is not None:
+            continue  # already exited
+
+        # Step 1: SIGTERM to the entire process group
+        kill_process_group(p, signal.SIGTERM)
+
+        # Step 2: Wait up to 5 seconds for graceful exit
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Step 3: Force-kill with SIGKILL
+            kill_process_group(p, signal.SIGKILL)
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                log("SYS", f"WARNING: process {p.pid} unkillable")
+
+    log("SYS", "All processes stopped. Bye!")
+
+
+def wait_for_processes(procs: list[subprocess.Popen]) -> None:
+    """Block until all processes exit or SIGINT/SIGTERM is received.
+
+    Uses select.select() instead of p.wait(timeout=N) because the latter
+    is not reliably interruptible by signals on macOS (CPython's subprocess
+    module uses a C-level waitpid loop that may retry on EINTR).
+    select.select() cleanly raises InterruptedError on signal delivery,
+    allowing us to catch it and trigger a graceful shutdown.
+    """
+    shutdown_requested = False
+
+    def on_signal(signum: int, _frame: object) -> None:
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    # Temporarily install handlers that just set a flag
+    prev_int = signal.signal(signal.SIGINT, on_signal)
+    prev_term = signal.signal(signal.SIGTERM, on_signal)
+
+    try:
+        while not shutdown_requested:
+            # check if all children have exited
+            if all(p.poll() is not None for p in procs):
+                break
+
+            # Sleep in an interruptible way — select on no FDs with a
+            # timeout. On SIGINT/SIGTERM, this raises InterruptedError.
+            try:
+                select.select([], [], [], 0.5)
+            except InterruptedError:
+                continue  # signal handler sets shutdown_requested, loop exits
+
+    finally:
+        # Restore original handlers
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+
+    if shutdown_requested:
+        shutdown(procs)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SAG 开发环境启动器")
-    parser.add_argument("--config", default="gateway.toml", help="配置文件路径 (默认: gateway.toml)")
-    parser.add_argument("--release", action="store_true", help="使用 release 模式编译后端")
-    parser.add_argument("--skip-backend", action="store_true", help="跳过后端启动")
-    parser.add_argument("--skip-ui", action="store_true", help="跳过前端启动")
+    parser.add_argument("--config", default="gateway.toml")
+    parser.add_argument("--release", action="store_true")
+    parser.add_argument("--skip-backend", action="store_true")
+    parser.add_argument("--skip-ui", action="store_true")
     args = parser.parse_args()
 
     procs: list[subprocess.Popen] = []
-    threads: list[threading.Thread] = []
-
-    def cleanup(*_args) -> None:
-        """优雅关闭所有子进程."""
-        log("SYS", "Shutting down...")
-        for p in procs:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait()
-        log("SYS", "All processes stopped. Bye!")
-
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
 
     print()
     log("SYS", "╔══════════════════════════════════════╗")
@@ -120,33 +190,24 @@ def main() -> None:
 
         backend = start_backend(args.config, args.release)
         procs.append(backend)
-        t = threading.Thread(target=stream_output, args=(backend, "BACKEND"), daemon=True)
-        t.start()
-        threads.append(t)
+        threading.Thread(target=stream_output, args=(backend, "BACKEND"), daemon=True).start()
 
     # ── 前端 ──
     if not args.skip_ui:
         ui = start_ui()
         procs.append(ui)
-        t = threading.Thread(target=stream_output, args=(ui, "UI"), daemon=True)
-        t.start()
-        threads.append(t)
+        threading.Thread(target=stream_output, args=(ui, "UI"), daemon=True).start()
 
     if not procs:
         log("SYS", "Nothing to start (both --skip-backend and --skip-ui)")
         return
 
-    log("SYS", f"Gateway API: http://127.0.0.1:3000")
-    log("SYS", f"Dashboard UI: http://localhost:5173")
+    log("SYS", "Gateway API: http://127.0.0.1:3000")
+    log("SYS", "Dashboard UI: http://localhost:5173")
     log("SYS", "Press Ctrl+C to stop both processes.")
     print()
 
-    # 等待所有子进程结束
-    try:
-        for p in procs:
-            p.wait()
-    except KeyboardInterrupt:
-        cleanup()
+    wait_for_processes(procs)
 
 
 if __name__ == "__main__":
