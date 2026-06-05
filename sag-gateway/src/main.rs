@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::info;
 
 mod tracing_init;
 
@@ -86,11 +86,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("gateway shut down");
 
-    // 12. Check hot-reload task for panics
-    match hot_reload_task.await {
-        Ok(()) => info!("hot-reload watcher exited cleanly"),
-        Err(e) => error!("hot-reload watcher panicked: {e}"),
-    }
+    // 12. Abort hot-reload watcher — it runs an infinite loop waiting for
+    //     file events and would otherwise block the process from exiting.
+    hot_reload_task.abort();
+    info!("hot-reload watcher stopped");
 
     Ok(())
 }
