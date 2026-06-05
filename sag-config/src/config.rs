@@ -93,10 +93,18 @@ fn default_timeout_secs() -> u64 {
 /// Maps a requested model name to one or more provider targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
-    /// The model name as requested by the client.
+    /// The model name as requested by the client (supports glob-like patterns e.g. "gpt-image-*").
     pub model_name: String,
+    /// Upstream API endpoint path for this model.
+    /// Examples: `/v1/chat/completions`, `/v1/images/generations`, `/v1/responses`.
+    #[serde(default = "default_api_endpoint")]
+    pub api_endpoint: String,
     /// Ordered list of targets — first matching/reachable target wins.
     pub targets: Vec<RouteTarget>,
+}
+
+fn default_api_endpoint() -> String {
+    "/v1/chat/completions".into()
 }
 
 /// A routing target: maps a logical model to a specific provider + real model name.

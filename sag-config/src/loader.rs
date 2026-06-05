@@ -29,9 +29,19 @@ impl ConfigHandle {
         self.inner.read().await
     }
 
+    /// Acquire a write lock on the config (for runtime mutation via admin API).
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, GatewayConfig> {
+        self.inner.write().await
+    }
+
     /// Returns the path to the config file.
     pub fn path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// Returns `true` if the config was loaded from a real file (not in-memory).
+    pub fn is_file_backed(&self) -> bool {
+        self.config_path.as_path().as_os_str() != "<memory>"
     }
 }
 
@@ -128,6 +138,52 @@ async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core
         sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
     })?;
     toml::from_str(&content).map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))
+}
+
+/// Persist the in-memory `GatewayConfig` back to the TOML file using `toml_edit`.
+///
+/// Uses `toml_edit` to parse the existing file (preserving comments and formatting)
+/// and only overwrites the `[providers]` and `[[routes]]` sections with the
+/// current in-memory state. All other sections (server, gateway_auth, analytics)
+/// retain their original formatting and comments.
+pub fn save_config_to_file(
+    config: &GatewayConfig,
+    path: &std::path::Path,
+) -> Result<(), sag_core::AppError> {
+    // Read the existing file to preserve formatting of non-mutated sections.
+    // If the file doesn't exist yet, start with an empty document.
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .map_err(|e| sag_core::AppError::Config(format!("failed to parse existing config: {e}")))?;
+
+    // ── Replace [providers] section ──
+    let providers_doc = toml_edit::ser::to_document(&config.providers)
+        .map_err(|e| sag_core::AppError::Config(format!("failed to serialize providers: {e}")))?;
+    // DocumentMut derefs to Table — clone it for insertion
+    let providers_table = (*providers_doc).clone();
+    doc["providers"] = toml_edit::Item::Table(providers_table);
+
+    // ── Replace [[routes]] section ──
+    if config.routes.is_empty() {
+        doc.remove("routes");
+    } else {
+        let mut routes_array = toml_edit::ArrayOfTables::new();
+        for route in &config.routes {
+            let route_doc = toml_edit::ser::to_document(route)
+                .map_err(|e| sag_core::AppError::Config(format!("failed to serialize route: {e}")))?;
+            let route_tbl = (*route_doc).clone();
+            routes_array.push(route_tbl);
+        }
+        doc["routes"] = toml_edit::Item::ArrayOfTables(routes_array);
+    }
+
+    // ── Write back ──
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| sag_core::AppError::Config(format!("failed to write config file: {e}")))?;
+
+    info!("config persisted to {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]
