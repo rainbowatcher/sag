@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use sag_core::{AppError, ChatCompletionRequest, ChatCompletionResponse};
+use sag_core::{AppError, ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse};
 use tracing::{debug, error, instrument, warn};
 
 use crate::LlmProvider;
@@ -66,6 +66,11 @@ impl OpenAiProvider {
 
         Ok(())
     }
+
+    /// Build the full upstream URL from the base URL and an API endpoint path.
+    fn build_url(&self, api_endpoint: &str) -> String {
+        format!("{}{}", self.base_url, api_endpoint)
+    }
 }
 
 #[async_trait]
@@ -83,6 +88,7 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
+        api_endpoint: &str,
     ) -> sag_core::Result<ChatCompletionResponse> {
         // Validate parameters
         self.validate_params(request)?;
@@ -91,7 +97,7 @@ impl LlmProvider for OpenAiProvider {
         let mut upstream_request = request.clone();
         upstream_request.model = real_model.to_string();
 
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.build_url(api_endpoint);
         debug!(%url, "sending non-streaming chat request");
 
         let response = self
@@ -129,6 +135,7 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
+        api_endpoint: &str,
     ) -> sag_core::Result<Response<Body>> {
         // Validate parameters
         self.validate_params(request)?;
@@ -137,7 +144,7 @@ impl LlmProvider for OpenAiProvider {
         let mut upstream_request = request.clone();
         upstream_request.model = real_model.to_string();
 
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = self.build_url(api_endpoint);
         debug!(%url, "sending streaming chat request");
 
         let response = self
@@ -184,5 +191,44 @@ impl LlmProvider for OpenAiProvider {
         response_builder
             .body(body)
             .map_err(|e| AppError::Internal(format!("failed to build stream response: {e}")))
+    }
+
+    #[instrument(skip(self, request), fields(provider = %self.name, model = %real_model))]
+    async fn chat_image(
+        &self,
+        request: &ImageGenerationRequest,
+        real_model: &str,
+    ) -> sag_core::Result<ImageGenerationResponse> {
+        let mut upstream = request.clone();
+        upstream.model = real_model.to_string();
+
+        let url = self.build_url("/v1/images/generations");
+        debug!(%url, "sending image generation request");
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&upstream)
+            .send()
+            .await
+            .map_err(AppError::from)?;
+
+        let status = response.status().as_u16();
+        let body_text = response.text().await.map_err(AppError::from)?;
+
+        if !(200..300).contains(&status) {
+            warn!(status, %body_text, "upstream image generation returned error");
+            return Err(AppError::Upstream {
+                provider: self.name.clone(),
+                status,
+                body: body_text,
+            });
+        }
+
+        serde_json::from_str(&body_text).map_err(|e| {
+            AppError::Internal(format!("failed to parse image generation response: {e}"))
+        })
     }
 }

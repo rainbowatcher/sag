@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::response::Response;
-use sag_core::types::{ChatCompletionRequest, ChatCompletionResponse};
+use sag_core::types::{ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse};
 
 /// Unified trait for LLM provider adapters.
 #[async_trait]
@@ -17,6 +17,7 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
+        api_endpoint: &str,
     ) -> sag_core::Result<ChatCompletionResponse>;
 
     /// Send a streaming chat completion request. Returns an Axum response
@@ -25,5 +26,13 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
+        api_endpoint: &str,
     ) -> sag_core::Result<Response<Body>>;
+
+    /// Send an image generation request. Returns image URLs or base64 data.
+    async fn chat_image(
+        &self,
+        request: &ImageGenerationRequest,
+        real_model: &str,
+    ) -> sag_core::Result<ImageGenerationResponse>;
 }

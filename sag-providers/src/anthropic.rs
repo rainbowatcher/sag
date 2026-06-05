@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::StreamExt;
 use reqwest::header::CONTENT_TYPE;
-use sag_core::{AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Usage};
+use sag_core::{AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ImageGenerationRequest, ImageGenerationResponse, Usage};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, instrument, warn};
 
@@ -223,6 +223,7 @@ impl LlmProvider for AnthropicProvider {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
+        _api_endpoint: &str,
     ) -> sag_core::Result<ChatCompletionResponse> {
         self.validate_params(request)?;
 
@@ -266,6 +267,7 @@ impl LlmProvider for AnthropicProvider {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
+        _api_endpoint: &str,
     ) -> sag_core::Result<Response<Body>> {
         self.validate_params(request)?;
 
@@ -317,5 +319,17 @@ impl LlmProvider for AnthropicProvider {
         response_builder
             .body(body)
             .map_err(|e| AppError::Internal(format!("failed to build stream response: {e}")))
+    }
+
+    #[instrument(skip(self), fields(provider = %self.name))]
+    async fn chat_image(
+        &self,
+        _request: &ImageGenerationRequest,
+        _real_model: &str,
+    ) -> sag_core::Result<ImageGenerationResponse> {
+        Err(AppError::BadRequest(format!(
+            "provider '{}' (anthropic) does not support image generation",
+            self.name
+        )))
     }
 }
