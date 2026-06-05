@@ -89,6 +89,20 @@ clean:
 clean-rust:
     cargo clean
 
+# ── 文档 ────────────────────────────────────────────────────────────
+
+# 构建文档网站
+docs:
+    mdbook build docs
+
+# 安装文档依赖
+docs-install:
+    cd scripts/mdbook-beautiful-mermaid && npm install
+
+# 启动文档开发服务器 (热重载)
+docs-serve:
+    mdbook serve docs --open
+
 # ── 审计 ────────────────────────────────────────────────────────────
 
 # cargo audit (需要先安装: cargo install cargo-audit)

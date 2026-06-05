@@ -1,0 +1,72 @@
+.mermaid {
+  display: flex;
+  justify-content: center;
+  margin: 1.5em 0;
+  --bg: var(--m-bg, #eceff4);
+  --fg: var(--m-fg, #2e3440);
+  --accent: var(--m-accent, #5e81ac);
+  --surface: var(--m-surface, #d8dee9);
+  --border: var(--m-border, #81a1c1);
+  --line: var(--m-line, #81a1c1);
+  --muted: var(--m-muted, #60728a);
+}
+
+.ayu .mermaid {
+  --m-bg: #0f1419;
+  --m-fg: #c5c5c5;
+  --m-accent: #ffb454;
+  --m-surface: #1e2329;
+  --m-border: #394956;
+  --m-line: #394956;
+  --m-muted: #7a8899;
+}
+
+.coal .mermaid {
+  --m-bg: #121618;
+  --m-fg: #98a3ad;
+  --m-accent: #3473ad;
+  --m-surface: #1e2326;
+  --m-border: #364247;
+  --m-line: #364247;
+  --m-muted: #6f7c86;
+}
+
+.light .mermaid {
+  --m-bg: #ffffff;
+  --m-fg: #000000;
+  --m-accent: #1f1fff;
+  --m-surface: #f0f0f0;
+  --m-border: #cccccc;
+  --m-line: #cccccc;
+  --m-muted: #666666;
+}
+
+.navy .mermaid {
+  --m-bg: #161923;
+  --m-fg: #bcbdd0;
+  --m-accent: #2b79a2;
+  --m-surface: #202533;
+  --m-border: #3a425a;
+  --m-line: #3a425a;
+  --m-muted: #7f85a0;
+}
+
+.rust .mermaid {
+  --m-bg: #fcf9f2;
+  --m-fg: #262625;
+  --m-accent: #e69f67;
+  --m-surface: #ede8db;
+  --m-border: #c4b9a5;
+  --m-line: #c4b9a5;
+  --m-muted: #8f8b84;
+}
+
+.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.mermaid-error pre {
+  color: #bf616a;
+  font-size: 0.85em;
+}
