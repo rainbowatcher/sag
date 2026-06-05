@@ -186,11 +186,12 @@ export const useApiStore = defineStore('api', () => {
         return true
       }
     } catch {
-      // fall through
+      gatewayOnline.value = false
+      return false
     } finally {
       validating.value = false
     }
-    disconnect()
+    gatewayOnline.value = false
     return false
   }
 
@@ -204,7 +205,11 @@ export const useApiStore = defineStore('api', () => {
   }
 
   function handle401() {
-    disconnect()
+    connection.value = null
+    validated.value = false
+    api.defaults.baseURL = ''
+    providers.value = []
+    routes.value = []
     if (_router) {
       _router.push('/connect?reason=expired')
     }

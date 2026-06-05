@@ -17,6 +17,7 @@ onMounted(() => {
   store.loadConnection()
   if (store.connection) {
     gatewayUrl.value = store.connection.gatewayUrl
+    apiKey.value = store.connection.apiKey
   }
   if (route.query.reason === 'expired') {
     error.value = 'Your session has expired. Please reconnect.'
