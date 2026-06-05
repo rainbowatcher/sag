@@ -1,5 +1,12 @@
 import { createRouter, createWebHistory } from 'vue-router';
+import { useApiStore } from '@/stores/api';
+
 const routes = [
+    {
+        path: '/connect',
+        name: 'connect',
+        component: () => import('@/pages/ConnectPage.vue'),
+    },
     {
         path: '/',
         component: () => import('@/components/AppLayout.vue'),
@@ -27,8 +34,31 @@ const routes = [
         ],
     },
 ];
+
 const router = createRouter({
     history: createWebHistory(),
     routes,
 });
+
+router.isReady().then(() => {
+    const store = useApiStore();
+    store.setRouter(router);
+});
+
+router.beforeEach(async (to) => {
+    if (to.path === '/connect') return true;
+
+    const store = useApiStore();
+
+    if (store.isConnected) return true;
+
+    const loaded = store.loadConnection();
+    if (!loaded) return '/connect';
+
+    const ok = await store.validateConnection();
+    if (!ok) return '/connect?reason=expired';
+
+    return true;
+});
+
 export default router;

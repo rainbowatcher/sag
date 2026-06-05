@@ -5,7 +5,7 @@ import { useApiStore } from '@/stores/api'
 import { cn } from '@/lib/utils'
 import {
   LayoutDashboard, Server, GitBranch, BarChart3,
-  Key, Wifi, WifiOff, Moon, Sun
+  Wifi, WifiOff, Moon, Sun, LogOut
 } from 'lucide-vue-next'
 
 const store = useApiStore()
@@ -16,6 +16,11 @@ const isDark = ref(false)
 function toggleDark() {
   isDark.value = !isDark.value
   document.documentElement.classList.toggle('dark', isDark.value)
+}
+
+function handleDisconnect() {
+  store.disconnect()
+  router.replace('/connect')
 }
 
 onMounted(() => {
@@ -65,25 +70,27 @@ const navItems: NavItem[] = [
         </button>
       </nav>
 
-      <div class="border-t px-5 py-3 space-y-3">
+      <!-- Connection status -->
+      <div class="border-t px-5 py-3 space-y-2.5">
         <div class="flex items-center justify-between text-xs text-muted-foreground">
           <div class="flex items-center gap-1.5">
             <component :is="store.gatewayOnline ? Wifi : WifiOff" class="h-3.5 w-3.5" :class="store.gatewayOnline ? 'text-green-500' : 'text-red-500'" />
-            {{ store.gatewayOnline ? 'Online' : 'Offline' }}
+            <span>{{ store.gatewayOnline ? 'Connected' : 'Offline' }}</span>
           </div>
           <button @click="toggleDark" class="hover:text-foreground transition-colors">
             <component :is="isDark ? Sun : Moon" class="h-3.5 w-3.5" />
           </button>
         </div>
-        <div class="flex items-center gap-2">
-          <Key class="h-3 w-3 text-muted-foreground shrink-0" />
-          <input
-            v-model="store.apiKey"
-            type="password"
-            placeholder="API Key..."
-            class="flex-1 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground/50"
-          />
-        </div>
+        <p v-if="store.gatewayUrl" class="text-[10px] text-muted-foreground truncate font-mono" :title="store.gatewayUrl">
+          {{ store.gatewayUrl }}
+        </p>
+        <button
+          @click="handleDisconnect"
+          class="flex items-center gap-1.5 w-full text-[11px] text-muted-foreground hover:text-destructive transition-colors"
+        >
+          <LogOut class="h-3 w-3" />
+          Disconnect
+        </button>
       </div>
     </aside>
 

@@ -35,14 +35,185 @@ export interface StatsRow {
   error_count: number
 }
 
+interface Connection {
+  gatewayUrl: string
+  apiKey: string
+  savedAt: number
+}
+
+const LS_KEY = 'sag-connection'
+const TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+
 export const useApiStore = defineStore('api', () => {
-  const apiKey = ref('')
+  // ═══════════════════════════════════════════════════════════════
+  // Connection state (persisted to localStorage)
+  // ═══════════════════════════════════════════════════════════════
+
+  const connection = ref<Connection | null>(null)
+  const validated = ref(false)
+  const connecting = ref(false)
+  const connectError = ref('')
+
+  const isConnected = computed(() => connection.value !== null && validated.value)
+  const gatewayUrl = computed(() => connection.value?.gatewayUrl ?? '')
 
   function headers() {
-    return apiKey.value ? { Authorization: `Bearer ${apiKey.value}` } : {}
+    return connection.value?.apiKey
+      ? { Authorization: `Bearer ${connection.value.apiKey}` }
+      : {}
   }
 
-  // ── Providers ──
+  function loadConnection(): boolean {
+    const raw = localStorage.getItem(LS_KEY)
+    if (!raw) return false
+
+    let conn: Connection
+    try {
+      conn = JSON.parse(raw) as Connection
+    } catch {
+      localStorage.removeItem(LS_KEY)
+      return false
+    }
+
+    if (Date.now() - conn.savedAt > TTL_MS) {
+      localStorage.removeItem(LS_KEY)
+      return false
+    }
+
+    connection.value = conn
+    api.defaults.baseURL = conn.gatewayUrl
+    return true
+  }
+
+  function saveConnection(url: string, key: string) {
+    const conn: Connection = { gatewayUrl: url, apiKey: key, savedAt: Date.now() }
+    localStorage.setItem(LS_KEY, JSON.stringify(conn))
+    connection.value = conn
+    api.defaults.baseURL = url
+  }
+
+  async function connect(url: string, key: string): Promise<string | null> {
+    connecting.value = true
+    connectError.value = ''
+
+    // Ensure URL has a protocol
+    let normalizedUrl = url
+    if (!/^https?:\/\//i.test(normalizedUrl)) {
+      normalizedUrl = 'http://' + normalizedUrl
+    }
+
+    try {
+      // Step 1: Health check (public endpoint)
+      const healthApi = axios.create({ baseURL: normalizedUrl })
+      let healthOk = false
+      try {
+        const { data } = await healthApi.get<{ status: string; version: string }>('/health', { timeout: 5000 })
+        healthOk = data.status === 'ok'
+        if (healthOk) {
+          gatewayVersion.value = data.version
+          gatewayOnline.value = true
+        }
+      } catch {
+        // continue — will be reported below
+      }
+
+      if (!healthOk) {
+        const msg = 'Cannot reach gateway. Check the URL and ensure the gateway is running.'
+        connectError.value = msg
+        return msg
+      }
+
+      // Step 2: Auth check — call /api/providers with the key
+      const authApi = axios.create({ baseURL: normalizedUrl })
+      let authOk = false
+      try {
+        const { data } = await authApi.get<{ providers: Provider[] }>('/api/providers', {
+          headers: { Authorization: `Bearer ${key}` },
+          timeout: 5000,
+        })
+        providers.value = data.providers
+        authOk = true
+      } catch (e: any) {
+        if (e.response?.status === 401) {
+          const msg = 'Invalid API key — please check and re-enter.'
+          connectError.value = msg
+          return msg
+        }
+        const msg = `Unexpected error: ${e.message}`
+        connectError.value = msg
+        return msg
+      }
+
+      if (!authOk) {
+        const msg = 'Auth check failed.'
+        connectError.value = msg
+        return msg
+      }
+
+      // Success
+      saveConnection(normalizedUrl, key)
+      validated.value = true
+      connectError.value = ''
+
+      // Preload routes (awaited to avoid race with dashboard render)
+      await fetchRoutes()
+
+      return null // null = success
+    } finally {
+      connecting.value = false
+    }
+  }
+
+  function disconnect() {
+    localStorage.removeItem(LS_KEY)
+    connection.value = null
+    validated.value = false
+    api.defaults.baseURL = ''
+    providers.value = []
+    routes.value = []
+  }
+
+  const validating = ref(false)
+
+  async function validateConnection(): Promise<boolean> {
+    validating.value = true
+    try {
+      const { data } = await api.get<{ status: string }>('/health', { timeout: 3000 })
+      if (data.status === 'ok') {
+        validated.value = true
+        gatewayOnline.value = true
+        gatewayVersion.value = (data as any).version ?? gatewayVersion.value
+        return true
+      }
+    } catch {
+      // fall through
+    } finally {
+      validating.value = false
+    }
+    disconnect()
+    return false
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 401 handler — redirect to connect screen
+  // ═══════════════════════════════════════════════════════════════
+
+  let _router: any = null
+  function setRouter(router: any) {
+    _router = router
+  }
+
+  function handle401() {
+    disconnect()
+    if (_router) {
+      _router.push('/connect?reason=expired')
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Providers
+  // ═══════════════════════════════════════════════════════════════
+
   const providers = ref<Provider[]>([])
   const providersLoading = ref(false)
 
@@ -51,6 +222,8 @@ export const useApiStore = defineStore('api', () => {
     try {
       const { data } = await api.get<{ providers: Provider[] }>('/api/providers', { headers: headers() })
       providers.value = data.providers
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
     } finally {
       providersLoading.value = false
     }
@@ -64,10 +237,18 @@ export const useApiStore = defineStore('api', () => {
     priority?: number
     supported_params?: string[]
   }) {
-    await api.post('/api/providers', payload, { headers: headers() })
+    try {
+      await api.post('/api/providers', payload, { headers: headers() })
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
+      throw e
+    }
   }
 
-  // ── Routes ──
+  // ═══════════════════════════════════════════════════════════════
+  // Routes
+  // ═══════════════════════════════════════════════════════════════
+
   const routes = ref<RouteConfig[]>([])
   const routesLoading = ref(false)
 
@@ -76,6 +257,8 @@ export const useApiStore = defineStore('api', () => {
     try {
       const { data } = await api.get<{ routes: RouteConfig[] }>('/api/routes', { headers: headers() })
       routes.value = data.routes
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
     } finally {
       routesLoading.value = false
     }
@@ -87,10 +270,18 @@ export const useApiStore = defineStore('api', () => {
     api_endpoint?: string
     priority?: number
   }) {
-    await api.post(`/api/providers/${providerName}/routes`, payload, { headers: headers() })
+    try {
+      await api.post(`/api/providers/${providerName}/routes`, payload, { headers: headers() })
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
+      throw e
+    }
   }
 
-  // ── Health ──
+  // ═══════════════════════════════════════════════════════════════
+  // Health
+  // ═══════════════════════════════════════════════════════════════
+
   const gatewayVersion = ref('')
   const gatewayOnline = ref(false)
 
@@ -104,7 +295,10 @@ export const useApiStore = defineStore('api', () => {
     }
   }
 
-  // ── Analytics ──
+  // ═══════════════════════════════════════════════════════════════
+  // Analytics
+  // ═══════════════════════════════════════════════════════════════
+
   const stats = ref<StatsRow[]>([])
   const statsLoading = ref(false)
 
@@ -121,7 +315,10 @@ export const useApiStore = defineStore('api', () => {
     }
   }
 
-  // ── Summary ──
+  // ═══════════════════════════════════════════════════════════════
+  // Summary
+  // ═══════════════════════════════════════════════════════════════
+
   const summary = computed(() => ({
     providerCount: providers.value.length,
     routeCount: routes.value.length,
@@ -130,11 +327,20 @@ export const useApiStore = defineStore('api', () => {
   }))
 
   return {
-    apiKey,
+    // Connection
+    connection, validated, connecting, validating, connectError,
+    isConnected, gatewayUrl,
+    loadConnection, connect, disconnect, validateConnection,
+    setRouter,
+    // Providers
     providers, providersLoading, fetchProviders, addProvider,
+    // Routes
     routes, routesLoading, fetchRoutes, addRoute,
+    // Health
     gatewayVersion, gatewayOnline, checkHealth,
+    // Analytics
     stats, statsLoading, fetchStats,
+    // Summary
     summary,
   }
 })
