@@ -64,6 +64,46 @@ pub struct ChatCompletionResponse {
     pub usage: Option<Usage>,
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Image Generation types (OpenAI Images API compatible)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Image generation request (OpenAI Images API format).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<String>,
+    /// Catch-all for provider-specific parameters.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A single generated image result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
+/// Image generation response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageGenerationResponse {
+    pub created: u64,
+    pub data: Vec<ImageData>,
+}
+
 /// An entry in the analytics call log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallLog {

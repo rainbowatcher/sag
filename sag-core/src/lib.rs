@@ -5,7 +5,7 @@ pub mod types;
 
 // Re-export key types at crate level for convenience
 pub use error::AppError;
-pub use types::{CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Usage};
+pub use types::{CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ImageData, ImageGenerationRequest, ImageGenerationResponse, Usage};
 
 /// Convenient alias for `Result<T, error::AppError>`.
 pub type Result<T> = std::result::Result<T, AppError>;
