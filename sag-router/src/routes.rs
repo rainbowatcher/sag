@@ -76,15 +76,10 @@ async fn chat_completions_handler(
                 let mut sorted = r.targets.clone();
                 sorted.sort_by_key(|t| std::cmp::Reverse(t.priority));
 
-                // Resolve passthrough
                 let resolved: Vec<(String, String, u32)> = sorted
                     .into_iter()
                     .map(|t| {
-                        let rm = if t.real_model == "<passthrough>" {
-                            request.model.clone()
-                        } else {
-                            t.real_model
-                        };
+                        let rm = t.real_model.unwrap_or_else(|| request.model.clone());
                         (t.provider, rm, t.priority)
                     })
                     .collect();

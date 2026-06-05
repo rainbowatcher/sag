@@ -127,7 +127,9 @@ pub struct RouteTarget {
     /// Provider name (must match a key in `providers`).
     pub provider: String,
     /// The real model name to send to this provider.
-    pub real_model: String,
+    /// If `None` (omitted), the original client-requested model name is used as-is.
+    #[serde(default)]
+    pub real_model: Option<String>,
     /// Priority within this route — higher = higher priority. Targets are
     /// sorted in descending order, so a target with priority `20` is tried
     /// before one with priority `10`. Defaults to `10`.
@@ -195,7 +197,7 @@ targets = [
         assert_eq!(route.model_name, "gpt-4o");
         assert_eq!(route.targets.len(), 1);
         assert_eq!(route.targets[0].provider, "openai");
-        assert_eq!(route.targets[0].real_model, "gpt-4o");
+        assert_eq!(route.targets[0].real_model.as_deref(), Some("gpt-4o"));
         assert_eq!(route.targets[0].priority, 10); // default
     }
 
@@ -287,7 +289,7 @@ targets = [
     }
 
     #[test]
-    fn parse_route_target_missing_real_model_fails() {
+    fn parse_route_target_missing_real_model_defaults_to_passthrough() {
         let toml_str = r#"
 [server]
 [providers]
@@ -299,6 +301,8 @@ targets = [
 ]
 "#;
         let result: Result<GatewayConfig, _> = toml::from_str(toml_str);
-        assert!(result.is_err(), "should fail: real_model is required");
+        assert!(result.is_ok(), "real_model should be optional");
+        let config = result.unwrap();
+        assert!(config.routes[0].targets[0].real_model.is_none());
     }
 }

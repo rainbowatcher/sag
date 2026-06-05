@@ -63,7 +63,9 @@ struct AddRouteRequest {
     /// The model name clients request (e.g. "gpt-4o").
     model_name: String,
     /// The real model name sent to the upstream provider.
-    real_model: String,
+    /// If `null` or omitted, the original client-requested model name is used as-is.
+    #[serde(default)]
+    real_model: Option<String>,
     /// Upstream API endpoint path (default: /v1/chat/completions).
     #[serde(default = "default_api_endpoint")]
     api_endpoint: String,
@@ -238,7 +240,7 @@ async fn add_route_for_provider(
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
-                    "error": { "code": "CONFLICT", "message": format!("route target '{}' already exists for model '{}'", req.real_model, req.model_name) }
+                    "error": { "code": "CONFLICT", "message": format!("route target '{}' already exists for model '{}'", req.real_model.as_deref().unwrap_or("(passthrough)"), req.model_name) }
                 })),
             )
                 .into_response();
@@ -262,7 +264,7 @@ async fn add_route_for_provider(
     info!(
         model = %req.model_name,
         provider = %provider_name,
-        real_model = %req.real_model,
+        real_model = req.real_model.as_deref().unwrap_or("(passthrough)"),
         "route added via admin API"
     );
 
@@ -477,7 +479,7 @@ mod tests {
                 api_endpoint: "/v1/chat/completions".into(),
                 targets: vec![RouteTarget {
                     provider: name.into(),
-                    real_model: real_model.into(),
+                    real_model: Some(real_model.into()),
                     priority: prio,
                 }],
             })
@@ -563,8 +565,8 @@ mod tests {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/v1/chat/completions".into(),
                 targets: vec![
-                    RouteTarget { provider: "openai".into(), real_model: "gpt-4o".into(), priority: 1 },
-                    RouteTarget { provider: "anthropic".into(), real_model: "claude-3-5-sonnet".into(), priority: 2 },
+                    RouteTarget { provider: "openai".into(), real_model: Some("gpt-4o".into()), priority: 1 },
+                    RouteTarget { provider: "anthropic".into(), real_model: Some("claude-3-5-sonnet".into()), priority: 2 },
                 ],
             },
             RouteConfig {
@@ -572,7 +574,7 @@ mod tests {
                 api_endpoint: "/v1/chat/completions".into(),
                 targets: vec![RouteTarget {
                     provider: "anthropic".into(),
-                    real_model: "claude-3-5-sonnet".into(),
+                    real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
                 }],
             },
@@ -783,7 +785,7 @@ mod auth_regression_tests {
                 api_endpoint: "/v1/chat/completions".into(),
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
-                    real_model: "gpt-4o".into(),
+                    real_model: Some("gpt-4o".into()),
                     priority: 1,
                 }],
             }],

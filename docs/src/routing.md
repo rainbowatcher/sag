@@ -53,7 +53,7 @@ priority = 10
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `provider` | string | 供应商名称，必须匹配 `[providers]` 中定义的名称 |
-| `real_model` | string | 实际发送给供应商的模型名。特殊值 `"<passthrough>"` 表示透传客户端的原始模型名 |
+| `real_model` | string (可选) | 实际发送给供应商的模型名。**省略此项**则透传客户端请求的原始模型名 |
 | `priority` | integer | 优先级，默认 `10`。**值越大优先级越高**，优先尝试 |
 
 ### `api_endpoint` 说明
@@ -112,7 +112,7 @@ priority = 50
 
 ### 2. 模型名透传
 
-客户端使用的模型名与供应商的模型名一致时，使用 `"<passthrough>"`：
+客户端使用的模型名与供应商的模型名一致时，省略 `real_model` 即可：
 
 ```toml
 [[routes]]
@@ -121,8 +121,7 @@ api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
-real_model = "<passthrough>"   # 实际发送 gpt-4o-mini
-priority = 100
+priority = 100                # real_model 省略，使用客户端原始模型名
 ```
 
 ### 3. 图片生成路由
@@ -151,8 +150,7 @@ api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
-real_model = "<passthrough>"
-priority = 10
+priority = 10                 # 透传客户端原始模型名
 ```
 
 精确匹配优先于通配符，所以 `"*"` 只在没有精确匹配时生效。
@@ -185,14 +183,13 @@ provider = "anthropic"
 real_model = "claude-sonnet-4-20250514"
 priority = 50
 
-# 轻量模型 — 透传模型名
+# 轻量模型 — 透传模型名（省略 real_model）
 [[routes]]
 model_name = "gpt-4o-mini"
 api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
-real_model = "<passthrough>"
 priority = 100
 
 # 图片生成
@@ -205,13 +202,12 @@ provider = "openai"
 real_model = "dall-e-3"
 priority = 100
 
-# 兜底路由
+# 兜底路由（透传原始模型名）
 [[routes]]
 model_name = "*"
 api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
-real_model = "<passthrough>"
 priority = 10
 ```
