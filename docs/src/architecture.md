@@ -41,7 +41,6 @@ sequenceDiagram
 5. 转发请求到上游 API，等待响应
 6. 响应转换回兼容 OpenAI 格式
 7. 调用记录异步写入 SQLite 用于分析
-
 ## 二进制入口点
 
 `sag-gateway` 子包负责启动编排：
