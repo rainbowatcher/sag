@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { cn } from '@/lib/utils'
+import { cn } from "@/lib/utils"
 
 interface Props {
   class?: string
@@ -9,7 +9,7 @@ interface Props {
 }
 
 const props = defineProps<Props>()
-const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
+const emit = defineEmits<{ "update:modelValue": [value: string] }>()
 </script>
 
 <template>

@@ -1,18 +1,18 @@
 <script setup lang="ts">
-import { cn } from '@/lib/utils'
+import { cn } from "@/lib/utils"
 
 interface Props {
-  variant?: 'default' | 'secondary' | 'destructive' | 'outline'
+  variant?: "default" | "secondary" | "destructive" | "outline"
   class?: string
 }
 
-const props = withDefaults(defineProps<Props>(), { variant: 'default' })
+const props = withDefaults(defineProps<Props>(), { variant: "default" })
 
 const variants: Record<string, string> = {
-  default: 'border-transparent bg-primary text-primary-foreground hover:bg-primary/80',
-  secondary: 'border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80',
-  destructive: 'border-transparent bg-destructive text-destructive-foreground hover:bg-destructive/80',
-  outline: 'text-foreground',
+  default: "border-transparent bg-primary text-primary-foreground hover:bg-primary/70",
+  secondary: "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
+  destructive: "border-transparent bg-destructive text-destructive-foreground hover:bg-destructive/80",
+  outline: "text-foreground",
 }
 </script>
 
