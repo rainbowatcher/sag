@@ -3,10 +3,12 @@
   "printWidth": 100,
   "tabWidth": 2,
   "useTabs": false,
-  "semi": true,
+  "semi": false,
   "singleQuote": false,
   "trailingComma": "all",
-  "sortImports": {},
+  "sortImports": {
+    "newlinesBetween": false
+  },
   "sortTailwindcss": {},
   "ignorePatterns": [
     "dist",
