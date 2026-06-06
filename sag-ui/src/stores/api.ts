@@ -293,9 +293,32 @@ export const useApiStore = defineStore('api', () => {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // Provider Models
+  // ═══════════════════════════════════════════════════════════════
+
+  const providerModels = ref<Record<string, string[]>>({})
+  const providerModelsLoading = ref(false)
+
+  async function fetchProviderModels(name: string) {
+    providerModelsLoading.value = true
+    try {
+      const { data } = await api.get<{ models: string[] }>(
+        `/api/providers/${encodeURIComponent(name)}/models`,
+        { headers: headers() },
+      )
+      providerModels.value[name] = data.models
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
+      providerModels.value[name] = []
+    } finally {
+      providerModelsLoading.value = false
+    }
+  }
+
   async function addRoute(providerName: string, payload: {
     model_name: string
-    real_model: string
+    real_model?: string
     api_endpoint?: string
     priority?: number
   }) {
@@ -363,6 +386,8 @@ export const useApiStore = defineStore('api', () => {
     setRouter,
     // Providers
     providers, providersLoading, fetchProviders, addProvider, deleteProvider, updateProvider,
+    // Provider Models
+    providerModels, providerModelsLoading, fetchProviderModels,
     // Routes
     routes, routesLoading, fetchRoutes, addRoute,
     // Health

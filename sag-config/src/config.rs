@@ -60,7 +60,7 @@ pub struct ProviderConfig {
     /// Provider-level priority — higher = higher priority, used for fallback
     /// ordering across providers. When a route target references this provider,
     /// targets are sorted in descending priority order so that higher-priority
-    /// providers are tried first. Defaults to `10`.
+    /// providers are tried first. Defaults to `0`.
     #[serde(default = "default_priority")]
     pub priority: u32,
     /// Maximum number of retries before giving up on this provider.
@@ -82,12 +82,11 @@ fn default_provider_type() -> String {
 fn default_base_url() -> String {
     "https://api.openai.com/v1".into()
 }
-/// Default priority value (`10`).
+/// Default priority value (`0`).
 ///
-/// When no priority is specified, targets default to `10`, which places them
-/// at a moderate priority level. Values range from `0` to `u32::MAX`.
+/// When no priority is specified, targets default to `0`.
 fn default_priority() -> u32 {
-    10
+    0
 }
 fn default_max_retries() -> u32 {
     2
@@ -132,7 +131,7 @@ pub struct RouteTarget {
     pub real_model: Option<String>,
     /// Priority within this route — higher = higher priority. Targets are
     /// sorted in descending order, so a target with priority `20` is tried
-    /// before one with priority `10`. Defaults to `10`.
+    /// before one with priority `0`. Defaults to `0`.
     #[serde(default = "default_priority")]
     pub priority: u32,
 }
@@ -186,7 +185,7 @@ targets = [
         let openai = config.providers.get("openai").unwrap();
         assert_eq!(openai.api_key, "sk-test");
         assert_eq!(openai.base_url, "https://api.openai.com/v1"); // default
-        assert_eq!(openai.priority, 10); // default
+        assert_eq!(openai.priority, 0); // default
         assert_eq!(openai.max_retries, 2); // default
         assert_eq!(openai.timeout_secs, 120); // default
         assert!(openai.supported_params.is_empty()); // default
@@ -198,7 +197,7 @@ targets = [
         assert_eq!(route.targets.len(), 1);
         assert_eq!(route.targets[0].provider, "openai");
         assert_eq!(route.targets[0].real_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(route.targets[0].priority, 10); // default
+        assert_eq!(route.targets[0].priority, 0); // default
     }
 
     #[test]

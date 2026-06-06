@@ -36,7 +36,7 @@ async function handleAdd() {
         : [],
     })
     showAdd.value = false
-    form.value = { name: '', api_key: '', provider_type: 'openai', base_url: 'https://api.openai.com/v1', priority: 10, supported_params: 'model,messages,temperature,max_tokens,stream' }
+    form.value = { name: '', api_key: '', provider_type: 'openai', base_url: 'https://api.openai.com/v1', priority: 0, supported_params: 'model,messages,temperature,max_tokens,stream' }
     await store.fetchProviders()
   } catch (e: any) {
     error.value = e.response?.data?.error?.message ?? e.message
@@ -89,7 +89,7 @@ const editForm = ref({
   api_key: '',
   provider_type: 'openai',
   base_url: '',
-  priority: 10,
+  priority: 0,
   max_retries: 2,
   timeout_secs: 120,
   supported_params: '',

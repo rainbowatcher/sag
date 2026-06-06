@@ -21,6 +21,10 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
             get(list_providers).post(add_provider).put(update_provider).delete(delete_provider),
         )
         .route(
+            "/providers/{name}/models",
+            get(list_provider_models),
+        )
+        .route(
             "/providers/{name}/routes",
             post(add_route_for_provider),
         )
@@ -53,7 +57,7 @@ struct AddProviderRequest {
 
 fn default_provider_type() -> String { "openai".into() }
 fn default_base_url() -> String { "https://api.openai.com/v1".into() }
-fn default_priority() -> u32 { 10 }
+fn default_priority() -> u32 { 0 }
 fn default_max_retries() -> u32 { 2 }
 fn default_timeout_secs() -> u64 { 120 }
 
@@ -312,6 +316,85 @@ async fn update_provider(
         })),
     )
         .into_response()
+}
+
+/// GET /api/providers/{name}/models — list models available from a provider.
+async fn list_provider_models(
+    State(state): State<AppState>,
+    Path(provider_name): Path<String>,
+) -> impl IntoResponse {
+    // Look up the provider config
+    let (api_key, base_url) = {
+        let config = state.config.read().await;
+        let pc = match config.providers.get(&provider_name) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": { "code": "NOT_FOUND", "message": format!("provider '{provider_name}' not found") }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        (pc.api_key.clone(), pc.base_url.clone())
+    };
+
+    // Build the models URL: strip trailing slash, append /models
+    let models_url = format!("{}/models", base_url.trim_end_matches('/'));
+
+    // Request models from the upstream provider
+    match reqwest::Client::new()
+        .get(&models_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                warn!(
+                    provider = %provider_name,
+                    status = %resp.status(),
+                    "upstream models endpoint returned error"
+                );
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "models": [] })),
+                )
+                    .into_response();
+            }
+
+            // Parse OpenAI-style response: { "data": [{ "id": "gpt-4o", ... }, ...] }
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    let models: Vec<String> = body["data"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| item["id"].as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    info!(
+                        provider = %provider_name,
+                        count = models.len(),
+                        "listed provider models"
+                    );
+                    (StatusCode::OK, Json(json!({ "models": models }))).into_response()
+                }
+                Err(e) => {
+                    warn!(?e, provider = %provider_name, "failed to parse models response");
+                    (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
+                }
+            }
+        }
+        Err(e) => {
+            warn!(?e, provider = %provider_name, "failed to reach models endpoint");
+            (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
+        }
+    }
 }
 
 /// POST /api/providers/{name}/routes — add a routing rule for an existing provider.
@@ -1029,6 +1112,7 @@ mod auth_regression_tests {
     fn protected_app(state: AppState) -> Router {
         let admin = Router::new()
             .route("/providers", get(list_providers).post(add_provider).put(update_provider).delete(delete_provider))
+            .route("/providers/{name}/models", get(list_provider_models))
             .route("/providers/{name}/routes", post(add_route_for_provider))
             .route("/routes", get(list_routes))
             .with_state(state.clone())
