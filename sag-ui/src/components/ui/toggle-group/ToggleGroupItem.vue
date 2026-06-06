@@ -1,20 +1,22 @@
 <script setup lang="ts">
+import { reactiveOmit } from "@vueuse/core"
 import type { VariantProps } from "class-variance-authority"
 import type { ToggleGroupItemProps } from "reka-ui"
-import type { HTMLAttributes } from "vue"
-import { reactiveOmit } from "@vueuse/core"
 import { ToggleGroupItem, useForwardProps } from "reka-ui"
+import type { HTMLAttributes } from "vue"
 import { inject } from "vue"
+import { toggleVariants } from "@/components/ui/toggle"
 import { cn } from "@/lib/utils"
-import { toggleVariants } from '@/components/ui/toggle'
 
 type ToggleGroupVariants = VariantProps<typeof toggleVariants>
 
-const props = defineProps<ToggleGroupItemProps & {
-  class?: HTMLAttributes["class"]
-  variant?: ToggleGroupVariants["variant"]
-  size?: ToggleGroupVariants["size"]
-}>()
+const props = defineProps<
+  ToggleGroupItemProps & {
+    class?: HTMLAttributes["class"]
+    variant?: ToggleGroupVariants["variant"]
+    size?: ToggleGroupVariants["size"]
+  }
+>()
 
 const context = inject<ToggleGroupVariants>("toggleGroup")
 
@@ -26,10 +28,16 @@ const forwardedProps = useForwardProps(delegatedProps)
 <template>
   <ToggleGroupItem
     v-slot="slotProps"
-    v-bind="forwardedProps" :class="cn(toggleVariants({
-      variant: context?.variant || variant,
-      size: context?.size || size,
-    }), props.class)"
+    v-bind="forwardedProps"
+    :class="
+      cn(
+        toggleVariants({
+          variant: context?.variant || variant,
+          size: context?.size || size,
+        }),
+        props.class,
+      )
+    "
   >
     <slot v-bind="slotProps" />
   </ToggleGroupItem>

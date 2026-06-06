@@ -1,17 +1,17 @@
 <script setup lang="ts">
-import { RouterView } from 'vue-router'
-import { useApiStore } from '@/stores/api'
-import { Loader2 } from 'lucide-vue-next'
+import { Loader2 } from "lucide-vue-next"
+import { RouterView } from "vue-router"
+import { useApiStore } from "@/stores/api"
 
 const store = useApiStore()
 </script>
 
 <template>
   <!-- Loading screen during auto-connect validation -->
-  <div v-if="store.validating" class="min-h-screen flex items-center justify-center bg-muted/30">
-    <div class="text-center space-y-3">
-      <Loader2 class="h-8 w-8 animate-spin text-primary mx-auto" />
-      <p class="text-sm text-muted-foreground">Connecting to gateway...</p>
+  <div v-if="store.validating" class="bg-muted/30 flex min-h-screen items-center justify-center">
+    <div class="space-y-3 text-center">
+      <Loader2 class="text-primary mx-auto h-8 w-8 animate-spin" />
+      <p class="text-muted-foreground text-sm">Connecting to gateway...</p>
     </div>
   </div>
 

@@ -1,36 +1,36 @@
-import { createRouter, createWebHistory } from 'vue-router'
-import type { RouteRecordRaw } from 'vue-router'
-import { useApiStore } from '@/stores/api'
+import { createRouter, createWebHistory } from "vue-router"
+import type { RouteRecordRaw } from "vue-router"
+import { useApiStore } from "@/stores/api"
 
 const routes: RouteRecordRaw[] = [
   {
-    path: '/connect',
-    name: 'connect',
-    component: () => import('@/pages/ConnectPage.vue'),
+    path: "/connect",
+    name: "connect",
+    component: () => import("@/pages/ConnectPage.vue"),
   },
   {
-    path: '/',
-    component: () => import('@/components/AppLayout.vue'),
+    path: "/",
+    component: () => import("@/components/AppLayout.vue"),
     children: [
       {
-        path: '',
-        name: 'dashboard',
-        component: () => import('@/pages/DashboardPage.vue'),
+        path: "",
+        name: "dashboard",
+        component: () => import("@/pages/DashboardPage.vue"),
       },
       {
-        path: 'providers',
-        name: 'providers',
-        component: () => import('@/pages/ProvidersPage.vue'),
+        path: "providers",
+        name: "providers",
+        component: () => import("@/pages/ProvidersPage.vue"),
       },
       {
-        path: 'routes',
-        name: 'routes',
-        component: () => import('@/pages/RoutesPage.vue'),
+        path: "routes",
+        name: "routes",
+        component: () => import("@/pages/RoutesPage.vue"),
       },
       {
-        path: 'analytics',
-        name: 'analytics',
-        component: () => import('@/pages/AnalyticsPage.vue'),
+        path: "analytics",
+        name: "analytics",
+        component: () => import("@/pages/AnalyticsPage.vue"),
       },
     ],
   },
@@ -50,7 +50,7 @@ router.isReady().then(() => {
 // Navigation guard: auto-connect or redirect to /connect
 router.beforeEach(async (to) => {
   // Allow access to /connect unconditionally
-  if (to.path === '/connect') return true
+  if (to.path === "/connect") return true
 
   const store = useApiStore()
 
@@ -59,11 +59,11 @@ router.beforeEach(async (to) => {
 
   // Try to load saved connection
   const loaded = store.loadConnection()
-  if (!loaded) return '/connect'
+  if (!loaded) return "/connect"
 
   // Validate saved connection silently
   const ok = await store.validateConnection()
-  if (!ok) return '/connect?reason=expired'
+  if (!ok) return "/connect?reason=expired"
 
   return true
 })

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
-import { useApiStore } from '@/stores/api'
-import { Server, GitBranch, MessageSquare, AlertTriangle } from 'lucide-vue-next'
+import { Server, GitBranch, MessageSquare, AlertTriangle } from "lucide-vue-next"
+import { onMounted } from "vue"
+import { useApiStore } from "@/stores/api"
 
 const store = useApiStore()
 
@@ -15,10 +15,30 @@ onMounted(async () => {
 })
 
 const cards = [
-  { label: 'Providers', value: () => store.summary.providerCount, icon: Server, color: 'text-blue-500' },
-  { label: 'Routes', value: () => store.summary.routeCount, icon: GitBranch, color: 'text-green-500' },
-  { label: 'Total Calls', value: () => store.summary.totalCalls, icon: MessageSquare, color: 'text-purple-500' },
-  { label: 'Errors', value: () => store.summary.totalErrors, icon: AlertTriangle, color: store.summary.totalErrors > 0 ? 'text-red-500' : 'text-muted-foreground' },
+  {
+    label: "Providers",
+    value: () => store.summary.providerCount,
+    icon: Server,
+    color: "text-blue-500",
+  },
+  {
+    label: "Routes",
+    value: () => store.summary.routeCount,
+    icon: GitBranch,
+    color: "text-green-500",
+  },
+  {
+    label: "Total Calls",
+    value: () => store.summary.totalCalls,
+    icon: MessageSquare,
+    color: "text-purple-500",
+  },
+  {
+    label: "Errors",
+    value: () => store.summary.totalErrors,
+    icon: AlertTriangle,
+    color: store.summary.totalErrors > 0 ? "text-red-500" : "text-muted-foreground",
+  },
 ]
 </script>
 
@@ -26,50 +46,64 @@ const cards = [
   <div class="space-y-6">
     <div>
       <h2 class="text-2xl font-bold tracking-tight">Dashboard</h2>
-      <p class="text-sm text-muted-foreground mt-1">SAG AI Gateway 运行概览</p>
+      <p class="text-muted-foreground mt-1 text-sm">SAG AI Gateway 运行概览</p>
     </div>
 
     <!-- Stat cards -->
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
-      <div v-for="card in cards" :key="card.label"
-        class="rounded-lg border bg-card p-4 flex items-center gap-4 hover:shadow-md transition-shadow">
-        <div class="h-10 w-10 rounded-lg bg-muted flex items-center justify-center">
+    <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div
+        v-for="card in cards"
+        :key="card.label"
+        class="bg-card flex items-center gap-4 rounded-lg border p-4 transition-shadow hover:shadow-md"
+      >
+        <div class="bg-muted flex h-10 w-10 items-center justify-center rounded-lg">
           <component :is="card.icon" class="h-5 w-5" :class="card.color" />
         </div>
         <div>
-          <p class="text-xs text-muted-foreground">{{ card.label }}</p>
+          <p class="text-muted-foreground text-xs">{{ card.label }}</p>
           <p class="text-xl font-bold">{{ card.value() }}</p>
         </div>
       </div>
     </div>
 
     <!-- Recent stats -->
-    <div class="rounded-lg border bg-card">
-      <div class="p-4 border-b">
+    <div class="bg-card rounded-lg border">
+      <div class="border-b p-4">
         <h3 class="font-semibold">Recent Statistics</h3>
       </div>
-      <div v-if="store.stats.length === 0" class="p-8 text-center text-muted-foreground text-sm">
+      <div v-if="store.stats.length === 0" class="text-muted-foreground p-8 text-center text-sm">
         No data available yet. Make some API calls to see statistics.
       </div>
       <table v-else class="w-full text-sm">
         <thead>
-          <tr class="border-b bg-muted/50">
-            <th class="text-left px-4 py-2.5 font-medium text-muted-foreground">Provider</th>
-            <th class="text-left px-4 py-2.5 font-medium text-muted-foreground">Model</th>
-            <th class="text-right px-4 py-2.5 font-medium text-muted-foreground">Calls</th>
-            <th class="text-right px-4 py-2.5 font-medium text-muted-foreground">Tokens</th>
-            <th class="text-right px-4 py-2.5 font-medium text-muted-foreground">Avg ms</th>
-            <th class="text-right px-4 py-2.5 font-medium text-muted-foreground">Errors</th>
+          <tr class="bg-muted/50 border-b">
+            <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Provider</th>
+            <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Model</th>
+            <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Calls</th>
+            <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Tokens</th>
+            <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Avg ms</th>
+            <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Errors</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(row, i) in store.stats" :key="i" class="border-b last:border-0 hover:bg-muted/30">
+          <tr
+            v-for="(row, i) in store.stats"
+            :key="i"
+            class="hover:bg-muted/30 border-b last:border-0"
+          >
             <td class="px-4 py-2.5">{{ row.provider }}</td>
             <td class="px-4 py-2.5 font-mono text-xs">{{ row.model }}</td>
             <td class="px-4 py-2.5 text-right tabular-nums">{{ row.call_count }}</td>
-            <td class="px-4 py-2.5 text-right tabular-nums">{{ row.total_tokens.toLocaleString() }}</td>
-            <td class="px-4 py-2.5 text-right tabular-nums">{{ row.avg_duration_ms.toFixed(0) }}</td>
-            <td class="px-4 py-2.5 text-right tabular-nums" :class="row.error_count > 0 ? 'text-red-500 font-medium' : ''">
+            <td class="px-4 py-2.5 text-right tabular-nums">
+              {{ row.total_tokens.toLocaleString() }}
+            </td>
+            <td class="px-4 py-2.5 text-right tabular-nums">
+              {{ row.avg_duration_ms.toFixed(0) }}
+            </td>
+            <td
+              class="px-4 py-2.5 text-right tabular-nums"
+              :class="row.error_count > 0 ? 'font-medium text-red-500' : ''"
+            >
               {{ row.error_count }}
             </td>
           </tr>
