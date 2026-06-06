@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { useStorage } from '@vueuse/core'
 import axios from 'axios'
 
 const api = axios.create({ baseURL: '' })
@@ -45,11 +46,7 @@ const LS_KEY = 'sag-connection'
 const TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 
 export const useApiStore = defineStore('api', () => {
-  // ═══════════════════════════════════════════════════════════════
-  // Connection state (persisted to localStorage)
-  // ═══════════════════════════════════════════════════════════════
-
-  const connection = ref<Connection | null>(null)
+  const connection = useStorage<Connection | null>(LS_KEY, null)
   const validated = ref(false)
   const connecting = ref(false)
   const connectError = ref('')
@@ -64,31 +61,19 @@ export const useApiStore = defineStore('api', () => {
   }
 
   function loadConnection(): boolean {
-    const raw = localStorage.getItem(LS_KEY)
-    if (!raw) return false
+    if (!connection.value) return false
 
-    let conn: Connection
-    try {
-      conn = JSON.parse(raw) as Connection
-    } catch {
-      localStorage.removeItem(LS_KEY)
+    if (Date.now() - connection.value.savedAt > TTL_MS) {
+      connection.value = null
       return false
     }
 
-    if (Date.now() - conn.savedAt > TTL_MS) {
-      localStorage.removeItem(LS_KEY)
-      return false
-    }
-
-    connection.value = conn
-    api.defaults.baseURL = conn.gatewayUrl
+    api.defaults.baseURL = connection.value.gatewayUrl
     return true
   }
 
   function saveConnection(url: string, key: string) {
-    const conn: Connection = { gatewayUrl: url, apiKey: key, savedAt: Date.now() }
-    localStorage.setItem(LS_KEY, JSON.stringify(conn))
-    connection.value = conn
+    connection.value = { gatewayUrl: url, apiKey: key, savedAt: Date.now() }
     api.defaults.baseURL = url
   }
 
@@ -165,7 +150,6 @@ export const useApiStore = defineStore('api', () => {
   }
 
   function disconnect() {
-    localStorage.removeItem(LS_KEY)
     connection.value = null
     validated.value = false
     api.defaults.baseURL = ''
