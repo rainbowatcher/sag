@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { useDark } from '@vueuse/core'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 import { useApiStore } from '@/stores/api'
 import { cn } from '@/lib/utils'
@@ -11,21 +11,16 @@ import {
 const store = useApiStore()
 const route = useRoute()
 const router = useRouter()
-const isDark = ref(false)
+const isDark = useDark()
 
 function toggleDark() {
   isDark.value = !isDark.value
-  document.documentElement.classList.toggle('dark', isDark.value)
 }
 
 function handleDisconnect() {
   store.disconnect()
   router.replace('/connect')
 }
-
-onMounted(() => {
-  store.checkHealth()
-})
 
 interface NavItem {
   label: string
@@ -43,7 +38,6 @@ const navItems: NavItem[] = [
 
 <template>
   <div class="flex h-screen bg-muted/30">
-    <!-- Sidebar -->
     <aside class="w-60 border-r bg-card flex flex-col">
       <div class="px-5 py-4 border-b flex items-center gap-2">
         <div class="h-7 w-7 rounded bg-primary flex items-center justify-center text-primary-foreground text-xs font-bold">S</div>
@@ -70,7 +64,6 @@ const navItems: NavItem[] = [
         </button>
       </nav>
 
-      <!-- Connection status -->
       <div class="border-t px-5 py-3 space-y-2.5">
         <div class="flex items-center justify-between text-xs text-muted-foreground">
           <div class="flex items-center gap-1.5">
@@ -94,7 +87,6 @@ const navItems: NavItem[] = [
       </div>
     </aside>
 
-    <!-- Main content -->
     <main class="flex-1 overflow-y-auto">
       <div class="max-w-6xl mx-auto p-6">
         <RouterView />
