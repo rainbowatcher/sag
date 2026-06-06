@@ -1,10 +1,9 @@
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json,
-    Router,
 };
 use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget};
 use serde_json::json;
@@ -18,16 +17,13 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route(
             "/providers",
-            get(list_providers).post(add_provider).put(update_provider).delete(delete_provider),
+            get(list_providers)
+                .post(add_provider)
+                .put(update_provider)
+                .delete(delete_provider),
         )
-        .route(
-            "/providers/{name}/models",
-            get(list_provider_models),
-        )
-        .route(
-            "/providers/{name}/routes",
-            post(add_route_for_provider),
-        )
+        .route("/providers/{name}/models", get(list_provider_models))
+        .route("/providers/{name}/routes", post(add_route_for_provider))
         .route("/routes", get(list_routes))
         .with_state(state)
 }
@@ -55,11 +51,21 @@ struct AddProviderRequest {
     supported_params: Vec<String>,
 }
 
-fn default_provider_type() -> String { "openai".into() }
-fn default_base_url() -> String { "https://api.openai.com/v1".into() }
-fn default_priority() -> u32 { 0 }
-fn default_max_retries() -> u32 { 2 }
-fn default_timeout_secs() -> u64 { 120 }
+fn default_provider_type() -> String {
+    "openai".into()
+}
+fn default_base_url() -> String {
+    "https://api.openai.com/v1".into()
+}
+fn default_priority() -> u32 {
+    0
+}
+fn default_max_retries() -> u32 {
+    2
+}
+fn default_timeout_secs() -> u64 {
+    120
+}
 
 #[derive(serde::Deserialize)]
 struct AddRouteRequest {
@@ -76,7 +82,9 @@ struct AddRouteRequest {
     priority: u32,
 }
 
-fn default_api_endpoint() -> String { "/v1/chat/completions".into() }
+fn default_api_endpoint() -> String {
+    "/v1/chat/completions".into()
+}
 
 #[derive(serde::Deserialize)]
 struct UpdateProviderRequest {
@@ -111,9 +119,7 @@ struct ProviderInfo {
 // ═══════════════════════════════════════════════════════════════════
 
 /// GET /api/providers — list all registered providers.
-async fn list_providers(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
     let providers: Vec<ProviderInfo> = config
         .providers
@@ -133,9 +139,7 @@ async fn list_providers(
 }
 
 /// GET /api/routes — list all routing rules.
-async fn list_routes(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
     (StatusCode::OK, Json(json!({ "routes": config.routes }))).into_response()
 }
@@ -182,7 +186,8 @@ async fn add_provider(
     };
 
     // 2. Build the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str() {
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str()
+    {
         "openai" => Arc::new(sag_providers::OpenAiProvider::new(
             req.name.clone(),
             &provider_config,
@@ -276,7 +281,8 @@ async fn update_provider(
     };
 
     // Rebuild the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str() {
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str()
+    {
         "openai" => Arc::new(sag_providers::OpenAiProvider::new(
             req.name.clone(),
             &provider_config,
@@ -358,11 +364,7 @@ async fn list_provider_models(
                     status = %resp.status(),
                     "upstream models endpoint returned error"
                 );
-                return (
-                    StatusCode::OK,
-                    Json(json!({ "models": [] })),
-                )
-                    .into_response();
+                return (StatusCode::OK, Json(json!({ "models": [] }))).into_response();
             }
 
             // Parse OpenAI-style response: { "data": [{ "id": "gpt-4o", ... }, ...] }
@@ -520,9 +522,7 @@ async fn delete_provider(
         let mut removed_targets: usize = 0;
         for route in config.routes.iter_mut() {
             let before = route.targets.len();
-            route
-                .targets
-                .retain(|t| t.provider != provider_name);
+            route.targets.retain(|t| t.provider != provider_name);
             let dropped = before - route.targets.len();
             if dropped > 0 {
                 removed_targets += dropped;
@@ -533,22 +533,15 @@ async fn delete_provider(
         // Drop routes that ended up with no targets at all — keeping an
         // empty `targets` list would just create a dead route that matches
         // a model but has no fallback, silently failing every request.
-        config
-            .routes
-            .retain(|r| !r.targets.is_empty());
+        config.routes.retain(|r| !r.targets.is_empty());
 
         // Remove the provider from the config map.
         config.providers.remove(&provider_name);
 
         // Persist to disk while we still hold the write lock.
         if state.config.is_file_backed() {
-            if let Err(e) =
-                sag_config::save_config_to_file(&config, state.config.path())
-            {
-                warn!(
-                    ?e,
-                    "failed to persist config after deleting provider"
-                );
+            if let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+                warn!(?e, "failed to persist config after deleting provider");
             }
         }
 
@@ -583,7 +576,6 @@ async fn delete_provider(
         .into_response()
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════
@@ -592,14 +584,14 @@ async fn delete_provider(
 mod tests {
     use super::*;
     use axum::{
+        Router,
         body::Body,
         http::{Request, StatusCode},
-        Router,
     };
     use sag_analytics::CallLogCollector;
     use sag_config::{
-        ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig,
-        RouteTarget, ServerConfig,
+        ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig, RouteTarget,
+        ServerConfig,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -628,8 +620,7 @@ mod tests {
         let handle = ConfigHandle::from_config(config);
 
         let cfg_read = handle.read().await;
-        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> =
-            HashMap::new();
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
         for (name, pc) in cfg_read.providers.iter() {
             let provider: Arc<dyn sag_providers::LlmProvider> =
                 Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
@@ -702,7 +693,9 @@ mod tests {
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["name"], "openai");
         assert_eq!(body["removed_targets"], 1);
@@ -732,10 +725,17 @@ mod tests {
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "NOT_FOUND");
-        assert!(body["error"]["message"].as_str().unwrap().contains("nonexistent"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nonexistent")
+        );
 
         let cfg = state.config.read().await;
         assert!(cfg.providers.contains_key("openai"));
@@ -749,7 +749,12 @@ mod tests {
             providers.insert(
                 name.to_string(),
                 ProviderConfig {
-                    provider_type: if name == "openai" { "openai" } else { "anthropic" }.into(),
+                    provider_type: if name == "openai" {
+                        "openai"
+                    } else {
+                        "anthropic"
+                    }
+                    .into(),
                     api_key: format!("sk-{name}"),
                     base_url: "https://example.com".into(),
                     priority: 10,
@@ -765,8 +770,16 @@ mod tests {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/v1/chat/completions".into(),
                 targets: vec![
-                    RouteTarget { provider: "openai".into(), real_model: Some("gpt-4o".into()), priority: 1 },
-                    RouteTarget { provider: "anthropic".into(), real_model: Some("claude-3-5-sonnet".into()), priority: 2 },
+                    RouteTarget {
+                        provider: "openai".into(),
+                        real_model: Some("gpt-4o".into()),
+                        priority: 1,
+                    },
+                    RouteTarget {
+                        provider: "anthropic".into(),
+                        real_model: Some("claude-3-5-sonnet".into()),
+                        priority: 2,
+                    },
                 ],
             },
             RouteConfig {
@@ -793,7 +806,9 @@ mod tests {
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["removed_targets"], 1);
         assert_eq!(body["cascaded_routes"], serde_json::json!(["gpt-4o"]));
@@ -802,11 +817,19 @@ mod tests {
         assert!(!cfg.providers.contains_key("openai"));
         assert!(cfg.providers.contains_key("anthropic"));
 
-        let gpt = cfg.routes.iter().find(|r| r.model_name == "gpt-4o").unwrap();
+        let gpt = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "gpt-4o")
+            .unwrap();
         assert_eq!(gpt.targets.len(), 1);
         assert_eq!(gpt.targets[0].provider, "anthropic");
 
-        let claude = cfg.routes.iter().find(|r| r.model_name == "claude-sonnet").unwrap();
+        let claude = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "claude-sonnet")
+            .unwrap();
         assert_eq!(claude.targets.len(), 1);
         assert_eq!(claude.targets[0].provider, "anthropic");
 
@@ -887,15 +910,23 @@ targets = [
             .split("\n\n")
             .find(|s| s.starts_with("[providers]") || s.trim_start().starts_with("providers."))
             .unwrap_or("");
-        assert!(!providers_block.contains("openai"),
-            "openai should not appear in [providers] block: {providers_block}");
-        assert!(providers_block.contains("anthropic"),
-            "anthropic should be preserved in [providers] block: {providers_block}");
+        assert!(
+            !providers_block.contains("openai"),
+            "openai should not appear in [providers] block: {providers_block}"
+        );
+        assert!(
+            providers_block.contains("anthropic"),
+            "anthropic should be preserved in [providers] block: {providers_block}"
+        );
 
-        assert!(!content.contains("real_model = \"gpt-4o\""),
-            "the openai→gpt-4o target should be removed: {content}");
-        assert!(content.contains("real_model = \"claude-3-5-sonnet\""),
-            "the anthropic→claude target should be preserved: {content}");
+        assert!(
+            !content.contains("real_model = \"gpt-4o\""),
+            "the openai→gpt-4o target should be removed: {content}"
+        );
+        assert!(
+            content.contains("real_model = \"claude-3-5-sonnet\""),
+            "the anthropic→claude target should be preserved: {content}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -915,7 +946,9 @@ targets = [
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let arr = body["providers"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -963,7 +996,9 @@ targets = [
             .method("PUT")
             .uri("/api/providers")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"nonexistent","base_url":"https://x.com"}"#))
+            .body(Body::from(
+                r#"{"name":"nonexistent","base_url":"https://x.com"}"#,
+            ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1024,7 +1059,6 @@ targets = [
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
 // Auth-regression tests — verify the auth middleware doesn't deadlock
 // write-locking handlers.
@@ -1042,15 +1076,15 @@ targets = [
 mod auth_regression_tests {
     use super::*;
     use axum::{
+        Router,
         body::Body,
         http::{Request, StatusCode},
         middleware,
-        Router,
     };
     use sag_analytics::CallLogCollector;
     use sag_config::{
-        ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig,
-        RouteTarget, ServerConfig,
+        ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig, RouteTarget,
+        ServerConfig,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1093,8 +1127,7 @@ mod auth_regression_tests {
             }],
         };
         let handle = ConfigHandle::from_config(config);
-        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> =
-            HashMap::new();
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
         let cfg_read = handle.read().await;
         for (name, pc) in cfg_read.providers.iter() {
             let provider: Arc<dyn sag_providers::LlmProvider> =
@@ -1111,7 +1144,13 @@ mod auth_regression_tests {
 
     fn protected_app(state: AppState) -> Router {
         let admin = Router::new()
-            .route("/providers", get(list_providers).post(add_provider).put(update_provider).delete(delete_provider))
+            .route(
+                "/providers",
+                get(list_providers)
+                    .post(add_provider)
+                    .put(update_provider)
+                    .delete(delete_provider),
+            )
             .route("/providers/{name}/models", get(list_provider_models))
             .route("/providers/{name}/routes", post(add_route_for_provider))
             .route("/routes", get(list_routes))

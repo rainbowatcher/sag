@@ -1,9 +1,9 @@
 use axum::{
+    Json,
     extract::{Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde_json::json;
 use tracing::warn;
@@ -12,11 +12,7 @@ use crate::state::AppState;
 
 /// Axum middleware: validates the `Authorization: Bearer <api_key>` header
 /// against the configured gateway API keys.
-pub async fn gateway_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn gateway_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let auth_header = request
         .headers()
         .get("Authorization")
@@ -59,10 +55,13 @@ pub async fn gateway_auth(
 
     if !key_valid {
         warn!("invalid gateway API key");
-        return (StatusCode::UNAUTHORIZED, Json(json!({
-            "error": { "code": "UNAUTHORIZED", "message": "invalid API key" }
-        })))
-        .into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": { "code": "UNAUTHORIZED", "message": "invalid API key" }
+            })),
+        )
+            .into_response();
     }
 
     next.run(request).await
@@ -72,17 +71,17 @@ pub async fn gateway_auth(
 mod tests {
     use super::*;
     use axum::{
+        Router,
         body::Body,
-        http::{header, Request, StatusCode},
+        http::{Request, StatusCode, header},
         middleware,
         routing::get,
-        Router,
     };
     use sag_config::ConfigHandle;
-    use tower::ServiceExt;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+    use tower::ServiceExt;
 
     /// Helper: build an AppState for the test with optional auth keys.
     async fn test_state(auth_keys: Option<Vec<String>>) -> AppState {
@@ -92,9 +91,7 @@ mod tests {
                 port: 3000,
             },
             analytics: None,
-            gateway_auth: auth_keys.map(|keys| sag_config::GatewayAuthConfig {
-                api_keys: keys,
-            }),
+            gateway_auth: auth_keys.map(|keys| sag_config::GatewayAuthConfig { api_keys: keys }),
             providers: HashMap::new(),
             routes: vec![],
         };
@@ -121,10 +118,7 @@ mod tests {
         let state = test_state(Some(vec!["secret".into()])).await;
         let app = test_app(state);
 
-        let request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -198,10 +192,7 @@ mod tests {
         let state = test_state(None).await;
         let app = test_app(state);
 
-        let request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -228,10 +219,7 @@ mod tests {
         let state = test_state(Some(vec![])).await;
         let app = test_app(state);
 
-        let request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
