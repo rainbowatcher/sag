@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{get, post},
     Json,
     Router,
 };
@@ -16,10 +16,9 @@ use crate::state::AppState;
 /// Build admin routes under `/api/*` (all auth-protected by the parent).
 pub fn build_admin_routes(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/providers", get(list_providers).post(add_provider))
         .route(
-            "/providers/{name}",
-            delete(delete_provider),
+            "/providers",
+            get(list_providers).post(add_provider).put(update_provider).delete(delete_provider),
         )
         .route(
             "/providers/{name}/routes",
@@ -74,6 +73,23 @@ struct AddRouteRequest {
 }
 
 fn default_api_endpoint() -> String { "/v1/chat/completions".into() }
+
+#[derive(serde::Deserialize)]
+struct UpdateProviderRequest {
+    name: String,
+    api_key: Option<String>,
+    provider_type: Option<String>,
+    base_url: Option<String>,
+    priority: Option<u32>,
+    max_retries: Option<u32>,
+    timeout_secs: Option<u64>,
+    supported_params: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteProviderRequest {
+    name: String,
+}
 
 #[derive(serde::Serialize)]
 struct ProviderInfo {
@@ -200,6 +216,104 @@ async fn add_provider(
         .into_response()
 }
 
+/// PUT /api/providers — update an existing provider's configuration.
+async fn update_provider(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateProviderRequest>,
+) -> impl IntoResponse {
+    let provider_config = {
+        let mut config = state.config.write().await;
+
+        let existing = match config.providers.get_mut(&req.name) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": { "code": "NOT_FOUND", "message": format!("provider '{}' not found", req.name) }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        if let Some(v) = req.api_key {
+            existing.api_key = v;
+        }
+        if let Some(v) = req.provider_type {
+            existing.provider_type = v;
+        }
+        if let Some(v) = req.base_url {
+            existing.base_url = v;
+        }
+        if let Some(v) = req.priority {
+            existing.priority = v;
+        }
+        if let Some(v) = req.max_retries {
+            existing.max_retries = v;
+        }
+        if let Some(v) = req.timeout_secs {
+            existing.timeout_secs = v;
+        }
+        if let Some(v) = req.supported_params {
+            existing.supported_params = v;
+        }
+
+        let pc = existing.clone();
+
+        // Persist to disk while holding the write lock
+        if state.config.is_file_backed() {
+            if let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+                warn!(?e, "failed to persist config after updating provider");
+            }
+        }
+
+        pc
+    };
+
+    // Rebuild the provider adapter and register it
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str() {
+        "openai" => Arc::new(sag_providers::OpenAiProvider::new(
+            req.name.clone(),
+            &provider_config,
+        )),
+        "anthropic" => Arc::new(sag_providers::AnthropicProvider::new(
+            req.name.clone(),
+            &provider_config,
+        )),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": { "code": "BAD_REQUEST", "message": format!("unknown provider_type: '{other}'. supported: openai, anthropic") }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    {
+        let mut providers = state.providers.write().await;
+        providers.insert(req.name.clone(), provider);
+    }
+
+    info!(name = %req.name, provider_type = %provider_config.provider_type, "provider updated via admin API");
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": req.name,
+            "provider_type": provider_config.provider_type,
+            "base_url": provider_config.base_url,
+            "priority": provider_config.priority,
+            "max_retries": provider_config.max_retries,
+            "timeout_secs": provider_config.timeout_secs,
+            "supported_params": provider_config.supported_params,
+        })),
+    )
+        .into_response()
+}
+
 /// POST /api/providers/{name}/routes — add a routing rule for an existing provider.
 async fn add_route_for_provider(
     State(state): State<AppState>,
@@ -295,8 +409,9 @@ async fn add_route_for_provider(
 ///    to a deleted adapter).
 async fn delete_provider(
     State(state): State<AppState>,
-    Path(provider_name): Path<String>,
+    Json(req): Json<DeleteProviderRequest>,
 ) -> impl IntoResponse {
+    let provider_name = req.name;
     // ── Stage 1: update config + persist ─────────────────────────────
     // Collect (model_name, removed_target_count) for every route that lost
     // at least one target, so we can report it back to the caller.
@@ -497,8 +612,9 @@ mod tests {
 
         let req = Request::builder()
             .method("DELETE")
-            .uri("/api/providers/openai")
-            .body(Body::empty())
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"openai"}"#))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -526,8 +642,9 @@ mod tests {
 
         let req = Request::builder()
             .method("DELETE")
-            .uri("/api/providers/nonexistent")
-            .body(Body::empty())
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"nonexistent"}"#))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -586,8 +703,9 @@ mod tests {
 
         let req = Request::builder()
             .method("DELETE")
-            .uri("/api/providers/openai")
-            .body(Body::empty())
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"openai"}"#))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -671,8 +789,9 @@ targets = [
 
         let req = Request::builder()
             .method("DELETE")
-            .uri("/api/providers/openai")
-            .body(Body::empty())
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"openai"}"#))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -719,6 +838,107 @@ targets = [
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], "openai");
     }
+
+    // 6. Update provider — happy path
+    #[tokio::test]
+    async fn update_provider_success() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"openai","base_url":"https://custom.com/v1","priority":5,"max_retries":3}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let p = cfg.providers.get("openai").unwrap();
+        assert_eq!(p.base_url, "https://custom.com/v1");
+        assert_eq!(p.priority, 5);
+        assert_eq!(p.max_retries, 3);
+        // Fields not in the update should keep their original values
+        assert_eq!(p.api_key, "sk-test");
+        assert_eq!(p.provider_type, "openai");
+    }
+
+    // 7. Update provider — 404
+    #[tokio::test]
+    async fn update_provider_not_found() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"nonexistent","base_url":"https://x.com"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // 8. Update provider — update api_key and provider_type
+    #[tokio::test]
+    async fn update_provider_key_and_type() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"openai","api_key":"sk-updated","provider_type":"anthropic","base_url":"https://api.anthropic.com"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let p = cfg.providers.get("openai").unwrap();
+        assert_eq!(p.api_key, "sk-updated");
+        assert_eq!(p.provider_type, "anthropic");
+        assert_eq!(p.base_url, "https://api.anthropic.com");
+
+        // Ensure the runtime registry was updated
+        let reg = state.providers.read().await;
+        assert!(reg.contains_key("openai"));
+    }
+
+    // 9. Update provider — supported_params
+    #[tokio::test]
+    async fn update_provider_supported_params() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"openai","supported_params":["model","messages","stream"]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let p = cfg.providers.get("openai").unwrap();
+        assert_eq!(p.supported_params, vec!["model", "messages", "stream"]);
+    }
 }
 
 
@@ -742,7 +962,6 @@ mod auth_regression_tests {
         body::Body,
         http::{Request, StatusCode},
         middleware,
-        routing::delete as axum_delete,
         Router,
     };
     use sag_analytics::CallLogCollector;
@@ -809,8 +1028,7 @@ mod auth_regression_tests {
 
     fn protected_app(state: AppState) -> Router {
         let admin = Router::new()
-            .route("/providers", get(list_providers).post(add_provider))
-            .route("/providers/{name}", axum_delete(delete_provider))
+            .route("/providers", get(list_providers).post(add_provider).put(update_provider).delete(delete_provider))
             .route("/providers/{name}/routes", post(add_route_for_provider))
             .route("/routes", get(list_routes))
             .with_state(state.clone())
@@ -847,9 +1065,10 @@ mod auth_regression_tests {
             app.oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/api/providers/openai")
+                    .uri("/api/providers")
                     .header("Authorization", "Bearer regression-key")
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"openai"}"#))
                     .unwrap(),
             )
             .await
@@ -916,6 +1135,29 @@ mod auth_regression_tests {
                     .uri("/api/providers")
                     .header("Authorization", "Bearer regression-key")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_regression_update_provider_completes_through_auth_middleware() {
+        let state = build_protected_state().await;
+        let app = protected_app(state);
+        let resp = bounded("PUT", async {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/providers")
+                    .header("Authorization", "Bearer regression-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"openai","base_url":"https://updated.com/v1"}"#,
+                    ))
                     .unwrap(),
             )
             .await

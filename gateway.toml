@@ -9,17 +9,10 @@ storage_dsn = "analytics.db"
 [gateway_auth]
 api_keys = ["sag-test-key"]
 
-[providers.openai]
-provider_type = "openai"
-api_key = "sk-fake-test-key"
-base_url = "https://api.openai.com/v1"
-priority = 10
-max_retries = 1
-timeout_secs = 30
-supported_params = ["model", "messages", "temperature", "top_p", "stream", "max_tokens"]
+[providers]
+openai = { provider_type = "openai", api_key = "sk-fake-test-key", base_url = "https://api.openai.com/v1", priority = 0, max_retries = 1, timeout_secs = 30, supported_params = ["model", "messages", "temperature", "top_p", "stream", "max_tokens"] }
 
 [[routes]]
 model_name = "gpt-4o"
-targets = [
-    { provider = "openai", real_model = "gpt-4o", priority = 10 },
-]
+api_endpoint = "/v1/chat/completions"
+targets = [{ provider = "openai", real_model = "gpt-4o", priority = 10 }]

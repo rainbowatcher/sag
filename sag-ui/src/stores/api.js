@@ -132,12 +132,13 @@ export const useApiStore = defineStore('api', () => {
             }
         }
         catch {
-            // fall through
+            gatewayOnline.value = false;
+            return false;
         }
         finally {
             validating.value = false;
         }
-        disconnect();
+        gatewayOnline.value = false;
         return false;
     }
     // ═══════════════════════════════════════════════════════════════
@@ -148,7 +149,11 @@ export const useApiStore = defineStore('api', () => {
         _router = router;
     }
     function handle401() {
-        disconnect();
+        connection.value = null;
+        validated.value = false;
+        api.defaults.baseURL = '';
+        providers.value = [];
+        routes.value = [];
         if (_router) {
             _router.push('/connect?reason=expired');
         }
@@ -192,12 +197,23 @@ export const useApiStore = defineStore('api', () => {
      */
     async function deleteProvider(name) {
         try {
-            await api.delete(`/api/providers/${encodeURIComponent(name)}`, {
+            await api.delete('/api/providers', {
                 headers: headers(),
+                data: { name },
             });
             // The server cascaded the deletion; refresh both lists so the UI
             // shows the updated routes (some may have been dropped entirely).
             await Promise.all([fetchProviders(), fetchRoutes()]);
+        }
+        catch (e) {
+            if (e.response?.status === 401)
+                handle401();
+            throw e;
+        }
+    }
+    async function updateProvider(name, payload) {
+        try {
+            await api.put('/api/providers', { name, ...payload }, { headers: headers() });
         }
         catch (e) {
             if (e.response?.status === 401)
@@ -285,7 +301,7 @@ export const useApiStore = defineStore('api', () => {
         loadConnection, connect, disconnect, validateConnection,
         setRouter,
         // Providers
-        providers, providersLoading, fetchProviders, addProvider, deleteProvider,
+        providers, providersLoading, fetchProviders, addProvider, deleteProvider, updateProvider,
         // Routes
         routes, routesLoading, fetchRoutes, addRoute,
         // Health

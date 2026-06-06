@@ -260,12 +260,30 @@ export const useApiStore = defineStore('api', () => {
    */
   async function deleteProvider(name: string): Promise<void> {
     try {
-      await api.delete(`/api/providers/${encodeURIComponent(name)}`, {
+      await api.delete('/api/providers', {
         headers: headers(),
+        data: { name },
       })
       // The server cascaded the deletion; refresh both lists so the UI
       // shows the updated routes (some may have been dropped entirely).
       await Promise.all([fetchProviders(), fetchRoutes()])
+    } catch (e: any) {
+      if (e.response?.status === 401) handle401()
+      throw e
+    }
+  }
+
+  async function updateProvider(name: string, payload: {
+    api_key?: string
+    provider_type?: string
+    base_url?: string
+    priority?: number
+    max_retries?: number
+    timeout_secs?: number
+    supported_params?: string[]
+  }) {
+    try {
+      await api.put('/api/providers', { name, ...payload }, { headers: headers() })
     } catch (e: any) {
       if (e.response?.status === 401) handle401()
       throw e
@@ -360,7 +378,7 @@ export const useApiStore = defineStore('api', () => {
     loadConnection, connect, disconnect, validateConnection,
     setRouter,
     // Providers
-    providers, providersLoading, fetchProviders, addProvider, deleteProvider,
+    providers, providersLoading, fetchProviders, addProvider, deleteProvider, updateProvider,
     // Routes
     routes, routesLoading, fetchRoutes, addRoute,
     // Health
