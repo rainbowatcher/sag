@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { useStorage } from '@vueuse/core'
+import { useLocalStorage, StorageSerializers } from '@vueuse/core'
 import axios from 'axios'
 
 const api = axios.create({ baseURL: '' })
@@ -46,7 +46,9 @@ const LS_KEY = 'sag-connection'
 const TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 
 export const useApiStore = defineStore('api', () => {
-  const connection = useStorage<Connection | null>(LS_KEY, null)
+  const connection = useLocalStorage<Connection | null>(LS_KEY, null, {
+    serializer: StorageSerializers.object,
+  })
   const validated = ref(false)
   const connecting = ref(false)
   const connectError = ref('')
@@ -61,7 +63,10 @@ export const useApiStore = defineStore('api', () => {
   }
 
   function loadConnection(): boolean {
-    if (!connection.value) return false
+    if (!connection.value) {
+      localStorage.removeItem(LS_KEY)
+      return false
+    }
 
     if (Date.now() - connection.value.savedAt > TTL_MS) {
       connection.value = null
