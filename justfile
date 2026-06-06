@@ -20,11 +20,11 @@ build-debug:
 
 # 构建前端 (Vue + Vite)
 ui-build:
-    cd sag-ui && npm run build
+    pnpm -C sag-ui run build
 
 # 安装前端依赖
 ui-install:
-    cd sag-ui && npm install
+    pnpm -C sag-ui install
 
 # ── 测试 ────────────────────────────────────────────────────────────
 
@@ -48,11 +48,11 @@ run-release config=config:
 
 # 启动前端开发服务器
 ui-dev:
-    cd sag-ui && npm run dev
+    cd sag-ui && pnpm -C sag-ui run dev
 
 # 预览前端构建产物
 ui-preview:
-    cd sag-ui && npm run preview
+    cd sag-ui && pnpm -C sag-ui run preview
 
 # ── 开发环境 ────────────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ fmt:
 
 # 运行 oxfmt 格式化
 ui-fmt:
-    pnpm -C sag-ui format
+    pnpm -C sag-ui run format
 
 # 运行 clippy 检查
 clippy:
@@ -76,7 +76,7 @@ clippy:
 
 # 运行前端 oxlint
 ui-lint:
-    cd sag-ui && npm run lint
+    pnpm -C sag-ui run lint
 
 # 运行所有 lint (Rust + 前端)
 lint: clippy ui-lint
@@ -101,7 +101,7 @@ docs:
 
 # 安装文档依赖
 docs-install:
-    cd scripts/mdbook-beautiful-mermaid && npm install
+    cd scripts/mdbook-beautiful-mermaid && pnpm install
 
 # 启动文档开发服务器 (热重载)
 docs-serve:
