@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 100,
+  "tabWidth": 2,
+  "useTabs": false,
+  "semi": false,
+  "singleQuote": false,
+  "trailingComma": "all",
+  "sortImports": {
+    "newlinesBetween": false
+  },
+  "sortTailwindcss": true,
+  "ignorePatterns": ["dist", "node_modules", "pnpm-lock.yaml", "**/*.tsbuildinfo"],
+  "overrides": [
+    {
+      "files": ["*.css"],
+      "options": { "tabWidth": 4 }
+    }
+  ]
+}

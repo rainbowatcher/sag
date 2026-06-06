@@ -66,6 +66,10 @@ dev config=config:
 fmt:
     cargo fmt --all
 
+# 运行 oxfmt 格式化
+ui-fmt:
+    pnpm -C sag-ui format
+
 # 运行 clippy 检查
 clippy:
     cargo clippy --all-targets -- -D warnings
