@@ -1,6 +1,6 @@
 {
-  "$schema": "https://raw.githubusercontent.com/unovue/shadcn-vue/main/apps/www/public/schema.json",
-  "style": "default",
+  "$schema": "https://shadcn-vue.com/schema.json",
+  "style": "new-york",
   "typescript": true,
   "tailwind": {
     "config": "tailwind.config.js",
@@ -10,6 +10,9 @@
   },
   "aliases": {
     "components": "@/components",
-    "utils": "@/lib/utils"
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "composables": "@/composables"
   }
 }
