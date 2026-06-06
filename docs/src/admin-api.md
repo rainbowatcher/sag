@@ -62,10 +62,30 @@ Content-Type: application/json
 }
 ```
 
+### 更新供应商
+
+```
+PUT /api/providers
+Content-Type: application/json
+
+{
+  "name": "my-provider",
+  "base_url": "https://custom.com/v1",
+  "priority": 5
+}
+```
+
+只更新请求体中传入的字段，未传入的字段保持原值。
+
 ### 删除供应商
 
 ```
-DELETE /api/providers/{name}
+DELETE /api/providers
+Content-Type: application/json
+
+{
+  "name": "my-provider"
+}
 ```
 
 删除供应商及其关联的路由目标。
