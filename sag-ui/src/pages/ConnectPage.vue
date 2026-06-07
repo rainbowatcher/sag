@@ -2,9 +2,9 @@
 import { Loader2, Plug, Server, Key, AlertCircle } from "lucide-vue-next"
 import { ref, onMounted } from "vue"
 import { useRoute, useRouter } from "vue-router"
-import { useApiStore } from "@/stores/api"
+import { useConnectionStore } from "@/stores/connection"
 
-const store = useApiStore()
+const store = useConnectionStore()
 const route = useRoute()
 const router = useRouter()
 

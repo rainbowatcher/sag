@@ -75,8 +75,8 @@ clippy:
     cargo clippy --all-targets -- -D warnings
 
 # 运行前端 oxlint
-ui-lint:
-    pnpm -C sag-ui run lint
+ui-lint *args:
+    pnpm -C sag-ui run lint {{ args }}
 
 # 运行所有 lint (Rust + 前端)
 lint: clippy ui-lint

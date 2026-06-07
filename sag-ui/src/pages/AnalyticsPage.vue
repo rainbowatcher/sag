@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { Search, RefreshCw, Loader2, TrendingUp, Zap, Clock } from "lucide-vue-next"
 import { ref, onMounted, computed } from "vue"
-import { useApiStore } from "@/stores/api"
+import { useAnalyticsStore } from "@/stores/analytics"
 
-const store = useApiStore()
+const store = useAnalyticsStore()
 const filterProvider = ref("")
 const filterModel = ref("")
 

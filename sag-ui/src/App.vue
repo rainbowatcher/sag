@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { Loader2 } from "lucide-vue-next"
 import { RouterView } from "vue-router"
-import { useApiStore } from "@/stores/api"
+import { useConnectionStore } from "@/stores/connection"
 
-const store = useApiStore()
+const store = useConnectionStore()
 </script>
 
 <template>

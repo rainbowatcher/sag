@@ -10,9 +10,10 @@ import {
   AlertTriangle,
 } from "lucide-vue-next"
 import { ref, onMounted } from "vue"
-import { useApiStore, type Provider } from "@/stores/api"
+import { useProviderStore } from "@/stores/providers"
+import type { Provider } from "@/types/api"
 
-const store = useApiStore()
+const store = useProviderStore()
 const showAdd = ref(false)
 const adding = ref(false)
 const error = ref("")

@@ -13,9 +13,11 @@ import {
 } from "lucide-vue-next"
 import { RouterView, useRoute, useRouter } from "vue-router"
 import { cn } from "@/lib/utils"
-import { useApiStore } from "@/stores/api"
+import { useConnectionStore } from "@/stores/connection"
+import { useHealthStore } from "@/stores/health"
 
-const store = useApiStore()
+const store = useConnectionStore()
+const health = useHealthStore()
 const route = useRoute()
 const router = useRouter()
 const isDark = useDark()
@@ -54,7 +56,7 @@ const navItems: NavItem[] = [
         </div>
         <div>
           <h1 class="text-sm font-semibold">SAG Gateway</h1>
-          <p class="text-muted-foreground text-[10px]">v{{ store.gatewayVersion || "-" }}</p>
+          <p class="text-muted-foreground text-[10px]">v{{ health.gatewayVersion || "-" }}</p>
         </div>
       </div>
 
@@ -81,11 +83,11 @@ const navItems: NavItem[] = [
         <div class="text-muted-foreground flex items-center justify-between text-xs">
           <div class="flex items-center gap-1.5">
             <component
-              :is="store.gatewayOnline ? Wifi : WifiOff"
+              :is="health.gatewayOnline ? Wifi : WifiOff"
               class="h-3.5 w-3.5"
-              :class="store.gatewayOnline ? 'text-green-500' : 'text-red-500'"
+              :class="health.gatewayOnline ? 'text-green-500' : 'text-red-500'"
             />
-            <span>{{ store.gatewayOnline ? "Connected" : "Offline" }}</span>
+            <span>{{ health.gatewayOnline ? "Connected" : "Offline" }}</span>
           </div>
           <button @click="toggleDark" class="hover:text-foreground transition-colors">
             <component :is="isDark ? Sun : Moon" class="h-3.5 w-3.5" />

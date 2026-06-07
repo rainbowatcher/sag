@@ -11,9 +11,12 @@ import {
   ComboboxEmpty,
 } from "@/components/ui/combobox"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { useApiStore, type AddRoutePayload } from "@/stores/api"
+import { useProviderStore } from "@/stores/providers"
+import { useRouteStore } from "@/stores/routes"
+import type { AddRoutePayload } from "@/types/api"
 
-const store = useApiStore()
+const routeStore = useRouteStore()
+const providerStore = useProviderStore()
 const showAdd = ref(false)
 const adding = ref(false)
 const error = ref("")
@@ -28,7 +31,7 @@ const form = ref({
 })
 
 onMounted(async () => {
-  await Promise.all([store.fetchProviders(), store.fetchRoutes()])
+  await Promise.all([providerStore.fetchProviders(), routeStore.fetchRoutes()])
 })
 
 watch(
@@ -36,7 +39,7 @@ watch(
   (name) => {
     form.value.real_model = ""
     if (name) {
-      store.fetchProviderModels(name)
+      routeStore.fetchProviderModels(name)
     }
   },
 )
@@ -53,7 +56,7 @@ async function handleAdd() {
     if (form.value.real_model) {
       payload.real_model = form.value.real_model
     }
-    await store.addRoute(form.value.provider_name, payload)
+    await routeStore.addRoute(form.value.provider_name, payload)
     showAdd.value = false
     form.value = {
       provider_name: "",
@@ -62,7 +65,7 @@ async function handleAdd() {
       api_endpoint: "/v1/chat/completions",
       priority: 0,
     }
-    await store.fetchRoutes()
+    await routeStore.fetchRoutes()
   } catch (e: any) {
     error.value = e.response?.data?.error?.message ?? e.message
   } finally {
@@ -86,16 +89,16 @@ const endpointPresets = [
       </div>
       <div class="flex items-center gap-2">
         <button
-          @click="store.fetchRoutes()"
-          :disabled="store.routesLoading"
+          @click="routeStore.fetchRoutes()"
+          :disabled="routeStore.routesLoading"
           class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
         >
-          <RefreshCw :class="store.routesLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
+          <RefreshCw :class="routeStore.routesLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
           Refresh
         </button>
         <button
           @click="showAdd = !showAdd"
-          :disabled="store.providers.length === 0"
+          :disabled="providerStore.providers.length === 0"
           class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors disabled:opacity-50"
         >
           <Plus class="h-3.5 w-3.5" />
@@ -123,7 +126,7 @@ const endpointPresets = [
             class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
           >
             <option value="" disabled>Select provider...</option>
-            <option v-for="p in store.providers" :key="p.name" :value="p.name">
+            <option v-for="p in providerStore.providers" :key="p.name" :value="p.name">
               {{ p.name }} ({{ p.provider_type }})
             </option>
           </select>
@@ -163,13 +166,15 @@ const endpointPresets = [
                 <Check v-if="form.real_model === ''" class="ml-auto h-4 w-4" />
               </ComboboxItem>
               <div
-                v-if="store.providerModelsLoading && !store.providerModels[form.provider_name]"
+                v-if="
+                  routeStore.providerModelsLoading && !routeStore.providerModels[form.provider_name]
+                "
                 class="text-muted-foreground px-2 py-4 text-center text-xs"
               >
                 Loading models...
               </div>
               <ComboboxItem
-                v-for="m in store.providerModels[form.provider_name] ?? []"
+                v-for="m in routeStore.providerModels[form.provider_name] ?? []"
                 :key="m"
                 :value="m"
               >
@@ -211,14 +216,14 @@ const endpointPresets = [
 
     <!-- Route list -->
     <div
-      v-if="store.routesLoading && store.routes.length === 0"
+      v-if="routeStore.routesLoading && routeStore.routes.length === 0"
       class="text-muted-foreground py-12 text-center"
     >
       <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" /> Loading...
     </div>
 
     <div
-      v-else-if="store.routes.length === 0"
+      v-else-if="routeStore.routes.length === 0"
       class="text-muted-foreground py-12 text-center text-sm"
     >
       No routes configured. Add one above.
@@ -226,7 +231,7 @@ const endpointPresets = [
 
     <div v-else class="space-y-4">
       <div
-        v-for="route in store.routes"
+        v-for="route in routeStore.routes"
         :key="route.model_name"
         class="bg-card overflow-hidden rounded-lg border"
       >

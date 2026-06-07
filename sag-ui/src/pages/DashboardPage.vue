@@ -1,43 +1,49 @@
 <script setup lang="ts">
 import { Server, GitBranch, MessageSquare, AlertTriangle } from "lucide-vue-next"
 import { onMounted } from "vue"
-import { useApiStore } from "@/stores/api"
+import { useAnalyticsStore } from "@/stores/analytics"
+import { useHealthStore } from "@/stores/health"
+import { useProviderStore } from "@/stores/providers"
+import { useRouteStore } from "@/stores/routes"
 
-const store = useApiStore()
+const providerStore = useProviderStore()
+const routeStore = useRouteStore()
+const analyticsStore = useAnalyticsStore()
+const healthStore = useHealthStore()
 
 onMounted(async () => {
   await Promise.all([
-    store.fetchProviders(),
-    store.fetchRoutes(),
-    store.fetchStats(),
-    store.checkHealth(),
+    providerStore.fetchProviders(),
+    routeStore.fetchRoutes(),
+    analyticsStore.fetchStats(),
+    healthStore.checkHealth(),
   ])
 })
 
 const cards = [
   {
     label: "Providers",
-    value: () => store.summary.providerCount,
+    value: () => analyticsStore.summary.providerCount,
     icon: Server,
     color: "text-blue-500",
   },
   {
     label: "Routes",
-    value: () => store.summary.routeCount,
+    value: () => analyticsStore.summary.routeCount,
     icon: GitBranch,
     color: "text-green-500",
   },
   {
     label: "Total Calls",
-    value: () => store.summary.totalCalls,
+    value: () => analyticsStore.summary.totalCalls,
     icon: MessageSquare,
     color: "text-purple-500",
   },
   {
     label: "Errors",
-    value: () => store.summary.totalErrors,
+    value: () => analyticsStore.summary.totalErrors,
     icon: AlertTriangle,
-    color: store.summary.totalErrors > 0 ? "text-red-500" : "text-muted-foreground",
+    color: analyticsStore.summary.totalErrors > 0 ? "text-red-500" : "text-muted-foreground",
   },
 ]
 </script>
@@ -71,7 +77,10 @@ const cards = [
       <div class="border-b p-4">
         <h3 class="font-semibold">Recent Statistics</h3>
       </div>
-      <div v-if="store.stats.length === 0" class="text-muted-foreground p-8 text-center text-sm">
+      <div
+        v-if="analyticsStore.stats.length === 0"
+        class="text-muted-foreground p-8 text-center text-sm"
+      >
         No data available yet. Make some API calls to see statistics.
       </div>
       <table v-else class="w-full text-sm">
@@ -87,7 +96,7 @@ const cards = [
         </thead>
         <tbody>
           <tr
-            v-for="(row, i) in store.stats"
+            v-for="(row, i) in analyticsStore.stats"
             :key="i"
             class="hover:bg-muted/30 border-b last:border-0"
           >

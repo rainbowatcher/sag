@@ -1,6 +1,6 @@
 import { createRouter, createWebHistory } from "vue-router"
 import type { RouteRecordRaw } from "vue-router"
-import { useApiStore } from "@/stores/api"
+import { useConnectionStore } from "@/stores/connection"
 
 const routes: RouteRecordRaw[] = [
   {
@@ -43,7 +43,7 @@ const router = createRouter({
 
 // Wire up the router reference in the store so 401 handlers can redirect
 router.isReady().then(() => {
-  const store = useApiStore()
+  const store = useConnectionStore()
   store.setRouter(router)
 })
 
@@ -52,7 +52,7 @@ router.beforeEach(async (to) => {
   // Allow access to /connect unconditionally
   if (to.path === "/connect") return true
 
-  const store = useApiStore()
+  const store = useConnectionStore()
 
   // Already connected and validated → proceed
   if (store.isConnected) return true
