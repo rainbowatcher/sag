@@ -27,6 +27,13 @@ export interface RouteConfig {
   targets: RouteTarget[]
 }
 
+export interface AddRoutePayload {
+  model_name: string
+  real_model?: string
+  api_endpoint?: string
+  priority?: number
+}
+
 export interface StatsRow {
   provider: string
   model: string
@@ -328,15 +335,7 @@ export const useApiStore = defineStore("api", () => {
     }
   }
 
-  async function addRoute(
-    providerName: string,
-    payload: {
-      model_name: string
-      real_model?: string
-      api_endpoint?: string
-      priority?: number
-    },
-  ) {
+  async function addRoute(providerName: string, payload: AddRoutePayload) {
     try {
       await api.post(`/api/providers/${providerName}/routes`, payload, { headers: headers() })
     } catch (e: any) {

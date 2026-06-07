@@ -11,7 +11,7 @@ import {
   ComboboxEmpty,
 } from "@/components/ui/combobox"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { useApiStore } from "@/stores/api"
+import { useApiStore, type AddRoutePayload } from "@/stores/api"
 
 const store = useApiStore()
 const showAdd = ref(false)
@@ -45,7 +45,7 @@ async function handleAdd() {
   error.value = ""
   adding.value = true
   try {
-    const payload: Record<string, any> = {
+    const payload: AddRoutePayload = {
       model_name: form.value.model_name,
       api_endpoint: form.value.api_endpoint || undefined,
       priority: form.value.priority,
