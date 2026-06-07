@@ -105,7 +105,7 @@ docs-install:
 
 # 启动文档开发服务器 (热重载)
 docs-serve:
-    mdbook serve docs -p 38718 --open
+    mdbook serve docs -p 38718
 
 # ── 审计 ────────────────────────────────────────────────────────────
 
