@@ -1,0 +1,8 @@
+[tools]
+just = "latest"
+mdbook = "latest"
+node = "22"
+pnpm = "11"
+prek = "latest"
+python = "3.14.4"
+watchexec = "latest"
