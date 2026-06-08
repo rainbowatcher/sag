@@ -1,101 +1,18 @@
 <script setup lang="ts">
-import { Plus, RefreshCw, Loader2, X, GitBranch, ChevronsUpDown, Check } from "lucide-vue-next"
-import { ref, onMounted, watch } from "vue"
+import { Plus, RefreshCw, Loader2, GitBranch } from "lucide-vue-next"
+import { ref, onMounted } from "vue"
+import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
-import {
-  Combobox,
-  ComboboxAnchor,
-  ComboboxInput,
-  ComboboxTrigger,
-  ComboboxList,
-  ComboboxItem,
-  ComboboxEmpty,
-} from "@/components/ui/combobox"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-import type { AddRoutePayload } from "@/types/api"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
 const showAdd = ref(false)
-const adding = ref(false)
-const error = ref("")
-const open = ref(false)
-
-const form = ref({
-  provider_name: "",
-  model_name: "",
-  real_model: "",
-  api_endpoint: "/v1/chat/completions",
-  priority: 0,
-})
 
 onMounted(async () => {
   await Promise.all([providerStore.fetchProviders(), routeStore.fetchRoutes()])
 })
-
-watch(
-  () => form.value.provider_name,
-  (name) => {
-    form.value.real_model = ""
-    if (name) {
-      routeStore.fetchProviderModels(name)
-    }
-  },
-)
-
-async function handleAdd() {
-  error.value = ""
-  adding.value = true
-  try {
-    const payload: AddRoutePayload = {
-      model_name: form.value.model_name,
-      api_endpoint: form.value.api_endpoint || undefined,
-      priority: form.value.priority,
-    }
-    if (form.value.real_model) {
-      payload.real_model = form.value.real_model
-    }
-    await routeStore.addRoute(form.value.provider_name, payload)
-    showAdd.value = false
-    form.value = {
-      provider_name: "",
-      model_name: "",
-      real_model: "",
-      api_endpoint: "/v1/chat/completions",
-      priority: 0,
-    }
-    await routeStore.fetchRoutes()
-  } catch (e: any) {
-    error.value = e.response?.data?.error?.message ?? e.message
-  } finally {
-    adding.value = false
-  }
-}
-
-const endpointPresets = [
-  { label: "Chat Completions", value: "/v1/chat/completions" },
-  { label: "Responses (GPT-5)", value: "/v1/responses" },
-  { label: "Image Generation", value: "/v1/images/generations" },
-]
 </script>
 
 <template>
@@ -122,106 +39,17 @@ const endpointPresets = [
       </div>
     </div>
 
-    <!-- Add form -->
-    <Card v-if="showAdd" class="space-y-4">
-      <CardHeader class="flex flex-row items-center justify-between space-y-0">
-        <CardTitle>New Route</CardTitle>
-        <Button variant="ghost" size="icon-sm" @click="showAdd = false">
-          <X class="h-4 w-4" />
-        </Button>
-      </CardHeader>
-      <CardContent>
-        <div v-if="error" class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-          {{ error }}
-        </div>
-        <div class="grid grid-cols-2 gap-4">
-          <div class="flex items-center gap-2">
-            <Label class="shrink-0">Provider *</Label>
-            <Select v-model="form.provider_name">
-              <SelectTrigger>
-                <SelectValue placeholder="Select provider..." />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="p in providerStore.providers" :key="p.name" :value="p.name">
-                  {{ p.name }} ({{ p.provider_type }})
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div class="flex items-center gap-2">
-            <Label class="shrink-0">Priority</Label>
-            <Input v-model.number="form.priority" type="number" />
-          </div>
-          <div class="flex items-center gap-2">
-            <Label class="shrink-0">Model Name *</Label>
-            <Input v-model="form.model_name" placeholder="gpt-4o" />
-          </div>
-          <div class="flex items-start gap-2">
-            <Label class="mt-2 shrink-0">Real Model</Label>
-            <div class="min-w-0 flex-1">
-              <Combobox v-model="form.real_model" v-model:open="open">
-                <ComboboxAnchor class="w-full">
-                  <ComboboxInput
-                    class="bg-background focus:ring-ring"
-                    placeholder="Select or type a model..."
-                  />
-                  <ComboboxTrigger>
-                    <ChevronsUpDown class="h-4 w-4 shrink-0 opacity-50" />
-                  </ComboboxTrigger>
-                </ComboboxAnchor>
-                <ComboboxList class="w-full">
-                  <ComboboxEmpty>No models found</ComboboxEmpty>
-                  <ComboboxItem v-if="!form.real_model" :value="''" @click="open = false">
-                    <span class="text-muted-foreground text-xs">Passthrough (use model name)</span>
-                    <Check v-if="form.real_model === ''" class="ml-auto h-4 w-4" />
-                  </ComboboxItem>
-                  <div
-                    v-if="
-                      routeStore.providerModelsLoading &&
-                      !routeStore.providerModels[form.provider_name]
-                    "
-                    class="text-muted-foreground px-2 py-4 text-center text-xs"
-                  >
-                    Loading models...
-                  </div>
-                  <ComboboxItem
-                    v-for="m in routeStore.providerModels[form.provider_name] ?? []"
-                    :key="m"
-                    :value="m"
-                  >
-                    {{ m }}
-                    <Check v-if="form.real_model === m" class="ml-auto h-4 w-4" />
-                  </ComboboxItem>
-                </ComboboxList>
-              </Combobox>
-              <p class="text-muted-foreground text-[10px]">
-                Leave empty to use the client-requested model name as-is
-              </p>
-            </div>
-          </div>
-          <div class="col-span-2 flex items-center gap-2">
-            <Label class="shrink-0">API Endpoint</Label>
-            <ToggleGroup
-              v-model="form.api_endpoint"
-              type="single"
-              variant="outline"
-              size="sm"
-              class="justify-start"
-            >
-              <ToggleGroupItem v-for="ep in endpointPresets" :key="ep.value" :value="ep.value">
-                {{ ep.label }}
-              </ToggleGroupItem>
-            </ToggleGroup>
-          </div>
-        </div>
-      </CardContent>
-      <CardFooter class="flex justify-end">
-        <Button @click="handleAdd" :disabled="adding || !form.provider_name || !form.model_name">
-          <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
-          {{ adding ? "Adding..." : "Create Route" }}
-        </Button>
-      </CardFooter>
-    </Card>
+    <RouteAddForm
+      v-if="showAdd"
+      :providers="providerStore.providers"
+      :provider-models="routeStore.providerModels"
+      :provider-models-loading="routeStore.providerModelsLoading"
+      @close="showAdd = false"
+      @created="
+        showAdd = false
+        routeStore.fetchRoutes()
+      "
+    />
     <!-- Route list -->
     <div
       v-if="routeStore.routesLoading && routeStore.routes.length === 0"
