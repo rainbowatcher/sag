@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2 } from "lucide-vue-next"
+import { RouterView } from "vue-router"
 import { useConnectionStore } from "@/stores/connection"
-import AppLayout from "./components/AppLayout.vue"
 
 const store = useConnectionStore()
 </script>
@@ -15,5 +15,5 @@ const store = useConnectionStore()
     </div>
   </div>
 
-  <AppLayout v-else />
+  <RouterView v-else />
 </template>
