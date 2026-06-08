@@ -1,68 +1,21 @@
 <script setup lang="ts">
-import {
-  Plus,
-  RefreshCw,
-  Loader2,
-  X,
-  ChevronDown,
-  Trash2,
-  Pen,
-  AlertTriangle,
-} from "lucide-vue-next"
+import { Plus, RefreshCw, Loader2, ChevronDown, Trash2, Pen, AlertTriangle } from "lucide-vue-next"
 import { ref, onMounted } from "vue"
+import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"
+import Label from "@/components/ui/label/Label.vue"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
 
 const store = useProviderStore()
 const showAdd = ref(false)
-const adding = ref(false)
-const error = ref("")
-
-const form = ref({
-  name: "",
-  api_key: "",
-  provider_type: "openai",
-  base_url: "https://api.openai.com/v1",
-  priority: 0,
-  supported_params: "model,messages,temperature,max_tokens,stream",
-})
 
 const expanded = ref<Record<string, boolean>>({})
 
 onMounted(() => store.fetchProviders())
 
-async function handleAdd() {
-  error.value = ""
-  adding.value = true
-  try {
-    await store.addProvider({
-      name: form.value.name,
-      api_key: form.value.api_key,
-      provider_type: form.value.provider_type,
-      base_url: form.value.base_url || undefined,
-      priority: form.value.priority,
-      supported_params: form.value.supported_params
-        ? form.value.supported_params
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : [],
-    })
-    showAdd.value = false
-    form.value = {
-      name: "",
-      api_key: "",
-      provider_type: "openai",
-      base_url: "https://api.openai.com/v1",
-      priority: 0,
-      supported_params: "model,messages,temperature,max_tokens,stream",
-    }
-    await store.fetchProviders()
-  } catch (e: any) {
-    error.value = e.response?.data?.error?.message ?? e.message
-  } finally {
-    adding.value = false
-  }
+async function onCreated() {
+  showAdd.value = false
+  await store.fetchProviders()
 }
 
 // ── Delete flow ──────────────────────────────────────────────────
@@ -204,83 +157,7 @@ async function handleUpdate(name: string) {
       </div>
     </div>
 
-    <!-- Add form -->
-    <div
-      v-if="showAdd"
-      class="bg-card animate-in slide-in-from-top-2 space-y-4 rounded-lg border p-5"
-    >
-      <div class="flex items-center justify-between">
-        <h3 class="font-semibold">New Provider</h3>
-        <button @click="showAdd = false" class="hover:text-destructive transition-colors">
-          <X class="h-4 w-4" />
-        </button>
-      </div>
-      <div v-if="error" class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-        {{ error }}
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div class="space-y-1">
-          <label class="text-muted-foreground text-xs font-medium">Name *</label>
-          <input
-            v-model="form.name"
-            class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            placeholder="my-openai"
-          />
-        </div>
-        <div class="space-y-1">
-          <label class="text-muted-foreground text-xs font-medium">Type</label>
-          <select
-            v-model="form.provider_type"
-            class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-          >
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-          </select>
-        </div>
-        <div class="col-span-2 space-y-1">
-          <label class="text-muted-foreground text-xs font-medium">API Key *</label>
-          <input
-            v-model="form.api_key"
-            type="password"
-            class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            placeholder="sk-..."
-          />
-        </div>
-        <div class="col-span-2 space-y-1">
-          <label class="text-muted-foreground text-xs font-medium">Base URL</label>
-          <input
-            v-model="form.base_url"
-            class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-          />
-        </div>
-        <div class="space-y-1">
-          <label class="text-muted-foreground text-xs font-medium">Priority</label>
-          <input
-            v-model.number="form.priority"
-            type="number"
-            class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-          />
-        </div>
-        <div class="space-y-1">
-          <label class="text-muted-foreground text-xs font-medium">Supported Params</label>
-          <input
-            v-model="form.supported_params"
-            class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            placeholder="model,messages,temperature"
-          />
-        </div>
-      </div>
-      <div class="flex justify-end">
-        <button
-          @click="handleAdd"
-          :disabled="adding || !form.name || !form.api_key"
-          class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-4 text-sm transition-colors disabled:opacity-50"
-        >
-          <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
-          {{ adding ? "Adding..." : "Create Provider" }}
-        </button>
-      </div>
-    </div>
+    <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
 
     <!-- Provider list -->
     <div
@@ -413,7 +290,7 @@ async function handleUpdate(name: string) {
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div class="space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Name</label>
+              <Label class="text-muted-foreground text-xs font-medium">Name</Label>
               <input
                 :value="p.name"
                 disabled
@@ -421,7 +298,7 @@ async function handleUpdate(name: string) {
               />
             </div>
             <div class="space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Type</label>
+              <Label class="text-muted-foreground text-xs font-medium">Type</Label>
               <select
                 v-model="editForm.provider_type"
                 class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
@@ -431,8 +308,8 @@ async function handleUpdate(name: string) {
               </select>
             </div>
             <div class="col-span-2 space-y-1">
-              <label class="text-muted-foreground text-xs font-medium"
-                >API Key (leave blank to keep current)</label
+              <Label class="text-muted-foreground text-xs font-medium"
+                >API Key (leave blank to keep current)</Label
               >
               <input
                 v-model="editForm.api_key"
@@ -442,14 +319,14 @@ async function handleUpdate(name: string) {
               />
             </div>
             <div class="col-span-2 space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Base URL</label>
+              <Label class="text-muted-foreground text-xs font-medium">Base URL</Label>
               <input
                 v-model="editForm.base_url"
                 class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
               />
             </div>
             <div class="space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Priority</label>
+              <Label class="text-muted-foreground text-xs font-medium">Priority</Label>
               <input
                 v-model.number="editForm.priority"
                 type="number"
@@ -457,7 +334,7 @@ async function handleUpdate(name: string) {
               />
             </div>
             <div class="space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Max Retries</label>
+              <Label class="text-muted-foreground text-xs font-medium">Max Retries</Label>
               <input
                 v-model.number="editForm.max_retries"
                 type="number"
@@ -465,7 +342,7 @@ async function handleUpdate(name: string) {
               />
             </div>
             <div class="space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Timeout (secs)</label>
+              <Label class="text-muted-foreground text-xs font-medium">Timeout (secs)</Label>
               <input
                 v-model.number="editForm.timeout_secs"
                 type="number"
@@ -473,7 +350,7 @@ async function handleUpdate(name: string) {
               />
             </div>
             <div class="space-y-1">
-              <label class="text-muted-foreground text-xs font-medium">Supported Params</label>
+              <Label class="text-muted-foreground text-xs font-medium">Supported Params</Label>
               <input
                 v-model="editForm.supported_params"
                 class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
