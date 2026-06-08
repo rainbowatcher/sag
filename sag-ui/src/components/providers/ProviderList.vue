@@ -2,6 +2,8 @@
 import { ChevronDown, Trash2, Pen, AlertTriangle, Loader2 } from "lucide-vue-next"
 import { ref } from "vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
 
@@ -90,45 +92,40 @@ async function onUpdated() {
           </div>
         </button>
         <div class="flex items-center gap-1 pr-3">
-          <span class="text-muted-foreground rounded-full border px-2 py-0.5 text-xs"
-            >priority: {{ p.priority }}</span
+          <Badge variant="outline" class="rounded-full px-2 py-0.5 text-xs font-normal"
+            >priority: {{ p.priority }}</Badge
           >
-          <button
+          <Button
+            variant="ghost"
+            size="icon-sm"
             @click.stop="startEdit(p)"
-            :class="
-              editingName === p.name
-                ? 'text-primary bg-primary/10'
-                : 'text-muted-foreground hover:text-primary'
-            "
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors"
+            :class="editingName === p.name ? 'text-primary bg-primary/10' : ''"
             :title="editingName === p.name ? 'Cancel edit' : 'Edit provider'"
             :aria-label="editingName === p.name ? 'Cancel edit' : 'Edit provider'"
           >
             <Pen class="h-3.5 w-3.5" />
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
             @click.stop="startDelete(p.name)"
-            :class="
-              confirmingDelete === p.name
-                ? 'text-destructive bg-destructive/10'
-                : 'text-muted-foreground hover:text-destructive'
-            "
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors"
+            :class="confirmingDelete === p.name ? 'text-destructive bg-destructive/10' : ''"
             :title="confirmingDelete === p.name ? 'Cancel delete' : 'Delete provider'"
             :aria-label="confirmingDelete === p.name ? 'Cancel delete' : 'Delete provider'"
           >
             <Trash2 class="h-3.5 w-3.5" />
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
             @click.stop="expanded[p.name] = !expanded[p.name]"
-            class="text-muted-foreground hover:bg-muted inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors"
             :aria-label="expanded[p.name] ? 'Collapse' : 'Expand'"
           >
             <ChevronDown
               class="h-4 w-4 transition-transform"
               :class="expanded[p.name] ? 'rotate-180' : ''"
             />
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -151,21 +148,18 @@ async function onUpdated() {
           {{ deleteError }}
         </div>
         <div class="flex justify-end gap-2">
-          <button
-            @click="cancelDelete"
-            :disabled="deleting"
-            class="hover:bg-accent h-7 rounded-md border px-3 text-xs transition-colors disabled:opacity-50"
-          >
+          <Button variant="outline" size="xs" @click="cancelDelete" :disabled="deleting">
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="destructive"
+            size="xs"
             @click="confirmDelete(p.name)"
             :disabled="deleting"
-            class="bg-destructive text-destructive-foreground hover:bg-destructive/90 inline-flex h-7 items-center gap-1.5 rounded-md px-3 text-xs transition-colors disabled:opacity-50"
           >
             <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
             {{ deleting ? "Deleting…" : "Delete" }}
-          </button>
+          </Button>
         </div>
       </div>
 
