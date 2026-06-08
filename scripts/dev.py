@@ -32,7 +32,7 @@ def log(tag: str, msg: str) -> None:
 
 def start_backend(config: str, release: bool) -> subprocess.Popen:
     """使用 watchexec 启动 Rust 后端，源码变化时自动重编译重启."""
-    cmd = ["watchexec", "-r", "--", "cargo", "run"]
+    cmd = ["watchexec", "-r", "-e", "rs", "--", "cargo", "run"]
     if release:
         cmd.append("--release")
     cmd.extend(["--", config])
