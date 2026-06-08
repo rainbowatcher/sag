@@ -6,16 +6,16 @@ import { z } from "zod"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import {
-  Combobox,
-  ComboboxAnchor,
-  ComboboxInput,
-  ComboboxTrigger,
-  ComboboxList,
-  ComboboxItem,
-  ComboboxEmpty,
-} from "@/components/ui/combobox"
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Select,
   SelectContent,
@@ -182,39 +182,59 @@ const endpointPresets = [
           <form.Field name="real_model" #default="{ field }">
             <Field :data-invalid="isInvalid(field)">
               <FieldLabel :for="field.name">Real Model</FieldLabel>
-              <Combobox
-                :model-value="field.state.value"
-                @update:model-value="(v) => field.handleChange(v as string)"
-                v-model:open="open"
-              >
-                <ComboboxAnchor class="w-full">
-                  <ComboboxInput
+              <Popover v-model:open="open">
+                <PopoverTrigger as-child>
+                  <Button
                     :id="field.name"
-                    class="bg-background focus:ring-ring"
-                    placeholder="Select a model"
-                  />
-                  <ComboboxTrigger>
-                    <ChevronsUpDown class="h-4 w-4 shrink-0 opacity-50" />
-                  </ComboboxTrigger>
-                </ComboboxAnchor>
-                <ComboboxList class="w-full">
-                  <ComboboxEmpty>No models found</ComboboxEmpty>
-                  <div
-                    v-if="providerModelsLoading && !providerModels[form.state.values.provider_name]"
-                    class="text-muted-foreground px-2 py-4 text-center text-xs"
+                    variant="outline"
+                    role="combobox"
+                    :aria-invalid="isInvalid(field)"
+                    :aria-expanded="open"
+                    class="w-full justify-between"
                   >
-                    Loading models...
-                  </div>
-                  <ComboboxItem
-                    v-for="m in providerModels[form.state.values.provider_name] ?? []"
-                    :key="m"
-                    :value="m"
-                  >
-                    {{ m }}
-                    <Check v-if="field.state.value === m" class="ml-auto h-4 w-4" />
-                  </ComboboxItem>
-                </ComboboxList>
-              </Combobox>
+                    {{ field.state.value || "Select a model" }}
+                    <ChevronsUpDown class="ml-auto h-4 w-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent class="w-(--reka-popper-anchor-width) p-0">
+                  <Command>
+                    <CommandInput placeholder="Search model..." />
+                    <CommandList>
+                      <CommandEmpty>No models found</CommandEmpty>
+                      <div
+                        v-if="
+                          providerModelsLoading && !providerModels[form.state.values.provider_name]
+                        "
+                        class="text-muted-foreground px-2 py-4 text-center text-xs"
+                      >
+                        Loading models...
+                      </div>
+                      <CommandGroup>
+                        <CommandItem
+                          v-for="m in providerModels[form.state.values.provider_name] ?? []"
+                          :key="m"
+                          :value="m"
+                          @select="
+                            (ev) => {
+                              const selectedValue = ev.detail.value as string
+                              field.handleChange(
+                                selectedValue === field.state.value ? '' : selectedValue,
+                              )
+                              open = false
+                            }
+                          "
+                        >
+                          {{ m }}
+                          <Check
+                            :class="field.state.value === m ? 'opacity-100' : 'opacity-0'"
+                            class="ml-auto h-4 w-4"
+                          />
+                        </CommandItem>
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
               <p class="text-muted-foreground text-[10px]">
                 Leave empty to use the client-requested model name as-is
               </p>

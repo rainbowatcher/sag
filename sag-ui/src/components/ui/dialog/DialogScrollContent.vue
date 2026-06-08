@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Cross2Icon } from "@radix-icons/vue"
+import { X } from "@lucide/vue"
 import { reactiveOmit } from "@vueuse/core"
 import type { DialogContentEmits, DialogContentProps } from "reka-ui"
 import {
@@ -55,7 +55,7 @@ const forwarded = useForwardPropsEmits(delegatedProps, emits)
         <DialogClose
           class="hover:bg-secondary absolute top-4 right-4 rounded-md p-0.5 transition-colors"
         >
-          <Cross2Icon class="h-4 w-4" />
+          <X class="h-4 w-4" />
           <span class="sr-only">Close</span>
         </DialogClose>
       </DialogContent>
