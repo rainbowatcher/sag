@@ -10,7 +10,6 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: "/",
-    // component: () => import("@/components/AppLayout.vue"),
     children: [
       {
         path: "",
