@@ -71,7 +71,9 @@ impl OpenAiProvider {
 
     /// Build the full upstream URL from the base URL and an API endpoint path.
     fn build_url(&self, api_endpoint: &str) -> String {
-        format!("{}{}", self.base_url, api_endpoint)
+        let base = self.base_url.trim_end_matches('/');
+        let path = api_endpoint.trim_start_matches('/');
+        format!("{}/{}", base, path)
     }
 }
 
@@ -200,7 +202,7 @@ impl LlmProvider for OpenAiProvider {
         let mut upstream = request.clone();
         upstream.model = real_model.to_string();
 
-        let url = self.build_url("/v1/images/generations");
+        let url = self.build_url("/images/generations");
         debug!(%url, "sending image generation request");
 
         let response = self

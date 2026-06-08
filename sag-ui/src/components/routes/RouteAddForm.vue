@@ -80,9 +80,9 @@ function swapPriority(i: number, j: number) {
 }
 
 const endpointPresets = [
-  { label: "Chat Completions", value: "/v1/chat/completions" },
-  { label: "Responses (GPT-5)", value: "/v1/responses" },
-  { label: "Image Generation", value: "/v1/images/generations" },
+  { label: "Chat Completions", value: "/chat/completions" },
+  { label: "Responses (GPT-5)", value: "/responses" },
+  { label: "Image Generation", value: "/images/generations" },
 ]
 
 const formSchema = z.object({

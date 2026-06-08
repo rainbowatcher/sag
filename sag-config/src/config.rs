@@ -122,7 +122,7 @@ pub struct RouteConfig {
     /// The model name as requested by the client (supports glob-like patterns e.g. "gpt-image-*").
     pub model_name: String,
     /// Upstream API endpoint path for this model.
-    /// Examples: `/v1/chat/completions`, `/v1/images/generations`, `/v1/responses`.
+    /// Examples: `/chat/completions`, `/images/generations`, `/responses`.
     #[serde(default = "default_api_endpoint")]
     pub api_endpoint: String,
     /// Target selection strategy (default: `FillFirst`).
@@ -133,7 +133,7 @@ pub struct RouteConfig {
 }
 
 fn default_api_endpoint() -> String {
-    "/v1/chat/completions".into()
+    "/chat/completions".into()
 }
 
 /// A routing target: maps a logical model to a specific provider + real model name.

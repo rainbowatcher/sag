@@ -88,7 +88,7 @@ struct AddRouteRequest {
 }
 
 fn default_api_endpoint() -> String {
-    "/v1/chat/completions".into()
+    "/chat/completions".into()
 }
 
 #[derive(serde::Deserialize)]
@@ -671,7 +671,7 @@ mod tests {
             .into_iter()
             .map(|(model, real_model, prio)| RouteConfig {
                 model_name: model.into(),
-                api_endpoint: "/v1/chat/completions".into(),
+                api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: name.into(),
@@ -775,7 +775,7 @@ mod tests {
         let routes = vec![
             RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/v1/chat/completions".into(),
+                api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 targets: vec![
                     RouteTarget {
@@ -792,7 +792,7 @@ mod tests {
             },
             RouteConfig {
                 model_name: "claude-sonnet".into(),
-                api_endpoint: "/v1/chat/completions".into(),
+                api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "anthropic".into(),
@@ -1128,7 +1128,7 @@ mod auth_regression_tests {
             providers,
             routes: vec![RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/v1/chat/completions".into(),
+                api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
