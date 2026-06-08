@@ -57,8 +57,8 @@ ui-preview:
 # ── 开发环境 ────────────────────────────────────────────────────────
 
 # 一键启动前后端开发环境 (推荐)
-dev config=config:
-    python3 scripts/dev.py --config {{ config }}
+dev *args:
+    python3 scripts/dev.py {{ args }}
 
 # ── 代码质量 ────────────────────────────────────────────────────────
 
