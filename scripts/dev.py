@@ -14,7 +14,6 @@ import os
 import select
 import signal
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -32,19 +31,15 @@ def log(tag: str, msg: str) -> None:
 
 
 def start_backend(config: str, release: bool) -> subprocess.Popen:
-    """启动 Rust 后端二进制."""
-    profile_dir = "release" if release else "debug"
-    binary = PROJECT_ROOT / "target" / profile_dir / "sag"
-    if not binary.exists():
-        log("SYS", f"Binary not found at {binary}, building first...")
-        subprocess.run(
-            ["cargo", "build"] + (["--release"] if release else []),
-            cwd=PROJECT_ROOT,
-            check=True,
-        )
-    log("SYS", f"Starting backend: {binary} {config}")
+    """使用 watchexec 启动 Rust 后端，源码变化时自动重编译重启."""
+    cmd = ["watchexec", "-r", "--", "cargo", "run"]
+    if release:
+        cmd.append("--release")
+    cmd.extend(["--", config])
+
+    log("SYS", f"Starting backend: {' '.join(cmd)}")
     return subprocess.Popen(
-        [str(binary), config],
+        cmd,
         cwd=PROJECT_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -175,19 +170,6 @@ def main() -> None:
 
     # ── 后端 ──
     if not args.skip_backend:
-        log("SYS", "Building backend (this may take a moment)...")
-        build_result = subprocess.run(
-            ["cargo", "build"] + (["--release"] if args.release else []),
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if build_result.returncode != 0:
-            log("SYS", "Backend build FAILED:")
-            print(build_result.stderr)
-            sys.exit(1)
-        log("SYS", "Backend build OK")
-
         backend = start_backend(args.config, args.release)
         procs.append(backend)
         threading.Thread(target=stream_output, args=(backend, "BACKEND"), daemon=True).start()
