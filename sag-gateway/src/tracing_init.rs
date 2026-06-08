@@ -12,6 +12,6 @@ pub fn init() {
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
-        .json()
+        .compact()
         .init();
 }
