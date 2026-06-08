@@ -55,8 +55,7 @@ impl OpenAiProvider {
         let unsupported: Vec<String> = request
             .extra
             .keys()
-            .filter(|k| !supported_set.contains(k.as_str()))
-            .map(|k| k.clone())
+            .filter(|k| !supported_set.contains(k.as_str())).cloned()
             .collect();
 
         if !unsupported.is_empty() {
@@ -181,7 +180,7 @@ impl LlmProvider for OpenAiProvider {
         let byte_stream = response.bytes_stream().map(|result| {
             result.map_err(|e| {
                 error!(?e, "error reading upstream stream chunk");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
+                std::io::Error::other(e)
             })
         });
 

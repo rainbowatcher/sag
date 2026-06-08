@@ -100,7 +100,7 @@ impl CallLogCollector {
                     error!(?e, "failed to persist call log");
                 }
 
-                if count % 10 == 0 {
+                if count.is_multiple_of(10) {
                     info!(count, "analytics: persisted {count} call logs");
                 }
             }
@@ -160,15 +160,15 @@ pub async fn query_stats(
 ) -> Result<Vec<StatsRow>, sqlx::Error> {
     // Build the query dynamically
     let mut conditions = Vec::new();
-    if let Some(p) = provider_filter {
-        if !p.is_empty() {
-            conditions.push(format!("provider = '{}'", p.replace('\'', "''")));
-        }
+    if let Some(p) = provider_filter
+        && !p.is_empty()
+    {
+        conditions.push(format!("provider = '{}'", p.replace('\'', "''")));
     }
-    if let Some(m) = model_filter {
-        if !m.is_empty() {
-            conditions.push(format!("model = '{}'", m.replace('\'', "''")));
-        }
+    if let Some(m) = model_filter
+        && !m.is_empty()
+    {
+        conditions.push(format!("model = '{}'", m.replace('\'', "''")));
     }
 
     let where_clause = if conditions.is_empty() {

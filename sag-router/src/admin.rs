@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget};
+use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget, Strategy};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -80,6 +80,11 @@ struct AddRouteRequest {
     api_endpoint: String,
     #[serde(default = "default_priority")]
     priority: u32,
+    /// Target selection strategy for the route.
+    /// Only applied when creating a new route (first target); ignored when
+    /// appending to an existing route.
+    #[serde(default)]
+    strategy: Option<Strategy>,
 }
 
 fn default_api_endpoint() -> String {
@@ -176,11 +181,10 @@ async fn add_provider(
         config.providers.insert(req.name.clone(), pc.clone());
 
         // Persist to disk while holding the write lock
-        if state.config.is_file_backed() {
-            if let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+        if state.config.is_file_backed()
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
                 warn!(?e, "failed to persist config after adding provider");
             }
-        }
 
         pc
     };
@@ -271,11 +275,10 @@ async fn update_provider(
         let pc = existing.clone();
 
         // Persist to disk while holding the write lock
-        if state.config.is_file_backed() {
-            if let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+        if state.config.is_file_backed()
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
                 warn!(?e, "failed to persist config after updating provider");
             }
-        }
 
         pc
     };
@@ -449,21 +452,23 @@ async fn add_route_for_provider(
         config.routes.push(RouteConfig {
             model_name: req.model_name.clone(),
             api_endpoint: req.api_endpoint.clone(),
+            strategy: req.strategy.unwrap_or_default(),
             targets: vec![target],
         });
     }
 
     // Persist to disk while holding the write lock
-    if state.config.is_file_backed() {
-        if let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+    if state.config.is_file_backed()
+        && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
             warn!(?e, "failed to persist config after adding route");
         }
-    }
 
+    let strategy = req.strategy.unwrap_or_default();
     info!(
         model = %req.model_name,
         provider = %provider_name,
         real_model = req.real_model.as_deref().unwrap_or("(passthrough)"),
+        ?strategy,
         "route added via admin API"
     );
 
@@ -474,6 +479,7 @@ async fn add_route_for_provider(
             "provider": provider_name,
             "real_model": req.real_model,
             "priority": req.priority,
+            "strategy": strategy,
         })),
     )
         .into_response()
@@ -539,11 +545,10 @@ async fn delete_provider(
         config.providers.remove(&provider_name);
 
         // Persist to disk while we still hold the write lock.
-        if state.config.is_file_backed() {
-            if let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+        if state.config.is_file_backed()
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
                 warn!(?e, "failed to persist config after deleting provider");
             }
-        }
 
         (cascaded_routes, removed_targets)
     };
@@ -632,6 +637,7 @@ mod tests {
             config: handle,
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+            route_counters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -666,6 +672,7 @@ mod tests {
             .map(|(model, real_model, prio)| RouteConfig {
                 model_name: model.into(),
                 api_endpoint: "/v1/chat/completions".into(),
+                strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: name.into(),
                     real_model: Some(real_model.into()),
@@ -769,6 +776,7 @@ mod tests {
             RouteConfig {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/v1/chat/completions".into(),
+                strategy: Strategy::FillFirst,
                 targets: vec![
                     RouteTarget {
                         provider: "openai".into(),
@@ -785,6 +793,7 @@ mod tests {
             RouteConfig {
                 model_name: "claude-sonnet".into(),
                 api_endpoint: "/v1/chat/completions".into(),
+                strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "anthropic".into(),
                     real_model: Some("claude-3-5-sonnet".into()),
@@ -890,6 +899,7 @@ targets = [
             config: handle,
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+            route_counters: Arc::new(RwLock::new(HashMap::new())),
         };
         let app = test_app(state);
 
@@ -1119,6 +1129,7 @@ mod auth_regression_tests {
             routes: vec![RouteConfig {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/v1/chat/completions".into(),
+                strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
                     real_model: Some("gpt-4o".into()),
@@ -1139,6 +1150,7 @@ mod auth_regression_tests {
             config: handle,
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+            route_counters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

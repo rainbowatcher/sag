@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
@@ -9,8 +11,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use sag_config::Strategy;
 use sag_core::{CallLog, ImageGenerationRequest, Usage};
 use serde_json::json;
+use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, instrument, warn};
 
@@ -61,7 +65,7 @@ async fn chat_completions_handler(
     let request_id = uuid::Uuid::new_v4();
     let is_stream = request.stream.unwrap_or(false);
 
-    // Resolve model -> sorted targets + api_endpoint from routing table
+    // Resolve model -> targets + api_endpoint from routing table
     let (targets, api_endpoint) = {
         let config_guard = state.config.read().await;
 
@@ -73,10 +77,22 @@ async fn chat_completions_handler(
 
         match route {
             Some(r) => {
-                let mut sorted = r.targets.clone();
-                sorted.sort_by_key(|t| std::cmp::Reverse(t.priority));
+                let targets = r.targets.clone();
+                let strategy = r.strategy;
+                let api_endpoint = r.api_endpoint.clone();
+                let model_name = r.model_name.clone();
+                // Drop the read lock before accessing route_counters (write lock)
+                drop(config_guard);
 
-                let resolved: Vec<(String, String, u32)> = sorted
+                // Apply target selection strategy
+                let ordered = match strategy {
+                    Strategy::FillFirst => order_fill_first(targets),
+                    Strategy::RoundRobin => {
+                        order_round_robin(targets, &model_name, &state.route_counters).await
+                    }
+                };
+
+                let resolved: Vec<(String, String, u32)> = ordered
                     .into_iter()
                     .map(|t| {
                         let rm = t.real_model.unwrap_or_else(|| request.model.clone());
@@ -84,7 +100,7 @@ async fn chat_completions_handler(
                     })
                     .collect();
 
-                (resolved, r.api_endpoint.clone())
+                (resolved, api_endpoint)
             }
             None => {
                 let err = sag_core::AppError::ModelNotFound(request.model.clone());
@@ -336,12 +352,49 @@ async fn dispatch_image_request(
 
 /// Determine if an error should trigger fallback to the next provider.
 fn is_retryable_error(e: &sag_core::AppError) -> bool {
-    match e {
-        sag_core::AppError::BadRequest(_) => false,
-        sag_core::AppError::ModelNotFound(_) => false,
-        sag_core::AppError::Unauthorized(_) => false,
-        _ => true,
+    !matches!(
+        e,
+        sag_core::AppError::BadRequest(_)
+            | sag_core::AppError::ModelNotFound(_)
+            | sag_core::AppError::Unauthorized(_)
+    )
+}
+
+/// Order targets for `FillFirst` strategy:
+/// group by priority (descending), shuffle within each group.
+fn order_fill_first(mut targets: Vec<sag_config::RouteTarget>) -> Vec<sag_config::RouteTarget> {
+    // Sort by priority descending so same-priority items are adjacent
+    targets.sort_by_key(|t| std::cmp::Reverse(t.priority));
+
+    // Shuffle within each priority group
+    let mut i = 0;
+    while i < targets.len() {
+        let prio = targets[i].priority;
+        let mut j = i + 1;
+        while j < targets.len() && targets[j].priority == prio {
+            j += 1;
+        }
+        fastrand::shuffle(&mut targets[i..j]);
+        i = j;
     }
+    targets
+}
+
+/// Order targets for `RoundRobin` strategy:
+/// rotate the list so that each request starts at a different position.
+async fn order_round_robin(
+    targets: Vec<sag_config::RouteTarget>,
+    model_name: &str,
+    counters: &Arc<RwLock<HashMap<String, u64>>>,
+) -> Vec<sag_config::RouteTarget> {
+    let mut guard = counters.write().await;
+    let counter = guard.entry(model_name.to_string()).or_insert(0);
+    let len = targets.len();
+    let start = (*counter % len as u64) as usize;
+    *counter += 1;
+    let mut rotated = targets;
+    rotated.rotate_left(start);
+    rotated
 }
 
 /// GET /v1/analytics/stats?provider=X&model=Y

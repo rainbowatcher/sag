@@ -95,12 +95,28 @@ fn default_timeout_secs() -> u64 {
     120
 }
 
+/// Target selection strategy for a route.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strategy {
+    /// Try targets in priority order; within the same priority, pick randomly.
+    /// On failure, fall back to the next priority tier.
+    #[default]
+    FillFirst,
+    /// Distribute requests across all targets in round-robin order.
+    /// On failure, try the next target in sequence.
+    RoundRobin,
+}
+
 /// Per-model routing configuration.
 /// Maps a requested model name to one or more provider targets.
 ///
-/// When a request matches this route, the targets are sorted by priority in
-/// descending order (higher = higher priority) and tried sequentially until
-/// one succeeds or all fail.
+/// When a request matches this route, targets are selected based on the route's
+/// `strategy`:
+/// - `FillFirst`: sorted by priority (descending); same-priority targets are
+///   tried in random order. Higher-priority targets are tried first.
+/// - `RoundRobin`: targets are tried in a rotating order. Each request advances
+///   the counter, distributing load evenly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// The model name as requested by the client (supports glob-like patterns e.g. "gpt-image-*").
@@ -109,7 +125,10 @@ pub struct RouteConfig {
     /// Examples: `/v1/chat/completions`, `/v1/images/generations`, `/v1/responses`.
     #[serde(default = "default_api_endpoint")]
     pub api_endpoint: String,
-    /// Ordered list of targets — tried in descending priority order.
+    /// Target selection strategy (default: `FillFirst`).
+    #[serde(default)]
+    pub strategy: Strategy,
+    /// List of targets for this route.
     pub targets: Vec<RouteTarget>,
 }
 
@@ -119,8 +138,9 @@ fn default_api_endpoint() -> String {
 
 /// A routing target: maps a logical model to a specific provider + real model name.
 ///
-/// Multiple targets in a route are sorted by priority (descending) and tried
-/// sequentially. Targets with the same priority maintain their declaration order.
+/// Multiple targets in a route are grouped by priority and tried based on the
+/// route's `strategy`. Targets with the same priority are tried in random order
+/// when strategy is `FillFirst`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Provider name (must match a key in `providers`).

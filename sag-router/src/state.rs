@@ -15,6 +15,8 @@ pub struct AppState {
     pub providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>>,
     /// Async call log collector for analytics.
     pub collector: Arc<CallLogCollector>,
+    /// Round-robin counters keyed by route model_name.
+    pub route_counters: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl AppState {

@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         config: config_handle.clone(),
         providers: provider_registry,
         collector,
+        route_counters: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // 9. Build router
