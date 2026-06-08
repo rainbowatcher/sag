@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ChevronDown, Trash2, Pen, AlertTriangle, Loader2 } from "lucide-vue-next"
 import { ref } from "vue"
-import Label from "@/components/ui/label/Label.vue"
+import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
 
@@ -41,79 +41,15 @@ function cancelDelete() {
 
 // ── Edit flow ────────────────────────────────────────────────────
 const editingName = ref<string | null>(null)
-const editing = ref(false)
-const editError = ref("")
-
-const editForm = ref({
-  api_key: "",
-  provider_type: "openai",
-  base_url: "",
-  priority: 0,
-  max_retries: 2,
-  timeout_secs: 120,
-  supported_params: "",
-})
 
 function startEdit(p: Provider) {
-  editError.value = ""
   confirmingDelete.value = null
   editingName.value = p.name
-  editForm.value = {
-    api_key: "",
-    provider_type: p.provider_type,
-    base_url: p.base_url,
-    priority: p.priority,
-    max_retries: p.max_retries,
-    timeout_secs: p.timeout_secs,
-    supported_params: p.supported_params.join(", "),
-  }
 }
 
-function cancelEdit() {
+async function onUpdated() {
   editingName.value = null
-  editError.value = ""
-}
-
-async function handleUpdate(name: string) {
-  editError.value = ""
-  editing.value = true
-  try {
-    const current = store.providers.find((p) => p.name === name)
-    const payload: Record<string, any> = {}
-    if (editForm.value.api_key) payload.api_key = editForm.value.api_key
-    if (current && editForm.value.provider_type !== current.provider_type) {
-      payload.provider_type = editForm.value.provider_type
-    }
-    if (current && editForm.value.base_url !== current.base_url) {
-      payload.base_url = editForm.value.base_url
-    }
-    if (current && editForm.value.priority !== current.priority) {
-      payload.priority = editForm.value.priority
-    }
-    if (current && editForm.value.max_retries !== current.max_retries) {
-      payload.max_retries = editForm.value.max_retries
-    }
-    if (current && editForm.value.timeout_secs !== current.timeout_secs) {
-      payload.timeout_secs = editForm.value.timeout_secs
-    }
-    const supported = editForm.value.supported_params
-      ? editForm.value.supported_params
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : []
-    const origSupported = current?.supported_params ?? []
-    if (JSON.stringify(supported) !== JSON.stringify(origSupported)) {
-      payload.supported_params = supported
-    }
-    await store.updateProvider(name, payload)
-    editingName.value = null
-    await store.fetchProviders()
-  } catch (e: any) {
-    editError.value = e.response?.data?.error?.message ?? e.message
-  } finally {
-    editing.value = false
-  }
+  await store.fetchProviders()
 }
 </script>
 
@@ -234,97 +170,8 @@ async function handleUpdate(name: string) {
       </div>
 
       <!-- Edit form -->
-      <div v-if="editingName === p.name" class="bg-muted/20 space-y-3 border-t px-4 py-3">
-        <div v-if="editError" class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-          {{ editError }}
-        </div>
-        <div class="grid grid-cols-2 gap-3">
-          <div class="space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Name</Label>
-            <input
-              :value="p.name"
-              disabled
-              class="bg-muted text-muted-foreground h-9 w-full rounded-md border px-3 text-sm"
-            />
-          </div>
-          <div class="space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Type</Label>
-            <select
-              v-model="editForm.provider_type"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            >
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
-            </select>
-          </div>
-          <div class="col-span-2 space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium"
-              >API Key (leave blank to keep current)</Label
-            >
-            <input
-              v-model="editForm.api_key"
-              type="password"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-              placeholder="Leave blank to keep current"
-            />
-          </div>
-          <div class="col-span-2 space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Base URL</Label>
-            <input
-              v-model="editForm.base_url"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            />
-          </div>
-          <div class="space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Priority</Label>
-            <input
-              v-model.number="editForm.priority"
-              type="number"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            />
-          </div>
-          <div class="space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Max Retries</Label>
-            <input
-              v-model.number="editForm.max_retries"
-              type="number"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            />
-          </div>
-          <div class="space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Timeout (secs)</Label>
-            <input
-              v-model.number="editForm.timeout_secs"
-              type="number"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-            />
-          </div>
-          <div class="space-y-1">
-            <Label class="text-muted-foreground text-xs font-medium">Supported Params</Label>
-            <input
-              v-model="editForm.supported_params"
-              class="bg-background focus:ring-ring h-9 w-full rounded-md border px-3 text-sm outline-none focus:ring-2"
-              placeholder="model,messages,temperature"
-            />
-          </div>
-        </div>
-        <div class="flex justify-end gap-2">
-          <button
-            @click="cancelEdit"
-            :disabled="editing"
-            class="hover:bg-accent h-8 rounded-md border px-3 text-xs transition-colors disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            @click="handleUpdate(p.name)"
-            :disabled="editing"
-            class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs transition-colors disabled:opacity-50"
-          >
-            <Loader2 v-if="editing" class="h-3 w-3 animate-spin" />
-            {{ editing ? "Saving..." : "Save" }}
-          </button>
-        </div>
+      <div v-if="editingName === p.name" class="bg-muted/20 border-t px-4 py-3">
+        <ProviderEditForm :provider="p" @close="editingName = null" @updated="onUpdated" />
       </div>
 
       <!-- Expanded details -->
