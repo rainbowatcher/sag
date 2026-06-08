@@ -13,6 +13,11 @@ const showAdd = ref(false)
 onMounted(async () => {
   await Promise.all([providerStore.fetchProviders(), routeStore.fetchRoutes()])
 })
+
+const handleRouteCreated = () => {
+  showAdd.value = false
+  routeStore.fetchRoutes()
+}
 </script>
 
 <template>
@@ -45,10 +50,7 @@ onMounted(async () => {
       :provider-models="routeStore.providerModels"
       :provider-models-loading="routeStore.providerModelsLoading"
       @close="showAdd = false"
-      @created="
-        showAdd = false
-        routeStore.fetchRoutes()
-      "
+      @created="handleRouteCreated"
     />
     <!-- Route list -->
     <div
