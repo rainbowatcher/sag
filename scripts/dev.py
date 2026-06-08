@@ -54,11 +54,11 @@ def start_ui() -> subprocess.Popen:
     ui_dir = PROJECT_ROOT / "sag-ui"
     if not (ui_dir / "node_modules").exists():
         log("SYS", "Installing UI dependencies first...")
-        subprocess.run(["npm", "install"], cwd=ui_dir, check=True)
+        subprocess.run(["pnpm", "install"], cwd=ui_dir, check=True)
 
-    log("SYS", "Starting UI dev server: npm run dev")
+    log("SYS", "Starting UI dev server: pnpm run dev")
     return subprocess.Popen(
-        ["npm", "run", "dev"],
+        ["pnpm", "run", "dev"],
         cwd=ui_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -172,7 +172,9 @@ def main() -> None:
     if not args.skip_backend:
         backend = start_backend(args.config, args.release)
         procs.append(backend)
-        threading.Thread(target=stream_output, args=(backend, "BACKEND"), daemon=True).start()
+        threading.Thread(
+            target=stream_output, args=(backend, "BACKEND"), daemon=True
+        ).start()
 
     # ── 前端 ──
     if not args.skip_ui:
