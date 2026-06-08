@@ -98,15 +98,14 @@ async function handleSubmit(event: Event) {
   }
 }
 
-watch(
-  () => form.state.values.provider_name,
-  (name) => {
-    form.setFieldValue("real_model", "")
-    if (name) {
-      routeStore.fetchProviderModels(name)
-    }
-  },
-)
+const providerName = form.useStore((state) => state.values.provider_name)
+
+watch(providerName, (name) => {
+  form.setFieldValue("real_model", "")
+  if (name) {
+    routeStore.fetchProviderModels(name)
+  }
+})
 
 const endpointPresets = [
   { label: "Chat Completions", value: "/v1/chat/completions" },
