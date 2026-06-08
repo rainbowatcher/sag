@@ -134,7 +134,7 @@ async function handleSubmit(event: Event) {
               <SelectTrigger :id="field.name">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent class="w-(--reka-select-trigger-width)">
                 <SelectItem value="openai">OpenAI</SelectItem>
                 <SelectItem value="anthropic">Anthropic</SelectItem>
               </SelectContent>

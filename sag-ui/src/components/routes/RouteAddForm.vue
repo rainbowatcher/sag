@@ -139,7 +139,7 @@ const endpointPresets = [
                 <SelectTrigger :id="field.name" :aria-invalid="isInvalid(field)">
                   <SelectValue placeholder="Select provider..." />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent class="w-(--reka-select-trigger-width)">
                   <SelectItem v-for="p in providers" :key="p.name" :value="p.name">
                     {{ p.name }} ({{ p.provider_type }})
                   </SelectItem>
