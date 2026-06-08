@@ -20,11 +20,14 @@ export interface RouteConfig {
   targets: RouteTarget[]
 }
 
+export type Strategy = "fill_first" | "round_robin"
+
 export interface AddRoutePayload {
   model_name: string
   real_model?: string
   api_endpoint?: string
   priority?: number
+  strategy?: Strategy
 }
 
 export interface StatsRow {
