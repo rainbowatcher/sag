@@ -3,3 +3,5 @@ allowBuilds:
   vue-demi: false
 minimumReleaseAgeExclude:
   - "@types/node@22.19.20"
+  - '@vue/language-core@3.3.4'
+  - vue-tsc@3.3.4
