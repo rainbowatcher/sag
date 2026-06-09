@@ -76,6 +76,7 @@ sag/
 ### API 设计
 - 遵循 OpenAI `/v1/chat/completions` 接口格式
 - 错误响应格式: `{ "error": { "code": "...", "message": "..." } }`
+- 避免使用路径参数
 
 ## 开发流程
 
