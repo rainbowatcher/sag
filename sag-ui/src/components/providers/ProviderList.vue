@@ -148,12 +148,12 @@ async function onUpdated() {
           {{ deleteError }}
         </div>
         <div class="flex justify-end gap-2">
-          <Button variant="outline" size="xs" @click="cancelDelete" :disabled="deleting">
+          <Button variant="outline" size="sm" @click="cancelDelete" :disabled="deleting">
             Cancel
           </Button>
           <Button
             variant="destructive"
-            size="xs"
+            size="sm"
             @click="confirmDelete(p.name)"
             :disabled="deleting"
           >
@@ -193,6 +193,28 @@ async function onUpdated() {
               :key="param"
               class="bg-muted rounded-full px-1.5 py-0.5"
               >{{ param }}</span
+            >
+          </div>
+        </div>
+        <div v-if="Object.keys(p.headers ?? {}).length > 0" class="flex gap-2">
+          <span class="text-muted-foreground w-20 shrink-0">Headers:</span>
+          <div class="flex flex-wrap gap-1">
+            <span
+              v-for="(v, k) in p.headers"
+              :key="k"
+              class="bg-muted rounded-full px-1.5 py-0.5 font-mono text-xs"
+              >{{ k }}: {{ v }}</span
+            >
+          </div>
+        </div>
+        <div v-if="Object.keys(p.body_overrides ?? {}).length > 0" class="flex gap-2">
+          <span class="text-muted-foreground w-20 shrink-0">Body Overrides:</span>
+          <div class="flex flex-wrap gap-1">
+            <span
+              v-for="(v, k) in p.body_overrides"
+              :key="k"
+              class="bg-muted rounded-full px-1.5 py-0.5 font-mono text-xs"
+              >{{ k }}: {{ typeof v === "object" ? JSON.stringify(v) : String(v) }}</span
             >
           </div>
         </div>

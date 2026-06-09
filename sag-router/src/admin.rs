@@ -3,10 +3,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, put},
+    routing::get,
 };
 use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget, Strategy};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -51,6 +52,15 @@ struct AddProviderRequest {
     timeout_secs: u64,
     #[serde(default)]
     supported_params: Vec<String>,
+    /// Custom headers to override upstream request headers.
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    /// Body field overrides merged into the upstream JSON request.
+    #[serde(default)]
+    body_overrides: HashMap<String, serde_json::Value>,
+    /// List of model IDs enabled for this provider (optional).
+    #[serde(default)]
+    enabled_models: Vec<String>,
 }
 
 fn default_provider_type() -> String {
@@ -120,6 +130,9 @@ struct UpdateProviderRequest {
     max_retries: Option<u32>,
     timeout_secs: Option<u64>,
     supported_params: Option<Vec<String>>,
+    headers: Option<HashMap<String, String>>,
+    body_overrides: Option<HashMap<String, serde_json::Value>>,
+    enabled_models: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -136,6 +149,8 @@ struct ProviderInfo {
     max_retries: u32,
     timeout_secs: u64,
     supported_params: Vec<String>,
+    headers: HashMap<String, String>,
+    body_overrides: HashMap<String, serde_json::Value>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -156,6 +171,8 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
             max_retries: cfg.max_retries,
             timeout_secs: cfg.timeout_secs,
             supported_params: cfg.supported_params.clone(),
+            headers: cfg.headers.clone(),
+            body_overrides: cfg.body_overrides.clone(),
         })
         .collect();
 
@@ -372,6 +389,8 @@ async fn add_provider(
             max_retries: req.max_retries,
             timeout_secs: req.timeout_secs,
             supported_params: req.supported_params.clone(),
+            headers: req.headers.clone(),
+            body_overrides: req.body_overrides.clone(),
         };
 
         config.providers.insert(req.name.clone(), pc.clone());
@@ -467,6 +486,12 @@ async fn update_provider(
         if let Some(v) = req.supported_params {
             existing.supported_params = v;
         }
+        if let Some(v) = req.headers {
+            existing.headers = v;
+        }
+        if let Some(v) = req.body_overrides {
+            existing.body_overrides = v;
+        }
 
         let pc = existing.clone();
 
@@ -518,6 +543,8 @@ async fn update_provider(
             "max_retries": provider_config.max_retries,
             "timeout_secs": provider_config.timeout_secs,
             "supported_params": provider_config.supported_params,
+            "headers": provider_config.headers,
+            "body_overrides": provider_config.body_overrides,
         })),
     )
         .into_response()
@@ -778,6 +805,8 @@ mod tests {
                 max_retries: 2,
                 timeout_secs: 120,
                 supported_params: vec![],
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
             },
         );
         let routes = routes
@@ -881,6 +910,8 @@ mod tests {
                     max_retries: 2,
                     timeout_secs: 120,
                     supported_params: vec![],
+                    headers: HashMap::new(),
+                    body_overrides: HashMap::new(),
                 },
             );
         }
@@ -1387,6 +1418,8 @@ mod auth_regression_tests {
                 max_retries: 2,
                 timeout_secs: 120,
                 supported_params: vec![],
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
             },
         );
         let config = GatewayConfig {

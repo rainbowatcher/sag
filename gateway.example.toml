@@ -46,6 +46,17 @@ supported_params = [
     "stream", "stop", "max_tokens", "tools", "tool_choice",
 ]
 
+# Custom headers override or add to the default request headers.
+# [providers.my-custom.headers]
+# x-api-key = "override-key"
+# x-custom-header = "value"
+
+# Body overrides merge into the upstream JSON request body at the top level.
+# Useful for setting provider-specific parameters or overriding defaults.
+# [providers.my-custom.body_overrides]
+# max_tokens = 4096
+# temperature = 0.8
+
 # ============================================================
 # Model routing table
 # Requested model -> [provider targets sorted by priority descending]

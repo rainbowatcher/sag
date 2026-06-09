@@ -38,6 +38,8 @@ const formSchema = z.object({
   max_retries: z.number(),
   timeout_secs: z.number(),
   supported_params: z.string(),
+  headers_json: z.string(),
+  body_overrides_json: z.string(),
 })
 
 const form = useForm({
@@ -49,6 +51,8 @@ const form = useForm({
     max_retries: props.provider.max_retries,
     timeout_secs: props.provider.timeout_secs,
     supported_params: props.provider.supported_params.join(", "),
+    headers_json: JSON.stringify(props.provider.headers ?? {}, null, 2),
+    body_overrides_json: JSON.stringify(props.provider.body_overrides ?? {}, null, 2),
   },
   validators: {
     onSubmit: formSchema,
@@ -84,9 +88,30 @@ const form = useForm({
       if (JSON.stringify(supported) !== JSON.stringify(origSupported)) {
         payload.supported_params = supported
       }
+      // Headers
+      try {
+        const parsed = value.headers_json ? JSON.parse(value.headers_json) : {}
+        if (JSON.stringify(parsed) !== JSON.stringify(current.headers ?? {})) {
+          payload.headers = parsed
+        }
+      } catch {
+        apiError.value = "Headers must be valid JSON"
+        throw new Error("invalid headers JSON")
+      }
+      // Body overrides
+      try {
+        const parsed = value.body_overrides_json ? JSON.parse(value.body_overrides_json) : {}
+        if (JSON.stringify(parsed) !== JSON.stringify(current.body_overrides ?? {})) {
+          payload.body_overrides = parsed
+        }
+      } catch {
+        apiError.value = "Body overrides must be valid JSON"
+        throw new Error("invalid body_overrides JSON")
+      }
       await store.updateProvider(current.name, payload)
       emit("updated")
     } catch (e: any) {
+      if (apiError.value) return
       apiError.value = e.response?.data?.error?.message ?? e.message
       throw e
     }
@@ -246,6 +271,50 @@ async function handleSubmit(event: Event) {
                 @blur="field.handleBlur"
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
+              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+            </Field>
+          </form.Field>
+        </div>
+
+        <div class="col-span-2">
+          <form.Field name="headers_json" #default="{ field }">
+            <Field :data-invalid="isInvalid(field)">
+              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
+                >Headers (JSON)</FieldLabel
+              >
+              <Input
+                :id="field.name"
+                :model-value="field.state.value"
+                placeholder='{"Authorization":"Bearer custom","X-Custom":"value"}'
+                :aria-invalid="isInvalid(field)"
+                @blur="field.handleBlur"
+                @input="field.handleChange(($event.target as HTMLInputElement).value)"
+              />
+              <p class="text-muted-foreground mt-0.5 text-xs">
+                Optional JSON object of custom headers.
+              </p>
+              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+            </Field>
+          </form.Field>
+        </div>
+
+        <div class="col-span-2">
+          <form.Field name="body_overrides_json" #default="{ field }">
+            <Field :data-invalid="isInvalid(field)">
+              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
+                >Body Overrides (JSON)</FieldLabel
+              >
+              <Input
+                :id="field.name"
+                :model-value="field.state.value"
+                placeholder='{"max_tokens":4096,"temperature":0.8}'
+                :aria-invalid="isInvalid(field)"
+                @blur="field.handleBlur"
+                @input="field.handleChange(($event.target as HTMLInputElement).value)"
+              />
+              <p class="text-muted-foreground mt-0.5 text-xs">
+                Optional JSON object of fields to override in the upstream request body.
+              </p>
               <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>

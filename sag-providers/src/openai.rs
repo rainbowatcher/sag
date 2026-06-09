@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -10,7 +12,7 @@ use sag_core::{
 };
 use tracing::{debug, error, instrument, warn};
 
-use crate::LlmProvider;
+use crate::{apply_body_overrides, apply_headers, LlmProvider};
 
 /// OpenAI-compatible provider adapter.
 ///
@@ -21,6 +23,8 @@ pub struct OpenAiProvider {
     api_key: String,
     http_client: reqwest::Client,
     supported_params: Vec<String>,
+    headers: HashMap<String, String>,
+    body_overrides: HashMap<String, serde_json::Value>,
 }
 
 impl OpenAiProvider {
@@ -37,6 +41,8 @@ impl OpenAiProvider {
             api_key: config.api_key.clone(),
             http_client,
             supported_params: config.supported_params.clone(),
+            headers: config.headers.clone(),
+            body_overrides: config.body_overrides.clone(),
         }
     }
 
@@ -75,6 +81,24 @@ impl OpenAiProvider {
         let path = api_endpoint.trim_start_matches('/');
         format!("{}/{}", base, path)
     }
+
+    /// Build a reqwest request with default + custom headers and optional body overrides.
+    fn build_request(
+        &self,
+        url: &str,
+        body: serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        let req = self
+            .http_client
+            .post(url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(CONTENT_TYPE, "application/json");
+
+        let req = apply_headers(req, &self.headers);
+
+        let body = apply_body_overrides(body, &self.body_overrides);
+        req.json(&body)
+    }
 }
 
 #[async_trait]
@@ -104,12 +128,11 @@ impl LlmProvider for OpenAiProvider {
         let url = self.build_url(api_endpoint);
         debug!(%url, "sending non-streaming chat request");
 
+        let body = serde_json::to_value(&upstream_request)
+            .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
+
         let response = self
-            .http_client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&upstream_request)
+            .build_request(&url, body)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -149,12 +172,11 @@ impl LlmProvider for OpenAiProvider {
         let url = self.build_url(api_endpoint);
         debug!(%url, "sending streaming chat request");
 
+        let body = serde_json::to_value(&upstream_request)
+            .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
+
         let response = self
-            .http_client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&upstream_request)
+            .build_request(&url, body)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -205,12 +227,11 @@ impl LlmProvider for OpenAiProvider {
         let url = self.build_url("/images/generations");
         debug!(%url, "sending image generation request");
 
+        let body = serde_json::to_value(&upstream)
+            .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
+
         let response = self
-            .http_client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&upstream)
+            .build_request(&url, body)
             .send()
             .await
             .map_err(AppError::from)?;

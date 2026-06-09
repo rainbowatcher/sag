@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -11,7 +13,7 @@ use sag_core::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, instrument, warn};
 
-use crate::LlmProvider;
+use crate::{apply_body_overrides, apply_headers, LlmProvider};
 
 // ── Anthropic wire types ─────────────────────────────────────────
 
@@ -85,6 +87,8 @@ pub struct AnthropicProvider {
     api_key: String,
     http_client: reqwest::Client,
     supported_params: Vec<String>,
+    headers: HashMap<String, String>,
+    body_overrides: HashMap<String, serde_json::Value>,
 }
 
 impl AnthropicProvider {
@@ -101,6 +105,8 @@ impl AnthropicProvider {
             api_key: config.api_key.clone(),
             http_client,
             supported_params: config.supported_params.clone(),
+            headers: config.headers.clone(),
+            body_overrides: config.body_overrides.clone(),
         }
     }
 
@@ -203,6 +209,25 @@ impl AnthropicProvider {
             usage,
         }
     }
+
+    /// Build a reqwest request with default + custom headers and optional body overrides.
+    fn build_request(
+        &self,
+        url: &str,
+        body: serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        let req = self
+            .http_client
+            .post(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header(CONTENT_TYPE, "application/json");
+
+        let req = apply_headers(req, &self.headers);
+
+        let body = apply_body_overrides(body, &self.body_overrides);
+        req.json(&body)
+    }
 }
 
 #[async_trait]
@@ -228,13 +253,11 @@ impl LlmProvider for AnthropicProvider {
         let url = format!("{}/messages", self.base_url);
         debug!(%url, "sending anthropic non-streaming request");
 
+        let body = serde_json::to_value(&upstream)
+            .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
+
         let response = self
-            .http_client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header(CONTENT_TYPE, "application/json")
-            .json(&upstream)
+            .build_request(&url, body)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -272,13 +295,11 @@ impl LlmProvider for AnthropicProvider {
         let url = format!("{}/messages", self.base_url);
         debug!(%url, "sending anthropic streaming request");
 
+        let body = serde_json::to_value(&upstream)
+            .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
+
         let response = self
-            .http_client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header(CONTENT_TYPE, "application/json")
-            .json(&upstream)
+            .build_request(&url, body)
             .send()
             .await
             .map_err(AppError::from)?;

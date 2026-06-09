@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Root configuration for the SAG (Smart AI Gateway).
@@ -73,6 +75,22 @@ pub struct ProviderConfig {
     /// Requests containing parameters not in this set will be rejected with 400.
     #[serde(default)]
     pub supported_params: Vec<String>,
+    /// Custom headers to add to or override in upstream requests.
+    /// These are applied after the provider's default headers,
+    /// so they can override auth, content-type, etc.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Request body field overrides merged into the upstream JSON body.
+    /// Key-value pairs are inserted at the top level of the body,
+    /// allowing you to set or override any field (e.g. max_tokens, temperature,
+    /// or provider-specific parameters).
+    #[serde(default)]
+    pub body_overrides: HashMap<String, serde_json::Value>,
+    /// List of model IDs enabled for this provider.
+    /// When non-empty, only these models may be used with this provider.
+    /// When empty (default), all models are allowed (backward compatible).
+    #[serde(default)]
+    pub enabled_models: Vec<String>,
 }
 
 fn default_provider_type() -> String {
@@ -254,6 +272,14 @@ priority = 1
 max_retries = 5
 timeout_secs = 60
 supported_params = ["model", "messages", "stream"]
+
+[providers.anthropic.headers]
+Authorization = "Bearer custom-token"
+X-Debug = "true"
+
+[providers.anthropic.body_overrides]
+max_tokens = 4096
+temperature = 0.8
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         let p = config.providers.get("anthropic").unwrap();
@@ -263,6 +289,10 @@ supported_params = ["model", "messages", "stream"]
         assert_eq!(p.max_retries, 5);
         assert_eq!(p.timeout_secs, 60);
         assert_eq!(p.supported_params, vec!["model", "messages", "stream"]);
+        assert_eq!(p.headers.get("Authorization").unwrap(), "Bearer custom-token");
+        assert_eq!(p.headers.get("X-Debug").unwrap(), "true");
+        assert_eq!(p.body_overrides.get("max_tokens").unwrap(), &serde_json::json!(4096));
+        assert_eq!(p.body_overrides.get("temperature").unwrap(), &serde_json::json!(0.8));
     }
 
     #[test]

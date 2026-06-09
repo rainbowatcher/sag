@@ -6,6 +6,8 @@ export interface Provider {
   max_retries: number
   timeout_secs: number
   supported_params: string[]
+  headers: Record<string, string>
+  body_overrides: Record<string, any>
 }
 
 export interface RouteTarget {

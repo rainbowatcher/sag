@@ -30,6 +30,8 @@ export const useProviderStore = defineStore("providers", () => {
     base_url?: string
     priority?: number
     supported_params?: string[]
+    headers?: Record<string, string>
+    body_overrides?: Record<string, any>
   }) {
     try {
       const conn = useConnectionStore()
@@ -65,6 +67,8 @@ export const useProviderStore = defineStore("providers", () => {
       max_retries?: number
       timeout_secs?: number
       supported_params?: string[]
+      headers?: Record<string, string>
+      body_overrides?: Record<string, any>
     },
   ) {
     try {
