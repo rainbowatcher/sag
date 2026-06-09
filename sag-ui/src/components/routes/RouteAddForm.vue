@@ -35,7 +35,7 @@ import {
 } from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useRouteStore } from "@/stores/routes"
-import type { AddRoutePayload, Provider, Strategy } from "@/types/api"
+import type { Provider, Strategy, CreateRoutePayload } from "@/types/api"
 
 const routeStore = useRouteStore()
 
@@ -94,7 +94,7 @@ const formSchema = z.object({
 const form = useForm({
   defaultValues: {
     model_name: "",
-    api_endpoint: "/v1/chat/completions",
+    api_endpoint: "/chat/completions",
     strategy: "fill_first" as Strategy,
   },
   validators: {
@@ -127,26 +127,18 @@ async function handleSubmit(event: Event) {
       return
     }
 
-    const errors: string[] = []
-    for (const [i, t] of targets.value.entries()) {
-      const payload: AddRoutePayload = {
-        model_name: routeName,
+    const payload: CreateRoutePayload = {
+      model_name: routeName,
+      api_endpoint: form.state.values.api_endpoint,
+      strategy: form.state.values.strategy,
+      targets: targets.value.map((t) => ({
+        provider: t.provider_name,
         real_model: t.real_model || undefined,
-        api_endpoint: form.state.values.api_endpoint || undefined,
         priority: t.priority,
-        strategy: i === 0 ? form.state.values.strategy : undefined,
-      }
-      try {
-        await routeStore.addRoute(t.provider_name, payload)
-      } catch (e: any) {
-        errors.push(`${t.provider_name}: ${e.response?.data?.error?.message ?? e.message}`)
-      }
+      })),
     }
 
-    if (errors.length > 0) {
-      apiError.value = errors.join("; ")
-      return
-    }
+    await routeStore.createRoute(payload)
     emit("created")
   } catch (e: any) {
     apiError.value = e.response?.data?.error?.message ?? e.message

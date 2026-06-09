@@ -1,0 +1,260 @@
+<script setup lang="ts">
+import { useForm } from "@tanstack/vue-form"
+import { Loader2, Plus, Trash2, ChevronsUpDown, Check } from "lucide-vue-next"
+import { ref } from "vue"
+import { z } from "zod"
+import { Button } from "@/components/ui/button"
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command"
+import { Field, FieldError, FieldLabel } from "@/components/ui/field"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { useProviderStore } from "@/stores/providers"
+import { useRouteStore } from "@/stores/routes"
+import type { RouteConfig, Strategy } from "@/types/api"
+
+const routeStore = useRouteStore()
+const providerStore = useProviderStore()
+
+const props = defineProps<{
+  route: RouteConfig
+}>()
+
+const emit = defineEmits<{
+  close: []
+  updated: []
+}>()
+
+const saving = ref(false)
+const apiError = ref("")
+const openPopover = ref<Record<number, boolean>>({})
+
+interface TargetEdit {
+  provider: string
+  real_model: string
+  priority: number
+}
+
+const targets = ref<TargetEdit[]>(
+  props.route.targets.map((t) => ({
+    provider: t.provider,
+    real_model: t.real_model ?? "",
+    priority: t.priority,
+  })),
+)
+
+function addTarget() {
+  targets.value.push({ provider: "", real_model: "", priority: 0 })
+}
+
+function removeTarget(index: number) {
+  if (targets.value.length > 1) {
+    targets.value.splice(index, 1)
+  }
+}
+
+const endpointPresets = [
+  { label: "Chat Completions", value: "/chat/completions" },
+  { label: "Responses (GPT-5)", value: "/responses" },
+  { label: "Image Generation", value: "/images/generations" },
+]
+
+const formSchema = z.object({
+  api_endpoint: z.string().min(1),
+  strategy: z.enum(["fill_first", "round_robin"]),
+})
+
+const form = useForm({
+  defaultValues: {
+    api_endpoint: props.route.api_endpoint,
+    strategy: props.route.strategy,
+  },
+  validators: {
+    onSubmit: formSchema,
+  },
+  onSubmit: async ({ value }) => {
+    apiError.value = ""
+    try {
+      if (targets.value.length === 0) {
+        apiError.value = "At least one target is required"
+        return
+      }
+      const emptyTarget = targets.value.find((t) => !t.provider)
+      if (emptyTarget) {
+        apiError.value = "Each target must have a provider selected"
+        return
+      }
+
+      await routeStore.updateRoute({
+        model_name: props.route.model_name,
+        api_endpoint:
+          value.api_endpoint !== props.route.api_endpoint ? value.api_endpoint : undefined,
+        strategy: value.strategy !== props.route.strategy ? value.strategy : undefined,
+        targets: targets.value.map((t) => ({
+          provider: t.provider,
+          real_model: t.real_model || undefined,
+          priority: t.priority,
+        })),
+      })
+      emit("updated")
+    } catch (e: any) {
+      apiError.value = e.response?.data?.error?.message ?? e.message
+      throw e
+    }
+  },
+})
+
+async function handleSubmit(event: Event) {
+  event.preventDefault()
+  apiError.value = ""
+  saving.value = true
+  try {
+    await form.handleSubmit()
+    if (apiError.value) return
+    emit("updated")
+  } finally {
+    saving.value = false
+  }
+}
+</script>
+
+<template>
+  <div class="space-y-3">
+    <div v-if="apiError" class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
+      {{ apiError }}
+    </div>
+    <form id="route-edit-form" @submit.prevent="handleSubmit">
+      <div class="grid grid-cols-2 gap-3">
+        <div class="space-y-1">
+          <FieldLabel class="text-muted-foreground text-xs font-medium">Model Name</FieldLabel>
+          <Input :model-value="route.model_name" disabled class="bg-muted text-muted-foreground" />
+        </div>
+        <form.Field name="strategy" #default="{ field }">
+          <Field>
+            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
+              >Strategy</FieldLabel
+            >
+            <ToggleGroup
+              :model-value="field.state.value"
+              @update:model-value="(v) => field.handleChange(v as Strategy)"
+              type="single"
+              variant="outline"
+              size="sm"
+              class="justify-start"
+            >
+              <ToggleGroupItem value="fill_first">Fill-first</ToggleGroupItem>
+              <ToggleGroupItem value="round_robin">Round-robin</ToggleGroupItem>
+            </ToggleGroup>
+          </Field>
+        </form.Field>
+
+        <div class="col-span-2">
+          <form.Field name="api_endpoint" #default="{ field }">
+            <Field>
+              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
+                >API Endpoint</FieldLabel
+              >
+              <ToggleGroup
+                :model-value="field.state.value"
+                @update:model-value="(v) => field.handleChange(v as string)"
+                type="single"
+                variant="outline"
+                size="sm"
+                class="justify-start"
+              >
+                <ToggleGroupItem v-for="ep in endpointPresets" :key="ep.value" :value="ep.value">
+                  {{ ep.label }}
+                </ToggleGroupItem>
+              </ToggleGroup>
+            </Field>
+          </form.Field>
+        </div>
+      </div>
+
+      <div class="mt-4 space-y-3">
+        <div class="flex items-center justify-between">
+          <p class="text-sm font-medium">Targets</p>
+          <Button type="button" variant="outline" size="sm" @click="addTarget">
+            <Plus class="mr-1 h-3.5 w-3.5" />
+            Add Target
+          </Button>
+        </div>
+
+        <div v-for="(t, i) in targets" :key="i" class="flex items-end gap-2 rounded-lg border p-3">
+          <span class="text-muted-foreground mb-2 w-5 pt-1 text-center text-xs font-medium">
+            {{ i + 1 }}
+          </span>
+
+          <div class="flex-1">
+            <Label class="text-xs">Provider</Label>
+            <Select
+              :model-value="t.provider"
+              @update:model-value="(v) => (t.provider = v as string)"
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select..." />
+              </SelectTrigger>
+              <SelectContent class="w-(--reka-select-trigger-width)">
+                <SelectItem v-for="p in providerStore.providers" :key="p.name" :value="p.name">
+                  {{ p.name }} ({{ p.provider_type }})
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div class="flex-1">
+            <Label class="text-xs">Real Model</Label>
+            <Input
+              :model-value="t.real_model"
+              @input="t.real_model = ($event.target as HTMLInputElement).value"
+              placeholder="gpt-4o"
+            />
+          </div>
+
+          <div class="w-20">
+            <Label class="text-xs">Priority</Label>
+            <Input
+              type="number"
+              :model-value="t.priority"
+              @input="t.priority = Number(($event.target as HTMLInputElement).value)"
+            />
+          </div>
+
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            :disabled="targets.length === 1"
+            @click="removeTarget(i)"
+          >
+            <Trash2 class="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </form>
+    <div class="flex justify-end gap-2">
+      <Button variant="outline" size="sm" @click="emit('close')" :disabled="saving">
+        Cancel
+      </Button>
+      <Button type="submit" form="route-edit-form" size="sm" :disabled="saving">
+        <Loader2 v-if="saving" class="h-3 w-3 animate-spin" />
+        {{ saving ? "Saving..." : "Save" }}
+      </Button>
+    </div>
+  </div>
+</template>

@@ -10,24 +10,31 @@ export interface Provider {
 
 export interface RouteTarget {
   provider: string
-  real_model: string
+  real_model: string | null
   priority: number
 }
 
 export interface RouteConfig {
   model_name: string
   api_endpoint: string
+  strategy: Strategy
   targets: RouteTarget[]
 }
 
 export type Strategy = "fill_first" | "round_robin"
 
-export interface AddRoutePayload {
+export interface CreateRoutePayload {
   model_name: string
-  real_model?: string
   api_endpoint?: string
-  priority?: number
   strategy?: Strategy
+  targets: Array<{ provider: string; real_model?: string; priority?: number }>
+}
+
+export interface UpdateRoutePayload {
+  model_name: string
+  api_endpoint?: string
+  strategy?: Strategy
+  targets?: Array<{ provider: string; real_model?: string; priority?: number }>
 }
 
 export interface StatsRow {

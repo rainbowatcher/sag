@@ -1,7 +1,7 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api, headers } from "@/lib/client"
-import type { RouteConfig, AddRoutePayload } from "@/types/api"
+import type { RouteConfig, CreateRoutePayload, UpdateRoutePayload } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
 export const useRouteStore = defineStore("routes", () => {
@@ -42,11 +42,36 @@ export const useRouteStore = defineStore("routes", () => {
     }
   }
 
-  async function addRoute(providerName: string, payload: AddRoutePayload) {
+  async function createRoute(payload: CreateRoutePayload) {
     try {
       const conn = useConnectionStore()
-      await api.post(`/api/providers/${providerName}/routes`, payload, {
+      await api.post("/api/routes", payload, {
         headers: headers(conn.connection?.apiKey),
+      })
+    } catch (e: any) {
+      if (e.response?.status === 401) useConnectionStore().handle401()
+      throw e
+    }
+  }
+
+  async function updateRoute(payload: UpdateRoutePayload) {
+    try {
+      const conn = useConnectionStore()
+      await api.put("/api/routes", payload, {
+        headers: headers(conn.connection?.apiKey),
+      })
+    } catch (e: any) {
+      if (e.response?.status === 401) useConnectionStore().handle401()
+      throw e
+    }
+  }
+
+  async function deleteRoute(modelName: string) {
+    try {
+      const conn = useConnectionStore()
+      await api.delete("/api/routes", {
+        headers: headers(conn.connection?.apiKey),
+        data: { model_name: modelName },
       })
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
@@ -61,6 +86,8 @@ export const useRouteStore = defineStore("routes", () => {
     providerModelsLoading,
     fetchRoutes,
     fetchProviderModels,
-    addRoute,
+    createRoute,
+    updateRoute,
+    deleteRoute,
   }
 })

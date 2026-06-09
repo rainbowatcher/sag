@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, put},
 };
 use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget, Strategy};
 use serde_json::json;
@@ -23,8 +23,10 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .delete(delete_provider),
         )
         .route("/providers/{name}/models", get(list_provider_models))
-        .route("/providers/{name}/routes", post(add_route_for_provider))
-        .route("/routes", get(list_routes))
+        .route(
+            "/routes",
+            get(list_routes).post(create_route).put(update_route).delete(delete_route),
+        )
         .with_state(state)
 }
 
@@ -67,28 +69,45 @@ fn default_timeout_secs() -> u64 {
     120
 }
 
-#[derive(serde::Deserialize)]
-struct AddRouteRequest {
-    /// The model name clients request (e.g. "gpt-4o").
-    model_name: String,
-    /// The real model name sent to the upstream provider.
-    /// If `null` or omitted, the original client-requested model name is used as-is.
-    #[serde(default)]
-    real_model: Option<String>,
-    /// Upstream API endpoint path (default: /v1/chat/completions).
-    #[serde(default = "default_api_endpoint")]
-    api_endpoint: String,
-    #[serde(default = "default_priority")]
-    priority: u32,
-    /// Target selection strategy for the route.
-    /// Only applied when creating a new route (first target); ignored when
-    /// appending to an existing route.
-    #[serde(default)]
-    strategy: Option<Strategy>,
-}
-
 fn default_api_endpoint() -> String {
     "/chat/completions".into()
+}
+
+// ── Route request types ───────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct RouteTargetInput {
+    provider: String,
+    #[serde(default)]
+    real_model: Option<String>,
+    #[serde(default)]
+    priority: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct CreateRouteRequest {
+    model_name: String,
+    #[serde(default = "default_api_endpoint")]
+    api_endpoint: String,
+    #[serde(default)]
+    strategy: Option<Strategy>,
+    targets: Vec<RouteTargetInput>,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateRouteRequest {
+    model_name: String,
+    #[serde(default)]
+    api_endpoint: Option<String>,
+    #[serde(default)]
+    strategy: Option<Strategy>,
+    #[serde(default)]
+    targets: Option<Vec<RouteTargetInput>>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteRouteRequest {
+    model_name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -147,6 +166,183 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
 async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
     (StatusCode::OK, Json(json!({ "routes": config.routes }))).into_response()
+}
+
+/// POST /api/routes — create a new route.
+async fn create_route(
+    State(state): State<AppState>,
+    Json(req): Json<CreateRouteRequest>,
+) -> impl IntoResponse {
+    {
+        let mut config = state.config.write().await;
+
+        if config.routes.iter().any(|r| r.model_name == req.model_name) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": { "code": "CONFLICT", "message": format!("route '{}' already exists", req.model_name) }
+                })),
+            )
+                .into_response();
+        }
+
+        for t in &req.targets {
+            if !config.providers.contains_key(&t.provider) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": { "code": "BAD_REQUEST", "message": format!("provider '{}' not found", t.provider) }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
+        let route = RouteConfig {
+            model_name: req.model_name.clone(),
+            api_endpoint: req.api_endpoint,
+            strategy: req.strategy.unwrap_or_default(),
+            targets: req
+                .targets
+                .into_iter()
+                .map(|t| RouteTarget {
+                    provider: t.provider,
+                    real_model: t.real_model,
+                    priority: t.priority,
+                })
+                .collect(),
+        };
+
+        config.routes.push(route);
+
+        if state.config.is_file_backed()
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        {
+            warn!(?e, "failed to persist config after creating route");
+        }
+    }
+
+    info!(model = %req.model_name, "route created via admin API");
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "model_name": req.model_name,
+        })),
+    )
+        .into_response()
+}
+
+/// PUT /api/routes — update an existing route (partial update).
+async fn update_route(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateRouteRequest>,
+) -> impl IntoResponse {
+    {
+        let mut config = state.config.write().await;
+
+        // Validate targets upfront before any mutable borrow
+        if let Some(ref targets) = req.targets {
+            for t in targets {
+                if !config.providers.contains_key(&t.provider) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": { "code": "BAD_REQUEST", "message": format!("provider '{}' not found", t.provider) }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        let idx = match config.routes.iter().position(|r| r.model_name == req.model_name) {
+            Some(i) => i,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": { "code": "NOT_FOUND", "message": format!("route '{}' not found", req.model_name) }
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        let existing = &mut config.routes[idx];
+
+        if let Some(endpoint) = req.api_endpoint {
+            existing.api_endpoint = endpoint;
+        }
+        if let Some(strategy) = req.strategy {
+            existing.strategy = strategy;
+        }
+        if let Some(targets) = req.targets {
+            existing.targets = targets
+                .into_iter()
+                .map(|t| RouteTarget {
+                    provider: t.provider,
+                    real_model: t.real_model,
+                    priority: t.priority,
+                })
+                .collect();
+        }
+
+        if state.config.is_file_backed()
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        {
+            warn!(?e, "failed to persist config after updating route");
+        }
+    }
+
+    info!(model = %req.model_name, "route updated via admin API");
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "model_name": req.model_name,
+        })),
+    )
+        .into_response()
+}
+
+/// DELETE /api/routes — delete a route by model_name.
+async fn delete_route(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteRouteRequest>,
+) -> impl IntoResponse {
+    {
+        let mut config = state.config.write().await;
+
+        let before = config.routes.len();
+        config.routes.retain(|r| r.model_name != req.model_name);
+
+        if config.routes.len() == before {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": { "code": "NOT_FOUND", "message": format!("route '{}' not found", req.model_name) }
+                })),
+            )
+                .into_response();
+        }
+
+        if state.config.is_file_backed()
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        {
+            warn!(?e, "failed to persist config after deleting route");
+        }
+    }
+
+    info!(model = %req.model_name, "route deleted via admin API");
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "model_name": req.model_name,
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/providers — add a new provider and register it in the runtime registry.
@@ -400,89 +596,6 @@ async fn list_provider_models(
             (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
         }
     }
-}
-
-/// POST /api/providers/{name}/routes — add a routing rule for an existing provider.
-async fn add_route_for_provider(
-    State(state): State<AppState>,
-    Path(provider_name): Path<String>,
-    Json(req): Json<AddRouteRequest>,
-) -> impl IntoResponse {
-    let mut config = state.config.write().await;
-
-    // Verify the provider exists
-    if !config.providers.contains_key(&provider_name) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": { "code": "NOT_FOUND", "message": format!("provider '{}' not found", provider_name) }
-            })),
-        )
-            .into_response();
-    }
-
-    let target = RouteTarget {
-        provider: provider_name.clone(),
-        real_model: req.real_model.clone(),
-        priority: req.priority,
-    };
-
-    // Check if route for this model already exists → append target
-    if let Some(route) = config
-        .routes
-        .iter_mut()
-        .find(|r| r.model_name == req.model_name)
-    {
-        // Avoid duplicate target for same provider+real_model combo
-        if route
-            .targets
-            .iter()
-            .any(|t| t.provider == provider_name && t.real_model == req.real_model)
-        {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": { "code": "CONFLICT", "message": format!("route target '{}' already exists for model '{}'", req.real_model.as_deref().unwrap_or("(passthrough)"), req.model_name) }
-                })),
-            )
-                .into_response();
-        }
-        route.targets.push(target);
-    } else {
-        config.routes.push(RouteConfig {
-            model_name: req.model_name.clone(),
-            api_endpoint: req.api_endpoint.clone(),
-            strategy: req.strategy.unwrap_or_default(),
-            targets: vec![target],
-        });
-    }
-
-    // Persist to disk while holding the write lock
-    if state.config.is_file_backed()
-        && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
-            warn!(?e, "failed to persist config after adding route");
-        }
-
-    let strategy = req.strategy.unwrap_or_default();
-    info!(
-        model = %req.model_name,
-        provider = %provider_name,
-        real_model = req.real_model.as_deref().unwrap_or("(passthrough)"),
-        ?strategy,
-        "route added via admin API"
-    );
-
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "model_name": req.model_name,
-            "provider": provider_name,
-            "real_model": req.real_model,
-            "priority": req.priority,
-            "strategy": strategy,
-        })),
-    )
-        .into_response()
 }
 
 /// DELETE /api/providers/{name} — remove a provider from the gateway.
@@ -965,6 +1078,166 @@ targets = [
         assert_eq!(arr[0]["name"], "openai");
     }
 
+    // ── Route CRUD tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_route_success() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-4o","priority":10}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.routes.len(), 1);
+        assert_eq!(cfg.routes[0].model_name, "gpt-4o");
+        assert_eq!(cfg.routes[0].targets.len(), 1);
+        assert_eq!(cfg.routes[0].targets[0].provider, "openai");
+        assert_eq!(cfg.routes[0].targets[0].real_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cfg.routes[0].targets[0].priority, 10);
+    }
+
+    #[tokio::test]
+    async fn create_route_conflict() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-4o"}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn create_route_invalid_provider() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"nonexistent","real_model":"gpt-4o"}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+    }
+
+    #[tokio::test]
+    async fn update_route_success() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","api_endpoint":"/responses","targets":[{"provider":"openai","real_model":"gpt-4o-updated","priority":5}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let r = cfg.routes.iter().find(|r| r.model_name == "gpt-4o").unwrap();
+        assert_eq!(r.api_endpoint, "/responses");
+        assert_eq!(r.targets[0].real_model.as_deref(), Some("gpt-4o-updated"));
+        assert_eq!(r.targets[0].priority, 5);
+    }
+
+    #[tokio::test]
+    async fn update_route_not_found() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"nonexistent","api_endpoint":"/responses"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_route_success() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model_name":"gpt-4o"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        assert!(cfg.routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_route_not_found() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model_name":"nonexistent"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     // 6. Update provider — happy path
     #[tokio::test]
     async fn update_provider_success() {
@@ -1164,8 +1437,10 @@ mod auth_regression_tests {
                     .delete(delete_provider),
             )
             .route("/providers/{name}/models", get(list_provider_models))
-            .route("/providers/{name}/routes", post(add_route_for_provider))
-            .route("/routes", get(list_routes))
+            .route(
+                "/routes",
+                get(list_routes).post(create_route).put(update_route).delete(delete_route),
+            )
             .with_state(state.clone())
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -1244,11 +1519,11 @@ mod auth_regression_tests {
             app.oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/providers/openai/routes")
+                    .uri("/api/routes")
                     .header("Authorization", "Bearer regression-key")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"model_name":"gpt-4o-mini","real_model":"gpt-4o-mini"}"#,
+                        r#"{"model_name":"gpt-4o-mini","targets":[{"provider":"openai","real_model":"gpt-4o-mini"}]}"#,
                     ))
                     .unwrap(),
             )
