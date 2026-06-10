@@ -69,7 +69,7 @@ function handleSelect(currentValue: string) {
         variant="outline"
         role="combobox"
         :aria-expanded="open"
-        :disabled="disabled"
+        :disabled="disabled || loading"
         class="bg-background hover:bg-background border-input w-full justify-between px-3 font-normal outline-offset-0 outline-none focus-visible:outline-[3px]"
       >
         <span :class="cn('truncate', !modelValue && 'text-muted-foreground')">
