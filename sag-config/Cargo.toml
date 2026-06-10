@@ -12,5 +12,4 @@ toml-edit = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
-anyhow = { workspace = true }
 sag-core = { path = "../sag-core" }
