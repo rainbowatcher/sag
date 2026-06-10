@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { useMediaQuery } from "@vueuse/core"
 import { Loader2, Plus, X as XIcon, RefreshCw } from "lucide-vue-next"
-import { computed, onMounted, ref, type Ref } from "vue"
+import { computed, ref, watch, type Ref } from "vue"
+import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -150,7 +151,13 @@ function runTestModel(model: string) {
   })
 }
 
-onMounted(() => {
+// ── Basic fields ─────────────────────────────────────────────
+const providerType = ref(props.provider.provider_type)
+const baseUrl = ref(props.provider.base_url)
+const timeoutSecs = ref(props.provider.timeout_secs)
+
+// Watch provider_type: auto-refresh models when type changes
+watch(providerType, () => {
   providerStore.fetchUpstreamModels({
     base_url: baseUrl.value,
     api_key: apiKeys.value[0] || props.provider.api_key,
@@ -159,11 +166,6 @@ onMounted(() => {
     models_endpoint: modelsEndpoint.value,
   })
 })
-
-// ── Basic fields ─────────────────────────────────────────────
-const providerType = ref(props.provider.provider_type)
-const baseUrl = ref(props.provider.base_url)
-const timeoutSecs = ref(props.provider.timeout_secs)
 async function handleSubmit() {
   apiError.value = ""
   saving.value = true
@@ -375,23 +377,18 @@ async function handleSubmit() {
               </div>
             </div>
             <div class="flex gap-2">
-              <Select
-                :model-value="selectedModel"
-                @update:model-value="(v) => (selectedModel = v as string)"
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select a model..." />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem
-                    v-for="m in providerStore.v1Models.filter((m) => !enabledModels.includes(m))"
-                    :key="m"
-                    :value="m"
-                  >
-                    {{ m }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              <Combobox
+                v-model="selectedModel"
+                :options="
+                  providerStore.v1Models
+                    .filter((m) => !enabledModels.includes(m))
+                    .map((m) => ({ value: m }))
+                "
+                placeholder="Select a model..."
+                search-placeholder="Search models..."
+                empty-text="No models found. Click Refresh Models."
+                :loading="providerStore.v1ModelsLoading"
+              />
               <Button
                 type="button"
                 variant="outline"

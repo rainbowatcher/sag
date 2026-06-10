@@ -3,6 +3,7 @@ import { useForm } from "@tanstack/vue-form"
 import { Loader2, Plus, Trash2, ChevronsUpDown, Check } from "lucide-vue-next"
 import { onMounted, ref } from "vue"
 import { z } from "zod"
+import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
 import {
   Command,
@@ -16,13 +17,6 @@ import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
@@ -234,8 +228,17 @@ async function handleSubmit(event: Event) {
 
           <div class="flex-1">
             <Label class="text-xs">Provider</Label>
-            <Select
+            <Combobox
               :model-value="t.provider"
+              :options="
+                providerStore.providers.map((p) => ({
+                  value: p.name,
+                  label: `${p.name} (${p.provider_type})`,
+                }))
+              "
+              placeholder="Select provider..."
+              search-placeholder="Search provider..."
+              empty-text="No providers found"
               @update:model-value="
                 (v) => {
                   t.provider = v as string
@@ -243,16 +246,7 @@ async function handleSubmit(event: Event) {
                   routeStore.loadProviderModels(v as string, providerStore.providers)
                 }
               "
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Select..." />
-              </SelectTrigger>
-              <SelectContent class="w-(--reka-select-trigger-width)">
-                <SelectItem v-for="p in providerStore.providers" :key="p.name" :value="p.name">
-                  {{ p.name }} ({{ p.provider_type }})
-                </SelectItem>
-              </SelectContent>
-            </Select>
+            />
           </div>
 
           <div class="flex-1">

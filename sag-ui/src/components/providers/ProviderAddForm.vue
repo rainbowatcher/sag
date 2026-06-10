@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
 import { Loader2, Plus, RefreshCw, X } from "lucide-vue-next"
-import { ref } from "vue"
+import { ref, watch } from "vue"
 import { z } from "zod"
+import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
@@ -82,6 +83,27 @@ const headers = ref<{ key: string; value: string }[]>([])
 
 // ── Body overrides ───────────────────────────────────────────
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
+
+// ── Base URL defaults per provider type ──────────────────────
+const DEFAULT_BASE_URLS: Record<string, string> = {
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com",
+}
+
+// Watch provider_type: if base_url still matches a known default,
+// auto-switch to the new type's default.
+watch(
+  () => form.state.values.provider_type,
+  (newType) => {
+    const currentUrl = form.state.values.base_url
+    // Only auto-switch if the current URL is a known default
+    // (i.e. the user hasn't manually changed it)
+    const isDefault = Object.values(DEFAULT_BASE_URLS).includes(currentUrl)
+    if (isDefault && DEFAULT_BASE_URLS[newType]) {
+      form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
+    }
+  },
+)
 
 // ── V1 models ────────────────────────────────────────────────
 const providerStore = useProviderStore()
@@ -331,23 +353,18 @@ async function handleSubmit(event: Event) {
               </div>
             </div>
             <div class="flex gap-2">
-              <Select
-                :model-value="selectedModel"
-                @update:model-value="(v) => (selectedModel = v as string)"
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select a model..." />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem
-                    v-for="m in providerStore.v1Models.filter((m) => !enabledModels.includes(m))"
-                    :key="m"
-                    :value="m"
-                  >
-                    {{ m }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              <Combobox
+                v-model="selectedModel"
+                :options="
+                  providerStore.v1Models
+                    .filter((m) => !enabledModels.includes(m))
+                    .map((m) => ({ value: m }))
+                "
+                placeholder="Select a model..."
+                search-placeholder="Search models..."
+                empty-text="No models found. Click Refresh Models."
+                :loading="providerStore.v1ModelsLoading"
+              />
               <Button
                 type="button"
                 variant="outline"
