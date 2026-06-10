@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
-import { Loader2, Plus, X } from "lucide-vue-next"
+import { Loader2, Plus, RefreshCw, X } from "lucide-vue-next"
 import { ref } from "vue"
 import { z } from "zod"
 import { Button } from "@/components/ui/button"
@@ -43,14 +43,24 @@ function removeApiKey(idx: number) {
 
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
-const newModel = ref("")
+const selectedModel = ref("")
+const customModel = ref("")
+const modelsEndpoint = ref("models")
 
 function addModel() {
-  const name = newModel.value.trim()
+  const name = selectedModel.value.trim()
   if (name && !enabledModels.value.includes(name)) {
     enabledModels.value.push(name)
   }
-  newModel.value = ""
+  selectedModel.value = ""
+}
+
+function addCustomModel() {
+  const name = customModel.value.trim()
+  if (name && !enabledModels.value.includes(name)) {
+    enabledModels.value.push(name)
+  }
+  customModel.value = ""
 }
 
 function removeModel(name: string) {
@@ -72,6 +82,27 @@ const headers = ref<{ key: string; value: string }[]>([])
 
 // ── Body overrides ───────────────────────────────────────────
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
+
+// ── V1 models ────────────────────────────────────────────────
+const providerStore = useProviderStore()
+
+function fetchModelsForForm() {
+  const firstKey = apiKeys.value.find((k) => k.trim()) ?? ""
+  const parsedHeaders = headers.value.reduce(
+    (acc, h) => {
+      if (h.key.trim() && h.value.trim()) acc[h.key.trim()] = h.value.trim()
+      return acc
+    },
+    {} as Record<string, string>,
+  )
+  providerStore.fetchUpstreamModels({
+    base_url: form.state.values.base_url,
+    api_key: firstKey,
+    headers: parsedHeaders,
+    provider_type: form.state.values.provider_type,
+    models_endpoint: modelsEndpoint.value,
+  })
+}
 
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
@@ -300,22 +331,76 @@ async function handleSubmit(event: Event) {
               </div>
             </div>
             <div class="flex gap-2">
-              <Input
-                :model-value="newModel"
-                placeholder="gpt-4o"
-                @input="newModel = ($event.target as HTMLInputElement).value"
-                @keydown.enter.prevent="addModel"
-              />
+              <Select
+                :model-value="selectedModel"
+                @update:model-value="(v) => (selectedModel = v as string)"
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a model..." />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem
+                    v-for="m in providerStore.v1Models.filter((m) => !enabledModels.includes(m))"
+                    :key="m"
+                    :value="m"
+                  >
+                    {{ m }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                :disabled="!newModel.trim()"
+                :disabled="!selectedModel.trim()"
                 @click="addModel"
               >
                 <Plus class="h-3.5 w-3.5" />
                 Add
               </Button>
+            </div>
+            <div class="flex items-center gap-2">
+              <Input
+                :model-value="customModel"
+                placeholder="Or type a model name..."
+                class="flex-1"
+                @input="customModel = ($event.target as HTMLInputElement).value"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="!customModel.trim()"
+                @click="addCustomModel"
+              >
+                <Plus class="h-3.5 w-3.5" />
+                Add
+              </Button>
+            </div>
+            <div class="flex items-center gap-2">
+              <Button type="button" variant="outline" size="sm" @click="fetchModelsForForm">
+                <RefreshCw class="h-3.5 w-3.5" />
+                Refresh Models
+              </Button>
+              <div v-if="providerStore.v1ModelsLoading" class="text-muted-foreground text-xs">
+                Loading models...
+              </div>
+            </div>
+            <div
+              v-if="providerStore.v1ModelsError"
+              class="rounded-md bg-red-50 px-2 py-1 text-xs text-red-500"
+            >
+              {{ providerStore.v1ModelsError }}
+            </div>
+            <div class="space-y-1">
+              <FieldLabel>Models Endpoint Path</FieldLabel>
+              <p class="text-muted-foreground text-xs">
+                Path appended to base_url for fetching models (default: models).
+              </p>
+              <Input
+                :model-value="modelsEndpoint"
+                @input="modelsEndpoint = ($event.target as HTMLInputElement).value"
+              />
             </div>
           </TabsContent>
 

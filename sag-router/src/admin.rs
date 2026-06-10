@@ -7,7 +7,7 @@ use axum::{
 };
 use reqwest::header::CONTENT_TYPE;
 use sag_config::{
-self, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
+    self, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -27,13 +27,14 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .delete(delete_provider),
         )
         .route("/providers/{name}/models", get(list_provider_models))
+        .route("/providers/fetch-models", post(fetch_models))
         .route("/model/test", post(model_test))
         .route(
             "/routes",
             get(list_routes)
-.post(create_route)
-.put(update_route)
-.delete(delete_route),
+                .post(create_route)
+                .put(update_route)
+                .delete(delete_route),
         )
         .with_state(state)
 }
@@ -453,8 +454,8 @@ async fn add_provider(
         if state.config.is_file_backed()
             && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
         {
-                warn!(?e, "failed to persist config after adding provider");
-            }
+            warn!(?e, "failed to persist config after adding provider");
+        }
 
         pc
     };
@@ -545,8 +546,8 @@ async fn update_provider(
         if state.config.is_file_backed()
             && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
         {
-                warn!(?e, "failed to persist config after updating provider");
-            }
+            warn!(?e, "failed to persist config after updating provider");
+        }
 
         pc
     };
@@ -586,50 +587,91 @@ async fn update_provider(
         .into_response()
 }
 
-/// GET /api/providers/{name}/models — list models available from a provider.
+/// GET /api/providers/{name}/models — list models enabled for this provider.
+/// Returns the provider's configured `enabled_models` directly without
+/// making an upstream request.
 async fn list_provider_models(
     State(state): State<AppState>,
     Path(provider_name): Path<String>,
 ) -> impl IntoResponse {
-    // Look up the provider config
-    let (api_key, base_url) = {
-        let config = state.config.read().await;
-        let pc = match config.providers.get(&provider_name) {
-            Some(p) => p,
-            None => {
+    let config = state.config.read().await;
+    let pc = match config.providers.get(&provider_name) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": { "code": "NOT_FOUND", "message": format!("provider '{provider_name}' not found") }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    (StatusCode::OK, Json(json!({ "models": pc.enabled_models }))).into_response()
+}
+
+// ── Fetch models request ───────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct FetchModelsRequest {
+    base_url: String,
+    api_key: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    provider_type: Option<ProviderType>,
+    /// Custom endpoint path for listing models (default: `v1/models`).
+    /// When empty, falls back to `v1/models` appended to `base_url`.
+    #[serde(default)]
+    models_endpoint: String,
+}
+
+/// POST /api/model/test — test a specific model by sending a real chat completion.
+
+/// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
+async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse {
+    let endpoint = if req.models_endpoint.is_empty() {
+        "v1/models"
+    } else {
+        &req.models_endpoint
+    };
+    let models_url = format!("{}/{}", req.base_url.trim_end_matches('/'), endpoint);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("valid reqwest client with timeout");
+    let mut http_req = client
+        .get(&models_url)
+        .header("Authorization", format!("Bearer {}", req.api_key));
+
+    // Anthropic uses x-api-key instead of Bearer
+    if req.provider_type == Some(ProviderType::Anthropic) {
+        http_req = client
+            .get(&models_url)
+            .header("x-api-key", &req.api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+
+    for (key, value) in &req.headers {
+        http_req = http_req.header(key.as_str(), value.as_str());
+    }
+
+    match http_req.send().await {
+        Ok(resp) => {
+            if !resp.status().is_success() {
                 return (
-                    StatusCode::NOT_FOUND,
+                    StatusCode::BAD_GATEWAY,
                     Json(json!({
-                        "error": { "code": "NOT_FOUND", "message": format!("provider '{provider_name}' not found") }
+                        "error": {
+                            "code": "UPSTREAM_ERROR",
+                            "message": format!("upstream returned status {}", resp.status()),
+                        }
                     })),
                 )
                     .into_response();
             }
-        };
-        (pc.api_key.clone(), pc.base_url.clone())
-    };
 
-    // Build the models URL: strip trailing slash, append /models
-    let models_url = format!("{}/models", base_url.trim_end_matches('/'));
-
-    // Request models from the upstream provider
-    match reqwest::Client::new()
-        .get(&models_url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                warn!(
-                    provider = %provider_name,
-                    status = %resp.status(),
-                    "upstream models endpoint returned error"
-                );
-                return (StatusCode::OK, Json(json!({ "models": [] }))).into_response();
-            }
-
-            // Parse OpenAI-style response: { "data": [{ "id": "gpt-4o", ... }, ...] }
             match resp.json::<serde_json::Value>().await {
                 Ok(body) => {
                     let models: Vec<String> = body["data"]
@@ -641,27 +683,39 @@ async fn list_provider_models(
                         })
                         .unwrap_or_default();
 
-                    info!(
-                        provider = %provider_name,
-                        count = models.len(),
-                        "listed provider models"
-                    );
-                    (StatusCode::OK, Json(json!({ "models": models }))).into_response()
+                    Json(json!({ "models": models })).into_response()
                 }
                 Err(e) => {
-                    warn!(?e, provider = %provider_name, "failed to parse models response");
-                    (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
+                    warn!(?e, "failed to parse upstream models response");
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": {
+                                "code": "PARSE_ERROR",
+                                "message": format!("failed to parse upstream response: {e}"),
+                            }
+                        })),
+                    )
+                        .into_response()
                 }
             }
         }
         Err(e) => {
-            warn!(?e, provider = %provider_name, "failed to reach models endpoint");
-            (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
+            warn!(?e, "failed to reach upstream models endpoint");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": {
+                        "code": "CONNECTION_ERROR",
+                        "message": format!("failed to connect to upstream: {e}"),
+                    }
+                })),
+            )
+                .into_response()
         }
     }
 }
 
-/// POST /api/model/test — test a specific model by sending a real chat completion.
 #[derive(serde::Deserialize)]
 struct ModelTestRequest {
     model: String,
@@ -840,8 +894,8 @@ async fn delete_provider(
         if state.config.is_file_backed()
             && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
         {
-                warn!(?e, "failed to persist config after deleting provider");
-            }
+            warn!(?e, "failed to persist config after deleting provider");
+        }
 
         (cascaded_routes, removed_targets)
     };
@@ -1082,9 +1136,9 @@ mod tests {
                     RouteTarget {
                         provider: "openai".into(),
                         real_model: Some("gpt-4o".into()),
-                    priority: 1,
-                    retries: None,
-                    extra: HashMap::new(),
+                        priority: 1,
+                        retries: None,
+                        extra: HashMap::new(),
                     },
                     RouteTarget {
                         provider: "anthropic".into(),
@@ -1472,8 +1526,8 @@ targets = [
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 10,
-                    retries: None,
-                    extra: HashMap::new(),
+                retries: None,
+                extra: HashMap::new(),
             }],
         }];
         let state = build_state(providers, routes).await;
@@ -1747,7 +1801,7 @@ mod auth_regression_tests {
                 retries: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
-                        extra: HashMap::new(),
+                    extra: HashMap::new(),
                     retries: None,
                     provider: "openai".into(),
                     real_model: Some("gpt-4o".into()),

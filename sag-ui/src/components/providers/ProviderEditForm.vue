@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useMediaQuery } from "@vueuse/core"
 import { Loader2, Plus, X as XIcon, RefreshCw } from "lucide-vue-next"
-import { computed, ref } from "vue"
+import { computed, onMounted, ref, type Ref } from "vue"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -32,10 +32,8 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { api, headers as authHeaders } from "@/lib/client"
-import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
-import type { ModelTestResult, Provider } from "@/types/api"
+import type { Provider } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
@@ -84,54 +82,29 @@ function removeApiKey(idx: number) {
 
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([...props.provider.enabled_models])
-const newModel = ref("")
-const testingModel = ref<Record<string, boolean>>({})
-const testModelResult = ref<Record<string, ModelTestResult[] | null>>({})
+const selectedModel = ref("")
+const modelsEndpoint = ref("models")
+const customModel = ref("")
+
+function addModelByName(name: string, sourceRef: Ref<string>) {
+  const trimmed = name.trim()
+  if (trimmed && !enabledModels.value.includes(trimmed)) {
+    enabledModels.value.push(trimmed)
+  }
+  sourceRef.value = ""
+}
 
 function addModel() {
-  const name = newModel.value.trim()
-  if (name && !enabledModels.value.includes(name)) {
-    enabledModels.value.push(name)
-  }
-  newModel.value = ""
+  addModelByName(selectedModel.value, selectedModel)
+}
+
+function addCustomModel() {
+  addModelByName(customModel.value, customModel)
 }
 
 function removeModel(name: string) {
   const idx = enabledModels.value.indexOf(name)
   if (idx !== -1) enabledModels.value.splice(idx, 1)
-}
-
-async function testModel(model: string) {
-  testingModel.value[model] = true
-  testModelResult.value[model] = null
-  try {
-    const conn = useConnectionStore()
-    const { data } = await api.post<{ results: ModelTestResult[] }>(
-      "/api/model/test",
-      {
-        model,
-        api_keys:
-          apiKeys.value.filter((k) => k.trim()).length > 0
-            ? apiKeys.value.filter((k) => k.trim())
-            : [props.provider.api_key],
-        base_url: props.provider.base_url,
-        provider_type: props.provider.provider_type,
-        headers: headersMap(),
-      },
-      { headers: authHeaders(conn.connection?.apiKey) },
-    )
-    testModelResult.value[model] = data.results
-  } catch (e: any) {
-    testModelResult.value[model] = [
-      {
-        key_prefix: "error",
-        success: false,
-        message: e.response?.data?.error?.message ?? e.message,
-      },
-    ]
-  } finally {
-    testingModel.value[model] = false
-  }
 }
 
 // ── KV pair management ───────────────────────────────────────
@@ -160,6 +133,32 @@ function headersMap(): Record<string, string> {
   }
   return m
 }
+
+// ── V1 models ────────────────────────────────────────────────
+const providerStore = useProviderStore()
+
+function runTestModel(model: string) {
+  providerStore.testModelWithState(model, {
+    model,
+    api_keys:
+      apiKeys.value.filter((k) => k.trim()).length > 0
+        ? apiKeys.value.filter((k) => k.trim())
+        : [props.provider.api_key],
+    base_url: baseUrl.value,
+    provider_type: providerType.value,
+    headers: headersMap(),
+  })
+}
+
+onMounted(() => {
+  providerStore.fetchUpstreamModels({
+    base_url: baseUrl.value,
+    api_key: apiKeys.value[0] || props.provider.api_key,
+    headers: headersMap(),
+    provider_type: providerType.value,
+    models_endpoint: modelsEndpoint.value,
+  })
+})
 
 // ── Basic fields ─────────────────────────────────────────────
 const providerType = ref(props.provider.provider_type)
@@ -342,15 +341,21 @@ async function handleSubmit() {
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  :disabled="testingModel[model]"
-                  @click="testModel(model)"
+                  :disabled="providerStore.testModelState.states[model]?.loading"
+                  @click="runTestModel(model)"
                 >
-                  <Loader2 v-if="testingModel[model]" class="h-3 w-3 animate-spin" />
+                  <Loader2
+                    v-if="providerStore.testModelState.states[model]?.loading"
+                    class="h-3 w-3 animate-spin"
+                  />
                   <RefreshCw v-else class="h-3 w-3" />
                 </Button>
-                <div v-if="testModelResult[model]" class="flex flex-wrap items-center gap-2">
+                <div
+                  v-if="providerStore.testModelState.states[model]?.data"
+                  class="flex flex-wrap items-center gap-2"
+                >
                   <span
-                    v-for="r in testModelResult[model]"
+                    v-for="r in providerStore.testModelState.states[model]?.data"
                     :key="r.key_prefix"
                     class="rounded px-1 py-0.5"
                     :class="r.success ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'"
@@ -358,28 +363,101 @@ async function handleSubmit() {
                     {{ r.success ? "✓" : "✗" }} {{ r.key_prefix }}
                   </span>
                 </div>
+                <div
+                  v-if="providerStore.testModelState.states[model]?.error"
+                  class="w-full text-xs text-red-500"
+                >
+                  {{ providerStore.testModelState.states[model]?.error }}
+                </div>
                 <Button variant="ghost" size="icon-sm" @click="removeModel(model)" class="ml-auto">
                   <XIcon class="h-3 w-3" />
                 </Button>
               </div>
             </div>
             <div class="flex gap-2">
-              <Input
-                :model-value="newModel"
-                placeholder="gpt-4o"
-                @input="newModel = ($event.target as HTMLInputElement).value"
-                @keydown.enter.prevent="addModel"
-              />
+              <Select
+                :model-value="selectedModel"
+                @update:model-value="(v) => (selectedModel = v as string)"
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a model..." />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem
+                    v-for="m in providerStore.v1Models.filter((m) => !enabledModels.includes(m))"
+                    :key="m"
+                    :value="m"
+                  >
+                    {{ m }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                :disabled="!newModel.trim()"
+                :disabled="!selectedModel.trim()"
                 @click="addModel"
               >
                 <Plus class="h-3.5 w-3.5" />
                 Add
               </Button>
+            </div>
+            <div class="flex items-center gap-2">
+              <Input
+                :model-value="customModel"
+                placeholder="Or type a model name..."
+                class="flex-1"
+                @input="customModel = ($event.target as HTMLInputElement).value"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="!customModel.trim()"
+                @click="addCustomModel"
+              >
+                <Plus class="h-3.5 w-3.5" />
+                Add
+              </Button>
+            </div>
+            <div class="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                @click="
+                  providerStore.fetchUpstreamModels({
+                    base_url: baseUrl,
+                    api_key: apiKeys[0] || props.provider.api_key,
+                    headers: headersMap(),
+                    provider_type: providerType,
+                    models_endpoint: modelsEndpoint,
+                  })
+                "
+              >
+                <RefreshCw class="h-3.5 w-3.5" />
+                Refresh Models
+              </Button>
+              <div v-if="providerStore.v1ModelsLoading" class="text-muted-foreground text-xs">
+                Loading models...
+              </div>
+            </div>
+            <div
+              v-if="providerStore.v1ModelsError"
+              class="rounded-md bg-red-50 px-2 py-1 text-xs text-red-500"
+            >
+              {{ providerStore.v1ModelsError }}
+            </div>
+            <div class="space-y-1">
+              <FieldLabel>Models Endpoint Path</FieldLabel>
+              <p class="text-muted-foreground text-xs">
+                Path appended to base_url for fetching models (default: models).
+              </p>
+              <Input
+                :model-value="modelsEndpoint"
+                @input="modelsEndpoint = ($event.target as HTMLInputElement).value"
+              />
             </div>
           </TabsContent>
 
