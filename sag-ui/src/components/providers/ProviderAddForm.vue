@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
-import { Loader2, Plus, RefreshCw, X } from "lucide-vue-next"
+import { Loader2, X } from "lucide-vue-next"
 import { ref, watch } from "vue"
 import { z } from "zod"
-import Combobox from "@/components/Combobox.vue"
+import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
+import KvEditor from "@/components/KvEditor.vue"
+import ModelManager from "@/components/ModelManager.vue"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
@@ -33,55 +35,29 @@ const apiError = ref("")
 const apiKeys = ref<string[]>([""])
 const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
 
-function addApiKey() {
-  apiKeys.value.push("")
-}
-
-function removeApiKey(idx: number) {
-  apiKeys.value.splice(idx, 1)
-  if (apiKeys.value.length === 0) apiKeys.value.push("")
-}
-
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
-const selectedModel = ref("")
-const customModel = ref("")
-const modelsEndpoint = ref("models")
 
-function addModel() {
-  const name = selectedModel.value.trim()
-  if (name && !enabledModels.value.includes(name)) {
-    enabledModels.value.push(name)
-  }
-  selectedModel.value = ""
+function onFetchModels(modelsEndpoint: string) {
+  const firstKey = apiKeys.value.find((k) => k.trim()) ?? ""
+  const parsedHeaders = headers.value.reduce(
+    (acc, h) => {
+      if (h.key.trim() && h.value.trim()) acc[h.key.trim()] = h.value.trim()
+      return acc
+    },
+    {} as Record<string, string>,
+  )
+  store.fetchUpstreamModels({
+    base_url: form.state.values.base_url,
+    api_key: firstKey,
+    headers: parsedHeaders,
+    provider_type: form.state.values.provider_type,
+    models_endpoint: modelsEndpoint,
+  })
 }
 
-function addCustomModel() {
-  const name = customModel.value.trim()
-  if (name && !enabledModels.value.includes(name)) {
-    enabledModels.value.push(name)
-  }
-  customModel.value = ""
-}
-
-function removeModel(name: string) {
-  const idx = enabledModels.value.indexOf(name)
-  if (idx !== -1) enabledModels.value.splice(idx, 1)
-}
-
-// ── KV pair helpers ──────────────────────────────────────────
-function addKvPair(arr: { key: string; value: string }[]) {
-  arr.push({ key: "", value: "" })
-}
-
-function removeKvPair(arr: { key: string; value: string }[], idx: number) {
-  arr.splice(idx, 1)
-}
-
-// ── Headers ──────────────────────────────────────────────────
+// ── KV pairs ─────────────────────────────────────────────────
 const headers = ref<{ key: string; value: string }[]>([])
-
-// ── Body overrides ───────────────────────────────────────────
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
 
 // ── Base URL defaults per provider type ──────────────────────
@@ -96,35 +72,12 @@ watch(
   () => form.state.values.provider_type,
   (newType) => {
     const currentUrl = form.state.values.base_url
-    // Only auto-switch if the current URL is a known default
-    // (i.e. the user hasn't manually changed it)
     const isDefault = Object.values(DEFAULT_BASE_URLS).includes(currentUrl)
     if (isDefault && DEFAULT_BASE_URLS[newType]) {
       form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
     }
   },
 )
-
-// ── V1 models ────────────────────────────────────────────────
-const providerStore = useProviderStore()
-
-function fetchModelsForForm() {
-  const firstKey = apiKeys.value.find((k) => k.trim()) ?? ""
-  const parsedHeaders = headers.value.reduce(
-    (acc, h) => {
-      if (h.key.trim() && h.value.trim()) acc[h.key.trim()] = h.value.trim()
-      return acc
-    },
-    {} as Record<string, string>,
-  )
-  providerStore.fetchUpstreamModels({
-    base_url: form.state.values.base_url,
-    api_key: firstKey,
-    headers: parsedHeaders,
-    provider_type: form.state.values.provider_type,
-    models_endpoint: modelsEndpoint.value,
-  })
-}
 
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
@@ -265,40 +218,13 @@ async function handleSubmit(event: Event) {
               </Field>
             </form.Field>
 
-            <div class="col-span-2 space-y-1">
-              <FieldLabel>API Keys</FieldLabel>
-              <div v-for="(_, idx) in apiKeys" :key="idx" class="mb-1 flex items-center gap-2">
-                <Input
-                  type="password"
-                  :model-value="apiKeys[idx]"
-                  :placeholder="`sk-... (key ${idx + 1})`"
-                  class="flex-1"
-                  @input="apiKeys[idx] = ($event.target as HTMLInputElement).value"
-                />
-                <Button variant="ghost" size="icon-sm" @click="removeApiKey(idx)">
-                  <X class="h-3.5 w-3.5" />
-                </Button>
-              </div>
-              <Button type="button" variant="outline" size="sm" @click="addApiKey">
-                <Plus class="h-3.5 w-3.5" />
-                Add Key
-              </Button>
-            </div>
-
-            <div class="col-span-2 space-y-1">
-              <FieldLabel>Key Strategy</FieldLabel>
-              <Select
-                :model-value="keyStrategy"
-                @update:model-value="(v) => (keyStrategy = v as any)"
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="fill_first">Fill First</SelectItem>
-                  <SelectItem value="round_robin">Round Robin</SelectItem>
-                </SelectContent>
-              </Select>
+            <div class="col-span-2">
+              <ApiKeyEditor
+                :api-keys="apiKeys"
+                :key-strategy="keyStrategy"
+                @update:api-keys="apiKeys = $event"
+                @update:key-strategy="keyStrategy = $event"
+              />
             </div>
 
             <div class="col-span-2">
@@ -337,158 +263,35 @@ async function handleSubmit(event: Event) {
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
           <TabsContent value="models" class="space-y-3">
-            <p v-if="enabledModels.length === 0" class="text-muted-foreground text-xs">
-              No models listed means all models are allowed (no restriction).
-            </p>
-            <div v-if="enabledModels.length > 0" class="space-y-1">
-              <div
-                v-for="model in enabledModels"
-                :key="model"
-                class="bg-muted flex items-center justify-between rounded px-2 py-1 text-xs"
-              >
-                <span class="font-mono">{{ model }}</span>
-                <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
-                  <X class="h-3 w-3" />
-                </Button>
-              </div>
-            </div>
-            <div class="flex gap-2">
-              <Combobox
-                v-model="selectedModel"
-                :options="
-                  providerStore.v1Models
-                    .filter((m) => !enabledModels.includes(m))
-                    .map((m) => ({ value: m }))
-                "
-                placeholder="Select a model..."
-                search-placeholder="Search models..."
-                empty-text="No models found. Click Refresh Models."
-                :loading="providerStore.v1ModelsLoading"
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                :disabled="!selectedModel.trim()"
-                @click="addModel"
-              >
-                <Plus class="h-3.5 w-3.5" />
-                Add
-              </Button>
-            </div>
-            <div class="flex items-center gap-2">
-              <Input
-                :model-value="customModel"
-                placeholder="Or type a model name..."
-                class="flex-1"
-                @input="customModel = ($event.target as HTMLInputElement).value"
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                :disabled="!customModel.trim()"
-                @click="addCustomModel"
-              >
-                <Plus class="h-3.5 w-3.5" />
-                Add
-              </Button>
-            </div>
-            <div class="flex items-center gap-2">
-              <Button type="button" variant="outline" size="sm" @click="fetchModelsForForm">
-                <RefreshCw class="h-3.5 w-3.5" />
-                Refresh Models
-              </Button>
-              <div v-if="providerStore.v1ModelsLoading" class="text-muted-foreground text-xs">
-                Loading models...
-              </div>
-            </div>
-            <div
-              v-if="providerStore.v1ModelsError"
-              class="rounded-md bg-red-50 px-2 py-1 text-xs text-red-500"
-            >
-              {{ providerStore.v1ModelsError }}
-            </div>
-            <div class="space-y-1">
-              <FieldLabel>Models Endpoint Path</FieldLabel>
-              <p class="text-muted-foreground text-xs">
-                Path appended to base_url for fetching models (default: models).
-              </p>
-              <Input
-                :model-value="modelsEndpoint"
-                @input="modelsEndpoint = ($event.target as HTMLInputElement).value"
-              />
-            </div>
+            <ModelManager
+              :enabled-models="enabledModels"
+              :v1-models="store.v1Models"
+              :v1-models-loading="store.v1ModelsLoading"
+              :v1-models-error="store.v1ModelsError"
+              @update:enabled-models="enabledModels = $event"
+              @fetch-models="onFetchModels"
+            />
           </TabsContent>
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->
           <TabsContent value="advanced" class="space-y-4">
-            <div class="space-y-1">
-              <FieldLabel>Headers</FieldLabel>
-              <p class="text-muted-foreground text-xs">
-                Key-value pairs of custom headers (values are plain text).
-              </p>
-              <div
-                v-for="(_, idx) in headers"
-                :key="'hdr-' + idx"
-                class="mb-1 flex items-center gap-2"
-              >
-                <Input
-                  :model-value="headers[idx].key"
-                  placeholder="Header-Name"
-                  class="w-48"
-                  @input="headers[idx].key = ($event.target as HTMLInputElement).value"
-                />
-                <Input
-                  :model-value="headers[idx].value"
-                  placeholder="Value"
-                  class="flex-1"
-                  @input="headers[idx].value = ($event.target as HTMLInputElement).value"
-                />
-                <Button variant="ghost" size="icon-sm" @click="removeKvPair(headers, idx)">
-                  <X class="h-3.5 w-3.5" />
-                </Button>
-              </div>
-              <Button type="button" variant="outline" size="sm" @click="addKvPair(headers)">
-                <Plus class="h-3.5 w-3.5" />
-                Add Header
-              </Button>
-            </div>
+            <KvEditor
+              v-model="headers"
+              title="Headers"
+              description="Key-value pairs of custom headers (values are plain text)."
+              key-placeholder="Header-Name"
+              value-placeholder="Value"
+            />
 
             <Separator />
 
-            <div class="space-y-1">
-              <FieldLabel>Body Overrides</FieldLabel>
-              <p class="text-muted-foreground text-xs">
-                Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON
-                (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).
-              </p>
-              <div
-                v-for="(_, idx) in bodyOverrides"
-                :key="'bo-' + idx"
-                class="mb-1 flex items-center gap-2"
-              >
-                <Input
-                  :model-value="bodyOverrides[idx].key"
-                  placeholder="max_tokens"
-                  class="w-48"
-                  @input="bodyOverrides[idx].key = ($event.target as HTMLInputElement).value"
-                />
-                <Input
-                  :model-value="bodyOverrides[idx].value"
-                  placeholder="4096"
-                  class="flex-1"
-                  @input="bodyOverrides[idx].value = ($event.target as HTMLInputElement).value"
-                />
-                <Button variant="ghost" size="icon-sm" @click="removeKvPair(bodyOverrides, idx)">
-                  <X class="h-3.5 w-3.5" />
-                </Button>
-              </div>
-              <Button type="button" variant="outline" size="sm" @click="addKvPair(bodyOverrides)">
-                <Plus class="h-3.5 w-3.5" />
-                Add Override
-              </Button>
-            </div>
+            <KvEditor
+              v-model="bodyOverrides"
+              title="Body Overrides"
+              description='Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).'
+              key-placeholder="max_tokens"
+              value-placeholder="4096"
+            />
           </TabsContent>
         </Tabs>
       </form>
