@@ -27,6 +27,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", post(chat_completions_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
 
+    let models_route = Router::new()
+        .route("/models", get(models_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
+
     let admin_routes = crate::admin::build_admin_routes(state.clone())
         .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
 
@@ -39,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/analytics/stats", get(analytics_stats_handler))
         .nest("/v1/chat/completions", chat_route)
+        .nest("/v1", models_route)
         .nest("/api", admin_routes)
         .layer(cors)
         .with_state(state)
@@ -436,5 +441,41 @@ async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// GET /v1/models
+///
+/// Returns the list of available models in OpenAI-compatible format.
+/// The model list is derived from the routing table — each route's
+/// `model_name` is surfaced as a model `id`.
+#[instrument(skip(state))]
+async fn models_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let config = state.config.read().await;
+
+    let data: Vec<serde_json::Value> = config
+        .routes
+        .iter()
+        .map(|route| {
+            let owned_by = route
+                .targets
+                .first()
+                .map(|t| t.provider.as_str())
+                .unwrap_or("sag");
+
+            json!({
+                "id": route.model_name,
+                "object": "model",
+                "created": 0,
+                "owned_by": owned_by,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "object": "list",
+        "data": data,
     }))
 }
