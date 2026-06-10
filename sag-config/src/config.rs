@@ -361,10 +361,19 @@ temperature = 0.8
         assert_eq!(p.api_key, "sk-ant");
         assert_eq!(p.base_url, "https://api.anthropic.com");
         assert_eq!(p.timeout_secs, 60);
-        assert_eq!(p.headers.get("Authorization").unwrap(), "Bearer custom-token");
+        assert_eq!(
+            p.headers.get("Authorization").unwrap(),
+            "Bearer custom-token"
+        );
         assert_eq!(p.headers.get("X-Debug").unwrap(), "true");
-        assert_eq!(p.body_overrides.get("max_tokens").unwrap(), &serde_json::json!(4096));
-        assert_eq!(p.body_overrides.get("temperature").unwrap(), &serde_json::json!(0.8));
+        assert_eq!(
+            p.body_overrides.get("max_tokens").unwrap(),
+            &serde_json::json!(4096)
+        );
+        assert_eq!(
+            p.body_overrides.get("temperature").unwrap(),
+            &serde_json::json!(0.8)
+        );
     }
 
     #[test]

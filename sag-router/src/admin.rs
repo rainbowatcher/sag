@@ -6,7 +6,9 @@ use axum::{
     routing::{get, post},
 };
 use reqwest::header::CONTENT_TYPE;
-use sag_config::{self, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy};
+use sag_config::{
+self, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +30,10 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
         .route("/model/test", post(model_test))
         .route(
             "/routes",
-            get(list_routes).post(create_route).put(update_route).delete(delete_route),
+            get(list_routes)
+.post(create_route)
+.put(update_route)
+.delete(delete_route),
         )
         .with_state(state)
 }
@@ -313,7 +318,11 @@ async fn update_route(
             }
         }
 
-        let idx = match config.routes.iter().position(|r| r.model_name == req.model_name) {
+        let idx = match config
+            .routes
+            .iter()
+            .position(|r| r.model_name == req.model_name)
+        {
             Some(i) => i,
             None => {
                 return (
@@ -442,7 +451,8 @@ async fn add_provider(
 
         // Persist to disk while holding the write lock
         if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        {
                 warn!(?e, "failed to persist config after adding provider");
             }
 
@@ -450,8 +460,7 @@ async fn add_provider(
     };
 
     // 2. Build the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type
-    {
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type {
         ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
             req.name.clone(),
             &provider_config,
@@ -534,7 +543,8 @@ async fn update_provider(
 
         // Persist to disk while holding the write lock
         if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        {
                 warn!(?e, "failed to persist config after updating provider");
             }
 
@@ -542,8 +552,7 @@ async fn update_provider(
     };
 
     // Rebuild the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type
-    {
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type {
         ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
             req.name.clone(),
             &provider_config,
@@ -665,9 +674,7 @@ struct ModelTestRequest {
     headers: HashMap<String, String>,
 }
 
-async fn model_test(
-    Json(req): Json<ModelTestRequest>,
-) -> impl IntoResponse {
+async fn model_test(Json(req): Json<ModelTestRequest>) -> impl IntoResponse {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -831,7 +838,8 @@ async fn delete_provider(
 
         // Persist to disk while we still hold the write lock.
         if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path()) {
+            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        {
                 warn!(?e, "failed to persist config after deleting provider");
             }
 
@@ -1290,7 +1298,10 @@ targets = [
         assert_eq!(cfg.routes[0].model_name, "gpt-4o");
         assert_eq!(cfg.routes[0].targets.len(), 1);
         assert_eq!(cfg.routes[0].targets[0].provider, "openai");
-        assert_eq!(cfg.routes[0].targets[0].real_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            cfg.routes[0].targets[0].real_model.as_deref(),
+            Some("gpt-4o")
+        );
         assert_eq!(cfg.routes[0].targets[0].priority, 10);
     }
 
@@ -1356,7 +1367,12 @@ targets = [
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "BAD_REQUEST");
-        assert!(body["error"]["message"].as_str().unwrap().contains("enabled_models"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("enabled_models")
+        );
     }
 
     #[tokio::test]
@@ -1454,7 +1470,8 @@ targets = [
             strategy: Strategy::FillFirst,
             targets: vec![RouteTarget {
                 provider: "openai".into(),
-                real_model: Some("gpt-4o".into()),                    priority: 10,
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
                     retries: None,
                     extra: HashMap::new(),
             }],
@@ -1520,7 +1537,11 @@ targets = [
         assert_eq!(response.status(), StatusCode::OK);
 
         let cfg = state.config.read().await;
-        let r = cfg.routes.iter().find(|r| r.model_name == "gpt-4o").unwrap();
+        let r = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "gpt-4o")
+            .unwrap();
         assert_eq!(r.api_endpoint, "/responses");
         assert_eq!(r.targets[0].real_model.as_deref(), Some("gpt-4o-updated"));
         assert_eq!(r.targets[0].priority, 5);
@@ -1658,7 +1679,6 @@ targets = [
         let reg = state.providers.read().await;
         assert!(reg.contains_key("openai"));
     }
-
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1764,7 +1784,10 @@ mod auth_regression_tests {
             .route("/providers/{name}/models", get(list_provider_models))
             .route(
                 "/routes",
-                get(list_routes).post(create_route).put(update_route).delete(delete_route),
+                get(list_routes)
+                    .post(create_route)
+                    .put(update_route)
+                    .delete(delete_route),
             )
             .with_state(state.clone())
             .route_layer(middleware::from_fn_with_state(
