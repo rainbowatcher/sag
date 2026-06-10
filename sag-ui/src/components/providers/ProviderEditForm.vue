@@ -164,8 +164,6 @@ function headersMap(): Record<string, string> {
 // ── Basic fields ─────────────────────────────────────────────
 const providerType = ref(props.provider.provider_type)
 const baseUrl = ref(props.provider.base_url)
-const priority = ref(props.provider.priority)
-const maxRetries = ref(props.provider.max_retries)
 const timeoutSecs = ref(props.provider.timeout_secs)
 async function handleSubmit() {
   apiError.value = ""
@@ -185,12 +183,6 @@ async function handleSubmit() {
     }
     if (baseUrl.value !== props.provider.base_url) {
       payload.base_url = baseUrl.value
-    }
-    if (priority.value !== props.provider.priority) {
-      payload.priority = priority.value
-    }
-    if (maxRetries.value !== props.provider.max_retries) {
-      payload.max_retries = maxRetries.value
     }
     if (timeoutSecs.value !== props.provider.timeout_secs) {
       payload.timeout_secs = timeoutSecs.value
@@ -255,7 +247,6 @@ async function handleSubmit() {
           <TabsList class="mb-4">
             <TabsTrigger value="basic">Basic</TabsTrigger>
             <TabsTrigger value="models">Models</TabsTrigger>
-            <TabsTrigger value="limits">Rate Limit &amp; Retry</TabsTrigger>
             <TabsTrigger value="advanced">Advanced</TabsTrigger>
           </TabsList>
 
@@ -325,6 +316,15 @@ async function handleSubmit() {
                 @input="baseUrl = ($event.target as HTMLInputElement).value"
               />
             </div>
+
+            <div class="space-y-1">
+              <FieldLabel>Timeout (secs)</FieldLabel>
+              <Input
+                type="number"
+                :model-value="timeoutSecs"
+                @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
+              />
+            </div>
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
@@ -380,34 +380,6 @@ async function handleSubmit() {
                 <Plus class="h-3.5 w-3.5" />
                 Add
               </Button>
-            </div>
-          </TabsContent>
-
-          <!-- ─── Tab: Rate Limit & Retry ─────────────────────── -->
-          <TabsContent value="limits" class="grid grid-cols-2 gap-4">
-            <div class="space-y-1">
-              <FieldLabel>Priority</FieldLabel>
-              <Input
-                type="number"
-                :model-value="priority"
-                @input="priority = Number(($event.target as HTMLInputElement).value)"
-              />
-            </div>
-            <div class="space-y-1">
-              <FieldLabel>Max Retries</FieldLabel>
-              <Input
-                type="number"
-                :model-value="maxRetries"
-                @input="maxRetries = Number(($event.target as HTMLInputElement).value)"
-              />
-            </div>
-            <div class="space-y-1">
-              <FieldLabel>Timeout (secs)</FieldLabel>
-              <Input
-                type="number"
-                :model-value="timeoutSecs"
-                @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
-              />
             </div>
           </TabsContent>
 

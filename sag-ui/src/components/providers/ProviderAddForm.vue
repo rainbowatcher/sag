@@ -78,8 +78,6 @@ const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
   provider_type: z.string(),
   base_url: z.string(),
-  priority: z.number(),
-  max_retries: z.number(),
   timeout_secs: z.number(),
 })
 
@@ -88,8 +86,6 @@ const form = useForm({
     name: "",
     provider_type: "openai",
     base_url: "https://api.openai.com/v1",
-    priority: 0,
-    max_retries: 2,
     timeout_secs: 120,
   },
   validators: {
@@ -128,8 +124,6 @@ const form = useForm({
         key_strategy: keyStrategy.value,
         provider_type: value.provider_type,
         base_url: value.base_url || undefined,
-        priority: value.priority,
-        max_retries: value.max_retries,
         timeout_secs: value.timeout_secs,
         headers: parsedHeaders,
         body_overrides: parsedBodyOverrides,
@@ -179,7 +173,6 @@ async function handleSubmit(event: Event) {
           <TabsList class="mb-4">
             <TabsTrigger value="basic">Basic</TabsTrigger>
             <TabsTrigger value="models">Models</TabsTrigger>
-            <TabsTrigger value="limits">Rate Limit &amp; Retry</TabsTrigger>
             <TabsTrigger value="advanced">Advanced</TabsTrigger>
           </TabsList>
 
@@ -270,6 +263,23 @@ async function handleSubmit(event: Event) {
                 </Field>
               </form.Field>
             </div>
+
+            <div class="space-y-1">
+              <form.Field name="timeout_secs" #default="{ field }">
+                <Field :data-invalid="isInvalid(field)">
+                  <FieldLabel :for="field.name">Timeout (secs)</FieldLabel>
+                  <Input
+                    :id="field.name"
+                    type="number"
+                    :model-value="field.state.value"
+                    :aria-invalid="isInvalid(field)"
+                    @blur="field.handleBlur"
+                    @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
+                  />
+                  <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+                </Field>
+              </form.Field>
+            </div>
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
@@ -307,54 +317,6 @@ async function handleSubmit(event: Event) {
                 Add
               </Button>
             </div>
-          </TabsContent>
-
-          <!-- ─── Tab: Rate Limit & Retry ─────────────────────── -->
-          <TabsContent value="limits" class="grid grid-cols-2 gap-4">
-            <form.Field name="priority" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Priority</FieldLabel>
-                <Input
-                  :id="field.name"
-                  type="number"
-                  :model-value="field.state.value"
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-                />
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-
-            <form.Field name="max_retries" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Max Retries</FieldLabel>
-                <Input
-                  :id="field.name"
-                  type="number"
-                  :model-value="field.state.value"
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-                />
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-
-            <form.Field name="timeout_secs" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Timeout (secs)</FieldLabel>
-                <Input
-                  :id="field.name"
-                  type="number"
-                  :model-value="field.state.value"
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-                />
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
           </TabsContent>
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->

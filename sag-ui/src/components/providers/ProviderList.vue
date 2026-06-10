@@ -142,9 +142,6 @@ async function onUpdated() {
           </div>
         </button>
         <div class="flex items-center gap-1 pr-3">
-          <Badge variant="outline" class="rounded-full px-2 py-0.5 text-xs font-normal"
-            >priority: {{ p.priority }}</Badge
-          >
           <Button
             variant="ghost"
             size="icon-sm"
@@ -220,10 +217,6 @@ async function onUpdated() {
         <div class="flex gap-2">
           <span class="text-muted-foreground w-20 shrink-0">Base URL:</span>
           <span class="font-mono">{{ p.base_url }}</span>
-        </div>
-        <div class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Max Retries:</span>
-          <span>{{ p.max_retries }}</span>
         </div>
         <div class="flex gap-2">
           <span class="text-muted-foreground w-20 shrink-0">Timeout:</span>

@@ -21,6 +21,7 @@ export interface RouteTarget {
   provider: string
   real_model: string | null
   priority: number
+  retries?: number
   extra?: Record<string, any>
 }
 
@@ -28,6 +29,7 @@ export interface RouteConfig {
   model_name: string
   api_endpoint: string
   strategy: Strategy
+  retries?: number
   targets: RouteTarget[]
 }
 
@@ -37,10 +39,12 @@ export interface CreateRoutePayload {
   model_name: string
   api_endpoint?: string
   strategy?: Strategy
+  retries?: number
   targets: Array<{
     provider: string
     real_model?: string
     priority?: number
+    retries?: number
     extra?: Record<string, any>
   }>
 }
@@ -49,10 +53,12 @@ export interface UpdateRoutePayload {
   model_name: string
   api_endpoint?: string
   strategy?: Strategy
+  retries?: number
   targets?: Array<{
     provider: string
     real_model?: string
     priority?: number
+    retries?: number
     extra?: Record<string, any>
   }>
 }

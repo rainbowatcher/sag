@@ -58,13 +58,16 @@ interface TargetForm {
   provider_name: string
   real_model: string
   priority: number
+  retries: number
   extra: string
 }
 
-const targets = ref<TargetForm[]>([{ provider_name: "", real_model: "", priority: 0, extra: "" }])
+const targets = ref<TargetForm[]>([
+  { provider_name: "", real_model: "", priority: 0, retries: 0, extra: "" },
+])
 
 function addTarget() {
-  targets.value.push({ provider_name: "", real_model: "", priority: 0, extra: "" })
+  targets.value.push({ provider_name: "", real_model: "", priority: 0, retries: 0, extra: "" })
 }
 
 function removeTarget(index: number) {
@@ -137,6 +140,7 @@ async function handleSubmit(event: Event) {
           provider: t.provider_name,
           real_model: t.real_model || undefined,
           priority: t.priority,
+          retries: t.retries || undefined,
         }
         if (t.extra.trim()) {
           try {
@@ -327,6 +331,15 @@ async function handleSubmit(event: Event) {
                 type="number"
                 :model-value="t.priority"
                 @input="t.priority = Number(($event.target as HTMLInputElement).value)"
+              />
+            </div>
+
+            <div class="w-20">
+              <Label class="text-xs">Retries</Label>
+              <Input
+                type="number"
+                :model-value="t.retries"
+                @input="t.retries = Number(($event.target as HTMLInputElement).value)"
               />
             </div>
 

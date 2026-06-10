@@ -48,6 +48,7 @@ interface TargetEdit {
   provider: string
   real_model: string
   priority: number
+  retries: number
   extra: string
 }
 
@@ -56,6 +57,7 @@ const targets = ref<TargetEdit[]>(
     provider: t.provider,
     real_model: t.real_model ?? "",
     priority: t.priority,
+    retries: t.retries ?? 0,
     extra: t.extra ? JSON.stringify(t.extra) : "",
   })),
 )
@@ -70,7 +72,7 @@ onMounted(() => {
 })
 
 function addTarget() {
-  targets.value.push({ provider: "", real_model: "", priority: 0, extra: "" })
+  targets.value.push({ provider: "", real_model: "", priority: 0, retries: 0, extra: "" })
 }
 
 function removeTarget(index: number) {
@@ -121,11 +123,13 @@ const form = useForm({
             provider: string
             real_model?: string
             priority?: number
+            retries?: number
             extra?: Record<string, any>
           } = {
             provider: t.provider,
             real_model: t.real_model || undefined,
             priority: t.priority,
+            retries: t.retries || undefined,
           }
           if (t.extra.trim()) {
             try {
@@ -310,6 +314,15 @@ async function handleSubmit(event: Event) {
               type="number"
               :model-value="t.priority"
               @input="t.priority = Number(($event.target as HTMLInputElement).value)"
+            />
+          </div>
+
+          <div class="w-20">
+            <Label class="text-xs">Retries</Label>
+            <Input
+              type="number"
+              :model-value="t.retries"
+              @input="t.retries = Number(($event.target as HTMLInputElement).value)"
             />
           </div>
 
