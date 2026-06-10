@@ -1,6 +1,8 @@
 export interface Provider {
   name: string
   api_key: string
+  api_keys: string[]
+  key_strategy: "fill_first" | "round_robin"
   provider_type: string
   base_url: string
   priority: number
@@ -10,6 +12,12 @@ export interface Provider {
   headers: Record<string, string>
   body_overrides: Record<string, any>
   enabled_models: string[]
+}
+
+export interface ModelTestResult {
+  key_prefix: string
+  success: boolean
+  message: string
 }
 
 export interface RouteTarget {

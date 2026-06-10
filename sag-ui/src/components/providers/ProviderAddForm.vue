@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
-import { X, Loader2, Plus } from "lucide-vue-next"
+import { Loader2, Plus, X } from "lucide-vue-next"
 import { ref } from "vue"
 import { z } from "zod"
 import { Button } from "@/components/ui/button"
@@ -14,6 +14,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Separator } from "@/components/ui/separator"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  TagsInput,
+  TagsInputInput,
+  TagsInputItem,
+  TagsInputItemDelete,
+  TagsInputItemText,
+} from "@/components/ui/tags-input"
 import { useProviderStore } from "@/stores/providers"
 
 const store = useProviderStore()
@@ -26,7 +35,20 @@ const emit = defineEmits<{
 const adding = ref(false)
 const apiError = ref("")
 
-// ── Model management ─────────────────────────────────────────────
+// ── API keys management ──────────────────────────────────────
+const apiKeys = ref<string[]>([""])
+const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
+
+function addApiKey() {
+  apiKeys.value.push("")
+}
+
+function removeApiKey(idx: number) {
+  apiKeys.value.splice(idx, 1)
+  if (apiKeys.value.length === 0) apiKeys.value.push("")
+}
+
+// ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
 const newModel = ref("")
 
@@ -43,27 +65,42 @@ function removeModel(name: string) {
   if (idx !== -1) enabledModels.value.splice(idx, 1)
 }
 
+// ── KV pair helpers ──────────────────────────────────────────
+function addKvPair(arr: { key: string; value: string }[]) {
+  arr.push({ key: "", value: "" })
+}
+
+function removeKvPair(arr: { key: string; value: string }[], idx: number) {
+  arr.splice(idx, 1)
+}
+
+// ── Headers ──────────────────────────────────────────────────
+const headers = ref<{ key: string; value: string }[]>([])
+
+// ── Body overrides ───────────────────────────────────────────
+const bodyOverrides = ref<{ key: string; value: string }[]>([])
+
+// ── Supported params ─────────────────────────────────────────
+const supportedParams = ref<string[]>(["model", "messages", "temperature", "max_tokens", "stream"])
+
+// ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
-  api_key: z.string().min(1, "API key is required"),
   provider_type: z.string(),
   base_url: z.string(),
   priority: z.number(),
-  supported_params: z.string(),
-  headers_json: z.string(),
-  body_overrides_json: z.string(),
+  max_retries: z.number(),
+  timeout_secs: z.number(),
 })
 
 const form = useForm({
   defaultValues: {
     name: "",
-    api_key: "",
     provider_type: "openai",
     base_url: "https://api.openai.com/v1",
     priority: 0,
-    supported_params: "model,messages,temperature,max_tokens,stream",
-    headers_json: "",
-    body_overrides_json: "",
+    max_retries: 2,
+    timeout_secs: 120,
   },
   validators: {
     onSubmit: formSchema,
@@ -71,35 +108,42 @@ const form = useForm({
   onSubmit: async ({ value }) => {
     apiError.value = ""
     try {
-      let headers: Record<string, string> = {}
-      let bodyOverrides: Record<string, any> = {}
-      try {
-        headers = value.headers_json ? JSON.parse(value.headers_json) : {}
-      } catch {
-        apiError.value = "Headers must be valid JSON"
-        throw new Error("invalid headers JSON")
+      // Parse body overrides
+      const parsedBodyOverrides: Record<string, any> = {}
+      for (const { key, value: val } of bodyOverrides.value) {
+        if (!key.trim()) continue
+        try {
+          parsedBodyOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
+        } catch {
+          apiError.value = `Body override "${key}": invalid JSON value`
+          throw new Error("invalid body override JSON")
+        }
       }
-      try {
-        bodyOverrides = value.body_overrides_json ? JSON.parse(value.body_overrides_json) : {}
-      } catch {
-        apiError.value = "Body overrides must be valid JSON"
-        throw new Error("invalid body_overrides JSON")
+
+      // Build headers map
+      const parsedHeaders: Record<string, string> = {}
+      for (const { key, value: val } of headers.value) {
+        if (key.trim() && val.trim()) {
+          parsedHeaders[key.trim()] = val.trim()
+        }
       }
+
+      const validKeys = apiKeys.value.filter((k) => k.trim())
+      const effectiveApiKey = validKeys[0] || ""
 
       await store.addProvider({
         name: value.name,
-        api_key: value.api_key,
+        api_key: effectiveApiKey,
+        api_keys: validKeys,
+        key_strategy: keyStrategy.value,
         provider_type: value.provider_type,
         base_url: value.base_url || undefined,
         priority: value.priority,
-        supported_params: value.supported_params
-          ? value.supported_params
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean)
-          : [],
-        headers,
-        body_overrides: bodyOverrides,
+        max_retries: value.max_retries,
+        timeout_secs: value.timeout_secs,
+        supported_params: supportedParams.value,
+        headers: parsedHeaders,
+        body_overrides: parsedBodyOverrides,
         enabled_models: enabledModels.value,
       })
       emit("created")
@@ -142,151 +186,109 @@ async function handleSubmit(event: Event) {
         {{ apiError }}
       </div>
       <form id="provider-add-form" @submit.prevent="handleSubmit">
-        <div class="grid grid-cols-2 gap-4">
-          <form.Field name="name" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name">Name *</FieldLabel>
-              <Input
-                :id="field.name"
-                :model-value="field.state.value"
-                placeholder="my-openai"
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
+        <Tabs default-value="basic">
+          <TabsList class="mb-4">
+            <TabsTrigger value="basic">Basic</TabsTrigger>
+            <TabsTrigger value="models">Models</TabsTrigger>
+            <TabsTrigger value="limits">Rate Limit &amp; Retry</TabsTrigger>
+            <TabsTrigger value="advanced">Advanced</TabsTrigger>
+          </TabsList>
 
-          <form.Field name="provider_type" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name">Type</FieldLabel>
+          <!-- ─── Tab: Basic ──────────────────────────────────── -->
+          <TabsContent value="basic" class="grid grid-cols-2 gap-4">
+            <form.Field name="name" #default="{ field }">
+              <Field :data-invalid="isInvalid(field)">
+                <FieldLabel :for="field.name">Name *</FieldLabel>
+                <Input
+                  :id="field.name"
+                  :model-value="field.state.value"
+                  placeholder="my-openai"
+                  :aria-invalid="isInvalid(field)"
+                  @blur="field.handleBlur"
+                  @input="field.handleChange(($event.target as HTMLInputElement).value)"
+                />
+                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+              </Field>
+            </form.Field>
+
+            <form.Field name="provider_type" #default="{ field }">
+              <Field :data-invalid="isInvalid(field)">
+                <FieldLabel :for="field.name">Type</FieldLabel>
+                <Select
+                  :model-value="field.state.value"
+                  @update:model-value="(v) => field.handleChange(v as string)"
+                >
+                  <SelectTrigger :id="field.name">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent class="w-(--reka-select-trigger-width)">
+                    <SelectItem value="openai">OpenAI</SelectItem>
+                    <SelectItem value="anthropic">Anthropic</SelectItem>
+                  </SelectContent>
+                </Select>
+                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+              </Field>
+            </form.Field>
+
+            <div class="col-span-2 space-y-1">
+              <FieldLabel>API Keys</FieldLabel>
+              <div v-for="(_, idx) in apiKeys" :key="idx" class="mb-1 flex items-center gap-2">
+                <Input
+                  type="password"
+                  :model-value="apiKeys[idx]"
+                  :placeholder="`sk-... (key ${idx + 1})`"
+                  class="flex-1"
+                  @input="apiKeys[idx] = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="ghost" size="icon-sm" @click="removeApiKey(idx)">
+                  <X class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <Button type="button" variant="outline" size="sm" @click="addApiKey">
+                <Plus class="h-3.5 w-3.5" />
+                Add Key
+              </Button>
+            </div>
+
+            <div class="col-span-2 space-y-1">
+              <FieldLabel>Key Strategy</FieldLabel>
               <Select
-                :model-value="field.state.value"
-                @update:model-value="(v) => field.handleChange(v as string)"
+                :model-value="keyStrategy"
+                @update:model-value="(v) => (keyStrategy = v as any)"
               >
-                <SelectTrigger :id="field.name">
+                <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="openai">OpenAI</SelectItem>
-                  <SelectItem value="anthropic">Anthropic</SelectItem>
+                  <SelectItem value="fill_first">Fill First</SelectItem>
+                  <SelectItem value="round_robin">Round Robin</SelectItem>
                 </SelectContent>
               </Select>
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
+            </div>
 
-          <div class="col-span-2">
-            <form.Field name="api_key" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">API Key *</FieldLabel>
-                <Input
-                  :id="field.name"
-                  type="password"
-                  :model-value="field.state.value"
-                  placeholder="sk-..."
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                />
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-          </div>
+            <div class="col-span-2">
+              <form.Field name="base_url" #default="{ field }">
+                <Field :data-invalid="isInvalid(field)">
+                  <FieldLabel :for="field.name">Base URL</FieldLabel>
+                  <Input
+                    :id="field.name"
+                    :model-value="field.state.value"
+                    :aria-invalid="isInvalid(field)"
+                    @blur="field.handleBlur"
+                    @input="field.handleChange(($event.target as HTMLInputElement).value)"
+                  />
+                  <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+                </Field>
+              </form.Field>
+            </div>
+          </TabsContent>
 
-          <div class="col-span-2">
-            <form.Field name="base_url" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Base URL</FieldLabel>
-                <Input
-                  :id="field.name"
-                  :model-value="field.state.value"
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                />
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-          </div>
-
-          <form.Field name="priority" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name">Priority</FieldLabel>
-              <Input
-                :id="field.name"
-                type="number"
-                :model-value="field.state.value"
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-              />
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-
-          <form.Field name="supported_params" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name">Supported Params</FieldLabel>
-              <Input
-                :id="field.name"
-                :model-value="field.state.value"
-                placeholder="model,messages,temperature"
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-
-          <div class="col-span-2">
-            <form.Field name="headers_json" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Headers (JSON)</FieldLabel>
-                <Input
-                  :id="field.name"
-                  :model-value="field.state.value"
-                  placeholder='{"Authorization":"Bearer custom","X-Custom":"value"}'
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                />
-                <p class="text-muted-foreground mt-0.5 text-xs">
-                  Optional JSON object of custom headers to add or override.
-                </p>
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-          </div>
-
-          <div class="col-span-2">
-            <form.Field name="body_overrides_json" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Body Overrides (JSON)</FieldLabel>
-                <Input
-                  :id="field.name"
-                  :model-value="field.state.value"
-                  placeholder='{"max_tokens":4096,"temperature":0.8}'
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                />
-                <p class="text-muted-foreground mt-0.5 text-xs">
-                  Optional JSON object of fields to override in the upstream request body.
-                </p>
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-          </div>
-
-          <div class="col-span-2 border-t pt-3">
-            <p class="text-muted-foreground mb-1 text-xs font-medium">Models</p>
-            <p v-if="enabledModels.length === 0" class="text-muted-foreground mb-1 text-xs">
+          <!-- ─── Tab: Models ─────────────────────────────────── -->
+          <TabsContent value="models" class="space-y-3">
+            <p v-if="enabledModels.length === 0" class="text-muted-foreground text-xs">
               No models listed means all models are allowed (no restriction).
             </p>
-            <div v-if="enabledModels.length > 0" class="mb-2 space-y-1">
+            <div v-if="enabledModels.length > 0" class="space-y-1">
               <div
                 v-for="model in enabledModels"
                 :key="model"
@@ -316,8 +318,137 @@ async function handleSubmit(event: Event) {
                 Add
               </Button>
             </div>
-          </div>
-        </div>
+          </TabsContent>
+
+          <!-- ─── Tab: Rate Limit & Retry ─────────────────────── -->
+          <TabsContent value="limits" class="grid grid-cols-2 gap-4">
+            <form.Field name="priority" #default="{ field }">
+              <Field :data-invalid="isInvalid(field)">
+                <FieldLabel :for="field.name">Priority</FieldLabel>
+                <Input
+                  :id="field.name"
+                  type="number"
+                  :model-value="field.state.value"
+                  :aria-invalid="isInvalid(field)"
+                  @blur="field.handleBlur"
+                  @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
+                />
+                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+              </Field>
+            </form.Field>
+
+            <form.Field name="max_retries" #default="{ field }">
+              <Field :data-invalid="isInvalid(field)">
+                <FieldLabel :for="field.name">Max Retries</FieldLabel>
+                <Input
+                  :id="field.name"
+                  type="number"
+                  :model-value="field.state.value"
+                  :aria-invalid="isInvalid(field)"
+                  @blur="field.handleBlur"
+                  @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
+                />
+                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+              </Field>
+            </form.Field>
+
+            <form.Field name="timeout_secs" #default="{ field }">
+              <Field :data-invalid="isInvalid(field)">
+                <FieldLabel :for="field.name">Timeout (secs)</FieldLabel>
+                <Input
+                  :id="field.name"
+                  type="number"
+                  :model-value="field.state.value"
+                  :aria-invalid="isInvalid(field)"
+                  @blur="field.handleBlur"
+                  @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
+                />
+                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+              </Field>
+            </form.Field>
+
+            <div class="col-span-2 space-y-1">
+              <FieldLabel>Supported Params</FieldLabel>
+              <TagsInput v-model="supportedParams" class="w-full">
+                <TagsInputItem v-for="item in supportedParams" :key="item" :value="item">
+                  <TagsInputItemText />
+                  <TagsInputItemDelete />
+                </TagsInputItem>
+                <TagsInputInput placeholder="Add param..." />
+              </TagsInput>
+            </div>
+          </TabsContent>
+
+          <!-- ─── Tab: Advanced ───────────────────────────────── -->
+          <TabsContent value="advanced" class="space-y-4">
+            <div class="space-y-1">
+              <FieldLabel>Headers</FieldLabel>
+              <p class="text-muted-foreground text-xs">
+                Key-value pairs of custom headers (values are plain text).
+              </p>
+              <div
+                v-for="(_, idx) in headers"
+                :key="'hdr-' + idx"
+                class="mb-1 flex items-center gap-2"
+              >
+                <Input
+                  :model-value="headers[idx].key"
+                  placeholder="Header-Name"
+                  class="w-48"
+                  @input="headers[idx].key = ($event.target as HTMLInputElement).value"
+                />
+                <Input
+                  :model-value="headers[idx].value"
+                  placeholder="Value"
+                  class="flex-1"
+                  @input="headers[idx].value = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="ghost" size="icon-sm" @click="removeKvPair(headers, idx)">
+                  <X class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <Button type="button" variant="outline" size="sm" @click="addKvPair(headers)">
+                <Plus class="h-3.5 w-3.5" />
+                Add Header
+              </Button>
+            </div>
+
+            <Separator />
+
+            <div class="space-y-1">
+              <FieldLabel>Body Overrides</FieldLabel>
+              <p class="text-muted-foreground text-xs">
+                Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON
+                (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).
+              </p>
+              <div
+                v-for="(_, idx) in bodyOverrides"
+                :key="'bo-' + idx"
+                class="mb-1 flex items-center gap-2"
+              >
+                <Input
+                  :model-value="bodyOverrides[idx].key"
+                  placeholder="max_tokens"
+                  class="w-48"
+                  @input="bodyOverrides[idx].key = ($event.target as HTMLInputElement).value"
+                />
+                <Input
+                  :model-value="bodyOverrides[idx].value"
+                  placeholder="4096"
+                  class="flex-1"
+                  @input="bodyOverrides[idx].value = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="ghost" size="icon-sm" @click="removeKvPair(bodyOverrides, idx)">
+                  <X class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <Button type="button" variant="outline" size="sm" @click="addKvPair(bodyOverrides)">
+                <Plus class="h-3.5 w-3.5" />
+                Add Override
+              </Button>
+            </div>
+          </TabsContent>
+        </Tabs>
       </form>
     </CardContent>
     <CardFooter class="flex justify-end">

@@ -1,10 +1,27 @@
 <script setup lang="ts">
-import { useForm } from "@tanstack/vue-form"
-import { Loader2, Plus, X, Check, X as XIcon, RefreshCw } from "lucide-vue-next"
-import { ref } from "vue"
-import { z } from "zod"
+import { useMediaQuery } from "@vueuse/core"
+import { Loader2, Plus, X as XIcon, RefreshCw } from "lucide-vue-next"
+import { computed, ref } from "vue"
 import { Button } from "@/components/ui/button"
-import { Field, FieldError, FieldLabel } from "@/components/ui/field"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  Drawer,
+  DrawerClose,
+  DrawerContent,
+  DrawerDescription,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+} from "@/components/ui/drawer"
+import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -13,10 +30,32 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Separator } from "@/components/ui/separator"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  TagsInput,
+  TagsInputInput,
+  TagsInputItem,
+  TagsInputItemDelete,
+  TagsInputItemText,
+} from "@/components/ui/tags-input"
 import { api, headers as authHeaders } from "@/lib/client"
 import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
-import type { Provider } from "@/types/api"
+import type { ModelTestResult, Provider } from "@/types/api"
+
+const isDesktop = useMediaQuery("(min-width: 640px)")
+
+const Modal = computed(() => ({
+  Root: isDesktop.value ? Dialog : Drawer,
+  Trigger: isDesktop.value ? "div" : "div",
+  Content: isDesktop.value ? DialogContent : DrawerContent,
+  Header: isDesktop.value ? DialogHeader : DrawerHeader,
+  Title: isDesktop.value ? DialogTitle : DrawerTitle,
+  Description: isDesktop.value ? DialogDescription : DrawerDescription,
+  Footer: isDesktop.value ? DialogFooter : DrawerFooter,
+  Close: isDesktop.value ? DialogClose : DrawerClose,
+}))
 
 const store = useProviderStore()
 
@@ -29,14 +68,32 @@ const emit = defineEmits<{
   updated: []
 }>()
 
+const open = ref(true)
 const saving = ref(false)
 const apiError = ref("")
 
-// ── Model management ─────────────────────────────────────────────
+function onOpenChange(v: boolean) {
+  if (!v) emit("close")
+}
+
+// ── API keys management ──────────────────────────────────────
+const apiKeys = ref<string[]>([...props.provider.api_keys])
+const keyStrategy = ref<"fill_first" | "round_robin">(props.provider.key_strategy)
+
+function addApiKey() {
+  apiKeys.value.push("")
+}
+
+function removeApiKey(idx: number) {
+  apiKeys.value.splice(idx, 1)
+  if (apiKeys.value.length === 0) apiKeys.value.push("")
+}
+
+// ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([...props.provider.enabled_models])
 const newModel = ref("")
 const testingModel = ref<Record<string, boolean>>({})
-const testModelResult = ref<Record<string, { success: boolean; message: string } | null>>({})
+const testModelResult = ref<Record<string, ModelTestResult[] | null>>({})
 
 function addModel() {
   const name = newModel.value.trim()
@@ -56,131 +113,137 @@ async function testModel(model: string) {
   testModelResult.value[model] = null
   try {
     const conn = useConnectionStore()
-    const { data } = await api.post<{ success: boolean; message: string }>(
+    const { data } = await api.post<{ results: ModelTestResult[] }>(
       "/api/model/test",
       {
         model,
-        api_key: props.provider.api_key,
+        api_keys:
+          apiKeys.value.filter((k) => k.trim()).length > 0
+            ? apiKeys.value.filter((k) => k.trim())
+            : [props.provider.api_key],
         base_url: props.provider.base_url,
         provider_type: props.provider.provider_type,
-        headers: props.provider.headers,
+        headers: headersMap(),
       },
       { headers: authHeaders(conn.connection?.apiKey) },
     )
-    testModelResult.value[model] = data
+    testModelResult.value[model] = data.results
   } catch (e: any) {
-    testModelResult.value[model] = {
-      success: false,
-      message: e.response?.data?.error?.message ?? e.message,
-    }
+    testModelResult.value[model] = [
+      {
+        key_prefix: "error",
+        success: false,
+        message: e.response?.data?.error?.message ?? e.message,
+      },
+    ]
   } finally {
     testingModel.value[model] = false
   }
 }
 
-const formSchema = z.object({
-  api_key: z.string(),
-  provider_type: z.string(),
-  base_url: z.string(),
-  priority: z.number(),
-  max_retries: z.number(),
-  timeout_secs: z.number(),
-  supported_params: z.string(),
-  headers_json: z.string(),
-  body_overrides_json: z.string(),
-})
+// ── KV pair management ───────────────────────────────────────
+const headersList = ref<{ key: string; value: string }[]>(
+  Object.entries(props.provider.headers ?? {}).map(([k, v]) => ({ key: k, value: v })),
+)
+const bodyOverridesList = ref<{ key: string; value: string }[]>(
+  Object.entries(props.provider.body_overrides ?? {}).map(([k, v]) => ({
+    key: k,
+    value: typeof v === "string" ? v : JSON.stringify(v),
+  })),
+)
 
-const form = useForm({
-  defaultValues: {
-    api_key: "",
-    provider_type: props.provider.provider_type,
-    base_url: props.provider.base_url,
-    priority: props.provider.priority,
-    max_retries: props.provider.max_retries,
-    timeout_secs: props.provider.timeout_secs,
-    supported_params: props.provider.supported_params.join(", "),
-    headers_json: JSON.stringify(props.provider.headers ?? {}, null, 2),
-    body_overrides_json: JSON.stringify(props.provider.body_overrides ?? {}, null, 2),
-  },
-  validators: {
-    onSubmit: formSchema,
-  },
-  onSubmit: async ({ value }) => {
-    apiError.value = ""
-    try {
-      const current = props.provider
-      const payload: Record<string, any> = {}
-      if (value.api_key) payload.api_key = value.api_key
-      if (value.provider_type !== current.provider_type) {
-        payload.provider_type = value.provider_type
-      }
-      if (value.base_url !== current.base_url) {
-        payload.base_url = value.base_url
-      }
-      if (value.priority !== current.priority) {
-        payload.priority = value.priority
-      }
-      if (value.max_retries !== current.max_retries) {
-        payload.max_retries = value.max_retries
-      }
-      if (value.timeout_secs !== current.timeout_secs) {
-        payload.timeout_secs = value.timeout_secs
-      }
-      const supported = value.supported_params
-        ? value.supported_params
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : []
-      const origSupported = current.supported_params ?? []
-      if (JSON.stringify(supported) !== JSON.stringify(origSupported)) {
-        payload.supported_params = supported
-      }
-      // Headers
-      try {
-        const parsed = value.headers_json ? JSON.parse(value.headers_json) : {}
-        if (JSON.stringify(parsed) !== JSON.stringify(current.headers ?? {})) {
-          payload.headers = parsed
-        }
-      } catch {
-        apiError.value = "Headers must be valid JSON"
-        throw new Error("invalid headers JSON")
-      }
-      // Body overrides
-      try {
-        const parsed = value.body_overrides_json ? JSON.parse(value.body_overrides_json) : {}
-        if (JSON.stringify(parsed) !== JSON.stringify(current.body_overrides ?? {})) {
-          payload.body_overrides = parsed
-        }
-      } catch {
-        apiError.value = "Body overrides must be valid JSON"
-        throw new Error("invalid body_overrides JSON")
-      }
-      if (JSON.stringify(enabledModels.value) !== JSON.stringify(current.enabled_models ?? [])) {
-        payload.enabled_models = enabledModels.value
-      }
-      await store.updateProvider(current.name, payload)
-      emit("updated")
-    } catch (e: any) {
-      if (apiError.value) return
-      apiError.value = e.response?.data?.error?.message ?? e.message
-      throw e
-    }
-  },
-})
-
-function isInvalid(field: any) {
-  return field.state.meta.isTouched && !field.state.meta.isValid
+function addKvPair(arr: { key: string; value: string }[]) {
+  arr.push({ key: "", value: "" })
 }
 
-async function handleSubmit(event: Event) {
-  event.preventDefault()
+function removeKvPair(arr: { key: string; value: string }[], idx: number) {
+  arr.splice(idx, 1)
+}
+
+function headersMap(): Record<string, string> {
+  const m: Record<string, string> = {}
+  for (const { key, value } of headersList.value) {
+    if (key.trim() && value.trim()) m[key.trim()] = value.trim()
+  }
+  return m
+}
+
+// ── Basic fields ─────────────────────────────────────────────
+const providerType = ref(props.provider.provider_type)
+const baseUrl = ref(props.provider.base_url)
+const priority = ref(props.provider.priority)
+const maxRetries = ref(props.provider.max_retries)
+const timeoutSecs = ref(props.provider.timeout_secs)
+const supportedParams = ref<string[]>([...props.provider.supported_params])
+
+async function handleSubmit() {
   apiError.value = ""
   saving.value = true
   try {
-    await form.handleSubmit()
-    if (apiError.value) return
+    const validKeys = apiKeys.value.filter((k) => k.trim())
+    const payload: Record<string, any> = {}
+
+    if (validKeys.length > 0) {
+      payload.api_key = validKeys[0]
+      payload.api_keys = validKeys
+    }
+    payload.key_strategy = keyStrategy.value
+
+    if (providerType.value !== props.provider.provider_type) {
+      payload.provider_type = providerType.value
+    }
+    if (baseUrl.value !== props.provider.base_url) {
+      payload.base_url = baseUrl.value
+    }
+    if (priority.value !== props.provider.priority) {
+      payload.priority = priority.value
+    }
+    if (maxRetries.value !== props.provider.max_retries) {
+      payload.max_retries = maxRetries.value
+    }
+    if (timeoutSecs.value !== props.provider.timeout_secs) {
+      payload.timeout_secs = timeoutSecs.value
+    }
+
+    const origSupported = props.provider.supported_params ?? []
+    if (JSON.stringify(supportedParams.value) !== JSON.stringify(origSupported)) {
+      payload.supported_params = supportedParams.value
+    }
+
+    // Headers
+    const parsedHeaders = headersMap()
+    if (JSON.stringify(parsedHeaders) !== JSON.stringify(props.provider.headers ?? {})) {
+      payload.headers = parsedHeaders
+    }
+
+    // Body overrides
+    const parsedBodyOverrides: Record<string, any> = {}
+    for (const { key, value: val } of bodyOverridesList.value) {
+      if (!key.trim()) continue
+      try {
+        parsedBodyOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
+      } catch {
+        apiError.value = `Body override "${key}": invalid JSON value`
+        return
+      }
+    }
+    if (
+      JSON.stringify(parsedBodyOverrides) !== JSON.stringify(props.provider.body_overrides ?? {})
+    ) {
+      payload.body_overrides = parsedBodyOverrides
+    }
+
+    if (
+      JSON.stringify(enabledModels.value) !== JSON.stringify(props.provider.enabled_models ?? [])
+    ) {
+      payload.enabled_models = enabledModels.value
+    }
+
+    await store.updateProvider(props.provider.name, payload)
     emit("updated")
+  } catch (e: any) {
+    if (apiError.value) return
+    apiError.value = e.response?.data?.error?.message ?? e.message
   } finally {
     saving.value = false
   }
@@ -188,201 +251,107 @@ async function handleSubmit(event: Event) {
 </script>
 
 <template>
-  <div class="space-y-3">
-    <div v-if="apiError" class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-      {{ apiError }}
-    </div>
-    <form id="provider-edit-form" @submit.prevent="handleSubmit">
-      <div class="grid grid-cols-2 gap-3">
-        <div class="space-y-1">
-          <FieldLabel class="text-muted-foreground text-xs font-medium">Name</FieldLabel>
-          <Input :model-value="provider.name" disabled class="bg-muted text-muted-foreground" />
-        </div>
-        <form.Field name="provider_type" #default="{ field }">
-          <Field :data-invalid="isInvalid(field)">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-              >Type</FieldLabel
-            >
-            <Select
-              :model-value="field.state.value"
-              @update:model-value="(v) => field.handleChange(v as string)"
-            >
-              <SelectTrigger :id="field.name">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent class="w-(--reka-select-trigger-width)">
-                <SelectItem value="openai">OpenAI</SelectItem>
-                <SelectItem value="anthropic">Anthropic</SelectItem>
-              </SelectContent>
-            </Select>
-            <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-          </Field>
-        </form.Field>
+  <component :is="Modal.Root" :open="open" @update:open="onOpenChange">
+    <component :is="Modal.Content" class="sm:max-w-2xl">
+      <component :is="Modal.Header">
+        <component :is="Modal.Title">
+          {{ provider.name }}
+        </component>
+        <component :is="Modal.Description"> Edit provider configuration </component>
+      </component>
 
-        <div class="col-span-2">
-          <form.Field name="api_key" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">
-                API Key (leave blank to keep current)
-              </FieldLabel>
-              <Input
-                :id="field.name"
-                type="password"
-                :model-value="field.state.value"
-                placeholder="Leave blank to keep current"
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-        </div>
+      <div v-if="apiError" class="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
+        {{ apiError }}
+      </div>
 
-        <div class="col-span-2">
-          <form.Field name="base_url" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-                >Base URL</FieldLabel
+      <div class="px-2 pb-4 sm:px-6">
+        <Tabs default-value="basic">
+          <TabsList class="mb-4">
+            <TabsTrigger value="basic">Basic</TabsTrigger>
+            <TabsTrigger value="models">Models</TabsTrigger>
+            <TabsTrigger value="limits">Rate Limit &amp; Retry</TabsTrigger>
+            <TabsTrigger value="advanced">Advanced</TabsTrigger>
+          </TabsList>
+
+          <!-- ─── Tab: Basic ──────────────────────────────────── -->
+          <TabsContent value="basic" class="grid grid-cols-2 gap-4">
+            <div>
+              <FieldLabel>Name</FieldLabel>
+              <Input :model-value="provider.name" disabled class="bg-muted text-muted-foreground" />
+            </div>
+
+            <div>
+              <FieldLabel>Type</FieldLabel>
+              <Select
+                :model-value="providerType"
+                @update:model-value="(v) => (providerType = v as string)"
               >
-              <Input
-                :id="field.name"
-                :model-value="field.state.value"
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-        </div>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="openai">OpenAI</SelectItem>
+                  <SelectItem value="anthropic">Anthropic</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
 
-        <form.Field name="priority" #default="{ field }">
-          <Field :data-invalid="isInvalid(field)">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-              >Priority</FieldLabel
-            >
-            <Input
-              :id="field.name"
-              type="number"
-              :model-value="field.state.value"
-              :aria-invalid="isInvalid(field)"
-              @blur="field.handleBlur"
-              @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-            />
-            <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-          </Field>
-        </form.Field>
+            <div class="col-span-2 space-y-1">
+              <FieldLabel>API Keys</FieldLabel>
+              <div v-for="(_, idx) in apiKeys" :key="idx" class="mb-1 flex items-center gap-2">
+                <Input
+                  type="password"
+                  :model-value="apiKeys[idx]"
+                  :placeholder="`sk-... (key ${idx + 1})`"
+                  class="flex-1"
+                  @input="apiKeys[idx] = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="ghost" size="icon-sm" @click="removeApiKey(idx)">
+                  <XIcon class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <Button type="button" variant="outline" size="sm" @click="addApiKey">
+                <Plus class="h-3.5 w-3.5" />
+                Add Key
+              </Button>
+            </div>
 
-        <form.Field name="max_retries" #default="{ field }">
-          <Field :data-invalid="isInvalid(field)">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-              >Max Retries</FieldLabel
-            >
-            <Input
-              :id="field.name"
-              type="number"
-              :model-value="field.state.value"
-              :aria-invalid="isInvalid(field)"
-              @blur="field.handleBlur"
-              @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-            />
-            <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-          </Field>
-        </form.Field>
-
-        <form.Field name="timeout_secs" #default="{ field }">
-          <Field :data-invalid="isInvalid(field)">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-              >Timeout (secs)</FieldLabel
-            >
-            <Input
-              :id="field.name"
-              type="number"
-              :model-value="field.state.value"
-              :aria-invalid="isInvalid(field)"
-              @blur="field.handleBlur"
-              @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
-            />
-            <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-          </Field>
-        </form.Field>
-
-        <div class="col-span-2">
-          <form.Field name="supported_params" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-                >Supported Params</FieldLabel
+            <div class="col-span-2 space-y-1">
+              <FieldLabel>Key Strategy</FieldLabel>
+              <Select
+                :model-value="keyStrategy"
+                @update:model-value="(v) => (keyStrategy = v as any)"
               >
-              <Input
-                :id="field.name"
-                :model-value="field.state.value"
-                placeholder="model,messages,temperature"
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-        </div>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="fill_first">Fill First</SelectItem>
+                  <SelectItem value="round_robin">Round Robin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
 
-        <div class="col-span-2">
-          <form.Field name="headers_json" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-                >Headers (JSON)</FieldLabel
+            <div class="col-span-2">
+              <FieldLabel>Base URL</FieldLabel>
+              <Input
+                :model-value="baseUrl"
+                @input="baseUrl = ($event.target as HTMLInputElement).value"
+              />
+            </div>
+          </TabsContent>
+
+          <!-- ─── Tab: Models ─────────────────────────────────── -->
+          <TabsContent value="models" class="space-y-3">
+            <p v-if="enabledModels.length === 0" class="text-muted-foreground text-xs">
+              No models listed means all models are allowed (no restriction).
+            </p>
+            <div v-if="enabledModels.length > 0" class="space-y-1">
+              <div
+                v-for="model in enabledModels"
+                :key="model"
+                class="bg-muted flex flex-wrap items-center gap-2 rounded px-2 py-1 text-xs"
               >
-              <Input
-                :id="field.name"
-                :model-value="field.state.value"
-                placeholder='{"Authorization":"Bearer custom","X-Custom":"value"}'
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <p class="text-muted-foreground mt-0.5 text-xs">
-                Optional JSON object of custom headers.
-              </p>
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-        </div>
-
-        <div class="col-span-2">
-          <form.Field name="body_overrides_json" #default="{ field }">
-            <Field :data-invalid="isInvalid(field)">
-              <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium"
-                >Body Overrides (JSON)</FieldLabel
-              >
-              <Input
-                :id="field.name"
-                :model-value="field.state.value"
-                placeholder='{"max_tokens":4096,"temperature":0.8}'
-                :aria-invalid="isInvalid(field)"
-                @blur="field.handleBlur"
-                @input="field.handleChange(($event.target as HTMLInputElement).value)"
-              />
-              <p class="text-muted-foreground mt-0.5 text-xs">
-                Optional JSON object of fields to override in the upstream request body.
-              </p>
-              <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-            </Field>
-          </form.Field>
-        </div>
-
-        <div class="col-span-2 border-t pt-3">
-          <p class="text-muted-foreground mb-1 text-xs font-medium">Models</p>
-          <p v-if="enabledModels.length === 0" class="text-muted-foreground mb-1 text-xs">
-            No models listed means all models are allowed (no restriction).
-          </p>
-          <div v-if="enabledModels.length > 0" class="mb-2 space-y-1">
-            <div
-              v-for="model in enabledModels"
-              :key="model"
-              class="bg-muted flex items-center justify-between rounded px-2 py-1 text-xs"
-            >
-              <div class="flex items-center gap-2">
                 <span class="font-mono">{{ model }}</span>
                 <Button
                   variant="ghost"
@@ -393,50 +362,169 @@ async function handleSubmit(event: Event) {
                   <Loader2 v-if="testingModel[model]" class="h-3 w-3 animate-spin" />
                   <RefreshCw v-else class="h-3 w-3" />
                 </Button>
-                <div
-                  v-if="testModelResult[model]"
-                  class="flex items-center gap-1 text-xs"
-                  :class="testModelResult[model]?.success ? 'text-green-600' : 'text-red-600'"
-                >
-                  <Check v-if="testModelResult[model]?.success" class="h-3 w-3" />
-                  <XIcon v-else class="h-3 w-3" />
-                  {{ testModelResult[model]?.message }}
+                <div v-if="testModelResult[model]" class="flex flex-wrap items-center gap-2">
+                  <span
+                    v-for="r in testModelResult[model]"
+                    :key="r.key_prefix"
+                    class="rounded px-1 py-0.5"
+                    :class="r.success ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'"
+                  >
+                    {{ r.success ? "✓" : "✗" }} {{ r.key_prefix }}
+                  </span>
                 </div>
+                <Button variant="ghost" size="icon-sm" @click="removeModel(model)" class="ml-auto">
+                  <XIcon class="h-3 w-3" />
+                </Button>
               </div>
-              <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
-                <X class="h-3 w-3" />
+            </div>
+            <div class="flex gap-2">
+              <Input
+                :model-value="newModel"
+                placeholder="gpt-4o"
+                @input="newModel = ($event.target as HTMLInputElement).value"
+                @keydown.enter.prevent="addModel"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="!newModel.trim()"
+                @click="addModel"
+              >
+                <Plus class="h-3.5 w-3.5" />
+                Add
               </Button>
             </div>
-          </div>
-          <div class="flex gap-2">
-            <Input
-              :model-value="newModel"
-              placeholder="gpt-4o"
-              @input="newModel = ($event.target as HTMLInputElement).value"
-              @keydown.enter.prevent="addModel"
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              :disabled="!newModel.trim()"
-              @click="addModel"
-            >
-              <Plus class="h-3.5 w-3.5" />
-              Add
-            </Button>
-          </div>
-        </div>
+          </TabsContent>
+
+          <!-- ─── Tab: Rate Limit & Retry ─────────────────────── -->
+          <TabsContent value="limits" class="grid grid-cols-2 gap-4">
+            <div class="space-y-1">
+              <FieldLabel>Priority</FieldLabel>
+              <Input
+                type="number"
+                :model-value="priority"
+                @input="priority = Number(($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="space-y-1">
+              <FieldLabel>Max Retries</FieldLabel>
+              <Input
+                type="number"
+                :model-value="maxRetries"
+                @input="maxRetries = Number(($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="space-y-1">
+              <FieldLabel>Timeout (secs)</FieldLabel>
+              <Input
+                type="number"
+                :model-value="timeoutSecs"
+                @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="col-span-2 space-y-1">
+              <FieldLabel>Supported Params</FieldLabel>
+              <TagsInput v-model="supportedParams" class="w-full">
+                <TagsInputItem v-for="item in supportedParams" :key="item" :value="item">
+                  <TagsInputItemText />
+                  <TagsInputItemDelete />
+                </TagsInputItem>
+                <TagsInputInput placeholder="Add param..." />
+              </TagsInput>
+            </div>
+          </TabsContent>
+
+          <!-- ─── Tab: Advanced ───────────────────────────────── -->
+          <TabsContent value="advanced" class="space-y-4">
+            <div class="space-y-1">
+              <FieldLabel>Headers</FieldLabel>
+              <p class="text-muted-foreground text-xs">
+                Key-value pairs of custom headers (values are plain text).
+              </p>
+              <div
+                v-for="(_, idx) in headersList"
+                :key="'hdr-' + idx"
+                class="mb-1 flex items-center gap-2"
+              >
+                <Input
+                  :model-value="headersList[idx].key"
+                  placeholder="Header-Name"
+                  class="w-48"
+                  @input="headersList[idx].key = ($event.target as HTMLInputElement).value"
+                />
+                <Input
+                  :model-value="headersList[idx].value"
+                  placeholder="Value"
+                  class="flex-1"
+                  @input="headersList[idx].value = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="ghost" size="icon-sm" @click="removeKvPair(headersList, idx)">
+                  <XIcon class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <Button type="button" variant="outline" size="sm" @click="addKvPair(headersList)">
+                <Plus class="h-3.5 w-3.5" />
+                Add Header
+              </Button>
+            </div>
+
+            <Separator />
+
+            <div class="space-y-1">
+              <FieldLabel>Body Overrides</FieldLabel>
+              <p class="text-muted-foreground text-xs">
+                Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON
+                (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).
+              </p>
+              <div
+                v-for="(_, idx) in bodyOverridesList"
+                :key="'bo-' + idx"
+                class="mb-1 flex items-center gap-2"
+              >
+                <Input
+                  :model-value="bodyOverridesList[idx].key"
+                  placeholder="max_tokens"
+                  class="w-48"
+                  @input="bodyOverridesList[idx].key = ($event.target as HTMLInputElement).value"
+                />
+                <Input
+                  :model-value="bodyOverridesList[idx].value"
+                  placeholder="4096"
+                  class="flex-1"
+                  @input="bodyOverridesList[idx].value = ($event.target as HTMLInputElement).value"
+                />
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  @click="removeKvPair(bodyOverridesList, idx)"
+                >
+                  <XIcon class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                @click="addKvPair(bodyOverridesList)"
+              >
+                <Plus class="h-3.5 w-3.5" />
+                Add Override
+              </Button>
+            </div>
+          </TabsContent>
+        </Tabs>
       </div>
-    </form>
-    <div class="flex justify-end gap-2">
-      <Button variant="outline" size="sm" @click="emit('close')" :disabled="saving">
-        Cancel
-      </Button>
-      <Button type="submit" form="provider-edit-form" size="sm" :disabled="saving">
-        <Loader2 v-if="saving" class="h-3 w-3 animate-spin" />
-        {{ saving ? "Saving..." : "Save" }}
-      </Button>
-    </div>
-  </div>
+
+      <component :is="Modal.Footer">
+        <component :is="Modal.Close" as-child>
+          <Button variant="outline" size="sm" :disabled="saving"> Cancel </Button>
+        </component>
+        <Button size="sm" :disabled="saving" @click="handleSubmit">
+          <Loader2 v-if="saving" class="h-3 w-3 animate-spin" />
+          {{ saving ? "Saving..." : "Save" }}
+        </Button>
+      </component>
+    </component>
+  </component>
 </template>

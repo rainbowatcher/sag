@@ -1,7 +1,7 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api, headers } from "@/lib/client"
-import type { Provider } from "@/types/api"
+import type { ModelTestResult, Provider } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
 export const useProviderStore = defineStore("providers", () => {
@@ -25,26 +25,28 @@ export const useProviderStore = defineStore("providers", () => {
 
   async function testModel(payload: {
     model: string
-    api_key: string
+    api_keys: string[]
     base_url: string
     provider_type?: string
     headers?: Record<string, string>
-  }): Promise<{ success: boolean; message: string }> {
+  }): Promise<ModelTestResult[]> {
     const conn = useConnectionStore()
-    const { data } = await api.post<{ success: boolean; message: string }>(
-      "/api/model/test",
-      payload,
-      { headers: headers(conn.connection?.apiKey) },
-    )
-    return data
+    const { data } = await api.post<{ results: ModelTestResult[] }>("/api/model/test", payload, {
+      headers: headers(conn.connection?.apiKey),
+    })
+    return data.results
   }
 
   async function addProvider(payload: {
     name: string
     api_key: string
+    api_keys?: string[]
+    key_strategy?: string
     provider_type: string
     base_url?: string
     priority?: number
+    max_retries?: number
+    timeout_secs?: number
     supported_params?: string[]
     headers?: Record<string, string>
     body_overrides?: Record<string, any>
@@ -78,6 +80,8 @@ export const useProviderStore = defineStore("providers", () => {
     name: string,
     payload: {
       api_key?: string
+      api_keys?: string[]
+      key_strategy?: string
       provider_type?: string
       base_url?: string
       priority?: number

@@ -16,15 +16,14 @@ import { Button } from "@/components/ui/button"
 import { api, headers as authHeaders } from "@/lib/client"
 import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
-import type { Provider } from "@/types/api"
+import type { ModelTestResult, Provider } from "@/types/api"
 
 const store = useProviderStore()
 
 const expanded = ref<Record<string, boolean>>({})
+const editingProvider = ref<Provider | null>(null)
 const testingModel = ref<Record<string, Record<string, boolean>>>({})
-const testModelResult = ref<
-  Record<string, Record<string, { success: boolean; message: string } | null>>
->({})
+const testModelResult = ref<Record<string, Record<string, ModelTestResult[] | null>>>({})
 
 async function testModel(providerName: string, model: string) {
   if (!testingModel.value[providerName]) testingModel.value[providerName] = {}
@@ -35,23 +34,27 @@ async function testModel(providerName: string, model: string) {
     const conn = useConnectionStore()
     const provider = store.providers.find((p) => p.name === providerName)
     if (!provider) return
-    const { data } = await api.post<{ success: boolean; message: string }>(
+    const keys = provider.api_keys.length > 0 ? provider.api_keys : [provider.api_key]
+    const { data } = await api.post<{ results: ModelTestResult[] }>(
       "/api/model/test",
       {
         model,
-        api_key: provider.api_key,
+        api_keys: keys,
         base_url: provider.base_url,
         provider_type: provider.provider_type,
         headers: provider.headers,
       },
       { headers: authHeaders(conn.connection?.apiKey) },
     )
-    testModelResult.value[providerName][model] = data
+    testModelResult.value[providerName][model] = data.results
   } catch (e: any) {
-    testModelResult.value[providerName][model] = {
-      success: false,
-      message: e.response?.data?.error?.message ?? e.message,
-    }
+    testModelResult.value[providerName][model] = [
+      {
+        key_prefix: "error",
+        success: false,
+        message: e.response?.data?.error?.message ?? e.message,
+      },
+    ]
   } finally {
     testingModel.value[providerName][model] = false
   }
@@ -64,7 +67,6 @@ const deleteError = ref("")
 
 function startDelete(name: string) {
   deleteError.value = ""
-  editingName.value = null
   confirmingDelete.value = confirmingDelete.value === name ? null : name
 }
 
@@ -88,15 +90,17 @@ function cancelDelete() {
 }
 
 // ── Edit flow ────────────────────────────────────────────────────
-const editingName = ref<string | null>(null)
-
 function startEdit(p: Provider) {
   confirmingDelete.value = null
-  editingName.value = p.name
+  editingProvider.value = p
+}
+
+function onEditClose() {
+  editingProvider.value = null
 }
 
 async function onUpdated() {
-  editingName.value = null
+  editingProvider.value = null
   await store.fetchProviders()
 }
 </script>
@@ -145,9 +149,8 @@ async function onUpdated() {
             variant="ghost"
             size="icon-sm"
             @click.stop="startEdit(p)"
-            :class="editingName === p.name ? 'text-primary bg-primary/10' : ''"
-            :title="editingName === p.name ? 'Cancel edit' : 'Edit provider'"
-            :aria-label="editingName === p.name ? 'Cancel edit' : 'Edit provider'"
+            title="Edit provider"
+            aria-label="Edit provider"
           >
             <Pen class="h-3.5 w-3.5" />
           </Button>
@@ -183,7 +186,7 @@ async function onUpdated() {
         <div class="text-destructive flex items-start gap-2">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
           <div>
-            <p class="font-medium">Delete provider &quot;{{ p.name }}&quot;?</p>
+            <p class="font-medium">Delete provider "{{ p.name }}"?</p>
             <p class="text-muted-foreground mt-0.5">
               Any route that uses this provider will lose its target. Routes with no remaining
               targets will be removed entirely.
@@ -209,14 +212,9 @@ async function onUpdated() {
         </div>
       </div>
 
-      <!-- Edit form -->
-      <div v-if="editingName === p.name" class="bg-muted/20 border-t px-4 py-3">
-        <ProviderEditForm :provider="p" @close="editingName = null" @updated="onUpdated" />
-      </div>
-
       <!-- Expanded details -->
       <div
-        v-if="expanded[p.name] && confirmingDelete !== p.name && editingName !== p.name"
+        v-if="expanded[p.name] && confirmingDelete !== p.name"
         class="bg-muted/20 space-y-1.5 border-t px-4 py-3 text-xs"
       >
         <div class="flex gap-2">
@@ -241,6 +239,12 @@ async function onUpdated() {
               >{{ param }}</span
             >
           </div>
+        </div>
+        <div class="flex gap-2">
+          <span class="text-muted-foreground w-20 shrink-0">Key Strategy:</span>
+          <span class="font-mono">{{
+            p.key_strategy === "round_robin" ? "Round Robin" : "Fill First"
+          }}</span>
         </div>
         <div v-if="Object.keys(p.headers ?? {}).length > 0" class="flex gap-2">
           <span class="text-muted-foreground w-20 shrink-0">Headers:</span>
@@ -284,19 +288,29 @@ async function onUpdated() {
               </Button>
               <div
                 v-if="testModelResult[p.name]?.[model]"
-                class="flex items-center gap-1 text-xs"
-                :class="
-                  testModelResult[p.name]?.[model]?.success ? 'text-green-600' : 'text-red-600'
-                "
+                class="flex flex-wrap items-center gap-1"
               >
-                <Check v-if="testModelResult[p.name]?.[model]?.success" class="h-3 w-3" />
-                <X v-else class="h-3 w-3" />
-                {{ testModelResult[p.name]?.[model]?.message }}
+                <span
+                  v-for="r in testModelResult[p.name]?.[model]"
+                  :key="r.key_prefix"
+                  class="rounded px-1 py-0.5 text-xs"
+                  :class="r.success ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'"
+                >
+                  {{ r.success ? "✓" : "✗" }} {{ r.key_prefix }}
+                </span>
               </div>
             </div>
           </div>
         </div>
       </div>
     </div>
+
+    <!-- Edit Drawer -->
+    <ProviderEditForm
+      v-if="editingProvider"
+      :provider="editingProvider"
+      @close="onEditClose"
+      @updated="onUpdated"
+    />
   </div>
 </template>

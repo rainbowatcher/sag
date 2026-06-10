@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use reqwest::header::CONTENT_TYPE;
-use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget, Strategy};
+use sag_config::{self, KeyStrategy, ProviderConfig, RouteConfig, RouteTarget, Strategy};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,6 +42,10 @@ struct AddProviderRequest {
     /// Provider name (must be unique).
     name: String,
     api_key: String,
+    #[serde(default)]
+    api_keys: Vec<String>,
+    #[serde(default)]
+    key_strategy: KeyStrategy,
     #[serde(default = "default_provider_type")]
     provider_type: String,
     #[serde(default = "default_base_url")]
@@ -128,6 +132,10 @@ struct DeleteRouteRequest {
 struct UpdateProviderRequest {
     name: String,
     api_key: Option<String>,
+    #[serde(default)]
+    api_keys: Option<Vec<String>>,
+    #[serde(default)]
+    key_strategy: Option<KeyStrategy>,
     provider_type: Option<String>,
     base_url: Option<String>,
     priority: Option<u32>,
@@ -148,6 +156,8 @@ struct DeleteProviderRequest {
 struct ProviderInfo {
     name: String,
     api_key: String,
+    api_keys: Vec<String>,
+    key_strategy: KeyStrategy,
     provider_type: String,
     base_url: String,
     priority: u32,
@@ -172,6 +182,8 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
         .map(|(name, cfg)| ProviderInfo {
             name: name.clone(),
             api_key: cfg.api_key.clone(),
+            api_keys: cfg.api_keys.clone(),
+            key_strategy: cfg.key_strategy,
             provider_type: cfg.provider_type.clone(),
             base_url: cfg.base_url.clone(),
             priority: cfg.priority,
@@ -394,6 +406,8 @@ async fn add_provider(
         let pc = ProviderConfig {
             provider_type: req.provider_type.clone(),
             api_key: req.api_key.clone(),
+            api_keys: req.api_keys.clone(),
+            key_strategy: req.key_strategy,
             base_url: req.base_url.clone(),
             priority: req.priority,
             max_retries: req.max_retries,
@@ -478,6 +492,12 @@ async fn update_provider(
 
         if let Some(v) = req.api_key {
             existing.api_key = v;
+        }
+        if let Some(v) = req.api_keys {
+            existing.api_keys = v;
+        }
+        if let Some(v) = req.key_strategy {
+            existing.key_strategy = v;
         }
         if let Some(v) = req.provider_type {
             existing.provider_type = v;
@@ -644,6 +664,8 @@ async fn list_provider_models(
 #[derive(serde::Deserialize)]
 struct ModelTestRequest {
     model: String,
+    #[serde(default)]
+    api_keys: Vec<String>,
     api_key: String,
     base_url: String,
     provider_type: Option<String>,
@@ -659,33 +681,69 @@ async fn model_test(
         .build()
         .unwrap();
 
-    let url: String;
-    let body: serde_json::Value;
-    let mut http_req;
-
-    if req.provider_type.as_deref() == Some("anthropic") {
-        url = format!("{}/messages", req.base_url.trim_end_matches('/'));
-        body = serde_json::json!({
-            "model": req.model,
-            "messages": [{"role": "user", "content": "say 'hi'"}],
-            "max_tokens": 1
-        });
-        http_req = client
-            .post(&url)
-            .header("x-api-key", &req.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header(CONTENT_TYPE, "application/json");
+    let keys = if req.api_keys.is_empty() {
+        vec![req.api_key.clone()]
     } else {
-        url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
-        body = serde_json::json!({
-            "model": req.model,
-            "messages": [{"role": "user", "content": "say 'hi'"}],
-            "max_tokens": 1
-        });
-        http_req = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", req.api_key))
-            .header(CONTENT_TYPE, "application/json");
+        req.api_keys.clone()
+    };
+
+    let mut results = Vec::new();
+
+    for key in &keys {
+        let result = test_single_key(&client, &req, key).await;
+        let prefix = if key.len() > 12 {
+            format!("{}…", &key[..12])
+        } else {
+            key.clone()
+        };
+        results.push(json!({
+            "key_prefix": prefix,
+            "success": result.0,
+            "message": result.1,
+        }));
+    }
+
+    Json(json!({ "results": results }))
+}
+
+async fn test_single_key(
+    client: &reqwest::Client,
+    req: &ModelTestRequest,
+    api_key: &str,
+) -> (bool, String) {
+    let (url, body, auth_header, auth_value): (String, serde_json::Value, &str, String) =
+        if req.provider_type.as_deref() == Some("anthropic") {
+            (
+                format!("{}/messages", req.base_url.trim_end_matches('/')),
+                serde_json::json!({
+                    "model": req.model,
+                    "messages": [{"role": "user", "content": "say 'hi'"}],
+                    "max_tokens": 1
+                }),
+                "x-api-key",
+                api_key.to_string(),
+            )
+        } else {
+            (
+                format!("{}/chat/completions", req.base_url.trim_end_matches('/')),
+                serde_json::json!({
+                    "model": req.model,
+                    "messages": [{"role": "user", "content": "say 'hi'"}],
+                    "max_tokens": 1
+                }),
+                "Authorization",
+                format!("Bearer {api_key}"),
+            )
+        };
+
+    let mut http_req = client
+        .post(&url)
+        .header(auth_header, &auth_value)
+        .header(CONTENT_TYPE, "application/json");
+
+    // Anthropic also needs the version header
+    if req.provider_type.as_deref() == Some("anthropic") {
+        http_req = http_req.header("anthropic-version", "2023-06-01");
     }
 
     for (key, value) in &req.headers {
@@ -698,23 +756,23 @@ async fn model_test(
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
-                Json(json!({ "success": true, "message": "OK" }))
+                (true, "OK".into())
             } else if status == 401 || status == 403 {
                 let body = resp.text().await.unwrap_or_default();
-                Json(json!({ "success": false, "message": format!("Authentication failed: {body}") }))
+                (false, format!("Authentication failed: {body}"))
             } else if status == 404 {
                 let body = resp.text().await.unwrap_or_default();
-                Json(json!({ "success": false, "message": format!("Model '{}' not found: {body}", req.model) }))
+                (false, format!("Model '{}' not found: {body}", req.model))
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                Json(json!({ "success": false, "message": format!("upstream returned status {status}: {body}") }))
+                (false, format!("upstream returned status {status}: {body}"))
             }
         }
         Err(e) => {
             if e.is_timeout() {
-                Json(json!({ "success": false, "message": "request timed out after 30s".to_string() }))
+                (false, "request timed out after 30s".into())
             } else {
-                Json(json!({ "success": false, "message": format!("connection failed: {e}") }))
+                (false, format!("connection failed: {e}"))
             }
         }
     }
@@ -895,6 +953,8 @@ mod tests {
             ProviderConfig {
                 provider_type: "openai".into(),
                 api_key: "sk-test".into(),
+                api_keys: vec![],
+                key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 priority: 10,
                 max_retries: 2,
@@ -1002,6 +1062,8 @@ mod tests {
                     }
                     .into(),
                     api_key: format!("sk-{name}"),
+                    api_keys: vec![],
+                    key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://example.com".into(),
                     priority: 10,
                     max_retries: 2,
@@ -1514,6 +1576,8 @@ mod auth_regression_tests {
             ProviderConfig {
                 provider_type: "openai".into(),
                 api_key: "sk-test".into(),
+                api_keys: vec![],
+                key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 priority: 10,
                 max_retries: 2,

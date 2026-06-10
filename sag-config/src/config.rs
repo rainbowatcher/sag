@@ -48,6 +48,18 @@ pub struct GatewayAuthConfig {
     pub api_keys: Vec<String>,
 }
 
+/// API key selection strategy for providers with multiple keys.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStrategy {
+    /// Always use the first available key.
+    /// On request failure, fall back to the next key in the list.
+    #[default]
+    FillFirst,
+    /// Distribute requests across all keys in round-robin order.
+    RoundRobin,
+}
+
 /// Upstream LLM provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -56,6 +68,14 @@ pub struct ProviderConfig {
     pub provider_type: String,
     /// API key for this provider (injected into requests).
     pub api_key: String,
+    /// Additional API keys for this provider.
+    /// When non-empty, these are used instead of `api_key`.
+    /// The strategy for selecting among them is controlled by `key_strategy`.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// How to select among multiple `api_keys`.
+    #[serde(default)]
+    pub key_strategy: KeyStrategy,
     /// Base URL for the provider's API.
     #[serde(default = "default_base_url")]
     pub base_url: String,

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -6,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use futures_util::StreamExt;
 use reqwest::header::CONTENT_TYPE;
+use sag_config::KeyStrategy;
 use sag_core::{
     AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     ImageGenerationRequest, ImageGenerationResponse, Usage,
@@ -84,7 +86,9 @@ struct AnthropicUsage {
 pub struct AnthropicProvider {
     name: String,
     base_url: String,
-    api_key: String,
+    api_keys: Vec<String>,
+    key_strategy: KeyStrategy,
+    key_counter: AtomicUsize,
     http_client: reqwest::Client,
     supported_params: Vec<String>,
     headers: HashMap<String, String>,
@@ -99,14 +103,33 @@ impl AnthropicProvider {
             .build()
             .expect("failed to build reqwest client");
 
+        let api_keys = if config.api_keys.is_empty() {
+            vec![config.api_key.clone()]
+        } else {
+            config.api_keys.clone()
+        };
+
         Self {
             name,
             base_url: config.base_url.trim_end_matches('/').to_string(),
-            api_key: config.api_key.clone(),
+            api_keys,
+            key_strategy: config.key_strategy,
+            key_counter: AtomicUsize::new(0),
             http_client,
             supported_params: config.supported_params.clone(),
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
+        }
+    }
+
+    /// Select the current API key based on the configured strategy.
+    fn current_key(&self) -> &str {
+        match self.key_strategy {
+            KeyStrategy::FillFirst => &self.api_keys[0],
+            KeyStrategy::RoundRobin => {
+                let idx = self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+                &self.api_keys[idx]
+            }
         }
     }
 
@@ -220,7 +243,7 @@ impl AnthropicProvider {
         let req = self
             .http_client
             .post(url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.current_key())
             .header("anthropic-version", "2023-06-01")
             .header(CONTENT_TYPE, "application/json");
 
