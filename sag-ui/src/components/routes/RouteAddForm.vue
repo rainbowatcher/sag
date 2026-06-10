@@ -1,38 +1,14 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
-import {
-  X,
-  Loader2,
-  ChevronsUpDown,
-  Check,
-  ArrowUp,
-  ArrowDown,
-  Plus,
-  Trash2,
-} from "lucide-vue-next"
+import { X, Loader2, ArrowUp, ArrowDown, Plus, Trash2 } from "lucide-vue-next"
 import { ref } from "vue"
 import { z } from "zod"
+import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, Strategy, CreateRoutePayload } from "@/types/api"
@@ -50,7 +26,6 @@ const emit = defineEmits<{
   created: []
 }>()
 
-const openPopover = ref<Record<number, boolean>>({})
 const adding = ref(false)
 const apiError = ref("")
 
@@ -253,8 +228,17 @@ async function handleSubmit(event: Event) {
 
             <div class="flex-1">
               <Label class="text-xs">Provider</Label>
-              <Select
+              <Combobox
                 :model-value="t.provider_name"
+                :options="
+                  providers.map((p) => ({
+                    value: p.name,
+                    label: `${p.name} (${p.provider_type})`,
+                  }))
+                "
+                placeholder="Select provider..."
+                search-placeholder="Search provider..."
+                empty-text="No providers found"
                 @update:model-value="
                   (v) => {
                     t.provider_name = v as string
@@ -262,67 +246,19 @@ async function handleSubmit(event: Event) {
                     routeStore.loadProviderModels(v as string, providers)
                   }
                 "
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select..." />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem v-for="p in providers" :key="p.name" :value="p.name">
-                    {{ p.name }} ({{ p.provider_type }})
-                  </SelectItem>
-                </SelectContent>
-              </Select>
+              />
             </div>
 
             <div class="flex-1">
               <Label class="text-xs">Real Model</Label>
-              <Popover v-model:open="openPopover[i]">
-                <PopoverTrigger as-child>
-                  <Button
-                    variant="outline"
-                    role="combobox"
-                    :aria-expanded="openPopover[i]"
-                    class="w-full justify-between"
-                  >
-                    {{ t.real_model || "Select model" }}
-                    <ChevronsUpDown class="ml-auto h-4 w-4 shrink-0 opacity-50" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent class="w-(--reka-popper-anchor-width) p-0">
-                  <Command>
-                    <CommandInput placeholder="Search model..." />
-                    <CommandList>
-                      <CommandEmpty>No models found</CommandEmpty>
-                      <div
-                        v-if="providerModelsLoading && !providerModels[t.provider_name]"
-                        class="text-muted-foreground px-2 py-4 text-center text-xs"
-                      >
-                        Loading models...
-                      </div>
-                      <CommandGroup>
-                        <CommandItem
-                          v-for="m in providerModels[t.provider_name] ?? []"
-                          :key="m"
-                          :value="m"
-                          @select="
-                            (ev) => {
-                              const val = ev.detail.value as string
-                              t.real_model = val === t.real_model ? '' : val
-                              openPopover[i] = false
-                            }
-                          "
-                        >
-                          {{ m }}
-                          <Check
-                            :class="t.real_model === m ? 'opacity-100' : 'opacity-0'"
-                            class="ml-auto h-4 w-4"
-                          />
-                        </CommandItem>
-                      </CommandGroup>
-                    </CommandList>
-                  </Command>
-                </PopoverContent>
-              </Popover>
+              <Combobox
+                v-model="t.real_model"
+                :options="(providerModels[t.provider_name] ?? []).map((m) => ({ value: m }))"
+                placeholder="Select model"
+                search-placeholder="Search model..."
+                empty-text="No models found"
+                :loading="providerModelsLoading && !providerModels[t.provider_name]"
+              />
             </div>
 
             <div class="w-20">

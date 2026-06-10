@@ -1,22 +1,13 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
-import { Loader2, Plus, Trash2, ChevronsUpDown, Check } from "lucide-vue-next"
+import { Loader2, Plus, Trash2 } from "lucide-vue-next"
 import { onMounted, ref } from "vue"
 import { z } from "zod"
 import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
@@ -36,8 +27,6 @@ const emit = defineEmits<{
 
 const saving = ref(false)
 const apiError = ref("")
-const openPopover = ref<Record<number, boolean>>({})
-
 interface TargetEdit {
   provider: string
   real_model: string
@@ -251,55 +240,14 @@ async function handleSubmit(event: Event) {
 
           <div class="flex-1">
             <Label class="text-xs">Real Model</Label>
-            <Popover v-model:open="openPopover[i]">
-              <PopoverTrigger as-child>
-                <Button
-                  variant="outline"
-                  role="combobox"
-                  :aria-expanded="openPopover[i]"
-                  class="w-full justify-between"
-                >
-                  {{ t.real_model || "Select model" }}
-                  <ChevronsUpDown class="ml-auto h-4 w-4 shrink-0 opacity-50" />
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent class="w-(--reka-popper-anchor-width) p-0">
-                <Command>
-                  <CommandInput placeholder="Search model..." />
-                  <CommandList>
-                    <CommandEmpty>No models found</CommandEmpty>
-                    <div
-                      v-if="
-                        routeStore.providerModelsLoading && !routeStore.providerModels[t.provider]
-                      "
-                      class="text-muted-foreground px-2 py-4 text-center text-xs"
-                    >
-                      Loading models...
-                    </div>
-                    <CommandGroup>
-                      <CommandItem
-                        v-for="m in routeStore.providerModels[t.provider] ?? []"
-                        :key="m"
-                        :value="m"
-                        @select="
-                          (ev) => {
-                            const val = ev.detail.value as string
-                            t.real_model = val === t.real_model ? '' : val
-                            openPopover[i] = false
-                          }
-                        "
-                      >
-                        {{ m }}
-                        <Check
-                          :class="t.real_model === m ? 'opacity-100' : 'opacity-0'"
-                          class="ml-auto h-4 w-4"
-                        />
-                      </CommandItem>
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-              </PopoverContent>
-            </Popover>
+            <Combobox
+              v-model="t.real_model"
+              :options="(routeStore.providerModels[t.provider] ?? []).map((m) => ({ value: m }))"
+              placeholder="Select model"
+              search-placeholder="Search model..."
+              empty-text="No models found"
+              :loading="routeStore.providerModelsLoading && !routeStore.providerModels[t.provider]"
+            />
           </div>
 
           <div class="w-20">
