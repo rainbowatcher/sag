@@ -5,6 +5,9 @@ SAG 使用基于 TOML 的配置文件（默认：`gateway.toml`）。
 ## 示例
 
 ```toml
+# 全局默认重试次数（每个目标），可被 per-route 或 per-target 覆盖
+retries = 2
+
 [server]
 host = "0.0.0.0"
 port = 3000
@@ -24,16 +27,12 @@ api_keys = [
 provider_type = "openai"
 api_key = "${OPENAI_API_KEY}"
 base_url = "https://api.openai.com/v1"
-priority = 10
-max_retries = 2
 timeout_secs = 120
 
 [providers.anthropic]
 provider_type = "anthropic"
 api_key = "${ANTHROPIC_API_KEY}"
 base_url = "https://api.anthropic.com/v1"
-priority = 1
-max_retries = 2
 timeout_secs = 120
 
 [[routes]]
@@ -43,10 +42,12 @@ targets = [
 ]
 
 # 多目标故障转移，目标级别 extra 覆盖供应商 body_overrides
+# retries 覆盖全局重试次数（仅此路由）
 [[routes]]
 model_name = "claude-sonnet"
+retries = 3
 targets = [
-    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10, extra = { max_tokens = 8192 } },
+    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10, retries = 5, extra = { max_tokens = 8192 } },
     { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
 ]
 

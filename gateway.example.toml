@@ -66,11 +66,14 @@ targets = [
     { provider = "openai", real_model = "gpt-4o-mini", priority = 10 },
 ]
 
+# Route-level retries override: retry each target up to 3 times
 [[routes]]
 model_name = "claude-sonnet"
+retries = 3
 targets = [
-    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10 },
-    # Fallback: if Anthropic fails, try OpenAI with gpt-4o-mini
+    # Per-target retries override: retry this target up to 5 times
+    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10, retries = 5 },
+    # Fallback: if Anthropic fails, try OpenAI with gpt-4o-mini (uses route-level retries=3)
     { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
 ]
 
