@@ -35,8 +35,7 @@ Content-Type: application/json
   "base_url": "https://api.openai.com/v1",
   "priority": 10,
   "max_retries": 2,
-  "timeout_secs": 120,
-  "supported_params": ["model", "messages", "temperature", "stream", "max_tokens"]
+  "timeout_secs": 120
 }
 ```
 

@@ -39,7 +39,7 @@ API Key 在配置文件 `gateway.toml` 的 `[gateway_auth]` 段中定义。认�
 }
 ```
 
-请求体中的字段与 OpenAI 一致。额外字段会通过 `extra` 透传给上游供应商，但会按供应商的 `supported_params` 进行参数校验。
+请求体中的字段与 OpenAI 一致。非标准的额外字段会通过 `extra` 透传给上游供应商。
 
 ### 非流式响应
 

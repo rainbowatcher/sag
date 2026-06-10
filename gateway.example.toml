@@ -21,13 +21,6 @@ api_keys = [
 # ============================================================
 # LLM Provider configurations
 # ============================================================
-#
-# supported_params (optional) — affects only non-standard extra parameters.
-# Standard OpenAI parameters (model, messages, temperature, stream,
-# stream_options, reasoning_effort, max_completion_tokens, etc.) are
-# always passed through as named fields and do NOT need to be listed here.
-# Keys NOT in this list will be logged as a warning but still forwarded.
-# Leave empty to allow all extras without warning.
 
 [providers.openai]
 api_key = "sk-your-openai-api-key"
@@ -35,10 +28,6 @@ base_url = "https://api.openai.com/v1"
 priority = 10
 max_retries = 2
 timeout_secs = 120
-supported_params = [
-    "seed", "tools", "tool_choice",
-    "response_format",
-]
 
 [providers.anthropic]
 api_key = "sk-ant-your-anthropic-api-key"

@@ -27,12 +27,6 @@ base_url = "https://api.openai.com/v1"
 priority = 10
 max_retries = 2
 timeout_secs = 120
-supported_params = [
-    "model", "messages", "temperature", "top_p", "n",
-    "stream", "stop", "max_tokens", "presence_penalty",
-    "frequency_penalty", "seed", "tools", "tool_choice",
-    "response_format",
-]
 
 [providers.anthropic]
 provider_type = "anthropic"
@@ -41,10 +35,6 @@ base_url = "https://api.anthropic.com/v1"
 priority = 1
 max_retries = 2
 timeout_secs = 120
-supported_params = [
-    "model", "messages", "temperature", "top_p",
-    "stream", "stop", "max_tokens", "tools", "tool_choice",
-]
 
 [[routes]]
 model_name = "gpt-4o"
