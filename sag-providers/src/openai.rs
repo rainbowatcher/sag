@@ -118,7 +118,6 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let url = self.build_url(api_endpoint);
-        debug!(%url, "sending non-streaming chat request");
 
         let body = serde_json::to_value(&upstream_request)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
@@ -164,7 +163,6 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let url = self.build_url(api_endpoint);
-        debug!(%url, "sending streaming chat request");
 
         let body = serde_json::to_value(&upstream_request)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
@@ -237,7 +235,6 @@ impl LlmProvider for OpenAiProvider {
         upstream.model = real_model.to_string();
 
         let url = self.build_url("/images/generations");
-        debug!(%url, "sending image generation request");
 
         let body = serde_json::to_value(&upstream)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;

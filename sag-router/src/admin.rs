@@ -12,7 +12,7 @@ use sag_config::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{instrument, warn};
 
 use crate::state::AppState;
 
@@ -43,7 +43,7 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
 // Request / Response types
 // ═══════════════════════════════════════════════════════════════════
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct AddProviderRequest {
     /// Provider name (must be unique).
     name: String,
@@ -74,7 +74,7 @@ fn default_api_endpoint() -> String {
 
 // ── Route request types ───────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct RouteTargetInput {
     provider: String,
     #[serde(default)]
@@ -88,7 +88,7 @@ struct RouteTargetInput {
     extra: HashMap<String, serde_json::Value>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct CreateRouteRequest {
     model_name: String,
     #[serde(default = "default_api_endpoint")]
@@ -101,7 +101,7 @@ struct CreateRouteRequest {
     targets: Vec<RouteTargetInput>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct UpdateRouteRequest {
     model_name: String,
     #[serde(default)]
@@ -115,12 +115,12 @@ struct UpdateRouteRequest {
     targets: Option<Vec<RouteTargetInput>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct DeleteRouteRequest {
     model_name: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct UpdateProviderRequest {
     name: String,
     api_key: Option<String>,
@@ -136,7 +136,7 @@ struct UpdateProviderRequest {
     enabled_models: Option<Vec<String>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct DeleteProviderRequest {
     name: String,
 }
@@ -189,10 +189,12 @@ async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /api/routes — create a new route.
+#[instrument(skip(state), fields(model_name))]
 async fn create_route(
     State(state): State<AppState>,
     Json(req): Json<CreateRouteRequest>,
 ) -> impl IntoResponse {
+    tracing::Span::current().record("model_name", &req.model_name);
     {
         let mut config = state.config.write().await;
 
@@ -265,8 +267,6 @@ async fn create_route(
         }
     }
 
-    info!(model = %req.model_name, "route created via admin API");
-
     (
         StatusCode::CREATED,
         Json(json!({
@@ -277,10 +277,12 @@ async fn create_route(
 }
 
 /// PUT /api/routes — update an existing route (partial update).
+#[instrument(skip(state), fields(model_name))]
 async fn update_route(
     State(state): State<AppState>,
     Json(req): Json<UpdateRouteRequest>,
 ) -> impl IntoResponse {
+    tracing::Span::current().record("model_name", &req.model_name);
     {
         let mut config = state.config.write().await;
 
@@ -367,8 +369,6 @@ async fn update_route(
         }
     }
 
-    info!(model = %req.model_name, "route updated via admin API");
-
     (
         StatusCode::OK,
         Json(json!({
@@ -379,10 +379,12 @@ async fn update_route(
 }
 
 /// DELETE /api/routes — delete a route by model_name.
+#[instrument(skip(state), fields(model_name))]
 async fn delete_route(
     State(state): State<AppState>,
     Json(req): Json<DeleteRouteRequest>,
 ) -> impl IntoResponse {
+    tracing::Span::current().record("model_name", &req.model_name);
     {
         let mut config = state.config.write().await;
 
@@ -406,8 +408,6 @@ async fn delete_route(
         }
     }
 
-    info!(model = %req.model_name, "route deleted via admin API");
-
     (
         StatusCode::OK,
         Json(json!({
@@ -418,10 +418,13 @@ async fn delete_route(
 }
 
 /// POST /api/providers — add a new provider and register it in the runtime registry.
+#[instrument(skip(state), fields(provider_name, provider_type))]
 async fn add_provider(
     State(state): State<AppState>,
     Json(req): Json<AddProviderRequest>,
 ) -> impl IntoResponse {
+    tracing::Span::current().record("provider_name", &req.name);
+    tracing::Span::current().record("provider_type", req.provider_type.as_str());
     // 1. Write-lock config, insert provider, and persist to disk
     let provider_config = {
         let mut config = state.config.write().await;
@@ -477,9 +480,6 @@ async fn add_provider(
         providers.insert(req.name.clone(), provider);
     }
 
-    info!(name = %req.name, provider_type = %        provider_config.provider_type.as_str(),
-        "provider added via admin API");
-
     (
         StatusCode::CREATED,
         Json(json!({
@@ -492,10 +492,12 @@ async fn add_provider(
 }
 
 /// PUT /api/providers — update an existing provider's configuration.
+#[instrument(skip(state), fields(provider_name))]
 async fn update_provider(
     State(state): State<AppState>,
     Json(req): Json<UpdateProviderRequest>,
 ) -> impl IntoResponse {
+    tracing::Span::current().record("provider_name", &req.name);
     let provider_config = {
         let mut config = state.config.write().await;
 
@@ -569,9 +571,6 @@ async fn update_provider(
         providers.insert(req.name.clone(), provider);
     }
 
-    info!(name = %req.name, provider_type = %        provider_config.provider_type.as_str(),
-        "provider updated via admin API");
-
     (
         StatusCode::OK,
         Json(json!({
@@ -629,6 +628,7 @@ struct FetchModelsRequest {
 /// POST /api/model/test — test a specific model by sending a real chat completion.
 
 /// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
+#[instrument(skip(req), fields(url))]
 async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse {
     let endpoint = if req.models_endpoint.is_empty() {
         "models"
@@ -636,8 +636,7 @@ async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse 
         &req.models_endpoint
     };
     let models_url = format!("{}/{}", req.base_url.trim_end_matches('/'), endpoint);
-
-    info!(url = %models_url, provider_type = ?req.provider_type, "fetching upstream models");
+    tracing::Span::current().record("url", &models_url);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -685,7 +684,6 @@ async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse 
                         })
                         .unwrap_or_default();
 
-                    info!(count = models.len(), "successfully fetched upstream models");
                     Json(json!({ "models": models })).into_response()
                 }
                 Err(e) => {
@@ -847,11 +845,13 @@ async fn test_single_key(
 ///    in-flight lookups immediately fail-soft (the next request matching a
 ///    removed target will surface "provider not found" instead of dispatching
 ///    to a deleted adapter).
+#[instrument(skip(state), fields(provider_name))]
 async fn delete_provider(
     State(state): State<AppState>,
     Json(req): Json<DeleteProviderRequest>,
 ) -> impl IntoResponse {
     let provider_name = req.name;
+    tracing::Span::current().record("provider_name", &provider_name);
     // ── Stage 1: update config + persist ─────────────────────────────
     // Collect (model_name, removed_target_count) for every route that lost
     // at least one target, so we can report it back to the caller.
@@ -912,13 +912,6 @@ async fn delete_provider(
         let mut providers = state.providers.write().await;
         providers.remove(&provider_name);
     }
-
-    info!(
-        name = %provider_name,
-        cascaded_routes = cascaded_routes.len(),
-        removed_targets = removed_targets,
-        "provider deleted via admin API"
-    );
 
     (
         StatusCode::OK,

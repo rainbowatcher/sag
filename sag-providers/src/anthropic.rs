@@ -250,7 +250,6 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let url = format!("{}/messages", self.base_url);
-        debug!(%url, "sending anthropic non-streaming request");
 
         let body = serde_json::to_value(&upstream)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
@@ -296,7 +295,6 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let url = format!("{}/messages", self.base_url);
-        debug!(%url, "sending anthropic streaming request");
 
         let body = serde_json::to_value(&upstream)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;

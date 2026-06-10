@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Query, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,7 +18,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, instrument, warn};
+use tracing::{Level, error, info, instrument, warn};
 
 use crate::auth::gateway_auth;
 use crate::state::AppState;
@@ -47,7 +47,25 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/v1/chat/completions", chat_route)
         .nest("/v1", models_route)
         .nest("/api", admin_routes)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    tracing::span!(
+                        Level::INFO,
+                        "request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        status = tracing::field::Empty,
+                        latency_ms = tracing::field::Empty,
+                    )
+                })
+                .on_response(
+                    |response: &Response<Body>, latency: std::time::Duration, span: &tracing::Span| {
+                        span.record("status", response.status().as_u16());
+                        span.record("latency_ms", latency.as_millis() as u64);
+                    },
+                ),
+        )
         .layer(cors)
         .with_state(state)
 }
@@ -65,7 +83,7 @@ pub fn build_router(state: AppState) -> Router {
 ///    up to the effective retry count; if exhausted, try next target
 /// 8. If all targets exhausted: return AllProvidersExhausted
 /// 9. Log analytics via CallLogCollector
-#[instrument(skip(state), fields())]
+#[instrument(skip(state), fields(request_id, model, stream))]
 async fn chat_completions_handler(
     State(state): State<AppState>,
     Json(request): Json<sag_core::ChatCompletionRequest>,
@@ -73,6 +91,10 @@ async fn chat_completions_handler(
     let start = Instant::now();
     let request_id = uuid::Uuid::new_v4();
     let is_stream = request.stream.unwrap_or(false);
+
+    tracing::Span::current().record("request_id", request_id.to_string());
+    tracing::Span::current().record("model", &request.model);
+    tracing::Span::current().record("stream", is_stream);
 
     // Resolve model -> targets + api_endpoint from routing table
     let (targets, api_endpoint) = {
@@ -137,10 +159,8 @@ async fn chat_completions_handler(
     };
 
     info!(
-        model = %request.model,
         num_targets = targets.len(),
         api_endpoint = %api_endpoint,
-        stream = is_stream,
         "dispatching request with fallback"
     );
 
@@ -201,7 +221,6 @@ async fn chat_completions_handler(
 
             info!(
                 provider = %provider_name,
-                real_model = %real_model,
                 attempt = attempt,
                 max_retries = retries,
                 "trying provider"
@@ -411,7 +430,6 @@ async fn dispatch_image_request(
 
             info!(
                 provider = %provider_name,
-                real_model = %real_model,
                 attempt = attempt,
                 "trying provider for image generation"
             );
