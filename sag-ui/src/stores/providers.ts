@@ -47,7 +47,6 @@ export const useProviderStore = defineStore("providers", () => {
     priority?: number
     max_retries?: number
     timeout_secs?: number
-    supported_params?: string[]
     headers?: Record<string, string>
     body_overrides?: Record<string, any>
     enabled_models?: string[]
@@ -87,7 +86,6 @@ export const useProviderStore = defineStore("providers", () => {
       priority?: number
       max_retries?: number
       timeout_secs?: number
-      supported_params?: string[]
       headers?: Record<string, string>
       body_overrides?: Record<string, any>
       enabled_models?: string[]

@@ -32,13 +32,6 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import {
-  TagsInput,
-  TagsInputInput,
-  TagsInputItem,
-  TagsInputItemDelete,
-  TagsInputItemText,
-} from "@/components/ui/tags-input"
 import { api, headers as authHeaders } from "@/lib/client"
 import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
@@ -174,8 +167,6 @@ const baseUrl = ref(props.provider.base_url)
 const priority = ref(props.provider.priority)
 const maxRetries = ref(props.provider.max_retries)
 const timeoutSecs = ref(props.provider.timeout_secs)
-const supportedParams = ref<string[]>([...props.provider.supported_params])
-
 async function handleSubmit() {
   apiError.value = ""
   saving.value = true
@@ -203,11 +194,6 @@ async function handleSubmit() {
     }
     if (timeoutSecs.value !== props.provider.timeout_secs) {
       payload.timeout_secs = timeoutSecs.value
-    }
-
-    const origSupported = props.provider.supported_params ?? []
-    if (JSON.stringify(supportedParams.value) !== JSON.stringify(origSupported)) {
-      payload.supported_params = supportedParams.value
     }
 
     // Headers
@@ -422,16 +408,6 @@ async function handleSubmit() {
                 :model-value="timeoutSecs"
                 @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
               />
-            </div>
-            <div class="col-span-2 space-y-1">
-              <FieldLabel>Supported Params</FieldLabel>
-              <TagsInput v-model="supportedParams" class="w-full">
-                <TagsInputItem v-for="item in supportedParams" :key="item" :value="item">
-                  <TagsInputItemText />
-                  <TagsInputItemDelete />
-                </TagsInputItem>
-                <TagsInputInput placeholder="Add param..." />
-              </TagsInput>
             </div>
           </TabsContent>
 

@@ -229,17 +229,6 @@ async function onUpdated() {
           <span class="text-muted-foreground w-20 shrink-0">Timeout:</span>
           <span>{{ p.timeout_secs }}s</span>
         </div>
-        <div v-if="p.supported_params.length > 0" class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Params:</span>
-          <div class="flex flex-wrap gap-1">
-            <span
-              v-for="param in p.supported_params"
-              :key="param"
-              class="bg-muted rounded-full px-1.5 py-0.5"
-              >{{ param }}</span
-            >
-          </div>
-        </div>
         <div class="flex gap-2">
           <span class="text-muted-foreground w-20 shrink-0">Key Strategy:</span>
           <span class="font-mono">{{

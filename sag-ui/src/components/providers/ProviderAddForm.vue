@@ -16,13 +16,6 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import {
-  TagsInput,
-  TagsInputInput,
-  TagsInputItem,
-  TagsInputItemDelete,
-  TagsInputItemText,
-} from "@/components/ui/tags-input"
 import { useProviderStore } from "@/stores/providers"
 
 const store = useProviderStore()
@@ -79,9 +72,6 @@ const headers = ref<{ key: string; value: string }[]>([])
 
 // ── Body overrides ───────────────────────────────────────────
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
-
-// ── Supported params ─────────────────────────────────────────
-const supportedParams = ref<string[]>(["model", "messages", "temperature", "max_tokens", "stream"])
 
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
@@ -141,7 +131,6 @@ const form = useForm({
         priority: value.priority,
         max_retries: value.max_retries,
         timeout_secs: value.timeout_secs,
-        supported_params: supportedParams.value,
         headers: parsedHeaders,
         body_overrides: parsedBodyOverrides,
         enabled_models: enabledModels.value,
@@ -366,17 +355,6 @@ async function handleSubmit(event: Event) {
                 <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
               </Field>
             </form.Field>
-
-            <div class="col-span-2 space-y-1">
-              <FieldLabel>Supported Params</FieldLabel>
-              <TagsInput v-model="supportedParams" class="w-full">
-                <TagsInputItem v-for="item in supportedParams" :key="item" :value="item">
-                  <TagsInputItemText />
-                  <TagsInputItemDelete />
-                </TagsInputItem>
-                <TagsInputInput placeholder="Add param..." />
-              </TagsInput>
-            </div>
           </TabsContent>
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->
