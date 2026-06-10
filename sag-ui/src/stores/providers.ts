@@ -23,6 +23,22 @@ export const useProviderStore = defineStore("providers", () => {
     }
   }
 
+  async function testModel(payload: {
+    model: string
+    api_key: string
+    base_url: string
+    provider_type?: string
+    headers?: Record<string, string>
+  }): Promise<{ success: boolean; message: string }> {
+    const conn = useConnectionStore()
+    const { data } = await api.post<{ success: boolean; message: string }>(
+      "/api/model/test",
+      payload,
+      { headers: headers(conn.connection?.apiKey) },
+    )
+    return data
+  }
+
   async function addProvider(payload: {
     name: string
     api_key: string
@@ -32,6 +48,7 @@ export const useProviderStore = defineStore("providers", () => {
     supported_params?: string[]
     headers?: Record<string, string>
     body_overrides?: Record<string, any>
+    enabled_models?: string[]
   }) {
     try {
       const conn = useConnectionStore()
@@ -69,6 +86,7 @@ export const useProviderStore = defineStore("providers", () => {
       supported_params?: string[]
       headers?: Record<string, string>
       body_overrides?: Record<string, any>
+      enabled_models?: string[]
     },
   ) {
     try {
@@ -91,5 +109,6 @@ export const useProviderStore = defineStore("providers", () => {
     addProvider,
     deleteProvider,
     updateProvider,
+    testModel,
   }
 })

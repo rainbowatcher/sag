@@ -1,15 +1,61 @@
 <script setup lang="ts">
-import { ChevronDown, Trash2, Pen, AlertTriangle, Loader2 } from "lucide-vue-next"
+import {
+  ChevronDown,
+  Trash2,
+  Pen,
+  AlertTriangle,
+  Loader2,
+  Check,
+  X,
+  RefreshCw,
+} from "lucide-vue-next"
 import { ref } from "vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { api, headers as authHeaders } from "@/lib/client"
+import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
 
 const store = useProviderStore()
 
 const expanded = ref<Record<string, boolean>>({})
+const testingModel = ref<Record<string, Record<string, boolean>>>({})
+const testModelResult = ref<
+  Record<string, Record<string, { success: boolean; message: string } | null>>
+>({})
+
+async function testModel(providerName: string, model: string) {
+  if (!testingModel.value[providerName]) testingModel.value[providerName] = {}
+  if (!testModelResult.value[providerName]) testModelResult.value[providerName] = {}
+  testingModel.value[providerName][model] = true
+  testModelResult.value[providerName][model] = null
+  try {
+    const conn = useConnectionStore()
+    const provider = store.providers.find((p) => p.name === providerName)
+    if (!provider) return
+    const { data } = await api.post<{ success: boolean; message: string }>(
+      "/api/model/test",
+      {
+        model,
+        api_key: provider.api_key,
+        base_url: provider.base_url,
+        provider_type: provider.provider_type,
+        headers: provider.headers,
+      },
+      { headers: authHeaders(conn.connection?.apiKey) },
+    )
+    testModelResult.value[providerName][model] = data
+  } catch (e: any) {
+    testModelResult.value[providerName][model] = {
+      success: false,
+      message: e.response?.data?.error?.message ?? e.message,
+    }
+  } finally {
+    testingModel.value[providerName][model] = false
+  }
+}
 
 // ── Delete flow ──────────────────────────────────────────────────
 const confirmingDelete = ref<string | null>(null)
@@ -216,6 +262,38 @@ async function onUpdated() {
               class="bg-muted rounded-full px-1.5 py-0.5 font-mono text-xs"
               >{{ k }}: {{ typeof v === "object" ? JSON.stringify(v) : String(v) }}</span
             >
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <span class="text-muted-foreground w-20 shrink-0">Models:</span>
+          <span v-if="p.enabled_models.length === 0" class="text-muted-foreground text-xs"
+            >All allowed</span
+          >
+          <div v-else class="flex flex-col gap-1">
+            <div v-for="model in p.enabled_models" :key="model" class="flex items-center gap-2">
+              <span class="font-mono text-xs">{{ model }}</span>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                :disabled="testingModel[p.name]?.[model]"
+                @click="testModel(p.name, model)"
+                title="Test model"
+              >
+                <Loader2 v-if="testingModel[p.name]?.[model]" class="h-3 w-3 animate-spin" />
+                <RefreshCw v-else class="h-3 w-3" />
+              </Button>
+              <div
+                v-if="testModelResult[p.name]?.[model]"
+                class="flex items-center gap-1 text-xs"
+                :class="
+                  testModelResult[p.name]?.[model]?.success ? 'text-green-600' : 'text-red-600'
+                "
+              >
+                <Check v-if="testModelResult[p.name]?.[model]?.success" class="h-3 w-3" />
+                <X v-else class="h-3 w-3" />
+                {{ testModelResult[p.name]?.[model]?.message }}
+              </div>
+            </div>
           </div>
         </div>
       </div>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
-import { X, Loader2 } from "lucide-vue-next"
+import { X, Loader2, Plus } from "lucide-vue-next"
 import { ref } from "vue"
 import { z } from "zod"
 import { Button } from "@/components/ui/button"
@@ -25,6 +25,23 @@ const emit = defineEmits<{
 
 const adding = ref(false)
 const apiError = ref("")
+
+// ── Model management ─────────────────────────────────────────────
+const enabledModels = ref<string[]>([])
+const newModel = ref("")
+
+function addModel() {
+  const name = newModel.value.trim()
+  if (name && !enabledModels.value.includes(name)) {
+    enabledModels.value.push(name)
+  }
+  newModel.value = ""
+}
+
+function removeModel(name: string) {
+  const idx = enabledModels.value.indexOf(name)
+  if (idx !== -1) enabledModels.value.splice(idx, 1)
+}
 
 const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
@@ -83,6 +100,7 @@ const form = useForm({
           : [],
         headers,
         body_overrides: bodyOverrides,
+        enabled_models: enabledModels.value,
       })
       emit("created")
     } catch (e: any) {
@@ -261,6 +279,43 @@ async function handleSubmit(event: Event) {
                 <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
               </Field>
             </form.Field>
+          </div>
+
+          <div class="col-span-2 border-t pt-3">
+            <p class="text-muted-foreground mb-1 text-xs font-medium">Models</p>
+            <p v-if="enabledModels.length === 0" class="text-muted-foreground mb-1 text-xs">
+              No models listed means all models are allowed (no restriction).
+            </p>
+            <div v-if="enabledModels.length > 0" class="mb-2 space-y-1">
+              <div
+                v-for="model in enabledModels"
+                :key="model"
+                class="bg-muted flex items-center justify-between rounded px-2 py-1 text-xs"
+              >
+                <span class="font-mono">{{ model }}</span>
+                <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
+                  <X class="h-3 w-3" />
+                </Button>
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <Input
+                :model-value="newModel"
+                placeholder="gpt-4o"
+                @input="newModel = ($event.target as HTMLInputElement).value"
+                @keydown.enter.prevent="addModel"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="!newModel.trim()"
+                @click="addModel"
+              >
+                <Plus class="h-3.5 w-3.5" />
+                Add
+              </Button>
+            </div>
           </div>
         </div>
       </form>

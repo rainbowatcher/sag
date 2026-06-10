@@ -3,8 +3,9 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
+use reqwest::header::CONTENT_TYPE;
 use sag_config::{self, ProviderConfig, RouteConfig, RouteTarget, Strategy};
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .delete(delete_provider),
         )
         .route("/providers/{name}/models", get(list_provider_models))
+        .route("/model/test", post(model_test))
         .route(
             "/routes",
             get(list_routes).post(create_route).put(update_route).delete(delete_route),
@@ -143,6 +145,7 @@ struct DeleteProviderRequest {
 #[derive(serde::Serialize)]
 struct ProviderInfo {
     name: String,
+    api_key: String,
     provider_type: String,
     base_url: String,
     priority: u32,
@@ -151,6 +154,7 @@ struct ProviderInfo {
     supported_params: Vec<String>,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
+    enabled_models: Vec<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -165,6 +169,7 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .map(|(name, cfg)| ProviderInfo {
             name: name.clone(),
+            api_key: cfg.api_key.clone(),
             provider_type: cfg.provider_type.clone(),
             base_url: cfg.base_url.clone(),
             priority: cfg.priority,
@@ -173,6 +178,7 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
             supported_params: cfg.supported_params.clone(),
             headers: cfg.headers.clone(),
             body_overrides: cfg.body_overrides.clone(),
+            enabled_models: cfg.enabled_models.clone(),
         })
         .collect();
 
@@ -391,6 +397,7 @@ async fn add_provider(
             supported_params: req.supported_params.clone(),
             headers: req.headers.clone(),
             body_overrides: req.body_overrides.clone(),
+            enabled_models: req.enabled_models.clone(),
         };
 
         config.providers.insert(req.name.clone(), pc.clone());
@@ -492,6 +499,9 @@ async fn update_provider(
         if let Some(v) = req.body_overrides {
             existing.body_overrides = v;
         }
+        if let Some(v) = req.enabled_models {
+            existing.enabled_models = v;
+        }
 
         let pc = existing.clone();
 
@@ -545,6 +555,7 @@ async fn update_provider(
             "supported_params": provider_config.supported_params,
             "headers": provider_config.headers,
             "body_overrides": provider_config.body_overrides,
+            "enabled_models": provider_config.enabled_models,
         })),
     )
         .into_response()
@@ -621,6 +632,86 @@ async fn list_provider_models(
         Err(e) => {
             warn!(?e, provider = %provider_name, "failed to reach models endpoint");
             (StatusCode::OK, Json(json!({ "models": [] }))).into_response()
+        }
+    }
+}
+
+/// POST /api/model/test — test a specific model by sending a real chat completion.
+#[derive(serde::Deserialize)]
+struct ModelTestRequest {
+    model: String,
+    api_key: String,
+    base_url: String,
+    provider_type: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+}
+
+async fn model_test(
+    Json(req): Json<ModelTestRequest>,
+) -> impl IntoResponse {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    let url: String;
+    let body: serde_json::Value;
+    let mut http_req;
+
+    if req.provider_type.as_deref() == Some("anthropic") {
+        url = format!("{}/messages", req.base_url.trim_end_matches('/'));
+        body = serde_json::json!({
+            "model": req.model,
+            "messages": [{"role": "user", "content": "say 'hi'"}],
+            "max_tokens": 1
+        });
+        http_req = client
+            .post(&url)
+            .header("x-api-key", &req.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header(CONTENT_TYPE, "application/json");
+    } else {
+        url = format!("{}/chat/completions", req.base_url.trim_end_matches('/'));
+        body = serde_json::json!({
+            "model": req.model,
+            "messages": [{"role": "user", "content": "say 'hi'"}],
+            "max_tokens": 1
+        });
+        http_req = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", req.api_key))
+            .header(CONTENT_TYPE, "application/json");
+    }
+
+    for (key, value) in &req.headers {
+        http_req = http_req.header(key.as_str(), value.as_str());
+    }
+
+    http_req = http_req.json(&body);
+
+    match http_req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if (200..300).contains(&status) {
+                Json(json!({ "success": true, "message": "OK" }))
+            } else if status == 401 || status == 403 {
+                let body = resp.text().await.unwrap_or_default();
+                Json(json!({ "success": false, "message": format!("Authentication failed: {body}") }))
+            } else if status == 404 {
+                let body = resp.text().await.unwrap_or_default();
+                Json(json!({ "success": false, "message": format!("Model '{}' not found: {body}", req.model) }))
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                Json(json!({ "success": false, "message": format!("upstream returned status {status}: {body}") }))
+            }
+        }
+        Err(e) => {
+            if e.is_timeout() {
+                Json(json!({ "success": false, "message": "request timed out after 30s".to_string() }))
+            } else {
+                Json(json!({ "success": false, "message": format!("connection failed: {e}") }))
+            }
         }
     }
 }
@@ -807,6 +898,7 @@ mod tests {
                 supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                enabled_models: vec![],
             },
         );
         let routes = routes
@@ -912,6 +1004,7 @@ mod tests {
                     supported_params: vec![],
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    enabled_models: vec![],
                 },
             );
         }
@@ -1420,6 +1513,7 @@ mod auth_regression_tests {
                 supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                enabled_models: vec![],
             },
         );
         let config = GatewayConfig {

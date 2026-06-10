@@ -1,5 +1,6 @@
 export interface Provider {
   name: string
+  api_key: string
   provider_type: string
   base_url: string
   priority: number
@@ -8,6 +9,7 @@ export interface Provider {
   supported_params: string[]
   headers: Record<string, string>
   body_overrides: Record<string, any>
+  enabled_models: string[]
 }
 
 export interface RouteTarget {
