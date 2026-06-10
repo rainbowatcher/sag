@@ -1,38 +1,16 @@
 # 管理 API
 
-SAG 在 `/api` 前缀下暴露 REST 管理 API，用于运行时管理。Dashboard 前端通过这些端点管理供应商和路由。
+管理 API 在 `/api` 前缀下暴露 REST 端点，用于运行时管理供应商和路由。
 
 ## 认证
 
-管理端点使用 Bearer token 认证：
+管理端点使用 Bearer token 认证，与[模型 API](./models-api.md#认证) 共享相同的 `[gateway_auth]` 配置：
 
 ```
 Authorization: Bearer <api_key>
 ```
 
-API Key 在服务端配置文件 `gateway.toml` 的 `[gateway_auth]` 段中定义。认证行为：
-
-| 配置 | 行为 |
-|------|------|
-| 无 `[gateway_auth]` 段 | 完全开放，无需认证 |
-| `api_keys = []` | 完全开放（同上） |
-| `api_keys = ["key1", "key2"]` | 只有提供有效 key 的请求可以通过 |
-
-### Dashboard 登录流程
-
-Dashboard 前端（Vue SPA）在 `/connect` 页面提供登录表单：
-
-1. 用户输入 Gateway URL 和 API Key，点击 Connect
-2. 前端先调 `GET /health` 确认服务可达
-3. 再调 `GET /api/providers`（带 `Authorization: Bearer <key>`）验证 key 有效性
-4. 成功后，连接信息（URL + API Key）保存在浏览器 `localStorage` 中，有效期 30 天
-5. 后续页面加载时自动读取 localStorage 重连，无需重复输入
-
-### localStorage 持久化
-
-- 重启服务后，浏览器中保存的连接信息不会丢失
-- 如 key 无效或网络暂时不可达，前端会保留已保存的 key，跳转到 `/connect` 页面供用户修正
-- 用户主动断开连接时才会清除 localStorage
+---
 
 ## 端点
 
@@ -90,7 +68,72 @@ Content-Type: application/json
 
 删除供应商及其关联的路由目标。
 
-### 添加路由目标
+### 列出供应商模型
+
+```
+GET /api/providers/{name}/models
+```
+
+从上游供应商的 `/models` 端点获取可用模型列表。
+
+#### 响应
+
+```json
+{
+  "models": ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
+}
+```
+
+> 如果上游返回错误或超时，返回空列表 `{ "models": [] }`。
+
+### 测试模型连接
+
+```
+POST /api/model/test
+Content-Type: application/json
+
+{
+  "model": "gpt-4o-mini",
+  "api_key": "sk-xxx",
+  "base_url": "https://api.openai.com/v1",
+  "provider_type": "openai",
+  "headers": {}
+}
+```
+
+向指定的模型发送一条最短消息（`say 'hi'`），验证连接和认证是否正常。
+
+**请求体字段**：
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `model` | string | 是 | 要测试的模型名 |
+| `api_key` | string | 是 | API Key |
+| `base_url` | string | 是 | 供应商 API 基础 URL |
+| `provider_type` | string | 否 | 供应商类型，`"openai"` 或 `"anthropic"`，默认 `"openai"` |
+| `api_keys` | array | 否 | 多个 API Key 时，逐一测试每个 key |
+| `headers` | object | 否 | 附加的自定义请求头 |
+
+**响应**：
+
+```json
+{
+  "results": [
+    {
+      "key_prefix": "sk-xxx...",
+      "success": true,
+      "message": "OK"
+    },
+    {
+      "key_prefix": "sk-yyy...",
+      "success": false,
+      "message": "Authentication failed: ..."
+    }
+  ]
+}
+```
+
+### 创建路由
 
 ```
 POST /api/routes
@@ -98,7 +141,7 @@ Content-Type: application/json
 
 {
   "model_name": "gpt-4o",
-  "api_endpoint": "/v1/chat/completions",
+  "api_endpoint": "/chat/completions",
   "targets": [
     {
       "provider": "openai",
@@ -115,8 +158,8 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 说明 |
 |------|------|------|------|
 | `model_name` | string | 是 | 客户端请求的模型名，`"*"` 为兜底路由 |
-| `api_endpoint` | string | 否 | API 端点路径，默认 `"/v1/chat/completions"` |
-| `strategy` | string | 否 | 目标选择策略（`failover` / `round_robin` / `fill_first`），默认 `failover` |
+| `api_endpoint` | string | 否 | API 端点路径，默认 `"/chat/completions"` |
+| `strategy` | string | 否 | 目标选择策略（`fill_first` / `round_robin`），默认 `fill_first` |
 | `targets` | array | 是 | 目标供应商列表 |
 
 **target 字段说明**：
@@ -134,22 +177,30 @@ Content-Type: application/json
 GET /api/routes
 ```
 
-返回所有配置的路由规则。响应格式：
+返回所有配置的路由规则。
 
-```json
-[
-  {
-    "model_name": "gpt-4o",
-    "api_endpoint": "/v1/chat/completions",
-    "strategy": "failover",
-    "targets": [
-      {
-        "provider": "openai",
-        "real_model": "gpt-4o",
-        "priority": 100,
-        "extra": { "temperature": 0.7 }
-      }
-    ]
-  }
-]
+### 更新路由
+
+```
+PUT /api/routes
+Content-Type: application/json
+
+{
+  "model_name": "gpt-4o",
+  "api_endpoint": "/responses",
+  "targets": [
+    { "provider": "openai", "real_model": "gpt-4o", "priority": 5 }
+  ]
+}
+```
+
+### 删除路由
+
+```
+DELETE /api/routes
+Content-Type: application/json
+
+{
+  "model_name": "gpt-4o"
+}
 ```
