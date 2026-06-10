@@ -54,7 +54,8 @@ priority = 10
 |------|------|------|
 | `provider` | string | 供应商名称，必须匹配 `[providers]` 中定义的名称 |
 | `real_model` | string (可选) | 实际发送给供应商的模型名。**省略此项**则透传客户端请求的原始模型名 |
-| `priority` | integer | 优先级，默认 `10`。**值越大优先级越高**，优先尝试 |
+| `priority` | integer | 优先级，默认 `0`。**值越大优先级越高**，优先尝试 |
+| `extra` | object (可选) | 针对该目标的额外 JSON 字段，合并到上游请求体中。**应用时机晚于供应商级别的 `body_overrides`**，因此目标级别的 key 具有更高优先级 |
 
 ### `api_endpoint` 说明
 
@@ -177,11 +178,13 @@ api_endpoint = "/v1/chat/completions"
 provider = "openai"
 real_model = "gpt-4o"
 priority = 100
+extra = { temperature = 0.7 }
 
 [[routes.targets]]
 provider = "anthropic"
 real_model = "claude-sonnet-4-20250514"
 priority = 50
+extra = { max_tokens = 8192 }
 
 # 轻量模型 — 透传模型名（省略 real_model）
 [[routes]]
@@ -210,4 +213,46 @@ api_endpoint = "/v1/chat/completions"
 [[routes.targets]]
 provider = "openai"
 priority = 10
+```
+
+## `extra` 字段详解
+
+`RouteTarget.extra` 允许为每个目标指定额外的 JSON 字段，这些字段会合并到发送给上游供应商的请求体中。
+
+**合并顺序**（后者覆盖前者）：
+
+1. 客户端原始请求体
+2. 供应商级别的 `body_overrides`
+3. 目标级别的 `extra`（**最高优先级**）
+
+### 使用场景
+
+#### 固定模型参数
+
+某些供应商对同一模型有不同的参数要求：
+
+```toml
+[[routes]]
+model_name = "my-model"
+
+[[routes.targets]]
+provider = "openai"
+real_model = "gpt-4o"
+priority = 100
+extra = { temperature = 0.7, max_tokens = 4096 }
+
+[[routes.targets]]
+provider = "anthropic"
+real_model = "claude-sonnet-4-20250514"
+priority = 50
+extra = { max_tokens = 8192, thinking = { type = "enabled", budget_tokens = 1600 } }
+```
+
+#### 供应商特定的非标准参数
+
+```toml
+[[routes.targets]]
+provider = "openai"
+real_model = "deepseek-chat"
+extra = { model_id = 39 }
 ```

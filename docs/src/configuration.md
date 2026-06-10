@@ -52,10 +52,11 @@ targets = [
     { provider = "openai", real_model = "gpt-4o", priority = 10 },
 ]
 
+# 多目标故障转移，目标级别 extra 覆盖供应商 body_overrides
 [[routes]]
 model_name = "claude-sonnet"
 targets = [
-    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10 },
+    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10, extra = { max_tokens = 8192 } },
     { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
 ]
 

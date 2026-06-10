@@ -68,6 +68,9 @@ targets = [
     { provider = "openai", real_model = "gpt-4o", priority = 10 },
 ]
 
+# Per-target extra fields override provider body_overrides for this target.
+# Example: { provider = "openai", extra = { temperature = 0.7, max_tokens = 4096 } }
+
 [[routes]]
 model_name = "gpt-4o-mini"
 targets = [

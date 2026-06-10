@@ -93,15 +93,40 @@ Content-Type: application/json
 ### 添加路由目标
 
 ```
-POST /api/providers/{name}/routes
+POST /api/routes
 Content-Type: application/json
 
 {
   "model_name": "gpt-4o",
-  "real_model": "gpt-4o",
-  "priority": 10
+  "api_endpoint": "/v1/chat/completions",
+  "targets": [
+    {
+      "provider": "openai",
+      "real_model": "gpt-4o",
+      "priority": 100,
+      "extra": { "temperature": 0.7 }
+    }
+  ]
 }
 ```
+
+**字段说明**：
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `model_name` | string | 是 | 客户端请求的模型名，`"*"` 为兜底路由 |
+| `api_endpoint` | string | 否 | API 端点路径，默认 `"/v1/chat/completions"` |
+| `strategy` | string | 否 | 目标选择策略（`failover` / `round_robin` / `fill_first`），默认 `failover` |
+| `targets` | array | 是 | 目标供应商列表 |
+
+**target 字段说明**：
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `provider` | string | 是 | 供应商名称 |
+| `real_model` | string | 否 | 实际模型名，省略则透传客户端原始模型名 |
+| `priority` | integer | 否 | 优先级，默认 0，值越大越优先 |
+| `extra` | object | 否 | 针对该目标的额外 JSON 字段，合并到上游请求体 |
 
 ### 列出路由
 
@@ -109,4 +134,22 @@ Content-Type: application/json
 GET /api/routes
 ```
 
-返回所有配置的路由规则。
+返回所有配置的路由规则。响应格式：
+
+```json
+[
+  {
+    "model_name": "gpt-4o",
+    "api_endpoint": "/v1/chat/completions",
+    "strategy": "failover",
+    "targets": [
+      {
+        "provider": "openai",
+        "real_model": "gpt-4o",
+        "priority": 100,
+        "extra": { "temperature": 0.7 }
+      }
+    ]
+  }
+]
+```
