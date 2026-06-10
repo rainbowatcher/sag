@@ -158,6 +158,46 @@ pub struct ImageGenerationResponse {
     pub data: Vec<ImageData>,
 }
 
+/// A parsed chunk from a streaming chat completion response.
+///
+/// Providers emit these; the router layer maps them into an SSE response
+/// while extracting token usage for analytics.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// SSE data line to forward to the client as-is (including `data: ` prefix
+    /// and `\n\n` suffix).
+    Data(Vec<u8>),
+    /// Token usage extracted from the stream for analytics.
+    Usage(Usage),
+    /// Stream end signal. The router will log the final CallLog when this is
+    /// received and close the response body.
+    Done,
+}
+
+impl StreamChunk {
+    /// Serialize this chunk into OpenAI SSE wire format bytes.
+    pub fn to_sse_bytes(&self) -> Vec<u8> {
+        match self {
+            StreamChunk::Data(data) => data.clone(),
+            StreamChunk::Usage(u) => {
+                let json = serde_json::json!({
+                    "usage": {
+                        "prompt_tokens": u.prompt_tokens,
+                        "completion_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens,
+                    }
+                });
+                format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&json).unwrap_or_default()
+                )
+                .into_bytes()
+            }
+            StreamChunk::Done => b"data: [DONE]\n\n".to_vec(),
+        }
+    }
+}
+
 /// An entry in the analytics call log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallLog {

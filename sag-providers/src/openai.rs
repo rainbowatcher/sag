@@ -1,20 +1,19 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::StatusCode;
-use axum::response::Response;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use sag_config::KeyStrategy;
 use sag_core::{
     AppError, ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest,
-    ImageGenerationResponse,
+    ImageGenerationResponse, StreamChunk,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{apply_body_overrides, apply_headers, LlmProvider};
+use crate::{LlmProvider, apply_body_overrides, apply_headers, drain_sse_frames};
 
 /// OpenAI-compatible provider adapter.
 ///
@@ -155,8 +154,7 @@ impl LlmProvider for OpenAiProvider {
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
-    ) -> sag_core::Result<Response<Body>> {
-        // Clone request and override model with the real model name
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream_request = request.clone();
         upstream_request.model = real_model.to_string();
 
@@ -190,25 +188,42 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        // Build an Axum response that streams the SSE chunks byte-by-byte.
-        let response_builder = axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive");
+        // Spawn a background task that reads the HTTP response body, parses SSE
+        // frames, and sends chunks into the channel. The returned stream reads
+        // from the receiver side.
+        let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
 
-        let byte_stream = response.bytes_stream().map(|result| {
-            result.map_err(|e| {
-                error!(?e, "error reading upstream stream chunk");
-                std::io::Error::other(e)
-            })
+        tokio::spawn(async move {
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer: Vec<u8> = Vec::new();
+
+            loop {
+                match byte_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        drain_sse_frames(&mut buffer, &tx);
+                    }
+                    Some(Err(e)) => {
+                        error!(?e, "error reading upstream stream chunk");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+
+            // Flush any remaining data in the buffer
+            if !buffer.is_empty() {
+                drain_sse_frames(&mut buffer, &tx);
+            }
+
+            let _ = tx.send(StreamChunk::Done);
         });
 
-        let body = Body::from_stream(byte_stream);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        });
 
-        response_builder
-            .body(body)
-            .map_err(|e| AppError::Internal(format!("failed to build stream response: {e}")))
+        Ok(Box::pin(stream))
     }
 
     #[instrument(skip(self, request), fields(provider = %self.name, model = %real_model))]

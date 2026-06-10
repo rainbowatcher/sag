@@ -20,3 +20,4 @@ sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
 reqwest = { workspace = true }
 fastrand = "2"
+futures-util = "0.3"

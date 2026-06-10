@@ -7,7 +7,7 @@ pub mod types;
 pub use error::AppError;
 pub use types::{
     CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ImageData,
-    ImageGenerationRequest, ImageGenerationResponse, Usage,
+    ImageGenerationRequest, ImageGenerationResponse, StreamChunk, Usage,
 };
 
 /// Convenient alias for `Result<T, error::AppError>`.

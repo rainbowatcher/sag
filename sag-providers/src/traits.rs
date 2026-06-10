@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::pin::Pin;
+
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::response::Response;
+use futures_util::Stream;
 use sag_core::types::{
     ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse,
+    StreamChunk,
 };
 
 /// Unified trait for LLM provider adapters.
@@ -21,15 +23,16 @@ pub trait LlmProvider: Send + Sync {
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse>;
 
-    /// Send a streaming chat completion request. Returns an Axum response
-    /// that streams SSE chunks back to the client.
+    /// Send a streaming chat completion request. Returns a stream of
+    /// parsed SSE chunks that the router layer can forward to the client
+    /// while extracting usage for analytics.
     async fn chat_stream(
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
-    ) -> sag_core::Result<Response<Body>>;
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
 
     /// Send an image generation request. Returns image URLs or base64 data.
     async fn chat_image(

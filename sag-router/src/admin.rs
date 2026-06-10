@@ -620,8 +620,8 @@ struct FetchModelsRequest {
     #[serde(default)]
     headers: HashMap<String, String>,
     provider_type: Option<ProviderType>,
-    /// Custom endpoint path for listing models (default: `v1/models`).
-    /// When empty, falls back to `v1/models` appended to `base_url`.
+    /// Custom endpoint path for listing models (default: `models`).
+    /// When empty, falls back to `models` appended to `base_url`.
     #[serde(default)]
     models_endpoint: String,
 }
@@ -631,11 +631,13 @@ struct FetchModelsRequest {
 /// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
 async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse {
     let endpoint = if req.models_endpoint.is_empty() {
-        "v1/models"
+        "models"
     } else {
         &req.models_endpoint
     };
     let models_url = format!("{}/{}", req.base_url.trim_end_matches('/'), endpoint);
+
+    info!(url = %models_url, provider_type = ?req.provider_type, "fetching upstream models");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -683,6 +685,7 @@ async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse 
                         })
                         .unwrap_or_default();
 
+                    info!(count = models.len(), "successfully fetched upstream models");
                     Json(json!({ "models": models })).into_response()
                 }
                 Err(e) => {

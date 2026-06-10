@@ -11,11 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::StreamExt;
 use sag_config::Strategy;
-use sag_core::{CallLog, ImageGenerationRequest, Usage};
+use sag_core::{CallLog, ImageGenerationRequest, StreamChunk, Usage};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, instrument, warn};
 
 use crate::auth::gateway_auth;
@@ -45,6 +47,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/v1/chat/completions", chat_route)
         .nest("/v1", models_route)
         .nest("/api", admin_routes)
+        .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
 }
@@ -106,10 +109,7 @@ async fn chat_completions_handler(
                         .into_iter()
                         .map(|t| {
                             let rm = t.real_model.unwrap_or_else(|| request.model.clone());
-                            let retries = t
-                                .retries
-                                .or(route_retries)
-                                .unwrap_or(global_retries);
+                            let retries = t.retries.or(route_retries).unwrap_or(global_retries);
                             (t.provider, rm, t.extra, retries)
                         })
                         .collect();
@@ -194,10 +194,8 @@ async fn chat_completions_handler(
             }
         };
 
-        // Per-provider retry loop: 1 initial attempt + max_retries retries.
         for attempt in 0..=*retries {
             if attempt > 0 {
-                // Small backoff before each retry.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
@@ -209,62 +207,152 @@ async fn chat_completions_handler(
                 "trying provider"
             );
 
-            // Dispatch to this provider
-            let result = if is_stream {
-                provider
-                    .chat_stream(&request, real_model, &api_endpoint, target_extra)
-                    .await
-                    .map(|resp| (resp.into_response(), None::<Usage>))
-            } else {
-                provider
-                    .chat(&request, real_model, &api_endpoint, target_extra)
-                    .await
-                    .map(|resp| {
-                        let usage = resp.usage.clone();
-                        ((StatusCode::OK, Json(resp)).into_response(), usage)
-                    })
-            };
+            let pname = provider_name.clone();
+            let rmodel = real_model.clone();
+            let tex = target_extra.clone();
 
-            match result {
-                Ok((response, usage)) => {
-                    // Success - log and return
-                    let log = CallLog {
-                        request_id,
-                        provider: provider_name.clone(),
-                        model: request.model.clone(),
-                        real_model: real_model.clone(),
-                        stream: is_stream,
-                        status_code: 200,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        usage,
-                        error: None,
-                        timestamp: chrono::Utc::now(),
-                    };
-                    state.collector.log(log);
-                    return response;
+            // ── Streaming path ──────────────────────────────────────
+            if is_stream {
+                match provider
+                    .chat_stream(&request, &rmodel, &api_endpoint, &tex)
+                    .await
+                {
+                    Ok(chunk_stream) => {
+                        let collector = state.collector.clone();
+                        let log_request_id = request_id;
+                        let log_provider = pname;
+                        let log_model = request.model.clone();
+                        let log_real_model = rmodel;
+
+                        let body = Body::from_stream(futures_util::stream::unfold(
+                            (
+                                chunk_stream,
+                                Usage::default(),
+                                collector,
+                                log_request_id,
+                                log_provider,
+                                log_model,
+                                log_real_model,
+                                start,
+                            ),
+                            |(
+                                mut stream,
+                                mut usage,
+                                collector,
+                                request_id,
+                                provider,
+                                model,
+                                real_model,
+                                start,
+                            )| async move {
+                                loop {
+                                    match stream.next().await {
+                                        Some(StreamChunk::Data(raw)) => {
+                                            return Some((
+                                                Ok::<_, std::io::Error>(axum::body::Bytes::from(
+                                                    raw,
+                                                )),
+                                                (
+                                                    stream, usage, collector, request_id, provider,
+                                                    model, real_model, start,
+                                                ),
+                                            ));
+                                        }
+                                        Some(StreamChunk::Usage(u)) => {
+                                            usage.prompt_tokens += u.prompt_tokens;
+                                            usage.completion_tokens += u.completion_tokens;
+                                            usage.total_tokens += u.total_tokens;
+                                        }
+                                        Some(StreamChunk::Done) | None => {
+                                            collector.log(CallLog {
+                                                request_id,
+                                                provider: provider.clone(),
+                                                model: model.clone(),
+                                                real_model: real_model.clone(),
+                                                stream: true,
+                                                status_code: 200,
+                                                duration_ms: start.elapsed().as_millis() as u64,
+                                                usage: Some(usage),
+                                                error: None,
+                                                timestamp: chrono::Utc::now(),
+                                            });
+                                            return None;
+                                        }
+                                    }
+                                }
+                            },
+                        ));
+
+                        let response = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "text/event-stream")
+                            .header("Cache-Control", "no-cache")
+                            .header("Connection", "keep-alive")
+                            .body(body)
+                            .unwrap();
+                        return response;
+                    }
+                    Err(e) => {
+                        let is_retryable = is_retryable_error(&e);
+                        warn!(
+                            provider = %provider_name,
+                            error = %e,
+                            retryable = is_retryable,
+                            attempt = attempt,
+                            "provider returned error"
+                        );
+
+                        if !is_retryable {
+                            errors.push(format!("{provider_name}: {e}"));
+                            break 'fallback;
+                        }
+
+                        if attempt == *retries {
+                            errors.push(format!("{provider_name}: {e} (retries exhausted)"));
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    let is_retryable = is_retryable_error(&e);
-                    warn!(
-                        provider = %provider_name,
-                        error = %e,
-                        retryable = is_retryable,
-                        attempt = attempt,
-                        "provider returned error"
-                    );
 
-                    if !is_retryable {
-                        // Non-retryable (4xx/BadRequest) - stop fallback immediately
-                        errors.push(format!("{provider_name}: {e}"));
-                        break 'fallback;
+            // ── Non-streaming path ──────────────────────────────────
+            } else {
+                match provider.chat(&request, &rmodel, &api_endpoint, &tex).await {
+                    Ok(resp) => {
+                        let log = CallLog {
+                            request_id,
+                            provider: pname,
+                            model: request.model.clone(),
+                            real_model: rmodel,
+                            stream: false,
+                            status_code: 200,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            usage: resp.usage.clone(),
+                            error: None,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        state.collector.log(log);
+                        return (StatusCode::OK, Json(resp)).into_response();
                     }
+                    Err(e) => {
+                        let is_retryable = is_retryable_error(&e);
+                        warn!(
+                            provider = %provider_name,
+                            error = %e,
+                            retryable = is_retryable,
+                            attempt = attempt,
+                            "provider returned error"
+                        );
 
-                    if attempt == *retries {
-                        // Exhausted retries for this target — try next target.
-                        errors.push(format!("{provider_name}: {e} (retries exhausted)"));
-                        break;
+                        if !is_retryable {
+                            errors.push(format!("{provider_name}: {e}"));
+                            break 'fallback;
+                        }
+
+                        if attempt == *retries {
+                            errors.push(format!("{provider_name}: {e} (retries exhausted)"));
+                            break;
+                        }
                     }
-                    // Otherwise: retry the same provider (continue inner loop).
                 }
             }
         }
@@ -328,7 +416,10 @@ async fn dispatch_image_request(
                 "trying provider for image generation"
             );
 
-            match provider.chat_image(&img_request, real_model, target_extra).await {
+            match provider
+                .chat_image(&img_request, real_model, target_extra)
+                .await
+            {
                 Ok(resp) => {
                     let log = CallLog {
                         request_id: *request_id,
@@ -488,9 +579,7 @@ async fn health_handler() -> Json<serde_json::Value> {
 /// The model list is derived from the routing table — each route's
 /// `model_name` is surfaced as a model `id`.
 #[instrument(skip(state))]
-async fn models_handler(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let config = state.config.read().await;
 
     let data: Vec<serde_json::Value> = config

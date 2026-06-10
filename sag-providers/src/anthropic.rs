@@ -1,21 +1,20 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::StatusCode;
-use axum::response::Response;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use sag_config::KeyStrategy;
 use sag_core::{
     AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    ImageGenerationRequest, ImageGenerationResponse, Usage,
+    ImageGenerationRequest, ImageGenerationResponse, StreamChunk, Usage,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{apply_body_overrides, apply_headers, LlmProvider};
+use crate::{LlmProvider, apply_body_overrides, apply_headers, drain_sse_frames};
 
 // ── Anthropic wire types ─────────────────────────────────────────
 
@@ -287,7 +286,7 @@ impl LlmProvider for AnthropicProvider {
         real_model: &str,
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
-    ) -> sag_core::Result<Response<Body>> {
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream = Self::to_anthropic_request(request, real_model);
         upstream.stream = Some(true);
 
@@ -321,24 +320,38 @@ impl LlmProvider for AnthropicProvider {
             });
         }
 
-        let response_builder = Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive");
+        let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
 
-        let byte_stream = response.bytes_stream().map(|result| {
-            result.map_err(|e| {
-                error!(?e, "error reading anthropic stream chunk");
-                std::io::Error::other(e)
-            })
+        tokio::spawn(async move {
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer: Vec<u8> = Vec::new();
+
+            loop {
+                match byte_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        drain_sse_frames(&mut buffer, &tx);
+                    }
+                    Some(Err(e)) => {
+                        error!(?e, "error reading anthropic stream chunk");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+
+            if !buffer.is_empty() {
+                drain_sse_frames(&mut buffer, &tx);
+            }
+
+            let _ = tx.send(StreamChunk::Done);
         });
 
-        let body = Body::from_stream(byte_stream);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        });
 
-        response_builder
-            .body(body)
-            .map_err(|e| AppError::Internal(format!("failed to build stream response: {e}")))
+        Ok(Box::pin(stream))
     }
 
     #[instrument(skip(self), fields(provider = %self.name))]
