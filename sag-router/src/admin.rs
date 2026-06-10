@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use reqwest::header::CONTENT_TYPE;
-use sag_config::{self, KeyStrategy, ProviderConfig, RouteConfig, RouteTarget, Strategy};
+use sag_config::{self, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,15 +46,15 @@ struct AddProviderRequest {
     api_keys: Vec<String>,
     #[serde(default)]
     key_strategy: KeyStrategy,
-    #[serde(default = "default_provider_type")]
-    provider_type: String,
-    #[serde(default = "default_base_url")]
+    #[serde(default)]
+    provider_type: ProviderType,
+    #[serde(default = "sag_config::default_base_url")]
     base_url: String,
-    #[serde(default = "default_priority")]
+    #[serde(default = "sag_config::default_priority")]
     priority: u32,
-    #[serde(default = "default_max_retries")]
+    #[serde(default = "sag_config::default_max_retries")]
     max_retries: u32,
-    #[serde(default = "default_timeout_secs")]
+    #[serde(default = "sag_config::default_timeout_secs")]
     timeout_secs: u64,
     /// Custom headers to override upstream request headers.
     #[serde(default)]
@@ -66,23 +66,6 @@ struct AddProviderRequest {
     #[serde(default)]
     enabled_models: Vec<String>,
 }
-
-fn default_provider_type() -> String {
-    "openai".into()
-}
-fn default_base_url() -> String {
-    "https://api.openai.com/v1".into()
-}
-fn default_priority() -> u32 {
-    0
-}
-fn default_max_retries() -> u32 {
-    2
-}
-fn default_timeout_secs() -> u64 {
-    120
-}
-
 fn default_api_endpoint() -> String {
     "/chat/completions".into()
 }
@@ -134,7 +117,7 @@ struct UpdateProviderRequest {
     api_keys: Option<Vec<String>>,
     #[serde(default)]
     key_strategy: Option<KeyStrategy>,
-    provider_type: Option<String>,
+    provider_type: Option<ProviderType>,
     base_url: Option<String>,
     priority: Option<u32>,
     max_retries: Option<u32>,
@@ -180,7 +163,7 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
             api_key: cfg.api_key.clone(),
             api_keys: cfg.api_keys.clone(),
             key_strategy: cfg.key_strategy,
-            provider_type: cfg.provider_type.clone(),
+            provider_type: cfg.provider_type.as_str().to_string(),
             base_url: cfg.base_url.clone(),
             priority: cfg.priority,
             max_retries: cfg.max_retries,
@@ -464,25 +447,16 @@ async fn add_provider(
     };
 
     // 2. Build the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str()
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type
     {
-        "openai" => Arc::new(sag_providers::OpenAiProvider::new(
+        ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
             req.name.clone(),
             &provider_config,
         )),
-        "anthropic" => Arc::new(sag_providers::AnthropicProvider::new(
+        ProviderType::Anthropic => Arc::new(sag_providers::AnthropicProvider::new(
             req.name.clone(),
             &provider_config,
         )),
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": { "code": "BAD_REQUEST", "message": format!("unknown provider_type: '{other}'. supported: openai, anthropic") }
-                })),
-            )
-                .into_response();
-        }
     };
 
     {
@@ -490,13 +464,14 @@ async fn add_provider(
         providers.insert(req.name.clone(), provider);
     }
 
-    info!(name = %req.name, provider_type = %provider_config.provider_type, "provider added via admin API");
+    info!(name = %req.name, provider_type = %        provider_config.provider_type.as_str(),
+        "provider added via admin API");
 
     (
         StatusCode::CREATED,
         Json(json!({
             "name": req.name,
-            "provider_type": provider_config.provider_type,
+            "provider_type":            provider_config.provider_type.as_str(),
             "base_url": provider_config.base_url,
         })),
     )
@@ -570,25 +545,16 @@ async fn update_provider(
     };
 
     // Rebuild the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type.as_str()
+    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type
     {
-        "openai" => Arc::new(sag_providers::OpenAiProvider::new(
+        ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
             req.name.clone(),
             &provider_config,
         )),
-        "anthropic" => Arc::new(sag_providers::AnthropicProvider::new(
+        ProviderType::Anthropic => Arc::new(sag_providers::AnthropicProvider::new(
             req.name.clone(),
             &provider_config,
         )),
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": { "code": "BAD_REQUEST", "message": format!("unknown provider_type: '{other}'. supported: openai, anthropic") }
-                })),
-            )
-                .into_response();
-        }
     };
 
     {
@@ -596,13 +562,14 @@ async fn update_provider(
         providers.insert(req.name.clone(), provider);
     }
 
-    info!(name = %req.name, provider_type = %provider_config.provider_type, "provider updated via admin API");
+    info!(name = %req.name, provider_type = %        provider_config.provider_type.as_str(),
+        "provider updated via admin API");
 
     (
         StatusCode::OK,
         Json(json!({
             "name": req.name,
-            "provider_type": provider_config.provider_type,
+            "provider_type":            provider_config.provider_type.as_str(),
             "base_url": provider_config.base_url,
             "priority": provider_config.priority,
             "max_retries": provider_config.max_retries,
@@ -698,7 +665,7 @@ struct ModelTestRequest {
     api_keys: Vec<String>,
     api_key: String,
     base_url: String,
-    provider_type: Option<String>,
+    provider_type: Option<ProviderType>,
     #[serde(default)]
     headers: HashMap<String, String>,
 }
@@ -742,7 +709,7 @@ async fn test_single_key(
     api_key: &str,
 ) -> (bool, String) {
     let (url, body, auth_header, auth_value): (String, serde_json::Value, &str, String) =
-        if req.provider_type.as_deref() == Some("anthropic") {
+        if req.provider_type == Some(ProviderType::Anthropic) {
             (
                 format!("{}/messages", req.base_url.trim_end_matches('/')),
                 serde_json::json!({
@@ -772,7 +739,7 @@ async fn test_single_key(
         .header(CONTENT_TYPE, "application/json");
 
     // Anthropic also needs the version header
-    if req.provider_type.as_deref() == Some("anthropic") {
+    if req.provider_type == Some(ProviderType::Anthropic) {
         http_req = http_req.header("anthropic-version", "2023-06-01");
     }
 
@@ -981,7 +948,7 @@ mod tests {
         providers.insert(
             name.to_string(),
             ProviderConfig {
-                provider_type: "openai".into(),
+                provider_type: ProviderType::OpenAI,
                 api_key: "sk-test".into(),
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
@@ -1085,11 +1052,10 @@ mod tests {
                 name.to_string(),
                 ProviderConfig {
                     provider_type: if name == "openai" {
-                        "openai"
+                        ProviderType::OpenAI
                     } else {
-                        "anthropic"
-                    }
-                    .into(),
+                        ProviderType::Anthropic
+                    },
                     api_key: format!("sk-{name}"),
                     api_keys: vec![],
                     key_strategy: KeyStrategy::FillFirst,
@@ -1360,7 +1326,7 @@ targets = [
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
-                provider_type: "openai".into(),
+                provider_type: ProviderType::OpenAI,
                 api_key: "sk-test".into(),
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
@@ -1402,7 +1368,7 @@ targets = [
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
-                provider_type: "openai".into(),
+                provider_type: ProviderType::OpenAI,
                 api_key: "sk-test".into(),
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
@@ -1441,7 +1407,7 @@ targets = [
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
-                provider_type: "openai".into(),
+                provider_type: ProviderType::OpenAI,
                 api_key: "sk-test".into(),
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
@@ -1477,7 +1443,7 @@ targets = [
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
-                provider_type: "openai".into(),
+                provider_type: ProviderType::OpenAI,
                 api_key: "sk-test".into(),
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
@@ -1650,7 +1616,7 @@ targets = [
         assert_eq!(p.max_retries, 3);
         // Fields not in the update should keep their original values
         assert_eq!(p.api_key, "sk-test");
-        assert_eq!(p.provider_type, "openai");
+        assert_eq!(p.provider_type, ProviderType::OpenAI);
     }
 
     // 7. Update provider — 404
@@ -1695,7 +1661,7 @@ targets = [
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.api_key, "sk-updated");
-        assert_eq!(p.provider_type, "anthropic");
+        assert_eq!(p.provider_type, ProviderType::Anthropic);
         assert_eq!(p.base_url, "https://api.anthropic.com");
 
         // Ensure the runtime registry was updated
@@ -1743,7 +1709,7 @@ mod auth_regression_tests {
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
-                provider_type: "openai".into(),
+                provider_type: ProviderType::OpenAI,
                 api_key: "sk-test".into(),
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,

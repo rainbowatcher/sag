@@ -48,6 +48,28 @@ pub struct GatewayAuthConfig {
     pub api_keys: Vec<String>,
 }
 
+/// Supported LLM provider adapter type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderType {
+    /// OpenAI-compatible API (also used for any OpenAI-drop-in replacement).
+    #[default]
+    #[serde(rename = "openai")]
+    OpenAI,
+    /// Anthropic Messages API.
+    Anthropic,
+}
+
+impl ProviderType {
+    /// Return the canonical lowercase string for this provider type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderType::OpenAI => "openai",
+            ProviderType::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// API key selection strategy for providers with multiple keys.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,9 +85,9 @@ pub enum KeyStrategy {
 /// Upstream LLM provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// Provider adapter type: "openai" (default) or "anthropic".
-    #[serde(default = "default_provider_type")]
-    pub provider_type: String,
+    /// Provider adapter type (default: `openai`).
+    #[serde(default)]
+    pub provider_type: ProviderType,
     /// API key for this provider (injected into requests).
     pub api_key: String,
     /// Additional API keys for this provider.
@@ -109,23 +131,19 @@ pub struct ProviderConfig {
     pub enabled_models: Vec<String>,
 }
 
-fn default_provider_type() -> String {
-    "openai".into()
-}
-
-fn default_base_url() -> String {
+pub fn default_base_url() -> String {
     "https://api.openai.com/v1".into()
 }
 /// Default priority value (`0`).
 ///
 /// When no priority is specified, targets default to `0`.
-fn default_priority() -> u32 {
+pub fn default_priority() -> u32 {
     0
 }
-fn default_max_retries() -> u32 {
+pub fn default_max_retries() -> u32 {
     2
 }
-fn default_timeout_secs() -> u64 {
+pub fn default_timeout_secs() -> u64 {
     120
 }
 

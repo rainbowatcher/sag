@@ -47,18 +47,18 @@ async fn main() -> anyhow::Result<()> {
 
     for (name, provider_config) in &config.providers {
         let provider: Arc<dyn sag_providers::LlmProvider> =
-            match provider_config.provider_type.as_str() {
-                "anthropic" => Arc::new(sag_providers::AnthropicProvider::new(
+            match provider_config.provider_type {
+                sag_config::ProviderType::Anthropic => Arc::new(sag_providers::AnthropicProvider::new(
                     name.clone(),
                     provider_config,
                 )),
-                _ => Arc::new(sag_providers::OpenAiProvider::new(
+                sag_config::ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
                     name.clone(),
                     provider_config,
                 )),
             };
         providers.insert(name.clone(), provider);
-        info!(name, provider_type = %provider_config.provider_type, base_url = %provider_config.base_url, "provider registered");
+        info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
     }
     drop(config);
 
