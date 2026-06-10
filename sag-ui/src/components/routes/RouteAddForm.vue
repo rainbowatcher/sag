@@ -254,7 +254,8 @@ async function handleSubmit(event: Event) {
                 @update:model-value="
                   (v) => {
                     t.provider_name = v as string
-                    routeStore.fetchProviderModels(v as string)
+                    t.real_model = ''
+                    routeStore.loadProviderModels(v as string, providers)
                   }
                 "
               >

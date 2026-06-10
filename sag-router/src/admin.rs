@@ -233,6 +233,26 @@ async fn create_route(
                 )
                     .into_response();
             }
+            // Validate target model against provider's enabled_models
+            let pc = &config.providers[&t.provider];
+            if !pc.enabled_models.is_empty() {
+                let model_to_check = t.real_model.as_deref().unwrap_or(&req.model_name);
+                if !pc.enabled_models.iter().any(|m| m == model_to_check) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "code": "BAD_REQUEST",
+                                "message": format!(
+                                    "model '{}' is not in provider '{}' enabled_models: {:?}",
+                                    model_to_check, t.provider, pc.enabled_models
+                                )
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
 
         let route = RouteConfig {
@@ -290,6 +310,26 @@ async fn update_route(
                         })),
                     )
                         .into_response();
+                }
+                // Validate target model against provider's enabled_models
+                let pc = &config.providers[&t.provider];
+                if !pc.enabled_models.is_empty() {
+                    let model_to_check = t.real_model.as_deref().unwrap_or(&req.model_name);
+                    if !pc.enabled_models.iter().any(|m| m == model_to_check) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "code": "BAD_REQUEST",
+                                    "message": format!(
+                                        "model '{}' is not in provider '{}' enabled_models: {:?}",
+                                        model_to_check, t.provider, pc.enabled_models
+                                    )
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
                 }
             }
         }
@@ -1324,6 +1364,174 @@ targets = [
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["error"]["code"], "CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn create_route_rejected_by_enabled_models() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: "sk-test".into(),
+                api_keys: vec![],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                priority: 10,
+                max_retries: 2,
+                timeout_secs: 120,
+                supported_params: vec![],
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+            },
+        );
+        let state = build_state(providers, vec![]).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-3.5-turbo","priority":10}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert!(body["error"]["message"].as_str().unwrap().contains("enabled_models"));
+    }
+
+    #[tokio::test]
+    async fn create_route_allowed_by_enabled_models() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: "sk-test".into(),
+                api_keys: vec![],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                priority: 10,
+                max_retries: 2,
+                timeout_secs: 120,
+                supported_params: vec![],
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+            },
+        );
+        let state = build_state(providers, vec![]).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-4o","priority":10}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.routes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_route_passthrough_checked_by_enabled_models() {
+        // When real_model is omitted, the route's model_name is checked
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: "sk-test".into(),
+                api_keys: vec![],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                priority: 10,
+                max_retries: 2,
+                timeout_secs: 120,
+                supported_params: vec![],
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into()],
+            },
+        );
+        let state = build_state(providers, vec![]).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        // model_name "gpt-4o-mini" is not in enabled_models
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o-mini","targets":[{"provider":"openai","priority":10}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_route_rejected_by_enabled_models() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: "sk-test".into(),
+                api_keys: vec![],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                priority: 10,
+                max_retries: 2,
+                timeout_secs: 120,
+                supported_params: vec![],
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into()],
+            },
+        );
+        let routes = vec![RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            strategy: Strategy::FillFirst,
+            targets: vec![RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
+                extra: HashMap::new(),
+            }],
+        }];
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        // Try to update with a model not in enabled_models
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-3.5-turbo","priority":5}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

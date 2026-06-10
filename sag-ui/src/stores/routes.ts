@@ -1,7 +1,7 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api, headers } from "@/lib/client"
-import type { RouteConfig, CreateRoutePayload, UpdateRoutePayload } from "@/types/api"
+import type { Provider, RouteConfig, CreateRoutePayload, UpdateRoutePayload } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
 export const useRouteStore = defineStore("routes", () => {
@@ -39,6 +39,15 @@ export const useRouteStore = defineStore("routes", () => {
       providerModels.value[name] = []
     } finally {
       providerModelsLoading.value = false
+    }
+  }
+
+  function loadProviderModels(providerName: string, providers: Provider[]) {
+    const p = providers.find((p) => p.name === providerName)
+    if (p && p.enabled_models.length > 0) {
+      providerModels.value[providerName] = p.enabled_models
+    } else if (providerName) {
+      fetchProviderModels(providerName)
     }
   }
 
@@ -85,6 +94,7 @@ export const useRouteStore = defineStore("routes", () => {
     providerModels,
     providerModelsLoading,
     fetchRoutes,
+    loadProviderModels,
     fetchProviderModels,
     createRoute,
     updateRoute,

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useForm } from "@tanstack/vue-form"
 import { Loader2, Plus, Trash2, ChevronsUpDown, Check } from "lucide-vue-next"
-import { ref } from "vue"
+import { onMounted, ref } from "vue"
 import { z } from "zod"
 import { Button } from "@/components/ui/button"
 import {
@@ -59,6 +59,15 @@ const targets = ref<TargetEdit[]>(
     extra: t.extra ? JSON.stringify(t.extra) : "",
   })),
 )
+
+// Pre-load models for existing targets
+onMounted(() => {
+  for (const t of targets.value) {
+    if (t.provider && !routeStore.providerModels[t.provider]) {
+      routeStore.loadProviderModels(t.provider, providerStore.providers)
+    }
+  }
+})
 
 function addTarget() {
   targets.value.push({ provider: "", real_model: "", priority: 0, extra: "" })
@@ -223,7 +232,13 @@ async function handleSubmit(event: Event) {
             <Label class="text-xs">Provider</Label>
             <Select
               :model-value="t.provider"
-              @update:model-value="(v) => (t.provider = v as string)"
+              @update:model-value="
+                (v) => {
+                  t.provider = v as string
+                  t.real_model = ''
+                  routeStore.loadProviderModels(v as string, providerStore.providers)
+                }
+              "
             >
               <SelectTrigger>
                 <SelectValue placeholder="Select..." />
@@ -238,11 +253,55 @@ async function handleSubmit(event: Event) {
 
           <div class="flex-1">
             <Label class="text-xs">Real Model</Label>
-            <Input
-              :model-value="t.real_model"
-              @input="t.real_model = ($event.target as HTMLInputElement).value"
-              placeholder="gpt-4o"
-            />
+            <Popover v-model:open="openPopover[i]">
+              <PopoverTrigger as-child>
+                <Button
+                  variant="outline"
+                  role="combobox"
+                  :aria-expanded="openPopover[i]"
+                  class="w-full justify-between"
+                >
+                  {{ t.real_model || "Select model" }}
+                  <ChevronsUpDown class="ml-auto h-4 w-4 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent class="w-(--reka-popper-anchor-width) p-0">
+                <Command>
+                  <CommandInput placeholder="Search model..." />
+                  <CommandList>
+                    <CommandEmpty>No models found</CommandEmpty>
+                    <div
+                      v-if="
+                        routeStore.providerModelsLoading && !routeStore.providerModels[t.provider]
+                      "
+                      class="text-muted-foreground px-2 py-4 text-center text-xs"
+                    >
+                      Loading models...
+                    </div>
+                    <CommandGroup>
+                      <CommandItem
+                        v-for="m in routeStore.providerModels[t.provider] ?? []"
+                        :key="m"
+                        :value="m"
+                        @select="
+                          (ev) => {
+                            const val = ev.detail.value as string
+                            t.real_model = val === t.real_model ? '' : val
+                            openPopover[i] = false
+                          }
+                        "
+                      >
+                        {{ m }}
+                        <Check
+                          :class="t.real_model === m ? 'opacity-100' : 'opacity-0'"
+                          class="ml-auto h-4 w-4"
+                        />
+                      </CommandItem>
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
           </div>
 
           <div class="w-20">
