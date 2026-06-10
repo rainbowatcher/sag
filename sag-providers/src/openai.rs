@@ -69,13 +69,13 @@ impl OpenAiProvider {
         }
     }
 
-    /// Validate that the request does not contain unsupported parameters.
-    /// Returns `Ok(())` if all extra keys are in `supported_params`,
-    /// or `Err(AppError::BadRequest)` with details of the offending keys.
-    fn validate_params(&self, request: &ChatCompletionRequest) -> Result<(), AppError> {
+    /// Warn about extra parameters not in the supported whitelist.
+    /// Named fields (standard OpenAI params) are always allowed through.
+    /// Non-standard extra keys not in `supported_params` are logged as a warning
+    /// but still passed to the upstream provider.
+    fn warn_unsupported_params(&self, request: &ChatCompletionRequest) {
         if self.supported_params.is_empty() {
-            // No restriction — allow everything
-            return Ok(());
+            return;
         }
 
         let supported_set: std::collections::HashSet<&str> =
@@ -88,14 +88,12 @@ impl OpenAiProvider {
             .collect();
 
         if !unsupported.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "provider '{}' does not support parameters: {}",
+            warn!(
+                "provider '{}' does not list support for parameters: {} (passed through to upstream)",
                 self.name,
                 unsupported.join(", ")
-            )));
+            );
         }
-
-        Ok(())
     }
 
     /// Build the full upstream URL from the base URL and an API endpoint path.
@@ -144,8 +142,8 @@ impl LlmProvider for OpenAiProvider {
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
-        // Validate parameters
-        self.validate_params(request)?;
+        // Warn about unsupported extra parameters (non-blocking)
+        self.warn_unsupported_params(request);
 
         // Clone request and override model with the real model name
         let mut upstream_request = request.clone();
@@ -189,8 +187,8 @@ impl LlmProvider for OpenAiProvider {
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Response<Body>> {
-        // Validate parameters
-        self.validate_params(request)?;
+        // Warn about unsupported extra parameters (non-blocking)
+        self.warn_unsupported_params(request);
 
         // Clone request and override model with the real model name
         let mut upstream_request = request.clone();

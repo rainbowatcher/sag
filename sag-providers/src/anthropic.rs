@@ -133,10 +133,13 @@ impl AnthropicProvider {
         }
     }
 
-    /// Validate extra parameters against supported whitelist.
-    fn validate_params(&self, request: &ChatCompletionRequest) -> Result<(), AppError> {
+    /// Warn about extra parameters not in the supported whitelist.
+    /// Named fields (standard OpenAI params) are always allowed through.
+    /// Non-standard extra keys not in `supported_params` are logged as a warning
+    /// but still passed to the upstream provider.
+    fn warn_unsupported_params(&self, request: &ChatCompletionRequest) {
         if self.supported_params.is_empty() {
-            return Ok(());
+            return;
         }
         let supported_set: std::collections::HashSet<&str> =
             self.supported_params.iter().map(|s| s.as_str()).collect();
@@ -148,13 +151,12 @@ impl AnthropicProvider {
             .collect();
 
         if !unsupported.is_empty() {
-            return Err(AppError::BadRequest(format!(
-                "provider '{}' does not support parameters: {}",
+            warn!(
+                "provider '{}' does not list support for parameters: {} (passed through to upstream)",
                 self.name,
                 unsupported.join(", ")
-            )));
+            );
         }
-        Ok(())
     }
 
     /// Convert an OpenAI-format request to Anthropic Messages API format.
@@ -273,7 +275,7 @@ impl LlmProvider for AnthropicProvider {
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
-        self.validate_params(request)?;
+        self.warn_unsupported_params(request);
 
         let upstream = Self::to_anthropic_request(request, real_model);
         let url = format!("{}/messages", self.base_url);
@@ -314,7 +316,7 @@ impl LlmProvider for AnthropicProvider {
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Response<Body>> {
-        self.validate_params(request)?;
+        self.warn_unsupported_params(request);
 
         let mut upstream = Self::to_anthropic_request(request, real_model);
         upstream.stream = Some(true);
