@@ -56,10 +56,11 @@ pub fn build_router(state: AppState) -> Router {
 /// 2. Match model -> route (exact -> wildcard `*`)
 /// 3. If api_endpoint is image-based, dispatch as image generation
 /// 4. Sort route targets by priority (descending — higher value wins)
-/// 5. Try each target: parameter validation -> dispatch
-/// 6. On 4xx error: return immediately (don't retry)
-/// 7. On 5xx / network / timeout: try next target
-/// 8. If all exhausted: return AllProvidersExhausted
+/// 5. Try each target with tiered retries (target → route → global retries count)
+/// 6. On 4xx error: return immediately (don't retry, don't fallback)
+/// 7. On retryable error (5xx / network / timeout): retry same provider
+///    up to the effective retry count; if exhausted, try next target
+/// 8. If all targets exhausted: return AllProvidersExhausted
 /// 9. Log analytics via CallLogCollector
 #[instrument(skip(state), fields())]
 async fn chat_completions_handler(
@@ -86,6 +87,8 @@ async fn chat_completions_handler(
                 let strategy = r.strategy;
                 let api_endpoint = r.api_endpoint.clone();
                 let model_name = r.model_name.clone();
+                let route_retries = r.retries;
+                let global_retries = config_guard.retries;
                 // Drop the read lock before accessing route_counters (write lock)
                 drop(config_guard);
 
@@ -97,13 +100,19 @@ async fn chat_completions_handler(
                     }
                 };
 
-                let resolved: Vec<(String, String, u32, HashMap<String, serde_json::Value>)> = ordered
-                    .into_iter()
-                    .map(|t| {
-                        let rm = t.real_model.unwrap_or_else(|| request.model.clone());
-                        (t.provider, rm, t.priority, t.extra)
-                    })
-                    .collect();
+                // Resolve effective retries per target: target.retries → route.retries → global.retries
+                let resolved: Vec<(String, String, HashMap<String, serde_json::Value>, u32)> =
+                    ordered
+                        .into_iter()
+                        .map(|t| {
+                            let rm = t.real_model.unwrap_or_else(|| request.model.clone());
+                            let retries = t
+                                .retries
+                                .or(route_retries)
+                                .unwrap_or(global_retries);
+                            (t.provider, rm, t.extra, retries)
+                        })
+                        .collect();
 
                 (resolved, api_endpoint)
             }
@@ -175,7 +184,7 @@ async fn chat_completions_handler(
         .await;
     }
 
-    for (provider_name, real_model, priority, target_extra) in &targets {
+    'fallback: for (provider_name, real_model, target_extra, retries) in &targets {
         let provider = match state.get_provider(provider_name).await {
             Some(p) => p,
             None => {
@@ -185,64 +194,78 @@ async fn chat_completions_handler(
             }
         };
 
-        info!(
-            provider = %provider_name,
-            real_model = %real_model,
-            priority = priority,
-            "trying provider"
-        );
-
-        // Dispatch to this provider
-        let result = if is_stream {
-            provider
-                .chat_stream(&request, real_model, &api_endpoint, target_extra)
-                .await
-                .map(|resp| (resp.into_response(), None::<Usage>))
-        } else {
-            provider
-                .chat(&request, real_model, &api_endpoint, target_extra)
-                .await
-                .map(|resp| {
-                    let usage = resp.usage.clone();
-                    ((StatusCode::OK, Json(resp)).into_response(), usage)
-                })
-        };
-
-        match result {
-            Ok((response, usage)) => {
-                // Success - log and return
-                let log = CallLog {
-                    request_id,
-                    provider: provider_name.clone(),
-                    model: request.model.clone(),
-                    real_model: real_model.clone(),
-                    stream: is_stream,
-                    status_code: 200,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    usage,
-                    error: None,
-                    timestamp: chrono::Utc::now(),
-                };
-                state.collector.log(log);
-                return response;
+        // Per-provider retry loop: 1 initial attempt + max_retries retries.
+        for attempt in 0..=*retries {
+            if attempt > 0 {
+                // Small backoff before each retry.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => {
-                // Determine if this error is retryable
-                let is_retryable = is_retryable_error(&e);
-                warn!(
-                    provider = %provider_name,
-                    error = %e,
-                    retryable = is_retryable,
-                    "provider returned error"
-                );
 
-                errors.push(format!("{provider_name}: {e}"));
+            info!(
+                provider = %provider_name,
+                real_model = %real_model,
+                attempt = attempt,
+                max_retries = retries,
+                "trying provider"
+            );
 
-                if !is_retryable {
-                    // Non-retryable (4xx/BadRequest) - stop fallback immediately
-                    break;
+            // Dispatch to this provider
+            let result = if is_stream {
+                provider
+                    .chat_stream(&request, real_model, &api_endpoint, target_extra)
+                    .await
+                    .map(|resp| (resp.into_response(), None::<Usage>))
+            } else {
+                provider
+                    .chat(&request, real_model, &api_endpoint, target_extra)
+                    .await
+                    .map(|resp| {
+                        let usage = resp.usage.clone();
+                        ((StatusCode::OK, Json(resp)).into_response(), usage)
+                    })
+            };
+
+            match result {
+                Ok((response, usage)) => {
+                    // Success - log and return
+                    let log = CallLog {
+                        request_id,
+                        provider: provider_name.clone(),
+                        model: request.model.clone(),
+                        real_model: real_model.clone(),
+                        stream: is_stream,
+                        status_code: 200,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        usage,
+                        error: None,
+                        timestamp: chrono::Utc::now(),
+                    };
+                    state.collector.log(log);
+                    return response;
                 }
-                // Otherwise, try next target
+                Err(e) => {
+                    let is_retryable = is_retryable_error(&e);
+                    warn!(
+                        provider = %provider_name,
+                        error = %e,
+                        retryable = is_retryable,
+                        attempt = attempt,
+                        "provider returned error"
+                    );
+
+                    if !is_retryable {
+                        // Non-retryable (4xx/BadRequest) - stop fallback immediately
+                        errors.push(format!("{provider_name}: {e}"));
+                        break 'fallback;
+                    }
+
+                    if attempt == *retries {
+                        // Exhausted retries for this target — try next target.
+                        errors.push(format!("{provider_name}: {e} (retries exhausted)"));
+                        break;
+                    }
+                    // Otherwise: retry the same provider (continue inner loop).
+                }
             }
         }
     }
@@ -276,13 +299,13 @@ async fn chat_completions_handler(
 async fn dispatch_image_request(
     state: &AppState,
     img_request: ImageGenerationRequest,
-    targets: &[(String, String, u32, HashMap<String, serde_json::Value>)],
+    targets: &[(String, String, HashMap<String, serde_json::Value>, u32)],
     request_id: &uuid::Uuid,
     model: &str,
     start: Instant,
     errors: &mut Vec<String>,
 ) -> Response<Body> {
-    for (provider_name, real_model, priority, target_extra) in targets {
+    'fallback: for (provider_name, real_model, target_extra, retries) in targets {
         let provider = match state.get_provider(provider_name).await {
             Some(p) => p,
             None => {
@@ -292,41 +315,56 @@ async fn dispatch_image_request(
             }
         };
 
-        info!(
-            provider = %provider_name,
-            real_model = %real_model,
-            priority = priority,
-            "trying provider for image generation"
-        );
-
-        match provider.chat_image(&img_request, real_model, target_extra).await {
-            Ok(resp) => {
-                let log = CallLog {
-                    request_id: *request_id,
-                    provider: provider_name.clone(),
-                    model: model.to_string(),
-                    real_model: real_model.clone(),
-                    stream: false,
-                    status_code: 200,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    usage: None,
-                    error: None,
-                    timestamp: chrono::Utc::now(),
-                };
-                state.collector.log(log);
-                return (StatusCode::OK, Json(resp)).into_response();
+        // Per-provider retry loop: 1 initial attempt + max_retries retries.
+        for attempt in 0..=*retries {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => {
-                let is_retryable = is_retryable_error(&e);
-                warn!(
-                    provider = %provider_name,
-                    error = %e,
-                    retryable = is_retryable,
-                    "provider image generation error"
-                );
-                errors.push(format!("{provider_name}: {e}"));
-                if !is_retryable {
-                    break;
+
+            info!(
+                provider = %provider_name,
+                real_model = %real_model,
+                attempt = attempt,
+                "trying provider for image generation"
+            );
+
+            match provider.chat_image(&img_request, real_model, target_extra).await {
+                Ok(resp) => {
+                    let log = CallLog {
+                        request_id: *request_id,
+                        provider: provider_name.clone(),
+                        model: model.to_string(),
+                        real_model: real_model.clone(),
+                        stream: false,
+                        status_code: 200,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        usage: None,
+                        error: None,
+                        timestamp: chrono::Utc::now(),
+                    };
+                    state.collector.log(log);
+                    return (StatusCode::OK, Json(resp)).into_response();
+                }
+                Err(e) => {
+                    let is_retryable = is_retryable_error(&e);
+                    warn!(
+                        provider = %provider_name,
+                        error = %e,
+                        retryable = is_retryable,
+                        attempt = attempt,
+                        "provider image generation error"
+                    );
+
+                    if !is_retryable {
+                        errors.push(format!("{provider_name}: {e}"));
+                        break 'fallback;
+                    }
+
+                    if attempt == *retries {
+                        errors.push(format!("{provider_name}: {e} (retries exhausted)"));
+                        break;
+                    }
+                    // Otherwise: retry the same provider.
                 }
             }
         }

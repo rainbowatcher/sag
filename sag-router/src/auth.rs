@@ -92,6 +92,7 @@ mod tests {
             },
             analytics: None,
             gateway_auth: auth_keys.map(|keys| sag_config::GatewayAuthConfig { api_keys: keys }),
+            retries: 2,
             providers: HashMap::new(),
             routes: vec![],
         };

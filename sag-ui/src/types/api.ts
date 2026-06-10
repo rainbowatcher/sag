@@ -5,8 +5,6 @@ export interface Provider {
   key_strategy: "fill_first" | "round_robin"
   provider_type: string
   base_url: string
-  priority: number
-  max_retries: number
   timeout_secs: number
   headers: Record<string, string>
   body_overrides: Record<string, any>

@@ -50,10 +50,6 @@ struct AddProviderRequest {
     provider_type: ProviderType,
     #[serde(default = "sag_config::default_base_url")]
     base_url: String,
-    #[serde(default = "sag_config::default_priority")]
-    priority: u32,
-    #[serde(default = "sag_config::default_max_retries")]
-    max_retries: u32,
     #[serde(default = "sag_config::default_timeout_secs")]
     timeout_secs: u64,
     /// Custom headers to override upstream request headers.
@@ -79,6 +75,9 @@ struct RouteTargetInput {
     real_model: Option<String>,
     #[serde(default)]
     priority: u32,
+    /// Per-target retry override (defaults to route-level, then global).
+    #[serde(default)]
+    retries: Option<u32>,
     #[serde(default)]
     extra: HashMap<String, serde_json::Value>,
 }
@@ -90,6 +89,9 @@ struct CreateRouteRequest {
     api_endpoint: String,
     #[serde(default)]
     strategy: Option<Strategy>,
+    /// Per-target retry count override for this entire route.
+    #[serde(default)]
+    retries: Option<u32>,
     targets: Vec<RouteTargetInput>,
 }
 
@@ -100,6 +102,9 @@ struct UpdateRouteRequest {
     api_endpoint: Option<String>,
     #[serde(default)]
     strategy: Option<Strategy>,
+    /// Per-target retry count override for this route.
+    #[serde(default)]
+    retries: Option<u32>,
     #[serde(default)]
     targets: Option<Vec<RouteTargetInput>>,
 }
@@ -119,8 +124,6 @@ struct UpdateProviderRequest {
     key_strategy: Option<KeyStrategy>,
     provider_type: Option<ProviderType>,
     base_url: Option<String>,
-    priority: Option<u32>,
-    max_retries: Option<u32>,
     timeout_secs: Option<u64>,
     headers: Option<HashMap<String, String>>,
     body_overrides: Option<HashMap<String, serde_json::Value>>,
@@ -140,8 +143,6 @@ struct ProviderInfo {
     key_strategy: KeyStrategy,
     provider_type: String,
     base_url: String,
-    priority: u32,
-    max_retries: u32,
     timeout_secs: u64,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
@@ -165,8 +166,6 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
             key_strategy: cfg.key_strategy,
             provider_type: cfg.provider_type.as_str().to_string(),
             base_url: cfg.base_url.clone(),
-            priority: cfg.priority,
-            max_retries: cfg.max_retries,
             timeout_secs: cfg.timeout_secs,
             headers: cfg.headers.clone(),
             body_overrides: cfg.body_overrides.clone(),
@@ -236,6 +235,7 @@ async fn create_route(
         let route = RouteConfig {
             model_name: req.model_name.clone(),
             api_endpoint: req.api_endpoint,
+            retries: req.retries,
             strategy: req.strategy.unwrap_or_default(),
             targets: req
                 .targets
@@ -243,6 +243,7 @@ async fn create_route(
                 .map(|t| RouteTarget {
                     provider: t.provider,
                     real_model: t.real_model,
+                    retries: t.retries,
                     priority: t.priority,
                     extra: t.extra,
                 })
@@ -333,12 +334,16 @@ async fn update_route(
         if let Some(strategy) = req.strategy {
             existing.strategy = strategy;
         }
+        if let Some(retries) = req.retries {
+            existing.retries = Some(retries);
+        }
         if let Some(targets) = req.targets {
             existing.targets = targets
                 .into_iter()
                 .map(|t| RouteTarget {
                     provider: t.provider,
                     real_model: t.real_model,
+                    retries: t.retries,
                     priority: t.priority,
                     extra: t.extra,
                 })
@@ -427,8 +432,6 @@ async fn add_provider(
             api_keys: req.api_keys.clone(),
             key_strategy: req.key_strategy,
             base_url: req.base_url.clone(),
-            priority: req.priority,
-            max_retries: req.max_retries,
             timeout_secs: req.timeout_secs,
             headers: req.headers.clone(),
             body_overrides: req.body_overrides.clone(),
@@ -514,12 +517,6 @@ async fn update_provider(
         if let Some(v) = req.base_url {
             existing.base_url = v;
         }
-        if let Some(v) = req.priority {
-            existing.priority = v;
-        }
-        if let Some(v) = req.max_retries {
-            existing.max_retries = v;
-        }
         if let Some(v) = req.timeout_secs {
             existing.timeout_secs = v;
         }
@@ -571,8 +568,6 @@ async fn update_provider(
             "name": req.name,
             "provider_type":            provider_config.provider_type.as_str(),
             "base_url": provider_config.base_url,
-            "priority": provider_config.priority,
-            "max_retries": provider_config.max_retries,
             "timeout_secs": provider_config.timeout_secs,
             "headers": provider_config.headers,
             "body_overrides": provider_config.body_overrides,
@@ -909,6 +904,7 @@ mod tests {
             gateway_auth: Some(GatewayAuthConfig {
                 api_keys: vec!["test-key".into()],
             }),
+            retries: 2,
             providers,
             routes,
         };
@@ -953,8 +949,6 @@ mod tests {
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
-                priority: 10,
-                max_retries: 2,
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -966,12 +960,14 @@ mod tests {
             .map(|(model, real_model, prio)| RouteConfig {
                 model_name: model.into(),
                 api_endpoint: "/chat/completions".into(),
+                retries: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: name.into(),
                     real_model: Some(real_model.into()),
+                    retries: None,
                     priority: prio,
-                        extra: HashMap::new(),
+                    extra: HashMap::new(),
                 }],
             })
             .collect();
@@ -1060,8 +1056,6 @@ mod tests {
                     api_keys: vec![],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://example.com".into(),
-                    priority: 10,
-                    max_retries: 2,
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
@@ -1074,17 +1068,20 @@ mod tests {
             RouteConfig {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/chat/completions".into(),
+                retries: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![
                     RouteTarget {
                         provider: "openai".into(),
                         real_model: Some("gpt-4o".into()),
-                        priority: 1,
-                        extra: HashMap::new(),
+                    priority: 1,
+                    retries: None,
+                    extra: HashMap::new(),
                     },
                     RouteTarget {
                         provider: "anthropic".into(),
                         real_model: Some("claude-3-5-sonnet".into()),
+                        retries: None,
                         extra: HashMap::new(),
                         priority: 2,
                     },
@@ -1093,10 +1090,12 @@ mod tests {
             RouteConfig {
                 model_name: "claude-sonnet".into(),
                 api_endpoint: "/chat/completions".into(),
+                retries: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "anthropic".into(),
-                        extra: HashMap::new(),
+                    extra: HashMap::new(),
+                    retries: None,
                     real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
                 }],
@@ -1331,8 +1330,6 @@ targets = [
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
-                priority: 10,
-                max_retries: 2,
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1373,8 +1370,6 @@ targets = [
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
-                priority: 10,
-                max_retries: 2,
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1412,8 +1407,6 @@ targets = [
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
-                priority: 10,
-                max_retries: 2,
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1448,8 +1441,6 @@ targets = [
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
-                priority: 10,
-                max_retries: 2,
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1459,12 +1450,13 @@ targets = [
         let routes = vec![RouteConfig {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),
+            retries: None,
             strategy: Strategy::FillFirst,
             targets: vec![RouteTarget {
                 provider: "openai".into(),
-                real_model: Some("gpt-4o".into()),
-                priority: 10,
-                extra: HashMap::new(),
+                real_model: Some("gpt-4o".into()),                    priority: 10,
+                    retries: None,
+                    extra: HashMap::new(),
             }],
         }];
         let state = build_state(providers, routes).await;
@@ -1612,8 +1604,6 @@ targets = [
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.base_url, "https://custom.com/v1");
-        assert_eq!(p.priority, 5);
-        assert_eq!(p.max_retries, 3);
         // Fields not in the update should keep their original values
         assert_eq!(p.api_key, "sk-test");
         assert_eq!(p.provider_type, ProviderType::OpenAI);
@@ -1714,8 +1704,6 @@ mod auth_regression_tests {
                 api_keys: vec![],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
-                priority: 10,
-                max_retries: 2,
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1731,13 +1719,16 @@ mod auth_regression_tests {
             gateway_auth: Some(GatewayAuthConfig {
                 api_keys: vec!["regression-key".into()],
             }),
+            retries: 2,
             providers,
             routes: vec![RouteConfig {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/chat/completions".into(),
+                retries: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                         extra: HashMap::new(),
+                    retries: None,
                     provider: "openai".into(),
                     real_model: Some("gpt-4o".into()),
                     priority: 1,

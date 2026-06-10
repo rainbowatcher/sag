@@ -9,6 +9,10 @@ pub struct GatewayConfig {
     pub analytics: Option<AnalyticsConfig>,
     pub gateway_auth: Option<GatewayAuthConfig>,
     pub providers: std::collections::HashMap<String, ProviderConfig>,
+    /// Global default for per-target retries (can be overridden per-route or per-target).
+    /// `1` → one attempt (no retries). `2` → one initial + one retry, etc.
+    #[serde(default = "default_retries")]
+    pub retries: u32,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 }
@@ -101,15 +105,6 @@ pub struct ProviderConfig {
     /// Base URL for the provider's API.
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    /// Provider-level priority — higher = higher priority, used for fallback
-    /// ordering across providers. When a route target references this provider,
-    /// targets are sorted in descending priority order so that higher-priority
-    /// providers are tried first. Defaults to `0`.
-    #[serde(default = "default_priority")]
-    pub priority: u32,
-    /// Maximum number of retries before giving up on this provider.
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
     /// Timeout in seconds for requests to this provider.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -134,13 +129,7 @@ pub struct ProviderConfig {
 pub fn default_base_url() -> String {
     "https://api.openai.com/v1".into()
 }
-/// Default priority value (`0`).
-///
-/// When no priority is specified, targets default to `0`.
-pub fn default_priority() -> u32 {
-    0
-}
-pub fn default_max_retries() -> u32 {
+pub fn default_retries() -> u32 {
     2
 }
 pub fn default_timeout_secs() -> u64 {
@@ -169,6 +158,12 @@ pub enum Strategy {
 ///   tried in random order. Higher-priority targets are tried first.
 /// - `RoundRobin`: targets are tried in a rotating order. Each request advances
 ///   the counter, distributing load evenly.
+///
+/// ## Retries
+///
+/// The effective number of retries for each target is resolved via three-tier
+/// fallback: **target-level** → **route-level** → **global** (`GatewayConfig.retries`).
+/// The first tier that explicitly sets a value wins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// The model name as requested by the client (supports glob-like patterns e.g. "gpt-image-*").
@@ -180,6 +175,11 @@ pub struct RouteConfig {
     /// Target selection strategy (default: `FillFirst`).
     #[serde(default)]
     pub strategy: Strategy,
+    /// Per-target retry count override for this route.
+    /// When `None` (default), falls back to the global `GatewayConfig.retries`.
+    /// When `Some(n)`, each target in this route retries up to `n` times.
+    #[serde(default)]
+    pub retries: Option<u32>,
     /// List of targets for this route.
     pub targets: Vec<RouteTarget>,
 }
@@ -204,8 +204,14 @@ pub struct RouteTarget {
     /// Priority within this route — higher = higher priority. Targets are
     /// sorted in descending order, so a target with priority `20` is tried
     /// before one with priority `0`. Defaults to `0`.
-    #[serde(default = "default_priority")]
+    #[serde(default)]
     pub priority: u32,
+    /// Per-target retry override.
+    /// When `None`, falls back to the route's `retries`, then to the global default.
+    /// When `Some(n)`, this target retries up to `n` times regardless of route/global
+    /// settings.
+    #[serde(default)]
+    pub retries: Option<u32>,
     /// Per-target extra body fields merged into the upstream JSON body.
     /// Applied after provider-level body_overrides, so target-level
     /// keys take precedence.
@@ -245,36 +251,29 @@ targets = [
     fn parse_full_config() {
         let config: GatewayConfig = toml::from_str(minimal_toml()).unwrap();
 
-        // Server
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 8080);
 
-        // Auth
         let auth = config.gateway_auth.unwrap();
         assert_eq!(auth.api_keys, vec!["key1", "key2"]);
 
-        // Analytics
         let analytics = config.analytics.unwrap();
         assert!(analytics.enabled);
-        assert_eq!(analytics.storage_dsn, "sqlite://analytics.db"); // default
+        assert_eq!(analytics.storage_dsn, "sqlite://analytics.db");
 
-        // Providers
         let openai = config.providers.get("openai").unwrap();
         assert_eq!(openai.api_key, "sk-test");
-        assert_eq!(openai.base_url, "https://api.openai.com/v1"); // default
-        assert_eq!(openai.priority, 0); // default
-        assert_eq!(openai.max_retries, 2); // default
-        assert_eq!(openai.timeout_secs, 120); // default
-        assert!(openai.base_url == "https://api.openai.com/v1"); // default
+        assert_eq!(openai.base_url, "https://api.openai.com/v1");
+        assert_eq!(openai.timeout_secs, 120);
+        assert_eq!(config.retries, 2);
 
-        // Routes
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
         assert_eq!(route.model_name, "gpt-4o");
         assert_eq!(route.targets.len(), 1);
         assert_eq!(route.targets[0].provider, "openai");
         assert_eq!(route.targets[0].real_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(route.targets[0].priority, 0); // default
+        assert_eq!(route.targets[0].priority, 0);
     }
 
     #[test]
@@ -300,6 +299,46 @@ targets = [
     }
 
     #[test]
+    fn parse_retries_defaults() {
+        let toml_str = r#"
+[server]
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retries, 2);
+    }
+
+    #[test]
+    fn parse_retries_tiered_override() {
+        let toml_str = r#"
+retries = 5
+
+[server]
+
+[providers]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai" },
+]
+
+[[routes]]
+model_name = "claude"
+retries = 3
+targets = [
+    { provider = "anthropic", retries = 1 },
+]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.retries, 5);
+        assert_eq!(config.routes[0].retries, None);
+        assert_eq!(config.routes[0].targets[0].retries, None);
+        assert_eq!(config.routes[1].retries, Some(3));
+        assert_eq!(config.routes[1].targets[0].retries, Some(1));
+    }
+
+    #[test]
     fn parse_provider_with_custom_fields() {
         let toml_str = r#"
 [server]
@@ -307,8 +346,6 @@ targets = [
 [providers.anthropic]
 api_key = "sk-ant"
 base_url = "https://api.anthropic.com"
-priority = 1
-max_retries = 5
 timeout_secs = 60
 
 [providers.anthropic.headers]
@@ -323,10 +360,7 @@ temperature = 0.8
         let p = config.providers.get("anthropic").unwrap();
         assert_eq!(p.api_key, "sk-ant");
         assert_eq!(p.base_url, "https://api.anthropic.com");
-        assert_eq!(p.priority, 1);
-        assert_eq!(p.max_retries, 5);
         assert_eq!(p.timeout_secs, 60);
-        assert_eq!(p.max_retries, 5);
         assert_eq!(p.headers.get("Authorization").unwrap(), "Bearer custom-token");
         assert_eq!(p.headers.get("X-Debug").unwrap(), "true");
         assert_eq!(p.body_overrides.get("max_tokens").unwrap(), &serde_json::json!(4096));
@@ -354,14 +388,10 @@ targets = [
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.routes.len(), 2);
-
-        // First route
         assert_eq!(config.routes[0].model_name, "gpt-4o");
         assert_eq!(config.routes[0].targets.len(), 2);
         assert_eq!(config.routes[0].targets[0].priority, 10);
         assert_eq!(config.routes[0].targets[1].priority, 1);
-
-        // Second route
         assert_eq!(config.routes[1].model_name, "claude-sonnet");
         assert_eq!(config.routes[1].targets.len(), 1);
     }
