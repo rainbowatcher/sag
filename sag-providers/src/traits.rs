@@ -12,9 +12,6 @@ pub trait LlmProvider: Send + Sync {
     /// Return the provider name (e.g. "openai", "anthropic").
     fn name(&self) -> &str;
 
-    /// Return the set of parameter names this provider supports.
-    fn supported_params(&self) -> &[String];
-
     /// Send a non-streaming chat completion request. Returns a standardized response.
     async fn chat(
         &self,

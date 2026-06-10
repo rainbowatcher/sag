@@ -26,7 +26,6 @@ pub struct OpenAiProvider {
     key_strategy: KeyStrategy,
     key_counter: AtomicUsize,
     http_client: reqwest::Client,
-    supported_params: Vec<String>,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
 }
@@ -52,7 +51,6 @@ impl OpenAiProvider {
             key_strategy: config.key_strategy,
             key_counter: AtomicUsize::new(0),
             http_client,
-            supported_params: config.supported_params.clone(),
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
         }
@@ -66,33 +64,6 @@ impl OpenAiProvider {
                 let idx = self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
                 &self.api_keys[idx]
             }
-        }
-    }
-
-    /// Warn about extra parameters not in the supported whitelist.
-    /// Named fields (standard OpenAI params) are always allowed through.
-    /// Non-standard extra keys not in `supported_params` are logged as a warning
-    /// but still passed to the upstream provider.
-    fn warn_unsupported_params(&self, request: &ChatCompletionRequest) {
-        if self.supported_params.is_empty() {
-            return;
-        }
-
-        let supported_set: std::collections::HashSet<&str> =
-            self.supported_params.iter().map(|s| s.as_str()).collect();
-
-        let unsupported: Vec<String> = request
-            .extra
-            .keys()
-            .filter(|k| !supported_set.contains(k.as_str())).cloned()
-            .collect();
-
-        if !unsupported.is_empty() {
-            warn!(
-                "provider '{}' does not list support for parameters: {} (passed through to upstream)",
-                self.name,
-                unsupported.join(", ")
-            );
         }
     }
 
@@ -130,10 +101,6 @@ impl LlmProvider for OpenAiProvider {
         &self.name
     }
 
-    fn supported_params(&self) -> &[String] {
-        &self.supported_params
-    }
-
     #[instrument(skip(self, request), fields(provider = %self.name, model = %real_model))]
     async fn chat(
         &self,
@@ -142,12 +109,14 @@ impl LlmProvider for OpenAiProvider {
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
-        // Warn about unsupported extra parameters (non-blocking)
-        self.warn_unsupported_params(request);
-
         // Clone request and override model with the real model name
         let mut upstream_request = request.clone();
         upstream_request.model = real_model.to_string();
+
+        if !request.extra.is_empty() {
+            let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
+            debug!(provider = %self.name, extra = ?keys, "forwarding non-standard extra parameters");
+        }
 
         let url = self.build_url(api_endpoint);
         debug!(%url, "sending non-streaming chat request");
@@ -187,12 +156,14 @@ impl LlmProvider for OpenAiProvider {
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Response<Body>> {
-        // Warn about unsupported extra parameters (non-blocking)
-        self.warn_unsupported_params(request);
-
         // Clone request and override model with the real model name
         let mut upstream_request = request.clone();
         upstream_request.model = real_model.to_string();
+
+        if !request.extra.is_empty() {
+            let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
+            debug!(provider = %self.name, extra = ?keys, "forwarding non-standard extra parameters");
+        }
 
         let url = self.build_url(api_endpoint);
         debug!(%url, "sending streaming chat request");

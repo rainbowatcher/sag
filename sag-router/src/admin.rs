@@ -56,8 +56,6 @@ struct AddProviderRequest {
     max_retries: u32,
     #[serde(default = "default_timeout_secs")]
     timeout_secs: u64,
-    #[serde(default)]
-    supported_params: Vec<String>,
     /// Custom headers to override upstream request headers.
     #[serde(default)]
     headers: HashMap<String, String>,
@@ -141,7 +139,6 @@ struct UpdateProviderRequest {
     priority: Option<u32>,
     max_retries: Option<u32>,
     timeout_secs: Option<u64>,
-    supported_params: Option<Vec<String>>,
     headers: Option<HashMap<String, String>>,
     body_overrides: Option<HashMap<String, serde_json::Value>>,
     enabled_models: Option<Vec<String>>,
@@ -163,7 +160,6 @@ struct ProviderInfo {
     priority: u32,
     max_retries: u32,
     timeout_secs: u64,
-    supported_params: Vec<String>,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
     enabled_models: Vec<String>,
@@ -189,7 +185,6 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
             priority: cfg.priority,
             max_retries: cfg.max_retries,
             timeout_secs: cfg.timeout_secs,
-            supported_params: cfg.supported_params.clone(),
             headers: cfg.headers.clone(),
             body_overrides: cfg.body_overrides.clone(),
             enabled_models: cfg.enabled_models.clone(),
@@ -452,7 +447,6 @@ async fn add_provider(
             priority: req.priority,
             max_retries: req.max_retries,
             timeout_secs: req.timeout_secs,
-            supported_params: req.supported_params.clone(),
             headers: req.headers.clone(),
             body_overrides: req.body_overrides.clone(),
             enabled_models: req.enabled_models.clone(),
@@ -554,9 +548,6 @@ async fn update_provider(
         if let Some(v) = req.timeout_secs {
             existing.timeout_secs = v;
         }
-        if let Some(v) = req.supported_params {
-            existing.supported_params = v;
-        }
         if let Some(v) = req.headers {
             existing.headers = v;
         }
@@ -616,7 +607,6 @@ async fn update_provider(
             "priority": provider_config.priority,
             "max_retries": provider_config.max_retries,
             "timeout_secs": provider_config.timeout_secs,
-            "supported_params": provider_config.supported_params,
             "headers": provider_config.headers,
             "body_overrides": provider_config.body_overrides,
             "enabled_models": provider_config.enabled_models,
@@ -999,7 +989,6 @@ mod tests {
                 priority: 10,
                 max_retries: 2,
                 timeout_secs: 120,
-                supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec![],
@@ -1108,7 +1097,6 @@ mod tests {
                     priority: 10,
                     max_retries: 2,
                     timeout_secs: 120,
-                    supported_params: vec![],
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     enabled_models: vec![],
@@ -1380,7 +1368,6 @@ targets = [
                 priority: 10,
                 max_retries: 2,
                 timeout_secs: 120,
-                supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
@@ -1423,7 +1410,6 @@ targets = [
                 priority: 10,
                 max_retries: 2,
                 timeout_secs: 120,
-                supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
@@ -1463,7 +1449,6 @@ targets = [
                 priority: 10,
                 max_retries: 2,
                 timeout_secs: 120,
-                supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
@@ -1500,7 +1485,6 @@ targets = [
                 priority: 10,
                 max_retries: 2,
                 timeout_secs: 120,
-                supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
@@ -1719,29 +1703,6 @@ targets = [
         assert!(reg.contains_key("openai"));
     }
 
-    // 9. Update provider — supported_params
-    #[tokio::test]
-    async fn update_provider_supported_params() {
-        let (providers, routes) = one_provider_config("openai", vec![]);
-        let state = build_state(providers, routes).await;
-        let app = test_app(state.clone());
-        let _ = &state;
-
-        let req = Request::builder()
-            .method("PUT")
-            .uri("/api/providers")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"name":"openai","supported_params":["model","messages","stream"]}"#,
-            ))
-            .unwrap();
-        let response = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let cfg = state.config.read().await;
-        let p = cfg.providers.get("openai").unwrap();
-        assert_eq!(p.supported_params, vec!["model", "messages", "stream"]);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1790,7 +1751,6 @@ mod auth_regression_tests {
                 priority: 10,
                 max_retries: 2,
                 timeout_secs: 120,
-                supported_params: vec![],
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec![],

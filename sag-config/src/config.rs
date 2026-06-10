@@ -91,10 +91,6 @@ pub struct ProviderConfig {
     /// Timeout in seconds for requests to this provider.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    /// Set of parameter names this provider supports.
-    /// Requests containing parameters not in this set will be rejected with 400.
-    #[serde(default)]
-    pub supported_params: Vec<String>,
     /// Custom headers to add to or override in upstream requests.
     /// These are applied after the provider's default headers,
     /// so they can override auth, content-type, etc.
@@ -251,7 +247,7 @@ targets = [
         assert_eq!(openai.priority, 0); // default
         assert_eq!(openai.max_retries, 2); // default
         assert_eq!(openai.timeout_secs, 120); // default
-        assert!(openai.supported_params.is_empty()); // default
+        assert!(openai.base_url == "https://api.openai.com/v1"); // default
 
         // Routes
         assert_eq!(config.routes.len(), 1);
@@ -296,7 +292,6 @@ base_url = "https://api.anthropic.com"
 priority = 1
 max_retries = 5
 timeout_secs = 60
-supported_params = ["model", "messages", "stream"]
 
 [providers.anthropic.headers]
 Authorization = "Bearer custom-token"
@@ -313,7 +308,7 @@ temperature = 0.8
         assert_eq!(p.priority, 1);
         assert_eq!(p.max_retries, 5);
         assert_eq!(p.timeout_secs, 60);
-        assert_eq!(p.supported_params, vec!["model", "messages", "stream"]);
+        assert_eq!(p.max_retries, 5);
         assert_eq!(p.headers.get("Authorization").unwrap(), "Bearer custom-token");
         assert_eq!(p.headers.get("X-Debug").unwrap(), "true");
         assert_eq!(p.body_overrides.get("max_tokens").unwrap(), &serde_json::json!(4096));
