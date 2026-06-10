@@ -87,6 +87,7 @@ impl OpenAiProvider {
         &self,
         url: &str,
         body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> reqwest::RequestBuilder {
         let req = self
             .http_client
@@ -97,6 +98,7 @@ impl OpenAiProvider {
         let req = apply_headers(req, &self.headers);
 
         let body = apply_body_overrides(body, &self.body_overrides);
+        let body = apply_body_overrides(body, target_extra);
         req.json(&body)
     }
 }
@@ -117,6 +119,7 @@ impl LlmProvider for OpenAiProvider {
         request: &ChatCompletionRequest,
         real_model: &str,
         api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
         // Validate parameters
         self.validate_params(request)?;
@@ -132,7 +135,7 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
         let response = self
-            .build_request(&url, body)
+            .build_request(&url, body, target_extra)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -161,6 +164,7 @@ impl LlmProvider for OpenAiProvider {
         request: &ChatCompletionRequest,
         real_model: &str,
         api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Response<Body>> {
         // Validate parameters
         self.validate_params(request)?;
@@ -176,7 +180,7 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
         let response = self
-            .build_request(&url, body)
+            .build_request(&url, body, target_extra)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -220,6 +224,7 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: &ImageGenerationRequest,
         real_model: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ImageGenerationResponse> {
         let mut upstream = request.clone();
         upstream.model = real_model.to_string();
@@ -231,7 +236,7 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
         let response = self
-            .build_request(&url, body)
+            .build_request(&url, body, target_extra)
             .send()
             .await
             .map_err(AppError::from)?;

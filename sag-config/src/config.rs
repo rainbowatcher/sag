@@ -172,6 +172,11 @@ pub struct RouteTarget {
     /// before one with priority `0`. Defaults to `0`.
     #[serde(default = "default_priority")]
     pub priority: u32,
+    /// Per-target extra body fields merged into the upstream JSON body.
+    /// Applied after provider-level body_overrides, so target-level
+    /// keys take precedence.
+    #[serde(default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[cfg(test)]

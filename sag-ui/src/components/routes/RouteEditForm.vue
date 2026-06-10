@@ -48,6 +48,7 @@ interface TargetEdit {
   provider: string
   real_model: string
   priority: number
+  extra: string
 }
 
 const targets = ref<TargetEdit[]>(
@@ -55,11 +56,12 @@ const targets = ref<TargetEdit[]>(
     provider: t.provider,
     real_model: t.real_model ?? "",
     priority: t.priority,
+    extra: t.extra ? JSON.stringify(t.extra) : "",
   })),
 )
 
 function addTarget() {
-  targets.value.push({ provider: "", real_model: "", priority: 0 })
+  targets.value.push({ provider: "", real_model: "", priority: 0, extra: "" })
 }
 
 function removeTarget(index: number) {
@@ -105,11 +107,28 @@ const form = useForm({
         api_endpoint:
           value.api_endpoint !== props.route.api_endpoint ? value.api_endpoint : undefined,
         strategy: value.strategy !== props.route.strategy ? value.strategy : undefined,
-        targets: targets.value.map((t) => ({
-          provider: t.provider,
-          real_model: t.real_model || undefined,
-          priority: t.priority,
-        })),
+        targets: targets.value.map((t) => {
+          const entry: {
+            provider: string
+            real_model?: string
+            priority?: number
+            extra?: Record<string, any>
+          } = {
+            provider: t.provider,
+            real_model: t.real_model || undefined,
+            priority: t.priority,
+          }
+          if (t.extra.trim()) {
+            try {
+              entry.extra = JSON.parse(t.extra)
+            } catch {
+              throw new Error(
+                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
+              )
+            }
+          }
+          return entry
+        }),
       })
       emit("updated")
     } catch (e: any) {
@@ -232,6 +251,15 @@ async function handleSubmit(event: Event) {
               type="number"
               :model-value="t.priority"
               @input="t.priority = Number(($event.target as HTMLInputElement).value)"
+            />
+          </div>
+
+          <div class="w-36">
+            <Label class="text-xs">Extra (JSON)</Label>
+            <Input
+              :model-value="t.extra"
+              placeholder='{"model_id": 39}'
+              @input="t.extra = ($event.target as HTMLInputElement).value"
             />
           </div>
 

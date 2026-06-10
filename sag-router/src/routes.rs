@@ -92,11 +92,11 @@ async fn chat_completions_handler(
                     }
                 };
 
-                let resolved: Vec<(String, String, u32)> = ordered
+                let resolved: Vec<(String, String, u32, HashMap<String, serde_json::Value>)> = ordered
                     .into_iter()
                     .map(|t| {
                         let rm = t.real_model.unwrap_or_else(|| request.model.clone());
-                        (t.provider, rm, t.priority)
+                        (t.provider, rm, t.priority, t.extra)
                     })
                     .collect();
 
@@ -170,7 +170,7 @@ async fn chat_completions_handler(
         .await;
     }
 
-    for (provider_name, real_model, priority) in &targets {
+    for (provider_name, real_model, priority, target_extra) in &targets {
         let provider = match state.get_provider(provider_name).await {
             Some(p) => p,
             None => {
@@ -190,12 +190,12 @@ async fn chat_completions_handler(
         // Dispatch to this provider
         let result = if is_stream {
             provider
-                .chat_stream(&request, real_model, &api_endpoint)
+                .chat_stream(&request, real_model, &api_endpoint, target_extra)
                 .await
                 .map(|resp| (resp.into_response(), None::<Usage>))
         } else {
             provider
-                .chat(&request, real_model, &api_endpoint)
+                .chat(&request, real_model, &api_endpoint, target_extra)
                 .await
                 .map(|resp| {
                     let usage = resp.usage.clone();
@@ -271,13 +271,13 @@ async fn chat_completions_handler(
 async fn dispatch_image_request(
     state: &AppState,
     img_request: ImageGenerationRequest,
-    targets: &[(String, String, u32)],
+    targets: &[(String, String, u32, HashMap<String, serde_json::Value>)],
     request_id: &uuid::Uuid,
     model: &str,
     start: Instant,
     errors: &mut Vec<String>,
 ) -> Response<Body> {
-    for (provider_name, real_model, priority) in targets {
+    for (provider_name, real_model, priority, target_extra) in targets {
         let provider = match state.get_provider(provider_name).await {
             Some(p) => p,
             None => {
@@ -294,7 +294,7 @@ async fn dispatch_image_request(
             "trying provider for image generation"
         );
 
-        match provider.chat_image(&img_request, real_model).await {
+        match provider.chat_image(&img_request, real_model, target_extra).await {
             Ok(resp) => {
                 let log = CallLog {
                     request_id: *request_id,

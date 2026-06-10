@@ -58,12 +58,13 @@ interface TargetForm {
   provider_name: string
   real_model: string
   priority: number
+  extra: string
 }
 
-const targets = ref<TargetForm[]>([{ provider_name: "", real_model: "", priority: 0 }])
+const targets = ref<TargetForm[]>([{ provider_name: "", real_model: "", priority: 0, extra: "" }])
 
 function addTarget() {
-  targets.value.push({ provider_name: "", real_model: "", priority: 0 })
+  targets.value.push({ provider_name: "", real_model: "", priority: 0, extra: "" })
 }
 
 function removeTarget(index: number) {
@@ -131,11 +132,23 @@ async function handleSubmit(event: Event) {
       model_name: routeName,
       api_endpoint: form.state.values.api_endpoint,
       strategy: form.state.values.strategy,
-      targets: targets.value.map((t) => ({
-        provider: t.provider_name,
-        real_model: t.real_model || undefined,
-        priority: t.priority,
-      })),
+      targets: targets.value.map((t) => {
+        const entry: CreateRoutePayload["targets"][number] = {
+          provider: t.provider_name,
+          real_model: t.real_model || undefined,
+          priority: t.priority,
+        }
+        if (t.extra.trim()) {
+          try {
+            entry.extra = JSON.parse(t.extra)
+          } catch {
+            throw new Error(
+              `Target ${t.provider_name || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
+            )
+          }
+        }
+        return entry
+      }),
     }
 
     await routeStore.createRoute(payload)
@@ -313,6 +326,15 @@ async function handleSubmit(event: Event) {
                 type="number"
                 :model-value="t.priority"
                 @input="t.priority = Number(($event.target as HTMLInputElement).value)"
+              />
+            </div>
+
+            <div class="w-36">
+              <Label class="text-xs">Extra (JSON)</Label>
+              <Input
+                :model-value="t.extra"
+                placeholder='{"model_id": 39}'
+                @input="t.extra = ($event.target as HTMLInputElement).value"
               />
             </div>
 

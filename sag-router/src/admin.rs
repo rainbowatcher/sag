@@ -94,6 +94,8 @@ struct RouteTargetInput {
     real_model: Option<String>,
     #[serde(default)]
     priority: u32,
+    #[serde(default)]
+    extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(serde::Deserialize)]
@@ -232,6 +234,7 @@ async fn create_route(
                     provider: t.provider,
                     real_model: t.real_model,
                     priority: t.priority,
+                    extra: t.extra,
                 })
                 .collect(),
         };
@@ -307,6 +310,7 @@ async fn update_route(
                     provider: t.provider,
                     real_model: t.real_model,
                     priority: t.priority,
+                    extra: t.extra,
                 })
                 .collect();
         }
@@ -911,6 +915,7 @@ mod tests {
                     provider: name.into(),
                     real_model: Some(real_model.into()),
                     priority: prio,
+                        extra: HashMap::new(),
                 }],
             })
             .collect();
@@ -1019,10 +1024,12 @@ mod tests {
                         provider: "openai".into(),
                         real_model: Some("gpt-4o".into()),
                         priority: 1,
+                        extra: HashMap::new(),
                     },
                     RouteTarget {
                         provider: "anthropic".into(),
                         real_model: Some("claude-3-5-sonnet".into()),
+                        extra: HashMap::new(),
                         priority: 2,
                     },
                 ],
@@ -1033,6 +1040,7 @@ mod tests {
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "anthropic".into(),
+                        extra: HashMap::new(),
                     real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
                 }],
@@ -1531,6 +1539,7 @@ mod auth_regression_tests {
                 api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
+                        extra: HashMap::new(),
                     provider: "openai".into(),
                     real_model: Some("gpt-4o".into()),
                     priority: 1,

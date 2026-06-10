@@ -215,6 +215,7 @@ impl AnthropicProvider {
         &self,
         url: &str,
         body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> reqwest::RequestBuilder {
         let req = self
             .http_client
@@ -226,6 +227,7 @@ impl AnthropicProvider {
         let req = apply_headers(req, &self.headers);
 
         let body = apply_body_overrides(body, &self.body_overrides);
+        let body = apply_body_overrides(body, target_extra);
         req.json(&body)
     }
 }
@@ -246,6 +248,7 @@ impl LlmProvider for AnthropicProvider {
         request: &ChatCompletionRequest,
         real_model: &str,
         _api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
         self.validate_params(request)?;
 
@@ -257,7 +260,7 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
         let response = self
-            .build_request(&url, body)
+            .build_request(&url, body, target_extra)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -286,6 +289,7 @@ impl LlmProvider for AnthropicProvider {
         request: &ChatCompletionRequest,
         real_model: &str,
         _api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Response<Body>> {
         self.validate_params(request)?;
 
@@ -299,7 +303,7 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
         let response = self
-            .build_request(&url, body)
+            .build_request(&url, body, target_extra)
             .send()
             .await
             .map_err(AppError::from)?;
@@ -342,6 +346,7 @@ impl LlmProvider for AnthropicProvider {
         &self,
         _request: &ImageGenerationRequest,
         _real_model: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ImageGenerationResponse> {
         Err(AppError::BadRequest(format!(
             "provider '{}' (anthropic) does not support image generation",

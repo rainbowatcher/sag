@@ -16,6 +16,7 @@ export interface RouteTarget {
   provider: string
   real_model: string | null
   priority: number
+  extra?: Record<string, any>
 }
 
 export interface RouteConfig {
@@ -31,14 +32,24 @@ export interface CreateRoutePayload {
   model_name: string
   api_endpoint?: string
   strategy?: Strategy
-  targets: Array<{ provider: string; real_model?: string; priority?: number }>
+  targets: Array<{
+    provider: string
+    real_model?: string
+    priority?: number
+    extra?: Record<string, any>
+  }>
 }
 
 export interface UpdateRoutePayload {
   model_name: string
   api_endpoint?: string
   strategy?: Strategy
-  targets?: Array<{ provider: string; real_model?: string; priority?: number }>
+  targets?: Array<{
+    provider: string
+    real_model?: string
+    priority?: number
+    extra?: Record<string, any>
+  }>
 }
 
 export interface StatsRow {

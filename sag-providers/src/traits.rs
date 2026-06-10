@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::response::Response;
@@ -20,6 +21,7 @@ pub trait LlmProvider: Send + Sync {
         request: &ChatCompletionRequest,
         real_model: &str,
         api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse>;
 
     /// Send a streaming chat completion request. Returns an Axum response
@@ -29,6 +31,7 @@ pub trait LlmProvider: Send + Sync {
         request: &ChatCompletionRequest,
         real_model: &str,
         api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Response<Body>>;
 
     /// Send an image generation request. Returns image URLs or base64 data.
@@ -36,5 +39,6 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: &ImageGenerationRequest,
         real_model: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ImageGenerationResponse>;
 }

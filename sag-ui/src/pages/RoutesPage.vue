@@ -223,6 +223,13 @@ const handleRouteCreated = () => {
               <span class="font-medium">{{ t.provider }}</span>
               <span class="text-muted-foreground">→</span>
               <span class="font-mono text-xs">{{ t.real_model || "(passthrough)" }}</span>
+              <span
+                v-if="t.extra && Object.keys(t.extra).length > 0"
+                class="text-muted-foreground bg-muted rounded px-1.5 py-0.5 font-mono text-[10px]"
+                :title="JSON.stringify(t.extra, null, 2)"
+              >
+                +{{ Object.keys(t.extra).length }} extra
+              </span>
             </div>
             <span class="text-muted-foreground rounded-full border px-2 py-0.5 text-xs"
               >p: {{ t.priority }}</span
