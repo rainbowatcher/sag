@@ -1323,19 +1323,18 @@ targets = [
 
         let content = std::fs::read_to_string(&path).unwrap();
 
-        // The [providers] section is serialized as an inline table
-        // (`anthropic = { ... }`).
-        let providers_block = content
-            .split("\n\n")
-            .find(|s| s.starts_with("[providers]") || s.trim_start().starts_with("providers."))
-            .unwrap_or("");
+        // Providers are serialized as sub-table format (`[providers.xxx]`).
         assert!(
-            !providers_block.contains("openai"),
-            "openai should not appear in [providers] block: {providers_block}"
+            !content.contains("[providers.openai]"),
+            "openai provider section should be removed: {content}"
         );
         assert!(
-            providers_block.contains("anthropic"),
-            "anthropic should be preserved in [providers] block: {providers_block}"
+            content.contains("[providers.anthropic]"),
+            "anthropic provider section should be preserved: {content}"
+        );
+        assert!(
+            content.contains("provider_type = \"anthropic\""),
+            "anthropic provider_type should be present: {content}"
         );
 
         assert!(
