@@ -63,7 +63,7 @@ function handleSelect(currentValue: string) {
 </script>
 
 <template>
-  <Popover v-model:open="open">
+  <Popover v-model:open="open" as="div">
     <PopoverTrigger as-child>
       <Button
         variant="outline"
