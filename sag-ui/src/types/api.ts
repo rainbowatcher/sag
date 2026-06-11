@@ -8,6 +8,7 @@ export interface Provider {
   headers: Record<string, string>
   body_overrides: Record<string, any>
   enabled_models: string[]
+  enabled: boolean
 }
 
 export interface ModelTestResult {

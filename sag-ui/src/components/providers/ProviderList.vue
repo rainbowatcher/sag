@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ChevronDown, Trash2, Pen, AlertTriangle, Loader2, RefreshCw } from "lucide-vue-next"
-import { computed, onMounted, ref, watch } from "vue"
+import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
+import { Loader2, Pen, Plus, RefreshCw, Trash2 } from "lucide-vue-next"
+import { h, onMounted, ref, watch } from "vue"
+import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
+import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
-import ProviderHeader from "@/components/providers/ProviderHeader.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -13,109 +14,91 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { api, headers as authHeaders } from "@/lib/client"
-import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
-import type { ModelTestResult, Provider } from "@/types/api"
+import type { Provider } from "@/types/api"
 
 const store = useProviderStore()
 
+// ── Filters ───────────────────────────────────────────────────────
 const filterModelName = ref("")
 const filterProviderType = ref("all")
 const sortByName = ref(true)
 
-const providerTypes = computed(() =>
-  Array.from(new Set(store.providers.map((provider) => provider.provider_type))).sort(),
-)
+// Model combobox options — populated from all provider enabled_models
+const modelOptions = ref<ComboboxOption[]>([])
+const modelsLoading = ref(false)
 
-const hasActiveFilters = computed(
-  () => filterModelName.value.trim() !== "" || filterProviderType.value !== "all",
-)
+// Add form
+const showAdd = ref(false)
+
+// Edit
+const editingProvider = ref<Provider | null>(null)
+
+// Delete
+const confirmingDelete = ref<string | null>(null)
+const deleting = ref(false)
+
+// ── Data fetching ─────────────────────────────────────────────────
+async function loadModelOptions() {
+  modelsLoading.value = true
+  try {
+    // fetch all providers to collect unique model names
+    await store.fetchProviders({ sort: "name" })
+    const models = new Set<string>()
+    for (const p of store.providers) {
+      for (const m of p.enabled_models) {
+        models.add(m)
+      }
+    }
+    modelOptions.value = Array.from(models)
+      .sort()
+      .map((m) => ({ value: m, label: m }))
+  } finally {
+    modelsLoading.value = false
+  }
+}
 
 async function fetchProviders() {
   await store.fetchProviders({
-    model_name: filterModelName.value,
+    model_name: filterModelName.value || undefined,
     provider_type: filterProviderType.value === "all" ? undefined : filterProviderType.value,
     sort: sortByName.value ? "name" : undefined,
   })
 }
 
-watch([filterModelName, filterProviderType, sortByName], async () => {
-  await fetchProviders()
+watch([filterModelName, filterProviderType, sortByName], () => {
+  fetchProviders()
 })
 
-onMounted(fetchProviders)
+onMounted(async () => {
+  await loadModelOptions()
+  // loadModelOptions already fetched all providers, but ensure sort matches
+  if (!sortByName.value) {
+    await fetchProviders()
+  }
+})
 
-const expanded = ref<Record<string, boolean>>({})
-const editingProvider = ref<Provider | null>(null)
-const testingModel = ref<Record<string, Record<string, boolean>>>({})
-const testModelResult = ref<Record<string, Record<string, ModelTestResult[] | null>>>({})
-
-async function testModel(providerName: string, model: string) {
-  if (!testingModel.value[providerName]) testingModel.value[providerName] = {}
-  if (!testModelResult.value[providerName]) testModelResult.value[providerName] = {}
-  testingModel.value[providerName][model] = true
-  testModelResult.value[providerName][model] = null
+// ── Enable / Disable toggle ───────────────────────────────────────
+async function toggleEnabled(provider: Provider) {
+  const newEnabled = !provider.enabled
+  // Optimistic update
+  provider.enabled = newEnabled
   try {
-    const conn = useConnectionStore()
-    const provider = store.providers.find((p) => p.name === providerName)
-    if (!provider) return
-    const keys = provider.api_keys
-    const { data } = await api.post<{ results: ModelTestResult[] }>(
-      "/api/model/test",
-      {
-        model,
-        api_keys: keys,
-        base_url: provider.base_url,
-        provider_type: provider.provider_type,
-        headers: provider.headers,
-      },
-      { headers: authHeaders(conn.connection?.apiKey) },
-    )
-    testModelResult.value[providerName][model] = data.results
-  } catch (e: any) {
-    testModelResult.value[providerName][model] = [
-      {
-        key_prefix: "error",
-        success: false,
-        message: e.response?.data?.error?.message ?? e.message,
-      },
-    ]
-  } finally {
-    testingModel.value[providerName][model] = false
+    await store.updateProvider(provider.name, { enabled: newEnabled })
+  } catch {
+    // Revert on failure by re-fetching
+    await fetchProviders()
   }
 }
 
-// ── Delete flow ──────────────────────────────────────────────────
-const confirmingDelete = ref<string | null>(null)
-const deleting = ref(false)
-const deleteError = ref("")
-
-function startDelete(name: string) {
-  deleteError.value = ""
-  confirmingDelete.value = confirmingDelete.value === name ? null : name
+// ── Add flow ──────────────────────────────────────────────────────
+async function onCreated() {
+  showAdd.value = false
+  await loadModelOptions()
+  await fetchProviders()
 }
 
-async function confirmDelete(name: string) {
-  deleting.value = true
-  deleteError.value = ""
-  try {
-    await store.deleteProvider(name)
-    confirmingDelete.value = null
-    delete expanded.value[name]
-  } catch (e: any) {
-    deleteError.value = e.response?.data?.error?.message ?? e.message
-  } finally {
-    deleting.value = false
-  }
-}
-
-function cancelDelete() {
-  confirmingDelete.value = null
-  deleteError.value = ""
-}
-
-// ── Edit flow ────────────────────────────────────────────────────
+// ── Edit flow ─────────────────────────────────────────────────────
 function startEdit(p: Provider) {
   confirmingDelete.value = null
   editingProvider.value = p
@@ -127,17 +110,165 @@ function onEditClose() {
 
 async function onUpdated() {
   editingProvider.value = null
-  await fetchProviders()
+  await loadModelOptions()
 }
+
+// ── Delete flow ───────────────────────────────────────────────────
+function startDelete(name: string) {
+  confirmingDelete.value = confirmingDelete.value === name ? null : name
+}
+
+async function confirmDelete(name: string) {
+  deleting.value = true
+  try {
+    await store.deleteProvider(name)
+    confirmingDelete.value = null
+    await loadModelOptions()
+  } catch {
+    confirmingDelete.value = null
+  } finally {
+    deleting.value = false
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// TanStack Table
+// ══════════════════════════════════════════════════════════════════
+
+const columnHelper = createColumnHelper<Provider>()
+
+const columns = [
+  columnHelper.accessor("name", {
+    header: "Name",
+    cell: (info) => info.getValue(),
+  }),
+  columnHelper.accessor("base_url", {
+    header: "Base URL",
+    cell: (info) =>
+      h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
+  }),
+  columnHelper.accessor("provider_type", {
+    header: "Type",
+    cell: (info) =>
+      h(Badge, { variant: "outline", class: "uppercase text-xs" }, () => info.getValue()),
+  }),
+  columnHelper.accessor("api_keys", {
+    header: "Keys",
+    cell: (info) => h("span", { class: "tabular-nums" }, String(info.getValue().length)),
+    meta: { class: "text-center" },
+  }),
+  columnHelper.accessor("enabled", {
+    header: "Status",
+    cell: (info) => {
+      const enabled = info.getValue()
+      return h(
+        "button",
+        {
+          role: "switch",
+          "aria-checked": enabled,
+          class: `relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 ${
+            enabled ? "bg-primary" : "bg-muted-foreground/30"
+          }`,
+          onClick: () => toggleEnabled(info.row.original),
+        },
+        [
+          h("span", {
+            class: `pointer-events-none block h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+              enabled ? "translate-x-4" : "translate-x-0"
+            }`,
+          }),
+        ],
+      )
+    },
+    meta: { class: "text-center" },
+  }),
+  columnHelper.display({
+    id: "actions",
+    header: "",
+    cell: (info) =>
+      h("div", { class: "flex items-center justify-end gap-1" }, [
+        h(
+          Button,
+          {
+            variant: "ghost",
+            size: "icon-sm",
+            onClick: () => startEdit(info.row.original),
+            title: "Edit provider",
+            "aria-label": "Edit provider",
+          },
+          () => h(Pen, { class: "h-3.5 w-3.5" }),
+        ),
+        h(
+          Button,
+          {
+            variant: "ghost",
+            size: "icon-sm",
+            class: confirmingDelete.value === info.row.original.name ? "text-destructive" : "",
+            onClick: () => startDelete(info.row.original.name),
+            title:
+              confirmingDelete.value === info.row.original.name
+                ? "Cancel delete"
+                : "Delete provider",
+            "aria-label":
+              confirmingDelete.value === info.row.original.name
+                ? "Cancel delete"
+                : "Delete provider",
+          },
+          () => h(Trash2, { class: "h-3.5 w-3.5" }),
+        ),
+      ]),
+  }),
+]
+
+const table = useVueTable({
+  get data() {
+    return store.providers
+  },
+  columns,
+  getCoreRowModel: getCoreRowModel(),
+})
 </script>
 
 <template>
-  <ProviderHeader @refresh="fetchProviders" />
+  <!-- ── Header ──────────────────────────────────────────────────── -->
+  <div class="flex items-center justify-between">
+    <div>
+      <h2 class="text-2xl font-bold tracking-tight">Providers</h2>
+      <p class="text-muted-foreground mt-1 text-sm">管理上游 LLM 供应商配置</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <button
+        @click="fetchProviders()"
+        :disabled="store.providersLoading"
+        class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
+      >
+        <RefreshCw :class="store.providersLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
+        Refresh
+      </button>
+      <button
+        @click="showAdd = !showAdd"
+        class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors"
+      >
+        <Plus class="h-3.5 w-3.5" />
+        Add Provider
+      </button>
+    </div>
+  </div>
 
-  <div class="grid gap-3 md:grid-cols-[1fr_220px_180px_auto] md:items-end">
+  <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
+
+  <!-- ── Filters ─────────────────────────────────────────────────── -->
+  <div class="grid gap-3 md:grid-cols-[1fr_200px_160px] md:items-end">
     <div>
       <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Model</label>
-      <Input v-model="filterModelName" placeholder="Filter by model..." class="h-9" />
+      <Combobox
+        v-model="filterModelName"
+        :options="modelOptions"
+        :loading="modelsLoading"
+        placeholder="All models"
+        search-placeholder="Search models..."
+        empty-text="No models found"
+      />
     </div>
     <div>
       <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Type</label>
@@ -150,9 +281,8 @@ async function onUpdated() {
         </SelectTrigger>
         <SelectContent>
           <SelectItem value="all">All types</SelectItem>
-          <SelectItem v-for="type in providerTypes" :key="type" :value="type">
-            {{ type }}
-          </SelectItem>
+          <SelectItem value="openai">OpenAI</SelectItem>
+          <SelectItem value="anthropic">Anthropic</SelectItem>
         </SelectContent>
       </Select>
     </div>
@@ -171,215 +301,102 @@ async function onUpdated() {
         </SelectContent>
       </Select>
     </div>
-    <div class="flex gap-2 md:pb-0">
-      <Button variant="outline" size="sm" @click="fetchProviders">Apply</Button>
-      <Button
-        v-if="hasActiveFilters"
-        variant="ghost"
-        size="sm"
-        @click="
-          () => {
-            filterModelName = ''
-            filterProviderType = 'all'
-          }
-        "
-      >
-        Clear
-      </Button>
-    </div>
   </div>
 
+  <!-- ── Loading ─────────────────────────────────────────────────── -->
   <div
     v-if="store.providersLoading && store.providers.length === 0"
     class="text-muted-foreground py-12 text-center"
   >
-    <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" /> Loading...
+    <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
+    Loading…
   </div>
 
+  <!-- ── Empty ───────────────────────────────────────────────────── -->
   <div
     v-else-if="store.providers.length === 0"
     class="text-muted-foreground py-12 text-center text-sm"
   >
     {{
-      hasActiveFilters
+      filterModelName || filterProviderType !== "all"
         ? "No providers match the current filters."
-        : "No providers configured. Add one above."
+        : 'No providers configured. Click "Add Provider" to get started.'
     }}
   </div>
 
-  <div v-else class="space-y-3">
-    <div
-      v-for="p in store.providers"
-      :key="p.name"
-      class="bg-card overflow-hidden rounded-lg border"
-    >
-      <div class="hover:bg-muted/30 flex items-center justify-between transition-colors">
-        <button
-          @click="expanded[p.name] = !expanded[p.name]"
-          class="flex flex-1 items-center gap-3 p-4 text-left"
+  <!-- ── Table ───────────────────────────────────────────────────── -->
+  <div v-else class="overflow-hidden rounded-lg border">
+    <table class="w-full">
+      <thead>
+        <tr
+          v-for="headerGroup in table.getHeaderGroups()"
+          :key="headerGroup.id"
+          class="bg-muted/50 border-b"
         >
-          <div
-            class="bg-primary/10 text-primary flex h-8 w-8 items-center justify-center rounded text-xs font-bold uppercase"
+          <th
+            v-for="header in headerGroup.headers"
+            :key="header.id"
+            class="text-muted-foreground px-4 py-3 text-left text-xs font-medium"
+            :class="(header.column.columnDef.meta as any)?.class"
           >
-            {{ p.name[0] }}
-          </div>
-          <div>
-            <p class="text-sm font-medium">{{ p.name }}</p>
-            <p class="text-muted-foreground text-xs">{{ p.provider_type }} · {{ p.base_url }}</p>
-          </div>
-        </button>
-        <div class="flex items-center gap-1 pr-3">
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            @click.stop="startEdit(p)"
-            title="Edit provider"
-            aria-label="Edit provider"
-          >
-            <Pen class="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            @click.stop="startDelete(p.name)"
-            :class="confirmingDelete === p.name ? 'text-destructive bg-destructive/10' : ''"
-            :title="confirmingDelete === p.name ? 'Cancel delete' : 'Delete provider'"
-            :aria-label="confirmingDelete === p.name ? 'Cancel delete' : 'Delete provider'"
-          >
-            <Trash2 class="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            @click.stop="expanded[p.name] = !expanded[p.name]"
-            :aria-label="expanded[p.name] ? 'Collapse' : 'Expand'"
-          >
-            <ChevronDown
-              class="h-4 w-4 transition-transform"
-              :class="expanded[p.name] ? 'rotate-180' : ''"
+            <FlexRender
+              v-if="!header.isPlaceholder"
+              :render="header.column.columnDef.header!"
+              :props="header.getContext()"
             />
-          </Button>
-        </div>
-      </div>
-
-      <!-- Inline confirm bar -->
-      <div
-        v-if="confirmingDelete === p.name"
-        class="bg-destructive/5 space-y-2 border-t px-4 py-3 text-xs"
-      >
-        <div class="text-destructive flex items-start gap-2">
-          <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-          <div>
-            <p class="font-medium">Delete provider "{{ p.name }}"?</p>
-            <p class="text-muted-foreground mt-0.5">
-              Any route that uses this provider will lose its target. Routes with no remaining
-              targets will be removed entirely.
-            </p>
-          </div>
-        </div>
-        <div v-if="deleteError" class="text-destructive bg-destructive/10 rounded-md px-2 py-1.5">
-          {{ deleteError }}
-        </div>
-        <div class="flex justify-end gap-2">
-          <Button variant="outline" size="sm" @click="cancelDelete" :disabled="deleting">
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            size="sm"
-            @click="confirmDelete(p.name)"
-            :disabled="deleting"
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr
+          v-for="row in table.getRowModel().rows"
+          :key="row.id"
+          class="hover:bg-muted/30 border-b transition-colors last:border-b-0"
+        >
+          <td
+            v-for="cell in row.getVisibleCells()"
+            :key="cell.id"
+            class="px-4 py-3 text-sm"
+            :class="(cell.column.columnDef.meta as any)?.class"
           >
-            <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
-            {{ deleting ? "Deleting…" : "Delete" }}
-          </Button>
-        </div>
-      </div>
+            <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
 
-      <!-- Expanded details -->
-      <div
-        v-if="expanded[p.name] && confirmingDelete !== p.name"
-        class="bg-muted/20 space-y-1.5 border-t px-4 py-3 text-xs"
-      >
-        <div class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Base URL:</span>
-          <span class="font-mono">{{ p.base_url }}</span>
-        </div>
-        <div class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Timeout:</span>
-          <span>{{ p.timeout_secs }}s</span>
-        </div>
-        <div class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Key Strategy:</span>
-          <span class="font-mono">{{
-            p.key_strategy === "round_robin" ? "Round Robin" : "Fill First"
-          }}</span>
-        </div>
-        <div v-if="Object.keys(p.headers ?? {}).length > 0" class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Headers:</span>
-          <div class="flex flex-wrap gap-1">
-            <span
-              v-for="(v, k) in p.headers"
-              :key="k"
-              class="bg-muted rounded-full px-1.5 py-0.5 font-mono text-xs"
-              >{{ k }}: {{ v }}</span
-            >
-          </div>
-        </div>
-        <div v-if="Object.keys(p.body_overrides ?? {}).length > 0" class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Body Overrides:</span>
-          <div class="flex flex-wrap gap-1">
-            <span
-              v-for="(v, k) in p.body_overrides"
-              :key="k"
-              class="bg-muted rounded-full px-1.5 py-0.5 font-mono text-xs"
-              >{{ k }}: {{ typeof v === "object" ? JSON.stringify(v) : String(v) }}</span
-            >
-          </div>
-        </div>
-        <div class="flex gap-2">
-          <span class="text-muted-foreground w-20 shrink-0">Models:</span>
-          <span v-if="p.enabled_models.length === 0" class="text-muted-foreground text-xs"
-            >All allowed</span
-          >
-          <div v-else class="flex flex-col gap-1">
-            <div v-for="model in p.enabled_models" :key="model" class="flex items-center gap-2">
-              <span class="font-mono text-xs">{{ model }}</span>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                :disabled="testingModel[p.name]?.[model]"
-                @click="testModel(p.name, model)"
-                title="Test model"
-              >
-                <Loader2 v-if="testingModel[p.name]?.[model]" class="h-3 w-3 animate-spin" />
-                <RefreshCw v-else class="h-3 w-3" />
-              </Button>
-              <div
-                v-if="testModelResult[p.name]?.[model]"
-                class="flex flex-wrap items-center gap-1"
-              >
-                <span
-                  v-for="r in testModelResult[p.name]?.[model]"
-                  :key="r.key_prefix"
-                  class="rounded px-1 py-0.5 text-xs"
-                  :class="r.success ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'"
-                >
-                  {{ r.success ? "✓" : "✗" }} {{ r.key_prefix }}
-                </span>
-              </div>
-            </div>
-          </div>
-        </div>
+  <!-- ── Delete confirmation ─────────────────────────────────────── -->
+  <div
+    v-if="confirmingDelete"
+    class="bg-destructive/5 border-destructive/20 fixed inset-x-0 bottom-0 z-50 border-t p-4 shadow-lg md:relative md:inset-auto md:rounded-lg md:border md:shadow-none"
+  >
+    <div class="flex items-center justify-between gap-4">
+      <p class="text-sm">
+        Delete provider
+        <span class="font-semibold">{{ confirmingDelete }}</span
+        >?
+      </p>
+      <div class="flex gap-2">
+        <Button variant="outline" size="sm" @click="confirmingDelete = null"> Cancel </Button>
+        <Button
+          variant="destructive"
+          size="sm"
+          :disabled="deleting"
+          @click="confirmDelete(confirmingDelete)"
+        >
+          <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
+          {{ deleting ? "Deleting…" : "Delete" }}
+        </Button>
       </div>
     </div>
-
-    <!-- Edit Drawer -->
-    <ProviderEditForm
-      v-if="editingProvider"
-      :provider="editingProvider"
-      @close="onEditClose"
-      @updated="onUpdated"
-    />
   </div>
+
+  <!-- ── Edit Drawer / Dialog ────────────────────────────────────── -->
+  <ProviderEditForm
+    v-if="editingProvider"
+    :provider="editingProvider"
+    @close="onEditClose"
+    @updated="onUpdated"
+  />
 </template>

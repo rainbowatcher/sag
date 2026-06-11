@@ -162,6 +162,7 @@ export const useProviderStore = defineStore("providers", () => {
       headers?: Record<string, string>
       body_overrides?: Record<string, unknown>
       enabled_models?: string[]
+      enabled?: boolean
     },
   ) {
     try {

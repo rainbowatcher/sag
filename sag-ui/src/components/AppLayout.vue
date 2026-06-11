@@ -47,7 +47,7 @@ const navItems: NavItem[] = [
 
 <template>
   <div class="bg-muted/30 flex h-screen">
-    <aside class="bg-card flex w-60 flex-col border-r">
+    <aside class="bg-sidebar flex w-60 flex-col border-r">
       <div class="flex items-center gap-2 border-b px-5 py-4">
         <div
           class="bg-primary text-primary-foreground flex h-7 w-7 items-center justify-center rounded text-xs font-bold"
