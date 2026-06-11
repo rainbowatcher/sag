@@ -70,7 +70,7 @@ impl ProviderBase {
     ///
     /// Ensures exactly one `/` between base and path, regardless of
     /// whether either has a leading/trailing slash.
-    pub fn build_url(&self, api_endpoint: &str) -> String {
+    pub(crate) fn build_url(&self, api_endpoint: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
         let path = api_endpoint.trim_start_matches('/');
         format!("{}/{}", base, path)
@@ -82,7 +82,7 @@ impl ProviderBase {
     /// `Content-Type: application/json` is set automatically.
     /// `extra_headers` are applied first, then `self.headers`, then
     /// `self.body_overrides`, then `target_extra`.
-    pub fn build_request(
+    pub(crate) fn build_request(
         &self,
         url: &str,
         body: serde_json::Value,
@@ -106,7 +106,7 @@ impl ProviderBase {
     ///
     /// On success returns the response body text for further parsing.
     /// On error returns `AppError::Upstream`.
-    pub async fn check_upstream_error(
+    pub(crate) async fn check_upstream_error(
         &self,
         response: reqwest::Response,
     ) -> sag_core::Result<String> {
@@ -168,7 +168,7 @@ impl ProviderBase {
     /// On success, returns the `Response` so the caller can consume the byte
     /// stream. On error, consumes the response to read the error body and
     /// returns `AppError::Upstream`.
-    pub async fn ensure_success(
+    pub(crate) async fn ensure_success(
         &self,
         response: reqwest::Response,
     ) -> sag_core::Result<reqwest::Response> {
