@@ -55,6 +55,10 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
     let config: GatewayConfig = toml::from_str(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
+    config.validate().map_err(|errors| {
+        sag_core::AppError::Config(errors.join("; "))
+    })?;
+
     info!(?config, "configuration loaded");
     Ok(ConfigHandle {
         inner: Arc::new(RwLock::new(config)),
@@ -174,8 +178,14 @@ async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core
     let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
     })?;
-    toml::from_str(&content)
-        .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))
+    let config: GatewayConfig = toml::from_str(&content)
+        .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
+
+    config.validate().map_err(|errors| {
+        sag_core::AppError::Config(errors.join("; "))
+    })?;
+
+    Ok(config)
 }
 
 /// Persist the in-memory `GatewayConfig` back to the TOML file using `toml_edit`.
@@ -250,7 +260,8 @@ port = 9090
 [gateway_auth]
 api_keys = ["test-key"]
 
-[providers]
+[providers.openai]
+api_keys = ["sk-test"]
 "#
     }
 

@@ -37,7 +37,7 @@ impl OpenAiProvider {
             .build()
             .expect("failed to build reqwest client");
 
-        assert!(!config.api_keys.is_empty(), "provider '{}': api_keys is empty", name);
+        debug_assert!(!config.api_keys.is_empty(), "provider '{}': api_keys is empty", name);
         let api_keys = config.api_keys.clone();
 
         Self {

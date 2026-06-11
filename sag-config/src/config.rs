@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,148 @@ pub struct GatewayConfig {
     pub retries: u32,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+}
+
+impl GatewayConfig {
+    /// Validate the configuration, returning all semantic errors found.
+    /// Returns `Ok(())` if no errors, `Err(Vec<String>)` with all error messages.
+    pub fn validate(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        // ── Server validation ──
+        if self.server.host.trim().is_empty() {
+            errors.push("server.host must not be empty".into());
+        }
+        if self.server.port == 0 {
+            errors.push("server.port must be greater than 0".into());
+        }
+
+        // ── Analytics validation ──
+        if let Some(ref analytics) = self.analytics
+            && analytics.enabled
+            && !analytics.storage_dsn.starts_with("sqlite://")
+            && analytics.storage_dsn != ":memory:"
+        {
+            errors.push(
+                "analytics.storage_dsn must start with 'sqlite://' or be ':memory:'".into(),
+            );
+        }
+
+        // ── Providers validation ──
+        let provider_names: HashSet<&str> = self.providers.keys().map(String::as_str).collect();
+
+        if self.providers.is_empty() {
+            errors.push("at least one provider is required".into());
+        }
+        if self.retries > 10 {
+            warnings.push(format!(
+                "global retries={} seems unusually high",
+                self.retries
+            ));
+        }
+
+        for (name, provider) in &self.providers {
+            if provider.api_keys.is_empty() {
+                errors.push(format!("provider '{name}': api_keys must not be empty"));
+            }
+            if !provider.base_url.contains("://") {
+                errors.push(format!(
+                    "provider '{name}': base_url '{}' is not a valid URL (missing scheme)",
+                    provider.base_url
+                ));
+            }
+            if provider.timeout_secs == 0 {
+                errors.push(format!(
+                    "provider '{name}': timeout_secs must be greater than 0"
+                ));
+            }
+            if provider.key_strategy == KeyStrategy::RoundRobin && provider.api_keys.len() == 1 {
+                warnings.push(format!(
+                    "provider '{name}': RoundRobin strategy with a single API key behaves the same as FillFirst"
+                ));
+            }
+        }
+
+        // ── Routes validation ──
+        let mut seen_model_names: HashSet<&str> = HashSet::new();
+        let mut wildcard_index: Option<usize> = None;
+
+        for (i, route) in self.routes.iter().enumerate() {
+            if route.model_name.trim().is_empty() {
+                errors.push(format!("routes[{i}]: model_name must not be empty"));
+            } else {
+                if !seen_model_names.insert(route.model_name.as_str()) {
+                    warnings.push(format!(
+                        "routes[{i}]: duplicate model_name '{}'",
+                        route.model_name
+                    ));
+                }
+                if route.model_name == "*" {
+                    wildcard_index = Some(i);
+                }
+            }
+
+            if !route.api_endpoint.starts_with('/') {
+                errors.push(format!(
+                    "routes[{i}] (model='{}'): api_endpoint must start with '/'",
+                    route.model_name
+                ));
+            }
+
+            if let Some(retries) = route.retries
+                && retries > 10
+            {
+                warnings.push(format!(
+                    "routes[{i}] (model='{}'): retries={retries} seems unusually high",
+                    route.model_name
+                ));
+            }
+
+            if route.targets.is_empty() {
+                errors.push(format!(
+                    "routes[{i}] (model='{}'): must have at least one target",
+                    route.model_name
+                ));
+            }
+
+            for (j, target) in route.targets.iter().enumerate() {
+                if !provider_names.contains(target.provider.as_str()) {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): target[{j}] references unknown provider '{}'",
+                        route.model_name, target.provider
+                    ));
+                }
+                if let Some(retries) = target.retries
+                    && retries > 10
+                {
+                    warnings.push(format!(
+                        "routes[{i}] (model='{}'): target[{j}] retries={retries} seems unusually high",
+                        route.model_name
+                    ));
+                }
+            }
+        }
+
+        if let Some(idx) = wildcard_index
+            && idx != self.routes.len() - 1
+        {
+            warnings.push(format!(
+                "routes[{idx}] (model='*'): wildcard route should be the last route",
+            ));
+        }
+
+        // Log warnings
+        for w in &warnings {
+            tracing::warn!("configuration warning: {w}");
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 /// Server listen configuration.
@@ -427,5 +569,195 @@ targets = [
         assert!(result.is_ok(), "real_model should be optional");
         let config = result.unwrap();
         assert!(config.routes[0].targets[0].real_model.is_none());
+    }
+
+    mod validate_tests {
+        use super::*;
+
+        fn valid_config() -> GatewayConfig {
+            toml::from_str(r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai" },
+]
+"#)
+            .unwrap()
+        }
+
+        #[test]
+        fn valid_config_passes() {
+            let config = valid_config();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_empty_api_keys() {
+            let mut config = valid_config();
+            config.providers.get_mut("openai").unwrap().api_keys.clear();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("api_keys must not be empty")));
+        }
+
+        #[test]
+        fn rejects_unknown_provider_ref() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "nonexistent" },
+]
+"#)
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("unknown provider")));
+        }
+
+        #[test]
+        fn rejects_empty_host() {
+            let mut config = valid_config();
+            config.server.host = "".into();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("server.host must not be empty")));
+        }
+
+        #[test]
+        fn rejects_port_zero() {
+            let mut config = valid_config();
+            config.server.port = 0;
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("port must be greater than 0")));
+        }
+
+        #[test]
+        fn rejects_invalid_base_url() {
+            let mut config = valid_config();
+            config.providers.get_mut("openai").unwrap().base_url = "not-a-url".into();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("not a valid URL")));
+        }
+
+        #[test]
+        fn rejects_timeout_zero() {
+            let mut config = valid_config();
+            config.providers.get_mut("openai").unwrap().timeout_secs = 0;
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("timeout_secs must be greater than 0")));
+        }
+
+        #[test]
+        fn rejects_empty_model_name() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = ""
+targets = [
+    { provider = "openai" },
+]
+"#)
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("model_name must not be empty")));
+        }
+
+        #[test]
+        fn rejects_api_endpoint_no_slash() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+api_endpoint = "chat/completions"
+targets = [
+    { provider = "openai" },
+]
+"#)
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("api_endpoint must start with '/'")));
+        }
+
+        #[test]
+        fn rejects_analytics_invalid_dsn() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[analytics]
+enabled = true
+storage_dsn = "postgres://localhost/db"
+[providers.openai]
+api_keys = ["sk-test"]
+"#)
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("storage_dsn must start with 'sqlite://'")));
+        }
+
+        #[test]
+        fn rejects_empty_providers() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[providers]
+"#)
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("at least one provider is required")));
+        }
+
+        #[test]
+        fn rejects_no_targets() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = []
+"#)
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(err.iter().any(|e| e.contains("at least one target")));
+        }
+
+        #[test]
+        fn valid_config_with_memory_dsn() {
+            let config: GatewayConfig = toml::from_str(r#"
+[server]
+[analytics]
+enabled = true
+storage_dsn = ":memory:"
+[providers.openai]
+api_keys = ["sk-test"]
+"#)
+            .unwrap();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_all_errors_at_once() {
+            let mut config = valid_config();
+            config.server.host = "".into();
+            config.server.port = 0;
+            config.providers.get_mut("openai").unwrap().api_keys.clear();
+            let err = config.validate().unwrap_err();
+            // Should contain multiple errors
+            assert!(err.len() >= 3, "expected at least 3 errors, got {err:?}");
+        }
     }
 }
