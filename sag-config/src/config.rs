@@ -92,11 +92,7 @@ pub struct ProviderConfig {
     /// Provider adapter type (default: `openai`).
     #[serde(default)]
     pub provider_type: ProviderType,
-    /// API key for this provider (injected into requests).
-    pub api_key: String,
-    /// Additional API keys for this provider.
-    /// When non-empty, these are used instead of `api_key`.
-    /// The strategy for selecting among them is controlled by `key_strategy`.
+    /// API keys for this provider.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// How to select among multiple `api_keys`.
@@ -166,7 +162,8 @@ pub enum Strategy {
 /// The first tier that explicitly sets a value wins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
-    /// The model name as requested by the client (supports glob-like patterns e.g. "gpt-image-*").
+    /// The model name as requested by the client.
+    /// Use `"*"` as a wildcard to match any model not matched by an exact route.
     pub model_name: String,
     /// Upstream API endpoint path for this model.
     /// Examples: `/chat/completions`, `/images/generations`, `/responses`.
@@ -237,7 +234,7 @@ api_keys = ["key1", "key2"]
 enabled = true
 
 [providers.openai]
-api_key = "sk-test"
+api_keys = ["sk-test"]
 
 [[routes]]
 model_name = "gpt-4o"
@@ -262,7 +259,7 @@ targets = [
         assert_eq!(analytics.storage_dsn, "sqlite://analytics.db");
 
         let openai = config.providers.get("openai").unwrap();
-        assert_eq!(openai.api_key, "sk-test");
+        assert_eq!(openai.api_keys, vec!["sk-test"]);
         assert_eq!(openai.base_url, "https://api.openai.com/v1");
         assert_eq!(openai.timeout_secs, 120);
         assert_eq!(config.retries, 2);
@@ -344,7 +341,7 @@ targets = [
 [server]
 
 [providers.anthropic]
-api_key = "sk-ant"
+api_keys = ["sk-ant"]
 base_url = "https://api.anthropic.com"
 timeout_secs = 60
 
@@ -358,7 +355,7 @@ temperature = 0.8
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         let p = config.providers.get("anthropic").unwrap();
-        assert_eq!(p.api_key, "sk-ant");
+        assert_eq!(p.api_keys, vec!["sk-ant"]);
         assert_eq!(p.base_url, "https://api.anthropic.com");
         assert_eq!(p.timeout_secs, 60);
         assert_eq!(

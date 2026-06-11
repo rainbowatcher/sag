@@ -47,7 +47,6 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
 struct AddProviderRequest {
     /// Provider name (must be unique).
     name: String,
-    api_key: String,
     #[serde(default)]
     api_keys: Vec<String>,
     #[serde(default)]
@@ -123,7 +122,6 @@ struct DeleteRouteRequest {
 #[derive(Debug, serde::Deserialize)]
 struct UpdateProviderRequest {
     name: String,
-    api_key: Option<String>,
     #[serde(default)]
     api_keys: Option<Vec<String>>,
     #[serde(default)]
@@ -144,7 +142,6 @@ struct DeleteProviderRequest {
 #[derive(serde::Serialize)]
 struct ProviderInfo {
     name: String,
-    api_key: String,
     api_keys: Vec<String>,
     key_strategy: KeyStrategy,
     provider_type: String,
@@ -167,7 +164,6 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .map(|(name, cfg)| ProviderInfo {
             name: name.clone(),
-            api_key: cfg.api_key.clone(),
             api_keys: cfg.api_keys.clone(),
             key_strategy: cfg.key_strategy,
             provider_type: cfg.provider_type.as_str().to_string(),
@@ -439,9 +435,18 @@ async fn add_provider(
                 .into_response();
         }
 
+        if req.api_keys.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": { "code": "MISSING_API_KEYS", "message": "at least one api_key required" }
+                })),
+            )
+                .into_response();
+        }
+
         let pc = ProviderConfig {
             provider_type: req.provider_type.clone(),
-            api_key: req.api_key.clone(),
             api_keys: req.api_keys.clone(),
             key_strategy: req.key_strategy,
             base_url: req.base_url.clone(),
@@ -514,9 +519,6 @@ async fn update_provider(
             }
         };
 
-        if let Some(v) = req.api_key {
-            existing.api_key = v;
-        }
         if let Some(v) = req.api_keys {
             existing.api_keys = v;
         }
@@ -615,7 +617,8 @@ async fn list_provider_models(
 #[derive(serde::Deserialize)]
 struct FetchModelsRequest {
     base_url: String,
-    api_key: String,
+    #[serde(default)]
+    api_keys: Vec<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
     provider_type: Option<ProviderType>,
@@ -630,6 +633,16 @@ struct FetchModelsRequest {
 /// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
 #[instrument(skip(req), fields(url))]
 async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse {
+    let Some(api_key) = req.api_keys.first() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": { "code": "MISSING_API_KEYS", "message": "at least one api_key required" }
+            })),
+        )
+            .into_response();
+    };
+
     let endpoint = if req.models_endpoint.is_empty() {
         "models"
     } else {
@@ -644,13 +657,13 @@ async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse 
         .expect("valid reqwest client with timeout");
     let mut http_req = client
         .get(&models_url)
-        .header("Authorization", format!("Bearer {}", req.api_key));
+        .header("Authorization", format!("Bearer {}", api_key));
 
     // Anthropic uses x-api-key instead of Bearer
     if req.provider_type == Some(ProviderType::Anthropic) {
         http_req = client
             .get(&models_url)
-            .header("x-api-key", &req.api_key)
+            .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01");
     }
 
@@ -722,7 +735,6 @@ struct ModelTestRequest {
     model: String,
     #[serde(default)]
     api_keys: Vec<String>,
-    api_key: String,
     base_url: String,
     provider_type: Option<ProviderType>,
     #[serde(default)]
@@ -735,15 +747,13 @@ async fn model_test(Json(req): Json<ModelTestRequest>) -> impl IntoResponse {
         .build()
         .unwrap();
 
-    let keys = if req.api_keys.is_empty() {
-        vec![req.api_key.clone()]
-    } else {
-        req.api_keys.clone()
-    };
+    if req.api_keys.is_empty() {
+        return Json(json!({ "results": [] })).into_response();
+    }
 
     let mut results = Vec::new();
 
-    for key in &keys {
+    for key in &req.api_keys {
         let result = test_single_key(&client, &req, key).await;
         let prefix = if key.len() > 12 {
             format!("{}…", &key[..12])
@@ -757,7 +767,7 @@ async fn model_test(Json(req): Json<ModelTestRequest>) -> impl IntoResponse {
         }));
     }
 
-    Json(json!({ "results": results }))
+    Json(json!({ "results": results })).into_response()
 }
 
 async fn test_single_key(
@@ -1003,8 +1013,7 @@ mod tests {
             name.to_string(),
             ProviderConfig {
                 provider_type: ProviderType::OpenAI,
-                api_key: "sk-test".into(),
-                api_keys: vec![],
+                api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 timeout_secs: 120,
@@ -1110,8 +1119,7 @@ mod tests {
                     } else {
                         ProviderType::Anthropic
                     },
-                    api_key: format!("sk-{name}"),
-                    api_keys: vec![],
+                    api_keys: vec![format!("sk-{name}")],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://example.com".into(),
                     timeout_secs: 120,
@@ -1221,12 +1229,12 @@ port = 3000
 api_keys = ["test-key"]
 
 [providers.openai]
-api_key = "sk-test"
+api_keys = ["sk-test"]
 base_url = "https://api.openai.com/v1"
 
 [providers.anthropic]
 provider_type = "anthropic"
-api_key = "sk-ant"
+api_keys = ["sk-ant"]
 base_url = "https://api.anthropic.com"
 
 [[routes]]
@@ -1387,8 +1395,7 @@ targets = [
             "openai".to_string(),
             ProviderConfig {
                 provider_type: ProviderType::OpenAI,
-                api_key: "sk-test".into(),
-                api_keys: vec![],
+                api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 timeout_secs: 120,
@@ -1432,8 +1439,7 @@ targets = [
             "openai".to_string(),
             ProviderConfig {
                 provider_type: ProviderType::OpenAI,
-                api_key: "sk-test".into(),
-                api_keys: vec![],
+                api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 timeout_secs: 120,
@@ -1469,8 +1475,7 @@ targets = [
             "openai".to_string(),
             ProviderConfig {
                 provider_type: ProviderType::OpenAI,
-                api_key: "sk-test".into(),
-                api_keys: vec![],
+                api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 timeout_secs: 120,
@@ -1503,8 +1508,7 @@ targets = [
             "openai".to_string(),
             ProviderConfig {
                 provider_type: ProviderType::OpenAI,
-                api_key: "sk-test".into(),
-                api_keys: vec![],
+                api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 timeout_secs: 120,
@@ -1676,7 +1680,7 @@ targets = [
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.base_url, "https://custom.com/v1");
         // Fields not in the update should keep their original values
-        assert_eq!(p.api_key, "sk-test");
+        assert_eq!(p.api_keys, vec!["sk-test"]);
         assert_eq!(p.provider_type, ProviderType::OpenAI);
     }
 
@@ -1713,7 +1717,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"openai","api_key":"sk-updated","provider_type":"anthropic","base_url":"https://api.anthropic.com"}"#,
+                r#"{"name":"openai","api_keys":["sk-updated"],"provider_type":"anthropic","base_url":"https://api.anthropic.com"}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -1721,7 +1725,7 @@ targets = [
 
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
-        assert_eq!(p.api_key, "sk-updated");
+        assert_eq!(p.api_keys, vec!["sk-updated"]);
         assert_eq!(p.provider_type, ProviderType::Anthropic);
         assert_eq!(p.base_url, "https://api.anthropic.com");
 
@@ -1770,8 +1774,7 @@ mod auth_regression_tests {
             "openai".to_string(),
             ProviderConfig {
                 provider_type: ProviderType::OpenAI,
-                api_key: "sk-test".into(),
-                api_keys: vec![],
+                api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
                 timeout_secs: 120,
@@ -1898,7 +1901,7 @@ mod auth_regression_tests {
                     .header("Authorization", "Bearer regression-key")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"name":"anthropic","api_key":"sk-ant","provider_type":"anthropic"}"#,
+                        r#"{"name":"anthropic","api_keys":["sk-ant"],"provider_type":"anthropic"}"#,
                     ))
                     .unwrap(),
             )
