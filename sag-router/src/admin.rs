@@ -687,15 +687,11 @@ async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse 
             }
 
             match resp.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    let models: Vec<String> = body["data"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|item| item["id"].as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                Ok(mut body) => {
+                    let models = body
+                        .get_mut("data")
+                        .map(std::mem::take)
+                        .unwrap_or(serde_json::Value::Array(vec![]));
 
                     Json(json!({ "models": models })).into_response()
                 }

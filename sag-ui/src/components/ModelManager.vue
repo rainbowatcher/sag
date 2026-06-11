@@ -6,6 +6,10 @@ import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 
+function modelLabel(item: Record<string, unknown>): string {
+  return (item.id ?? item.name ?? item.model ?? Object.values(item)[0]) as string
+}
+
 export interface ModelTestState {
   loading: boolean
   error: string
@@ -15,7 +19,7 @@ export interface ModelTestState {
 const props = withDefaults(
   defineProps<{
     enabledModels: string[]
-    v1Models: string[]
+    v1Models: Record<string, unknown>[]
     v1ModelsLoading: boolean
     v1ModelsError: string
     /** Per-model test states (optional — only shown when provided) */
@@ -139,7 +143,11 @@ function removeModel(name: string) {
       <div class="min-w-0 flex-1">
         <Combobox
           v-model="selectedModel"
-          :options="v1Models.filter((m) => !enabledModels.includes(m)).map((m) => ({ value: m }))"
+          :options="
+            v1Models
+              .filter((m) => !enabledModels.includes(modelLabel(m)))
+              .map((m) => ({ value: modelLabel(m) }))
+          "
           placeholder="Select a model..."
           search-placeholder="Search models..."
           empty-text="No models found. Click Refresh Models."

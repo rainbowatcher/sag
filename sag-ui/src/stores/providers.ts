@@ -27,7 +27,7 @@ export const useProviderStore = defineStore("providers", () => {
   const providers = ref<Provider[]>([])
   const providersLoading = ref(false)
 
-  const v1Models = ref<string[]>([])
+  const v1Models = ref<Record<string, unknown>[]>([])
   const v1ModelsLoading = ref(false)
   const v1ModelsError = ref<string>("")
 
@@ -59,7 +59,7 @@ export const useProviderStore = defineStore("providers", () => {
     v1ModelsError.value = ""
     try {
       const conn = useConnectionStore()
-      const { data } = await api.post<{ models: string[] }>(
+      const { data } = await api.post<{ models: Record<string, unknown>[] }>(
         "/api/providers/fetch-models",
         payload,
         {
