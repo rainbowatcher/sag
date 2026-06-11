@@ -113,21 +113,6 @@ function removeModel(name: string) {
       </div>
     </div>
 
-    <!-- Combobox + Add -->
-    <div class="flex justify-between gap-2">
-      <Combobox
-        v-model="selectedModel"
-        :options="v1Models.filter((m) => !enabledModels.includes(m)).map((m) => ({ value: m }))"
-        placeholder="Select a model..."
-        search-placeholder="Search models..."
-        empty-text="No models found. Click Refresh Models."
-        :loading="v1ModelsLoading"
-      />
-      <Button variant="outline" size="sm" :disabled="!selectedModel.trim()" @click="addModel">
-        <Plus class="h-3.5 w-3.5" />
-      </Button>
-    </div>
-
     <!-- Custom model input -->
     <div class="flex items-center gap-2">
       <Input
@@ -146,6 +131,23 @@ function removeModel(name: string) {
       >
         <Plus class="h-3.5 w-3.5" />
         Add
+      </Button>
+    </div>
+
+    <!-- Combobox + Add -->
+    <div class="flex gap-2">
+      <div class="min-w-0 flex-1">
+        <Combobox
+          v-model="selectedModel"
+          :options="v1Models.filter((m) => !enabledModels.includes(m)).map((m) => ({ value: m }))"
+          placeholder="Select a model..."
+          search-placeholder="Search models..."
+          empty-text="No models found. Click Refresh Models."
+          :loading="v1ModelsLoading"
+        />
+      </div>
+      <Button variant="outline" size="sm" :disabled="!selectedModel.trim()" @click="addModel">
+        <Plus class="h-3.5 w-3.5" />
       </Button>
     </div>
 
