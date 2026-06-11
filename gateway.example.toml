@@ -26,12 +26,12 @@ api_keys = [
 # ============================================================
 
 [providers.openai]
-api_key = "sk-your-openai-api-key"
+api_keys = ["sk-your-openai-api-key"]
 base_url = "https://api.openai.com/v1"
 timeout_secs = 120
 
 [providers.anthropic]
-api_key = "sk-ant-your-anthropic-api-key"
+api_keys = ["sk-ant-your-anthropic-api-key"]
 base_url = "https://api.anthropic.com/v1"
 timeout_secs = 120
 

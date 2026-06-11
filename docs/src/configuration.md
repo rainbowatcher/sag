@@ -25,13 +25,13 @@ api_keys = [
 
 [providers.openai]
 provider_type = "openai"
-api_key = "${OPENAI_API_KEY}"
+api_keys = ["${OPENAI_API_KEY}"]
 base_url = "https://api.openai.com/v1"
 timeout_secs = 120
 
 [providers.anthropic]
 provider_type = "anthropic"
-api_key = "${ANTHROPIC_API_KEY}"
+api_keys = ["${ANTHROPIC_API_KEY}"]
 base_url = "https://api.anthropic.com/v1"
 timeout_secs = 120
 
@@ -78,7 +78,7 @@ Dashboard 前端在登录页输入 URL 和 API Key 后，会将连接信息保�
 供应商 API 密钥可以使用 `${VAR_NAME}` 语法通过环境变量设置。例如：
 
 ```toml
-api_key = "${OPENAI_API_KEY}"
+api_keys = ["${OPENAI_API_KEY}"]
 ```
 
 SAG 在启动时会读取环境变量 `OPENAI_API_KEY` 的值替换该配置项。环境变量也支持在 `[[routes]]` 的 `real_model` 中使用。

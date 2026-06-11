@@ -31,7 +31,7 @@ Content-Type: application/json
 {
   "name": "my-provider",
   "provider_type": "openai",
-  "api_key": "...",
+  "api_keys": ["..."],
   "base_url": "https://api.openai.com/v1",
   "priority": 10,
   "max_retries": 2,
@@ -93,7 +93,7 @@ Content-Type: application/json
 
 {
   "model": "gpt-4o-mini",
-  "api_key": "sk-xxx",
+  "api_keys": ["sk-xxx"],
   "base_url": "https://api.openai.com/v1",
   "provider_type": "openai",
   "headers": {}
@@ -107,10 +107,9 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 说明 |
 |------|------|------|------|
 | `model` | string | 是 | 要测试的模型名 |
-| `api_key` | string | 是 | API Key |
 | `base_url` | string | 是 | 供应商 API 基础 URL |
 | `provider_type` | string | 否 | 供应商类型，`"openai"` 或 `"anthropic"`，默认 `"openai"` |
-| `api_keys` | array | 否 | 多个 API Key 时，逐一测试每个 key |
+| `api_keys` | array | 是 | 要测试的 API Keys，会逐一测试每个 key |
 | `headers` | object | 否 | 附加的自定义请求头 |
 
 **响应**：

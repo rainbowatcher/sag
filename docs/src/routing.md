@@ -164,12 +164,12 @@ priority = 10                 # 透传客户端原始模型名
 ```toml
 [providers.openai]
 type = "openai"
-api_key = "${OPENAI_API_KEY}"
+api_keys = ["${OPENAI_API_KEY}"]
 base_url = "https://api.openai.com/v1"
 
 [providers.anthropic]
 type = "anthropic"
-api_key = "${ANTHROPIC_API_KEY}"
+api_keys = ["${ANTHROPIC_API_KEY}"]
 base_url = "https://api.anthropic.com"
 
 # 主模型 — OpenAI 优先，Anthropic 兜底
