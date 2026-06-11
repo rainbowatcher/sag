@@ -42,17 +42,8 @@ const deleting = ref(false)
 async function loadModelOptions() {
   modelsLoading.value = true
   try {
-    // fetch all providers to collect unique model names
-    await store.fetchProviders({ sort: "name" })
-    const models = new Set<string>()
-    for (const p of store.providers) {
-      for (const m of p.enabled_models) {
-        models.add(m)
-      }
-    }
-    modelOptions.value = Array.from(models)
-      .sort()
-      .map((m) => ({ value: m, label: m }))
+    await store.fetchAllProviderModels()
+    modelOptions.value = store.allProviderModels.map((m) => ({ value: m, label: m }))
   } finally {
     modelsLoading.value = false
   }
@@ -72,10 +63,7 @@ watch([filterModelName, filterProviderType, sortByName], () => {
 
 onMounted(async () => {
   await loadModelOptions()
-  // loadModelOptions already fetched all providers, but ensure sort matches
-  if (!sortByName.value) {
-    await fetchProviders()
-  }
+  await fetchProviders()
 })
 
 // ── Enable / Disable toggle ───────────────────────────────────────
@@ -111,6 +99,7 @@ function onEditClose() {
 async function onUpdated() {
   editingProvider.value = null
   await loadModelOptions()
+  await fetchProviders()
 }
 
 // ── Delete flow ───────────────────────────────────────────────────
@@ -124,6 +113,7 @@ async function confirmDelete(name: string) {
     await store.deleteProvider(name)
     confirmingDelete.value = null
     await loadModelOptions()
+    await fetchProviders()
   } catch {
     confirmingDelete.value = null
   } finally {
@@ -144,6 +134,11 @@ const columns = [
   }),
   columnHelper.accessor("base_url", {
     header: "Base URL",
+    cell: (info) =>
+      h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
+  }),
+  columnHelper.accessor("models_endpoint", {
+    header: "Models Endpoint",
     cell: (info) =>
       h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
   }),

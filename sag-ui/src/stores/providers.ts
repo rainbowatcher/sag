@@ -37,6 +37,9 @@ export const useProviderStore = defineStore("providers", () => {
   const upstreamModelsLoading = ref(false)
   const upstreamModelsError = ref<string>("")
 
+  const allProviderModels = ref<string[]>([])
+  const allProviderModelsLoading = ref(false)
+
   const testModelState = createPerItemState<ModelTestResult[], string>()
 
   async function fetchProviders(params: FetchProvidersParams = {}) {
@@ -87,6 +90,27 @@ export const useProviderStore = defineStore("providers", () => {
       upstreamModelsError.value = e.response?.data?.error?.message ?? e.message ?? String(e)
     } finally {
       upstreamModelsLoading.value = false
+    }
+  }
+
+  async function fetchAllProviderModels() {
+    allProviderModelsLoading.value = true
+    try {
+      const conn = useConnectionStore()
+      const { data } = await api.get<{ providers: Provider[] }>("/api/providers?sort=name", {
+        headers: headers(conn.connection?.apiKey),
+      })
+      const models = new Set<string>()
+      for (const p of data.providers) {
+        for (const m of p.enabled_models) {
+          models.add(m)
+        }
+      }
+      allProviderModels.value = Array.from(models).sort()
+    } catch (e: any) {
+      if (e.response?.status === 401) useConnectionStore().handle401()
+    } finally {
+      allProviderModelsLoading.value = false
     }
   }
 
@@ -141,7 +165,7 @@ export const useProviderStore = defineStore("providers", () => {
         data: { name },
       })
       const { useRouteStore } = await import("./routes")
-      await Promise.all([fetchProviders(), useRouteStore().fetchRoutes()])
+      await useRouteStore().fetchRoutes()
     } catch (e: any) {
       providers.value = oldProviders
       if (e.response?.status === 401) useConnectionStore().handle401()
@@ -185,8 +209,11 @@ export const useProviderStore = defineStore("providers", () => {
     upstreamModels,
     upstreamModelsLoading,
     upstreamModelsError,
+    allProviderModels,
+    allProviderModelsLoading,
     fetchProviders,
     fetchUpstreamModels,
+    fetchAllProviderModels,
     addProvider,
     deleteProvider,
     updateProvider,
