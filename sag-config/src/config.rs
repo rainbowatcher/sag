@@ -234,30 +234,30 @@ pub enum KeyStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Provider adapter type (default: `openai`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_provider_type")]
     pub provider_type: ProviderType,
     /// API keys for this provider.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// How to select among multiple `api_keys`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_key_strategy")]
     pub key_strategy: KeyStrategy,
     /// Base URL for the provider's API.
-    #[serde(default = "default_base_url")]
+    #[serde(default = "default_base_url", skip_serializing_if = "is_default_base_url")]
     pub base_url: String,
     /// Timeout in seconds for requests to this provider.
-    #[serde(default = "default_timeout_secs")]
+    #[serde(default = "default_timeout_secs", skip_serializing_if = "is_default_timeout_secs")]
     pub timeout_secs: u64,
     /// Custom headers to add to or override in upstream requests.
     /// These are applied after the provider's default headers,
     /// so they can override auth, content-type, etc.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     /// Request body field overrides merged into the upstream JSON body.
     /// Key-value pairs are inserted at the top level of the body,
     /// allowing you to set or override any field (e.g. max_tokens, temperature,
     /// or provider-specific parameters).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub body_overrides: HashMap<String, serde_json::Value>,
     /// Whether this provider is enabled. When `false`, the provider is skipped
     /// during routing and shown as disabled in the admin UI.
@@ -266,7 +266,7 @@ pub struct ProviderConfig {
     /// List of model IDs enabled for this provider.
     /// When non-empty, only these models may be used with this provider.
     /// When empty (default), all models are allowed (backward compatible).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_models: Vec<String>,
 }
 
@@ -281,6 +281,27 @@ pub fn default_timeout_secs() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+fn is_default_provider_type(v: &ProviderType) -> bool {
+    *v == ProviderType::default()
+}
+fn is_default_key_strategy(v: &KeyStrategy) -> bool {
+    *v == KeyStrategy::default()
+}
+fn is_default_strategy(v: &Strategy) -> bool {
+    *v == Strategy::default()
+}
+fn is_default_base_url(v: &str) -> bool {
+    v == default_base_url()
+}
+fn is_default_timeout_secs(v: &u64) -> bool {
+    *v == default_timeout_secs()
+}
+fn is_default_api_endpoint(v: &str) -> bool {
+    v == default_api_endpoint()
 }
 
 /// Target selection strategy for a route.
@@ -318,15 +339,15 @@ pub struct RouteConfig {
     pub model_name: String,
     /// Upstream API endpoint path for this model.
     /// Examples: `/chat/completions`, `/images/generations`, `/responses`.
-    #[serde(default = "default_api_endpoint")]
+    #[serde(default = "default_api_endpoint", skip_serializing_if = "is_default_api_endpoint")]
     pub api_endpoint: String,
     /// Target selection strategy (default: `FillFirst`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_strategy")]
     pub strategy: Strategy,
     /// Per-target retry count override for this route.
     /// When `None` (default), falls back to the global `GatewayConfig.retries`.
     /// When `Some(n)`, each target in this route retries up to `n` times.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
     /// List of targets for this route.
     pub targets: Vec<RouteTarget>,
@@ -347,23 +368,23 @@ pub struct RouteTarget {
     pub provider: String,
     /// The real model name to send to this provider.
     /// If `None` (omitted), the original client-requested model name is used as-is.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub real_model: Option<String>,
     /// Priority within this route — higher = higher priority. Targets are
     /// sorted in descending order, so a target with priority `20` is tried
     /// before one with priority `0`. Defaults to `0`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub priority: u32,
     /// Per-target retry override.
     /// When `None`, falls back to the route's `retries`, then to the global default.
     /// When `Some(n)`, this target retries up to `n` times regardless of route/global
     /// settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
     /// Per-target extra body fields merged into the upstream JSON body.
     /// Applied after provider-level body_overrides, so target-level
     /// keys take precedence.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
