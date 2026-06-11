@@ -107,7 +107,47 @@ async fn chat_completions_handler(
 
         match route {
             Some(r) => {
-                let targets = r.targets.clone();
+                let mut targets = r.targets.clone();
+                // Filter out targets pointing to disabled providers
+                targets.retain(|t| {
+                    let enabled = config_guard
+                        .providers
+                        .get(&t.provider)
+                        .map(|pc| pc.enabled)
+                        .unwrap_or(true);
+                    if !enabled {
+                        info!(
+                            provider = %t.provider,
+                            route = %r.model_name,
+                            "skipping disabled provider in route target"
+                        );
+                    }
+                    enabled
+                });
+                // If all targets were filtered out, return early with a clear error
+                if targets.is_empty() {
+                    let err = sag_core::AppError::AllProvidersExhausted {
+                        model: request.model.clone(),
+                        reason: format!(
+                            "all targets for route '{}' point to disabled providers",
+                            r.model_name
+                        ),
+                    };
+                    let log = CallLog {
+                        request_id,
+                        provider: String::new(),
+                        model: request.model.clone(),
+                        real_model: String::new(),
+                        stream: is_stream,
+                        status_code: 502,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        usage: None,
+                        error: Some(err.to_string()),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    state.collector.log(log);
+                    return err.into_response();
+                }
                 let strategy = r.strategy;
                 let api_endpoint = r.api_endpoint.clone();
                 let model_name = r.model_name.clone();
@@ -428,6 +468,21 @@ async fn dispatch_image_request(
     errors: &mut Vec<String>,
 ) -> Response<Body> {
     'fallback: for (provider_name, real_model, target_extra, retries) in targets {
+        // Double-check: skip if provider was disabled since target resolution
+        {
+            let cfg = state.config.read().await;
+            if !cfg
+                .providers
+                .get(provider_name)
+                .map(|pc| pc.enabled)
+                .unwrap_or(true)
+            {
+                info!(provider = %provider_name, "skipping disabled provider during image request dispatch");
+                errors.push(format!("{provider_name}: disabled"));
+                continue;
+            }
+        }
+
         let provider = match state.get_provider(provider_name).await {
             Some(p) => p,
             None => {
@@ -618,6 +673,16 @@ async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value
     let data: Vec<serde_json::Value> = config
         .routes
         .iter()
+        .filter(|route| {
+            // Include route only if at least one target has an enabled provider
+            route.targets.iter().any(|t| {
+                config
+                    .providers
+                    .get(&t.provider)
+                    .map(|pc| pc.enabled)
+                    .unwrap_or(true)
+            })
+        })
         .map(|route| {
             let owned_by = route
                 .targets
@@ -638,4 +703,162 @@ async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "object": "list",
         "data": data,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sag_analytics::CallLogCollector;
+    use sag_config::{
+        ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
+        ProviderType, RouteConfig, RouteTarget, ServerConfig,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn build_test_state(
+        providers: HashMap<String, ProviderConfig>,
+        routes: Vec<RouteConfig>,
+    ) -> AppState {
+        let config = GatewayConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 3000,
+            },
+            analytics: None,
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["test-key".into()],
+            }),
+            retries: 2,
+            providers,
+            routes,
+        };
+        let handle = ConfigHandle::from_config(config);
+
+        let cfg_read = handle.read().await;
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+        for (name, pc) in cfg_read.providers.iter() {
+            if pc.enabled {
+                let provider: Arc<dyn sag_providers::LlmProvider> =
+                    Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+                registry.insert(name.clone(), provider);
+            }
+        }
+        drop(cfg_read);
+
+        AppState {
+            config: handle,
+            providers: Arc::new(RwLock::new(registry)),
+            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+            route_counters: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn models_handler_excludes_routes_with_only_disabled_providers() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai-enabled".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAI,
+                api_keys: vec!["sk-test".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec![],
+                enabled: true,
+            },
+        );
+        providers.insert(
+            "openai-disabled".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAI,
+                api_keys: vec!["sk-test".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec![],
+                enabled: false,
+            },
+        );
+
+        let routes = vec![
+            // Route with enabled provider → should appear
+            RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                strategy: Strategy::FillFirst,
+                targets: vec![RouteTarget {
+                    provider: "openai-enabled".into(),
+                    real_model: Some("gpt-4o".into()),
+                    priority: 1,
+                    retries: None,
+                    extra: HashMap::new(),
+                }],
+            },
+            // Route with ONLY disabled providers → should NOT appear
+            RouteConfig {
+                model_name: "claude-opus".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                strategy: Strategy::FillFirst,
+                targets: vec![RouteTarget {
+                    provider: "openai-disabled".into(),
+                    real_model: Some("claude-opus".into()),
+                    priority: 1,
+                    retries: None,
+                    extra: HashMap::new(),
+                }],
+            },
+            // Route with mix of disabled and enabled → should appear
+            RouteConfig {
+                model_name: "gpt-4o-mini".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                strategy: Strategy::FillFirst,
+                targets: vec![
+                    RouteTarget {
+                        provider: "openai-disabled".into(),
+                        real_model: Some("gpt-4o-mini".into()),
+                        priority: 2,
+                        retries: None,
+                        extra: HashMap::new(),
+                    },
+                    RouteTarget {
+                        provider: "openai-enabled".into(),
+                        real_model: Some("gpt-4o-mini".into()),
+                        priority: 1,
+                        retries: None,
+                        extra: HashMap::new(),
+                    },
+                ],
+            },
+        ];
+
+        let state = build_test_state(providers, routes).await;
+        let Json(response) = models_handler(State(state)).await;
+        let data = response["data"].as_array().unwrap();
+        let model_ids: Vec<&str> = data
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+
+        // gpt-4o (enabled) and gpt-4o-mini (mixed) should appear
+        assert!(model_ids.contains(&"gpt-4o"), "gpt-4o should be in models list");
+        assert!(
+            model_ids.contains(&"gpt-4o-mini"),
+            "gpt-4o-mini should be in models list (mixed targets)"
+        );
+        // claude-opus (only disabled) should NOT appear
+        assert!(
+            !model_ids.contains(&"claude-opus"),
+            "claude-opus should NOT be in models list (all targets disabled)"
+        );
+    }
 }

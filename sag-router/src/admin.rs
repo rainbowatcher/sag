@@ -131,6 +131,8 @@ struct UpdateProviderRequest {
     headers: Option<HashMap<String, String>>,
     body_overrides: Option<HashMap<String, serde_json::Value>>,
     enabled_models: Option<Vec<String>>,
+    #[serde(default)]
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -149,6 +151,7 @@ struct ProviderInfo {
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
     enabled_models: Vec<String>,
+    enabled: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -194,6 +197,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         headers: cfg.headers.clone(),
         body_overrides: cfg.body_overrides.clone(),
         enabled_models: cfg.enabled_models.clone(),
+        enabled: cfg.enabled,
     }
 }
 
@@ -497,6 +501,7 @@ async fn add_provider(
             headers: req.headers.clone(),
             body_overrides: req.body_overrides.clone(),
             enabled_models: req.enabled_models.clone(),
+            enabled: true,
         };
 
         config.providers.insert(req.name.clone(), pc.clone());
@@ -576,6 +581,9 @@ async fn update_provider(
         }
         if let Some(v) = req.enabled_models {
             existing.enabled_models = v;
+        }
+        if let Some(v) = req.enabled {
+            existing.enabled = v;
         }
 
         let pc = existing.clone();
@@ -1053,6 +1061,7 @@ mod tests {
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec![],
+                enabled: true,
             },
         );
         let routes = routes
@@ -1159,6 +1168,7 @@ mod tests {
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     enabled_models: vec![],
+                    enabled: true,
                 },
             );
         }
@@ -1378,6 +1388,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
+                enabled: true,
             },
         );
         providers.insert(
@@ -1391,6 +1402,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
+                enabled: true,
             },
         );
         providers.insert(
@@ -1404,6 +1416,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
+                enabled: true,
             },
         );
 
@@ -1436,6 +1449,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec![],
+                enabled: true,
             },
         );
         providers.insert(
@@ -1449,6 +1463,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["other-model".into()],
+                enabled: true,
             },
         );
 
@@ -1538,6 +1553,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+                enabled: true,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -1582,6 +1598,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+                enabled: true,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -1618,6 +1635,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
+                enabled: true,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -1651,6 +1669,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
+                enabled: true,
             },
         );
         let routes = vec![RouteConfig {
@@ -1918,6 +1937,7 @@ mod auth_regression_tests {
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 enabled_models: vec![],
+                enabled: true,
             },
         );
         let config = GatewayConfig {

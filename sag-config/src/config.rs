@@ -259,6 +259,10 @@ pub struct ProviderConfig {
     /// or provider-specific parameters).
     #[serde(default)]
     pub body_overrides: HashMap<String, serde_json::Value>,
+    /// Whether this provider is enabled. When `false`, the provider is skipped
+    /// during routing and shown as disabled in the admin UI.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// List of model IDs enabled for this provider.
     /// When non-empty, only these models may be used with this provider.
     /// When empty (default), all models are allowed (backward compatible).
@@ -274,6 +278,9 @@ pub fn default_retries() -> u32 {
 }
 pub fn default_timeout_secs() -> u64 {
     120
+}
+fn default_true() -> bool {
+    true
 }
 
 /// Target selection strategy for a route.
