@@ -33,9 +33,12 @@ Content-Type: application/json
   "provider_type": "openai",
   "api_keys": ["..."],
   "base_url": "https://api.openai.com/v1",
+  "models_endpoint": "models",
   "timeout_secs": 120
 }
 ```
+
+`models_endpoint` 是可选字段，表示 provider 级 models 列表路径，默认 `models`。传入 `/v1/models/` 会被规范化为 `v1/models` 并持久化。
 
 ### 更新供应商
 
@@ -45,7 +48,8 @@ Content-Type: application/json
 
 {
   "name": "my-provider",
-  "base_url": "https://custom.com/v1"
+  "base_url": "https://custom.com/v1",
+  "models_endpoint": "v1/models"
 }
 ```
 
@@ -72,7 +76,7 @@ Content-Type: application/json
 GET /api/providers/{name}/models
 ```
 
-从上游供应商的 `/models` 端点获取可用模型列表。
+从 provider 配置中返回已启用的 `enabled_models` 列表；不会实时调用上游 models endpoint。
 
 #### 响应
 

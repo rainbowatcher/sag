@@ -11,6 +11,7 @@
 - **聊天**：`POST /v1/chat/completions`
 - **流式**：SSE 流式透传
 - **图像**：`POST /v1/images/generations`
+- **模型列表**：管理面板默认请求 `models`，可通过 provider 的 `models_endpoint` 配置覆盖路径。
 
 ### Anthropic
 

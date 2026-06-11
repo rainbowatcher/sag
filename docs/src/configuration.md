@@ -27,12 +27,14 @@ api_keys = [
 provider_type = "openai"
 api_keys = ["${OPENAI_API_KEY}"]
 base_url = "https://api.openai.com/v1"
+models_endpoint = "models"
 timeout_secs = 120
 
 [providers.anthropic]
 provider_type = "anthropic"
 api_keys = ["${ANTHROPIC_API_KEY}"]
 base_url = "https://api.anthropic.com/v1"
+models_endpoint = "models"
 timeout_secs = 120
 
 [[routes]]
@@ -58,6 +60,8 @@ targets = [
     { provider = "openai", priority = 10 },
 ]
 ```
+
+`models_endpoint` 是 provider 级配置，用于管理面板刷新上游模型列表。默认值为 `models`，会拼接到 `base_url` 后；支持 `models`、`/models`、`v1/models` 等写法，保存时会规范化为相对路径。
 
 ## 认证
 
