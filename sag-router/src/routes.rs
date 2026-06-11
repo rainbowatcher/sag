@@ -247,6 +247,7 @@ async fn chat_completions_handler(
                             (
                                 chunk_stream,
                                 Usage::default(),
+                                None::<String>,
                                 collector,
                                 log_request_id,
                                 log_provider,
@@ -257,6 +258,7 @@ async fn chat_completions_handler(
                             |(
                                 mut stream,
                                 mut usage,
+                                mut stream_error,
                                 collector,
                                 request_id,
                                 provider,
@@ -272,8 +274,9 @@ async fn chat_completions_handler(
                                                     raw,
                                                 )),
                                                 (
-                                                    stream, usage, collector, request_id, provider,
-                                                    model, real_model, start,
+                                                    stream, usage, stream_error, collector,
+                                                    request_id, provider, model, real_model,
+                                                    start,
                                                 ),
                                             ));
                                         }
@@ -282,17 +285,23 @@ async fn chat_completions_handler(
                                             usage.completion_tokens += u.completion_tokens;
                                             usage.total_tokens += u.total_tokens;
                                         }
+                                        Some(StreamChunk::Error(msg)) => {
+                                            warn!(provider = %provider, error = %msg, "mid-stream error");
+                                            stream_error = Some(msg);
+                                        }
                                         Some(StreamChunk::Done) | None => {
+                                            let error = stream_error.take();
+                                            let status_code = if error.is_some() { 502 } else { 200 };
                                             collector.log(CallLog {
                                                 request_id,
                                                 provider: provider.clone(),
                                                 model: model.clone(),
                                                 real_model: real_model.clone(),
                                                 stream: true,
-                                                status_code: 200,
+                                                status_code,
                                                 duration_ms: start.elapsed().as_millis() as u64,
                                                 usage: Some(usage),
-                                                error: None,
+                                                error,
                                                 timestamp: chrono::Utc::now(),
                                             });
                                             return None;

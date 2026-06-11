@@ -255,6 +255,10 @@ pub enum StreamChunk {
     Data(Vec<u8>),
     /// Token usage extracted from the stream for analytics.
     Usage(Usage),
+    /// A mid-stream error from the upstream connection (network drop, timeout,
+    /// etc.). The router should log this for analytics but may not be able to
+    /// notify the client since response headers are already sent.
+    Error(String),
     /// Stream end signal. The router will log the final CallLog when this is
     /// received and close the response body.
     Done,
@@ -271,6 +275,19 @@ impl StreamChunk {
                         "prompt_tokens": u.prompt_tokens,
                         "completion_tokens": u.completion_tokens,
                         "total_tokens": u.total_tokens,
+                    }
+                });
+                format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&json).unwrap_or_default()
+                )
+                .into_bytes()
+            }
+            StreamChunk::Error(e) => {
+                let json = serde_json::json!({
+                    "error": {
+                        "code": "STREAM_ERROR",
+                        "message": e,
                     }
                 });
                 format!(

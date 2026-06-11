@@ -321,6 +321,7 @@ impl LlmProvider for AnthropicProvider {
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
             let mut buffer: Vec<u8> = Vec::new();
+            let mut had_error = false;
 
             loop {
                 match byte_stream.next().await {
@@ -330,6 +331,8 @@ impl LlmProvider for AnthropicProvider {
                     }
                     Some(Err(e)) => {
                         error!(?e, "error reading anthropic stream chunk");
+                        let _ = tx.send(StreamChunk::Error(e.to_string()));
+                        had_error = true;
                         break;
                     }
                     None => break,
@@ -340,7 +343,10 @@ impl LlmProvider for AnthropicProvider {
                 drain_sse_frames(&mut buffer, &tx);
             }
 
-            let _ = tx.send(StreamChunk::Done);
+            if !had_error {
+                let _ = tx.send(StreamChunk::Done);
+            }
+            // On error the sender is dropped; the router sees None after Error.
         });
 
         let stream = futures_util::stream::unfold(rx, |mut rx| async move {
