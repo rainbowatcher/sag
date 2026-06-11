@@ -1646,7 +1646,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"openai","base_url":"https://custom.com/v1","priority":5,"max_retries":3}"#,
+                r#"{"name":"openai","base_url":"https://custom.com/v1","timeout_secs":60}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -1655,6 +1655,7 @@ targets = [
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.base_url, "https://custom.com/v1");
+        assert_eq!(p.timeout_secs, 60);
         // Fields not in the update should keep their original values
         assert_eq!(p.api_keys, vec!["sk-test"]);
         assert_eq!(p.provider_type, ProviderType::OpenAI);

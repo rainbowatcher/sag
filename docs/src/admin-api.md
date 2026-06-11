@@ -33,8 +33,6 @@ Content-Type: application/json
   "provider_type": "openai",
   "api_keys": ["..."],
   "base_url": "https://api.openai.com/v1",
-  "priority": 10,
-  "max_retries": 2,
   "timeout_secs": 120
 }
 ```
@@ -47,12 +45,13 @@ Content-Type: application/json
 
 {
   "name": "my-provider",
-  "base_url": "https://custom.com/v1",
-  "priority": 5
+  "base_url": "https://custom.com/v1"
 }
 ```
 
 只更新请求体中传入的字段，未传入的字段保持原值。
+
+> `priority` 不是供应商字段，不会参与路由排序。路由目标的优先级应在 `targets[].priority` 上配置。
 
 ### 删除供应商
 

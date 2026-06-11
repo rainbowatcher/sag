@@ -229,6 +229,9 @@ pub enum KeyStrategy {
 }
 
 /// Upstream LLM provider configuration.
+///
+/// Provider-level priority is not part of routing selection. Target ordering is
+/// controlled by `RouteTarget.priority` inside each route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Provider adapter type (default: `openai`).

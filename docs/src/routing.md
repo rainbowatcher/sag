@@ -69,7 +69,7 @@ priority = 10
 
 ## 优先级与故障转移
 
-路由内的目标按 `priority` **降序**排列（值越大越优先）。处理逻辑：
+路由内的目标按 `priority` **降序**排列（值越大越优先）。这里的 `priority` 是 `RouteTarget` 级别字段，不是 `ProviderConfig` 级别字段。处理逻辑：
 
 ```mermaid
 flowchart TD
