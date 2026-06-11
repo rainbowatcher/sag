@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { Loader2, X } from "lucide-vue-next"
 import { ref, watch } from "vue"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"

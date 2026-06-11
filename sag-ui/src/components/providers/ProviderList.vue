@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
-import { Loader2, Pen, Plus, RefreshCw, Trash2 } from "lucide-vue-next"
 import { h, onMounted, ref, watch } from "vue"
 import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
 import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"

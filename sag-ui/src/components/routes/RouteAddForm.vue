@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { X, Loader2, ArrowUp, ArrowDown, Plus, Trash2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { X, Loader2, ArrowUp, ArrowDown, Plus, Trash2 } from "lucide-vue-next"
 import { ref } from "vue"
 import { z } from "zod"
 import Combobox from "@/components/Combobox.vue"

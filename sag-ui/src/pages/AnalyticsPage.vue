@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Search, RefreshCw, Loader2, TrendingUp, Zap, Clock } from "lucide-vue-next"
+import { Search, RefreshCw, Loader2, TrendingUp, Zap, Clock } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
 import { useAnalyticsStore } from "@/stores/analytics"
 

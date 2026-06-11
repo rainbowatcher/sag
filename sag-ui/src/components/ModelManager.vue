@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2, Plus, RefreshCw, X } from "lucide-vue-next"
+import { Loader2, Plus, RefreshCw, X } from "@lucide/vue"
 import { ref, type Ref } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"

@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { GitBranch, Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
-import { GitBranch, Loader2, Pen, Plus, RefreshCw, Trash2 } from "lucide-vue-next"
 import { h, onMounted, ref } from "vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"

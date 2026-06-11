@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Plus, X } from "lucide-vue-next"
+import { Plus, X } from "@lucide/vue"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"

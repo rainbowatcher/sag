@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Server, GitBranch, MessageSquare, AlertTriangle } from "lucide-vue-next"
+import { Server, GitBranch, MessageSquare, AlertTriangle } from "@lucide/vue"
 import { onMounted } from "vue"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useHealthStore } from "@/stores/health"

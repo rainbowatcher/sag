@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2, Plug, Server, Key, AlertCircle } from "lucide-vue-next"
+import { Loader2, Plug, Server, Key, AlertCircle } from "@lucide/vue"
 import { ref, onMounted } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { useConnectionStore } from "@/stores/connection"

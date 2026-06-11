@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Check, ChevronDown, Loader2 } from "lucide-vue-next"
+import { Check, ChevronDown, Loader2 } from "@lucide/vue"
 import { computed, ref } from "vue"
 import { Button } from "@/components/ui/button"
 import {

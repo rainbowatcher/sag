@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { Loader2 } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
-import { Loader2 } from "lucide-vue-next"
 import { computed, ref } from "vue"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2 } from "lucide-vue-next"
+import { Loader2 } from "@lucide/vue"
 import { RouterView } from "vue-router"
 import { useConnectionStore } from "@/stores/connection"
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
+import { Loader2, Plus, Trash2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { Loader2, Plus, Trash2 } from "lucide-vue-next"
 import { onMounted, ref } from "vue"
 import { z } from "zod"
 import Combobox from "@/components/Combobox.vue"
@@ -149,7 +149,7 @@ async function handleSubmit(event: Event) {
 </script>
 
 <template>
-  <div class="space-y-3">
+  <div class="space-y-3 overflow-hidden">
     <div v-if="apiError" class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
       {{ apiError }}
     </div>

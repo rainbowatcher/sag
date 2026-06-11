@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { useDark } from "@vueuse/core"
 import {
   LayoutDashboard,
   Server,
@@ -10,7 +9,8 @@ import {
   Moon,
   Sun,
   LogOut,
-} from "lucide-vue-next"
+} from "@lucide/vue"
+import { useDark } from "@vueuse/core"
 import { RouterView, useRoute, useRouter } from "vue-router"
 import { cn } from "@/lib/utils"
 import { useConnectionStore } from "@/stores/connection"
