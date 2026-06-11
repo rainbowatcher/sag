@@ -445,7 +445,7 @@ async fn add_provider(
         }
 
         let pc = ProviderConfig {
-            provider_type: req.provider_type.clone(),
+            provider_type: req.provider_type,
             api_keys: req.api_keys.clone(),
             key_strategy: req.key_strategy,
             base_url: req.base_url.clone(),
@@ -610,7 +610,6 @@ struct FetchModelsRequest {
 }
 
 /// POST /api/model/test — test a specific model by sending a real chat completion.
-
 /// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
 #[instrument(skip(req), fields(url))]
 async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse {

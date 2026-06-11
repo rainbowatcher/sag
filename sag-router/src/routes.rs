@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Query, State},
-    http::{Request, StatusCode},
+    http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,8 +17,7 @@ use sag_core::{CallLog, ImageGenerationRequest, StreamChunk, Usage};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
-use tracing::{Level, error, info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::auth::gateway_auth;
 use crate::state::AppState;
