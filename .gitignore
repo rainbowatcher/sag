@@ -33,3 +33,4 @@ node_modules
 .kilo/
 gateway.toml
 .cline/
+.kimchi/
