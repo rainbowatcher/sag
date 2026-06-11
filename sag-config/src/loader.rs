@@ -11,16 +11,15 @@ use crate::config::GatewayConfig;
 #[derive(Debug, Clone)]
 pub struct ConfigHandle {
     inner: Arc<RwLock<GatewayConfig>>,
-    config_path: Arc<PathBuf>,
+    config_path: Option<Arc<PathBuf>>,
 }
 
 impl ConfigHandle {
     /// Build a `ConfigHandle` from an in-memory `GatewayConfig` (for testing / programmatic use).
-    /// Uses a placeholder path since no file is involved.
     pub fn from_config(config: GatewayConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(config)),
-            config_path: Arc::new(PathBuf::from("<memory>")),
+            config_path: None,
         }
     }
 
@@ -34,14 +33,14 @@ impl ConfigHandle {
         self.inner.write().await
     }
 
-    /// Returns the path to the config file.
-    pub fn path(&self) -> &Path {
-        &self.config_path
+    /// Returns the path to the config file, or `None` if the config is in-memory.
+    pub fn path(&self) -> Option<&Path> {
+        self.config_path.as_ref().map(|p| p.as_path())
     }
 
     /// Returns `true` if the config was loaded from a real file (not in-memory).
     pub fn is_file_backed(&self) -> bool {
-        self.config_path.as_path().as_os_str() != "<memory>"
+        self.config_path.is_some()
     }
 }
 
@@ -62,7 +61,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
     info!(?config, "configuration loaded");
     Ok(ConfigHandle {
         inner: Arc::new(RwLock::new(config)),
-        config_path: Arc::new(path),
+        config_path: Some(Arc::new(path)),
     })
 }
 
@@ -86,13 +85,20 @@ impl HotReloadHandle {
 }
 
 /// Spawn a background task that watches the config file for changes and reloads it.
-/// The returned handle will reflect the latest config.
+/// The returned handle will reflect the latest config. If `handle` is in-memory
+/// (no associated file path), the watcher task exits immediately.
 pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
     let inner = handle.inner.clone();
     let path = handle.config_path.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let task = tokio::spawn(async move {
+        // If there is no backing file, skip the watcher entirely.
+        let Some(path) = path else {
+            info!("hot-reload skipped for in-memory config");
+            return;
+        };
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<notify::Event, notify::Error>>(16);
 
         let mut watcher = match RecommendedWatcher::new(
@@ -269,7 +275,7 @@ api_keys = ["sk-test"]
     fn load_config_success() {
         let path = temp_toml(valid_toml());
         let handle = load_config(&path).unwrap();
-        assert_eq!(handle.path(), path.as_path());
+        assert_eq!(handle.path(), Some(path.as_path()));
 
         // Can read the config synchronously via try_read
         let config = handle.inner.try_read().unwrap();

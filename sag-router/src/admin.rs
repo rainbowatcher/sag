@@ -255,8 +255,8 @@ async fn create_route(
 
         config.routes.push(route);
 
-        if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        if let Some(path) = state.config.path()
+            && let Err(e) = sag_config::save_config_to_file(&config, path)
         {
             warn!(?e, "failed to persist config after creating route");
         }
@@ -357,8 +357,8 @@ async fn update_route(
                 .collect();
         }
 
-        if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        if let Some(path) = state.config.path()
+            && let Err(e) = sag_config::save_config_to_file(&config, path)
         {
             warn!(?e, "failed to persist config after updating route");
         }
@@ -396,8 +396,8 @@ async fn delete_route(
                 .into_response();
         }
 
-        if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        if let Some(path) = state.config.path()
+            && let Err(e) = sag_config::save_config_to_file(&config, path)
         {
             warn!(?e, "failed to persist config after deleting route");
         }
@@ -458,8 +458,8 @@ async fn add_provider(
         config.providers.insert(req.name.clone(), pc.clone());
 
         // Persist to disk while holding the write lock
-        if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        if let Some(path) = state.config.path()
+            && let Err(e) = sag_config::save_config_to_file(&config, path)
         {
             warn!(?e, "failed to persist config after adding provider");
         }
@@ -537,8 +537,8 @@ async fn update_provider(
         let pc = existing.clone();
 
         // Persist to disk while holding the write lock
-        if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        if let Some(path) = state.config.path()
+            && let Err(e) = sag_config::save_config_to_file(&config, path)
         {
             warn!(?e, "failed to persist config after updating provider");
         }
@@ -880,8 +880,8 @@ async fn delete_provider(
         config.providers.remove(&provider_name);
 
         // Persist to disk while we still hold the write lock.
-        if state.config.is_file_backed()
-            && let Err(e) = sag_config::save_config_to_file(&config, state.config.path())
+        if let Some(path) = state.config.path()
+            && let Err(e) = sag_config::save_config_to_file(&config, path)
         {
             warn!(?e, "failed to persist config after deleting provider");
         }
