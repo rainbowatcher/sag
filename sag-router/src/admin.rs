@@ -54,6 +54,8 @@ struct AddProviderRequest {
     provider_type: ProviderType,
     #[serde(default = "sag_config::default_base_url")]
     base_url: String,
+    #[serde(default = "sag_config::default_models_endpoint")]
+    models_endpoint: String,
     #[serde(default = "sag_config::default_timeout_secs")]
     timeout_secs: u64,
     /// Custom headers to override upstream request headers.
@@ -127,6 +129,7 @@ struct UpdateProviderRequest {
     key_strategy: Option<KeyStrategy>,
     provider_type: Option<ProviderType>,
     base_url: Option<String>,
+    models_endpoint: Option<String>,
     timeout_secs: Option<u64>,
     headers: Option<HashMap<String, String>>,
     body_overrides: Option<HashMap<String, serde_json::Value>>,
@@ -147,6 +150,7 @@ struct ProviderInfo {
     key_strategy: KeyStrategy,
     provider_type: String,
     base_url: String,
+    models_endpoint: String,
     timeout_secs: u64,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
@@ -193,6 +197,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         key_strategy: cfg.key_strategy,
         provider_type: cfg.provider_type.as_str().to_string(),
         base_url: cfg.base_url.clone(),
+        models_endpoint: cfg.models_endpoint.clone(),
         timeout_secs: cfg.timeout_secs,
         headers: cfg.headers.clone(),
         body_overrides: cfg.body_overrides.clone(),
@@ -497,6 +502,7 @@ async fn add_provider(
             api_keys: req.api_keys.clone(),
             key_strategy: req.key_strategy,
             base_url: req.base_url.clone(),
+            models_endpoint: sag_config::normalize_models_endpoint(&req.models_endpoint),
             timeout_secs: req.timeout_secs,
             headers: req.headers.clone(),
             body_overrides: req.body_overrides.clone(),
@@ -530,6 +536,7 @@ async fn add_provider(
             "name": req.name,
             "provider_type":            provider_config.provider_type.as_str(),
             "base_url": provider_config.base_url,
+            "models_endpoint": provider_config.models_endpoint,
         })),
     )
         .into_response()
@@ -569,6 +576,9 @@ async fn update_provider(
         }
         if let Some(v) = req.base_url {
             existing.base_url = v;
+        }
+        if let Some(v) = req.models_endpoint {
+            existing.models_endpoint = sag_config::normalize_models_endpoint(&v);
         }
         if let Some(v) = req.timeout_secs {
             existing.timeout_secs = v;
@@ -612,6 +622,7 @@ async fn update_provider(
             "name": req.name,
             "provider_type":            provider_config.provider_type.as_str(),
             "base_url": provider_config.base_url,
+            "models_endpoint": provider_config.models_endpoint,
             "timeout_secs": provider_config.timeout_secs,
             "headers": provider_config.headers,
             "body_overrides": provider_config.body_overrides,
@@ -661,6 +672,11 @@ struct FetchModelsRequest {
     models_endpoint: String,
 }
 
+fn build_models_url(base_url: &str, models_endpoint: &str) -> String {
+    let endpoint = sag_config::normalize_models_endpoint(models_endpoint);
+    format!("{}/{}", base_url.trim_end_matches('/'), endpoint)
+}
+
 /// POST /api/model/test — test a specific model by sending a real chat completion.
 /// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
 #[instrument(skip(req), fields(url))]
@@ -675,12 +691,7 @@ async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse 
             .into_response();
     };
 
-    let endpoint = if req.models_endpoint.is_empty() {
-        "models"
-    } else {
-        &req.models_endpoint
-    };
-    let models_url = format!("{}/{}", req.base_url.trim_end_matches('/'), endpoint);
+    let models_url = build_models_url(&req.base_url, &req.models_endpoint);
     tracing::Span::current().record("url", &models_url);
 
     let client = reqwest::Client::builder()
@@ -1045,6 +1056,22 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn build_models_url_normalizes_endpoint_path() {
+        assert_eq!(
+            build_models_url("https://example.com/v1", "models"),
+            "https://example.com/v1/models"
+        );
+        assert_eq!(
+            build_models_url("https://example.com/v1/", "/models"),
+            "https://example.com/v1/models"
+        );
+        assert_eq!(
+            build_models_url("https://example.com/v1", "v1/models/"),
+            "https://example.com/v1/v1/models"
+        );
+    }
+
     fn one_provider_config(
         name: &str,
         routes: Vec<(&str, &str, u32)>,
@@ -1057,6 +1084,7 @@ mod tests {
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1164,6 +1192,7 @@ mod tests {
                     api_keys: vec![format!("sk-{name}")],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://example.com".into(),
+                    models_endpoint: "models".into(),
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
@@ -1371,6 +1400,7 @@ targets = [
         let arr = body["providers"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], "openai");
+        assert_eq!(arr[0]["models_endpoint"], "models");
     }
 
     #[tokio::test]
@@ -1383,6 +1413,7 @@ targets = [
                 api_keys: vec!["sk-z".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1397,6 +1428,7 @@ targets = [
                 api_keys: vec!["sk-a".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.anthropic.com".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1411,6 +1443,7 @@ targets = [
                 api_keys: vec!["sk-m".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://example.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1444,6 +1477,7 @@ targets = [
                 api_keys: vec!["sk-openai".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1458,6 +1492,7 @@ targets = [
                 api_keys: vec!["sk-restricted".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://example.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1548,6 +1583,7 @@ targets = [
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1593,6 +1629,7 @@ targets = [
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1630,6 +1667,7 @@ targets = [
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1664,6 +1702,7 @@ targets = [
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
@@ -1824,7 +1863,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"openai","base_url":"https://custom.com/v1","timeout_secs":60}"#,
+                r#"{"name":"openai","base_url":"https://custom.com/v1","timeout_secs":60,"models_endpoint":"/v1/models/"}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -1833,10 +1872,34 @@ targets = [
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.base_url, "https://custom.com/v1");
+        assert_eq!(p.models_endpoint, "v1/models");
         assert_eq!(p.timeout_secs, 60);
         // Fields not in the update should keep their original values
         assert_eq!(p.api_keys, vec!["sk-test"]);
         assert_eq!(p.provider_type, ProviderType::OpenAI);
+    }
+
+    #[tokio::test]
+    async fn update_provider_empty_models_endpoint_defaults() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+        let _ = &state;
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"openai","models_endpoint":""}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let p = cfg.providers.get("openai").unwrap();
+        assert_eq!(p.models_endpoint, "models");
     }
 
     // 7. Update provider — 404
@@ -1883,6 +1946,7 @@ targets = [
         assert_eq!(p.api_keys, vec!["sk-updated"]);
         assert_eq!(p.provider_type, ProviderType::Anthropic);
         assert_eq!(p.base_url, "https://api.anthropic.com");
+        assert_eq!(p.models_endpoint, "models");
 
         // Ensure the runtime registry was updated
         let reg = state.providers.read().await;
@@ -1932,6 +1996,7 @@ mod auth_regression_tests {
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),

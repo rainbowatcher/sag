@@ -65,6 +65,16 @@ impl GatewayConfig {
                     provider.base_url
                 ));
             }
+            if provider.models_endpoint.contains("://")
+                || provider.models_endpoint.contains('?')
+                || provider.models_endpoint.contains('#')
+                || provider.models_endpoint.split('/').any(|segment| segment.contains(char::is_whitespace))
+            {
+                errors.push(format!(
+                    "provider '{name}': models_endpoint '{}' must be a relative path without scheme, query, fragment, or whitespace",
+                    provider.models_endpoint
+                ));
+            }
             if provider.timeout_secs == 0 {
                 errors.push(format!(
                     "provider '{name}': timeout_secs must be greater than 0"
@@ -243,10 +253,14 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "is_default_key_strategy")]
     pub key_strategy: KeyStrategy,
     /// Base URL for the provider's API.
-    #[serde(default = "default_base_url", skip_serializing_if = "is_default_base_url")]
+    #[serde(default = "default_base_url")]
     pub base_url: String,
+    /// Upstream endpoint path used by admin APIs to fetch available models.
+    /// Defaults to `models`, appended to `base_url`.
+    #[serde(default = "default_models_endpoint")]
+    pub models_endpoint: String,
     /// Timeout in seconds for requests to this provider.
-    #[serde(default = "default_timeout_secs", skip_serializing_if = "is_default_timeout_secs")]
+    #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Custom headers to add to or override in upstream requests.
     /// These are applied after the provider's default headers,
@@ -273,6 +287,17 @@ pub struct ProviderConfig {
 pub fn default_base_url() -> String {
     "https://api.openai.com/v1".into()
 }
+pub fn default_models_endpoint() -> String {
+    "models".into()
+}
+pub fn normalize_models_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        default_models_endpoint()
+    } else {
+        trimmed.to_string()
+    }
+}
 pub fn default_retries() -> u32 {
     2
 }
@@ -293,12 +318,6 @@ fn is_default_key_strategy(v: &KeyStrategy) -> bool {
 }
 fn is_default_strategy(v: &Strategy) -> bool {
     *v == Strategy::default()
-}
-fn is_default_base_url(v: &str) -> bool {
-    v == default_base_url()
-}
-fn is_default_timeout_secs(v: &u64) -> bool {
-    *v == default_timeout_secs()
 }
 fn is_default_api_endpoint(v: &str) -> bool {
     v == default_api_endpoint()
@@ -433,6 +452,7 @@ targets = [
         let openai = config.providers.get("openai").unwrap();
         assert_eq!(openai.api_keys, vec!["sk-test"]);
         assert_eq!(openai.base_url, "https://api.openai.com/v1");
+        assert_eq!(openai.models_endpoint, "models");
         assert_eq!(openai.timeout_secs, 120);
         assert_eq!(config.retries, 2);
 
@@ -515,6 +535,7 @@ targets = [
 [providers.anthropic]
 api_keys = ["sk-ant"]
 base_url = "https://api.anthropic.com"
+models_endpoint = "v1/models"
 timeout_secs = 60
 
 [providers.anthropic.headers]
@@ -529,6 +550,7 @@ temperature = 0.8
         let p = config.providers.get("anthropic").unwrap();
         assert_eq!(p.api_keys, vec!["sk-ant"]);
         assert_eq!(p.base_url, "https://api.anthropic.com");
+        assert_eq!(p.models_endpoint, "v1/models");
         assert_eq!(p.timeout_secs, 60);
         assert_eq!(
             p.headers.get("Authorization").unwrap(),
@@ -543,6 +565,35 @@ temperature = 0.8
             p.body_overrides.get("temperature").unwrap(),
             &serde_json::json!(0.8)
         );
+    }
+
+    #[test]
+    fn normalize_models_endpoint_variants() {
+        assert_eq!(normalize_models_endpoint("models"), "models");
+        assert_eq!(normalize_models_endpoint("/models"), "models");
+        assert_eq!(normalize_models_endpoint("v1/models/"), "v1/models");
+        assert_eq!(normalize_models_endpoint("  /v1/models/  "), "v1/models");
+        assert_eq!(normalize_models_endpoint(""), "models");
+    }
+
+    #[test]
+    fn rejects_invalid_models_endpoint() {
+        let toml_str = r#"
+[server]
+
+[providers.openai]
+api_keys = ["sk-test"]
+models_endpoint = "https://example.com/models"
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai" },
+]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.iter().any(|e| e.contains("models_endpoint")));
     }
 
     #[test]

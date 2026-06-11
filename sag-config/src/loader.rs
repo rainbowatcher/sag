@@ -195,6 +195,42 @@ async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core
     Ok(config)
 }
 
+/// Convert a `serde_json::Value` into a `toml_edit::Item` (via `value()` helper).
+fn json_to_toml_item(v: &serde_json::Value) -> toml_edit::Item {
+    match v {
+        serde_json::Value::Null => {
+            // Should never happen — nulls are validated before calling this.
+            toml_edit::value("null")
+        }
+        serde_json::Value::Bool(b) => toml_edit::value(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml_edit::value(i)
+            } else if let Some(f) = n.as_f64() {
+                toml_edit::value(f)
+            } else {
+                // Fallback: serialize as string for unusual numbers (e.g. large integers)
+                toml_edit::value(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => toml_edit::value(s.as_str()),
+        serde_json::Value::Array(items) => {
+            let mut arr = toml_edit::Array::new();
+            for item in items {
+                arr.push(json_to_toml_item(item).into_value().expect("array items should be values"));
+            }
+            toml_edit::value(arr)
+        }
+        serde_json::Value::Object(map) => {
+            let mut table = toml_edit::InlineTable::new();
+            for (k, val) in map {
+                table.insert(k, json_to_toml_item(val).into_value().expect("object values should be values"));
+            }
+            toml_edit::value(table)
+        }
+    }
+}
+
 /// Validate that a JSON map doesn't contain null values (which can't be stored as TOML).
 fn check_json_map(
     map: &HashMap<String, serde_json::Value>,
@@ -234,7 +270,10 @@ pub fn save_config_to_file(
 ) -> Result<(), sag_core::AppError> {
     // Validate no null values before writing
     for (name, provider) in &config.providers {
-        check_json_map(&provider.body_overrides, &format!("providers.{name}.body_overrides"))?;
+        check_json_map(
+            &provider.body_overrides,
+            &format!("providers.{name}.body_overrides"),
+        )?;
     }
     for (i, route) in config.routes.iter().enumerate() {
         for (j, target) in route.targets.iter().enumerate() {
@@ -260,15 +299,17 @@ pub fn save_config_to_file(
     }
 
     for (name, provider) in &config.providers {
-        let provider_exists = doc.get("providers")
+        let provider_exists = doc
+            .get("providers")
             .and_then(|t| t.as_table())
             .and_then(|t| t.get(name))
             .is_some();
 
         if !provider_exists {
             // New provider — serialize via to_document (no existing format to preserve)
-            let pd = toml_edit::ser::to_document(provider)
-                .map_err(|e| sag_core::AppError::Config(format!("failed to serialize provider '{name}': {e}")))?;
+            let pd = toml_edit::ser::to_document(provider).map_err(|e| {
+                sag_core::AppError::Config(format!("failed to serialize provider '{name}': {e}"))
+            })?;
             doc["providers"][name] = toml_edit::Item::Table((*pd).clone());
         } else {
             // Existing provider — per-field update
@@ -290,18 +331,22 @@ pub fn save_config_to_file(
             }
             // scalars
             doc["providers"][name]["base_url"] = toml_edit::value(provider.base_url.as_str());
+            doc["providers"][name]["models_endpoint"] =
+                toml_edit::value(provider.models_endpoint.as_str());
             doc["providers"][name]["timeout_secs"] = toml_edit::value(provider.timeout_secs as i64);
-            doc["providers"][name]["provider_type"] = toml_edit::value(provider.provider_type.as_str());
-            doc["providers"][name]["key_strategy"] = toml_edit::value(match provider.key_strategy {
-                KeyStrategy::FillFirst => "fill_first",
-                KeyStrategy::RoundRobin => "round_robin",
-            });
+            doc["providers"][name]["provider_type"] =
+                toml_edit::value(provider.provider_type.as_str());
+            doc["providers"][name]["key_strategy"] =
+                toml_edit::value(match provider.key_strategy {
+                    KeyStrategy::FillFirst => "fill_first",
+                    KeyStrategy::RoundRobin => "round_robin",
+                });
             doc["providers"][name]["enabled"] = toml_edit::value(provider.enabled);
             // headers — inline table
             {
                 let mut table = toml_edit::InlineTable::new();
                 for (k, v) in &provider.headers {
-                    table.insert(k, v.as_str());
+                    table.insert(k, v.as_str().into());
                 }
                 doc["providers"][name]["headers"] = toml_edit::value(table);
             }
@@ -311,9 +356,16 @@ pub fn save_config_to_file(
                     .as_table_mut()
                     .and_then(|t| t.remove("body_overrides"));
             } else {
-                let val = toml_edit::ser::to_value(&provider.body_overrides)
-                    .map_err(|e| sag_core::AppError::Config(format!("failed to serialize body_overrides for '{name}': {e}")))?;
-                doc["providers"][name]["body_overrides"] = toml_edit::Item::Value(val);
+                let mut inline = toml_edit::InlineTable::new();
+                for (k, v) in &provider.body_overrides {
+                    inline.insert(
+                        k,
+                        json_to_toml_item(v)
+                            .into_value()
+                            .expect("body_overrides values should be valid toml values"),
+                    );
+                }
+                doc["providers"][name]["body_overrides"] = toml_edit::value(inline);
             }
         }
     }
@@ -571,6 +623,7 @@ base_url = "https://api.anthropic.com"
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://api.openai.com/v1".into(),
+                    models_endpoint: "models".into(),
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
@@ -626,6 +679,7 @@ base_url = "https://api.anthropic.com"
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://api.openai.com/v1".into(),
+                    models_endpoint: "models".into(),
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
@@ -660,6 +714,10 @@ base_url = "https://api.anthropic.com"
             !saved.contains("enabled_models"),
             "empty enabled_models should not be written"
         );
+        assert!(
+            saved.contains("models_endpoint = \"models\""),
+            "models_endpoint should be written even when default, got:\n{saved}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -675,11 +733,13 @@ api_keys = ["key1"]
 
 [providers.openai]
 api_keys = ["sk-test"]
+models_endpoint = "models"
 
 [providers.anthropic]
 provider_type = "anthropic"
 api_keys = ["sk-ant"]
 base_url = "https://api.anthropic.com"
+models_endpoint = "v1/models"
 timeout_secs = 60
 
 [[routes]]
@@ -707,6 +767,7 @@ targets = [
             assert_eq!(p1.api_keys, p2.api_keys);
             assert_eq!(p1.key_strategy, p2.key_strategy);
             assert_eq!(p1.base_url, p2.base_url);
+            assert_eq!(p1.models_endpoint, p2.models_endpoint);
             assert_eq!(p1.timeout_secs, p2.timeout_secs);
             assert_eq!(p1.headers, p2.headers);
             assert_eq!(p1.body_overrides, p2.body_overrides);
@@ -750,6 +811,7 @@ targets = [
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://api.openai.com/v1".into(),
+                    models_endpoint: "models".into(),
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
