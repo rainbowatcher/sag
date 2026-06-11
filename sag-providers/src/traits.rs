@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures_util::Stream;
+use sag_core::AppError;
 use sag_core::types::{
     ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest, ImageGenerationResponse,
     StreamChunk,
@@ -35,10 +36,18 @@ pub trait LlmProvider: Send + Sync {
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
 
     /// Send an image generation request. Returns image URLs or base64 data.
+    ///
+    /// Default implementation returns `BadRequest` — override for providers
+    /// that support image generation (e.g. OpenAI).
     async fn chat_image(
         &self,
-        request: &ImageGenerationRequest,
-        real_model: &str,
-        target_extra: &HashMap<String, serde_json::Value>,
-    ) -> sag_core::Result<ImageGenerationResponse>;
+        _request: &ImageGenerationRequest,
+        _real_model: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+    ) -> sag_core::Result<ImageGenerationResponse> {
+        Err(AppError::BadRequest(format!(
+            "provider '{}' does not support image generation",
+            self.name()
+        )))
+    }
 }

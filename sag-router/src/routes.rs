@@ -47,25 +47,25 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/v1/chat/completions", chat_route)
         .nest("/v1", models_route)
         .nest("/api", admin_routes)
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &Request<Body>| {
-                    tracing::span!(
-                        Level::INFO,
-                        "request",
-                        method = %request.method(),
-                        uri = %request.uri(),
-                        status = tracing::field::Empty,
-                        latency_ms = tracing::field::Empty,
-                    )
-                })
-                .on_response(
-                    |response: &Response<Body>, latency: std::time::Duration, span: &tracing::Span| {
-                        span.record("status", response.status().as_u16());
-                        span.record("latency_ms", latency.as_millis() as u64);
-                    },
-                ),
-        )
+        // .layer(
+        //     TraceLayer::new_for_http()
+        //         .make_span_with(|request: &Request<Body>| {
+        //             tracing::span!(
+        //                 Level::INFO,
+        //                 "request",
+        //                 method = %request.method(),
+        //                 uri = %request.uri(),
+        //                 status = tracing::field::Empty,
+        //                 latency_ms = tracing::field::Empty,
+        //             )
+        //         })
+        //         .on_response(
+        //             |response: &Response<Body>, latency: std::time::Duration, span: &tracing::Span| {
+        //                 span.record("status", response.status().as_u16());
+        //                 span.record("latency_ms", latency.as_millis() as u64);
+        //             },
+        //         ),
+        // )
         .layer(cors)
         .with_state(state)
 }
@@ -274,8 +274,14 @@ async fn chat_completions_handler(
                                                     raw,
                                                 )),
                                                 (
-                                                    stream, usage, stream_error, collector,
-                                                    request_id, provider, model, real_model,
+                                                    stream,
+                                                    usage,
+                                                    stream_error,
+                                                    collector,
+                                                    request_id,
+                                                    provider,
+                                                    model,
+                                                    real_model,
                                                     start,
                                                 ),
                                             ));
@@ -291,7 +297,8 @@ async fn chat_completions_handler(
                                         }
                                         Some(StreamChunk::Done) | None => {
                                             let error = stream_error.take();
-                                            let status_code = if error.is_some() { 502 } else { 200 };
+                                            let status_code =
+                                                if error.is_some() { 502 } else { 200 };
                                             collector.log(CallLog {
                                                 request_id,
                                                 provider: provider.clone(),
