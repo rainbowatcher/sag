@@ -65,19 +65,6 @@ const DEFAULT_BASE_URLS: Record<string, string> = {
   anthropic: "https://api.anthropic.com",
 }
 
-// Watch provider_type: if base_url still matches a known default,
-// auto-switch to the new type's default.
-watch(
-  () => form.state.values.provider_type,
-  (newType) => {
-    const currentUrl = form.state.values.base_url
-    const isDefault = Object.values(DEFAULT_BASE_URLS).includes(currentUrl)
-    if (isDefault && DEFAULT_BASE_URLS[newType]) {
-      form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
-    }
-  },
-)
-
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
@@ -141,6 +128,19 @@ const form = useForm({
   },
 })
 
+// Watch provider_type: if base_url still matches a known default,
+// auto-switch to the new type's default.
+watch(
+  () => form.state.values.provider_type,
+  (newType) => {
+    const currentUrl = form.state.values.base_url
+    const isDefault = Object.values(DEFAULT_BASE_URLS).includes(currentUrl)
+    if (isDefault && DEFAULT_BASE_URLS[newType]) {
+      form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
+    }
+  },
+)
+
 function isInvalid(field: any) {
   return field.state.meta.isTouched && !field.state.meta.isValid
 }
@@ -151,8 +151,6 @@ async function handleSubmit(event: Event) {
   adding.value = true
   try {
     await form.handleSubmit()
-    if (apiError.value) return
-    emit("created")
   } finally {
     adding.value = false
   }
