@@ -1,24 +1,50 @@
 <script setup lang="ts">
-import {
-  ChevronDown,
-  Trash2,
-  Pen,
-  AlertTriangle,
-  Loader2,
-  Check,
-  X,
-  RefreshCw,
-} from "lucide-vue-next"
-import { ref } from "vue"
+import { ChevronDown, Trash2, Pen, AlertTriangle, Loader2, RefreshCw } from "lucide-vue-next"
+import { computed, onMounted, ref, watch } from "vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
+import ProviderHeader from "@/components/providers/ProviderHeader.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { api, headers as authHeaders } from "@/lib/client"
 import { useConnectionStore } from "@/stores/connection"
 import { useProviderStore } from "@/stores/providers"
 import type { ModelTestResult, Provider } from "@/types/api"
 
 const store = useProviderStore()
+
+const filterModelName = ref("")
+const filterProviderType = ref("all")
+const sortByName = ref(true)
+
+const providerTypes = computed(() =>
+  Array.from(new Set(store.providers.map((provider) => provider.provider_type))).sort(),
+)
+
+const hasActiveFilters = computed(
+  () => filterModelName.value.trim() !== "" || filterProviderType.value !== "all",
+)
+
+async function fetchProviders() {
+  await store.fetchProviders({
+    model_name: filterModelName.value,
+    provider_type: filterProviderType.value === "all" ? undefined : filterProviderType.value,
+    sort: sortByName.value ? "name" : undefined,
+  })
+}
+
+watch([filterModelName, filterProviderType, sortByName], async () => {
+  await fetchProviders()
+})
+
+onMounted(fetchProviders)
 
 const expanded = ref<Record<string, boolean>>({})
 const editingProvider = ref<Provider | null>(null)
@@ -101,11 +127,68 @@ function onEditClose() {
 
 async function onUpdated() {
   editingProvider.value = null
-  await store.fetchProviders()
+  await fetchProviders()
 }
 </script>
 
 <template>
+  <ProviderHeader @refresh="fetchProviders" />
+
+  <div class="grid gap-3 md:grid-cols-[1fr_220px_180px_auto] md:items-end">
+    <div>
+      <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Model</label>
+      <Input v-model="filterModelName" placeholder="Filter by model..." class="h-9" />
+    </div>
+    <div>
+      <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Type</label>
+      <Select
+        :model-value="filterProviderType"
+        @update:model-value="(value) => (filterProviderType = value as string)"
+      >
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">All types</SelectItem>
+          <SelectItem v-for="type in providerTypes" :key="type" :value="type">
+            {{ type }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+    <div>
+      <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Sort</label>
+      <Select
+        :model-value="sortByName ? 'name' : 'default'"
+        @update:model-value="(value) => (sortByName = value === 'name')"
+      >
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="name">Name (A-Z)</SelectItem>
+          <SelectItem value="default">Default</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+    <div class="flex gap-2 md:pb-0">
+      <Button variant="outline" size="sm" @click="fetchProviders">Apply</Button>
+      <Button
+        v-if="hasActiveFilters"
+        variant="ghost"
+        size="sm"
+        @click="
+          () => {
+            filterModelName = ''
+            filterProviderType = 'all'
+          }
+        "
+      >
+        Clear
+      </Button>
+    </div>
+  </div>
+
   <div
     v-if="store.providersLoading && store.providers.length === 0"
     class="text-muted-foreground py-12 text-center"
@@ -117,7 +200,11 @@ async function onUpdated() {
     v-else-if="store.providers.length === 0"
     class="text-muted-foreground py-12 text-center text-sm"
   >
-    No providers configured. Add one above.
+    {{
+      hasActiveFilters
+        ? "No providers match the current filters."
+        : "No providers configured. Add one above."
+    }}
   </div>
 
   <div v-else class="space-y-3">

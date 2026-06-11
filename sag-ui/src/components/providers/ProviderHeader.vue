@@ -7,9 +7,13 @@ import { useProviderStore } from "@/stores/providers"
 const store = useProviderStore()
 const showAdd = ref(false)
 
-async function onCreated() {
+const emit = defineEmits<{
+  refresh: []
+}>()
+
+function onCreated() {
   showAdd.value = false
-  await store.fetchProviders()
+  emit("refresh")
 }
 </script>
 
@@ -21,7 +25,7 @@ async function onCreated() {
     </div>
     <div class="flex items-center gap-2">
       <button
-        @click="store.fetchProviders()"
+        @click="emit('refresh')"
         :disabled="store.providersLoading"
         class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
       >

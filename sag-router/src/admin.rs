@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -151,28 +151,72 @@ struct ProviderInfo {
     enabled_models: Vec<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ListProvidersQuery {
+    #[serde(default)]
+    model_name: Option<String>,
+    #[serde(default)]
+    provider_type: Option<ProviderType>,
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+fn provider_matches_filters(cfg: &ProviderConfig, query: &ListProvidersQuery) -> bool {
+    let model_filter = query
+        .model_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+
+    let matches_model = match model_filter {
+        Some(model) => {
+            cfg.enabled_models.is_empty() || cfg.enabled_models.iter().any(|m| m == model)
+        }
+        None => true,
+    };
+
+    let matches_type = query
+        .provider_type
+        .map(|provider_type| cfg.provider_type == provider_type)
+        .unwrap_or(true);
+
+    matches_model && matches_type
+}
+
+fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
+    ProviderInfo {
+        name: name.to_string(),
+        api_keys: cfg.api_keys.clone(),
+        key_strategy: cfg.key_strategy,
+        provider_type: cfg.provider_type.as_str().to_string(),
+        base_url: cfg.base_url.clone(),
+        timeout_secs: cfg.timeout_secs,
+        headers: cfg.headers.clone(),
+        body_overrides: cfg.body_overrides.clone(),
+        enabled_models: cfg.enabled_models.clone(),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Handlers
 // ═══════════════════════════════════════════════════════════════════
 
 /// GET /api/providers — list all registered providers.
-async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_providers(
+    State(state): State<AppState>,
+    Query(query): Query<ListProvidersQuery>,
+) -> impl IntoResponse {
     let config = state.config.read().await;
-    let providers: Vec<ProviderInfo> = config
+    let mut providers: Vec<ProviderInfo> = config
         .providers
         .iter()
-        .map(|(name, cfg)| ProviderInfo {
-            name: name.clone(),
-            api_keys: cfg.api_keys.clone(),
-            key_strategy: cfg.key_strategy,
-            provider_type: cfg.provider_type.as_str().to_string(),
-            base_url: cfg.base_url.clone(),
-            timeout_secs: cfg.timeout_secs,
-            headers: cfg.headers.clone(),
-            body_overrides: cfg.body_overrides.clone(),
-            enabled_models: cfg.enabled_models.clone(),
-        })
+        .filter(|(_, cfg)| provider_matches_filters(cfg, &query))
+        .map(|(name, cfg)| provider_info(name, cfg))
         .collect();
+
+    if query.sort.as_deref() == Some("name") || query.sort.is_none() {
+        providers.sort_by(|a, b| a.name.cmp(&b.name));
+    }
 
     (StatusCode::OK, Json(json!({ "providers": providers }))).into_response()
 }
@@ -980,6 +1024,19 @@ mod tests {
             .with_state(state)
     }
 
+    async fn provider_names_from_response(response: axum::response::Response) -> Vec<String> {
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|provider| provider["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     fn one_provider_config(
         name: &str,
         routes: Vec<(&str, &str, u32)>,
@@ -1305,6 +1362,109 @@ targets = [
         let arr = body["providers"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], "openai");
+    }
+
+    #[tokio::test]
+    async fn list_providers_filters_by_model_and_type_and_sorts_by_name() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "z-openai".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAI,
+                api_keys: vec!["sk-z".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into()],
+            },
+        );
+        providers.insert(
+            "a-anthropic".into(),
+            ProviderConfig {
+                provider_type: ProviderType::Anthropic,
+                api_keys: vec!["sk-a".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.anthropic.com".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into()],
+            },
+        );
+        providers.insert(
+            "m-openai".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAI,
+                api_keys: vec!["sk-m".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://example.com/v1".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
+            },
+        );
+
+        let state = build_state(providers, vec![]).await;
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/providers?model_name=gpt-4o&provider_type=openai&sort=name")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let names = provider_names_from_response(response).await;
+        assert_eq!(names, vec!["m-openai".to_string(), "z-openai".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_providers_model_filter_includes_unrestricted_providers() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAI,
+                api_keys: vec!["sk-openai".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec![],
+            },
+        );
+        providers.insert(
+            "restricted".into(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAI,
+                api_keys: vec!["sk-restricted".into()],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://example.com/v1".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                enabled_models: vec!["other-model".into()],
+            },
+        );
+
+        let state = build_state(providers, vec![]).await;
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/providers?model_name=gpt-4o")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let names = provider_names_from_response(response).await;
+        assert_eq!(names, vec!["openai".to_string()]);
     }
 
     // ── Route CRUD tests ──────────────────────────────────────────────

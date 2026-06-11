@@ -4,6 +4,12 @@ import { api, headers } from "@/lib/client"
 import type { ModelTestResult, Provider } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
+export interface FetchProvidersParams {
+  model_name?: string
+  provider_type?: string
+  sort?: string
+}
+
 function createPerItemState<T, K extends string>() {
   const states = ref<
     Record<string, { loading: boolean; error: string; data: T | undefined } | undefined>
@@ -33,13 +39,21 @@ export const useProviderStore = defineStore("providers", () => {
 
   const testModelState = createPerItemState<ModelTestResult[], string>()
 
-  async function fetchProviders() {
+  async function fetchProviders(params: FetchProvidersParams = {}) {
     providersLoading.value = true
     try {
       const conn = useConnectionStore()
-      const { data } = await api.get<{ providers: Provider[] }>("/api/providers", {
-        headers: headers(conn.connection?.apiKey),
-      })
+      const queryParams = new URLSearchParams()
+      if (params.model_name?.trim()) queryParams.set("model_name", params.model_name.trim())
+      if (params.provider_type) queryParams.set("provider_type", params.provider_type)
+      if (params.sort) queryParams.set("sort", params.sort)
+      const query = queryParams.toString()
+      const { data } = await api.get<{ providers: Provider[] }>(
+        `/api/providers${query ? `?${query}` : ""}`,
+        {
+          headers: headers(conn.connection?.apiKey),
+        },
+      )
       providers.value = data.providers
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()

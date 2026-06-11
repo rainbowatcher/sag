@@ -59,8 +59,7 @@ impl ProviderBase {
         match self.key_strategy {
             KeyStrategy::FillFirst => &self.api_keys[0],
             KeyStrategy::RoundRobin => {
-                let idx =
-                    self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+                let idx = self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
                 &self.api_keys[idx]
             }
         }

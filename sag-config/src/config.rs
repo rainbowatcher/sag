@@ -38,9 +38,8 @@ impl GatewayConfig {
             && !analytics.storage_dsn.starts_with("sqlite://")
             && analytics.storage_dsn != ":memory:"
         {
-            errors.push(
-                "analytics.storage_dsn must start with 'sqlite://' or be ':memory:'".into(),
-            );
+            errors
+                .push("analytics.storage_dsn must start with 'sqlite://' or be ':memory:'".into());
         }
 
         // ── Providers validation ──
@@ -578,7 +577,8 @@ targets = [
         use super::*;
 
         fn valid_config() -> GatewayConfig {
-            toml::from_str(r#"
+            toml::from_str(
+                r#"
 [server]
 host = "127.0.0.1"
 port = 8080
@@ -591,7 +591,8 @@ model_name = "gpt-4o"
 targets = [
     { provider = "openai" },
 ]
-"#)
+"#,
+            )
             .unwrap()
         }
 
@@ -611,7 +612,8 @@ targets = [
 
         #[test]
         fn rejects_unknown_provider_ref() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
@@ -621,7 +623,8 @@ model_name = "gpt-4o"
 targets = [
     { provider = "nonexistent" },
 ]
-"#)
+"#,
+            )
             .unwrap();
             let err = config.validate().unwrap_err();
             assert!(err.iter().any(|e| e.contains("unknown provider")));
@@ -632,7 +635,10 @@ targets = [
             let mut config = valid_config();
             config.server.host = "".into();
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("server.host must not be empty")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("server.host must not be empty"))
+            );
         }
 
         #[test]
@@ -640,7 +646,10 @@ targets = [
             let mut config = valid_config();
             config.server.port = 0;
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("port must be greater than 0")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("port must be greater than 0"))
+            );
         }
 
         #[test]
@@ -656,12 +665,16 @@ targets = [
             let mut config = valid_config();
             config.providers.get_mut("openai").unwrap().timeout_secs = 0;
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("timeout_secs must be greater than 0")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("timeout_secs must be greater than 0"))
+            );
         }
 
         #[test]
         fn rejects_empty_model_name() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
@@ -671,15 +684,20 @@ model_name = ""
 targets = [
     { provider = "openai" },
 ]
-"#)
+"#,
+            )
             .unwrap();
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("model_name must not be empty")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("model_name must not be empty"))
+            );
         }
 
         #[test]
         fn rejects_api_endpoint_no_slash() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
@@ -690,41 +708,56 @@ api_endpoint = "chat/completions"
 targets = [
     { provider = "openai" },
 ]
-"#)
+"#,
+            )
             .unwrap();
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("api_endpoint must start with '/'")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("api_endpoint must start with '/'"))
+            );
         }
 
         #[test]
         fn rejects_analytics_invalid_dsn() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [analytics]
 enabled = true
 storage_dsn = "postgres://localhost/db"
 [providers.openai]
 api_keys = ["sk-test"]
-"#)
+"#,
+            )
             .unwrap();
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("storage_dsn must start with 'sqlite://'")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("storage_dsn must start with 'sqlite://'"))
+            );
         }
 
         #[test]
         fn rejects_empty_providers() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [providers]
-"#)
+"#,
+            )
             .unwrap();
             let err = config.validate().unwrap_err();
-            assert!(err.iter().any(|e| e.contains("at least one provider is required")));
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("at least one provider is required"))
+            );
         }
 
         #[test]
         fn rejects_no_targets() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
@@ -732,7 +765,8 @@ api_keys = ["sk-test"]
 [[routes]]
 model_name = "gpt-4o"
 targets = []
-"#)
+"#,
+            )
             .unwrap();
             let err = config.validate().unwrap_err();
             assert!(err.iter().any(|e| e.contains("at least one target")));
@@ -740,14 +774,16 @@ targets = []
 
         #[test]
         fn valid_config_with_memory_dsn() {
-            let config: GatewayConfig = toml::from_str(r#"
+            let config: GatewayConfig = toml::from_str(
+                r#"
 [server]
 [analytics]
 enabled = true
 storage_dsn = ":memory:"
 [providers.openai]
 api_keys = ["sk-test"]
-"#)
+"#,
+            )
             .unwrap();
             assert!(config.validate().is_ok());
         }

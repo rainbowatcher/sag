@@ -4,8 +4,8 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use sag_core::{
-    AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    StreamChunk, Usage,
+    AppError, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, StreamChunk,
+    Usage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -140,9 +140,7 @@ fn process_anthropic_sse_frame(
             }
             "message_delta" => {
                 // Convert stop reason to OpenAI finish_reason chunk
-                let finish_reason = val["delta"]["stop_reason"]
-                    .as_str()
-                    .map(map_stop_reason);
+                let finish_reason = val["delta"]["stop_reason"].as_str().map(map_stop_reason);
                 let chunk = serde_json::json!({
                     "id": state.id.as_deref().unwrap_or(""),
                     "object": "chat.completion.chunk",
@@ -180,7 +178,6 @@ fn process_anthropic_sse_frame(
         }
     }
 }
-
 
 // ── Anthropic wire types ─────────────────────────────────────────
 
@@ -371,10 +368,7 @@ impl LlmProvider for AnthropicProvider {
                 &url,
                 body,
                 target_extra,
-                &[
-                    ("x-api-key", key),
-                    ("anthropic-version", "2023-06-01"),
-                ],
+                &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
             )
             .await?;
 
@@ -412,10 +406,7 @@ impl LlmProvider for AnthropicProvider {
                 &url,
                 body,
                 target_extra,
-                &[
-                    ("x-api-key", key),
-                    ("anthropic-version", "2023-06-01"),
-                ],
+                &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
             )
             .await?;
 

@@ -54,9 +54,9 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
     let config: GatewayConfig = toml::from_str(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
-    config.validate().map_err(|errors| {
-        sag_core::AppError::Config(errors.join("; "))
-    })?;
+    config
+        .validate()
+        .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
 
     info!(?config, "configuration loaded");
     Ok(ConfigHandle {
@@ -187,9 +187,9 @@ async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core
     let config: GatewayConfig = toml::from_str(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
-    config.validate().map_err(|errors| {
-        sag_core::AppError::Config(errors.join("; "))
-    })?;
+    config
+        .validate()
+        .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
 
     Ok(config)
 }

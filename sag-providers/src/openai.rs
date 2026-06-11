@@ -28,7 +28,10 @@ impl OpenAiProvider {
     }
 
     fn auth_header(&self) -> (&str, String) {
-        ("Authorization", format!("Bearer {}", self.base.current_key()))
+        (
+            "Authorization",
+            format!("Bearer {}", self.base.current_key()),
+        )
     }
 }
 
@@ -167,9 +170,7 @@ impl LlmProvider for OpenAiProvider {
             .await?;
 
         serde_json::from_str(&body_text).map_err(|e| {
-            AppError::Internal(format!(
-                "failed to parse image generation response: {e}"
-            ))
+            AppError::Internal(format!("failed to parse image generation response: {e}"))
         })
     }
 }
