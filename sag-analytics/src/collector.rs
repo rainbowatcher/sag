@@ -15,8 +15,8 @@ impl CallLogCollector {
     /// Create a new collector with a SQLite pool and spawn background persistence.
     /// `dsn` is a simple path (e.g. `analytics.db`) or `:memory:` for in-memory.
     pub async fn new(dsn: &str) -> Result<Self, sqlx::Error> {
-        let options = if dsn == ":memory:" {
-            SqliteConnectOptions::from_str("sqlite::memory:")?
+        let options = if dsn.starts_with("sqlite:") || dsn == ":memory:" {
+            SqliteConnectOptions::from_str(dsn)?
         } else {
             SqliteConnectOptions::new()
                 .filename(dsn)
