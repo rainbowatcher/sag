@@ -171,7 +171,7 @@ async fn chat_completions_handler(
         let prompt = request
             .messages
             .last()
-            .map(|m| m.content.clone())
+            .and_then(|m| m.text_content().map(String::from))
             .unwrap_or_default();
 
         // Forward relevant extra keys from the chat request

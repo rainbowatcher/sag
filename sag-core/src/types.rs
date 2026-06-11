@@ -4,9 +4,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    /// Message content — can be a plain text string or an array of
+    /// content parts (text, image_url, input_audio, file, etc.).
+    pub content: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Catch-all for message-level fields not captured by the struct
+    /// (e.g. `tool_calls`, `tool_call_id`, `refusal`, `audio`, `function_call`).
+    /// These are forwarded transparently by OpenAI providers and ignored
+    /// by providers that map to a different wire format (e.g. Anthropic).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ChatMessage {
+    /// Extract the plain-text content of this message, if it is a simple string.
+    pub fn text_content(&self) -> Option<&str> {
+        self.content.as_str()
+    }
 }
 
 /// Standard chat completion request accepted by the gateway.
@@ -30,8 +45,9 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     /// Up to 4 sequences where the API will stop generating further tokens.
+    /// Accepts either a single string or an array of strings.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop: Option<Vec<String>>,
+    pub stop: Option<StopSequence>,
     /// The maximum number of tokens that can be generated (deprecated in favor of max_completion_tokens).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
@@ -41,15 +57,27 @@ pub struct ChatCompletionRequest {
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f64>,
+    /// Modify the likelihood of specified tokens appearing in the completion.
+    /// Maps token IDs (as string keys) to bias values from -100 to 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<serde_json::Value>,
     /// An upper bound for the number of tokens that can be generated, including reasoning tokens.
     /// Replaces `max_tokens` for o-series models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
+    /// Output types that you would like the model to generate.
+    /// E.g. `["text"]` or `["text", "audio"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<serde_json::Value>,
+    /// Parameters for audio output. Required when audio output is requested
+    /// with `modalities: ["audio"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<serde_json::Value>,
     /// Options for streaming response. Only set this when you set `stream: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<serde_json::Value>,
     /// Constrains effort on reasoning for reasoning models.
-    /// Supported values: `none`, `low`, `medium`, `high`.
+    /// Supported values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Set of 16 key-value pairs that can be attached to the completion for structured metadata.
@@ -58,6 +86,9 @@ pub struct ChatCompletionRequest {
     /// Whether to enable parallel function calling during tool use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    /// Static predicted output content for faster regeneration (Predicted Outputs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<serde_json::Value>,
     /// A list of tools the model may call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
@@ -67,7 +98,8 @@ pub struct ChatCompletionRequest {
     /// An object specifying the format that the model must output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
-    /// If specified, the system will make a best effort to sample deterministically (Deprecated).
+    /// If specified, the system will make a best effort to sample deterministically.
+    /// This feature is in Beta — determinism is not guaranteed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
     /// Whether to return log probabilities of the output tokens.
@@ -76,19 +108,73 @@ pub struct ChatCompletionRequest {
     /// An integer specifying the number of most likely tokens to return at each token position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<i64>,
-    /// A unique identifier representing your end-user.
+    /// A unique identifier representing your end-user (being replaced by
+    /// `safety_identifier` and `prompt_cache_key`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Used by OpenAI to cache responses for similar requests to optimize
+    /// cache hit rates. Replaces `user` for caching purposes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// The retention policy for the prompt cache.
+    /// One of `"in_memory"` or `"24h"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
+    /// A stable identifier used to help detect users that may be violating
+    /// OpenAI's usage policies. Replaces `user` for safety purposes.
+    /// Max 64 characters; hashing recommended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
     /// Whether to store the output for distillation or evals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
     /// Specifies the processing type used for serving the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// Constrains the verbosity of the model's response.
+    /// Supported values: `"low"`, `"medium"`, `"high"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
+    /// Configuration for running moderation on the request input and
+    /// generated output. E.g. `{"model": "omni-moderation-latest"}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<serde_json::Value>,
+    /// Web search options for models that support the web search tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_search_options: Option<serde_json::Value>,
+    /// Deprecated in favor of `tool_choice`. Controls which (if any)
+    /// function is called by the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<serde_json::Value>,
+    /// Deprecated in favor of `tools`. A list of functions the model
+    /// may generate JSON inputs for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions: Option<serde_json::Value>,
     /// Catch-all for non-standard / provider-specific parameters.
     /// Filtered per-provider against supported params.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Represents the `stop` parameter which can be either a single string or an
+/// array of up to 4 strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StopSequence {
+    /// A single stop sequence, e.g. `"END"`.
+    Single(String),
+    /// Multiple stop sequences, e.g. `["END", "STOP"]`.
+    Multiple(Vec<String>),
+}
+
+impl StopSequence {
+    /// Convert to a `Vec<String>` regardless of variant.
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StopSequence::Single(s) => vec![s],
+            StopSequence::Multiple(v) => v,
+        }
+    }
 }
 
 /// A choice in a non-streaming chat completion response.

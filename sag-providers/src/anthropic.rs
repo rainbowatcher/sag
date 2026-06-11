@@ -133,7 +133,7 @@ impl AnthropicProvider {
             .messages
             .iter()
             .find(|m| m.role == "system")
-            .map(|m| m.content.clone());
+            .and_then(|m| m.text_content().map(String::from));
 
         let messages: Vec<AnthropicMessage> = request
             .messages
@@ -146,14 +146,14 @@ impl AnthropicProvider {
                     "user".into()
                 },
                 content: vec![ContentBlock::Text {
-                    text: m.content.clone(),
+                    text: m.text_content().unwrap_or_default().to_string(),
                 }],
             })
             .collect();
 
         let max_tokens = request.max_tokens.unwrap_or(1024);
 
-        let stop_sequences = request.stop.clone();
+        let stop_sequences = request.stop.clone().map(|s| s.into_vec());
 
         AnthropicRequest {
             model: real_model.to_string(),
@@ -194,8 +194,9 @@ impl AnthropicProvider {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: text,
+                    content: serde_json::Value::String(text),
                     name: None,
+                    extra: serde_json::Map::new(),
                 },
                 finish_reason: Some("stop".into()),
             }],
