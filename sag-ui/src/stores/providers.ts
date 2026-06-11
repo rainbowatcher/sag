@@ -27,9 +27,9 @@ export const useProviderStore = defineStore("providers", () => {
   const providers = ref<Provider[]>([])
   const providersLoading = ref(false)
 
-  const v1Models = ref<Record<string, unknown>[]>([])
-  const v1ModelsLoading = ref(false)
-  const v1ModelsError = ref<string>("")
+  const upstreamModels = ref<Record<string, unknown>[]>([])
+  const upstreamModelsLoading = ref(false)
+  const upstreamModelsError = ref<string>("")
 
   const testModelState = createPerItemState<ModelTestResult[], string>()
 
@@ -55,8 +55,8 @@ export const useProviderStore = defineStore("providers", () => {
     provider_type?: string
     models_endpoint?: string
   }) {
-    v1ModelsLoading.value = true
-    v1ModelsError.value = ""
+    upstreamModelsLoading.value = true
+    upstreamModelsError.value = ""
     try {
       const conn = useConnectionStore()
       const { data } = await api.post<{ models: Record<string, unknown>[] }>(
@@ -66,13 +66,13 @@ export const useProviderStore = defineStore("providers", () => {
           headers: headers(conn.connection?.apiKey),
         },
       )
-      v1Models.value = data.models
-      v1ModelsError.value = ""
+      upstreamModels.value = data.models
+      upstreamModelsError.value = ""
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
-      v1ModelsError.value = e.response?.data?.error?.message ?? e.message ?? String(e)
+      upstreamModelsError.value = e.response?.data?.error?.message ?? e.message ?? String(e)
     } finally {
-      v1ModelsLoading.value = false
+      upstreamModelsLoading.value = false
     }
   }
 
@@ -167,9 +167,9 @@ export const useProviderStore = defineStore("providers", () => {
   return {
     providers,
     providersLoading,
-    v1Models,
-    v1ModelsLoading,
-    v1ModelsError,
+    upstreamModels,
+    upstreamModelsLoading,
+    upstreamModelsError,
     fetchProviders,
     fetchUpstreamModels,
     addProvider,

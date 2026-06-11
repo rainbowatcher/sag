@@ -19,9 +19,9 @@ export interface ModelTestState {
 const props = withDefaults(
   defineProps<{
     enabledModels: string[]
-    v1Models: Record<string, unknown>[]
-    v1ModelsLoading: boolean
-    v1ModelsError: string
+    upstreamModels: Record<string, unknown>[]
+    upstreamModelsLoading: boolean
+    upstreamModelsError: string
     /** Per-model test states (optional — only shown when provided) */
     modelTestStates?: Record<string, ModelTestState | undefined>
     disabled?: boolean
@@ -144,14 +144,14 @@ function removeModel(name: string) {
         <Combobox
           v-model="selectedModel"
           :options="
-            v1Models
+            upstreamModels
               .filter((m) => !enabledModels.includes(modelLabel(m)))
               .map((m) => ({ value: modelLabel(m) }))
           "
           placeholder="Select a model..."
           search-placeholder="Search models..."
           empty-text="No models found. Click Refresh Models."
-          :loading="v1ModelsLoading"
+          :loading="upstreamModelsLoading"
         />
       </div>
       <Button variant="outline" size="sm" :disabled="!selectedModel.trim()" @click="addModel">
@@ -171,11 +171,13 @@ function removeModel(name: string) {
         <RefreshCw class="h-3.5 w-3.5" />
         Refresh Models
       </Button>
-      <div v-if="v1ModelsLoading" class="text-muted-foreground text-xs">Loading models...</div>
+      <div v-if="upstreamModelsLoading" class="text-muted-foreground text-xs">
+        Loading models...
+      </div>
     </div>
 
-    <div v-if="v1ModelsError" class="rounded-md bg-red-50 px-2 py-1 text-xs text-red-500">
-      {{ v1ModelsError }}
+    <div v-if="upstreamModelsError" class="rounded-md bg-red-50 px-2 py-1 text-xs text-red-500">
+      {{ upstreamModelsError }}
     </div>
 
     <!-- Models endpoint path -->

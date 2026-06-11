@@ -259,9 +259,9 @@ async function handleSubmit() {
           <TabsContent value="models" class="space-y-3">
             <ModelManager
               :enabled-models="enabledModels"
-              :v1-models="store.v1Models"
-              :v1-models-loading="store.v1ModelsLoading"
-              :v1-models-error="store.v1ModelsError"
+              :upstream-models="store.upstreamModels"
+              :upstream-models-loading="store.upstreamModelsLoading"
+              :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
