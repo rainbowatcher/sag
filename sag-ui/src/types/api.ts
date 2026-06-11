@@ -4,6 +4,7 @@ export interface Provider {
   key_strategy: "fill_first" | "round_robin"
   provider_type: string
   base_url: string
+  models_endpoint: string
   timeout_secs: number
   headers: Record<string, string>
   body_overrides: Record<string, any>
@@ -23,6 +24,14 @@ export interface RouteTarget {
   priority: number
   retries?: number
   extra?: Record<string, any>
+}
+
+export interface TargetItem {
+  provider: string
+  real_model: string
+  priority: number
+  retries: number
+  extra: string
 }
 
 export interface RouteConfig {

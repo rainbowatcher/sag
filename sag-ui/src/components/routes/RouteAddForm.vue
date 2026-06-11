@@ -1,17 +1,16 @@
 <script setup lang="ts">
-import { X, Loader2, ArrowUp, ArrowDown, Plus, Trash2 } from "@lucide/vue"
+import { X, Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { ref } from "vue"
 import { z } from "zod"
-import Combobox from "@/components/Combobox.vue"
+import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
-import { Field, FieldError, FieldLabel } from "@/components/ui/field"
+import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useRouteStore } from "@/stores/routes"
-import type { Provider, Strategy, CreateRoutePayload } from "@/types/api"
+import type { Provider, Strategy, CreateRoutePayload, TargetItem } from "@/types/api"
 
 const routeStore = useRouteStore()
 
@@ -29,34 +28,9 @@ const emit = defineEmits<{
 const adding = ref(false)
 const apiError = ref("")
 
-interface TargetForm {
-  provider_name: string
-  real_model: string
-  priority: number
-  retries: number
-  extra: string
-}
-
-const targets = ref<TargetForm[]>([
-  { provider_name: "", real_model: "", priority: 0, retries: 0, extra: "" },
+const targets = ref<TargetItem[]>([
+  { provider: "", real_model: "", priority: 0, retries: 0, extra: "" },
 ])
-
-function addTarget() {
-  targets.value.push({ provider_name: "", real_model: "", priority: 0, retries: 0, extra: "" })
-}
-
-function removeTarget(index: number) {
-  if (targets.value.length > 1) {
-    targets.value.splice(index, 1)
-  }
-}
-
-function swapPriority(i: number, j: number) {
-  if (j < 0 || j >= targets.value.length) return
-  const tmp = targets.value[i].priority
-  targets.value[i].priority = targets.value[j].priority
-  targets.value[j].priority = tmp
-}
 
 const endpointPresets = [
   { label: "Chat Completions", value: "/chat/completions" },
@@ -94,7 +68,7 @@ async function handleSubmit(event: Event) {
       apiError.value = "At least one target is required"
       return
     }
-    const emptyTarget = targets.value.find((t) => !t.provider_name)
+    const emptyTarget = targets.value.find((t) => !t.provider)
     if (emptyTarget) {
       apiError.value = "Each target must have a provider selected"
       return
@@ -112,7 +86,7 @@ async function handleSubmit(event: Event) {
       strategy: form.state.values.strategy,
       targets: targets.value.map((t) => {
         const entry: CreateRoutePayload["targets"][number] = {
-          provider: t.provider_name,
+          provider: t.provider,
           real_model: t.real_model || undefined,
           priority: t.priority,
           retries: t.retries || undefined,
@@ -122,7 +96,7 @@ async function handleSubmit(event: Event) {
             entry.extra = JSON.parse(t.extra)
           } catch {
             throw new Error(
-              `Target ${t.provider_name || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
+              `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
             )
           }
         }
@@ -208,120 +182,13 @@ async function handleSubmit(event: Event) {
           </div>
         </div>
 
-        <div class="mt-6 space-y-3">
-          <div class="flex items-center justify-between">
-            <p class="text-sm font-medium">Targets</p>
-            <Button type="button" variant="outline" size="sm" @click="addTarget">
-              <Plus class="mr-1 h-3.5 w-3.5" />
-              Add Target
-            </Button>
-          </div>
-
-          <div
-            v-for="(t, i) in targets"
-            :key="i"
-            class="flex items-end gap-2 rounded-lg border p-3"
-          >
-            <span class="text-muted-foreground mb-2 w-5 pt-1 text-center text-xs font-medium">
-              {{ i + 1 }}
-            </span>
-
-            <div class="flex-1">
-              <Label class="text-xs">Provider</Label>
-              <Combobox
-                :model-value="t.provider_name"
-                :options="
-                  providers.map((p) => ({
-                    value: p.name,
-                    label: `${p.name} (${p.provider_type})`,
-                  }))
-                "
-                placeholder="Select provider..."
-                search-placeholder="Search provider..."
-                empty-text="No providers found"
-                @update:model-value="
-                  (v) => {
-                    t.provider_name = v as string
-                    t.real_model = ''
-                    routeStore.loadProviderModels(v as string, providers)
-                  }
-                "
-              />
-            </div>
-
-            <div class="flex-1">
-              <Label class="text-xs">Real Model</Label>
-              <Combobox
-                v-model="t.real_model"
-                :options="(providerModels[t.provider_name] ?? []).map((m) => ({ value: m }))"
-                placeholder="Select model"
-                search-placeholder="Search model..."
-                empty-text="No models found"
-                :loading="providerModelsLoading && !providerModels[t.provider_name]"
-              />
-            </div>
-
-            <div class="w-20">
-              <Label class="text-xs">Priority</Label>
-              <Input
-                type="number"
-                :model-value="t.priority"
-                @input="t.priority = Number(($event.target as HTMLInputElement).value)"
-              />
-            </div>
-
-            <div class="w-20">
-              <Label class="text-xs">Retries</Label>
-              <Input
-                type="number"
-                :model-value="t.retries"
-                @input="t.retries = Number(($event.target as HTMLInputElement).value)"
-              />
-            </div>
-
-            <div class="w-36">
-              <Label class="text-xs">Extra (JSON)</Label>
-              <Input
-                :model-value="t.extra"
-                placeholder='{"model_id": 39}'
-                @input="t.extra = ($event.target as HTMLInputElement).value"
-              />
-            </div>
-
-            <div class="flex flex-col gap-0.5 pb-1">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                class="h-5 w-5"
-                :disabled="i === 0"
-                @click="swapPriority(i, i - 1)"
-              >
-                <ArrowUp class="h-3 w-3" />
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                class="h-5 w-5"
-                :disabled="i === targets.length - 1"
-                @click="swapPriority(i, i + 1)"
-              >
-                <ArrowDown class="h-3 w-3" />
-              </Button>
-            </div>
-
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              :disabled="targets.length === 1"
-              @click="removeTarget(i)"
-            >
-              <Trash2 class="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
+        <TargetEditor
+          :targets="targets"
+          :providers="providers"
+          :provider-models="providerModels"
+          :provider-models-loading="providerModelsLoading"
+          show-priority-controls
+        />
       </form>
     </CardContent>
     <CardFooter class="flex justify-end">

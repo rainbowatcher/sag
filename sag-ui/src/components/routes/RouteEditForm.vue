@@ -1,17 +1,16 @@
 <script setup lang="ts">
-import { Loader2, Plus, Trash2 } from "@lucide/vue"
+import { Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { onMounted, ref } from "vue"
 import { z } from "zod"
-import Combobox from "@/components/Combobox.vue"
+import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
-import { Field, FieldError, FieldLabel } from "@/components/ui/field"
+import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-import type { RouteConfig, Strategy } from "@/types/api"
+import type { RouteConfig, Strategy, TargetItem } from "@/types/api"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
@@ -27,15 +26,7 @@ const emit = defineEmits<{
 
 const saving = ref(false)
 const apiError = ref("")
-interface TargetEdit {
-  provider: string
-  real_model: string
-  priority: number
-  retries: number
-  extra: string
-}
-
-const targets = ref<TargetEdit[]>(
+const targets = ref<TargetItem[]>(
   props.route.targets.map((t) => ({
     provider: t.provider,
     real_model: t.real_model ?? "",
