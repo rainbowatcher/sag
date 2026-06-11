@@ -39,7 +39,6 @@ const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
 const enabledModels = ref<string[]>([])
 
 function onFetchModels(modelsEndpoint: string) {
-  const firstKey = apiKeys.value.find((k) => k.trim()) ?? ""
   const parsedHeaders = headers.value.reduce(
     (acc, h) => {
       if (h.key.trim() && h.value.trim()) acc[h.key.trim()] = h.value.trim()
@@ -49,7 +48,7 @@ function onFetchModels(modelsEndpoint: string) {
   )
   store.fetchUpstreamModels({
     base_url: form.state.values.base_url,
-    api_key: firstKey,
+    api_keys: apiKeys.value.filter((k) => k.trim()),
     headers: parsedHeaders,
     provider_type: form.state.values.provider_type,
     models_endpoint: modelsEndpoint,
@@ -121,11 +120,9 @@ const form = useForm({
       }
 
       const validKeys = apiKeys.value.filter((k) => k.trim())
-      const effectiveApiKey = validKeys[0] || ""
 
       await store.addProvider({
         name: value.name,
-        api_key: effectiveApiKey,
         api_keys: validKeys,
         key_strategy: keyStrategy.value,
         provider_type: value.provider_type,

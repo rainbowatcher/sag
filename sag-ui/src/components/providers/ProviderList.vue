@@ -34,7 +34,7 @@ async function testModel(providerName: string, model: string) {
     const conn = useConnectionStore()
     const provider = store.providers.find((p) => p.name === providerName)
     if (!provider) return
-    const keys = provider.api_keys.length > 0 ? provider.api_keys : [provider.api_key]
+    const keys = provider.api_keys
     const { data } = await api.post<{ results: ModelTestResult[] }>(
       "/api/model/test",
       {

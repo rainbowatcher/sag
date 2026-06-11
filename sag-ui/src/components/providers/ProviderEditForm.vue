@@ -85,10 +85,7 @@ const enabledModels = ref<string[]>([...props.provider.enabled_models])
 function onTestModel(model: string) {
   store.testModelWithState(model, {
     model,
-    api_keys:
-      apiKeys.value.filter((k) => k.trim()).length > 0
-        ? apiKeys.value.filter((k) => k.trim())
-        : [props.provider.api_key],
+    api_keys: apiKeys.value.filter((k) => k.trim()),
     base_url: baseUrl.value,
     provider_type: providerType.value,
     headers: headersMap(),
@@ -118,7 +115,7 @@ function headersMap(): Record<string, string> {
 function onFetchModels(modelsEndpoint: string) {
   store.fetchUpstreamModels({
     base_url: baseUrl.value,
-    api_key: apiKeys.value[0] || props.provider.api_key,
+    api_keys: apiKeys.value.filter((k) => k.trim()),
     headers: headersMap(),
     provider_type: providerType.value,
     models_endpoint: modelsEndpoint,
@@ -134,7 +131,6 @@ async function handleSubmit() {
     const payload: Record<string, any> = {}
 
     if (validKeys.length > 0) {
-      payload.api_key = validKeys[0]
       payload.api_keys = validKeys
     }
     payload.key_strategy = keyStrategy.value

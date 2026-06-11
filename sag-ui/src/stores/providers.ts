@@ -50,7 +50,7 @@ export const useProviderStore = defineStore("providers", () => {
 
   async function fetchUpstreamModels(payload: {
     base_url: string
-    api_key: string
+    api_keys: string[]
     headers?: Record<string, string>
     provider_type?: string
     models_endpoint?: string
@@ -97,8 +97,7 @@ export const useProviderStore = defineStore("providers", () => {
 
   async function addProvider(payload: {
     name: string
-    api_key: string
-    api_keys?: string[]
+    api_keys: string[]
     key_strategy?: string
     provider_type: string
     base_url?: string
@@ -139,7 +138,6 @@ export const useProviderStore = defineStore("providers", () => {
   async function updateProvider(
     name: string,
     payload: {
-      api_key?: string
       api_keys?: string[]
       key_strategy?: string
       provider_type?: string
