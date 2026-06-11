@@ -53,7 +53,7 @@ pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamC
 }
 
 /// Search for the SSE frame delimiter `\n\n` (or `\r\n\r\n`).
-fn find_sse_boundary(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_sse_boundary(buf: &[u8]) -> Option<usize> {
     if buf.len() >= 4
         && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
     {

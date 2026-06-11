@@ -195,6 +195,11 @@ impl LlmProvider for OpenAiProvider {
             let mut had_error = false;
 
             loop {
+                // Stop reading if the client has disconnected
+                if tx.is_closed() {
+                    break;
+                }
+
                 match byte_stream.next().await {
                     Some(Ok(chunk)) => {
                         buffer.extend_from_slice(&chunk);
@@ -202,7 +207,9 @@ impl LlmProvider for OpenAiProvider {
                     }
                     Some(Err(e)) => {
                         error!(?e, "error reading upstream stream chunk");
-                        let _ = tx.send(StreamChunk::Error(e.to_string()));
+                        if !tx.is_closed() {
+                            let _ = tx.send(StreamChunk::Error(e.to_string()));
+                        }
                         had_error = true;
                         break;
                     }
