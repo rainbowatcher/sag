@@ -11,7 +11,6 @@ use sag_config::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{instrument, warn};
 
 use crate::state::AppState;
@@ -469,16 +468,7 @@ async fn add_provider(
     };
 
     // 2. Build the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type {
-        ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
-            req.name.clone(),
-            &provider_config,
-        )),
-        ProviderType::Anthropic => Arc::new(sag_providers::AnthropicProvider::new(
-            req.name.clone(),
-            &provider_config,
-        )),
-    };
+    let provider = sag_providers::create_provider(req.name.clone(), &provider_config);
 
     {
         let mut providers = state.providers.write().await;
@@ -557,16 +547,7 @@ async fn update_provider(
     };
 
     // Rebuild the provider adapter and register it
-    let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type {
-        ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
-            req.name.clone(),
-            &provider_config,
-        )),
-        ProviderType::Anthropic => Arc::new(sag_providers::AnthropicProvider::new(
-            req.name.clone(),
-            &provider_config,
-        )),
-    };
+    let provider = sag_providers::create_provider(req.name.clone(), &provider_config);
 
     {
         let mut providers = state.providers.write().await;

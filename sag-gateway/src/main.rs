@@ -46,18 +46,9 @@ async fn main() -> anyhow::Result<()> {
     let mut providers: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
 
     for (name, provider_config) in &config.providers {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match provider_config.provider_type {
-            sag_config::ProviderType::Anthropic => Arc::new(sag_providers::AnthropicProvider::new(
-                name.clone(),
-                provider_config,
-            )),
-            sag_config::ProviderType::OpenAI => Arc::new(sag_providers::OpenAiProvider::new(
-                name.clone(),
-                provider_config,
-            )),
-        };
-        providers.insert(name.clone(), provider);
+        let provider = sag_providers::create_provider(name.clone(), provider_config);
         info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
+        providers.insert(name.clone(), provider);
     }
     drop(config);
 
