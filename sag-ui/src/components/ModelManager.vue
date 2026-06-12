@@ -74,6 +74,11 @@ function removeModel(name: string) {
     props.enabledModels.filter((m) => m !== name),
   )
 }
+
+function onModelsEndpointChange(value: string | number) {
+  modelsEndpoint.value = String(value)
+  emit("update:modelsEndpoint", modelsEndpoint.value)
+}
 </script>
 
 <template>
@@ -198,10 +203,7 @@ function removeModel(name: string) {
       <Input
         :model-value="modelsEndpoint"
         :disabled="disabled"
-        @input="
-          modelsEndpoint = ($event.target as HTMLInputElement).value
-          emit('update:modelsEndpoint', modelsEndpoint)
-        "
+        @update:model-value="onModelsEndpointChange"
       />
     </div>
   </div>
