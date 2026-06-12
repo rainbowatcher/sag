@@ -37,8 +37,13 @@ const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
 
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
+const modelsEndpoint = ref("models")
 
-function onFetchModels(modelsEndpoint: string) {
+function defaultModelsEndpoint(providerType?: string) {
+  return providerType === "anthropic" ? "v1/models" : "models"
+}
+
+function onFetchModels(endpoint: string) {
   const parsedHeaders = headers.value.reduce(
     (acc, h) => {
       if (h.key.trim() && h.value.trim()) acc[h.key.trim()] = h.value.trim()
@@ -51,7 +56,7 @@ function onFetchModels(modelsEndpoint: string) {
     api_keys: apiKeys.value.filter((k) => k.trim()),
     headers: parsedHeaders,
     provider_type: form.state.values.provider_type,
-    models_endpoint: modelsEndpoint,
+    models_endpoint: endpoint,
   })
 }
 
@@ -118,6 +123,7 @@ const form = useForm({
         headers: parsedHeaders,
         body_overrides: parsedBodyOverrides,
         enabled_models: enabledModels.value,
+        models_endpoint: modelsEndpoint.value.trim() || undefined,
       })
       emit("created")
     } catch (e: any) {
@@ -132,11 +138,14 @@ const form = useForm({
 // auto-switch to the new type's default.
 watch(
   () => form.state.values.provider_type,
-  (newType) => {
+  (newType, oldType) => {
     const currentUrl = form.state.values.base_url
     const isDefault = Object.values(DEFAULT_BASE_URLS).includes(currentUrl)
     if (isDefault && DEFAULT_BASE_URLS[newType]) {
       form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
+    }
+    if (modelsEndpoint.value === defaultModelsEndpoint(oldType)) {
+      modelsEndpoint.value = defaultModelsEndpoint(newType)
     }
   },
 )
@@ -263,6 +272,7 @@ async function handleSubmit(event: Event) {
               :upstream-models="store.upstreamModels"
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
+              v-model:models-endpoint="modelsEndpoint"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
             />

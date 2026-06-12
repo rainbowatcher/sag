@@ -81,6 +81,11 @@ const keyStrategy = ref<"fill_first" | "round_robin">(props.provider.key_strateg
 
 // ── Models ───────────────────────────────────────────────────
 const enabledModels = ref<string[]>([...props.provider.enabled_models])
+const modelsEndpoint = ref(props.provider.models_endpoint || "models")
+
+function defaultModelsEndpoint(providerType: string) {
+  return providerType === "anthropic" ? "v1/models" : "models"
+}
 
 function onTestModel(model: string) {
   store.testModelWithState(model, {
@@ -112,13 +117,13 @@ function headersMap(): Record<string, string> {
 }
 
 // ── Fetch upstream models ────────────────────────────────────
-function onFetchModels(modelsEndpoint: string) {
+function onFetchModels(endpoint: string) {
   store.fetchUpstreamModels({
     base_url: baseUrl.value,
     api_keys: apiKeys.value.filter((k) => k.trim()),
     headers: headersMap(),
     provider_type: providerType.value,
-    models_endpoint: modelsEndpoint,
+    models_endpoint: endpoint,
   })
 }
 
@@ -134,6 +139,14 @@ async function handleSubmit() {
       payload.api_keys = validKeys
     }
     payload.key_strategy = keyStrategy.value
+
+    const oldModelsEndpoint = defaultModelsEndpoint(props.provider.provider_type)
+    if (
+      providerType.value !== props.provider.provider_type &&
+      modelsEndpoint.value === oldModelsEndpoint
+    ) {
+      modelsEndpoint.value = defaultModelsEndpoint(providerType.value)
+    }
 
     if (providerType.value !== props.provider.provider_type) {
       payload.provider_type = providerType.value
@@ -170,6 +183,10 @@ async function handleSubmit() {
       JSON.stringify(enabledModels.value) !== JSON.stringify(props.provider.enabled_models ?? [])
     ) {
       payload.enabled_models = enabledModels.value
+    }
+
+    if (modelsEndpoint.value.trim() !== (props.provider.models_endpoint || "models")) {
+      payload.models_endpoint = modelsEndpoint.value.trim() || undefined
     }
 
     await store.updateProvider(props.provider.name, payload)
@@ -263,6 +280,7 @@ async function handleSubmit() {
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
+              v-model:models-endpoint="modelsEndpoint"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"

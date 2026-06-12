@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Loader2, Plus, RefreshCw, X } from "@lucide/vue"
-import { ref, type Ref } from "vue"
+import { ref, watch, type Ref } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
@@ -22,6 +22,7 @@ const props = withDefaults(
     upstreamModels: Record<string, unknown>[]
     upstreamModelsLoading: boolean
     upstreamModelsError: string
+    modelsEndpoint?: string
     /** Per-model test states (optional — only shown when provided) */
     modelTestStates?: Record<string, ModelTestState | undefined>
     disabled?: boolean
@@ -34,6 +35,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   "update:enabledModels": [value: string[]]
+  "update:modelsEndpoint": [value: string]
   fetchModels: [modelsEndpoint: string]
   testModel: [model: string]
 }>()
@@ -41,7 +43,14 @@ const emit = defineEmits<{
 // ── Internal state ─────────────────────────────────
 const selectedModel = ref("")
 const customModel = ref("")
-const modelsEndpoint = ref("models")
+const modelsEndpoint = ref(props.modelsEndpoint ?? "models")
+
+watch(
+  () => props.modelsEndpoint,
+  (value) => {
+    modelsEndpoint.value = value ?? "models"
+  },
+)
 
 function addModelByName(name: string, sourceRef: Ref<string>) {
   const trimmed = name.trim()
@@ -189,7 +198,10 @@ function removeModel(name: string) {
       <Input
         :model-value="modelsEndpoint"
         :disabled="disabled"
-        @input="modelsEndpoint = ($event.target as HTMLInputElement).value"
+        @input="
+          modelsEndpoint = ($event.target as HTMLInputElement).value
+          emit('update:modelsEndpoint', modelsEndpoint)
+        "
       />
     </div>
   </div>
