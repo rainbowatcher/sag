@@ -9,7 +9,7 @@ use sag_core::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, error, instrument};
+use tracing::{error, instrument, trace};
 
 use crate::{LlmProvider, ProviderBase, find_sse_boundary};
 
@@ -341,7 +341,7 @@ impl LlmProvider for AnthropicProvider {
         &self.base.name
     }
 
-    #[instrument(skip(self, request), fields(provider = %self.base.name, model = %real_model))]
+    #[instrument(skip_all, fields(provider = %self.base.name, model = %real_model))]
     async fn chat(
         &self,
         request: &ChatCompletionRequest,
@@ -353,7 +353,7 @@ impl LlmProvider for AnthropicProvider {
 
         if !request.extra.is_empty() {
             let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
-            debug!(provider = %self.base.name, extra = ?keys, "forwarding non-standard extra parameters");
+            trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
         let url = self.base.build_url("/messages");
@@ -378,7 +378,7 @@ impl LlmProvider for AnthropicProvider {
         Ok(Self::from_anthropic_response(anthropic_resp, real_model))
     }
 
-    #[instrument(skip(self, request), fields(provider = %self.base.name, model = %real_model))]
+    #[instrument(skip_all, fields(provider = %self.base.name, model = %real_model))]
     async fn chat_stream(
         &self,
         request: &ChatCompletionRequest,
@@ -391,7 +391,7 @@ impl LlmProvider for AnthropicProvider {
 
         if !request.extra.is_empty() {
             let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
-            debug!(provider = %self.base.name, extra = ?keys, "forwarding non-standard extra parameters");
+            trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
         let url = self.base.build_url("/messages");

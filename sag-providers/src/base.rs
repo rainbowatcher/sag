@@ -99,7 +99,7 @@ impl ProviderBase {
         let body = apply_body_overrides(body, &self.body_overrides);
         let body = apply_body_overrides(body, target_extra);
         let body_str = serde_json::to_string(&body).unwrap_or_default();
-        debug!(provider = %self.name, url, body = %body_str, "upstream request");
+        debug!(url, body = %body_str, "upstream request");
         req.json(&body)
     }
 
@@ -143,7 +143,7 @@ impl ProviderBase {
             .await
             .map_err(AppError::from)?;
         let body_text = self.check_upstream_error(response).await?;
-        debug!(provider = %self.name, response_body = %body_text, "upstream response");
+        debug!(response_body = %body_text, "upstream response");
         Ok(body_text)
     }
 
@@ -164,7 +164,10 @@ impl ProviderBase {
             .await
             .map_err(AppError::from)?;
         let response = self.ensure_success(response).await?;
-        debug!(provider = %self.name, status = response.status().as_u16(), "upstream stream established");
+        debug!(
+            status = response.status().as_u16(),
+            "upstream stream established"
+        );
         Ok(response)
     }
 

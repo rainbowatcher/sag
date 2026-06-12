@@ -8,7 +8,7 @@ use sag_core::{
     ImageGenerationResponse, StreamChunk,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, instrument};
+use tracing::{error, instrument, trace};
 
 use crate::{LlmProvider, ProviderBase, drain_sse_frames};
 
@@ -41,7 +41,7 @@ impl LlmProvider for OpenAiProvider {
         &self.base.name
     }
 
-    #[instrument(skip(self, request), fields(provider = %self.base.name, model = %real_model))]
+    #[instrument(skip_all, fields(provider = %self.base.name, model = %real_model))]
     async fn chat(
         &self,
         request: &ChatCompletionRequest,
@@ -54,7 +54,7 @@ impl LlmProvider for OpenAiProvider {
 
         if !request.extra.is_empty() {
             let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
-            debug!(provider = %self.base.name, extra = ?keys, "forwarding non-standard extra parameters");
+            trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
         let url = self.base.build_url(api_endpoint);
@@ -74,7 +74,7 @@ impl LlmProvider for OpenAiProvider {
         Ok(completion)
     }
 
-    #[instrument(skip(self, request), fields(provider = %self.base.name, model = %real_model))]
+    #[instrument(skip_all, fields(provider = %self.base.name, model = %real_model))]
     async fn chat_stream(
         &self,
         request: &ChatCompletionRequest,
@@ -88,7 +88,7 @@ impl LlmProvider for OpenAiProvider {
 
         if !request.extra.is_empty() {
             let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
-            debug!(provider = %self.base.name, extra = ?keys, "forwarding non-standard extra parameters");
+            trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
         let url = self.base.build_url(api_endpoint);
@@ -148,7 +148,7 @@ impl LlmProvider for OpenAiProvider {
         Ok(Box::pin(stream))
     }
 
-    #[instrument(skip(self, request), fields(provider = %self.base.name, model = %real_model))]
+    #[instrument(skip_all, fields(provider = %self.base.name, model = %real_model))]
     async fn chat_image(
         &self,
         request: &ImageGenerationRequest,
