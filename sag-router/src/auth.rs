@@ -10,9 +10,15 @@ use tracing::warn;
 
 use crate::state::AppState;
 
-/// Axum middleware: validates the `Authorization: Bearer <api_key>` header
+/// Axum middleware: validates the `Authorization: Bearer *** header
 /// against the configured gateway API keys.
 pub async fn gateway_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let trace_id = request
+        .extensions()
+        .get::<uuid::Uuid>()
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+
     let auth_header = request
         .headers()
         .get("Authorization")
@@ -36,7 +42,7 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
                     let provided_key = match auth_header {
                         Some(key) => key,
                         None => {
-                            warn!("request missing Authorization header");
+                            warn!(trace_id, "request missing Authorization header");
                             return (StatusCode::UNAUTHORIZED, Json(json!({
                                 "error": { "code": "UNAUTHORIZED", "message": "missing Authorization header" }
                             })))
@@ -54,7 +60,7 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
     };
 
     if !key_valid {
-        warn!("invalid gateway API key");
+        warn!(trace_id, "invalid gateway API key");
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({

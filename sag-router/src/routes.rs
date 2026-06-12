@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{Query, State},
     http::StatusCode,
@@ -21,6 +21,7 @@ use tracing::{error, info, instrument, warn};
 
 use crate::auth::gateway_auth;
 use crate::state::AppState;
+use crate::trace_middleware::trace_middleware;
 
 /// Build the main Axum router with all routes and middleware.
 pub fn build_router(state: AppState) -> Router {
@@ -48,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", admin_routes)
         .layer(cors)
         .layer(middleware::from_fn(crate::http_log::log_http))
+        .layer(middleware::from_fn(trace_middleware))
         .with_state(state)
 }
 
@@ -67,13 +69,13 @@ pub fn build_router(state: AppState) -> Router {
 #[instrument(skip_all, fields(request_id, model, stream))]
 async fn chat_completions_handler(
     State(state): State<AppState>,
+    Extension(trace_id): Extension<uuid::Uuid>,
     Json(request): Json<sag_core::ChatCompletionRequest>,
 ) -> Response<Body> {
     let start = Instant::now();
-    let request_id = uuid::Uuid::new_v4();
     let is_stream = request.stream.unwrap_or(false);
 
-    tracing::Span::current().record("request_id", request_id.to_string());
+    tracing::Span::current().record("request_id", trace_id.to_string());
     tracing::Span::current().record("model", &request.model);
     tracing::Span::current().record("stream", is_stream);
 
@@ -116,7 +118,7 @@ async fn chat_completions_handler(
                         ),
                     };
                     let log = CallLog {
-                        request_id,
+                        request_id: trace_id,
                         provider: String::new(),
                         model: request.model.clone(),
                         real_model: String::new(),
@@ -162,7 +164,7 @@ async fn chat_completions_handler(
             None => {
                 let err = sag_core::AppError::ModelNotFound(request.model.clone());
                 let log = CallLog {
-                    request_id,
+                    request_id: trace_id,
                     provider: String::new(),
                     model: request.model.clone(),
                     real_model: String::new(),
@@ -211,7 +213,7 @@ async fn chat_completions_handler(
             &state,
             img_request,
             &targets,
-            &request_id,
+            &trace_id,
             &request.model,
             start,
             &mut errors,
@@ -253,7 +255,7 @@ async fn chat_completions_handler(
                 {
                     Ok(chunk_stream) => {
                         let collector = state.collector.clone();
-                        let log_request_id = request_id;
+                        let log_request_id = trace_id;
                         let log_provider = pname;
                         let log_model = request.model.clone();
                         let log_real_model = rmodel;
@@ -369,7 +371,7 @@ async fn chat_completions_handler(
                 match provider.chat(&request, &rmodel, &api_endpoint, &tex).await {
                     Ok(resp) => {
                         let log = CallLog {
-                            request_id,
+                            request_id: trace_id,
                             provider: pname,
                             model: request.model.clone(),
                             real_model: rmodel,
@@ -418,7 +420,7 @@ async fn chat_completions_handler(
     error!(model = %request.model, "all providers exhausted");
 
     let log = CallLog {
-        request_id,
+        request_id: trace_id,
         provider: String::new(),
         model: request.model.clone(),
         real_model: String::new(),
