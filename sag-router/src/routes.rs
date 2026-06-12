@@ -417,7 +417,13 @@ async fn chat_completions_handler(
         reason,
     };
 
-    error!(model = %request.model, "all providers exhausted");
+    error!(
+        model = %request.model,
+        trace_id = %trace_id,
+        duration_ms = %start.elapsed().as_millis() as u64,
+        attempts = %errors.join("; "),
+        "all providers exhausted"
+    );
 
     let log = CallLog {
         request_id: trace_id,

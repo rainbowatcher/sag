@@ -97,7 +97,13 @@ impl CallLogCollector {
                 .await;
 
                 if let Err(e) = result {
-                    error!(?e, "failed to persist call log");
+                    error!(
+                        request_id = %log.request_id,
+                        provider = %log.provider,
+                        model = %log.model,
+                        error = ?e,
+                        "failed to persist call log"
+                    );
                 }
 
                 if count.is_multiple_of(10) {
