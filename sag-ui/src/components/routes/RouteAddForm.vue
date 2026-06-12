@@ -53,6 +53,55 @@ const form = useForm({
   validators: {
     onSubmit: formSchema,
   },
+  onSubmit: async ({ value }) => {
+    apiError.value = ""
+    try {
+      if (targets.value.length === 0) {
+        apiError.value = "At least one target is required"
+        return
+      }
+      const emptyTarget = targets.value.find((t) => !t.provider)
+      if (emptyTarget) {
+        apiError.value = "Each target must have a provider selected"
+        return
+      }
+
+      const routeName = value.model_name || targets.value[0].real_model || ""
+      if (!routeName) {
+        apiError.value = "Please provide model_name or fill real_model on the first target"
+        return
+      }
+
+      const payload: CreateRoutePayload = {
+        model_name: routeName,
+        api_endpoint: value.api_endpoint,
+        strategy: value.strategy,
+        targets: targets.value.map((t) => {
+          const entry: CreateRoutePayload["targets"][number] = {
+            provider: t.provider,
+            real_model: t.real_model || undefined,
+            priority: t.priority,
+            retries: t.retries || undefined,
+          }
+          if (t.extra.trim()) {
+            try {
+              entry.extra = JSON.parse(t.extra)
+            } catch {
+              throw new Error(
+                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
+              )
+            }
+          }
+          return entry
+        }),
+      }
+
+      await routeStore.createRoute(payload)
+    } catch (e: any) {
+      apiError.value = e.response?.data?.error?.message ?? e.message
+      throw e
+    }
+  },
 })
 
 async function handleSubmit(event: Event) {
@@ -61,53 +110,10 @@ async function handleSubmit(event: Event) {
   adding.value = true
   try {
     await form.handleSubmit()
-    if (!form.state.isSubmitted) return
     if (apiError.value) return
-
-    if (targets.value.length === 0) {
-      apiError.value = "At least one target is required"
-      return
-    }
-    const emptyTarget = targets.value.find((t) => !t.provider)
-    if (emptyTarget) {
-      apiError.value = "Each target must have a provider selected"
-      return
-    }
-
-    const routeName = form.state.values.model_name || targets.value[0].real_model || ""
-    if (!routeName) {
-      apiError.value = "Please provide model_name or fill real_model on the first target"
-      return
-    }
-
-    const payload: CreateRoutePayload = {
-      model_name: routeName,
-      api_endpoint: form.state.values.api_endpoint,
-      strategy: form.state.values.strategy,
-      targets: targets.value.map((t) => {
-        const entry: CreateRoutePayload["targets"][number] = {
-          provider: t.provider,
-          real_model: t.real_model || undefined,
-          priority: t.priority,
-          retries: t.retries || undefined,
-        }
-        if (t.extra.trim()) {
-          try {
-            entry.extra = JSON.parse(t.extra)
-          } catch {
-            throw new Error(
-              `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
-            )
-          }
-        }
-        return entry
-      }),
-    }
-
-    await routeStore.createRoute(payload)
     emit("created")
-  } catch (e: any) {
-    apiError.value = e.response?.data?.error?.message ?? e.message
+  } catch {
+    // apiError already set in form.onSubmit; no need to re-emit
   } finally {
     adding.value = false
   }
@@ -148,7 +154,7 @@ async function handleSubmit(event: Event) {
             <Field>
               <FieldLabel :for="field.name">Strategy</FieldLabel>
               <ToggleGroup
-                :model-value="field.state.value"
+                :model-value="field.state.value ?? 'fill_first'"
                 @update:model-value="(v) => field.handleChange(v as Strategy)"
                 type="single"
                 variant="outline"
@@ -166,7 +172,7 @@ async function handleSubmit(event: Event) {
               <Field>
                 <FieldLabel :for="field.name">API Endpoint</FieldLabel>
                 <ToggleGroup
-                  :model-value="field.state.value"
+                  :model-value="field.state.value ?? '/chat/completions'"
                   @update:model-value="(v) => field.handleChange(v as string)"
                   type="single"
                   variant="outline"
@@ -183,7 +189,7 @@ async function handleSubmit(event: Event) {
         </div>
 
         <TargetEditor
-          :targets="targets"
+          v-model="targets"
           :providers="providers"
           :provider-models="providerModels"
           :provider-models-loading="providerModelsLoading"

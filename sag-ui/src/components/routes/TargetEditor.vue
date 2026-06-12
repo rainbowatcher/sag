@@ -20,39 +20,50 @@ import type { Provider, TargetItem } from "@/types/api"
 const routeStore = useRouteStore()
 
 const props = defineProps<{
-  targets: TargetItem[]
+  modelValue: TargetItem[]
   providers: Provider[]
   providerModels: Record<string, string[]>
   providerModelsLoading: boolean
   showPriorityControls?: boolean
 }>()
 
+const emit = defineEmits<{
+  "update:modelValue": [TargetItem[]]
+}>()
+
+function updateTargets(val: TargetItem[]) {
+  emit("update:modelValue", val)
+}
+
+function updateTarget(index: number, patch: Partial<TargetItem>) {
+  const newTargets = props.modelValue.map((t, i) => (i === index ? { ...t, ...patch } : t))
+  updateTargets(newTargets)
+}
+
 function addTarget() {
-  props.targets.push({
-    provider: "",
-    real_model: "",
-    priority: 0,
-    retries: 0,
-    extra: "",
-  })
+  updateTargets([
+    ...props.modelValue,
+    { provider: "", real_model: "", priority: 0, retries: 0, extra: "" },
+  ])
 }
 
 function removeTarget(index: number) {
-  if (props.targets.length > 1) {
-    props.targets.splice(index, 1)
+  if (props.modelValue.length > 1) {
+    updateTargets([...props.modelValue.slice(0, index), ...props.modelValue.slice(index + 1)])
   }
 }
 
 function swapPriority(i: number, j: number) {
-  if (j < 0 || j >= props.targets.length) return
-  const tmp = props.targets[i].priority
-  props.targets[i].priority = props.targets[j].priority
-  props.targets[j].priority = tmp
+  if (j < 0 || j >= props.modelValue.length) return
+  const newTargets = [...props.modelValue]
+  const tmp = newTargets[i].priority
+  newTargets[i].priority = newTargets[j].priority
+  newTargets[j].priority = tmp
+  updateTargets(newTargets)
 }
 
-function onProviderChange(t: TargetItem, value: string) {
-  t.provider = value
-  t.real_model = ""
+function onProviderChange(index: number, value: string) {
+  updateTarget(index, { provider: value, real_model: "" })
   routeStore.loadProviderModels(value, props.providers)
 }
 </script>
@@ -78,7 +89,7 @@ function onProviderChange(t: TargetItem, value: string) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRow v-for="(t, i) in targets" :key="i">
+          <TableRow v-for="(t, i) in modelValue" :key="`${i}-${t.provider}-${t.real_model}`">
             <TableCell class="text-muted-foreground text-center text-xs font-medium">
               {{ i + 1 }}
             </TableCell>
@@ -91,17 +102,18 @@ function onProviderChange(t: TargetItem, value: string) {
                 placeholder="Select provider..."
                 search-placeholder="Search provider..."
                 empty-text="No providers found"
-                @update:model-value="(v) => onProviderChange(t, v as string)"
+                @update:model-value="(v) => onProviderChange(i, v as string)"
               />
             </TableCell>
             <TableCell>
               <Combobox
-                v-model="t.real_model"
+                :model-value="t.real_model"
                 :options="(providerModels[t.provider] ?? []).map((m) => ({ value: m }))"
                 placeholder="Select model"
                 search-placeholder="Search model..."
                 empty-text="No models found"
                 :loading="providerModelsLoading && !providerModels[t.provider]"
+                @update:model-value="(v) => updateTarget(i, { real_model: v as string })"
               />
             </TableCell>
             <TableCell class="text-right">
@@ -120,7 +132,11 @@ function onProviderChange(t: TargetItem, value: string) {
                         <Input
                           type="number"
                           :model-value="t.priority"
-                          @input="t.priority = Number(($event.target as HTMLInputElement).value)"
+                          @input="
+                            updateTarget(i, {
+                              priority: Number(($event.target as HTMLInputElement).value),
+                            })
+                          "
                         />
                       </div>
                       <div>
@@ -128,12 +144,21 @@ function onProviderChange(t: TargetItem, value: string) {
                         <Input
                           type="number"
                           :model-value="t.retries"
-                          @input="t.retries = Number(($event.target as HTMLInputElement).value)"
+                          @input="
+                            updateTarget(i, {
+                              retries: Number(($event.target as HTMLInputElement).value),
+                            })
+                          "
                         />
                       </div>
                       <div>
                         <Label class="text-xs">Extra (JSON)</Label>
-                        <Textarea v-model="t.extra" placeholder='{"model_id": 39}' rows="4" />
+                        <Textarea
+                          :model-value="t.extra"
+                          @update:model-value="updateTarget(i, { extra: String($event) })"
+                          placeholder='{"model_id": 39}'
+                          rows="4"
+                        />
                       </div>
                     </div>
                   </PopoverContent>
@@ -155,7 +180,7 @@ function onProviderChange(t: TargetItem, value: string) {
                     variant="ghost"
                     size="icon"
                     class="size-8"
-                    :disabled="i === targets.length - 1"
+                    :disabled="i === modelValue.length - 1"
                     @click="swapPriority(i, i + 1)"
                   >
                     <ArrowDown class="h-3.5 w-3.5" />
@@ -166,7 +191,7 @@ function onProviderChange(t: TargetItem, value: string) {
                   variant="ghost"
                   size="icon"
                   class="text-destructive hover:text-destructive size-8"
-                  :disabled="targets.length === 1"
+                  :disabled="modelValue.length === 1"
                   @click="removeTarget(i)"
                 >
                   <Trash2 class="h-4 w-4" />

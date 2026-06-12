@@ -107,7 +107,6 @@ const form = useForm({
           return entry
         }),
       })
-      emit("updated")
     } catch (e: any) {
       apiError.value = e.response?.data?.error?.message ?? e.message
       throw e
@@ -123,6 +122,8 @@ async function handleSubmit(event: Event) {
     await form.handleSubmit()
     if (apiError.value) return
     emit("updated")
+  } catch {
+    // apiError already set in form.onSubmit; no need to re-emit
   } finally {
     saving.value = false
   }
@@ -146,7 +147,7 @@ async function handleSubmit(event: Event) {
               >Strategy</FieldLabel
             >
             <ToggleGroup
-              :model-value="field.state.value"
+              :model-value="field.state.value || form.getFieldValue('strategy')"
               @update:model-value="(v) => field.handleChange(v as Strategy)"
               type="single"
               variant="outline"
@@ -166,7 +167,7 @@ async function handleSubmit(event: Event) {
                 >API Endpoint</FieldLabel
               >
               <ToggleGroup
-                :model-value="field.state.value"
+                :model-value="field.state.value || form.getFieldValue('api_endpoint')"
                 @update:model-value="(v) => field.handleChange(v as string)"
                 type="single"
                 variant="outline"
@@ -183,7 +184,7 @@ async function handleSubmit(event: Event) {
       </div>
 
       <TargetEditor
-        :targets="targets"
+        v-model="targets"
         :providers="providerStore.providers"
         :provider-models="routeStore.providerModels"
         :provider-models-loading="routeStore.providerModelsLoading"
