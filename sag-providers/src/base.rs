@@ -5,7 +5,7 @@ use reqwest::RequestBuilder;
 use reqwest::header::CONTENT_TYPE;
 use sag_config::{KeyStrategy, ProviderConfig};
 use sag_core::AppError;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{apply_body_overrides, apply_headers};
 
@@ -99,7 +99,8 @@ impl ProviderBase {
         let body = apply_body_overrides(body, &self.body_overrides);
         let body = apply_body_overrides(body, target_extra);
         let body_str = serde_json::to_string(&body).unwrap_or_default();
-        debug!(url, body = %body_str, "upstream request");
+        debug!(url, "sending upstream request");
+        trace!(url, body = %body_str, "upstream request body");
         req.json(&body)
     }
 
@@ -143,7 +144,7 @@ impl ProviderBase {
             .await
             .map_err(AppError::from)?;
         let body_text = self.check_upstream_error(response).await?;
-        debug!(response_body = %body_text, "upstream response");
+        trace!(response_body = %body_text, "upstream response body");
         Ok(body_text)
     }
 
