@@ -68,7 +68,10 @@ impl GatewayConfig {
             if provider.models_endpoint.contains("://")
                 || provider.models_endpoint.contains('?')
                 || provider.models_endpoint.contains('#')
-                || provider.models_endpoint.split('/').any(|segment| segment.contains(char::is_whitespace))
+                || provider
+                    .models_endpoint
+                    .split('/')
+                    .any(|segment| segment.contains(char::is_whitespace))
             {
                 errors.push(format!(
                     "provider '{name}': models_endpoint '{}' must be a relative path without scheme, query, fragment, or whitespace",
@@ -358,7 +361,10 @@ pub struct RouteConfig {
     pub model_name: String,
     /// Upstream API endpoint path for this model.
     /// Examples: `/chat/completions`, `/images/generations`, `/responses`.
-    #[serde(default = "default_api_endpoint", skip_serializing_if = "is_default_api_endpoint")]
+    #[serde(
+        default = "default_api_endpoint",
+        skip_serializing_if = "is_default_api_endpoint"
+    )]
     pub api_endpoint: String,
     /// Target selection strategy (default: `FillFirst`).
     #[serde(default, skip_serializing_if = "is_default_strategy")]

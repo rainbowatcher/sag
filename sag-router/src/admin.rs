@@ -9,6 +9,7 @@ use reqwest::header::CONTENT_TYPE;
 use sag_config::{
     self, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
 };
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use tracing::{instrument, warn};
@@ -158,6 +159,18 @@ struct ProviderInfo {
     enabled: bool,
 }
 
+/// Borrowing response item for `GET /api/routes` that ensures `api_endpoint`
+/// always appears in the JSON response, even when it equals the default value.
+#[derive(Serialize)]
+struct RouteResponseItem<'a> {
+    model_name: &'a str,
+    api_endpoint: &'a str,
+    strategy: Strategy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retries: Option<u32>,
+    targets: &'a [RouteTarget],
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ListProvidersQuery {
     #[serde(default)]
@@ -233,7 +246,18 @@ async fn list_providers(
 /// GET /api/routes — list all routing rules.
 async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
-    (StatusCode::OK, Json(json!({ "routes": config.routes }))).into_response()
+    let routes: Vec<RouteResponseItem<'_>> = config
+        .routes
+        .iter()
+        .map(|r| RouteResponseItem {
+            model_name: &r.model_name,
+            api_endpoint: &r.api_endpoint,
+            strategy: r.strategy,
+            retries: r.retries,
+            targets: &r.targets,
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({ "routes": routes }))).into_response()
 }
 
 /// POST /api/routes — create a new route.
@@ -1890,9 +1914,7 @@ targets = [
             .method("PUT")
             .uri("/api/providers")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"name":"openai","models_endpoint":""}"#,
-            ))
+            .body(Body::from(r#"{"name":"openai","models_endpoint":""}"#))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);

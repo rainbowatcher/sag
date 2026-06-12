@@ -5,7 +5,7 @@ use reqwest::RequestBuilder;
 use reqwest::header::CONTENT_TYPE;
 use sag_config::{KeyStrategy, ProviderConfig};
 use sag_core::AppError;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{apply_body_overrides, apply_headers};
 
@@ -98,6 +98,8 @@ impl ProviderBase {
         let req = apply_headers(req, &self.headers);
         let body = apply_body_overrides(body, &self.body_overrides);
         let body = apply_body_overrides(body, target_extra);
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        debug!(provider = %self.name, url, body = %body_str, "upstream request");
         req.json(&body)
     }
 
@@ -140,7 +142,9 @@ impl ProviderBase {
             .send()
             .await
             .map_err(AppError::from)?;
-        self.check_upstream_error(response).await
+        let body_text = self.check_upstream_error(response).await?;
+        debug!(provider = %self.name, response_body = %body_text, "upstream response");
+        Ok(body_text)
     }
 
     /// Send a JSON POST request for streaming and return the `Response`.
@@ -159,7 +163,9 @@ impl ProviderBase {
             .send()
             .await
             .map_err(AppError::from)?;
-        self.ensure_success(response).await
+        let response = self.ensure_success(response).await?;
+        debug!(provider = %self.name, status = response.status().as_u16(), "upstream stream established");
+        Ok(response)
     }
 
     /// Check upstream response status for **streaming** requests.

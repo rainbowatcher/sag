@@ -46,26 +46,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/v1/chat/completions", chat_route)
         .nest("/v1", models_route)
         .nest("/api", admin_routes)
-        // .layer(
-        //     TraceLayer::new_for_http()
-        //         .make_span_with(|request: &Request<Body>| {
-        //             tracing::span!(
-        //                 Level::INFO,
-        //                 "request",
-        //                 method = %request.method(),
-        //                 uri = %request.uri(),
-        //                 status = tracing::field::Empty,
-        //                 latency_ms = tracing::field::Empty,
-        //             )
-        //         })
-        //         .on_response(
-        //             |response: &Response<Body>, latency: std::time::Duration, span: &tracing::Span| {
-        //                 span.record("status", response.status().as_u16());
-        //                 span.record("latency_ms", latency.as_millis() as u64);
-        //             },
-        //         ),
-        // )
         .layer(cors)
+        .layer(middleware::from_fn(crate::http_log::log_http))
         .with_state(state)
 }
 
@@ -82,7 +64,7 @@ pub fn build_router(state: AppState) -> Router {
 ///    up to the effective retry count; if exhausted, try next target
 /// 8. If all targets exhausted: return AllProvidersExhausted
 /// 9. Log analytics via CallLogCollector
-#[instrument(skip(state), fields(request_id, model, stream))]
+#[instrument(skip_all, fields(request_id, model, stream))]
 async fn chat_completions_handler(
     State(state): State<AppState>,
     Json(request): Json<sag_core::ChatCompletionRequest>,
@@ -196,12 +178,6 @@ async fn chat_completions_handler(
             }
         }
     };
-
-    info!(
-        num_targets = targets.len(),
-        api_endpoint = %api_endpoint,
-        "dispatching request with fallback"
-    );
 
     let mut errors = Vec::new();
 
@@ -710,8 +686,8 @@ mod tests {
     use super::*;
     use sag_analytics::CallLogCollector;
     use sag_config::{
-        ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
-        ProviderType, RouteConfig, RouteTarget, ServerConfig,
+        ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+        RouteConfig, RouteTarget, ServerConfig,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -846,13 +822,13 @@ mod tests {
         let state = build_test_state(providers, routes).await;
         let Json(response) = models_handler(State(state)).await;
         let data = response["data"].as_array().unwrap();
-        let model_ids: Vec<&str> = data
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
+        let model_ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
 
         // gpt-4o (enabled) and gpt-4o-mini (mixed) should appear
-        assert!(model_ids.contains(&"gpt-4o"), "gpt-4o should be in models list");
+        assert!(
+            model_ids.contains(&"gpt-4o"),
+            "gpt-4o should be in models list"
+        );
         assert!(
             model_ids.contains(&"gpt-4o-mini"),
             "gpt-4o-mini should be in models list (mixed targets)"

@@ -217,14 +217,23 @@ fn json_to_toml_item(v: &serde_json::Value) -> toml_edit::Item {
         serde_json::Value::Array(items) => {
             let mut arr = toml_edit::Array::new();
             for item in items {
-                arr.push(json_to_toml_item(item).into_value().expect("array items should be values"));
+                arr.push(
+                    json_to_toml_item(item)
+                        .into_value()
+                        .expect("array items should be values"),
+                );
             }
             toml_edit::value(arr)
         }
         serde_json::Value::Object(map) => {
             let mut table = toml_edit::InlineTable::new();
             for (k, val) in map {
-                table.insert(k, json_to_toml_item(val).into_value().expect("object values should be values"));
+                table.insert(
+                    k,
+                    json_to_toml_item(val)
+                        .into_value()
+                        .expect("object values should be values"),
+                );
             }
             toml_edit::value(table)
         }
