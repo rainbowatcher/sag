@@ -10,8 +10,8 @@ import {
   Sun,
   LogOut,
 } from "@lucide/vue"
-import { useDark } from "@vueuse/core"
 import { RouterView, useRoute, useRouter } from "vue-router"
+import { isDark, toggleDark } from "@/composables/useTheme"
 import { cn } from "@/lib/utils"
 import { useConnectionStore } from "@/stores/connection"
 import { useHealthStore } from "@/stores/health"
@@ -20,11 +20,6 @@ const store = useConnectionStore()
 const health = useHealthStore()
 const route = useRoute()
 const router = useRouter()
-const isDark = useDark()
-
-function toggleDark() {
-  isDark.value = !isDark.value
-}
 
 function handleDisconnect() {
   store.disconnect()
@@ -89,7 +84,7 @@ const navItems: NavItem[] = [
             />
             <span>{{ health.gatewayOnline ? "Connected" : "Offline" }}</span>
           </div>
-          <button @click="toggleDark" class="hover:text-foreground transition-colors">
+          <button @click="() => toggleDark()" class="hover:text-foreground transition-colors">
             <component :is="isDark ? Sun : Moon" class="h-3.5 w-3.5" />
           </button>
         </div>
