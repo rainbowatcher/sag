@@ -2,6 +2,7 @@
 import { Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
 import { h, onMounted, ref, watch } from "vue"
+import { Switch } from "@/components/ui/switch"
 import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
 import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
@@ -68,15 +69,8 @@ onMounted(async () => {
 
 // ── Enable / Disable toggle ───────────────────────────────────────
 async function toggleEnabled(provider: Provider) {
-  const newEnabled = !provider.enabled
-  // Optimistic update
-  provider.enabled = newEnabled
-  try {
-    await store.updateProvider(provider.name, { enabled: newEnabled })
-  } catch {
-    // Revert on failure by re-fetching
-    await fetchProviders()
-  }
+  await store.updateProvider(provider.name, { enabled: !provider.enabled })
+  await fetchProviders()
 }
 
 // ── Add flow ──────────────────────────────────────────────────────
@@ -155,25 +149,11 @@ const columns = [
   columnHelper.accessor("enabled", {
     header: "Status",
     cell: (info) => {
-      const enabled = info.getValue()
-      return h(
-        "button",
-        {
-          role: "switch",
-          "aria-checked": enabled,
-          class: `relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 ${
-            enabled ? "bg-primary" : "bg-muted-foreground/30"
-          }`,
-          onClick: () => toggleEnabled(info.row.original),
-        },
-        [
-          h("span", {
-            class: `pointer-events-none block h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-              enabled ? "translate-x-4" : "translate-x-0"
-            }`,
-          }),
-        ],
-      )
+      const provider = info.row.original
+      return h(Switch, {
+        modelValue: info.getValue(),
+        "onUpdate:modelValue": () => toggleEnabled(provider),
+      })
     },
     meta: { class: "text-center" },
   }),
