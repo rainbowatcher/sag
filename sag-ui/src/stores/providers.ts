@@ -198,7 +198,6 @@ export const useProviderStore = defineStore("providers", () => {
         { name, ...payload },
         { headers: headers(conn.connection?.apiKey) },
       )
-      await fetchProviders()
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       throw e

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { GitBranch, Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
-import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
-import { h, onMounted, ref } from "vue"
+import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
+import { FlexRender, createColumnHelper, getCoreRowModel, getSortedRowModel, useVueTable } from "@tanstack/vue-table"
+import { computed, h, onMounted, ref } from "vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"
 import { Badge } from "@/components/ui/badge"
@@ -66,6 +66,19 @@ async function confirmDelete(modelName: string) {
   }
 }
 
+// ── Provider enabled lookup ──────────────────────────────────────
+const disabledProviders = computed(() => {
+  const set = new Set<string>()
+  for (const p of providerStore.providers) {
+    if (!p.enabled) set.add(p.name)
+  }
+  return set
+})
+
+function disabledTargetCount(route: RouteConfig): number {
+  return route.targets.filter((t) => disabledProviders.value.has(t.provider)).length
+}
+
 onMounted(async () => {
   await Promise.all([providerStore.fetchProviders(), routeStore.fetchRoutes()])
 })
@@ -110,8 +123,27 @@ const columns = [
   }),
   columnHelper.accessor("targets", {
     header: "Targets",
-    cell: (info) =>
-      h("span", { class: "tabular-nums font-medium" }, String(info.getValue().length)),
+    sortingFn: (a, b) => a.original.targets.length - b.original.targets.length,
+    cell: (info) => {
+      const total = info.getValue().length
+      const disabled = disabledTargetCount(info.row.original)
+      if (disabled === 0) {
+        return h("span", { class: "tabular-nums font-medium" }, String(total))
+      }
+      return h(
+        "div",
+        { class: "flex items-center justify-center gap-1.5" },
+        [
+          h(AlertTriangle, {
+            class: "text-amber-500 h-3.5 w-3.5 shrink-0",
+          }),
+          h("span", { class: "tabular-nums font-medium text-muted-foreground" }, [
+            String(total - disabled),
+            h("span", { class: "text-muted-foreground/60" }, `/${total}`),
+          ]),
+        ],
+      )
+    },
     meta: { class: "text-center" },
   }),
   columnHelper.display({
@@ -159,6 +191,7 @@ const table = useVueTable({
   },
   columns,
   getCoreRowModel: getCoreRowModel(),
+  getSortedRowModel: getSortedRowModel(),
 })
 </script>
 
@@ -228,13 +261,30 @@ const table = useVueTable({
               v-for="header in headerGroup.headers"
               :key="header.id"
               class="text-muted-foreground px-4 py-3 text-left text-xs font-medium"
-              :class="(header.column.columnDef.meta as any)?.class"
+              :class="[
+                (header.column.columnDef.meta as any)?.class,
+                header.column.getCanSort()
+                  ? 'cursor-pointer select-none hover:text-foreground transition-colors'
+                  : '',
+              ]"
+              @click="header.column.getCanSort() && header.column.toggleSorting()"
             >
-              <FlexRender
-                v-if="!header.isPlaceholder"
-                :render="header.column.columnDef.header!"
-                :props="header.getContext()"
-              />
+              <div class="flex items-center gap-1">
+                <FlexRender
+                  v-if="!header.isPlaceholder"
+                  :render="header.column.columnDef.header!"
+                  :props="header.getContext()"
+                />
+                <ArrowUpDown
+                  v-if="header.column.getCanSort()"
+                  class="h-3 w-3"
+                  :class="
+                    header.column.getIsSorted()
+                      ? 'text-foreground'
+                      : 'text-muted-foreground/40'
+                  "
+                />
+              </div>
             </th>
           </tr>
         </thead>
@@ -243,6 +293,9 @@ const table = useVueTable({
             v-for="row in table.getRowModel().rows"
             :key="row.id"
             class="hover:bg-muted/30 border-b transition-colors last:border-b-0"
+            :class="{
+              'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
+            }"
           >
             <td
               v-for="cell in row.getVisibleCells()"
