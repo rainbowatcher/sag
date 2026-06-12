@@ -45,16 +45,6 @@ onMounted(() => {
   }
 })
 
-function addTarget() {
-  targets.value.push({ provider: "", real_model: "", priority: 0, retries: 0, extra: "" })
-}
-
-function removeTarget(index: number) {
-  if (targets.value.length > 1) {
-    targets.value.splice(index, 1)
-  }
-}
-
 const endpointPresets = [
   { label: "Chat Completions", value: "/chat/completions" },
   { label: "Responses (GPT-5)", value: "/responses" },
@@ -192,93 +182,12 @@ async function handleSubmit(event: Event) {
         </div>
       </div>
 
-      <div class="mt-4 space-y-3">
-        <div class="flex items-center justify-between">
-          <p class="text-sm font-medium">Targets</p>
-          <Button type="button" variant="outline" size="sm" @click="addTarget">
-            <Plus class="mr-1 h-3.5 w-3.5" />
-            Add Target
-          </Button>
-        </div>
-
-        <div v-for="(t, i) in targets" :key="i" class="flex items-end gap-2 rounded-lg border p-3">
-          <span class="text-muted-foreground mb-2 w-5 pt-1 text-center text-xs font-medium">
-            {{ i + 1 }}
-          </span>
-
-          <div class="flex-1">
-            <Label class="text-xs">Provider</Label>
-            <Combobox
-              :model-value="t.provider"
-              :options="
-                providerStore.providers.map((p) => ({
-                  value: p.name,
-                  label: `${p.name} (${p.provider_type})`,
-                }))
-              "
-              placeholder="Select provider..."
-              search-placeholder="Search provider..."
-              empty-text="No providers found"
-              @update:model-value="
-                (v) => {
-                  t.provider = v as string
-                  t.real_model = ''
-                  routeStore.loadProviderModels(v as string, providerStore.providers)
-                }
-              "
-            />
-          </div>
-
-          <div class="flex-1">
-            <Label class="text-xs">Real Model</Label>
-            <Combobox
-              v-model="t.real_model"
-              :options="(routeStore.providerModels[t.provider] ?? []).map((m) => ({ value: m }))"
-              placeholder="Select model"
-              search-placeholder="Search model..."
-              empty-text="No models found"
-              :loading="routeStore.providerModelsLoading && !routeStore.providerModels[t.provider]"
-            />
-          </div>
-
-          <div class="w-20">
-            <Label class="text-xs">Priority</Label>
-            <Input
-              type="number"
-              :model-value="t.priority"
-              @input="t.priority = Number(($event.target as HTMLInputElement).value)"
-            />
-          </div>
-
-          <div class="w-20">
-            <Label class="text-xs">Retries</Label>
-            <Input
-              type="number"
-              :model-value="t.retries"
-              @input="t.retries = Number(($event.target as HTMLInputElement).value)"
-            />
-          </div>
-
-          <div class="w-36">
-            <Label class="text-xs">Extra (JSON)</Label>
-            <Input
-              :model-value="t.extra"
-              placeholder='{"model_id": 39}'
-              @input="t.extra = ($event.target as HTMLInputElement).value"
-            />
-          </div>
-
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            :disabled="targets.length === 1"
-            @click="removeTarget(i)"
-          >
-            <Trash2 class="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
+      <TargetEditor
+        :targets="targets"
+        :providers="providerStore.providers"
+        :provider-models="routeStore.providerModels"
+        :provider-models-loading="routeStore.providerModelsLoading"
+      />
     </form>
     <div class="flex justify-end gap-2">
       <Button variant="outline" size="sm" @click="emit('close')" :disabled="saving">
