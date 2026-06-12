@@ -117,6 +117,7 @@ impl LlmProvider for OpenAiProvider {
 
                 match byte_stream.next().await {
                     Some(Ok(chunk)) => {
+                        trace!(received_bytes = chunk.len(), "received upstream SSE chunk");
                         buffer.extend_from_slice(&chunk);
                         drain_sse_frames(&mut buffer, &tx);
                     }

@@ -165,6 +165,7 @@ impl ProviderBase {
             .await
             .map_err(AppError::from)?;
         let response = self.ensure_success(response).await?;
+        trace!("upstream stream connection established");
         debug!(
             status = response.status().as_u16(),
             "upstream stream established"

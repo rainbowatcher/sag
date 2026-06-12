@@ -429,6 +429,7 @@ impl LlmProvider for AnthropicProvider {
 
                 match byte_stream.next().await {
                     Some(Ok(chunk)) => {
+                        trace!(received_bytes = chunk.len(), "received anthropic SSE chunk");
                         buffer.extend_from_slice(&chunk);
                         drain_anthropic_sse_frames(&mut buffer, &tx, &mut state);
                     }

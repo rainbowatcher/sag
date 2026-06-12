@@ -17,7 +17,7 @@ use sag_core::{CallLog, ImageGenerationRequest, StreamChunk, Usage};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument, trace, warn};
 
 use crate::auth::gateway_auth;
 use crate::state::AppState;
@@ -241,6 +241,14 @@ async fn chat_completions_handler(
                 attempt = attempt,
                 max_retries = retries,
                 "trying provider"
+            );
+
+            // trace-level: detailed per-attempt debug info
+            trace!(
+                provider = %provider_name,
+                real_model = %real_model,
+                attempt,
+                "attempting provider target"
             );
 
             let pname = provider_name.clone();
