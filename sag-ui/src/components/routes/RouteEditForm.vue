@@ -47,7 +47,7 @@ onMounted(() => {
 
 const endpointPresets = [
   { label: "Chat Completions", value: "/chat/completions" },
-  { label: "Responses (GPT-5)", value: "/responses" },
+  { label: "Responses", value: "/responses" },
   { label: "Image Generation", value: "/images/generations" },
 ]
 
@@ -137,7 +137,7 @@ async function handleSubmit(event: Event) {
     </div>
     <form id="route-edit-form" @submit.prevent="handleSubmit">
       <div class="grid grid-cols-2 gap-3">
-        <div class="space-y-1">
+        <div class="flex flex-col gap-3">
           <FieldLabel class="text-muted-foreground text-xs font-medium">Model Name</FieldLabel>
           <Input :model-value="route.model_name" disabled class="bg-muted text-muted-foreground" />
         </div>
@@ -151,7 +151,6 @@ async function handleSubmit(event: Event) {
               @update:model-value="(v) => field.handleChange(v as Strategy)"
               type="single"
               variant="outline"
-              size="sm"
               class="justify-start"
             >
               <ToggleGroupItem value="fill_first">Fill-first</ToggleGroupItem>
@@ -171,7 +170,6 @@ async function handleSubmit(event: Event) {
                 @update:model-value="(v) => field.handleChange(v as string)"
                 type="single"
                 variant="outline"
-                size="sm"
                 class="justify-start"
               >
                 <ToggleGroupItem v-for="ep in endpointPresets" :key="ep.value" :value="ep.value">
