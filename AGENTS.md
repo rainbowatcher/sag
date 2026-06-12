@@ -10,7 +10,7 @@ SAG 是一个 LLM API 反向代理网关，接收 OpenAI 兼容的 `/v1/chat/com
 |---|---|
 | **后端** | Rust 2024 edition, Axum 0.8, Tokio, Serde, SQLx (SQLite), Reqwest |
 | **前端** | Vue 3.5 (Composition API + `<script setup>`), TypeScript 5.7, Vite 6.4, Pinia, Tailwind CSS v4, shadcn-vue |
-| **工具** | Cargo workspace, just, pnpm, prek (pre-commit), oxlint/oxfmt, mdBook |
+| **工具** | Cargo workspace, just, pnpm, oxlint/oxfmt, mdBook |
 
 ## 关键命令
 
@@ -69,7 +69,11 @@ sag/
 `sag-ui/src/components/ui/` 目录由 shadcn-vue 自动生成，规则见该目录下的 [`AGENTS.md`](sag-ui/src/components/ui/AGENTS.md)。
 
 ### Git
-- 提交前 `prek` 会自动运行 `lint-staged`，对 `sag-ui/` 下的暂存文件执行 `oxfmt` + `oxlint`
+- 提交前 `pre-commit` hook 会根据暂存文件类型自动执行对应检查：
+  - `*.rs` → `cargo fmt --check`
+  - `sag-ui/**/*.{ts,vue}` → `lint-staged` → `oxfmt` + `oxlint`
+- 跳过 git hooks：`SKIP_SIMPLE_GIT_HOOKS=1 git commit`
+- `cargo clippy` 和 `cargo check` 请通过 `just lint` / `just test` 手动执行
 - `gateway.toml` 已 gitignored，不要提交
 - 不要修改已存在的 commit，除非用户明确要求
 
@@ -80,7 +84,7 @@ sag/
 
 ## 开发流程
 
-1. 确保安装了 `mise.toml` 中列出的工具 (just, node, pnpm, prek 等)
-2. `just init-config` 初始化本地配置
-3. `just dev` 或 `python3 scripts/dev.py` 启动开发环境
+1. 确保安装了 `mise.toml` 中列出的工具 (just, node, pnpm 等)
+2. `just setup` — 初始化开发环境（配置 git hooks、生成配置、安装前端依赖）
+3. `just dev` 或 `python3 scripts/dev.py` — 启动开发环境
 4. 提交前运行 `just test` + `just lint` 确保代码质量

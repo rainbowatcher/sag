@@ -115,10 +115,16 @@ audit:
 
 # ── 辅助 ────────────────────────────────────────────────────────────
 
-# 生成示例配置文件
-init-config:
-    cp gateway.example.toml gateway.toml
-    @echo "Created gateway.toml from example"
+# 一键初始化开发环境（可重复运行）
+setup:
+    git config core.hooksPath scripts/hooks
+    @echo "✓ Git hooks installed"
+    @if [ ! -f gateway.toml ]; then cp gateway.example.toml gateway.toml && echo "✓ Created gateway.toml"; else echo "  gateway.toml already exists"; fi
+    pnpm -C sag-ui install
+    @echo "✓ Frontend dependencies installed"
+    @echo ""
+    @echo "Development environment is ready!"
+    @echo "Run 'just dev' to start."
 
 # 查看项目树 (排除 target / node_modules)
 tree:

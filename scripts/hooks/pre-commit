@@ -1,0 +1,31 @@
+#!/bin/sh
+
+if [ "$SKIP_SIMPLE_GIT_HOOKS" = "1" ]; then
+    echo "[INFO] SKIP_SIMPLE_GIT_HOOKS is set to 1, skipping hook."
+    exit 0
+fi
+
+if [ -f "$SIMPLE_GIT_HOOKS_RC" ]; then
+    . "$SIMPLE_GIT_HOOKS_RC"
+fi
+
+# ── Rust: formatting check ────────────────────────────────────────
+if git diff --cached --name-only -- '*.rs' | grep -q .; then
+    echo "[INFO] Running cargo fmt --check..."
+    cargo fmt --check || {
+        echo "[ERROR] Rust formatting check failed. Run 'cargo fmt' to fix." >&2
+        exit 1
+    }
+fi
+
+# ── Frontend: lint-staged for sag-ui ──────────────────────────────
+if git diff --cached --name-only -- 'sag-ui/*' 'sag-ui/**/*' | grep -q .; then
+    echo "[INFO] Running lint-staged for sag-ui..."
+    cd sag-ui && npx lint-staged || {
+        echo "[ERROR] lint-staged failed." >&2
+        exit 1
+    }
+    cd "$OLDPWD" || exit 1
+fi
+
+exit 0
