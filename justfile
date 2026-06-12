@@ -58,7 +58,7 @@ ui-preview:
 
 # 一键启动前后端开发环境 (推荐)
 dev *args:
-    RUST_LOG=debug python3 scripts/dev.py {{ args }}
+    RUST_LOG=info,sag_router::http_log=debug python3 scripts/dev.py {{ args }}
 
 # ── 代码质量 ────────────────────────────────────────────────────────
 
