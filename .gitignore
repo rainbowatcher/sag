@@ -34,3 +34,4 @@ node_modules
 gateway.toml
 .cline/
 .kimchi/
+.plan/
