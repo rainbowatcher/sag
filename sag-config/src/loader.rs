@@ -273,6 +273,18 @@ fn check_json_map(
 /// updates for `[providers]` section (preserving comments and formatting of
 /// unaffected fields). The `[[routes]]` section is rebuilt entirely (accepting
 /// comment loss on routes).
+///
+/// # Persistence scope
+///
+/// This function only persists `[providers]` and `[[routes]]` mutations. The
+/// top-level fields (`retries`, `[backoff]`, `[server]`, `[analytics]`,
+/// `[gateway_auth]`) are **not** written back — if a future admin endpoint
+/// mutates any of them, the on-disk file will not reflect the change, and any
+/// user-authored `[backoff]` block in the source file will be preserved
+/// verbatim on save (potentially becoming stale relative to the in-memory
+/// state). To persist those, serialize the full `GatewayConfig` via
+/// `toml_edit::ser::to_document` and replace the document, or add explicit
+/// per-field updates similar to the `[providers]` loop below.
 pub fn save_config_to_file(
     config: &GatewayConfig,
     path: &std::path::Path,
@@ -394,6 +406,10 @@ pub fn save_config_to_file(
         doc["routes"] = toml_edit::Item::ArrayOfTables(routes_array);
     }
 
+    // TODO(persistence): backoff (and other top-level fields — see doc comment above) is not
+    // persisted by this function. If a future admin endpoint mutates `backoff`, the on-disk
+    // config will not reflect the change. Wire up `doc["backoff"]` updates here, or replace
+    // the whole document with `toml_edit::ser::to_document(config)`.
     // ── Write back ──
     std::fs::write(path, doc.to_string())
         .map_err(|e| sag_core::AppError::Config(format!("failed to write config file: {e}")))?;
