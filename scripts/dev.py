@@ -15,19 +15,17 @@ import select
 import signal
 import subprocess
 import threading
-import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def log(tag: str, msg: str) -> None:
-    """带时间戳的彩色日志."""
-    colors = {"BACKEND": "\033[36m", "UI": "\033[35m", "SYS": "\033[33m"}
+    """带颜色标签的日志."""
+    colors = {"BE": "\033[36m", "FE": "\033[35m", "SYS": "\033[33m"}
     reset = "\033[0m"
     c = colors.get(tag, "")
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {c}[{tag}]{reset} {msg}", flush=True)
+    print(f"{c}[{tag}]{reset} {msg}", flush=True)
 
 
 def start_backend(config: str, release: bool) -> subprocess.Popen:
@@ -173,14 +171,14 @@ def main() -> None:
         backend = start_backend(args.config, args.release)
         procs.append(backend)
         threading.Thread(
-            target=stream_output, args=(backend, "BACKEND"), daemon=True
+            target=stream_output, args=(backend, "BE"), daemon=True
         ).start()
 
     # ── 前端 ──
     if not args.skip_ui:
         ui = start_ui()
         procs.append(ui)
-        threading.Thread(target=stream_output, args=(ui, "UI"), daemon=True).start()
+        threading.Thread(target=stream_output, args=(ui, "FE"), daemon=True).start()
 
     if not procs:
         log("SYS", "Nothing to start (both --skip-backend and --skip-ui)")
