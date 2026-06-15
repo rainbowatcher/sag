@@ -28,7 +28,7 @@ use sag_router::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
 };
 use sag_router::admin_routes::{create_route, delete_route, list_routes, update_route};
-use sag_router::auth::gateway_auth;
+use sag_router::middleware::auth::gateway_auth;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
