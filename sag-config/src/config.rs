@@ -13,6 +13,9 @@ pub struct GatewayConfig {
     /// `1` → one attempt (no retries). `2` → one initial + one retry, etc.
     #[serde(default = "default_retries")]
     pub retries: u32,
+    /// Global exponential-backoff settings for retry delays.
+    #[serde(default)]
+    pub backoff: BackoffConfig,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 }
@@ -52,6 +55,17 @@ impl GatewayConfig {
             warnings.push(format!(
                 "global retries={} seems unusually high",
                 self.retries
+            ));
+        }
+
+        // ── Backoff validation ──
+        if self.backoff.base_ms == 0 {
+            errors.push("backoff.base_ms must be greater than 0".into());
+        }
+        if self.backoff.max_ms < self.backoff.base_ms {
+            errors.push(format!(
+                "backoff.max_ms ({}) must be >= backoff.base_ms ({})",
+                self.backoff.max_ms, self.backoff.base_ms
             ));
         }
 
@@ -307,6 +321,48 @@ pub fn default_retries() -> u32 {
 pub fn default_timeout_secs() -> u64 {
     120
 }
+
+/// Exponential-backoff settings for retry delays between attempts.
+///
+/// Formula: `min(base_ms * 2^attempt, max_ms)`, with optional full jitter
+/// (`delay = random(0, computed)`) to avoid thundering-herd retries across
+/// many concurrent clients. `attempt = 0` returns the base delay; `attempt = 1`
+/// doubles it; etc.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackoffConfig {
+    /// Initial backoff delay in milliseconds (corresponds to attempt 0).
+    #[serde(default = "default_backoff_base_ms")]
+    pub base_ms: u64,
+    /// Maximum backoff delay cap in milliseconds. Prevents unbounded waits
+    /// for high `retries` values.
+    #[serde(default = "default_backoff_max_ms")]
+    pub max_ms: u64,
+    /// Whether to apply full jitter to each delay. When `true`, the actual
+    /// sleep is `random(0, computed_cap)`; when `false`, the deterministic
+    /// cap is used. Defaults to `true` (recommended for production).
+    #[serde(default = "default_backoff_jitter")]
+    pub jitter: bool,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            base_ms: default_backoff_base_ms(),
+            max_ms: default_backoff_max_ms(),
+            jitter: default_backoff_jitter(),
+        }
+    }
+}
+
+pub fn default_backoff_base_ms() -> u64 {
+    100
+}
+pub fn default_backoff_max_ms() -> u64 {
+    5_000
+}
+pub fn default_backoff_jitter() -> bool {
+    true
+}
 fn default_true() -> bool {
     true
 }
@@ -504,6 +560,52 @@ targets = [
     }
 
     #[test]
+    fn parse_backoff_defaults() {
+        let toml_str = r#"
+[server]
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        // BackoffConfig::default() — matches the legacy constants so
+        // existing deployments behave identically after upgrading.
+        assert_eq!(config.backoff.base_ms, 100);
+        assert_eq!(config.backoff.max_ms, 5_000);
+        assert!(config.backoff.jitter);
+    }
+
+    #[test]
+    fn parse_backoff_overrides() {
+        let toml_str = r#"
+[server]
+[providers]
+
+[backoff]
+base_ms = 250
+max_ms = 30_000
+jitter = false
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backoff.base_ms, 250);
+        assert_eq!(config.backoff.max_ms, 30_000);
+        assert!(!config.backoff.jitter);
+    }
+
+    #[test]
+    fn parse_backoff_partial_uses_defaults_for_missing_fields() {
+        let toml_str = r#"
+[server]
+[providers]
+
+[backoff]
+max_ms = 10_000
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backoff.base_ms, 100, "default base_ms");
+        assert_eq!(config.backoff.max_ms, 10_000, "overridden max_ms");
+        assert!(config.backoff.jitter, "default jitter");
+    }
+
+    #[test]
     fn parse_retries_tiered_override() {
         let toml_str = r#"
 retries = 5
@@ -684,6 +786,39 @@ targets = [
         #[test]
         fn valid_config_passes() {
             let config = valid_config();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_backoff_base_ms_zero() {
+            let mut config = valid_config();
+            config.backoff.base_ms = 0;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("backoff.base_ms must be greater than 0")),
+                "expected base_ms error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_backoff_max_ms_less_than_base_ms() {
+            let mut config = valid_config();
+            config.backoff.base_ms = 500;
+            config.backoff.max_ms = 100;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("backoff.max_ms")),
+                "expected max_ms error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn backoff_max_ms_equal_to_base_ms_is_allowed() {
+            // Edge case: fixed delay (no exponential growth, no cap).
+            let mut config = valid_config();
+            config.backoff.base_ms = 200;
+            config.backoff.max_ms = 200;
             assert!(config.validate().is_ok());
         }
 

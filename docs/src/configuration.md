@@ -8,6 +8,19 @@ SAG 使用基于 TOML 的配置文件（默认：`gateway.toml`）。
 # 全局默认重试次数（每个目标），可被 per-route 或 per-target 覆盖
 retries = 2
 
+# 指数退避设置：每次重试间隔 `min(base_ms * 2^attempt, max_ms)`，
+# 可选 full jitter（实际等待 = random(0, 计算结果)）。
+# 调整这些值以在响应延迟和上游负载之间做权衡。
+[backoff]
+# 初始退避延迟（毫秒），对应第 0 次重试。默认：100。
+base_ms = 100
+# 最大退避延迟上限（毫秒）。默认：5000（5 秒）。
+max_ms = 5000
+# 是否对每次延迟应用 full jitter。开启时实际等待为 random(0, 上限)，
+# 可避免大量并发客户端的 thundering-herd 问题。关闭则使用确定性的
+# 退避值（便于测试）。默认：true。
+jitter = true
+
 [server]
 host = "0.0.0.0"
 port = 3000
@@ -62,6 +75,20 @@ targets = [
 ```
 
 `models_endpoint` 是 provider 级配置，用于管理面板刷新上游模型列表。默认值为 `models`，会拼接到 `base_url` 后；支持 `models`、`/models`、`v1/models` 等写法，保存时会规范化为相对路径。
+
+## 重试退避
+
+`[backoff]` 段控制目标重试之间的退避策略，仅在 `retries` ≥ 1 时生效：
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `base_ms` | `100` | 初始退避延迟（毫秒），对应第 0 次重试前的等待 |
+| `max_ms` | `5000` | 退避上限（毫秒），避免高 `retries` 时等待无界增长 |
+| `jitter` | `true` | 是否对每次延迟应用 full jitter（`delay = random(0, cap)`） |
+
+退避公式：`min(base_ms * 2^attempt, max_ms)`，其中 `attempt` 从 `0` 计数。例如默认配置下：第 1 次重试前等待 `0~100ms`、第 2 次 `0~200ms`、第 3 次 `0~400ms`、...，最大 `5s`。
+
+`jitter = true`（推荐）可以避免大量并发客户端在重试时同时冲击上游（thundering herd）；`jitter = false` 则使用确定性延迟，便于测试与排障。
 
 ## 认证
 

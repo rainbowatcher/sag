@@ -113,7 +113,7 @@ mod tests {
     use axum::body::to_bytes;
     use futures_util::stream;
     use sag_analytics::CallLogCollector;
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
+    use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
     use sag_core::Usage;
     use std::collections::HashMap;
     use std::pin::Pin;
@@ -133,6 +133,7 @@ mod tests {
                 api_keys: vec!["k".into()],
             }),
             retries: 2,
+            backoff: BackoffConfig::default(),
             providers: HashMap::new(),
             routes: vec![],
         };

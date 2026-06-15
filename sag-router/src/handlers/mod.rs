@@ -104,8 +104,8 @@ mod tests {
     use super::*;
     use sag_analytics::CallLogCollector;
     use sag_config::{
-        ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
-        RouteConfig, ServerConfig, Strategy,
+        BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
+        ProviderType, RouteConfig, ServerConfig, Strategy,
     };
     use sag_providers::{LlmProvider, OpenAiProvider};
     use std::collections::HashMap;
@@ -126,6 +126,7 @@ mod tests {
                 api_keys: vec!["test-key".into()],
             }),
             retries: 2,
+            backoff: BackoffConfig::default(),
             providers,
             routes,
         };

@@ -335,8 +335,8 @@ mod tests {
     };
     use sag_analytics::CallLogCollector;
     use sag_config::{
-        ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
-        RouteConfig, RouteTarget, ServerConfig,
+        BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
+        ProviderType, RouteConfig, RouteTarget, ServerConfig,
     };
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -356,6 +356,7 @@ mod tests {
                 api_keys: vec!["test-key".into()],
             }),
             retries: 2,
+            backoff: BackoffConfig::default(),
             providers,
             routes,
         };

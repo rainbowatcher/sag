@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sag_config::BackoffConfig;
 use sag_core::{AppError, ChatCompletionResponse, StreamChunk};
 use tracing::trace;
 
@@ -36,6 +37,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         errors,
     } = ctx;
 
+    // Snapshot the backoff config once so the per-target retry loop doesn't
+    // hold the config read lock and so all targets within one request share
+    // a consistent view (a hot-reload mid-dispatch shouldn't change the
+    // schedule for an in-flight request).
+    let backoff = state.config.read().await.backoff.clone();
+
     for (provider_name, real_model, target_extra, retries) in targets {
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
             continue;
@@ -47,8 +54,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         let target_extra = target_extra.clone();
         let api_endpoint = api_endpoint.to_string();
 
-        let outcome =
-            run_with_retries::<ChatAttempt, _, _>(provider_name, *retries, errors, |attempt| {
+        let outcome = run_with_retries::<ChatAttempt, _, _>(
+            provider_name,
+            *retries,
+            &backoff,
+            errors,
+            |attempt| {
                 let provider = provider.clone();
                 let real_model = real_model.clone();
                 let target_extra = target_extra.clone();
@@ -72,8 +83,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             .map(ChatAttempt::NonStream)
                     }
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         let Some(attempt) = outcome else {
             continue;
@@ -118,7 +130,7 @@ mod tests {
     use axum::body::to_bytes;
     use futures_util::Stream;
     use sag_analytics::CallLogCollector;
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
+    use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
     use sag_core::types::{ChatCompletionRequest, Usage};
     use sag_providers::LlmProvider;
     use serde_json::json;
@@ -263,6 +275,7 @@ mod tests {
                 api_keys: vec!["k".into()],
             }),
             retries: 2,
+            backoff: BackoffConfig::default(),
             providers: HashMap::new(),
             routes: vec![],
         };

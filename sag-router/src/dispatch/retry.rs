@@ -1,13 +1,9 @@
 //! Generic per-target retry loop with exponential backoff.
 
+use sag_config::BackoffConfig;
 use sag_core::AppError;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
-
-/// Initial backoff delay before the first retry.
-const BASE_BACKOFF_MS: u64 = 100;
-/// Maximum backoff delay cap. Prevents unbounded waits for high `max_retries`.
-const MAX_BACKOFF_MS: u64 = 5_000;
 
 /// Compute the exponential-backoff delay for a given attempt (0-indexed).
 ///
@@ -35,8 +31,10 @@ pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) ->
 /// attempt failed (in which case `errors` is populated with the final
 /// error per provider).
 ///
-/// Backoff schedule (with jitter): attempt 1 → ~0–100ms, attempt 2 →
-/// ~0–200ms, attempt 3 → ~0–400ms, … capped at 5s. See [`compute_backoff`].
+/// Backoff schedule is driven by `backoff` (typically read from
+/// [`GatewayConfig::backoff`](sag_config::GatewayConfig::backoff)):
+/// attempt 1 → `0..=backoff.base_ms`, attempt 2 → `0..=backoff.base_ms * 2`,
+/// … capped at `backoff.max_ms`. See [`compute_backoff`].
 ///
 /// Behavior:
 /// - Non-retryable errors (4xx-class) abort the loop immediately and
@@ -46,6 +44,7 @@ pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) ->
 pub async fn run_with_retries<T, F, Fut>(
     label: &str,
     max_retries: u32,
+    backoff: &BackoffConfig,
     errors: &mut Vec<String>,
     mut op: F,
 ) -> Option<T>
@@ -55,14 +54,15 @@ where
 {
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            let backoff = compute_backoff(attempt - 1, BASE_BACKOFF_MS, MAX_BACKOFF_MS, true);
+            let delay =
+                compute_backoff(attempt - 1, backoff.base_ms, backoff.max_ms, backoff.jitter);
             info!(
                 provider = %label,
-                backoff_ms = backoff.as_millis() as u64,
+                backoff_ms = delay.as_millis() as u64,
                 attempt,
                 "backing off before retry"
             );
-            sleep(backoff).await;
+            sleep(delay).await;
         }
         info!(
             provider = %label,
@@ -182,7 +182,8 @@ mod tests {
         let start = Instant::now();
         let mut errors = Vec::new();
         let mut calls = 0u32;
-        let result: Option<()> = run_with_retries("test", 2, &mut errors, |_attempt| {
+        let backoff = BackoffConfig::default();
+        let result: Option<()> = run_with_retries("test", 2, &backoff, &mut errors, |_attempt| {
             calls += 1;
             async move { Err::<(), _>(AppError::Internal("fail".into())) }
         })
@@ -197,5 +198,16 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "backoff exceeded upper bound, got {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn backoff_config_defaults_match_legacy_constants() {
+        // The pre-configurable retry.rs used 100ms base, 5000ms cap, jitter on.
+        // Defaults must keep the same behavior so existing deployments
+        // behave identically after upgrading.
+        let cfg = BackoffConfig::default();
+        assert_eq!(cfg.base_ms, 100);
+        assert_eq!(cfg.max_ms, 5_000);
+        assert!(cfg.jitter);
     }
 }

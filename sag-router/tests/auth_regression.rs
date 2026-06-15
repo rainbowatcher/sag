@@ -20,8 +20,8 @@ use axum::{
 };
 use sag_analytics::CallLogCollector;
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
-    RouteConfig, RouteTarget, ServerConfig, Strategy,
+    BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
+    ProviderType, RouteConfig, RouteTarget, ServerConfig, Strategy,
 };
 use sag_router::AppState;
 use sag_router::admin_providers::{
@@ -59,6 +59,7 @@ async fn build_protected_state() -> AppState {
             api_keys: vec!["regression-key".into()],
         }),
         retries: 2,
+        backoff: BackoffConfig::default(),
         providers,
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),

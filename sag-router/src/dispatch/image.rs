@@ -33,6 +33,10 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
 
     let img_request = build_image_request(request);
 
+    // Snapshot the backoff config once for the whole dispatch — see
+    // `dispatch_chat` for the rationale.
+    let backoff = state.config.read().await.backoff.clone();
+
     for (provider_name, real_model, target_extra, retries) in targets {
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
             continue;
@@ -45,6 +49,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         let outcome = run_with_retries::<ImageGenerationResponse, _, _>(
             provider_name,
             *retries,
+            &backoff,
             errors,
             |_attempt| {
                 let provider = provider.clone();

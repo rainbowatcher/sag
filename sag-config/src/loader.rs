@@ -641,6 +641,7 @@ base_url = "https://api.anthropic.com"
                 },
             )]),
             retries: 2,
+            backoff: BackoffConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -697,6 +698,7 @@ base_url = "https://api.anthropic.com"
                 },
             )]),
             retries: 2,
+            backoff: BackoffConfig::default(),
             routes: vec![],
         };
 
@@ -829,6 +831,7 @@ targets = [
                 },
             )]),
             retries: 2,
+            backoff: BackoffConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
