@@ -1,5 +1,4 @@
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::format::FmtSpan;
 
 /// Initialize the tracing subscriber with env-filter support and JSON output.
 pub fn init() {
@@ -7,7 +6,6 @@ pub fn init() {
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .with_span_events(FmtSpan::CLOSE)
         .with_target(true)
         .with_thread_ids(false)
         .with_file(false)
