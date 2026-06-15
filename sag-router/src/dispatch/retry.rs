@@ -1,12 +1,42 @@
-//! Generic per-target retry loop.
+//! Generic per-target retry loop with exponential backoff.
 
 use sag_core::AppError;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
-/// Run `op` up to `max_retries + 1` times with a fixed backoff between
-/// attempts. Returns the success value, or `None` if every attempt failed
-/// (in which case `errors` is populated with the final error per provider).
+/// Initial backoff delay before the first retry.
+const BASE_BACKOFF_MS: u64 = 100;
+/// Maximum backoff delay cap. Prevents unbounded waits for high `max_retries`.
+const MAX_BACKOFF_MS: u64 = 5_000;
+
+/// Compute the exponential-backoff delay for a given attempt (0-indexed).
+///
+/// Formula: `min(base_ms * 2^attempt, max_ms)`, with optional full jitter
+/// (`delay = random(0, computed)`) to avoid thundering-herd retries across
+/// many concurrent clients. `attempt = 0` returns the base delay (no
+/// doubling); `attempt = 1` doubles it; etc.
+///
+/// `jitter = false` is deterministic and intended for unit tests.
+pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) -> Duration {
+    // Cap the shift to avoid overflow on `1u64 << attempt` for huge attempt values.
+    let exp = attempt.min(63);
+    let raw = base_ms.saturating_mul(1u64 << exp);
+    let capped = raw.min(max_ms);
+    let ms = if jitter {
+        fastrand::u64(0..=capped)
+    } else {
+        capped
+    };
+    Duration::from_millis(ms)
+}
+
+/// Run `op` up to `max_retries + 1` times with exponential backoff (plus
+/// jitter) between attempts. Returns the success value, or `None` if every
+/// attempt failed (in which case `errors` is populated with the final
+/// error per provider).
+///
+/// Backoff schedule (with jitter): attempt 1 → ~0–100ms, attempt 2 →
+/// ~0–200ms, attempt 3 → ~0–400ms, … capped at 5s. See [`compute_backoff`].
 ///
 /// Behavior:
 /// - Non-retryable errors (4xx-class) abort the loop immediately and
@@ -25,7 +55,14 @@ where
 {
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            sleep(Duration::from_millis(100)).await;
+            let backoff = compute_backoff(attempt - 1, BASE_BACKOFF_MS, MAX_BACKOFF_MS, true);
+            info!(
+                provider = %label,
+                backoff_ms = backoff.as_millis() as u64,
+                attempt,
+                "backing off before retry"
+            );
+            sleep(backoff).await;
         }
         info!(
             provider = %label,
@@ -71,6 +108,7 @@ pub fn is_retryable_error(err: &AppError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn is_retryable_error_excludes_4xx() {
@@ -82,5 +120,82 @@ mod tests {
             model: "m".into(),
             reason: "r".into(),
         }));
+    }
+
+    #[test]
+    fn backoff_doubles_each_attempt_without_jitter() {
+        // No jitter → deterministic. 100, 200, 400, 800, …
+        assert_eq!(
+            compute_backoff(0, 100, 5_000, false),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            compute_backoff(1, 100, 5_000, false),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            compute_backoff(2, 100, 5_000, false),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            compute_backoff(3, 100, 5_000, false),
+            Duration::from_millis(800)
+        );
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        // Attempt 10 would be 100 * 1024 = 102400ms, capped at 5000ms.
+        assert_eq!(
+            compute_backoff(10, 100, 5_000, false),
+            Duration::from_millis(5_000)
+        );
+        // Attempt 63 saturates the shift without overflow.
+        assert_eq!(
+            compute_backoff(63, 100, 5_000, false),
+            Duration::from_millis(5_000)
+        );
+    }
+
+    #[test]
+    fn backoff_with_jitter_stays_in_range() {
+        for attempt in 0..10 {
+            for _ in 0..20 {
+                let d = compute_backoff(attempt, 100, 5_000, true);
+                let cap = (100u64 << attempt.min(63)).min(5_000);
+                assert!(
+                    d.as_millis() <= cap as u128,
+                    "jittered backoff {d:?} exceeds cap {cap}ms for attempt {attempt}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_actually_sleep_with_backoff() {
+        // 3 attempts: attempt 0 (no sleep), then backoff before attempt 1
+        // (up to 100ms with jitter), then backoff before attempt 2 (up to
+        // 200ms with jitter). All 3 attempts fail to exhaust the retry budget.
+        // The unit tests for `compute_backoff` cover the exact formula;
+        // full jitter means the actual delay can be as low as 0ms, so we
+        // assert an upper bound rather than a lower bound here.
+        let start = Instant::now();
+        let mut errors = Vec::new();
+        let mut calls = 0u32;
+        let result: Option<()> = run_with_retries("test", 2, &mut errors, |_attempt| {
+            calls += 1;
+            async move { Err::<(), _>(AppError::Internal("fail".into())) }
+        })
+        .await;
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "should have exhausted retries");
+        assert_eq!(calls, 3, "op should be called once per attempt");
+        assert_eq!(errors.len(), 1);
+        // Upper bound: even with max jitter, two backoffs cannot exceed
+        // 100ms + 200ms = 300ms (plus scheduling slack).
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "backoff exceeded upper bound, got {elapsed:?}"
+        );
     }
 }

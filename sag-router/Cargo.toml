@@ -21,3 +21,7 @@ sag-analytics = { path = "../sag-analytics" }
 reqwest = { workspace = true }
 fastrand = "2"
 futures-util = "0.3"
+
+[dev-dependencies]
+async-trait = "0.1"
+http-body-util = "0.1"

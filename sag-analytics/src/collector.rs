@@ -1,13 +1,23 @@
 use sag_core::CallLog;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
+
+/// Internal command sent through the collector's MPSC channel.
+enum CollectorCommand {
+    /// Persist a call log entry.
+    Log(CallLog),
+    /// Signal completion after all prior `Log` commands have been persisted.
+    /// The oneshot sender is invoked by the background task once it reaches
+    /// this command, guaranteeing FIFO ordering with preceding logs.
+    Flush(oneshot::Sender<()>),
+}
 
 /// Async collector that receives `CallLog` events via an MPSC channel
 /// and persists them to SQLite.
 pub struct CallLogCollector {
-    tx: mpsc::Sender<CallLog>,
+    tx: mpsc::Sender<CollectorCommand>,
     pool: SqlitePool,
 }
 
@@ -53,61 +63,70 @@ impl CallLogCollector {
         .execute(&pool)
         .await?;
 
-        let (tx, mut rx) = mpsc::channel::<CallLog>(4096);
+        let (tx, mut rx) = mpsc::channel::<CollectorCommand>(4096);
         let pool_clone = pool.clone();
 
         tokio::spawn(async move {
             info!("analytics collector started (sqlite)");
             let mut count: u64 = 0;
-            while let Some(log) = rx.recv().await {
-                count += 1;
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    CollectorCommand::Log(log) => {
+                        count += 1;
 
-                let (prompt, completion, total) = match &log.usage {
-                    Some(u) => (
-                        Some(u.prompt_tokens as i64),
-                        Some(u.completion_tokens as i64),
-                        Some(u.total_tokens as i64),
-                    ),
-                    None => (None, None, None),
-                };
+                        let (prompt, completion, total) = match &log.usage {
+                            Some(u) => (
+                                Some(u.prompt_tokens as i64),
+                                Some(u.completion_tokens as i64),
+                                Some(u.total_tokens as i64),
+                            ),
+                            None => (None, None, None),
+                        };
 
-                let result = sqlx::query(
-                    r#"
-                    INSERT INTO call_logs
-                        (request_id, provider, model, real_model, stream,
-                         status_code, duration_ms,
-                         prompt_tokens, completion_tokens, total_tokens,
-                         error, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    "#,
-                )
-                .bind(log.request_id.to_string())
-                .bind(&log.provider)
-                .bind(&log.model)
-                .bind(&log.real_model)
-                .bind(log.stream as i32)
-                .bind(log.status_code as i32)
-                .bind(log.duration_ms as i64)
-                .bind(prompt)
-                .bind(completion)
-                .bind(total)
-                .bind(&log.error)
-                .bind(log.timestamp.to_rfc3339())
-                .execute(&pool_clone)
-                .await;
+                        let result = sqlx::query(
+                            r#"
+                            INSERT INTO call_logs
+                                (request_id, provider, model, real_model, stream,
+                                 status_code, duration_ms,
+                                 prompt_tokens, completion_tokens, total_tokens,
+                                 error, timestamp)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            "#,
+                        )
+                        .bind(log.request_id.to_string())
+                        .bind(&log.provider)
+                        .bind(&log.model)
+                        .bind(&log.real_model)
+                        .bind(log.stream as i32)
+                        .bind(log.status_code as i32)
+                        .bind(log.duration_ms as i64)
+                        .bind(prompt)
+                        .bind(completion)
+                        .bind(total)
+                        .bind(&log.error)
+                        .bind(log.timestamp.to_rfc3339())
+                        .execute(&pool_clone)
+                        .await;
 
-                if let Err(e) = result {
-                    error!(
-                        request_id = %log.request_id,
-                        provider = %log.provider,
-                        model = %log.model,
-                        error = ?e,
-                        "failed to persist call log"
-                    );
-                }
+                        if let Err(e) = result {
+                            error!(
+                                request_id = %log.request_id,
+                                provider = %log.provider,
+                                model = %log.model,
+                                error = ?e,
+                                "failed to persist call log"
+                            );
+                        }
 
-                if count.is_multiple_of(10) {
-                    info!(count, "analytics: persisted {count} call logs");
+                        if count.is_multiple_of(10) {
+                            info!(count, "analytics: persisted {count} call logs");
+                        }
+                    }
+                    CollectorCommand::Flush(done) => {
+                        // Signal the caller that all prior logs have been processed.
+                        // Ignore send errors (caller dropped the receiver).
+                        let _ = done.send(());
+                    }
                 }
             }
             info!("analytics collector shut down");
@@ -122,13 +141,13 @@ impl CallLogCollector {
     }
 
     /// Return a cloneable sender for other crates to push call logs.
-    pub fn sender(&self) -> mpsc::Sender<CallLog> {
+    pub fn sender(&self) -> mpsc::Sender<CollectorCommand> {
         self.tx.clone()
     }
 
     /// Send a call log asynchronously. Non-blocking.
     pub fn log(&self, entry: CallLog) {
-        match self.tx.try_send(entry) {
+        match self.tx.try_send(CollectorCommand::Log(entry)) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 error!("analytics channel full, dropping call log");
@@ -136,6 +155,20 @@ impl CallLogCollector {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 error!("analytics channel closed, dropping call log");
             }
+        }
+    }
+
+    /// Wait until all previously sent call logs have been persisted to SQLite.
+    /// Useful in tests to avoid races between `log()` and subsequent `query_stats()`.
+    /// In production this can be used for graceful shutdown.
+    pub async fn flush(&self) {
+        let (done, rx) = oneshot::channel();
+        // Use `send().await` (not `try_send`) so that a full channel blocks
+        // until the background task drains it. This guarantees FIFO ordering
+        // with all prior `Log` commands before `Flush` is delivered.
+        if self.tx.send(CollectorCommand::Flush(done)).await.is_ok() {
+            // Ignore errors: the background task may have shut down.
+            let _ = rx.await;
         }
     }
 
