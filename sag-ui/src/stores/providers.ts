@@ -1,6 +1,7 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api, headers } from "@/lib/client"
+import { getErrorMessage } from "@/lib/utils"
 import type { ModelTestResult, Provider } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
@@ -22,7 +23,7 @@ function createPerItemState<T, K extends string>() {
       return result
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
-      const errorMsg = e.response?.data?.error?.message ?? e.message ?? String(e)
+      const errorMsg = getErrorMessage(e, String(e))
       states.value[key] = { loading: false, error: errorMsg, data: undefined }
     }
   }
@@ -87,7 +88,7 @@ export const useProviderStore = defineStore("providers", () => {
       upstreamModelsError.value = ""
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
-      upstreamModelsError.value = e.response?.data?.error?.message ?? e.message ?? String(e)
+      upstreamModelsError.value = getErrorMessage(e, String(e))
     } finally {
       upstreamModelsLoading.value = false
     }

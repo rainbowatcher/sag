@@ -2,12 +2,14 @@
 import { Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { onMounted, ref } from "vue"
+import { toast } from "vue-sonner"
 import { z } from "zod"
 import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 import type { RouteConfig, Strategy, TargetItem } from "@/types/api"
@@ -108,11 +110,15 @@ const form = useForm({
         }),
       })
     } catch (e: any) {
-      apiError.value = e.response?.data?.error?.message ?? e.message
+      apiError.value = getErrorMessage(e)
       throw e
     }
   },
 })
+
+function onUpdated() {
+  toast.success(`Route "${props.route.model_name}" updated`)
+}
 
 async function handleSubmit(event: Event) {
   event.preventDefault()
@@ -121,9 +127,10 @@ async function handleSubmit(event: Event) {
   try {
     await form.handleSubmit()
     if (apiError.value) return
+    onUpdated()
     emit("updated")
-  } catch {
-    // apiError already set in form.onSubmit; no need to re-emit
+  } catch (e: any) {
+    if (!apiError.value) toast.error(getErrorMessage(e))
   } finally {
     saving.value = false
   }

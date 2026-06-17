@@ -8,6 +8,7 @@ import {
   useVueTable,
 } from "@tanstack/vue-table"
 import { computed, h, ref } from "vue"
+import { toast } from "vue-sonner"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -19,6 +20,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 import type { RouteConfig } from "@/types/api"
@@ -62,11 +64,13 @@ async function confirmDelete() {
   deleting.value = true
   try {
     await routeStore.deleteRoute(deleteTarget.value)
+    toast.success(`Route "${deleteTarget.value}" deleted`)
     deleteDialogOpen.value = false
     deleteTarget.value = null
     await routeStore.fetchRoutes()
-  } catch {
-    // error handled by store; keep dialog open to show retry option
+  } catch (e: any) {
+    const msg = getErrorMessage(e)
+    toast.error(msg)
   } finally {
     deleting.value = false
   }

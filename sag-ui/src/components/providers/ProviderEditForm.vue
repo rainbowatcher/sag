@@ -2,6 +2,7 @@
 import { Loader2 } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
 import { computed, ref } from "vue"
+import { toast } from "vue-sonner"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import ModelManager from "@/components/ModelManager.vue"
@@ -35,6 +36,7 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
 
@@ -190,10 +192,13 @@ async function handleSubmit() {
     }
 
     await store.updateProvider(props.provider.name, payload)
+    toast.success(`Provider "${props.provider.name}" updated`)
     emit("updated")
   } catch (e: any) {
     if (apiError.value) return
-    apiError.value = e.response?.data?.error?.message ?? e.message
+    const msg = getErrorMessage(e)
+    apiError.value = msg
+    toast.error(msg)
   } finally {
     saving.value = false
   }

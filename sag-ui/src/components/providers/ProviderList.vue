@@ -2,7 +2,7 @@
 import { Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
 import { h, onMounted, ref, watch } from "vue"
-import { Switch } from "@/components/ui/switch"
+import { toast } from "vue-sonner"
 import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
 import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
@@ -15,6 +15,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
+import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
 
@@ -69,7 +71,9 @@ onMounted(async () => {
 
 // ── Enable / Disable toggle ───────────────────────────────────────
 async function toggleEnabled(provider: Provider) {
-  await store.updateProvider(provider.name, { enabled: !provider.enabled })
+  const newState = !provider.enabled
+  await store.updateProvider(provider.name, { enabled: newState })
+  toast.success(`Provider "${provider.name}" ${newState ? "enabled" : "disabled"}`)
   await fetchProviders()
 }
 
@@ -105,11 +109,13 @@ async function confirmDelete(name: string) {
   deleting.value = true
   try {
     await store.deleteProvider(name)
+    toast.success(`Provider "${name}" deleted`)
     confirmingDelete.value = null
     await loadModelOptions()
     await fetchProviders()
-  } catch {
-    confirmingDelete.value = null
+  } catch (e: any) {
+    const msg = getErrorMessage(e)
+    toast.error(msg)
   } finally {
     deleting.value = false
   }

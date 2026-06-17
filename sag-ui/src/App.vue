@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Loader2 } from "@lucide/vue"
 import { RouterView } from "vue-router"
+import { Toaster } from "@/components/ui/sonner"
 import { useConnectionStore } from "@/stores/connection"
 
 const store = useConnectionStore()
@@ -16,4 +17,5 @@ const store = useConnectionStore()
   </div>
 
   <RouterView v-else />
+  <Toaster theme="system" position="top-center" expand />
 </template>

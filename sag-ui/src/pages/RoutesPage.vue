@@ -4,6 +4,7 @@ import { onMounted, ref } from "vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
+import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 
@@ -24,7 +25,7 @@ async function refreshPage() {
   try {
     await Promise.all([providerStore.fetchProviders(), routeStore.fetchRoutes()])
   } catch (e: any) {
-    pageError.value = e.response?.data?.error?.message ?? e.message ?? "Failed to load data"
+    pageError.value = getErrorMessage(e, "Failed to load data")
   }
 }
 

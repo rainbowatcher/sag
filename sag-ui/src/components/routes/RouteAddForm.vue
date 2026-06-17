@@ -2,6 +2,7 @@
 import { X, Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { ref } from "vue"
+import { toast } from "vue-sonner"
 import { z } from "zod"
 import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
@@ -9,6 +10,7 @@ import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/componen
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { getErrorMessage } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, Strategy, CreateRoutePayload, TargetItem } from "@/types/api"
 
@@ -98,11 +100,16 @@ const form = useForm({
 
       await routeStore.createRoute(payload)
     } catch (e: any) {
-      apiError.value = e.response?.data?.error?.message ?? e.message
+      apiError.value = getErrorMessage(e)
       throw e
     }
   },
 })
+
+function onCreated() {
+  const name = form.state.values.model_name || targets.value[0].real_model || ""
+  toast.success(`Route "${name}" created`)
+}
 
 async function handleSubmit(event: Event) {
   event.preventDefault()
@@ -111,9 +118,10 @@ async function handleSubmit(event: Event) {
   try {
     await form.handleSubmit()
     if (apiError.value) return
+    onCreated()
     emit("created")
-  } catch {
-    // apiError already set in form.onSubmit; no need to re-emit
+  } catch (e: any) {
+    if (!apiError.value) toast.error(getErrorMessage(e))
   } finally {
     adding.value = false
   }

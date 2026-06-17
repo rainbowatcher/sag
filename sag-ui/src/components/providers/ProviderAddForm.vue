@@ -2,6 +2,7 @@
 import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { ref, watch } from "vue"
+import { toast } from "vue-sonner"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
@@ -19,6 +20,7 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 
 const store = useProviderStore()
@@ -125,10 +127,12 @@ const form = useForm({
         enabled_models: enabledModels.value,
         models_endpoint: modelsEndpoint.value.trim() || undefined,
       })
+      toast.success(`Provider "${value.name}" created`)
       emit("created")
     } catch (e: any) {
-      if (apiError.value) return
-      apiError.value = e.response?.data?.error?.message ?? e.message
+      const msg = getErrorMessage(e)
+      apiError.value = msg
+      toast.error(msg)
       throw e
     }
   },
