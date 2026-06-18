@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
-import { ref, watch, type Ref } from "vue"
+import { Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
+import { ref, watch } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
@@ -42,8 +42,6 @@ const emit = defineEmits<{
 }>()
 
 // ── Internal state ─────────────────────────────────
-const selectedModel = ref("")
-const customModel = ref("")
 const modelsEndpoint = ref(props.modelsEndpoint ?? "models")
 
 watch(
@@ -52,22 +50,6 @@ watch(
     modelsEndpoint.value = value ?? "models"
   },
 )
-
-function addModelByName(name: string, sourceRef: Ref<string>) {
-  const trimmed = name.trim()
-  if (trimmed && !props.enabledModels.includes(trimmed)) {
-    emit("update:enabledModels", [...props.enabledModels, trimmed])
-  }
-  sourceRef.value = ""
-}
-
-function addModel() {
-  addModelByName(selectedModel.value, selectedModel)
-}
-
-function addCustomModel() {
-  addModelByName(customModel.value, customModel)
-}
 
 function removeModel(name: string) {
   emit(
@@ -148,46 +130,18 @@ function onModelsEndpointChange(value: string | number) {
       </div>
     </div>
 
-    <!-- Custom model input -->
-    <div class="flex items-center gap-2">
-      <Input
-        :model-value="customModel"
-        placeholder="Or type a model name..."
-        class="flex-1"
-        :disabled="disabled"
-        @input="customModel = ($event.target as HTMLInputElement).value"
+    <!-- Multi-select model combobox -->
+    <div class="min-w-0">
+      <Combobox
+        :model-value="enabledModels"
+        :options="upstreamModels.map((m) => ({ value: modelLabel(m) }))"
+        placeholder="Select models..."
+        search-placeholder="Search models..."
+        empty-text="No models found. Click Refresh Models."
+        :loading="upstreamModelsLoading"
+        multiple
+        @update:model-value="(v) => emit('update:enabledModels', v as string[])"
       />
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        :disabled="!customModel.trim()"
-        @click="addCustomModel"
-      >
-        <Plus class="h-3.5 w-3.5" />
-        Add
-      </Button>
-    </div>
-
-    <!-- Combobox + Add -->
-    <div class="flex gap-2">
-      <div class="min-w-0 flex-1">
-        <Combobox
-          v-model="selectedModel"
-          :options="
-            upstreamModels
-              .filter((m) => !enabledModels.includes(modelLabel(m)))
-              .map((m) => ({ value: modelLabel(m) }))
-          "
-          placeholder="Select a model..."
-          search-placeholder="Search models..."
-          empty-text="No models found. Click Refresh Models."
-          :loading="upstreamModelsLoading"
-        />
-      </div>
-      <Button variant="outline" size="sm" :disabled="!selectedModel.trim()" @click="addModel">
-        <Plus class="h-3.5 w-3.5" />
-      </Button>
     </div>
 
     <!-- Refresh + loading / error -->
