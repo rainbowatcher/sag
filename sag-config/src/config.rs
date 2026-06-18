@@ -162,6 +162,34 @@ impl GatewayConfig {
                     ));
                 }
             }
+
+            // ── Composite (provider, real_model) uniqueness per route ──
+            // The save path uses `(provider, real_model)` as the
+            // composite key for `sync_inline_table_array_in_place`
+            // (two targets may legitimately share a `provider` as long
+            // as their `real_model`s differ). Forbidding the conflicting
+            // case — same `provider` AND same `real_model` — here keeps
+            // the on-disk ↔ in-memory mapping unambiguous; without
+            // this check a config with two identical targets would
+            // silently collapse to one on save.
+            let mut seen_targets: HashSet<(&str, Option<&str>)> = HashSet::new();
+            for (j, target) in route.targets.iter().enumerate() {
+                let key: (&str, Option<&str>) =
+                    (target.provider.as_str(), target.real_model.as_deref());
+                if !seen_targets.insert(key) {
+                    let real_model_desc = match &target.real_model {
+                        Some(rm) => format!("real_model='{rm}'"),
+                        None => "real_model=omitted".to_string(),
+                    };
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): duplicates (provider, real_model) \
+                         for target[{j}] — another target in this route already has \
+                         provider='{}' and {real_model_desc}; the save path uses this \
+                         pair as the sync key and would silently overwrite one of the two",
+                        route.model_name, target.provider
+                    ));
+                }
+            }
         }
 
         if let Some(idx) = wildcard_index
@@ -438,6 +466,20 @@ fn default_api_endpoint() -> String {
     "/chat/completions".into()
 }
 
+impl RouteConfig {
+    /// Returns `true` if this route's `api_endpoint` is the built-in default
+    /// (`"/chat/completions"`). Save logic uses this to mirror the
+    /// `skip_serializing_if = "is_default_api_endpoint"` rule on
+    /// [`RouteConfig::api_endpoint`]: the field is dropped from the file
+    /// when the value is the default, and written otherwise. Calling
+    /// `default_api_endpoint` directly would leak an implementation detail
+    /// of "what counts as a default" into the public API; this method
+    /// encapsulates that comparison.
+    pub fn uses_default_api_endpoint(&self) -> bool {
+        is_default_api_endpoint(&self.api_endpoint)
+    }
+}
+
 /// A routing target: maps a logical model to a specific provider + real model name.
 ///
 /// Multiple targets in a route are grouped by priority and tried based on the
@@ -465,6 +507,13 @@ pub struct RouteTarget {
     /// Per-target extra body fields merged into the upstream JSON body.
     /// Applied after provider-level body_overrides, so target-level
     /// keys take precedence.
+    ///
+    /// Serialized as a single nested inline table (`extra = { ... }`)
+    /// within the target's inline table, e.g.
+    /// `{ provider = "openai", extra = { temperature = 0.7 } }`. This
+    /// keeps target-level extras clearly grouped, avoids namespace
+    /// collisions with future `RouteTarget` fields, and round-trips with
+    /// the on-disk key order preserved.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -1017,6 +1066,89 @@ api_keys = ["sk-test"]
             let err = config.validate().unwrap_err();
             // Should contain multiple errors
             assert!(err.len() >= 3, "expected at least 3 errors, got {err:?}");
+        }
+
+        #[test]
+        fn uses_default_api_endpoint_matches_serde_skip_rule() {
+            // The new predicate must agree with the same comparison that
+            // serde uses (via `is_default_api_endpoint`) — otherwise the save
+            // path could drop a non-default field or keep a default one.
+            let mut route = RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: default_api_endpoint(),
+                strategy: Strategy::FillFirst,
+                retries: None,
+                targets: vec![],
+            };
+            assert!(route.uses_default_api_endpoint());
+            assert!(is_default_api_endpoint(&route.api_endpoint));
+
+            route.api_endpoint = "/images/generations".into();
+            assert!(!route.uses_default_api_endpoint());
+            assert!(!is_default_api_endpoint(&route.api_endpoint));
+        }
+
+        #[test]
+        fn rejects_duplicate_provider_and_real_model_within_route() {
+            // Two targets in the same route sharing BOTH `provider` AND
+            // `real_model` would silently collapse on save (the save
+            // path's `(provider, real_model)` key map has only one slot
+            // for the pair). `validate()` is the only consumer-visible
+            // line of defense — reject it explicitly so the user sees a
+            // clear error instead of a quiet data loss.
+            let mut config = valid_config();
+            config.routes[0].targets = vec![
+                RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("gpt-4".into()),
+                    priority: 10,
+                    retries: None,
+                    extra: HashMap::new(),
+                },
+                RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("gpt-4".into()),
+                    priority: 5,
+                    retries: None,
+                    extra: HashMap::new(),
+                },
+            ];
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("duplicates (provider, real_model)")),
+                "expected duplicate-key error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_same_provider_distinct_real_model_within_route() {
+            // Sanity check: the why behind the composite-key refactor.
+            // Two targets HAVE THE SAME provider but DIFFERENT
+            // real_models must be legal (this is how multi-model
+            // fallback through one provider works). The validator must
+            // permit this and the save path must keep them distinct.
+            let mut config = valid_config();
+            config.routes[0].targets = vec![
+                RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("gpt-4".into()),
+                    priority: 10,
+                    retries: None,
+                    extra: HashMap::new(),
+                },
+                RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("gpt-3.5-turbo".into()),
+                    priority: 5,
+                    retries: None,
+                    extra: HashMap::new(),
+                },
+            ];
+            assert!(
+                config.validate().is_ok(),
+                "distinct real_models with the same provider must validate"
+            );
         }
     }
 }
