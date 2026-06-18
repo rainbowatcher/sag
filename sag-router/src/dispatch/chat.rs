@@ -12,8 +12,8 @@ use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
-DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-success_log,
+    DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
+    success_log,
 };
 
 /// Unified result of a single chat attempt. The stream and non-stream
@@ -43,10 +43,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     // a consistent view (a hot-reload mid-dispatch shouldn't change the
     // schedule for an in-flight request).
     let backoff = state.config.read().await.backoff.clone();
-let api_endpoint = api_endpoint.to_string();
+    let api_endpoint = api_endpoint.to_string();
 
     for (provider_name, real_model, target_extra, retries) in targets {
-let Some(circuit_key) =
+        let Some(circuit_key) =
             circuit_allows_target(state, &request.model, provider_name, real_model, errors).await
         else {
             continue;
@@ -60,7 +60,7 @@ let Some(circuit_key) =
         // re-allocate on every retry attempt.
         let real_model = real_model.clone();
         let target_extra = target_extra.clone();
-        
+
         let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
             provider_name,
             *retries,
@@ -132,7 +132,7 @@ mod tests {
     use futures_util::Stream;
     use sag_analytics::CallLogCollector;
     use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
-use sag_core::AppError;
+    use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
     use sag_providers::LlmProvider;
     use serde_json::json;
@@ -286,7 +286,7 @@ use sag_core::AppError;
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
-route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
+            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
 
