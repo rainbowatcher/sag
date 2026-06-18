@@ -1,0 +1,106 @@
+# ============================================================
+# SAG — Test Environment Configuration
+#
+# Copy to gateway.test.toml (gitignored) and fill in keys.
+# Differences from gateway.example.toml:
+#   - port 3001 (drifts away from dev port 3000)
+#   - host bound to 127.0.0.1 (loopback only — agent tools are local)
+#   - analytics storage_dsn points at analytics-test.db (parallel to dev)
+#
+# Hot-reload is in-process: editing routes / providers takes effect without
+# restart, but [server].port / [server].host changes do NOT rebind the
+# listen socket — restart test-env to pick those up.
+#
+# This template deliberately omits [gateway_auth] — agent tools default to
+# no Authorization header. If you want to exercise the auth path, copy
+# the [gateway_auth] block from gateway.example.toml after first-time setup.
+# ============================================================
+
+# Global default retry count (per target). Can be overridden per-route or per-target.
+retries = 2
+
+# Exponential-backoff settings for retry delays. See gateway.example.toml
+# for full semantics; defaults preserved here for parity with prod.
+[backoff]
+base_ms = 100
+max_ms = 5000
+jitter = true
+
+[server]
+host = "127.0.0.1"
+port = 3001
+
+[analytics]
+enabled = true
+storage_dsn = "sqlite://analytics-test.db"
+
+# NOTE: [gateway_auth] intentionally NOT included — agent tools
+# (`.kilo/`, `.cline/`, `.kimchi/`) typically connect without Authorization.
+# Copy the block from gateway.example.toml after first fill-in if needed.
+
+# ============================================================
+# LLM Provider configurations
+# Same set as gateway.example.toml; operators override keys per environment.
+# ============================================================
+
+[providers.openai]
+api_keys = ["sk-your-openai-api-key"]
+base_url = "https://api.openai.com/v1"
+timeout_secs = 120
+
+[providers.anthropic]
+api_keys = ["sk-ant-your-anthropic-api-key"]
+base_url = "https://api.anthropic.com/v1"
+timeout_secs = 120
+
+# ============================================================
+# Model routing table — identical structure to prod.
+# ============================================================
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+]
+
+[[routes]]
+model_name = "gpt-4o-mini"
+targets = [
+    { provider = "openai", real_model = "gpt-4o-mini", priority = 10 },
+]
+
+[[routes]]
+model_name = "claude-sonnet"
+retries = 3
+targets = [
+    { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 10, retries = 5 },
+    { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
+]
+
+[[routes]]
+model_name = "claude-opus"
+targets = [
+    { provider = "anthropic", real_model = "claude-3-opus-20240229", priority = 10 },
+]
+
+[[routes]]
+model_name = "*"
+targets = [
+    { provider = "openai", real_model = "<passthrough>", priority = 10 },
+]
+
+# ============================================================
+# Q4 STUB — Agent-tool connection (operator fills per environment)
+# ============================================================
+# After the operator copies this template to gateway.test.toml, fill in the
+# `api_keys` placeholder values above (and any [providers.*].base_url overrides
+# you need for the upstream you're testing against) — values come from each
+# agent tool's local config:
+#
+#   - .kilo/   : agent's provider base_url & api_key
+#   - .cline/  : ditto
+#   - .kimchi/ : ditto
+#
+# Then point the agent at:  http://127.0.0.1:3001/v1
+# Tools will call /v1/chat/completions against this gateway without
+# Authorization by default (matches the no-[gateway_auth] decision above).

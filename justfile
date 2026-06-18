@@ -135,3 +135,9 @@ setup:
 # 查看项目树 (排除 target / node_modules)
 tree:
     find . -not -path './target/*' -not -path './sag-ui/node_modules/*' -not -path './.git/*' -not -name '*.db*' | head -120
+
+# ── 测试环境 (test-env) ─────────────────────────────────────────────────
+
+# 转发到 scripts/test-env.py：`just test-env start` / `stop` / `restart` / `status`
+test-env *args:
+    python3 scripts/test-env.py {{ args }}

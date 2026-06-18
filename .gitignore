@@ -35,3 +35,11 @@ gateway.toml
 .cline/
 .kimchi/
 .plan/
+
+# test-env state (Phase 2 — see .plan/test-environment.md)
+.test-env/
+gateway.test.toml
+logs/
+# analytics-test.db is already covered by the `*.db` pattern above.
+
+__pycache__/
