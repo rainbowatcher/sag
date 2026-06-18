@@ -14,6 +14,12 @@ config := "gateway.toml"
 build:
     cargo build --release
 
+# 单二进制部署构建（嵌入前端）。顺序串死避免 stale dist：
+# 必须先 pnpm build 产 sag-ui/dist/，再让 cargo 把 dist/ 嵌入二进制。
+build-test:
+    pnpm -C sag-ui run build
+    cargo build --release --features embed-ui
+
 # Debug 构建
 build-debug:
     cargo build

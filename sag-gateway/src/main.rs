@@ -12,6 +12,9 @@ use tracing::info;
 
 mod tracing_init;
 
+#[cfg(feature = "embed-ui")]
+mod ui_routes;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 1. Initialize tracing (structured logging)
@@ -63,6 +66,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 9. Build router
     let app = sag_router::build_router(app_state);
+
+    // 9a. When the `embed-ui` feature is on, route any unmatched path
+    //     through the embedded SPA (assets + index.html fallback).
+    #[cfg(feature = "embed-ui")]
+    let app = app.fallback(crate::ui_routes::ui_handler);
 
     // 10. Determine listen address
     let config = config_handle.read().await;

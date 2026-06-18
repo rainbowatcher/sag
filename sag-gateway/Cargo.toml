@@ -21,3 +21,14 @@ sag-config = { path = "../sag-config" }
 sag-router = { path = "../sag-router" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
+
+# Optional deps for the `embed-ui` feature (see [features] below).
+rust-embed = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
+
+[features]
+# When on, sag-ui/dist/ is rolled into the binary at compile time.
+# Default is OFF: keeps the binary lean for users who deploy the SPA
+# separately via Vite or a CDN. The test-env launcher (`just build-test`)
+# is the canonical caller for this feature.
+embed-ui = ["dep:rust-embed", "dep:mime_guess"]
