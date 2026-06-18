@@ -2,6 +2,7 @@ pub mod admin;
 pub mod admin_providers;
 pub mod admin_routes;
 pub mod admin_testing;
+pub mod circuit_breaker;
 pub mod dispatch;
 pub mod handlers;
 pub mod middleware;

@@ -6,6 +6,8 @@ use sag_config::ConfigHandle;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
 
+use crate::circuit_breaker::RouteCircuitBreaker;
+
 /// Shared application state for all Axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -17,6 +19,8 @@ pub struct AppState {
     pub collector: Arc<CallLogCollector>,
     /// Round-robin counters keyed by route model_name.
     pub route_counters: Arc<RwLock<HashMap<String, u64>>>,
+    /// Runtime availability memory for route targets.
+    pub route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
 }
 
 impl AppState {

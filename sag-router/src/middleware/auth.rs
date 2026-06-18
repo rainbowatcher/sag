@@ -108,6 +108,7 @@ mod tests {
             providers: Arc::new(RwLock::new(HashMap::new())),
             collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
 

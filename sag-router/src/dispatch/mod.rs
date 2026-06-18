@@ -23,8 +23,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sag_core::{AppError, CallLog, ChatCompletionRequest, Usage};
-use tracing::error;
+use tracing::{error, info};
 
+use crate::circuit_breaker::RouteTargetKey;
+use crate::dispatch::retry::RetryOutcome;
 use crate::state::AppState;
 
 pub mod chat;
@@ -55,6 +57,63 @@ pub struct DispatchCtx<'a> {
     pub trace_id: uuid::Uuid,
     pub start: Instant,
     pub errors: &'a mut Vec<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Circuit breaker helpers — shared across the dispatch submodules.
+// ═══════════════════════════════════════════════════════════════════
+
+pub(in crate::dispatch) async fn circuit_allows_target(
+    state: &AppState,
+    model: &str,
+    provider_name: &str,
+    real_model: &str,
+    errors: &mut Vec<String>,
+) -> Option<RouteTargetKey> {
+    let circuit_key = RouteTargetKey::new(model, provider_name, real_model);
+    let remaining = state
+        .route_circuit_breaker
+        .read()
+        .await
+        .open_remaining(&circuit_key);
+
+    if let Some(remaining) = remaining {
+        info!(
+            provider = %provider_name,
+            real_model = %real_model,
+            remaining_ms = remaining.as_millis() as u64,
+            "skipping open route target circuit"
+        );
+        errors.push(format!(
+            "{provider_name}/{real_model}: circuit open ({}ms remaining)",
+            remaining.as_millis()
+        ));
+        None
+    } else {
+        Some(circuit_key)
+    }
+}
+
+pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
+    state: &AppState,
+    circuit_key: RouteTargetKey,
+    outcome: RetryOutcome<T>,
+) -> Option<T> {
+    match outcome {
+        RetryOutcome::Success(value) => {
+            state
+                .route_circuit_breaker
+                .write()
+                .await
+                .close(&circuit_key);
+            Some(value)
+        }
+        RetryOutcome::Exhausted => {
+            state.route_circuit_breaker.write().await.open(circuit_key);
+            None
+        }
+        RetryOutcome::NonRetryable => None,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

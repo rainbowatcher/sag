@@ -142,6 +142,7 @@ mod tests {
             providers: Arc::new(RwLock::new(HashMap::new())),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
 
@@ -185,11 +186,17 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
             }),
             StreamChunk::Usage(Usage {
                 prompt_tokens: 5,
                 completion_tokens: 0,
                 total_tokens: 5,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
             }),
             StreamChunk::Done,
         ];

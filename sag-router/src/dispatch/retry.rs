@@ -26,10 +26,46 @@ pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) ->
     Duration::from_millis(ms)
 }
 
+/// Result of running the retry loop. Dispatchers use the distinction between
+/// retry exhaustion and non-retryable failures to update route target circuit
+/// state only when a target has actually spent its retry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOutcome<T> {
+    Success(T),
+    NonRetryable,
+    Exhausted,
+}
+
+impl<T> RetryOutcome<T> {
+    pub fn into_option(self) -> Option<T> {
+        match self {
+            Self::Success(value) => Some(value),
+            Self::NonRetryable | Self::Exhausted => None,
+        }
+    }
+}
+
 /// Run `op` up to `max_retries + 1` times with exponential backoff (plus
 /// jitter) between attempts. Returns the success value, or `None` if every
 /// attempt failed (in which case `errors` is populated with the final
 /// error per provider).
+pub async fn run_with_retries<T, F, Fut>(
+    label: &str,
+    max_retries: u32,
+    backoff: &BackoffConfig,
+    errors: &mut Vec<String>,
+    op: F,
+) -> Option<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+{
+    run_with_retries_outcome(label, max_retries, backoff, errors, op)
+        .await
+        .into_option()
+}
+
+/// Run `op` up to `max_retries + 1` times and retain the terminal reason.
 ///
 /// Backoff schedule is driven by `backoff` (typically read from
 /// [`GatewayConfig::backoff`](sag_config::GatewayConfig::backoff)):
@@ -41,13 +77,13 @@ pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) ->
 ///   push a `{label}: {err}` entry to `errors`.
 /// - Retryable errors at the final attempt push a `{label}: {err}
 ///   (retries exhausted)` entry and stop.
-pub async fn run_with_retries<T, F, Fut>(
+pub async fn run_with_retries_outcome<T, F, Fut>(
     label: &str,
     max_retries: u32,
     backoff: &BackoffConfig,
     errors: &mut Vec<String>,
     mut op: F,
-) -> Option<T>
+) -> RetryOutcome<T>
 where
     F: FnMut(u32) -> Fut,
     Fut: std::future::Future<Output = Result<T, AppError>>,
@@ -71,7 +107,7 @@ where
             "trying provider"
         );
         match op(attempt).await {
-            Ok(value) => return Some(value),
+            Ok(value) => return RetryOutcome::Success(value),
             Err(err) => {
                 let retryable = is_retryable_error(&err);
                 warn!(
@@ -83,16 +119,16 @@ where
                 );
                 if !retryable {
                     errors.push(format!("{label}: {err}"));
-                    return None;
+                    return RetryOutcome::NonRetryable;
                 }
                 if attempt == max_retries {
                     errors.push(format!("{label}: {err} (retries exhausted)"));
-                    return None;
+                    return RetryOutcome::Exhausted;
                 }
             }
         }
     }
-    None
+    RetryOutcome::Exhausted
 }
 
 /// Whether an error should trigger a retry on the same provider, or fall

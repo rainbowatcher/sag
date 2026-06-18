@@ -6,14 +6,15 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sag_config::BackoffConfig;
-use sag_core::{AppError, ChatCompletionResponse, StreamChunk};
-use tracing::trace;
+use sag_core::{ChatCompletionResponse, StreamChunk};
 
 use crate::dispatch::resolve::resolve_provider;
-use crate::dispatch::retry::run_with_retries;
+use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
-use crate::dispatch::{DispatchCtx, fallback_exhausted_response, success_log};
+use crate::dispatch::{
+DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
+success_log,
+};
 
 /// Unified result of a single chat attempt. The stream and non-stream
 /// outcomes are different types, so we wrap them in an enum to share
@@ -42,8 +43,15 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     // a consistent view (a hot-reload mid-dispatch shouldn't change the
     // schedule for an in-flight request).
     let backoff = state.config.read().await.backoff.clone();
+let api_endpoint = api_endpoint.to_string();
 
     for (provider_name, real_model, target_extra, retries) in targets {
+let Some(circuit_key) =
+            circuit_allows_target(state, &request.model, provider_name, real_model, errors).await
+        else {
+            continue;
+        };
+
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
             continue;
         };
@@ -52,25 +60,18 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         // re-allocate on every retry attempt.
         let real_model = real_model.clone();
         let target_extra = target_extra.clone();
-        let api_endpoint = api_endpoint.to_string();
-
-        let outcome = run_with_retries::<ChatAttempt, _, _>(
+        
+        let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
             provider_name,
             *retries,
             &backoff,
             errors,
-            |attempt| {
+            |_attempt| {
                 let provider = provider.clone();
                 let real_model = real_model.clone();
                 let target_extra = target_extra.clone();
                 let api_endpoint = api_endpoint.clone();
                 async move {
-                    trace!(
-                        provider = %provider_name,
-                        real_model = %real_model,
-                        attempt,
-                        "attempting provider target"
-                    );
                     if is_stream {
                         provider
                             .chat_stream(request, &real_model, &api_endpoint, &target_extra)
@@ -87,7 +88,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         )
         .await;
 
-        let Some(attempt) = outcome else {
+        let Some(attempt) = apply_circuit_outcome(state, circuit_key, outcome).await else {
             continue;
         };
 
@@ -131,6 +132,7 @@ mod tests {
     use futures_util::Stream;
     use sag_analytics::CallLogCollector;
     use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
+use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
     use sag_providers::LlmProvider;
     use serde_json::json;
@@ -284,6 +286,7 @@ mod tests {
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
 

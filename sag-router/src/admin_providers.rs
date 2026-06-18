@@ -491,6 +491,7 @@ mod tests {
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
 
@@ -784,6 +785,7 @@ targets = [
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         };
         let app = test_app(state);
 

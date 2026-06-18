@@ -9,8 +9,11 @@ use axum::{
 use sag_core::{ChatCompletionRequest, ImageGenerationRequest, ImageGenerationResponse};
 
 use crate::dispatch::resolve::resolve_provider;
-use crate::dispatch::retry::run_with_retries;
-use crate::dispatch::{DispatchCtx, fallback_exhausted_response, success_log};
+use crate::dispatch::retry::run_with_retries_outcome;
+use crate::dispatch::{
+    DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
+    success_log,
+};
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
 /// always non-streaming.
@@ -38,6 +41,12 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     let backoff = state.config.read().await.backoff.clone();
 
     for (provider_name, real_model, target_extra, retries) in targets {
+        let Some(circuit_key) =
+            circuit_allows_target(state, &request.model, provider_name, real_model, errors).await
+        else {
+            continue;
+        };
+
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
             continue;
         };
@@ -46,7 +55,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         let target_extra = target_extra.clone();
         let img_request = img_request.clone();
 
-        let outcome = run_with_retries::<ImageGenerationResponse, _, _>(
+        let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
             provider_name,
             *retries,
             &backoff,
@@ -65,7 +74,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         )
         .await;
 
-        let Some(resp) = outcome else {
+        let Some(resp) = apply_circuit_outcome(state, circuit_key, outcome).await else {
             continue;
         };
 
@@ -114,7 +123,163 @@ pub fn build_image_request(request: &ChatCompletionRequest) -> ImageGenerationRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sag_core::ChatMessage;
+    use crate::dispatch::ResolvedTarget;
+    use crate::state::AppState;
+    use async_trait::async_trait;
+    use futures_util::Stream;
+    use sag_analytics::CallLogCollector;
+    use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
+    use sag_core::{AppError, ChatCompletionResponse, ChatMessage, ImageData, StreamChunk};
+    use sag_providers::LlmProvider;
+    use serde_json::json;
+    use std::collections::{HashMap, VecDeque};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+
+    enum ImageBehavior {
+        Ok(ImageGenerationResponse),
+        Retryable(AppError),
+    }
+
+    struct MockImageProvider {
+        name: String,
+        image_queue: Mutex<VecDeque<ImageBehavior>>,
+        image_calls: AtomicU32,
+    }
+
+    impl MockImageProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                image_queue: Mutex::new(VecDeque::new()),
+                image_calls: AtomicU32::new(0),
+            }
+        }
+
+        fn push_image(&self, behavior: ImageBehavior) {
+            self.image_queue.lock().unwrap().push_back(behavior);
+        }
+
+        fn image_calls(&self) -> u32 {
+            self.image_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockImageProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn chat(
+            &self,
+            _request: &ChatCompletionRequest,
+            _real_model: &str,
+            _api_endpoint: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+        ) -> sag_core::Result<ChatCompletionResponse> {
+            unreachable!("image dispatch should not call chat")
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatCompletionRequest,
+            _real_model: &str,
+            _api_endpoint: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+        ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            unreachable!("image dispatch should not call chat_stream")
+        }
+
+        async fn chat_image(
+            &self,
+            _request: &ImageGenerationRequest,
+            _real_model: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+        ) -> sag_core::Result<ImageGenerationResponse> {
+            self.image_calls.fetch_add(1, Ordering::SeqCst);
+            match self.image_queue.lock().unwrap().pop_front() {
+                Some(ImageBehavior::Ok(resp)) => Ok(resp),
+                Some(ImageBehavior::Retryable(err)) => Err(err),
+                None => Ok(build_image_response()),
+            }
+        }
+    }
+
+    fn build_image_response() -> ImageGenerationResponse {
+        ImageGenerationResponse {
+            created: 0,
+            data: vec![ImageData {
+                url: Some("https://example.test/image.png".into()),
+                b64_json: None,
+                revised_prompt: None,
+            }],
+        }
+    }
+
+    fn build_request(model: &str) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "draw a cat"}],
+        }))
+        .expect("valid image test request")
+    }
+
+    async fn build_state(providers: Vec<Arc<dyn LlmProvider>>) -> AppState {
+        let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        for provider in providers {
+            registry.insert(provider.name().to_string(), provider);
+        }
+
+        let config = GatewayConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 3000,
+            },
+            analytics: None,
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["k".into()],
+            }),
+            retries: 2,
+            backoff: BackoffConfig::default(),
+            providers: HashMap::new(),
+            routes: vec![],
+        };
+
+        AppState {
+            config: ConfigHandle::from_config(config),
+            providers: Arc::new(RwLock::new(registry)),
+            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
+            route_counters: Arc::new(RwLock::new(HashMap::new())),
+            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
+        }
+    }
+
+    fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {
+        (provider.into(), real_model.into(), HashMap::new(), retries)
+    }
+
+    fn make_ctx<'a>(
+        state: &'a AppState,
+        request: &'a ChatCompletionRequest,
+        targets: &'a [ResolvedTarget],
+        errors: &'a mut Vec<String>,
+    ) -> DispatchCtx<'a> {
+        DispatchCtx {
+            state,
+            request,
+            targets,
+            api_endpoint: "/images/generations",
+            is_stream: false,
+            trace_id: Uuid::new_v4(),
+            start: Instant::now(),
+            errors,
+        }
+    }
 
     #[test]
     fn build_image_request_extracts_prompt_from_last_message() {
@@ -167,6 +332,37 @@ mod tests {
         assert_eq!(img.model, "dall-e-3");
         assert_eq!(img.prompt, "a cat in space");
         assert_eq!(img.n, Some(2));
+    }
+
+    #[tokio::test]
+    async fn dispatch_image_remembers_exhausted_target_on_next_request() {
+        let m1 = Arc::new(MockImageProvider::new("first"));
+        let m2 = Arc::new(MockImageProvider::new("second"));
+        m1.push_image(ImageBehavior::Retryable(AppError::Internal("fail".into())));
+        m2.push_image(ImageBehavior::Ok(build_image_response()));
+        m2.push_image(ImageBehavior::Ok(build_image_response()));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let req = build_request("dall-e-3");
+        let targets = vec![
+            target("first", "dall-e-3", 0),
+            target("second", "dall-e-3", 0),
+        ];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_image(make_ctx(&state, &req, &targets, &mut first_errors)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.image_calls(), 1);
+        assert_eq!(m2.image_calls(), 1);
+
+        let mut second_errors = Vec::new();
+        let second = dispatch_image(make_ctx(&state, &req, &targets, &mut second_errors)).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(m1.image_calls(), 1, "open circuit should skip first target");
+        assert_eq!(m2.image_calls(), 2);
+        assert!(
+            second_errors.iter().any(|e| e.contains("circuit open")),
+            "second request should record why the first target was skipped"
+        );
     }
 
     #[test]
