@@ -17,10 +17,8 @@ async fn main() -> anyhow::Result<()> {
     // 1. Initialize tracing (structured logging)
     tracing_init::init();
 
-    // 2. Parse CLI args for config path
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or("gateway.toml".to_string());
+    // 2. Resolve config path: --config <path> > positional <path> > "gateway.toml"
+    let config_path = resolve_config_path()?;
     info!(%config_path, "starting SAG gateway");
 
     // 3. Load configuration with hot-reload support
@@ -97,6 +95,45 @@ async fn main() -> anyhow::Result<()> {
     info!("all subsystems shut down");
 
     Ok(())
+}
+
+/// Resolves the configuration file path from CLI arguments.
+///
+/// Precedence:
+/// 1. `--config <path>` flag (most explicit)
+/// 2. First non-flag positional argument (legacy `sag <path>` shape)
+/// 3. Default: `gateway.toml`
+///
+/// Both shapes are accepted so existing invocations like
+/// `./target/release/sag /etc/sag/gateway.toml` keep working, while
+/// container / docker flows can use `./sag --config /etc/sag/gateway.toml`.
+fn resolve_config_path() -> anyhow::Result<String> {
+    let mut explicit: Option<String> = None;
+    let mut positional: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            // `--config <path>`: explicit path wins over any positional.
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
+            explicit = Some(value);
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            // `--config=<path>` form (handy for `docker run` / systemd units).
+            explicit = Some(value.to_string());
+        } else if arg.starts_with('-') {
+            // Unknown flag-like token: skip silently so future flag additions
+            // don't break older invocations. Examples: `--verbose`, `-v`.
+            continue;
+        } else if positional.is_none() {
+            positional = Some(arg);
+        }
+        // Non-`--config` positional tokens after the first are dropped to keep
+        // parsing deterministic.
+    }
+    Ok(explicit
+        .or(positional)
+        .unwrap_or_else(|| "gateway.toml".to_string()))
 }
 
 /// Waits for SIGTERM or SIGINT (Ctrl+C).

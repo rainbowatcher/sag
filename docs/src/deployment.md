@@ -35,7 +35,6 @@ CMD ["sag", "--config", "/etc/sag/gateway.toml"]
 | 变量 | 说明 |
 |----------|------|
 | `RUST_LOG` | Tracing 过滤器（例如 `info,sag=debug`） |
-| `SAG_CONFIG` | 配置文件路径（`--config` 的替代方式） |
 
 ## 优雅关闭
 
