@@ -2,11 +2,25 @@
 
 ## 构建
 
+### 普通构建（不含 UI）
+
 ```bash
 cargo build --release
 ```
 
-编译后的二进制文件位于 `target/release/sag`。
+产物位于 `target/release/sag`。此模式下 UI 需单独部署（`pnpm -C sag-ui preview` / Nginx / CDN），网关本身只 serve API。
+
+### 单二进制构建（嵌入 UI）
+
+把 `sag-ui/dist/` 在编译期嵌入二进制，得到完全自包含的部署单元 —— API 与管理面板共存于一个进程，只需一个文件即可下发到任意目标机器。
+
+```bash
+just build-test
+```
+
+> 等价手写步骤：`pnpm -C sag-ui run build && cargo build --release --features embed-ui`。**顺序不可调换** —— 必须先 `pnpm build` 产出 `sag-ui/dist/`，rust-embed 才有的可嵌；否则编译期失败，或运行时 `ui_handler` 直接返回 500 并提示「`UiAssets::get("index.html")` missing — run `pnpm -C sag-ui build`」。
+
+构建后 `./target/release/sag` 已自带全部前端资源，由 `sag-gateway/src/ui_routes.rs` 在 `/` 与 `/assets/*` 上自动 serve（SPA history-mode 兜 `/index.html`）。
 
 ## 运行
 
@@ -14,14 +28,23 @@ cargo build --release
 ./target/release/sag --config /path/to/gateway.toml
 ```
 
+构建时启用 `--features embed-ui` 的二进制自带 UI，浏览器访问 `http://<host>:<port>/` 即看到管理面板；未启用时需要把 Vite preview 反向代理到网关 `/v1` 与 `/admin`。
+
+## 热重载边界
+
+`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / retries / backoff / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](./configuration.md#热重载)。
+
 ## Docker
 
 ```dockerfile
 FROM rust:alpine AS build
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev nodejs npm
+RUN npm install -g pnpm
 WORKDIR /app
 COPY . .
-RUN cargo build --release
+RUN pnpm -C sag-ui install
+RUN pnpm -C sag-ui run build
+RUN cargo build --release --features embed-ui
 
 FROM alpine
 COPY --from=build /app/target/release/sag /usr/local/bin/sag
@@ -30,12 +53,33 @@ EXPOSE 3000
 CMD ["sag", "--config", "/etc/sag/gateway.toml"]
 ```
 
+该 Dockerfile 走 embed-ui 单二进制路径，镜像只有 `/usr/local/bin/sag` + `/etc/sag/gateway.toml` 两个 SAG 相关文件，不需要再挂载前端资源目录。
+
+若不需要嵌入 UI，可省略 `pnpm install` / `pnpm build` 两行，并去掉 `--features embed-ui`。此时网关只 serve API，UI 走 `pnpm -C sag-ui preview` 或独立前端服务，由 reverse proxy 把 `/assets/*` 与 `/` 指过去。
+
 ## 环境变量
 
 | 变量 | 说明 |
 |----------|------|
 | `RUST_LOG` | Tracing 过滤器（例如 `info,sag=debug`） |
+| Provider-level `${VAR}` | 在 TOML 中以 `${OPENAI_API_KEY}` 等形式展开 provider API key 与 route 的 `real_model` |
+
+## 测试环境
+
+`scripts/test-env.py` 提供与开发环境**物理隔离**的 release 路径 —— 真实 release 二进制、内嵌 UI、独立端口、独立 SQLite。`start` / `stop` / `restart` / `status` 四子命令对应 systemd / supervisor 风格的 ops 下命令。详见仓库根 [`AGENTS.md`](../../AGENTS.md) 的「测试环境」节。
+
+```bash
+just build-test        # 一次性：pnpm build UI → cargo --features embed-ui
+just test-env start    # 后台拉起，pid / lock / build-info 写入 .test-env/
+just test-env status   # 查 pid / uptime / binary mtime / config mtime / log tail
+just test-env restart  # 原子 stop+start
+just test-env stop     # SIGTERM → 5s grace → SIGKILL
+```
+
+> **默认行为提醒**：裸 `just test-env`（不带子命令）等价于 `just test-env status`，源自 `scripts/test-env.py` 中 argparse `args.cmd` 为 `None` 时 fallback 到 `cmd_status()` 的有意设计 —— status 是 read-only、作默认安全。想真正启动 gateway 必须**显式**写 `just test-env start`。无参调用看到 `[ERR] no test-env state` 不是错，是状态为空指针 —— 此时跑 `just test-env start` 即可拉起。
+
+State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analytics-test.db`）、日志（`logs/test-env.log`）均与开发环境互不干扰。
 
 ## 优雅关闭
 
-SAG 处理 `SIGINT` 和 `SIGTERM` 信号以实现优雅关闭，允许正在处理的请求完成。
+SAG 处理 `SIGINT` 与 `SIGTERM` 信号以实现优雅关闭，允许正在处理的请求完成。`just test-env stop` 走 SIGTERM → SIGKILL 升级路径：先发 SIGTERM，5 秒宽限期内进程自行退出则成功，否则 SIGKILL 兜底。
