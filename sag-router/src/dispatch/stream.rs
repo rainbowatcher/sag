@@ -88,9 +88,15 @@ where
                         stream: true,
                         status_code,
                         duration_ms: state.start.elapsed().as_millis() as u64,
-                        usage: Some(state.usage),
                         error,
                         timestamp: chrono::Utc::now(),
+                        reasoning_effort: None,
+                        upstream_duration_ms: None,
+                        ttft_ms: None,
+                        cached_tokens: None,
+                        cache_creation_tokens: None,
+                        reasoning_tokens: None,
+                        usage: Some(state.usage),
                     });
                     return None;
                 }
@@ -112,7 +118,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use futures_util::stream;
-    use sag_analytics::CallLogCollector;
+    use sag_analytics::{CallLogCollector, StatsFilter};
     use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
     use sag_core::Usage;
     use std::collections::HashMap;
@@ -213,7 +219,10 @@ mod tests {
 
         // CallLog should record the accumulated usage: 10+5=15 prompt, 20+0=20 completion, 30+5=35 total
         state.collector.flush().await;
-        let rows = sag_analytics::query_stats(state.collector.pool(), None, None)
+        let rows = state
+            .collector
+            .store()
+            .query_stats(StatsFilter::default())
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -245,7 +254,10 @@ mod tests {
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         state.collector.flush().await;
-        let rows = sag_analytics::query_stats(state.collector.pool(), None, None)
+        let rows = state
+            .collector
+            .store()
+            .query_stats(StatsFilter::default())
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -275,7 +287,10 @@ mod tests {
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         state.collector.flush().await;
-        let rows = sag_analytics::query_stats(state.collector.pool(), None, None)
+        let rows = state
+            .collector
+            .store()
+            .query_stats(StatsFilter::default())
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -300,7 +315,10 @@ mod tests {
 
         // CallLog should still be recorded with default (zero) usage
         state.collector.flush().await;
-        let rows = sag_analytics::query_stats(state.collector.pool(), None, None)
+        let rows = state
+            .collector
+            .store()
+            .query_stats(StatsFilter::default())
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -328,7 +346,10 @@ mod tests {
         assert_eq!(&body[..], b"data: partial\n\n");
 
         state.collector.flush().await;
-        let rows = sag_analytics::query_stats(state.collector.pool(), None, None)
+        let rows = state
+            .collector
+            .store()
+            .query_stats(StatsFilter::default())
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);

@@ -13,11 +13,13 @@ use serde_json::json;
 use tracing::{error, instrument};
 
 use crate::state::AppState;
+use sag_analytics::StatsFilter;
 
 #[derive(Deserialize)]
 pub struct StatsQuery {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub real_model: Option<String>,
 }
 
 /// GET `/health`
@@ -71,20 +73,20 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
     }))
 }
 
-/// GET `/v1/analytics/stats?provider=X&model=Y`
+/// GET `/v1/analytics/stats?provider=X&model=Y&real_model=Z`
 ///
-/// Returns aggregated call statistics grouped by provider and model.
+/// Returns aggregated call statistics grouped by provider, model, and real_model.
 pub async fn analytics_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsQuery>,
 ) -> Response<Body> {
-    match sag_analytics::query_stats(
-        state.collector.pool(),
-        params.provider.as_deref(),
-        params.model.as_deref(),
-    )
-    .await
-    {
+    let filter = StatsFilter {
+        provider: params.provider,
+        model: params.model,
+        real_model: params.real_model,
+        ..Default::default()
+    };
+    match state.collector.store().query_stats(filter).await {
         Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
         Err(e) => {
             error!(?e, "analytics query failed");

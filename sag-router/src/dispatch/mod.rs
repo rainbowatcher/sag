@@ -121,6 +121,14 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
 // ═══════════════════════════════════════════════════════════════════
 
 /// Build a `CallLog` for a successful response.
+///
+/// Note: the three `cached_tokens` / `cache_creation_tokens` /
+/// `reasoning_tokens` mappings from [`Usage`] implement plan section 3.4
+/// (Usage → CallLog copy) ahead of schedule. They are safe at stage 0
+/// because [`Usage`]'s corresponding fields are always `None` until the
+/// cache-parsing stages land; once they do, the data flows through
+/// automatically with no further change here.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn success_log(
     request_id: uuid::Uuid,
     provider: &str,
@@ -129,7 +137,9 @@ pub(in crate::dispatch) fn success_log(
     stream: bool,
     start: Instant,
     usage: Option<&Usage>,
+    reasoning_effort: Option<&str>,
 ) -> CallLog {
+    let usage = usage.cloned();
     CallLog {
         request_id,
         provider: provider.to_string(),
@@ -138,16 +148,25 @@ pub(in crate::dispatch) fn success_log(
         stream,
         status_code: 200,
         duration_ms: start.elapsed().as_millis() as u64,
-        usage: usage.cloned(),
         error: None,
         timestamp: chrono::Utc::now(),
+        reasoning_effort: reasoning_effort.map(|s| s.to_string()),
+        upstream_duration_ms: None,
+        ttft_ms: None,
+        cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
+        cache_creation_tokens: usage.as_ref().and_then(|u| u.cache_creation_tokens),
+        reasoning_tokens: usage.as_ref().and_then(|u| u.reasoning_tokens),
+        usage,
     }
 }
 
 /// Build a `CallLog` for a non-success response.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn failure_log(
     request_id: uuid::Uuid,
+    provider: &str,
     model: &str,
+    real_model: &str,
     stream: bool,
     start: Instant,
     status_code: u16,
@@ -155,23 +174,68 @@ pub(in crate::dispatch) fn failure_log(
 ) -> CallLog {
     CallLog {
         request_id,
-        provider: String::new(),
+        provider: provider.to_string(),
         model: model.to_string(),
-        real_model: String::new(),
+        real_model: real_model.to_string(),
         stream,
         status_code,
         duration_ms: start.elapsed().as_millis() as u64,
         usage: None,
         error: Some(err.to_string()),
         timestamp: chrono::Utc::now(),
+        reasoning_effort: None,
+        upstream_duration_ms: None,
+        ttft_ms: None,
+        cached_tokens: None,
+        cache_creation_tokens: None,
+        reasoning_tokens: None,
     }
 }
 
+/// Log a per-target failure so analytics can attribute it to the actual
+/// provider / real_model that was attempted.
+///
+/// Stage 0.6 fix: previously the `failure_log` used empty provider /
+/// real_model strings, which biased per-provider error rates toward zero.
+/// Use this helper on every `apply_circuit_outcome` → `None` arm in dispatch
+/// loops (chat, image, …) to keep attribution symmetric.
+///
+/// The most-recent entry in `errors` is recorded as the failure reason.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::dispatch) fn log_per_target_failure(
+    state: &AppState,
+    trace_id: uuid::Uuid,
+    provider_name: &str,
+    model: &str,
+    real_model: &str,
+    is_stream: bool,
+    start: Instant,
+    errors: &[String],
+) {
+    let last_err = errors
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    state.collector.log(failure_log(
+        trace_id,
+        provider_name,
+        model,
+        real_model,
+        is_stream,
+        start,
+        502,
+        &AppError::Internal(last_err),
+    ));
+}
+
 /// Log a non-success entry and return the matching JSON error response.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn failure_response(
     state: &AppState,
     trace_id: uuid::Uuid,
+    provider: &str,
     model: &str,
+    real_model: &str,
     is_stream: bool,
     start: Instant,
     status_code: StatusCode,
@@ -179,7 +243,9 @@ pub(in crate::dispatch) fn failure_response(
 ) -> Response<Body> {
     state.collector.log(failure_log(
         trace_id,
+        provider,
         model,
+        real_model,
         is_stream,
         start,
         status_code.as_u16(),
@@ -209,8 +275,8 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         attempts = %errors.join("; "),
         "all providers exhausted"
     );
-    state
-        .collector
-        .log(failure_log(trace_id, model, is_stream, start, 502, &err));
+    state.collector.log(failure_log(
+        trace_id, "", model, "", is_stream, start, 502, &err,
+    ));
     err.into_response()
 }

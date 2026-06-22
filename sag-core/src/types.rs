@@ -191,6 +191,15 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Tokens retrieved from the prompt cache (OpenAI `prompt_tokens_details.cached_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Tokens newly written to the prompt cache (Anthropic `cache_creation_input_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// Tokens consumed by the model's internal reasoning (e.g. o-series `reasoning_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Standard chat completion response.
@@ -270,13 +279,7 @@ impl StreamChunk {
         match self {
             StreamChunk::Data(data) => data.clone(),
             StreamChunk::Usage(u) => {
-                let json = serde_json::json!({
-                    "usage": {
-                        "prompt_tokens": u.prompt_tokens,
-                        "completion_tokens": u.completion_tokens,
-                        "total_tokens": u.total_tokens,
-                    }
-                });
+                let json = serde_json::json!({ "usage": u });
                 format!(
                     "data: {}\n\n",
                     serde_json::to_string(&json).unwrap_or_default()
@@ -314,4 +317,24 @@ pub struct CallLog {
     pub usage: Option<Usage>,
     pub error: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// `reasoning_effort` parameter from the client request (OpenAI o-series).
+    /// `None` means the client did not specify it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Duration spent waiting for and receiving the upstream response only
+    /// (excluding any SAG-internal overhead). Populated in stage 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_duration_ms: Option<u64>,
+    /// Time-To-First-Token in milliseconds. Populated in stage 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// Tokens retrieved from the prompt cache (copied from Usage at log time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Tokens newly written to the prompt cache (copied from Usage at log time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// Tokens consumed by the model's internal reasoning (copied from Usage at log time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }

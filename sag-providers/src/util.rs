@@ -95,6 +95,9 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 prompt_tokens: pt as u32,
                 completion_tokens: ct as u32,
                 total_tokens: pt as u32 + ct as u32,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
             }));
         }
     }

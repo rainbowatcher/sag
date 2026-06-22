@@ -36,6 +36,9 @@ fn extract_anthropic_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender
             prompt_tokens: input as u32,
             completion_tokens: output as u32,
             total_tokens: (input + output) as u32,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
         }));
     }
 }
@@ -313,6 +316,9 @@ impl AnthropicProvider {
             prompt_tokens: u.input_tokens,
             completion_tokens: u.output_tokens,
             total_tokens: u.input_tokens + u.output_tokens,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
         });
 
         ChatCompletionResponse {

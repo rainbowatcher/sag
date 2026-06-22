@@ -12,7 +12,7 @@ use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    success_log,
+    log_per_target_failure, success_log,
 };
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
@@ -75,6 +75,18 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         .await;
 
         let Some(resp) = apply_circuit_outcome(state, circuit_key, outcome).await else {
+            // Per-provider failure: log a failure entry with the actual provider/real_model
+            // so the analytics table knows which provider was attempted.
+            log_per_target_failure(
+                state,
+                trace_id,
+                provider_name,
+                &request.model,
+                &real_model,
+                false,
+                start,
+                errors,
+            );
             continue;
         };
 
@@ -86,6 +98,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             false,
             start,
             None,
+            None, // reasoning_effort — not applicable for image generation
         ));
         return (StatusCode::OK, Json(resp)).into_response();
     }

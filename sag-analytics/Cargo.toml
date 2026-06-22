@@ -9,4 +9,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 sqlx = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 sag-core = { path = "../sag-core" }

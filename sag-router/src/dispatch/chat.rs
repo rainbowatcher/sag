@@ -13,7 +13,7 @@ use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    success_log,
+    log_per_target_failure, success_log,
 };
 
 /// Unified result of a single chat attempt. The stream and non-stream
@@ -56,8 +56,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             continue;
         };
 
-        // Hoist the String conversion out of the closure so we don't
-        // re-allocate on every retry attempt.
+        // Clone per-target values once so the retry closure can cheaply clone
+        // them for each attempt.
         let real_model = real_model.clone();
         let target_extra = target_extra.clone();
 
@@ -89,6 +89,18 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         .await;
 
         let Some(attempt) = apply_circuit_outcome(state, circuit_key, outcome).await else {
+            // Per-provider failure: log a failure entry with the actual provider/real_model
+            // so the analytics table knows which provider was attempted.
+            log_per_target_failure(
+                state,
+                trace_id,
+                provider_name,
+                &request.model,
+                &real_model,
+                is_stream,
+                start,
+                errors,
+            );
             continue;
         };
 
@@ -113,6 +125,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     false,
                     start,
                     resp.usage.as_ref(),
+                    request.reasoning_effort.as_deref(),
                 ));
                 return (StatusCode::OK, Json(resp)).into_response();
             }
@@ -130,7 +143,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use futures_util::Stream;
-    use sag_analytics::CallLogCollector;
+    use sag_analytics::{CallLogCollector, StatsFilter};
     use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
     use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
@@ -324,6 +337,9 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
             }),
         )));
         let state = build_state(vec![mock.clone()]).await;
@@ -338,7 +354,10 @@ mod tests {
 
         // Verify CallLog was recorded with usage
         state.collector.flush().await;
-        let rows = sag_analytics::query_stats(state.collector.pool(), None, None)
+        let rows = state
+            .collector
+            .store()
+            .query_stats(StatsFilter::default())
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -359,6 +378,9 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
             }),
             StreamChunk::Done,
         ]));
@@ -444,6 +466,97 @@ mod tests {
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(errors.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_remembers_exhausted_target_on_next_request() {
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail".into())));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut first_errors)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        let mut second_errors = Vec::new();
+        let second =
+            dispatch_chat(make_ctx(&state, &req, &targets, false, &mut second_errors)).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1, "open circuit should skip first target");
+        assert_eq!(m2.chat_calls(), 2);
+        assert!(
+            second_errors.iter().any(|e| e.contains("circuit open")),
+            "second request should record why the first target was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_success_after_retry_keeps_target_available() {
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal(
+            "transient".into(),
+        )));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 1), target("second", "gpt-4o", 0)];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut first_errors)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 2);
+        assert_eq!(m2.chat_calls(), 0);
+
+        let mut second_errors = Vec::new();
+        let second =
+            dispatch_chat(make_ctx(&state, &req, &targets, false, &mut second_errors)).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            m1.chat_calls(),
+            3,
+            "successful target should remain available"
+        );
+        assert_eq!(m2.chat_calls(), 0);
+        assert!(second_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_non_retryable_failure_does_not_open_circuit() {
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::BadRequest(
+            "bad".into(),
+        )));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut first_errors)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        let mut second_errors = Vec::new();
+        let second =
+            dispatch_chat(make_ctx(&state, &req, &targets, false, &mut second_errors)).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            m1.chat_calls(),
+            2,
+            "non-retryable failure should not open circuit"
+        );
+        assert_eq!(m2.chat_calls(), 1);
+        assert!(second_errors.is_empty());
     }
 
     #[tokio::test]

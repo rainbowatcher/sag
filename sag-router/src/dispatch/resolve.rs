@@ -37,7 +37,9 @@ pub async fn resolve_route(
         return Err(failure_response(
             state,
             trace_id,
+            "",
             &request.model,
+            "",
             is_stream,
             start,
             StatusCode::NOT_FOUND,
@@ -60,7 +62,9 @@ pub async fn resolve_route(
         return Err(failure_response(
             state,
             trace_id,
+            "",
             &request.model,
+            "",
             is_stream,
             start,
             StatusCode::BAD_GATEWAY,
