@@ -1,6 +1,6 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
-import { api, headers } from "@/lib/client"
+import { api } from "@/lib/client"
 import { getErrorMessage } from "@/lib/utils"
 import type { ModelTestResult, Provider } from "@/types/api"
 import { useConnectionStore } from "./connection"
@@ -46,7 +46,6 @@ export const useProviderStore = defineStore("providers", () => {
   async function fetchProviders(params: FetchProvidersParams = {}) {
     providersLoading.value = true
     try {
-      const conn = useConnectionStore()
       const queryParams = new URLSearchParams()
       if (params.model_name?.trim()) queryParams.set("model_name", params.model_name.trim())
       if (params.provider_type) queryParams.set("provider_type", params.provider_type)
@@ -54,9 +53,6 @@ export const useProviderStore = defineStore("providers", () => {
       const query = queryParams.toString()
       const { data } = await api.get<{ providers: Provider[] }>(
         `/api/providers${query ? `?${query}` : ""}`,
-        {
-          headers: headers(conn.connection?.apiKey),
-        },
       )
       providers.value = data.providers
     } catch (e: any) {
@@ -76,13 +72,9 @@ export const useProviderStore = defineStore("providers", () => {
     upstreamModelsLoading.value = true
     upstreamModelsError.value = ""
     try {
-      const conn = useConnectionStore()
       const { data } = await api.post<{ models: Record<string, unknown>[] }>(
         "/api/providers/fetch-models",
         payload,
-        {
-          headers: headers(conn.connection?.apiKey),
-        },
       )
       upstreamModels.value = data.models
       upstreamModelsError.value = ""
@@ -97,10 +89,7 @@ export const useProviderStore = defineStore("providers", () => {
   async function fetchAllProviderModels() {
     allProviderModelsLoading.value = true
     try {
-      const conn = useConnectionStore()
-      const { data } = await api.get<{ providers: Provider[] }>("/api/providers?sort=name", {
-        headers: headers(conn.connection?.apiKey),
-      })
+      const { data } = await api.get<{ providers: Provider[] }>("/api/providers?sort=name")
       const models = new Set<string>()
       for (const p of data.providers) {
         for (const m of p.enabled_models) {
@@ -126,10 +115,7 @@ export const useProviderStore = defineStore("providers", () => {
     },
   ) {
     return await testModelState.execute(model, async () => {
-      const conn = useConnectionStore()
-      const { data } = await api.post<{ results: ModelTestResult[] }>("/api/model/test", payload, {
-        headers: headers(conn.connection?.apiKey),
-      })
+      const { data } = await api.post<{ results: ModelTestResult[] }>("/api/model/test", payload)
       return data.results
     })
   }
@@ -149,8 +135,7 @@ export const useProviderStore = defineStore("providers", () => {
     models_endpoint?: string
   }) {
     try {
-      const conn = useConnectionStore()
-      await api.post("/api/providers", payload, { headers: headers(conn.connection?.apiKey) })
+      await api.post("/api/providers", payload)
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       throw e
@@ -161,9 +146,7 @@ export const useProviderStore = defineStore("providers", () => {
     const oldProviders = [...providers.value]
     providers.value = providers.value.filter((p) => p.name !== name)
     try {
-      const conn = useConnectionStore()
       await api.delete("/api/providers", {
-        headers: headers(conn.connection?.apiKey),
         data: { name },
       })
       const { useRouteStore } = await import("./routes")
@@ -193,12 +176,7 @@ export const useProviderStore = defineStore("providers", () => {
     },
   ) {
     try {
-      const conn = useConnectionStore()
-      await api.put(
-        "/api/providers",
-        { name, ...payload },
-        { headers: headers(conn.connection?.apiKey) },
-      )
+      await api.put("/api/providers", { name, ...payload })
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       throw e

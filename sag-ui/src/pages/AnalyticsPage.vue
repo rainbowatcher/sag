@@ -13,6 +13,7 @@ import {
 import { ref, onMounted, computed } from "vue"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 import { useAnalyticsStore } from "@/stores/analytics"
+import type { CallLog } from "@/types/api"
 
 const store = useAnalyticsStore()
 
@@ -85,6 +86,24 @@ function formatTs(iso: string): string {
   } catch {
     return iso
   }
+}
+
+/**
+ * Plan §2.4 — TPS (tokens per second) computed at display time, not
+ * persisted. Formula: `completion_tokens / (upstream_duration_ms -
+ * ttft_ms) * 1000`. Returns `null` (rendered as `—`) when any input is
+ * missing or the gen-only window is ≤ 0 (non-streaming responses have
+ * `ttft_ms == upstream_duration_ms` so the denominator is zero; an
+ * image-only stream that never sent a Data chunk has `ttft_ms == null`).
+ */
+function tpsFor(row: CallLog): number | null {
+  const usage = row.usage
+  const ttft = row.ttft_ms
+  const upstream = row.upstream_duration_ms
+  if (!usage || ttft == null || upstream == null) return null
+  const genMs = upstream - ttft
+  if (genMs <= 0) return null
+  return (usage.completion_tokens * 1000) / genMs
 }
 </script>
 
@@ -387,7 +406,21 @@ function formatTs(iso: string): string {
                   >
                   <span v-else class="text-muted-foreground">—</span>
                 </td>
-                <td class="px-3 py-2 text-right tabular-nums">{{ row.duration_ms }} ms</td>
+                <td class="px-3 py-2 text-right font-mono text-xs tabular-nums">
+                  <div>{{ row.duration_ms }} ms</div>
+                  <div
+                    v-if="row.upstream_duration_ms != null"
+                    class="text-muted-foreground text-[10px]"
+                  >
+                    upstream {{ row.upstream_duration_ms }} ms
+                  </div>
+                  <div v-if="row.ttft_ms != null" class="text-muted-foreground text-[10px]">
+                    ttft {{ row.ttft_ms }} ms
+                  </div>
+                  <div v-if="tpsFor(row) != null" class="text-muted-foreground text-[10px]">
+                    {{ tpsFor(row)!.toFixed(1) }} tps
+                  </div>
+                </td>
                 <td
                   class="text-muted-foreground max-w-[16rem] truncate px-3 py-2 font-mono text-xs"
                   :title="row.error"

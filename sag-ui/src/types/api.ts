@@ -109,9 +109,20 @@ export interface CallLog {
   timestamp: string
   /** Set when the client sent `reasoning_effort` (OpenAI o-series). */
   reasoning_effort?: string
-  /** Stage-2 timing field; always None today. */
+  /**
+   * Stage-2 timing field: wall-clock duration from immediately before
+   * the upstream provider call to the final response (non-streaming)
+   * or stream end (streaming). Excludes SAG-internal overhead. Populated
+   * for both streaming and non-streaming successes.
+   */
   upstream_duration_ms?: number
-  /** Stage-2 timing field; always None today. */
+  /**
+   * Stage-2 timing field: time-to-first-token in milliseconds
+   * (streaming only — non-streaming responses have `ttft_ms ==
+   * upstream_duration_ms` since the whole response is the first byte).
+   * `None` for streams that emit only metadata (Usage/Error) before
+   * terminating, since no user-visible first byte ever arrived.
+   */
   ttft_ms?: number
   cached_tokens?: number
   cache_creation_tokens?: number

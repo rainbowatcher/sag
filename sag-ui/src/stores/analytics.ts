@@ -23,6 +23,10 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       const params = new URLSearchParams()
       if (provider) params.set("provider", provider)
       if (model) params.set("model", model)
+      // No per-call headers — `connection.ts:saveConnection` keeps
+      // `api.defaults.headers.common.Authorization` in sync with the
+      // persisted apiKey (Step 1 A2). `scripts/lint-api-auth.mjs` flags
+      // any future re-introduction of per-call headers as a regression.
       const { data } = await api.get<{ data: StatsRow[] }>(`/v1/analytics/stats?${params}`)
       stats.value = data.data
     } catch (e: any) {
@@ -79,6 +83,11 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       // and compare against it. Hardcoded default 50 never triggers;
       // safe to defer until §1.3 exposes page-size controls.
       params.set("limit", String(effectiveLimit + 1))
+      // No per-call headers — Step 1 (A2) makes the global
+      // `api.defaults.headers.common.Authorization` carry the Bearer
+      // token for all `/api/*` calls from this store. See
+      // `stores/connection.ts:saveConnection` and
+      // `scripts/lint-api-auth.mjs`.
       const { data } = await api.get<{ data: CallLog[] }>(`/api/logs?${params}`)
       const rows = data.data
       hasMoreLogs.value = rows.length > effectiveLimit

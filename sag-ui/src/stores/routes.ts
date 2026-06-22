@@ -1,6 +1,6 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
-import { api, headers } from "@/lib/client"
+import { api } from "@/lib/client"
 import type { Provider, RouteConfig, CreateRoutePayload, UpdateRoutePayload } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
@@ -13,10 +13,9 @@ export const useRouteStore = defineStore("routes", () => {
   async function fetchRoutes() {
     routesLoading.value = true
     try {
-      const conn = useConnectionStore()
-      const { data } = await api.get<{ routes: RouteConfig[] }>("/api/routes", {
-        headers: headers(conn.connection?.apiKey),
-      })
+      // No per-call `headers` — `connection.ts:saveConnection` keeps
+      // `api.defaults.headers.common.Authorization` in sync (Step 1 A2).
+      const { data } = await api.get<{ routes: RouteConfig[] }>("/api/routes")
       routes.value = data.routes
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
@@ -28,10 +27,8 @@ export const useRouteStore = defineStore("routes", () => {
   async function fetchProviderModels(name: string) {
     providerModelsLoading.value = true
     try {
-      const conn = useConnectionStore()
       const { data } = await api.get<{ models: string[] }>(
         `/api/providers/${encodeURIComponent(name)}/models`,
-        { headers: headers(conn.connection?.apiKey) },
       )
       providerModels.value[name] = data.models
     } catch (e: any) {
@@ -53,10 +50,7 @@ export const useRouteStore = defineStore("routes", () => {
 
   async function createRoute(payload: CreateRoutePayload) {
     try {
-      const conn = useConnectionStore()
-      await api.post("/api/routes", payload, {
-        headers: headers(conn.connection?.apiKey),
-      })
+      await api.post("/api/routes", payload)
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       throw e
@@ -65,10 +59,7 @@ export const useRouteStore = defineStore("routes", () => {
 
   async function updateRoute(payload: UpdateRoutePayload) {
     try {
-      const conn = useConnectionStore()
-      await api.put("/api/routes", payload, {
-        headers: headers(conn.connection?.apiKey),
-      })
+      await api.put("/api/routes", payload)
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       throw e
@@ -77,9 +68,7 @@ export const useRouteStore = defineStore("routes", () => {
 
   async function deleteRoute(modelName: string) {
     try {
-      const conn = useConnectionStore()
       await api.delete("/api/routes", {
-        headers: headers(conn.connection?.apiKey),
         data: { model_name: modelName },
       })
     } catch (e: any) {

@@ -43,12 +43,33 @@ export const useConnectionStore = defineStore("connection", () => {
     }
 
     api.defaults.baseURL = connection.value.gatewayUrl
+    // Step 1 (A2): pair with `saveConnection` to keep the global
+    // Authorization header in lock-step with the saved connection.
+    // `router.beforeEach` calls `validateConnection` next, which hits
+    // `/health` (public, unaffected) and then routes that hit `/api/*`
+    // get the Bearer header for free.
+    if (connection.value.apiKey) {
+      api.defaults.headers.common.Authorization = `Bearer ${connection.value.apiKey}`
+    } else {
+      delete api.defaults.headers.common.Authorization
+    }
     return true
   }
 
   function saveConnection(url: string, key: string) {
     connection.value = { gatewayUrl: url, apiKey: key, savedAt: Date.now() }
     api.defaults.baseURL = url
+    // Step 1 (A2): centralize the Bearer header so every subsequent
+    // `api.get/post/...` carries it without per-call boilerplate. The
+    // inverse (delete) happens in `disconnect` and `handle401`. Any
+    // store that still passes a per-call `headers:` to an
+    // `api.X(/api/...)` call is a regression — `scripts/lint-api-auth.mjs`
+    // catches that and fails `pnpm lint`.
+    if (key) {
+      api.defaults.headers.common.Authorization = `Bearer ${key}`
+    } else {
+      delete api.defaults.headers.common.Authorization
+    }
   }
 
   async function connect(url: string, key: string): Promise<string | null> {
@@ -118,12 +139,20 @@ export const useConnectionStore = defineStore("connection", () => {
     connection.value = null
     validated.value = false
     api.defaults.baseURL = ""
+    // Step 1 (A2): counter-set the global Authorization header so any
+    // subsequent axios call (e.g. an interaction with the unauthenticated
+    // Vite dev origin during navigation) does not carry a stale Bearer.
+    delete api.defaults.headers.common.Authorization
   }
 
   async function handle401() {
     connection.value = null
     validated.value = false
     api.defaults.baseURL = ""
+    // Step 1 (A2): same counter-set as `disconnect`. Without this, a
+    // re-attempted call against a re-authenticated gateway would still
+    // send the dead header until the next saveConnection.
+    delete api.defaults.headers.common.Authorization
     if (_router) {
       _router.push("/connect?reason=expired")
     }
