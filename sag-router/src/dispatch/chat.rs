@@ -168,8 +168,6 @@ mod tests {
 
     enum StreamBehavior {
         Ok(Vec<StreamChunk>),
-        Retryable(AppError),
-        NonRetryable(AppError),
     }
 
     struct MockProvider {
@@ -243,9 +241,6 @@ mod tests {
             match self.stream_queue.lock().unwrap().pop_front() {
                 Some(StreamBehavior::Ok(chunks)) => {
                     Ok(Box::pin(futures_util::stream::iter(chunks)))
-                }
-                Some(StreamBehavior::Retryable(e)) | Some(StreamBehavior::NonRetryable(e)) => {
-                    Err(e)
                 }
                 None => Ok(Box::pin(futures_util::stream::empty())),
             }

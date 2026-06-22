@@ -55,17 +55,17 @@ where
             let key_exists = current
                 .as_table()
                 .expect("path element must be a table")
-                .contains_key(*key);
+                .contains_key(key);
             if !key_exists {
                 current
                     .as_table_mut()
                     .expect("path element must be a table")
-                    .insert(*key, Item::Table(Table::new()));
+                    .insert(key, Item::Table(Table::new()));
             }
             current = current
                 .as_table_mut()
                 .expect("path element must be a table")
-                .get_mut(*key)
+                .get_mut(key)
                 .expect("just inserted or already existed");
         }
     }
@@ -97,7 +97,7 @@ where
 fn navigate_mut<'a>(root: &'a mut Item, path: &[&str]) -> Option<&'a mut Item> {
     let mut current = root;
     for key in path {
-        current = current.as_table_mut()?.get_mut(*key)?;
+        current = current.as_table_mut()?.get_mut(key)?;
     }
     Some(current)
 }
@@ -372,7 +372,7 @@ pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
     // would move the closure into the Map adapter, and we re-invoke
     // `key_fn` in the per-item update loop below.
     let desired_keys: HashSet<Vec<Option<String>>> =
-        items.iter().map(|item| key_fn(item)).collect();
+        items.iter().map(&key_fn).collect();
 
     // Build a position index of existing inline-table entries matched
     // against the composite key built from `key_fields`. O(m) one-time
@@ -448,7 +448,7 @@ pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
 fn read_composite_key(table: &InlineTable, key_fields: &[&str]) -> Vec<Option<String>> {
     key_fields
         .iter()
-        .map(|kf| table.get(*kf).and_then(|v| v.as_str()).map(String::from))
+        .map(|kf| table.get(kf).and_then(|v| v.as_str()).map(String::from))
         .collect()
 }
 
@@ -895,7 +895,7 @@ pub fn sync_inline_table_in_place<V, F>(
     // Step 4: append new keys (sorted for determinism).
     let mut new_keys: Vec<&String> = in_memory
         .keys()
-        .filter(|k| !existing.contains_key(*k))
+        .filter(|k| !existing.contains_key(k))
         .collect();
     new_keys.sort();
     for key in new_keys {

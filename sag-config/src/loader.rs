@@ -395,7 +395,7 @@ pub fn save_config_to_file(
             })?;
             Ok((*rd).clone())
         },
-        |existing, r| write_route_fields(existing, r),
+        write_route_fields,
     )?;
 
     // ── Write back ──
@@ -555,8 +555,8 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
         &route.targets,
         &["provider", "real_model"],
         |t| vec![Some(t.provider.clone()), t.real_model.clone()],
-        |t| build_target_table(t),
-        |existing_table, t| write_target_fields(existing_table, t),
+        build_target_table,
+        write_target_fields,
     );
 
     // Force multi-line layout (`[\n    { ... },\n    { ... }\n]`) is
