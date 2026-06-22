@@ -371,8 +371,7 @@ pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
     // (`|item| key_fn(item)`) — passing `key_fn` to `.map()` directly
     // would move the closure into the Map adapter, and we re-invoke
     // `key_fn` in the per-item update loop below.
-    let desired_keys: HashSet<Vec<Option<String>>> =
-        items.iter().map(&key_fn).collect();
+    let desired_keys: HashSet<Vec<Option<String>>> = items.iter().map(&key_fn).collect();
 
     // Build a position index of existing inline-table entries matched
     // against the composite key built from `key_fields`. O(m) one-time

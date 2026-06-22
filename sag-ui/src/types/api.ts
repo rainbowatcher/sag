@@ -83,3 +83,47 @@ export interface StatsRow {
   avg_duration_ms: number
   error_count: number
 }
+
+/** Token usage block returned by upstream providers (mirrors sag_core::Usage). */
+export interface Usage {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cached_tokens?: number
+  cache_creation_tokens?: number
+  reasoning_tokens?: number
+}
+
+/** Single row of the call log returned by `GET /api/logs` (mirrors sag_core::CallLog). */
+export interface CallLog {
+  request_id: string
+  provider: string
+  model: string
+  real_model: string
+  stream: boolean
+  status_code: number
+  duration_ms: number
+  usage?: Usage
+  error?: string
+  /** RFC3339 timestamp string from chrono::DateTime<Utc>. */
+  timestamp: string
+  /** Set when the client sent `reasoning_effort` (OpenAI o-series). */
+  reasoning_effort?: string
+  /** Stage-2 timing field; always None today. */
+  upstream_duration_ms?: number
+  /** Stage-2 timing field; always None today. */
+  ttft_ms?: number
+  cached_tokens?: number
+  cache_creation_tokens?: number
+  reasoning_tokens?: number
+}
+
+/** Query parameters accepted by `GET /api/logs`. */
+export interface LogFilter {
+  provider?: string
+  model?: string
+  real_model?: string
+  status_code?: number
+  offset?: number
+  limit?: number
+}
