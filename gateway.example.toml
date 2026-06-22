@@ -22,7 +22,7 @@ jitter = true
 
 [server]
 host = "0.0.0.0"
-port = 3000
+port = 37210
 
 [analytics]
 enabled = true

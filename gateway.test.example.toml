@@ -3,7 +3,7 @@
 #
 # Copy to gateway.test.toml (gitignored) and fill in keys.
 # Differences from gateway.example.toml:
-#   - port 3001 (drifts away from dev port 3000)
+#   - port 37211 (drifts away from dev port 37210)
 #   - host bound to 127.0.0.1 (loopback only — agent tools are local)
 #   - analytics storage_dsn points at analytics-test.db (parallel to dev)
 #
@@ -101,6 +101,6 @@ targets = [
 #   - .cline/  : ditto
 #   - .kimchi/ : ditto
 #
-# Then point the agent at:  http://127.0.0.1:3001/v1
+# Then point the agent at:  http://127.0.0.1:37211/v1
 # Tools will call /v1/chat/completions against this gateway without
 # Authorization by default (matches the no-[gateway_auth] decision above).

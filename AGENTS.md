@@ -99,7 +99,7 @@ sag/
 |---|---|---|
 | Rust 二进制 | `cargo run` 的 debug 实例 | `./target/release/sag`（事先 `just build-test`） |
 | 前端 | Vite dev server 独立 HMR | emit 后的产物通过 `rust-embed` 嵌入二进制（`--features embed-ui`） |
-| 默认端口 | 3000（读 `gateway.toml`） | 3001（读 `gateway.test.toml`） |
+| 默认端口 | 37210（读 `gateway.toml`） | 37211（读 `gateway.test.toml`） |
 | 状态目录 | n/a | `.test-env/{pid,lock,build-info.json}` |
 | 日志 | stdout（watchexec 接管） | `logs/test-env.log`（append，grep 友好） |
 | 配置 | `gateway.toml` | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
@@ -124,7 +124,7 @@ just test-env stop             # SIGTERM → 5s grace → SIGKILL
 
 ### 默认子命令：status（不是 start）
 
-不带任何子命令直接调用 `just test-env` 等价于 `just test-env status`。这是 `scripts/test-env.py` 中 argparse `args.cmd` 为 `None` 时 fallback 到 `cmd_status()` 的有意设计 —— status 是 read-only、副作用为零，作默认安全；start 会 fork + 写 pid + 占 3001 端口，作为默认会让 `<tab>` 补全误起实例。
+不带任何子命令直接调用 `just test-env` 等价于 `just test-env status`。这是 `scripts/test-env.py` 中 argparse `args.cmd` 为 `None` 时 fallback 到 `cmd_status()` 的有意设计 —— status 是 read-only、副作用为零，作默认安全；start 会 fork + 写 pid + 占 37211 端口，作为默认会让 `<tab>` 补全误起实例。
 
 ```bash
 just test-env          # → status（不是 start）

@@ -8,7 +8,7 @@ const store = useConnectionStore()
 const route = useRoute()
 const router = useRouter()
 
-const gatewayUrl = ref("http://127.0.0.1:3000")
+const gatewayUrl = ref("http://127.0.0.1:37210")
 const apiKey = ref("")
 const error = ref("")
 
@@ -66,7 +66,7 @@ async function handleConnect() {
           <input
             v-model="gatewayUrl"
             type="text"
-            placeholder="http://127.0.0.1:3000"
+            placeholder="http://127.0.0.1:37210"
             :disabled="store.connecting"
             class="bg-background placeholder:text-muted-foreground/50 focus:ring-ring h-10 w-full rounded-md border px-3 font-mono text-sm transition-shadow outline-none focus:ring-2 disabled:opacity-50"
           />

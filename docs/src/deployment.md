@@ -49,7 +49,7 @@ RUN cargo build --release --features embed-ui
 FROM alpine
 COPY --from=build /app/target/release/sag /usr/local/bin/sag
 COPY gateway.toml /etc/sag/
-EXPOSE 3000
+EXPOSE 37210
 CMD ["sag", "--config", "/etc/sag/gateway.toml"]
 ```
 
