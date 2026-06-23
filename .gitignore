@@ -36,6 +36,7 @@ node_modules
 .kimchi/
 .qoder/
 .claude/
+.mimocode/
 
 # test-env state (Phase 2 — see .plan/test-environment.md)
 .test-env/
