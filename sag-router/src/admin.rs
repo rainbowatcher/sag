@@ -13,6 +13,7 @@
 
 use axum::{Router, routing::get, routing::post};
 
+use crate::admin_logs::list_logs;
 use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
 };
@@ -40,5 +41,6 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .put(update_route)
                 .delete(delete_route),
         )
+        .route("/logs", get(list_logs))
         .with_state(state)
 }

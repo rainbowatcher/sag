@@ -14,6 +14,13 @@ use crate::state::AppState;
 /// Wrap a `StreamChunk` stream in an SSE `Response`, forwarding data chunks
 /// to the client verbatim and accumulating `Usage` / `Error` chunks into
 /// a final `CallLog` when the stream ends.
+///
+/// `upstream_start` is captured immediately before the provider call. It
+/// drives two timing fields on the final `CallLog`:
+/// - `upstream_duration_ms` — wall-clock from start to stream end.
+/// - `ttft_ms` — wall-clock to the first `StreamChunk::Data`, or `None`
+///   if the stream emitted only metadata.
+#[allow(clippy::too_many_arguments)]
 pub fn build_streaming_response<S>(
     state: &AppState,
     chunk_stream: S,
@@ -22,6 +29,8 @@ pub fn build_streaming_response<S>(
     real_model: &str,
     trace_id: uuid::Uuid,
     start: Instant,
+    upstream_start: Instant,
+    reasoning_effort: Option<String>,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -42,6 +51,9 @@ where
         model: String,
         real_model: String,
         start: Instant,
+        upstream_start: Instant,
+        first_byte_at: Option<Instant>,
+        reasoning_effort: Option<String>,
     }
 
     let collector = state.collector.clone();
@@ -56,6 +68,9 @@ where
         model: model.to_string(),
         real_model: real_model.to_string(),
         start,
+        upstream_start,
+        first_byte_at: None,
+        reasoning_effort,
     };
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -65,6 +80,10 @@ where
         loop {
             match state.stream.next().await {
                 Some(StreamChunk::Data(raw)) => {
+                    // Stamp TTFT once on the first user-visible byte.
+                    if state.first_byte_at.is_none() {
+                        state.first_byte_at = Some(Instant::now());
+                    }
                     return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(raw)), state));
                 }
                 Some(StreamChunk::Usage(u)) => {
@@ -80,6 +99,14 @@ where
                     state.done = true;
                     let error = state.error.take();
                     let status_code = if error.is_some() { 502 } else { 200 };
+                    // `upstream_duration_ms` is always populated; `ttft_ms`
+                    // is only set if at least one `Data` chunk arrived.
+                    let upstream_duration_ms = Instant::now()
+                        .duration_since(state.upstream_start)
+                        .as_millis() as u64;
+                    let ttft_ms = state
+                        .first_byte_at
+                        .map(|t| t.duration_since(state.upstream_start).as_millis() as u64);
                     state.collector.log(CallLog {
                         request_id: state.request_id,
                         provider: state.provider.clone(),
@@ -90,9 +117,9 @@ where
                         duration_ms: state.start.elapsed().as_millis() as u64,
                         error,
                         timestamp: chrono::Utc::now(),
-                        reasoning_effort: None,
-                        upstream_duration_ms: None,
-                        ttft_ms: None,
+                        reasoning_effort: state.reasoning_effort.clone(),
+                        upstream_duration_ms: Some(upstream_duration_ms),
+                        ttft_ms,
                         cached_tokens: None,
                         cache_creation_tokens: None,
                         reasoning_tokens: None,
@@ -118,7 +145,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use futures_util::stream;
-    use sag_analytics::{CallLogCollector, StatsFilter};
+    use sag_analytics::{CallLogCollector, LogFilter, StatsFilter};
     use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
     use sag_core::Usage;
     use std::collections::HashMap;
@@ -156,6 +183,21 @@ mod tests {
         Box::pin(stream::iter(chunks))
     }
 
+    /// Drain the collector and return the most recently inserted CallLog.
+    async fn latest_call_log(state: &AppState) -> sag_core::CallLog {
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(LogFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.pop().expect("at least one log row")
+    }
+
     #[tokio::test]
     async fn data_chunks_are_forwarded_to_body() {
         let state = build_state().await;
@@ -172,6 +214,8 @@ mod tests {
             "gpt-4o",
             Uuid::new_v4(),
             Instant::now(),
+            Instant::now(),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -214,6 +258,8 @@ mod tests {
             "gpt-4o",
             Uuid::new_v4(),
             Instant::now(),
+            Instant::now(),
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -250,6 +296,8 @@ mod tests {
             "gpt-4o",
             Uuid::new_v4(),
             Instant::now(),
+            Instant::now(),
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -283,6 +331,8 @@ mod tests {
             "gpt-4o",
             Uuid::new_v4(),
             Instant::now(),
+            Instant::now(),
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -309,6 +359,8 @@ mod tests {
             "gpt-4o",
             Uuid::new_v4(),
             Instant::now(),
+            Instant::now(),
+            None,
         );
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert!(body.is_empty(), "empty stream should yield empty body");
@@ -341,6 +393,8 @@ mod tests {
             "gpt-4o",
             Uuid::new_v4(),
             Instant::now(),
+            Instant::now(),
+            None,
         );
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"data: partial\n\n");
@@ -355,5 +409,96 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].call_count, 1);
         assert_eq!(rows[0].error_count, 0);
+    }
+
+    // ─── Plan §2.3 — TTFT and upstream_duration_ms population ──────
+
+    /// Stream with at least one `Data` chunk before `Done`/`None`:
+    /// `ttft_ms` must be `Some` (and ≤ upstream_duration_ms),
+    /// `upstream_duration_ms` must be `Some`.
+    #[tokio::test]
+    async fn ttft_and_upstream_duration_populated_when_data_chunk_seen() {
+        let state = build_state().await;
+        let chunks = vec![
+            StreamChunk::Data(b"data: hello\n\n".to_vec()),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            Uuid::new_v4(),
+            Instant::now(),
+            // upstream_start recorded significantly before the stream
+            // completes — guarantees a positive upstream_duration_ms.
+            Instant::now() - std::time::Duration::from_millis(50),
+            Some("medium".into()),
+        );
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let log = latest_call_log(&state).await;
+        let upstream = log
+            .upstream_duration_ms
+            .expect("upstream_duration_ms must be set");
+        let ttft = log
+            .ttft_ms
+            .expect("ttft_ms must be set when a Data chunk is seen");
+        assert!(
+            ttft <= upstream,
+            "TTFT ({ttft}) must be ≤ upstream_duration_ms ({upstream})"
+        );
+        assert!(
+            upstream >= 50,
+            "upstream_duration_ms ({upstream}) should reflect the 50ms upstream_start offset"
+        );
+        assert_eq!(
+            log.reasoning_effort.as_deref(),
+            Some("medium"),
+            "reasoning_effort must round-trip through the stream CallLog"
+        );
+    }
+
+    /// Stream with ONLY Usage/Error/Done metadata chunks (no
+    /// `StreamChunk::Data`): `ttft_ms` stays `None` (no observable
+    /// user-visible first byte), but `upstream_duration_ms` is still
+    /// populated (wall-clock end-to-end elapsed).
+    #[tokio::test]
+    async fn ttft_is_none_when_stream_has_no_data_chunk() {
+        let state = build_state().await;
+        let chunks = vec![
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            None,
+        );
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let log = latest_call_log(&state).await;
+        assert!(
+            log.upstream_duration_ms.is_some(),
+            "upstream_duration_ms must still be set for metadata-only streams"
+        );
+        assert!(
+            log.ttft_ms.is_none(),
+            "ttft_ms must be None when no Data chunk was observed"
+        );
     }
 }

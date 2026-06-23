@@ -16,12 +16,16 @@ use crate::dispatch::{
     log_per_target_failure, success_log,
 };
 
-/// Unified result of a single chat attempt. The stream and non-stream
-/// outcomes are different types, so we wrap them in an enum to share
-/// the [`run_with_retries`] helper.
+/// Unified result of a single chat attempt. The `Instant` records when
+/// the upstream provider call started so the success branch can compute
+/// `upstream_duration_ms` without including SAG-internal retry/circuit
+/// overhead.
 enum ChatAttempt {
-    Stream(futures_util::stream::BoxStream<'static, StreamChunk>),
-    NonStream(ChatCompletionResponse),
+    Stream(
+        futures_util::stream::BoxStream<'static, StreamChunk>,
+        std::time::Instant,
+    ),
+    NonStream(ChatCompletionResponse, std::time::Instant),
 }
 
 /// Try each target in order. On a retryable error, fall through to the next
@@ -72,16 +76,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 let target_extra = target_extra.clone();
                 let api_endpoint = api_endpoint.clone();
                 async move {
+                    // Capture the upstream start time immediately before the
+                    // provider call so retry/circuit overhead is excluded.
+                    let upstream_start = std::time::Instant::now();
                     if is_stream {
                         provider
                             .chat_stream(request, &real_model, &api_endpoint, &target_extra)
                             .await
-                            .map(|s| ChatAttempt::Stream(Box::pin(s)))
+                            .map(|s| ChatAttempt::Stream(Box::pin(s), upstream_start))
                     } else {
                         provider
                             .chat(request, &real_model, &api_endpoint, &target_extra)
                             .await
-                            .map(ChatAttempt::NonStream)
+                            .map(|r| ChatAttempt::NonStream(r, upstream_start))
                     }
                 }
             },
@@ -105,7 +112,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         };
 
         match attempt {
-            ChatAttempt::Stream(stream) => {
+            ChatAttempt::Stream(stream, upstream_start) => {
                 return build_streaming_response(
                     state,
                     stream,
@@ -114,9 +121,15 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     &real_model,
                     trace_id,
                     start,
+                    upstream_start,
+                    request.reasoning_effort.clone(),
                 );
             }
-            ChatAttempt::NonStream(resp) => {
+            ChatAttempt::NonStream(resp, upstream_start) => {
+                // Non-streaming responses are single-shot: TTFT equals the
+                // total upstream duration.
+                let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
+                let timing = Some(upstream_duration_ms);
                 state.collector.log(success_log(
                     trace_id,
                     provider_name,
@@ -126,6 +139,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     start,
                     resp.usage.as_ref(),
                     request.reasoning_effort.as_deref(),
+                    timing,
+                    timing,
                 ));
                 return (StatusCode::OK, Json(resp)).into_response();
             }

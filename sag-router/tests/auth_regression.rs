@@ -16,7 +16,6 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
     middleware,
-    routing::get,
 };
 use sag_analytics::CallLogCollector;
 use sag_config::{
@@ -24,10 +23,7 @@ use sag_config::{
     ProviderType, RouteConfig, RouteTarget, ServerConfig, Strategy,
 };
 use sag_router::AppState;
-use sag_router::admin_providers::{
-    add_provider, delete_provider, list_provider_models, list_providers, update_provider,
-};
-use sag_router::admin_routes::{create_route, delete_route, list_routes, update_route};
+use sag_router::admin::build_admin_routes;
 use sag_router::middleware::auth::gateway_auth;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -94,23 +90,9 @@ async fn build_protected_state() -> AppState {
 }
 
 fn protected_app(state: AppState) -> Router {
-    let admin = Router::new()
-        .route(
-            "/providers",
-            get(list_providers)
-                .post(add_provider)
-                .put(update_provider)
-                .delete(delete_provider),
-        )
-        .route("/providers/{name}/models", get(list_provider_models))
-        .route(
-            "/routes",
-            get(list_routes)
-                .post(create_route)
-                .put(update_route)
-                .delete(delete_route),
-        )
-        .with_state(state.clone())
+    // Wrap the real admin routes with the auth middleware so any
+    // missing-route regression in `build_admin_routes` surfaces here.
+    let admin = build_admin_routes(state.clone())
         .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
     Router::new().nest("/api", admin).with_state(state)
 }
@@ -241,4 +223,95 @@ async fn auth_regression_update_provider_completes_through_auth_middleware() {
     })
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── `/api/logs` auth wiring ───────────────────────────────────────
+
+/// Helper: read the response body as JSON.
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn auth_regression_logs_missing_header_returns_401_envelope() {
+    let state = build_protected_state().await;
+    let app = protected_app(state);
+
+    let resp = bounded("GET /api/logs (no auth)", async {
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["error"]["code"], "UNAUTHORIZED",
+        "/api/logs must reject unauthenticated requests with the connection-level 401 envelope"
+    );
+    assert_eq!(body["error"]["message"], "missing Authorization header");
+}
+
+#[tokio::test]
+async fn auth_regression_logs_wrong_bearer_returns_401_envelope() {
+    let state = build_protected_state().await;
+    let app = protected_app(state);
+
+    let resp = bounded("GET /api/logs (wrong key)", async {
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/logs")
+                .header("Authorization", "Bearer not-the-real-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+    assert_eq!(body["error"]["message"], "invalid API key");
+}
+
+#[tokio::test]
+async fn auth_regression_logs_correct_bearer_proceeds() {
+    let state = build_protected_state().await;
+    let app = protected_app(state);
+
+    let resp = bounded("GET /api/logs (correct key)", async {
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/logs")
+                .header("Authorization", "Bearer regression-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "valid Bearer must reach the handler"
+    );
+    let body = body_json(resp).await;
+    assert!(
+        body["data"].is_array(),
+        "valid auth gets back the LogsPage's data envelope, not a 401"
+    );
 }

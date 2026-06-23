@@ -99,6 +99,8 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             start,
             None,
             None, // reasoning_effort — not applicable for image generation
+            None, // upstream_duration_ms — image path timing is out of scope for stage 2
+            None, // ttft_ms — image generation is single-shot, conceptually non-streaming
         ));
         return (StatusCode::OK, Json(resp)).into_response();
     }

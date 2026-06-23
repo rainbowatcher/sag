@@ -2,10 +2,63 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use sag_core::{AppError, CallLog, Usage};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::collections::HashSet;
 use std::str::FromStr;
 use tracing::warn;
 
 use crate::store::{LogFilter, LogStore, StatsFilter, StatsRow};
+
+/// Stage-0.4 extension columns added to `call_logs` beyond the original
+/// 13-column schema. Each entry is `(column_name, sqlite_type_declaration)`.
+/// Kept in one place so `ensure_schema_consistency` and its tests share
+/// the same list and a rename cannot silently drift out of sync.
+const STAGE_04_COLUMNS: &[(&str, &str)] = &[
+    ("reasoning_effort", "TEXT"),
+    ("upstream_duration_ms", "INTEGER"),
+    ("ttft_ms", "INTEGER"),
+    ("cached_tokens", "INTEGER"),
+    ("cache_creation_tokens", "INTEGER"),
+    ("reasoning_tokens", "INTEGER"),
+];
+
+/// Maximum page size for `query_logs`. Mirrors the route-layer clamp in
+/// `sag-router/src/admin_logs.rs` so a runaway `?limit=` cannot stream
+/// gigabytes into the dashboard.
+const MAX_LOG_LIMIT: u64 = 500;
+
+/// Idempotent schema-drift repair for `call_logs`. Runs at every store
+/// startup. Missing extension columns are added with `ALTER TABLE … ADD COLUMN`
+/// as nullable, matching the `Option<…>` Rust types.
+async fn ensure_schema_consistency(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // Acquire a single connection so the ALTER-TABLE sequence is
+    // serialized against any other pool client. With `max_connections=4`,
+    // naively issuing checks and ALTERs through separate `.execute`
+    // calls would risk a "database is locked" race on a busy store.
+    let mut conn = pool.acquire().await?;
+
+    // Read the current column set once instead of one round-trip per
+    // expected column.
+    let existing: HashSet<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('call_logs')")
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+
+    for (name, decl) in STAGE_04_COLUMNS {
+        if existing.contains(*name) {
+            continue;
+        }
+        // SQLite `ALTER TABLE … ADD COLUMN` does not accept `NOT NULL`
+        // without a `DEFAULT`, and adding a constraint to an existing
+        // table is unsupported. New columns are intentionally nullable
+        // so pre-existing rows land on `NULL`.
+        let sql = format!("ALTER TABLE call_logs ADD COLUMN {} {}", name, decl);
+        sqlx::query(&sql).execute(&mut *conn).await?;
+        tracing::info!(column = name, decl, "added missing call_logs column");
+    }
+    Ok(())
+}
 
 /// SQLite-backed implementation of [`LogStore`].
 pub struct SqliteLogStore {
@@ -31,6 +84,12 @@ impl SqliteLogStore {
 
         // Run migrations to create/update schema
         sqlx::migrate!("./migrations").run(&pool).await?;
+
+        // Repair databases where `CREATE TABLE IF NOT EXISTS` left a
+        // pre-stage-0.4 table in place while the migration recorded itself
+        // as applied. The repair is idempotent and short-circuits on fresh
+        // installs where `pragma_table_info` sees the columns already.
+        ensure_schema_consistency(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -80,9 +139,7 @@ impl LogStore for SqliteLogStore {
             .bind(total)
             .bind(&log.error)
             .bind(log.timestamp.timestamp_millis())
-            // ── Stage 0.4: extended CallLog fields, sourced from the
-            //    struct directly so future stages (reasoning effort,
-            //    timing, cache) flow through automatically.
+            // Extended CallLog fields.
             .bind(log.reasoning_effort.as_ref())
             .bind(log.upstream_duration_ms.map(|v| v as i64))
             .bind(log.ttft_ms.map(|v| v as i64))
@@ -216,7 +273,8 @@ impl LogStore for SqliteLogStore {
         if let Some(sc) = filter.status_code {
             query = query.bind(sc as i32);
         }
-        query = query.bind(filter.limit as i64).bind(filter.offset as i64);
+        let limit = filter.limit.min(MAX_LOG_LIMIT);
+        query = query.bind(limit as i64).bind(filter.offset as i64);
 
         let rows = query
             .fetch_all(&self.pool)
@@ -232,10 +290,6 @@ impl LogStore for SqliteLogStore {
 }
 
 /// Raw row from the `call_logs` table (timestamp stored as INTEGER unix ms).
-///
-/// Mirrors the columns declared in `migrations/*.sqlite.sql` so a single
-/// `query_as::<_, LogRow>` call can hydrate the whole extended schema
-/// introduced in stage 0.4.
 #[derive(Debug, sqlx::FromRow)]
 struct LogRow {
     request_id: String,
@@ -479,8 +533,7 @@ mod tests {
         assert_eq!(page2.len(), 2);
     }
 
-    /// Stage 0.4 round-trip: every new CallLog field must be persisted
-    /// (not silently nulled) and read back through query_logs.
+    /// Every CallLog extension field must round-trip through insert/query.
     #[tokio::test]
     async fn insert_and_query_logs_round_trip_stage04_fields() {
         let store = SqliteLogStore::new_memory().await.unwrap();
@@ -562,5 +615,158 @@ mod tests {
             .unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].error.as_deref(), Some("upstream timeout"));
+    }
+
+    // ─── Schema-drift repair ─────────────────────────────────────────
+
+    /// Open a file-backed SQLite pool with the pre-stage-0.4 13-column
+    /// `call_logs` table. Caller owns `path` for cleanup.
+    async fn open_old_schema_db(path: &std::path::Path) -> Result<SqlitePool, sqlx::Error> {
+        // `create_if_missing(false)` would fail if the file isn't there;
+        // we want to assert the path is clean so prior runs cannot leak
+        // columns between tests.
+        let _ = std::fs::remove_file(path);
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE call_logs (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id          TEXT    NOT NULL,
+                provider            TEXT    NOT NULL DEFAULT '',
+                model               TEXT    NOT NULL DEFAULT '',
+                real_model          TEXT    NOT NULL DEFAULT '',
+                stream              INTEGER NOT NULL DEFAULT 0,
+                status_code         INTEGER NOT NULL DEFAULT 0,
+                duration_ms         INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens       INTEGER,
+                completion_tokens   INTEGER,
+                total_tokens        INTEGER,
+                error               TEXT,
+                timestamp           INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+        Ok(pool)
+    }
+
+    fn tmp_db_path(suffix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sag-analytics-{}-{}.db",
+            suffix,
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_consistency_repairs_pre_stage_04_database() {
+        let path = tmp_db_path("drift-repair");
+        let pool = open_old_schema_db(&path).await.unwrap();
+
+        // Sanity check: only the 13 legacy columns exist before repair.
+        let pre_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('call_logs') ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !pre_cols.iter().any(|c| c == "reasoning_effort"),
+            "pre-condition: reasoning_effort must be absent; saw {:?}",
+            pre_cols
+        );
+
+        ensure_schema_consistency(&pool).await.unwrap();
+
+        // Post-repair: every expected column lands on the table.
+        let post_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('call_logs') ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for (name, _) in STAGE_04_COLUMNS {
+            assert!(
+                post_cols.iter().any(|c| c == *name),
+                "missing after repair: {name}; saw {:?}",
+                post_cols
+            );
+        }
+
+        // The same `SELECT` that crashed in production must now succeed.
+        // We use `fetch_optional` because the table is empty at this point —
+        // the assertion is "the column exists and the query parses", not
+        // "there is at least one row". `fetch_one` would error on an empty
+        // result set with `RowNotFound`, which would mask the real signal
+        // (a no-such-column error) we'd actually care about catching.
+        let _: Option<String> =
+            sqlx::query_scalar("SELECT reasoning_effort FROM call_logs LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+
+        // Existing rows must land on NULL (i.e. pre-existing rows are
+        // untouched and new columns are NULL by default).
+        sqlx::query("INSERT INTO call_logs (request_id, timestamp) VALUES (?, ?)")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(chrono::Utc::now().timestamp_millis())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stage04_cols: Vec<(Option<String>, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT reasoning_effort, upstream_duration_ms, ttft_ms FROM call_logs")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stage04_cols.len(), 1);
+        let (effort, upstream, ttft) = &stage04_cols[0];
+        assert!(effort.is_none());
+        assert!(upstream.is_none());
+        assert!(ttft.is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_consistency_is_idempotent() {
+        let path = tmp_db_path("drift-idempotent");
+        let pool = open_old_schema_db(&path).await.unwrap();
+
+        // First call repairs; second and third must be safe no-ops.
+        ensure_schema_consistency(&pool).await.unwrap();
+        ensure_schema_consistency(&pool).await.unwrap();
+        ensure_schema_consistency(&pool).await.unwrap();
+
+        let final_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('call_logs') ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for (name, _) in STAGE_04_COLUMNS {
+            // Each column appears exactly once — the idempotency test
+            // would catch a stale repeated rewrite or duplicate.
+            assert_eq!(
+                final_cols.iter().filter(|c| c.as_str() == *name).count(),
+                1,
+                "column {name} must appear exactly once after idempotent repair",
+            );
+        }
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_consistency_is_noop_on_fresh_migrated_database() {
+        // On a fresh :memory: DB every column is already present; the
+        // repair layer must skip every ALTER without raising.
+        let store = SqliteLogStore::new_memory().await.unwrap();
+        ensure_schema_consistency(&store.pool).await.unwrap();
     }
 }

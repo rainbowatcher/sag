@@ -121,13 +121,6 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
 // ═══════════════════════════════════════════════════════════════════
 
 /// Build a `CallLog` for a successful response.
-///
-/// Note: the three `cached_tokens` / `cache_creation_tokens` /
-/// `reasoning_tokens` mappings from [`Usage`] implement plan section 3.4
-/// (Usage → CallLog copy) ahead of schedule. They are safe at stage 0
-/// because [`Usage`]'s corresponding fields are always `None` until the
-/// cache-parsing stages land; once they do, the data flows through
-/// automatically with no further change here.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn success_log(
     request_id: uuid::Uuid,
@@ -138,6 +131,8 @@ pub(in crate::dispatch) fn success_log(
     start: Instant,
     usage: Option<&Usage>,
     reasoning_effort: Option<&str>,
+    upstream_duration_ms: Option<u64>,
+    ttft_ms: Option<u64>,
 ) -> CallLog {
     let usage = usage.cloned();
     CallLog {
@@ -151,8 +146,8 @@ pub(in crate::dispatch) fn success_log(
         error: None,
         timestamp: chrono::Utc::now(),
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
-        upstream_duration_ms: None,
-        ttft_ms: None,
+        upstream_duration_ms,
+        ttft_ms,
         cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
         cache_creation_tokens: usage.as_ref().and_then(|u| u.cache_creation_tokens),
         reasoning_tokens: usage.as_ref().and_then(|u| u.reasoning_tokens),

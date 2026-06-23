@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admin_logs;
 pub mod admin_providers;
 pub mod admin_routes;
 pub mod admin_testing;
