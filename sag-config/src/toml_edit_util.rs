@@ -1352,7 +1352,7 @@ strategy = "fill_first"
             &items,
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
-            |t| build_target_table(t),
+            build_target_table,
             |_, _| {},
         );
         let s = arr.to_string();
@@ -1402,7 +1402,7 @@ targets = [
             &items,
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
-            |t| build_target_table(t),
+            build_target_table,
             |existing, (provider, _)| {
                 existing.insert("provider", Value::from(provider.as_str()));
             },
@@ -1512,7 +1512,7 @@ targets = [
             &items,
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
-            |t| build_target_table(t),
+            build_target_table,
             |_, _| {},
         );
         let s = arr.to_string();

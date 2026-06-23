@@ -257,39 +257,6 @@ struct AnthropicUsage {
     cache_creation_input_tokens: Option<u32>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn anthropic_usage_deserializes_cache_fields() {
-        let json = r#"{
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cache_read_input_tokens": 200,
-            "cache_creation_input_tokens": 50
-        }"#;
-        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
-        assert_eq!(usage.input_tokens, 1000);
-        assert_eq!(usage.output_tokens, 500);
-        assert_eq!(usage.cache_read_input_tokens, Some(200));
-        assert_eq!(usage.cache_creation_input_tokens, Some(50));
-    }
-
-    #[test]
-    fn anthropic_usage_cache_fields_default_to_none_when_absent() {
-        let json = r#"{
-            "input_tokens": 800,
-            "output_tokens": 300
-        }"#;
-        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
-        assert_eq!(usage.input_tokens, 800);
-        assert_eq!(usage.output_tokens, 300);
-        assert!(usage.cache_read_input_tokens.is_none());
-        assert!(usage.cache_creation_input_tokens.is_none());
-    }
-}
-
 // ── Provider ─────────────────────────────────────────────────────
 
 /// Anthropic Messages API provider adapter.
@@ -510,5 +477,38 @@ impl LlmProvider for AnthropicProvider {
         });
 
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_usage_deserializes_cache_fields() {
+        let json = r#"{
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 50
+        }"#;
+        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 500);
+        assert_eq!(usage.cache_read_input_tokens, Some(200));
+        assert_eq!(usage.cache_creation_input_tokens, Some(50));
+    }
+
+    #[test]
+    fn anthropic_usage_cache_fields_default_to_none_when_absent() {
+        let json = r#"{
+            "input_tokens": 800,
+            "output_tokens": 300
+        }"#;
+        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 800);
+        assert_eq!(usage.output_tokens, 300);
+        assert!(usage.cache_read_input_tokens.is_none());
+        assert!(usage.cache_creation_input_tokens.is_none());
     }
 }
