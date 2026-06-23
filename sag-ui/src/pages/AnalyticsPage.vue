@@ -253,6 +253,13 @@ function fmtTps(row: CallLog): string | null {
   const tps = tpsFor(row)
   return tps == null ? null : `${tps.toFixed(1)} tps`
 }
+
+/** Per-request cache hit rate: cached_tokens / prompt_tokens, or null if not applicable. */
+function cacheHitRate(row: CallLog): number | null {
+  const usage = row.usage
+  if (!usage || !usage.prompt_tokens || !row.cached_tokens) return null
+  return row.cached_tokens / usage.prompt_tokens
+}
 </script>
 
 <template>
@@ -747,6 +754,11 @@ function fmtTps(row: CallLog): string | null {
                 <th class="text-muted-foreground px-3 py-2 text-right font-medium">Total</th>
                 <th class="text-muted-foreground px-3 py-2 text-left font-medium">Reasoning</th>
                 <th class="text-muted-foreground px-3 py-2 text-right font-medium">Duration</th>
+                <th class="text-muted-foreground px-3 py-2 text-right font-medium">Cached</th>
+                <th class="text-muted-foreground px-3 py-2 text-right font-medium">
+                  Cache Creation
+                </th>
+                <th class="text-muted-foreground px-3 py-2 text-right font-medium">Hit</th>
                 <th class="text-muted-foreground px-3 py-2 text-left font-medium">Error</th>
               </tr>
             </thead>
@@ -817,6 +829,21 @@ function fmtTps(row: CallLog): string | null {
                   <div v-if="fmtTps(row)" class="text-muted-foreground text-[10px]">
                     {{ fmtTps(row) }}
                   </div>
+                </td>
+                <td class="px-3 py-2 text-right tabular-nums">
+                  {{ row.cached_tokens?.toLocaleString() ?? "—" }}
+                </td>
+                <td class="px-3 py-2 text-right tabular-nums">
+                  {{ row.cache_creation_tokens?.toLocaleString() ?? "—" }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-xs tabular-nums">
+                  <span
+                    v-if="cacheHitRate(row) != null"
+                    :class="cacheHitRate(row)! > 0 ? 'text-green-600' : 'text-muted-foreground'"
+                  >
+                    {{ (cacheHitRate(row)! * 100).toFixed(1) + "%" }}
+                  </span>
+                  <span v-else class="text-muted-foreground">—</span>
                 </td>
                 <td
                   class="text-muted-foreground max-w-[16rem] truncate px-3 py-2 font-mono text-xs"
