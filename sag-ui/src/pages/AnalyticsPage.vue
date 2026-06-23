@@ -12,6 +12,7 @@ import {
 } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
+import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import type { CallLog } from "@/types/api"
 
@@ -145,7 +146,7 @@ function tpsFor(row: CallLog): number | null {
             <Clock class="h-5 w-5 text-green-500" />
             <div>
               <p class="text-muted-foreground text-xs">Avg Latency</p>
-              <p class="text-lg font-bold tabular-nums">{{ statsTotals.avgMs.toFixed(0) }} ms</p>
+              <p class="text-lg font-bold tabular-nums">{{ formatDuration(statsTotals.avgMs) }}</p>
             </div>
           </div>
           <div class="bg-card flex items-center gap-3 rounded-lg border p-4">
@@ -232,7 +233,9 @@ function tpsFor(row: CallLog): number | null {
                 <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Real Model</th>
                 <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Calls</th>
                 <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Tokens</th>
-                <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Avg ms</th>
+                <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">
+                  Avg Latency
+                </th>
                 <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Errors</th>
               </tr>
             </thead>
@@ -251,8 +254,8 @@ function tpsFor(row: CallLog): number | null {
                 <td class="px-4 py-2.5 text-right tabular-nums">
                   {{ row.total_tokens.toLocaleString() }}
                 </td>
-                <td class="px-4 py-2.5 text-right tabular-nums">
-                  {{ row.avg_duration_ms.toFixed(0) }}
+                <td class="px-4 py-2.5 text-right font-mono text-xs tabular-nums">
+                  {{ formatDuration(row.avg_duration_ms) }}
                 </td>
                 <td
                   class="px-4 py-2.5 text-right tabular-nums"
@@ -407,18 +410,22 @@ function tpsFor(row: CallLog): number | null {
                   <span v-else class="text-muted-foreground">—</span>
                 </td>
                 <td class="px-3 py-2 text-right font-mono text-xs tabular-nums">
-                  <div>{{ row.duration_ms }} ms</div>
+                  <div :title="`${row.duration_ms} ms`">{{ formatDuration(row.duration_ms) }}</div>
                   <div
                     v-if="row.upstream_duration_ms != null"
                     class="text-muted-foreground text-[10px]"
                   >
-                    upstream {{ row.upstream_duration_ms }} ms
+                    upstream
+                    <span :title="`${row.upstream_duration_ms} ms`">{{
+                      formatDuration(row.upstream_duration_ms)
+                    }}</span>
                   </div>
                   <div v-if="row.ttft_ms != null" class="text-muted-foreground text-[10px]">
-                    ttft {{ row.ttft_ms }} ms
+                    ttft
+                    <span :title="`${row.ttft_ms} ms`">{{ formatDuration(row.ttft_ms) }}</span>
                   </div>
-                  <div v-if="tpsFor(row) != null" class="text-muted-foreground text-[10px]">
-                    {{ tpsFor(row)!.toFixed(1) }} tps
+                  <div v-if="fmtTps(row)" class="text-muted-foreground text-[10px]">
+                    {{ fmtTps(row) }}
                   </div>
                 </td>
                 <td

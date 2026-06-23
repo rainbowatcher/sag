@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Server, GitBranch, MessageSquare, AlertTriangle } from "@lucide/vue"
 import { onMounted } from "vue"
+import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useHealthStore } from "@/stores/health"
 import { useProviderStore } from "@/stores/providers"
@@ -90,7 +91,7 @@ const cards = [
             <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Model</th>
             <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Calls</th>
             <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Tokens</th>
-            <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Avg ms</th>
+            <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Avg Latency</th>
             <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Errors</th>
           </tr>
         </thead>
@@ -106,8 +107,8 @@ const cards = [
             <td class="px-4 py-2.5 text-right tabular-nums">
               {{ row.total_tokens.toLocaleString() }}
             </td>
-            <td class="px-4 py-2.5 text-right tabular-nums">
-              {{ row.avg_duration_ms.toFixed(0) }}
+            <td class="px-4 py-2.5 text-right font-mono text-xs tabular-nums">
+              {{ formatDuration(row.avg_duration_ms) }}
             </td>
             <td
               class="px-4 py-2.5 text-right tabular-nums"
