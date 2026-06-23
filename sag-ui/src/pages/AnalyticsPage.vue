@@ -34,19 +34,24 @@ async function refreshStats() {
   )
 }
 
-const statsTotals = computed(() => ({
-  calls: store.stats.reduce((s, r) => s + r.call_count, 0),
-  tokens: store.stats.reduce((s, r) => s + r.total_tokens, 0),
-  avgMs:
-    store.stats.length > 0
-      ? store.stats.reduce((s, r) => s + r.avg_duration_ms * r.call_count, 0) /
-        Math.max(
-          1,
-          store.stats.reduce((s, r) => s + r.call_count, 0),
-        )
-      : 0,
-  errors: store.stats.reduce((s, r) => s + r.error_count, 0),
-}))
+const statsTotals = computed(() => {
+  let calls = 0
+  let tokens = 0
+  let errors = 0
+  let weightedMs = 0
+  for (const r of store.stats) {
+    calls += r.call_count
+    tokens += r.total_tokens
+    errors += r.error_count
+    weightedMs += r.avg_duration_ms * r.call_count
+  }
+  return {
+    calls,
+    tokens,
+    avgMs: calls > 0 ? weightedMs / calls : 0,
+    errors,
+  }
+})
 
 // ── Logs tab state ─────────────────────────────────────────────────
 const logsFilterProvider = ref("")
@@ -89,14 +94,7 @@ function formatTs(iso: string): string {
   }
 }
 
-/**
- * Plan §2.4 — TPS (tokens per second) computed at display time, not
- * persisted. Formula: `completion_tokens / (upstream_duration_ms -
- * ttft_ms) * 1000`. Returns `null` (rendered as `—`) when any input is
- * missing or the gen-only window is ≤ 0 (non-streaming responses have
- * `ttft_ms == upstream_duration_ms` so the denominator is zero; an
- * image-only stream that never sent a Data chunk has `ttft_ms == null`).
- */
+/** Tokens/sec over the generation window after TTFT; null when inputs are missing or invalid. */
 function tpsFor(row: CallLog): number | null {
   const usage = row.usage
   const ttft = row.ttft_ms
@@ -105,6 +103,11 @@ function tpsFor(row: CallLog): number | null {
   const genMs = upstream - ttft
   if (genMs <= 0) return null
   return (usage.completion_tokens * 1000) / genMs
+}
+
+function fmtTps(row: CallLog): string | null {
+  const tps = tpsFor(row)
+  return tps == null ? null : `${tps.toFixed(1)} tps`
 }
 </script>
 
@@ -269,7 +272,7 @@ function tpsFor(row: CallLog): number | null {
         </div>
       </TabsContent>
 
-      <!-- ── Logs panel (plan section 1.3) ─────────────────────────── -->
+      <!-- ── Logs panel ────────────────────────────────────────────── -->
       <TabsContent value="logs" class="space-y-4">
         <div class="flex flex-wrap items-center gap-3">
           <input

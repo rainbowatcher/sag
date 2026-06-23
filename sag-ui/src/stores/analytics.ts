@@ -7,7 +7,6 @@ import { useConnectionStore } from "./connection"
 import { useProviderStore } from "./providers"
 import { useRouteStore } from "./routes"
 
-/** Default page size for the logs tab; matches `DEFAULT_LOG_LIMIT` on the server. */
 const DEFAULT_LOG_LIMIT = 50
 
 export const useAnalyticsStore = defineStore("analytics", () => {
@@ -23,10 +22,6 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       const params = new URLSearchParams()
       if (provider) params.set("provider", provider)
       if (model) params.set("model", model)
-      // No per-call headers — `connection.ts:saveConnection` keeps
-      // `api.defaults.headers.common.Authorization` in sync with the
-      // persisted apiKey (Step 1 A2). `scripts/lint-api-auth.mjs` flags
-      // any future re-introduction of per-call headers as a regression.
       const { data } = await api.get<{ data: StatsRow[] }>(`/v1/analytics/stats?${params}`)
       stats.value = data.data
     } catch (e: any) {
@@ -38,7 +33,6 @@ export const useAnalyticsStore = defineStore("analytics", () => {
   }
 
   // ── Logs (raw call history) ──────────────────────────────────────
-  // Plan section 1.2/1.3: filterable, paginated call log list.
   const logs = ref<CallLog[]>([])
   const logsLoading = ref(false)
   const logsError = ref<string | null>(null)
@@ -71,23 +65,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (filter.status_code != null) params.set("status_code", String(filter.status_code))
       params.set("offset", String(filter.offset ?? logsOffset.value))
       // Probe for an extra row to determine `hasMoreLogs` precisely.
-      // TODO(plan-stage-1.x, see .plan/analytics-evolution.md §1.3
-      // "前端：基础列表页"): if `effectiveLimit` is ever made
-      // user-configurable up to `MAX_LOG_LIMIT = 500` (currently
-      // hardcoded to 50), the +1 sentinel forces a 501 request that
-      // the server clamps back to 500 — `rows.length` then never
-      // exceeds `effectiveLimit`, so `hasMoreLogs` goes falsely
-      // negative on a non-final page. Either cap the probe at
-      // MAX_LOG_LIMIT (and accept that the very last page has no
-      // visible sentinel) or expose a `Total` field from the server
-      // and compare against it. Hardcoded default 50 never triggers;
-      // safe to defer until §1.3 exposes page-size controls.
       params.set("limit", String(effectiveLimit + 1))
-      // No per-call headers — Step 1 (A2) makes the global
-      // `api.defaults.headers.common.Authorization` carry the Bearer
-      // token for all `/api/*` calls from this store. See
-      // `stores/connection.ts:saveConnection` and
-      // `scripts/lint-api-auth.mjs`.
       const { data } = await api.get<{ data: CallLog[] }>(`/api/logs?${params}`)
       const rows = data.data
       hasMoreLogs.value = rows.length > effectiveLimit
@@ -132,11 +110,17 @@ export const useAnalyticsStore = defineStore("analytics", () => {
   const summary = computed(() => {
     const p = useProviderStore()
     const r = useRouteStore()
+    let totalCalls = 0
+    let totalErrors = 0
+    for (const row of stats.value) {
+      totalCalls += row.call_count
+      totalErrors += row.error_count
+    }
     return {
       providerCount: p.providers.length,
       routeCount: r.routes.length,
-      totalCalls: stats.value.reduce((s, row) => s + row.call_count, 0),
-      totalErrors: stats.value.reduce((s, row) => s + row.error_count, 0),
+      totalCalls,
+      totalErrors,
     }
   })
 

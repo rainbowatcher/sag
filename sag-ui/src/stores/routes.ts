@@ -13,8 +13,6 @@ export const useRouteStore = defineStore("routes", () => {
   async function fetchRoutes() {
     routesLoading.value = true
     try {
-      // No per-call `headers` — `connection.ts:saveConnection` keeps
-      // `api.defaults.headers.common.Authorization` in sync (Step 1 A2).
       const { data } = await api.get<{ routes: RouteConfig[] }>("/api/routes")
       routes.value = data.routes
     } catch (e: any) {
