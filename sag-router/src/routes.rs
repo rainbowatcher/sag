@@ -21,7 +21,10 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::instrument;
 
 use crate::dispatch::{DispatchCtx, dispatch_chat, dispatch_image, resolve_route};
-use crate::handlers::{analytics_stats, list_models, show_health};
+use crate::handlers::{
+    analytics_cache_stats, analytics_distribution, analytics_stats, analytics_trend, list_models,
+    show_health,
+};
 use crate::middleware::auth::gateway_auth;
 use crate::middleware::trace::trace_middleware;
 use crate::state::AppState;
@@ -50,6 +53,9 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(show_health))
         .route("/v1/analytics/stats", get(analytics_stats))
+        .route("/v1/analytics/cache", get(analytics_cache_stats))
+        .route("/v1/analytics/trend", get(analytics_trend))
+        .route("/v1/analytics/distribution", get(analytics_distribution))
         .merge(protected)
         .layer(cors)
         .layer(middleware::from_fn(crate::middleware::http_log::log_http))

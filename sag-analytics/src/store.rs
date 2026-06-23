@@ -20,6 +20,18 @@ pub trait LogStore: Send + Sync {
     /// Query individual call log entries with pagination.
     async fn query_logs(&self, filter: LogFilter) -> sag_core::Result<Vec<CallLog>>;
 
+    /// Query cache hit-rate statistics grouped by `(provider, model, real_model)`.
+    async fn query_cache_stats(&self, filter: StatsFilter) -> sag_core::Result<Vec<CacheStatsRow>>;
+
+    /// Time-bucketed trend query. `bucket_seconds` controls the bucket width.
+    async fn query_trend(&self, filter: TrendFilter) -> sag_core::Result<Vec<TrendRow>>;
+
+    /// Distribution (proportion) query grouped by `(provider, model, real_model)`.
+    async fn query_distribution(
+        &self,
+        filter: StatsFilter,
+    ) -> sag_core::Result<Vec<DistributionRow>>;
+
     /// Gracefully shut down the store, flushing any pending writes.
     async fn shutdown(&self);
 }
@@ -57,4 +69,50 @@ pub struct StatsRow {
     pub total_tokens: i64,
     pub avg_duration_ms: f64,
     pub error_count: i64,
+}
+
+/// Cache hit-rate statistics row, grouped by `(provider, model, real_model)`.
+///
+/// The client computes `cache_hit_rate` as `total_cached_tokens / total_prompt_tokens`
+/// when `total_prompt_tokens > 0`. Raw sums are returned so the frontend can
+/// aggregate or display them independently.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct CacheStatsRow {
+    pub provider: String,
+    pub model: String,
+    pub real_model: String,
+    pub total_calls: i64,
+    pub total_prompt_tokens: i64,
+    pub total_cached_tokens: i64,
+}
+
+/// Filter for time-bucketed trend queries.
+#[derive(Debug, Clone)]
+pub struct TrendFilter {
+    pub provider: Option<String>,
+    pub bucket_seconds: u64,
+    pub from: DateTime<Utc>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// Time-bucketed trend row. `bucket` is a unix-millisecond timestamp marking
+/// the start of the bucket.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct TrendRow {
+    pub bucket: i64,
+    pub call_count: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub success_count: i64,
+}
+
+/// Distribution row with call proportion. `percentage` is `call_count / total * 100`
+/// so all rows for a given query sum to 100.
+#[derive(Debug, Serialize)]
+pub struct DistributionRow {
+    pub provider: String,
+    pub model: String,
+    pub real_model: String,
+    pub call_count: i64,
+    pub percentage: f64,
 }

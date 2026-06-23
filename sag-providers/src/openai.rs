@@ -68,8 +68,30 @@ impl LlmProvider for OpenAiProvider {
             .send_json(&url, body, target_extra, &[(auth_name, &auth_value)])
             .await?;
 
-        let completion: ChatCompletionResponse = serde_json::from_str(&body_text)
+        let mut completion: ChatCompletionResponse = serde_json::from_str(&body_text)
             .map_err(|e| AppError::Internal(format!("failed to parse upstream response: {e}")))?;
+
+        // Patch nested cache/reasoning token fields from the raw usage
+        // object. The derived Deserialize for Usage sees a flat struct,
+        // so `prompt_tokens_details.cached_tokens` and
+        // `completion_tokens_details.reasoning_tokens` are silently ignored.
+        // This post-deserialization patch lifts them into the top-level
+        // Usage fields without requiring a custom deserializer.
+        if let Some(ref mut usage) = completion.usage
+            && let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+            && let Some(raw_usage) = raw.get("usage")
+        {
+            usage.cached_tokens = raw_usage
+                .get("prompt_tokens_details")
+                .and_then(|v| v.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            usage.reasoning_tokens = raw_usage
+                .get("completion_tokens_details")
+                .and_then(|v| v.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+        }
 
         Ok(completion)
     }

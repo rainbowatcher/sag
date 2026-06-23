@@ -87,9 +87,23 @@ where
                     return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(raw)), state));
                 }
                 Some(StreamChunk::Usage(u)) => {
+                    // Token-count fields accumulate across multiple Usage
+                    // chunks (Anthropic emits two: message_start + message_delta).
                     state.usage.prompt_tokens += u.prompt_tokens;
                     state.usage.completion_tokens += u.completion_tokens;
                     state.usage.total_tokens += u.total_tokens;
+                    // Cache/reasoning fields appear at most once per stream
+                    // (in message_start). Taking the last non-None value avoids
+                    // double-counting if a future second chunk repeats them.
+                    if u.cached_tokens.is_some() {
+                        state.usage.cached_tokens = u.cached_tokens;
+                    }
+                    if u.cache_creation_tokens.is_some() {
+                        state.usage.cache_creation_tokens = u.cache_creation_tokens;
+                    }
+                    if u.reasoning_tokens.is_some() {
+                        state.usage.reasoning_tokens = u.reasoning_tokens;
+                    }
                 }
                 Some(StreamChunk::Error(msg)) => {
                     warn!(provider = %state.provider, error = %msg, "mid-stream error");

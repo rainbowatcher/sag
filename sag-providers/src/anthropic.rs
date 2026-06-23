@@ -32,12 +32,20 @@ fn extract_anthropic_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender
         usage.get("input_tokens").and_then(|v| v.as_u64()),
         usage.get("output_tokens").and_then(|v| v.as_u64()),
     ) {
+        let cached_tokens = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let cache_creation_tokens = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         let _ = tx.send(StreamChunk::Usage(Usage {
             prompt_tokens: input as u32,
             completion_tokens: output as u32,
             total_tokens: (input + output) as u32,
-            cached_tokens: None,
-            cache_creation_tokens: None,
+            cached_tokens,
+            cache_creation_tokens,
             reasoning_tokens: None,
         }));
     }
@@ -243,6 +251,43 @@ enum ContentBlockResp {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_usage_deserializes_cache_fields() {
+        let json = r#"{
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 50
+        }"#;
+        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 500);
+        assert_eq!(usage.cache_read_input_tokens, Some(200));
+        assert_eq!(usage.cache_creation_input_tokens, Some(50));
+    }
+
+    #[test]
+    fn anthropic_usage_cache_fields_default_to_none_when_absent() {
+        let json = r#"{
+            "input_tokens": 800,
+            "output_tokens": 300
+        }"#;
+        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 800);
+        assert_eq!(usage.output_tokens, 300);
+        assert!(usage.cache_read_input_tokens.is_none());
+        assert!(usage.cache_creation_input_tokens.is_none());
+    }
 }
 
 // ── Provider ─────────────────────────────────────────────────────
@@ -316,8 +361,8 @@ impl AnthropicProvider {
             prompt_tokens: u.input_tokens,
             completion_tokens: u.output_tokens,
             total_tokens: u.input_tokens + u.output_tokens,
-            cached_tokens: None,
-            cache_creation_tokens: None,
+            cached_tokens: u.cache_read_input_tokens,
+            cache_creation_tokens: u.cache_creation_input_tokens,
             reasoning_tokens: None,
         });
 
