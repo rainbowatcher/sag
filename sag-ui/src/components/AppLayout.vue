@@ -4,6 +4,7 @@ import {
   Server,
   GitBranch,
   BarChart3,
+  ScrollText,
   Wifi,
   WifiOff,
   Moon,
@@ -15,6 +16,7 @@ import { isDark, toggleDark } from "@/composables/useTheme"
 import { cn } from "@/lib/utils"
 import { useConnectionStore } from "@/stores/connection"
 import { useHealthStore } from "@/stores/health"
+import Button from "./ui/button/Button.vue"
 
 const store = useConnectionStore()
 const health = useHealthStore()
@@ -37,6 +39,7 @@ const navItems: NavItem[] = [
   { label: "Providers", path: "/providers", icon: Server },
   { label: "Routes", path: "/routes", icon: GitBranch },
   { label: "Analytics", path: "/analytics", icon: BarChart3 },
+  { label: "Logs", path: "/logs", icon: ScrollText },
 ]
 </script>
 
@@ -56,13 +59,14 @@ const navItems: NavItem[] = [
       </div>
 
       <nav class="flex-1 space-y-1 px-2 py-2">
-        <button
+        <Button
+          variant="ghost"
           v-for="item in navItems"
           :key="item.path"
           @click="router.push(item.path)"
           :class="
             cn(
-              'flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors',
+              'flex w-full items-center justify-start gap-3 rounded-md px-3 py-2 text-sm transition-colors',
               route.path === item.path
                 ? 'bg-primary/10 text-foreground font-medium'
                 : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
@@ -71,7 +75,7 @@ const navItems: NavItem[] = [
         >
           <component :is="item.icon" class="h-4 w-4" />
           {{ item.label }}
-        </button>
+        </Button>
       </nav>
 
       <div class="space-y-2.5 border-t px-5 py-3">
@@ -84,9 +88,14 @@ const navItems: NavItem[] = [
             />
             <span>{{ health.gatewayOnline ? "Connected" : "Offline" }}</span>
           </div>
-          <button @click="() => toggleDark()" class="hover:text-foreground transition-colors">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            @click="() => toggleDark()"
+            class="hover:text-foreground transition-colors"
+          >
             <component :is="isDark ? Sun : Moon" class="h-3.5 w-3.5" />
-          </button>
+          </Button>
         </div>
         <p
           v-if="store.gatewayUrl"
@@ -95,13 +104,14 @@ const navItems: NavItem[] = [
         >
           {{ store.gatewayUrl }}
         </p>
-        <button
+        <Button
+          variant="outline"
           @click="handleDisconnect"
           class="text-muted-foreground hover:text-destructive flex w-full items-center gap-1.5 text-[11px] transition-colors"
         >
           <LogOut class="h-3 w-3" />
           Disconnect
-        </button>
+        </Button>
       </div>
     </aside>
 
