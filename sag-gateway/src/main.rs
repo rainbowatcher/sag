@@ -17,11 +17,16 @@ mod ui_routes;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Initialize tracing (structured logging)
-    tracing_init::init();
-
-    // 2. Resolve config path: --config <path> > positional <path> > "gateway.toml"
+    // 1. Resolve config path: --config <path> > positional <path> > "gateway.toml"
     let config_path = resolve_config_path()?;
+
+    // 2. Peek at the config file for logging.level and logging.format, then
+    //    initialize tracing. The peek is done before full config load so the
+    //    early startup log messages respect the configured level and format.
+    //    If the file can't be read or the keys are missing, defaults apply.
+    let (log_level, log_format) = sag_config::peek_logging_config(&config_path);
+    tracing_init::init(Some(&log_level), log_format);
+
     info!(%config_path, "starting SAG gateway");
 
     // 3. Load configuration with hot-reload support

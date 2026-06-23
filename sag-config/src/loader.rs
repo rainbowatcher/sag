@@ -7,7 +7,8 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::config::{
-    GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
+    GatewayConfig, KeyStrategy, LogFormat, ProviderConfig, ProviderType, RouteConfig, RouteTarget,
+    Strategy,
 };
 use crate::toml_edit_util::{
     ensure_array_field, ensure_inline_table_field, ensure_nested_inline_table, prune_keys,
@@ -51,6 +52,38 @@ impl ConfigHandle {
     pub fn is_file_backed(&self) -> bool {
         self.config_path.is_some()
     }
+}
+
+/// Quickly read `logging.level` and `logging.format` from a TOML file without
+/// full config parsing. Returns `(level, format)` filled with defaults where
+/// the file can't be read or the keys are missing.
+///
+/// This is used before tracing is initialized so that the log level and format
+/// from the config file can be applied early, without waiting for the full
+/// config load.
+pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
+    let content = match std::fs::read_to_string(path.as_ref()) {
+        Ok(c) => c,
+        Err(_) => return ("info".into(), LogFormat::default()),
+    };
+    let value: toml::Value = match content.parse() {
+        Ok(v) => v,
+        Err(_) => return ("info".into(), LogFormat::default()),
+    };
+    let logging = match value.get("logging") {
+        Some(v) => v,
+        None => return ("info".into(), LogFormat::default()),
+    };
+    let level = logging
+        .get("level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("info")
+        .to_string();
+    let format = match logging.get("format").and_then(|v| v.as_str()) {
+        Some("json") => LogFormat::Json,
+        _ => LogFormat::Compact,
+    };
+    (level, format)
 }
 
 /// Load the initial configuration from a TOML file and return a `ConfigHandle`.
@@ -861,6 +894,7 @@ base_url = "https://api.anthropic.com"
             )]),
             retries: 2,
             backoff: BackoffConfig::default(),
+            logging: LoggingConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1021,6 +1055,7 @@ key_strategy = "round_robin"
             )]),
             retries: 2,
             backoff: BackoffConfig::default(),
+            logging: LoggingConfig::default(),
             routes: vec![],
         };
 
@@ -1174,6 +1209,7 @@ targets = [
             )]),
             retries: 2,
             backoff: BackoffConfig::default(),
+            logging: LoggingConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1239,6 +1275,7 @@ targets = [
             )]),
             retries: 2,
             backoff: BackoffConfig::default(),
+            logging: LoggingConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1294,6 +1331,7 @@ targets = [
             )]),
             retries: 2,
             backoff: BackoffConfig::default(),
+            logging: LoggingConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1487,6 +1525,7 @@ targets = [
             providers: HashMap::from([("openai".into(), minimal_provider())]),
             retries: 2,
             backoff: BackoffConfig::default(),
+            logging: LoggingConfig::default(),
             routes: vec![],
         }
     }

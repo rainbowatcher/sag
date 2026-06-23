@@ -191,6 +191,7 @@ mod tests {
             retries: 2,
             backoff: BackoffConfig::default(),
             providers: HashMap::new(),
+            logging: sag_config::LoggingConfig::default(),
             routes: vec![],
         };
         AppState {

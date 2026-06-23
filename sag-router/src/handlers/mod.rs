@@ -237,6 +237,7 @@ mod tests {
             retries: 2,
             backoff: BackoffConfig::default(),
             providers,
+            logging: sag_config::LoggingConfig::default(),
             routes,
         };
         let handle = ConfigHandle::from_config(config);

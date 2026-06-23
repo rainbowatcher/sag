@@ -57,6 +57,7 @@ async fn build_protected_state() -> AppState {
         retries: 2,
         backoff: BackoffConfig::default(),
         providers,
+        logging: sag_config::LoggingConfig::default(),
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),

@@ -6,6 +6,16 @@
 # Global default retry count (per target). Can be overridden per-route or per-target.
 retries = 2
 
+# Logging configuration (optional, defaults below).
+# The RUST_LOG environment variable, if set, takes precedence over level.
+[logging]
+# Log level or EnvFilter directive (e.g. "info", "debug", "info,sag_router=debug").
+# Default: "info".
+level = "info"
+# Output format: "compact" (human-readable) or "json" (structured).
+# Default: "compact".
+format = "compact"
+
 # Exponential-backoff settings for retry delays. Each retry sleeps for
 # `min(base_ms * 2^attempt, max_ms)` with optional full jitter (random(0, cap)).
 # Override per deployment to trade off latency vs. upstream load.

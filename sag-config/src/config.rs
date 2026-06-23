@@ -18,6 +18,10 @@ pub struct GatewayConfig {
     pub backoff: BackoffConfig,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Logging configuration (optional, default log level: "info").
+    /// The `RUST_LOG` environment variable, if set, takes precedence.
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl GatewayConfig {
@@ -211,6 +215,44 @@ impl GatewayConfig {
             Err(errors)
         }
     }
+}
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// Human-readable compact format (default).
+    #[default]
+    Compact,
+    /// Structured JSON format for log aggregators.
+    Json,
+}
+
+/// Logging configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// Log level filter string (e.g., "info", "debug", "trace", "warn", "error").
+    /// Also supports `EnvFilter` directives like `"info,sag_router=debug"`.
+    /// The `RUST_LOG` environment variable, if set, takes precedence over this value.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Output format: `"compact"` (human-readable) or `"json"` (structured logging).
+    /// Defaults to `"compact"`.
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: LogFormat::default(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".into()
 }
 
 /// Server listen configuration.
