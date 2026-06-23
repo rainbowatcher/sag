@@ -121,6 +121,15 @@ where
                     let ttft_ms = state
                         .first_byte_at
                         .map(|t| t.duration_since(state.upstream_start).as_millis() as u64);
+                    // Mirror success_log (mod.rs:151-153): the flat
+                    // cache/reasoning columns must carry the same values as
+                    // `usage`, because the persistence layer binds these
+                    // columns from the flat fields, not from `log.usage`.
+                    // Without this, query_cache_stats undercounts streaming
+                    // responses. Capture before the move into `Some(state.usage)`.
+                    let cached_tokens = state.usage.cached_tokens;
+                    let cache_creation_tokens = state.usage.cache_creation_tokens;
+                    let reasoning_tokens = state.usage.reasoning_tokens;
                     state.collector.log(CallLog {
                         request_id: state.request_id,
                         provider: state.provider.clone(),
@@ -134,9 +143,9 @@ where
                         reasoning_effort: state.reasoning_effort.clone(),
                         upstream_duration_ms: Some(upstream_duration_ms),
                         ttft_ms,
-                        cached_tokens: None,
-                        cache_creation_tokens: None,
-                        reasoning_tokens: None,
+                        cached_tokens,
+                        cache_creation_tokens,
+                        reasoning_tokens,
                         usage: Some(state.usage),
                     });
                     return None;
@@ -292,6 +301,46 @@ mod tests {
         assert_eq!(rows[0].total_prompt_tokens, 15);
         assert_eq!(rows[0].total_completion_tokens, 20);
         assert_eq!(rows[0].total_tokens, 35);
+    }
+
+    /// Regression for the streaming cache-passthrough bug: the flat
+    /// `cached_tokens` / `cache_creation_tokens` / `reasoning_tokens`
+    /// columns on the stream `CallLog` must carry the same values as
+    /// `usage`, because `SqliteLogStore::insert_batch` binds these
+    /// columns from the flat fields (not from `log.usage`). Without
+    /// this, `query_cache_stats` undercounts every streamed response.
+    #[tokio::test]
+    async fn cache_fields_persisted_from_stream_usage() {
+        let state = build_state().await;
+        let chunks = vec![
+            StreamChunk::Data(b"data: hi\n\n".to_vec()),
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+                cached_tokens: Some(5),
+                cache_creation_tokens: Some(3),
+                reasoning_tokens: Some(7),
+            }),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "anthropic",
+            "claude",
+            "claude-sonnet-4",
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            None,
+        );
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let log = latest_call_log(&state).await;
+        assert_eq!(log.cached_tokens, Some(5));
+        assert_eq!(log.cache_creation_tokens, Some(3));
+        assert_eq!(log.reasoning_tokens, Some(7));
     }
 
     #[tokio::test]
