@@ -84,6 +84,16 @@ export interface StatsRow {
   error_count: number
 }
 
+/** Cache hit-rate statistics returned by `GET /v1/analytics/cache`. */
+export interface CacheStatsRow {
+  provider: string
+  model: string
+  real_model: string
+  total_calls: number
+  total_prompt_tokens: number
+  total_cached_tokens: number
+}
+
 /** Token usage block returned by upstream providers (mirrors sag_core::Usage). */
 export interface Usage {
   prompt_tokens: number
@@ -116,6 +126,24 @@ export interface CallLog {
   cached_tokens?: number
   cache_creation_tokens?: number
   reasoning_tokens?: number
+}
+
+/** Time-bucketed trend row returned by `GET /v1/analytics/trend`. */
+export interface TrendRow {
+  bucket: number
+  call_count: number
+  prompt_tokens: number
+  completion_tokens: number
+  success_count: number
+}
+
+/** Distribution row returned by `GET /v1/analytics/distribution`. */
+export interface DistributionRow {
+  provider: string
+  model: string
+  real_model: string
+  call_count: number
+  percentage: number
 }
 
 /** Query parameters accepted by `GET /api/logs`. */

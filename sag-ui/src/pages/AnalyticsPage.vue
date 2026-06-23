@@ -10,13 +10,157 @@ import {
   ChevronLeft,
   ChevronRight,
 } from "@lucide/vue"
-import { ref, onMounted, computed } from "vue"
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler,
+} from "chart.js"
+import { ref, onMounted, computed, watch } from "vue"
+import { Line, Pie } from "vue-chartjs"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
 import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import type { CallLog } from "@/types/api"
 
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler,
+)
+
 const store = useAnalyticsStore()
+
+// ── Dashboard tab state ────────────────────────────────────────────
+type TimeRange = "1h" | "24h" | "7d"
+const dashRange = ref<TimeRange>("24h")
+const dashProvider = ref("")
+
+const rangeMs: Record<TimeRange, number> = {
+  "1h": 3600_000,
+  "24h": 86_400_000,
+  "7d": 604_800_000,
+}
+const rangeBucket: Record<TimeRange, number> = {
+  "1h": 300, // 5 min
+  "24h": 3600, // 1 hour
+  "7d": 14400, // 4 hours
+}
+
+async function refreshDashboard() {
+  const now = Date.now()
+  const fromMs = now - rangeMs[dashRange.value]
+  await Promise.all([
+    store.fetchTrend(rangeBucket[dashRange.value], fromMs, now, dashProvider.value || undefined),
+    store.fetchDistribution(dashProvider.value || undefined),
+  ])
+}
+
+// Re-fetch when time range or provider filter changes, and on mount.
+watch([dashRange, dashProvider], () => refreshDashboard(), { immediate: true })
+
+const trendTokensChart = computed(() => ({
+  labels: store.trend.map((r) =>
+    new Date(r.bucket).toLocaleString(
+      dashRange.value === "7d" ? "en-CA" : "en-CA",
+      (dashRange.value === "7d"
+        ? { month: "short", day: "numeric", hour: "2-digit" }
+        : { hour: "2-digit", minute: "2-digit" }) as Intl.DateTimeFormatOptions,
+    ),
+  ),
+  datasets: [
+    {
+      label: "Prompt",
+      data: store.trend.map((r) => r.prompt_tokens),
+      borderColor: "rgb(59,130,246)",
+      backgroundColor: "rgba(59,130,246,0.1)",
+      fill: true,
+      tension: 0.3,
+      pointRadius: 0,
+    },
+    {
+      label: "Completion",
+      data: store.trend.map((r) => r.completion_tokens),
+      borderColor: "rgb(34,197,94)",
+      backgroundColor: "rgba(34,197,94,0.1)",
+      fill: true,
+      tension: 0.3,
+      pointRadius: 0,
+    },
+  ],
+}))
+
+const trendCallsChart = computed(() => ({
+  labels: store.trend.map((r) =>
+    new Date(r.bucket).toLocaleString(
+      "en-CA",
+      (dashRange.value === "7d"
+        ? { month: "short", day: "numeric", hour: "2-digit" }
+        : { hour: "2-digit", minute: "2-digit" }) as Intl.DateTimeFormatOptions,
+    ),
+  ),
+  datasets: [
+    {
+      label: "Calls",
+      data: store.trend.map((r) => r.call_count),
+      borderColor: "rgb(168,85,247)",
+      backgroundColor: "rgba(168,85,247,0.1)",
+      fill: true,
+      tension: 0.3,
+      pointRadius: 0,
+    },
+    {
+      label: "Success",
+      data: store.trend.map((r) => r.success_count),
+      borderColor: "rgb(34,197,94)",
+      backgroundColor: "transparent",
+      tension: 0.3,
+      pointRadius: 0,
+    },
+  ],
+}))
+
+const pieChart = computed(() => ({
+  labels: store.distribution.map((r) => `${r.provider}/${r.model}`),
+  datasets: [
+    {
+      data: store.distribution.map((r) => r.call_count),
+      backgroundColor: [
+        "rgb(59,130,246)",
+        "rgb(34,197,94)",
+        "rgb(168,85,247)",
+        "rgb(251,146,60)",
+        "rgb(236,72,153)",
+        "rgb(14,165,233)",
+        "rgb(251,191,36)",
+        "rgb(99,102,241)",
+      ],
+    },
+  ],
+}))
+
+// ── Cache tab state ────────────────────────────────────────────────
+const cacheFilterProvider = ref("")
+const cacheFilterModel = ref("")
+
+async function refreshCache() {
+  await store.fetchCacheStats(
+    cacheFilterProvider.value || undefined,
+    cacheFilterModel.value || undefined,
+  )
+}
 
 // ── Stats tab state ────────────────────────────────────────────────
 const statsFilterProvider = ref("")
@@ -123,8 +267,136 @@ function fmtTps(row: CallLog): string | null {
     <Tabs :default-value="'stats'" class="space-y-6">
       <TabsList>
         <TabsTrigger value="stats">Stats</TabsTrigger>
+        <TabsTrigger value="dashboard">Dashboard</TabsTrigger>
         <TabsTrigger value="logs">Logs</TabsTrigger>
+        <TabsTrigger value="cache">Cache</TabsTrigger>
       </TabsList>
+
+      <!-- ── Dashboard panel ──────────────────────────────────────── -->
+      <TabsContent value="dashboard" class="space-y-6">
+        <div class="flex flex-wrap items-center gap-3">
+          <div class="bg-muted inline-flex rounded-md p-0.5">
+            <button
+              v-for="r in ['1h', '24h', '7d'] as TimeRange[]"
+              :key="r"
+              @click="dashRange = r"
+              class="rounded-sm px-3 py-1 text-sm transition-colors"
+              :class="
+                dashRange === r ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground'
+              "
+            >
+              {{ r }}
+            </button>
+          </div>
+          <input
+            v-model="dashProvider"
+            class="bg-background focus:ring-ring h-9 w-40 rounded-md border px-3 text-sm outline-none focus:ring-2"
+            placeholder="provider"
+          />
+          <button
+            @click="refreshDashboard()"
+            :disabled="store.trendLoading || store.distLoading"
+            class="hover:bg-accent ml-auto inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
+          >
+            <RefreshCw
+              :class="store.trendLoading || store.distLoading ? 'animate-spin' : ''"
+              class="h-3.5 w-3.5"
+            />
+            Refresh
+          </button>
+        </div>
+
+        <div
+          v-if="store.trendError || store.distError"
+          class="bg-destructive/10 text-destructive border-destructive/30 flex items-start gap-3 rounded-lg border px-4 py-3"
+          role="alert"
+        >
+          <AlertCircle class="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div class="min-w-0 flex-1">
+            <p class="text-sm font-medium">Failed to load dashboard data</p>
+            <p class="mt-1 text-xs break-words opacity-80">
+              {{ store.trendError || store.distError }}
+            </p>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <!-- Distribution pie chart -->
+          <div class="bg-card rounded-lg border p-4">
+            <h3 class="mb-3 text-sm font-medium">Call Distribution</h3>
+            <div
+              v-if="store.distLoading"
+              class="text-muted-foreground flex items-center justify-center py-16"
+            >
+              <Loader2 class="h-5 w-5 animate-spin" />
+            </div>
+            <div
+              v-else-if="store.distribution.length === 0"
+              class="text-muted-foreground flex items-center justify-center py-16 text-sm"
+            >
+              No data available.
+            </div>
+            <div v-else class="mx-auto max-w-xs">
+              <Pie
+                :data="pieChart"
+                :options="{ plugins: { legend: { position: 'bottom' as const } } }"
+              />
+            </div>
+          </div>
+
+          <!-- Token trend line chart -->
+          <div class="bg-card rounded-lg border p-4">
+            <h3 class="mb-3 text-sm font-medium">Token Trend</h3>
+            <div
+              v-if="store.trendLoading"
+              class="text-muted-foreground flex items-center justify-center py-16"
+            >
+              <Loader2 class="h-5 w-5 animate-spin" />
+            </div>
+            <div
+              v-else-if="store.trend.length === 0"
+              class="text-muted-foreground flex items-center justify-center py-16 text-sm"
+            >
+              No data available.
+            </div>
+            <Line
+              v-else
+              :data="trendTokensChart"
+              :options="{
+                responsive: true,
+                scales: { y: { beginAtZero: true } },
+                plugins: { legend: { position: 'bottom' as const } },
+              }"
+            />
+          </div>
+
+          <!-- Call count trend line chart -->
+          <div class="bg-card rounded-lg border p-4 lg:col-span-2">
+            <h3 class="mb-3 text-sm font-medium">Call Count Trend</h3>
+            <div
+              v-if="store.trendLoading"
+              class="text-muted-foreground flex items-center justify-center py-16"
+            >
+              <Loader2 class="h-5 w-5 animate-spin" />
+            </div>
+            <div
+              v-else-if="store.trend.length === 0"
+              class="text-muted-foreground flex items-center justify-center py-16 text-sm"
+            >
+              No data available.
+            </div>
+            <Line
+              v-else
+              :data="trendCallsChart"
+              :options="{
+                responsive: true,
+                scales: { y: { beginAtZero: true } },
+                plugins: { legend: { position: 'bottom' as const } },
+              }"
+            />
+          </div>
+        </div>
+      </TabsContent>
 
       <!-- ── Stats panel (existing aggregate view) ──────────────────── -->
       <TabsContent value="stats" class="space-y-6">
@@ -265,6 +537,121 @@ function fmtTps(row: CallLog): string | null {
                   :class="row.error_count > 0 ? 'font-medium text-red-500' : ''"
                 >
                   {{ row.error_count }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </TabsContent>
+
+      <!-- ── Cache panel ──────────────────────────────────────────── -->
+      <TabsContent value="cache" class="space-y-4">
+        <div class="flex items-center gap-3">
+          <input
+            v-model="cacheFilterProvider"
+            @keyup.enter="refreshCache()"
+            class="bg-background focus:ring-ring h-9 w-44 rounded-md border px-3 text-sm outline-none focus:ring-2"
+            placeholder="Filter provider..."
+          />
+          <input
+            v-model="cacheFilterModel"
+            @keyup.enter="refreshCache()"
+            class="bg-background focus:ring-ring h-9 w-44 rounded-md border px-3 text-sm outline-none focus:ring-2"
+            placeholder="Filter model..."
+          />
+          <button
+            @click="refreshCache()"
+            class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors"
+          >
+            <Search class="h-3.5 w-3.5" />
+            Query
+          </button>
+          <button
+            @click="refreshCache()"
+            :disabled="store.cacheLoading"
+            class="hover:bg-accent ml-auto inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
+          >
+            <RefreshCw :class="store.cacheLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
+            Refresh
+          </button>
+        </div>
+
+        <div
+          v-if="store.cacheError"
+          class="bg-destructive/10 text-destructive border-destructive/30 flex items-start gap-3 rounded-lg border px-4 py-3"
+          role="alert"
+        >
+          <AlertCircle class="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div class="min-w-0 flex-1">
+            <p class="text-sm font-medium">Failed to load cache statistics</p>
+            <p class="mt-1 text-xs break-words opacity-80">{{ store.cacheError }}</p>
+          </div>
+          <button
+            @click="refreshCache()"
+            class="bg-destructive text-destructive-foreground hover:bg-destructive/90 inline-flex h-8 items-center rounded-md px-3 text-xs font-medium transition-colors"
+          >
+            Retry
+          </button>
+        </div>
+
+        <div class="bg-card rounded-lg border">
+          <div v-if="store.cacheLoading" class="text-muted-foreground py-12 text-center">
+            <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" /> Loading...
+          </div>
+          <div
+            v-else-if="store.cache.length === 0"
+            class="text-muted-foreground py-12 text-center text-sm"
+          >
+            No cache statistics available.
+          </div>
+          <table v-else class="w-full text-sm">
+            <thead>
+              <tr class="bg-muted/50 border-b">
+                <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Provider</th>
+                <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Model</th>
+                <th class="text-muted-foreground px-4 py-2.5 text-left font-medium">Real Model</th>
+                <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Calls</th>
+                <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">
+                  Prompt Tokens
+                </th>
+                <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">
+                  Cached Tokens
+                </th>
+                <th class="text-muted-foreground px-4 py-2.5 text-right font-medium">Hit Rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="(row, i) in store.cache"
+                :key="i"
+                class="hover:bg-muted/30 border-b last:border-0"
+              >
+                <td class="px-4 py-2.5 font-medium">{{ row.provider }}</td>
+                <td class="px-4 py-2.5 font-mono text-xs">{{ row.model }}</td>
+                <td class="px-4 py-2.5 font-mono text-xs">{{ row.real_model }}</td>
+                <td class="px-4 py-2.5 text-right tabular-nums">
+                  {{ row.total_calls.toLocaleString() }}
+                </td>
+                <td class="px-4 py-2.5 text-right tabular-nums">
+                  {{ row.total_prompt_tokens.toLocaleString() }}
+                </td>
+                <td class="px-4 py-2.5 text-right tabular-nums">
+                  {{ row.total_cached_tokens.toLocaleString() }}
+                </td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs tabular-nums">
+                  <span
+                    v-if="row.total_prompt_tokens > 0"
+                    :class="
+                      row.total_cached_tokens / row.total_prompt_tokens > 0
+                        ? 'text-green-600'
+                        : 'text-muted-foreground'
+                    "
+                  >
+                    {{
+                      ((row.total_cached_tokens / row.total_prompt_tokens) * 100).toFixed(1) + "%"
+                    }}
+                  </span>
+                  <span v-else class="text-muted-foreground">—</span>
                 </td>
               </tr>
             </tbody>

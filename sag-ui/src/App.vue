@@ -8,14 +8,20 @@ const store = useConnectionStore()
 </script>
 
 <template>
-  <!-- Loading screen during auto-connect validation -->
-  <div v-if="store.validating" class="bg-muted/30 flex min-h-screen items-center justify-center">
+  <!-- Loading overlay during auto-connect validation.
+       Must NOT use v-if/v-else that toggles <RouterView> mount state,
+       because the navigation guard may still be pending when validating
+       flips back to false, producing a null vnode and crashing the app. -->
+  <div
+    v-if="store.validating"
+    class="bg-muted/30 fixed inset-0 z-50 flex items-center justify-center"
+  >
     <div class="space-y-3 text-center">
       <Loader2 class="text-primary mx-auto h-8 w-8 animate-spin" />
       <p class="text-muted-foreground text-sm">Connecting to gateway...</p>
     </div>
   </div>
 
-  <RouterView v-else />
+  <RouterView />
   <Toaster theme="system" position="top-center" expand />
 </template>
