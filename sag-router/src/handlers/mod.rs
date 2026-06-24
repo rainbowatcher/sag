@@ -8,12 +8,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sag_core::AppError;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, instrument};
 
-use crate::state::AppState;
 use sag_analytics::{StatsFilter, TrendFilter};
+use sag_dispatch::AppState;
 
 #[derive(Deserialize)]
 pub struct StatsQuery {
@@ -106,13 +107,7 @@ pub async fn analytics_stats(
         Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
         Err(e) => {
             error!(?e, "analytics query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": { "code": "INTERNAL_ERROR", "message": e.to_string() }
-                })),
-            )
-                .into_response()
+            AppError::Internal(e.to_string()).into_response()
         }
     }
 }
@@ -125,13 +120,7 @@ pub async fn analytics_trend(
     Query(params): Query<TrendQuery>,
 ) -> Response<Body> {
     let Some(from) = chrono::DateTime::from_timestamp_millis(params.from) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error": {"code": "INVALID_PARAM", "message": "invalid 'from' timestamp"}}),
-            ),
-        )
-            .into_response();
+        return AppError::BadRequest("invalid 'from' timestamp".into()).into_response();
     };
     let to = params.to.and_then(chrono::DateTime::from_timestamp_millis);
 
@@ -145,11 +134,7 @@ pub async fn analytics_trend(
         Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
         Err(e) => {
             error!(?e, "trend query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"code": "INTERNAL_ERROR", "message": e.to_string()}})),
-            )
-                .into_response()
+            AppError::Internal(e.to_string()).into_response()
         }
     }
 }
@@ -171,11 +156,7 @@ pub async fn analytics_distribution(
         Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
         Err(e) => {
             error!(?e, "distribution query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"code": "INTERNAL_ERROR", "message": e.to_string()}})),
-            )
-                .into_response()
+            AppError::Internal(e.to_string()).into_response()
         }
     }
 }
@@ -197,13 +178,7 @@ pub async fn analytics_cache_stats(
         Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
         Err(e) => {
             error!(?e, "cache stats query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": { "code": "INTERNAL_ERROR", "message": e.to_string() }
-                })),
-            )
-                .into_response()
+            AppError::Internal(e.to_string()).into_response()
         }
     }
 }
@@ -212,8 +187,8 @@ pub async fn analytics_cache_stats(
 mod tests {
     use super::*;
     use sag_config::{
-        BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
-        ProviderType, RouteConfig, ServerConfig, Strategy,
+        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
+        KeyStrategy, ProviderConfig, ProviderType, RouteConfig, ServerConfig, Strategy,
     };
     use sag_providers::{LlmProvider, OpenAiProvider};
     use std::collections::HashMap;
@@ -239,6 +214,7 @@ mod tests {
             logging: sag_config::LoggingConfig::default(),
             routes,
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
         let handle = ConfigHandle::from_config(config);
 
@@ -253,7 +229,7 @@ mod tests {
         }
         drop(cfg_read);
 
-        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
+        sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     fn provider_config(enabled: bool) -> ProviderConfig {

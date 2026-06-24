@@ -19,12 +19,14 @@ pub enum CircuitHint {
 }
 
 impl CircuitHint {
-    /// Default open-duration in seconds for each hint category.
-    pub fn default_duration_secs(self) -> u64 {
+    /// Look up the open-duration in seconds from the configured values.
+    /// `quota_secs` / `rate_secs` / `generic_secs` are typically read from
+    /// the `[circuit_breaker]` config section.
+    pub fn duration_secs(self, quota_secs: u64, rate_secs: u64, generic_secs: u64) -> u64 {
         match self {
-            CircuitHint::QuotaExhausted => 3600,
-            CircuitHint::RateLimited => 10,
-            CircuitHint::Generic => 60,
+            CircuitHint::QuotaExhausted => quota_secs,
+            CircuitHint::RateLimited => rate_secs,
+            CircuitHint::Generic => generic_secs,
         }
     }
 }
@@ -56,6 +58,17 @@ pub enum AppError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    /// Resource not found (admin API: provider, route, etc.).
+    /// Distinct from [`ModelNotFound`](Self::ModelNotFound) which carries
+    /// the `MODEL_NOT_FOUND` code for the dispatch path; admin lookups use
+    /// the generic `NOT_FOUND` code.
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// Conflicting state (duplicate provider/route name in admin API).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// All providers exhausted (retries / fallbacks failed).
     #[error("all providers exhausted for model={model}: {reason}")]
     AllProvidersExhausted { model: String, reason: String },
@@ -85,7 +98,13 @@ impl AppError {
                 status: 429, body, ..
             } => {
                 let lower = body.to_lowercase();
-                if lower.contains("quota")
+                // Check "rate limit" first: it is a narrow, high-precision
+                // match. Quota keywords like "exceeded" / "insufficient"
+                // are broader and would misclassify a plain rate-limit 429
+                // as QuotaExhausted (1 h) instead of RateLimited (10 s).
+                if lower.contains("rate limit") {
+                    CircuitHint::RateLimited
+                } else if lower.contains("quota")
                     || lower.contains("billing")
                     || lower.contains("insufficient")
                     || lower.contains("exceeded")
@@ -93,8 +112,6 @@ impl AppError {
                     || lower.contains("current quota")
                 {
                     CircuitHint::QuotaExhausted
-                } else if lower.contains("rate limit") {
-                    CircuitHint::RateLimited
                 } else {
                     // Unknown 429 — default to 60 s. A 10 s cooldown for
                     // a quota-exhaustion 429 we didn't recognise would
@@ -122,6 +139,8 @@ impl IntoResponse for AppError {
             }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg.clone()),
             AppError::ModelNotFound(msg) => (StatusCode::NOT_FOUND, "MODEL_NOT_FOUND", msg.clone()),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg.clone()),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg.clone()),
             AppError::AllProvidersExhausted { reason, .. } => (
                 StatusCode::BAD_GATEWAY,
                 "ALL_PROVIDERS_EXHAUSTED",
@@ -202,6 +221,23 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "MODEL_NOT_FOUND");
         assert_eq!(body["error"]["message"], "unknown-model");
+    }
+
+    #[tokio::test]
+    async fn not_found_returns_404() {
+        let (status, body) = extract(AppError::NotFound("provider 'foo' not found".into())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "NOT_FOUND");
+        assert_eq!(body["error"]["message"], "provider 'foo' not found");
+    }
+
+    #[tokio::test]
+    async fn conflict_returns_409() {
+        let (status, body) =
+            extract(AppError::Conflict("provider 'foo' already exists".into())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "CONFLICT");
+        assert_eq!(body["error"]["message"], "provider 'foo' already exists");
     }
 
     #[tokio::test]

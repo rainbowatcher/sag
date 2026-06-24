@@ -16,6 +16,9 @@ pub struct GatewayConfig {
     /// Global exponential-backoff settings for retry delays.
     #[serde(default)]
     pub backoff: BackoffConfig,
+    /// Circuit-breaker cooldown durations by error category.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
     /// Fill-first shuffle cache TTL in seconds. The shuffled target order
     /// is re-randomised after this many seconds since the last shuffle.
     /// Defaults to 7200 (2 hours). Set to 0 to disable automatic re-shuffle
@@ -438,6 +441,47 @@ pub fn default_backoff_max_ms() -> u64 {
 }
 pub fn default_backoff_jitter() -> bool {
     true
+}
+
+/// Circuit-breaker cooldown durations by error category.
+///
+/// Each field specifies how long (in seconds) a route target stays open
+/// after its retries are exhausted. The mapping from upstream error to
+/// category is performed by [`sag_core::CircuitHint`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Cooldown after quota/billing exhaustion (HTTP 429 with quota keywords).
+    /// Default: 3600 (1 hour).
+    #[serde(default = "default_quota_exhausted_secs")]
+    pub quota_exhausted_secs: u64,
+    /// Cooldown after a plain rate-limit 429 (non-quota).
+    /// Default: 10.
+    #[serde(default = "default_rate_limited_secs")]
+    pub rate_limited_secs: u64,
+    /// Cooldown for generic retryable failures (5xx / timeout / network).
+    /// Default: 60.
+    #[serde(default = "default_generic_secs")]
+    pub generic_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            quota_exhausted_secs: default_quota_exhausted_secs(),
+            rate_limited_secs: default_rate_limited_secs(),
+            generic_secs: default_generic_secs(),
+        }
+    }
+}
+
+fn default_quota_exhausted_secs() -> u64 {
+    3600
+}
+fn default_rate_limited_secs() -> u64 {
+    10
+}
+fn default_generic_secs() -> u64 {
+    60
 }
 fn default_shuffle_cache_ttl_secs() -> u64 {
     7200

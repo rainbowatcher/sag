@@ -24,6 +24,13 @@ retries = 2
 # re-shuffle on config reload). Default: 7200 (2 hours).
 # shuffle_cache_ttl_secs = 7200
 
+# Circuit breaker cooldown durations by error category (seconds).
+# Omitted keys use the defaults shown below.
+# [circuit_breaker]
+# quota_exhausted_secs = 3600
+# rate_limited_secs = 10
+# generic_secs = 60
+
 # Logging configuration (optional, defaults below).
 # The RUST_LOG environment variable, if set, takes precedence over level.
 [logging]

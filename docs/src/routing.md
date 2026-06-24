@@ -82,11 +82,10 @@ flowchart TD
     缓存顺序且未过期?}
     C -->|否| D[按 priority 降序排列<br/>同优先级随机打乱<br/>缓存结果 + 时间戳]
     C -->|是| E[使用缓存顺序]
-    D --> F[Pass 1: 尝试下一个<br/>非 penalized 目标]
+    D --> F[尝试下一个目标]
     E --> F
     F --> G{目标可用?}
     G -->|熔断器开| F
-    G -->|penalized| F
     G -->|provider disabled| F
     G -->|是| H[调用上游 API]
     H --> I{响应结果}
@@ -94,11 +93,7 @@ flowchart TD
     I -->|4xx 错误| K[停止重试]
     I -->|5xx/网络超时| L{该目标重试耗尽?}
     L -->|否| H
-    L -->|是| M{Pass 1 已跳过
-    penalized 目标?}
-    M -->|是| N[Pass 2: 清除 penalized<br/>重试所有目标]
-    M -->|否| F
-    N --> F
+    L -->|是| F
     F -->|全部失败| O[返回 502]
 ```
 
@@ -107,8 +102,7 @@ flowchart TD
 1. **首次随机** — 首次访问时同优先级 target 随机打乱，避免所有 SAG 实例启动后都打同一个 provider
 2. **顺序缓存 + TTL** — 打乱结果通过 `model_name` 缓存，后续请求严格按同一顺序尝试。缓存有效期由 `shuffle_cache_ttl_secs` 控制（默认 7200 秒 = 2 小时），到期后自动重新打乱
 3. **缓存失效** — 当路由配置变更（target 增删、provider/real_model/priority 修改）时自动重新打乱，忽略 TTL
-4. **熔断 penalized** — 如果当前活跃 target 重试耗尽，熔断器打开；即使冷却结束，该 target 也不会自动回到首选位置（进入 penalized 集合），只有当日**前活跃的** target 也全部失败后，penalized 集合才会被清除，允许之前被熔断的 target 重新参与竞争。这保证了 FillFirst 的"粘性"——不会在熔断冷却结束后跳回原先的 target
-5. **两遍调度** — pass 1 跳过 penalized target 尝试所有非 penalized 目标；如果全部失败，pass 2 清除 penalized 集合并重试所有目标（包括之前被 penalized 的）
+4. **熔断器** — 如果目标重试耗尽，熔断器按错误类型打开对应冷却时长。冷却期内该目标被跳过；冷却结束后自动重新加入，按优先级正常参与竞争
 
 **示例**：
 
@@ -135,7 +129,7 @@ priority = 0
 
 - 请求 1-1000：所有请求都发给 anthropic，只要它健康
 - 如果 anthropic 熔断：自动跳到 openai
-- 60s 后熔断器过期：重新尝试 anthropic
+- 冷却结束后：重新尝试 anthropic（FillFirst 自然语义——优先用首选 target）
 
 如果 TOML 中没有配 strategy，默认为 `fill_first`。
 
@@ -168,7 +162,7 @@ flowchart TD
 2. **计数器独立** — 每个 `model_name` 有自己的计数器，互不干扰
 3. **按优先级分组** — 和 FillFirst 一样按 priority 降序排列，但同一优先级内按轮询顺序
 4. **不跨界** — 高优先级失败尝试完所有同级 target 后，才会进入下一个优先级（与 FillFirst 相同）
-5. **熔断器生效** — 熔断器打开时自动跳过该 target，冷却结束后重新加入轮询。RoundRobin 不使用 penalized 机制——熔断冷却结束后 target 自然回归轮转
+5. **熔断器生效** — 熔断器打开时自动跳过该 target，冷却结束后重新加入轮转
 
 **示例**：
 
@@ -199,34 +193,28 @@ priority = 10
 | 适用场景 | 主备模式、成本优化 | 负载均衡 |
 | 缓存状态 | CachedOrder（TTL + 跨请求记忆） | 无（只记计数器） |
 | 配置热重载 | 重新随机 | 计数器继续递增 |
-| 熔断冷却后行为 | penalized（不自动回首选） | 自然回归轮转 |
+| 熔断冷却后行为 | 自然回归首选（按优先级） | 自然回归轮转 |
 | 默认 | 是 | 否 |
 
 ## 熔断器策略
 
-SAG 的熔断器（Circuit Breaker）根据**错误类型**自动选择冷却时长：
+SAG 的熔断器根据**错误类型**自动选择冷却时长，三个 duration 均可通过 `[circuit_breaker]` 配置段覆盖：
 
-| 错误类型 | 冷却时长 | 触发条件 |
-|---------|---------|---------|
-| 额度耗尽 | 1 小时（3600s） | 上游返回 `429` + `insufficient_quota` 或类似额度相关错误 |
+| 错误类型 | 默认冷却 | 触发条件 |
+|---------|---------|----|
+| 额度耗尽 | 1 小时 | 上游返回 `429` + quota/billing 相关错误 body |
 | 请求过频 | 10 秒 | 上游返回 `429`（速率限制），非额度相关 |
 | 通用故障 | 60 秒 | 5xx、网络超时、连接错误等 |
 
-### FillFirst 的 penalized 机制
+冷却结束后，目标自然重新加入路由——FillFirst 按优先级尝试首选 target，RoundRobin 回到轮转顺序。
 
-FillFirst 模式下，熔断器有一个额外的 `penalized` 集合：
-
-1. **熔断打开时** — target 同时加入 `open_until`（按错误类型定冷却时长）和 `penalized`（永久，直到两遍调度清除）
-2. **熔断冷却结束** — target 从 `open_until` 移除，但**保留在 `penalized`** 中
-3. **两遍调度**：
-   - **Pass 1** — 跳过所有 penalized target，只尝试"干净"的目标。如果成功，penalized target 不被触及
-   - **Pass 2** — 仅当 pass 1 所有非 penalized target 都失败时触发。清除 `penalized` 集合，重试所有目标（包括之前被 penalized 的）
-
-这解决了"熔断冷却结束→跳回原 target→又失败→又熔断"的乒乓效应。
-
-### RoundRobin 不使用 penalized
-
-RoundRobin 的语义是"每个请求换一个"，熔断冷却结束后 target 自然回到轮转顺序中。这符合轮询的预期行为。
+```toml
+# 熔断器冷却时长（秒），省略则使用默认值。
+[circuit_breaker]
+quota_exhausted_secs = 3600   # 默认 1 小时
+rate_limited_secs = 10        # 默认 10 秒
+generic_secs = 60             # 默认 60 秒
+```
 
 ## shuffle_cache_ttl_secs
 

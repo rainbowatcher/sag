@@ -1,14 +1,12 @@
 use axum::{
-    Json,
     extract::{Request, State},
-    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use sag_core::AppError;
 use tracing::warn;
 
-use crate::state::AppState;
+use sag_dispatch::AppState;
 
 /// Axum middleware: validates the `Authorization: Bearer *** header
 /// against the configured gateway API keys.
@@ -43,10 +41,8 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
                         Some(key) => key,
                         None => {
                             warn!(trace_id, "request missing Authorization header");
-                            return (StatusCode::UNAUTHORIZED, Json(json!({
-                                "error": { "code": "UNAUTHORIZED", "message": "missing Authorization header" }
-                            })))
-                            .into_response();
+                            return AppError::Unauthorized("missing Authorization header".into())
+                                .into_response();
                         }
                     };
                     auth_config.api_keys.iter().any(|k| k == &provided_key)
@@ -61,13 +57,7 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
 
     if !key_valid {
         warn!(trace_id, "invalid gateway API key");
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": { "code": "UNAUTHORIZED", "message": "invalid API key" }
-            })),
-        )
-            .into_response();
+        return AppError::Unauthorized("invalid API key".into()).into_response();
     }
 
     next.run(request).await
@@ -100,6 +90,7 @@ mod tests {
             gateway_auth: auth_keys.map(|keys| sag_config::GatewayAuthConfig { api_keys: keys }),
             retries: 2,
             backoff: sag_config::BackoffConfig::default(),
+            circuit_breaker: sag_config::CircuitBreakerConfig::default(),
             providers: HashMap::new(),
             logging: sag_config::LoggingConfig::default(),
             routes: vec![],
@@ -107,7 +98,7 @@ mod tests {
         };
         let handle = ConfigHandle::from_config(config);
         let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
-        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
+        sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     /// Build a small test app: a single `GET /test` route protected by `gateway_auth`.

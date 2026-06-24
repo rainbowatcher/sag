@@ -35,6 +35,17 @@ max_ms = 5000
 # Default: true.
 jitter = true
 
+# Circuit breaker cooldown durations by error category (seconds).
+# Omitted keys use the defaults shown below.
+[circuit_breaker]
+# Cooldown after quota/billing exhaustion (HTTP 429 with quota keywords).
+# Default: 3600 (1 hour).
+# quota_exhausted_secs = 3600
+# Cooldown after a plain rate-limit 429 (non-quota). Default: 10.
+# rate_limited_secs = 10
+# Cooldown for generic retryable failures (5xx / timeout / network). Default: 60.
+# generic_secs = 60
+
 [server]
 host = "0.0.0.0"
 port = 37210

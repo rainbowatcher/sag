@@ -12,6 +12,15 @@ retries = 2
 # 设 0 表示永不过期，只在配置热重载时重新打乱。
 shuffle_cache_ttl_secs = 7200
 
+# 熔断器冷却时长（秒），按错误类型分别配置。省略则使用默认值。
+[circuit_breaker]
+# 额度耗尽（上游 429 + quota/billing 关键词）。默认：3600（1 小时）。
+quota_exhausted_secs = 3600
+# 速率限制（上游 429，非额度相关）。默认：10。
+rate_limited_secs = 10
+# 通用故障（5xx / 网络超时 / 连接错误）。默认：60。
+generic_secs = 60
+
 # 指数退避设置：每次重试间隔 `min(base_ms * 2^attempt, max_ms)`，
 # 可选 full jitter（实际等待 = random(0, 计算结果)）。
 # 调整这些值以在响应延迟和上游负载之间做权衡。
@@ -93,6 +102,20 @@ targets = [
 退避公式：`min(base_ms * 2^attempt, max_ms)`，其中 `attempt` 从 `0` 计数。例如默认配置下：第 1 次重试前等待 `0~100ms`、第 2 次 `0~200ms`、第 3 次 `0~400ms`、...，最大 `5s`。
 
 `jitter = true`（推荐）可以避免大量并发客户端在重试时同时冲击上游（thundering herd）；`jitter = false` 则使用确定性延迟，便于测试与排障。
+
+## 熔断器
+
+`[circuit_breaker]` 段控制目标重试耗尽后的冷却时长，按上游错误类型分别配置：
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `quota_exhausted_secs` | `3600` | 额度耗尽（上游 429 + quota/billing 关键词）后的冷却时长（秒），即 1 小时 |
+| `rate_limited_secs` | `10` | 速率限制（上游 429，非额度相关）后的冷却时长（秒） |
+| `generic_secs` | `60` | 通用故障（5xx / 网络超时 / 连接错误）后的冷却时长（秒） |
+
+冷却期内该 target 被跳过，调度器自动 fallthrough 到下一个 target。冷却结束后 target 自然回归路由——FillFirst 按优先级尝试首选，RoundRobin 回到轮转顺序。
+
+错误分类逻辑由 `sag_core::CircuitHint` 实现：对上游 429 body 做关键词匹配，先精确匹配 `"rate limit"`（→ `RateLimited` / 10s），再匹配 quota/billing 相关关键词（→ `QuotaExhausted` / 1h），未知 429 和 5xx/网络错误回退到 `Generic`（→ 60s）。详情见[路由 → 熔断器策略](./routing.md#熔断器策略)。
 
 ## 认证
 

@@ -659,6 +659,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    use crate::config::CircuitBreakerConfig;
     use crate::config::*;
 
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -896,6 +897,7 @@ base_url = "https://api.anthropic.com"
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1059,6 +1061,7 @@ key_strategy = "round_robin"
             logging: LoggingConfig::default(),
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         save_config_to_file(&config, &path).unwrap();
@@ -1213,6 +1216,7 @@ targets = [
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1280,6 +1284,7 @@ targets = [
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1337,6 +1342,7 @@ targets = [
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1533,6 +1539,7 @@ targets = [
             logging: LoggingConfig::default(),
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 
