@@ -56,6 +56,7 @@ pub(crate) fn one_provider_config(
             timeout_secs: 120,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
             enabled_models: vec![],
             enabled: true,
         },

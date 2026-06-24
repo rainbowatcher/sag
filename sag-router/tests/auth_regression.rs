@@ -40,6 +40,7 @@ async fn build_protected_state() -> AppState {
             timeout_secs: 120,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
             enabled_models: vec![],
             enabled: true,
         },

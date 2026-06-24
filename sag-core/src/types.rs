@@ -26,7 +26,7 @@ impl ChatMessage {
 
 /// Standard chat completion request accepted by the gateway.
 /// Mirrors the OpenAI Chat Completion API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     /// ID of the model to use.
     pub model: String,

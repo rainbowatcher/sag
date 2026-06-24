@@ -111,6 +111,11 @@ impl LlmProvider for OpenAiProvider {
             .apply_role_mappings(&mut upstream_request.messages);
         upstream_request.model = real_model.to_string();
         upstream_request.stream = Some(true);
+        // Force include_usage: SAG needs usage for CallLog stats; a client's
+        // stream_options (especially include_usage: false) must not override
+        // this internal requirement. OpenAI-compatible backends interpret
+        // stream_options.include_usage as documented.
+        upstream_request.stream_options = Some(serde_json::json!({"include_usage": true}));
 
         if !request.extra.is_empty() {
             let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
