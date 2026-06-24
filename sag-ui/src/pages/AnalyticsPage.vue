@@ -2,7 +2,6 @@
 import { AlertCircle, Search, RefreshCw, Loader2, TrendingUp, Zap, Clock } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -15,7 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
-import { formatDuration } from "@/lib/utils"
+import { formatDuration, successRateColor } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 
 const store = useAnalyticsStore()
@@ -57,7 +56,7 @@ const statsTotals = computed(() => {
     errors += r.error_count
     weightedMs += r.avg_duration_ms * r.call_count
   }
-  const successRate = calls > 0 ? ((calls - errors) / calls) * 100 : 0
+  const successRate = calls > 0 ? ((calls - errors) / calls) * 100 : null
   return {
     calls,
     tokens,
@@ -65,17 +64,6 @@ const statsTotals = computed(() => {
     successRate,
   }
 })
-
-function successRateClass(rate: number) {
-  if (rate >= 99) return "text-green-500"
-  if (rate >= 95) return "text-amber-500"
-  return "text-red-500"
-}
-
-function rowSuccessRate(row: { call_count: number; error_count: number }) {
-  if (row.call_count === 0) return null
-  return ((row.call_count - row.error_count) / row.call_count) * 100
-}
 </script>
 
 <template>
@@ -132,23 +120,31 @@ function rowSuccessRate(row: { call_count: number; error_count: number }) {
           <Card>
             <CardContent class="flex items-center gap-3 p-4">
               <div
+                v-if="statsTotals.successRate !== null"
                 class="flex h-5 w-5 items-center justify-center rounded-full border-2 text-[10px] font-bold"
-                :class="
-                  statsTotals.successRate >= 95
-                    ? 'border-green-500 text-green-500'
-                    : 'border-red-500 text-red-500'
-                "
+                :style="{
+                  borderColor: successRateColor(statsTotals.successRate),
+                  color: successRateColor(statsTotals.successRate),
+                }"
               >
                 {{ statsTotals.successRate >= 95 ? "✓" : "!" }}
+              </div>
+              <div
+                v-else
+                class="border-muted-foreground/30 text-muted-foreground flex h-5 w-5 items-center justify-center rounded-full border-2 text-[10px] font-bold"
+              >
+                —
               </div>
               <div>
                 <p class="text-muted-foreground text-xs">Success Rate</p>
                 <p
+                  v-if="statsTotals.successRate !== null"
                   class="text-lg font-bold tabular-nums"
-                  :class="successRateClass(statsTotals.successRate)"
+                  :style="{ color: successRateColor(statsTotals.successRate) }"
                 >
                   {{ statsTotals.successRate.toFixed(1) }}%
                 </p>
+                <p v-else class="text-muted-foreground text-lg">—</p>
               </div>
             </CardContent>
           </Card>
@@ -231,9 +227,19 @@ function rowSuccessRate(row: { call_count: number; error_count: number }) {
                   {{ formatDuration(row.avg_duration_ms) }}
                 </TableCell>
                 <TableCell class="text-right font-mono text-xs tabular-nums">
-                  <span v-if="row.call_count > 0" :class="successRateClass(rowSuccessRate(row)!)">
-                    {{ rowSuccessRate(row)!.toFixed(1) }}%
-                  </span>
+                  <template v-if="row.call_count > 0">
+                    <span
+                      :style="{
+                        color: successRateColor(
+                          ((row.call_count - row.error_count) / row.call_count) * 100,
+                        ),
+                      }"
+                    >
+                      {{
+                        (((row.call_count - row.error_count) / row.call_count) * 100).toFixed(1)
+                      }}%
+                    </span>
+                  </template>
                   <span v-else class="text-muted-foreground">—</span>
                 </TableCell>
               </TableRow>

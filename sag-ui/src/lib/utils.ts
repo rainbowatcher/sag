@@ -20,3 +20,16 @@ export function formatDuration(ms: number): string {
   const mins = minutes % 60
   return `${hours}h ${mins}m ${seconds}s`
 }
+
+/**
+ * Map a success rate percentage (0–100) to a colour via OKLCH hue sweep.
+ *
+ * Lightness and chroma are held constant so the ramp is perceptually
+ * uniform: green (100 %) → yellow → orange → red (0 %).
+ */
+export function successRateColor(rate: number): string {
+  const clamped = Math.max(0, Math.min(100, rate))
+  const t = 1 - clamped / 100
+  const h = 142 - t * (142 - 25)
+  return `oklch(0.52 0.2 ${h.toFixed(1)})`
+}
