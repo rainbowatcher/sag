@@ -147,9 +147,6 @@ function cacheHitRate(row: CallLog): number | null {
       <AlertCircle class="h-4 w-4" />
       <AlertTitle>Failed to load call logs</AlertTitle>
       <AlertDescription class="break-words">{{ store.logsError }}</AlertDescription>
-      <Button variant="destructive" size="sm" class="mt-2" @click="store.fetchLogs()">
-        Retry
-      </Button>
     </Alert>
 
     <div class="rounded-lg border">
