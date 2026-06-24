@@ -115,7 +115,7 @@ targets = [
 
 冷却期内该 target 被跳过，调度器自动 fallthrough 到下一个 target。冷却结束后 target 自然回归路由——FillFirst 按优先级尝试首选，RoundRobin 回到轮转顺序。
 
-错误分类逻辑由 `sag_core::CircuitHint` 实现：对上游 429 body 做关键词匹配，先精确匹配 `"rate limit"`（→ `RateLimited` / 10s），再匹配 quota/billing 相关关键词（→ `QuotaExhausted` / 1h），未知 429 和 5xx/网络错误回退到 `Generic`（→ 60s）。详情见[路由 → 熔断器策略](./routing.md#熔断器策略)。
+错误分类逻辑由 `sag_core::CircuitHint` 实现：对上游 429 body 做关键词匹配，先精确匹配 `"rate limit"`（→ `RateLimited` / 10s），再匹配 quota/billing 相关关键词（→ `QuotaExhausted` / 1h），未知 429 和 5xx/网络错误回退到 `Generic`（→ 60s）。详情见[路由 → 熔断器策略](/routing#熔断器策略)。
 
 ## 认证
 

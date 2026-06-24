@@ -4,7 +4,7 @@
 
 ## 认证
 
-管理端点使用 Bearer token 认证，与[模型 API](./models-api.md#认证) 共享相同的 `[gateway_auth]` 配置：
+管理端点使用 Bearer token 认证，与[模型 API](/models-api#认证) 共享相同的 `[gateway_auth]` 配置：
 
 ```
 Authorization: Bearer <api_key>

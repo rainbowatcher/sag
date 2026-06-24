@@ -103,15 +103,11 @@ clean-rust:
 
 # 构建文档网站
 docs:
-    mdbook build docs
-
-# 安装文档依赖
-docs-install:
-    cd scripts/mdbook-beautiful-mermaid && pnpm install
+    pnpm -C docs run build
 
 # 启动文档开发服务器 (热重载)
 docs-serve:
-    mdbook serve docs -p 38718
+    pnpm -C docs run dev
 
 # ── 审计 ────────────────────────────────────────────────────────────
 

@@ -47,6 +47,10 @@ logs/
 # python
 __pycache__/
 
+# VitePress 缓存与构建产物
+docs/.vitepress/cache
+docs/.vitepress/dist
+
 # misc
 .plan/
 gateway.toml

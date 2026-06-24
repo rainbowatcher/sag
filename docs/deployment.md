@@ -32,7 +32,7 @@ just build-test
 
 ## 热重载边界
 
-`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / retries / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](./configuration.md#热重载)。
+`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / retries / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](/configuration#热重载)。
 
 ## Docker
 
@@ -66,7 +66,7 @@ CMD ["sag", "--config", "/etc/sag/gateway.toml"]
 
 ## 测试环境
 
-`scripts/test-env.py` 提供与开发环境**物理隔离**的 release 路径 —— 真实 release 二进制、内嵌 UI、独立端口、独立 SQLite。`start` / `stop` / `restart` / `status` 四子命令对应 systemd / supervisor 风格的 ops 下命令。详见仓库根 [`AGENTS.md`](../../AGENTS.md) 的「测试环境」节。
+`scripts/test-env.py` 提供与开发环境**物理隔离**的 release 路径 —— 真实 release 二进制、内嵌 UI、独立端口、独立 SQLite。`start` / `stop` / `restart` / `status` 四子命令对应 systemd / supervisor 风格的 ops 下命令。详见仓库根 [`AGENTS.md`](https://github.com/rainbowatcher/sag/blob/main/AGENTS.md) 的「测试环境」节。
 
 ```bash
 just build-test        # 一次性：pnpm build UI → cargo --features embed-ui

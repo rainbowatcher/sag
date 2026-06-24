@@ -80,7 +80,7 @@ API Key 在配置文件 `gateway.toml` 的 `[gateway_auth]` 段中定义。认�
 3. **尝试供应商** — 依次调用，4xx 错误立即停止，5xx/超时自动故障转移到下一个目标
 4. **全部失败** — 返回 `502 All Providers Exhausted`
 
-详细的路由配置说明见[路由](./routing.md)。
+详细的路由配置说明见[路由](/routing)。
 
 ### 错误响应
 
@@ -185,4 +185,4 @@ API Key 在配置文件 `gateway.toml` 的 `[gateway_auth]` 段中定义。认�
 }
 ```
 
-详细说明见[分析](./analytics.md)。
+详细说明见[分析](/analytics)。
