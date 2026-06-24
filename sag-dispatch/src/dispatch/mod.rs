@@ -28,7 +28,7 @@ use tracing::{error, info};
 
 use crate::circuit_breaker::RouteTargetKey;
 use crate::dispatch::retry::RetryOutcome;
-use crate::state::AppState;
+use crate::state::{AppState, DispatchRuntime};
 
 pub mod chat;
 pub mod image;
@@ -51,6 +51,7 @@ pub type ResolvedRoute = (Vec<ResolvedTarget>, String, Strategy);
 /// function signatures stay readable as the dispatch surface grows.
 pub struct DispatchCtx<'a> {
     pub state: &'a AppState,
+    pub runtime: &'a DispatchRuntime,
     pub request: &'a ChatCompletionRequest,
     pub targets: &'a [ResolvedTarget],
     pub api_endpoint: &'a str,
@@ -58,46 +59,23 @@ pub struct DispatchCtx<'a> {
     pub trace_id: uuid::Uuid,
     pub start: Instant,
     pub errors: &'a mut Vec<String>,
-    /// The route's target-selection strategy. Used by the dispatch loop
-    /// to decide whether to skip penalized targets (FillFirst) or
-    /// include them in rotation (RoundRobin).
-    pub strategy: Strategy,
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // Circuit breaker helpers — shared across the dispatch submodules.
 // ═══════════════════════════════════════════════════════════════════
 
-/// Result of checking a target against the circuit breaker.
-///
-/// Replaces the previous `Option<RouteTargetKey>` return — callers now
-/// match on the reason a target was skipped instead of string-matching
-/// on error messages to detect penalized targets.
-#[derive(Debug)]
-pub(in crate::dispatch) enum TargetAvailability {
-    /// Target is healthy and may be tried.
-    Allowed(RouteTargetKey),
-    /// Circuit is still open (inside the cooldown window).
-    CircuitOpen,
-    /// FillFirst penalized — circuit closed but target not yet
-    /// promoted back to primary.
-    Penalized,
-}
-
-/// Check whether a target is available (circuit closed, not penalized).
-/// Returns the decision enum instead of a bare Option so callers can
-/// distinguish the skip reason without string-matching on error messages.
-pub(in crate::dispatch) async fn circuit_check_target(
-    state: &AppState,
+/// Check whether a target's circuit is open. Returns `Some(key)` if the
+/// target is healthy, `None` if the circuit is still open (in cooldown).
+pub(in crate::dispatch) async fn circuit_allows_target(
+    runtime: &DispatchRuntime,
     model: &str,
     provider_name: &str,
     real_model: &str,
-    strategy: Strategy,
-) -> TargetAvailability {
+) -> Option<RouteTargetKey> {
     let circuit_key = RouteTargetKey::new(model, provider_name, real_model);
-    let breaker = state.route_circuit_breaker.read().await;
+    let breaker = runtime.route_circuit_breaker.read().await;
 
-    // Still-open circuit → unconditionally skip.
     if let Some(remaining) = breaker.open_remaining(&circuit_key) {
         info!(
             provider = %provider_name,
@@ -105,92 +83,21 @@ pub(in crate::dispatch) async fn circuit_check_target(
             remaining_ms = remaining.as_millis() as u64,
             "skipping open route target circuit"
         );
-        return TargetAvailability::CircuitOpen;
+        return None;
     }
 
-    // FillFirst: skip penalized targets in the first pass.
-    if strategy == Strategy::FillFirst && breaker.is_penalized(model, &circuit_key) {
-        info!(
-            provider = %provider_name,
-            real_model = %real_model,
-            "skipping penalized route target (fill-first)"
-        );
-        return TargetAvailability::Penalized;
-    }
-
-    TargetAvailability::Allowed(circuit_key)
-}
-
-/// Two-pass dispatch state machine shared by [`dispatch_chat`] and
-/// [`dispatch_image`]. Handles the FillFirst penalized-target lifecycle
-/// so dispatch loops don't duplicate pass-management logic.
-pub(in crate::dispatch) struct TargetPass {
-    strategy: Strategy,
-    pass: u32,
-    penalized_skipped: bool,
-    max_pass: u32,
-}
-
-impl TargetPass {
-    pub fn new(strategy: Strategy) -> Self {
-        let max_pass = if strategy == Strategy::FillFirst {
-            2
-        } else {
-            1
-        };
-        Self {
-            strategy,
-            pass: 0,
-            penalized_skipped: false,
-            max_pass,
-        }
-    }
-
-    /// Track that a target was skipped on the current pass.
-    pub fn record_skip(&mut self, availability: &TargetAvailability) {
-        if self.pass == 0 && matches!(availability, TargetAvailability::Penalized) {
-            self.penalized_skipped = true;
-        }
-    }
-
-    /// Advance to the next pass, clearing penalized targets if
-    /// entering pass 2. Returns `true` if there are more targets
-    /// to try, `false` if dispatch is done.
-    pub async fn advance(
-        &mut self,
-        state: &AppState,
-        model: &str,
-        errors: &mut Vec<String>,
-    ) -> bool {
-        if self.pass + 1 >= self.max_pass {
-            return false;
-        }
-        // FillFirst: only enter pass 2 if pass 1 actually skipped
-        // penalized targets (otherwise every target was already tried).
-        if self.strategy == Strategy::FillFirst && self.pass == 0 && !self.penalized_skipped {
-            return false;
-        }
-        self.pass += 1;
-        if self.pass == 1 {
-            state
-                .route_circuit_breaker
-                .write()
-                .await
-                .clear_penalized(model);
-            errors.push("clearing penalized targets for retry".into());
-        }
-        true
-    }
+    Some(circuit_key)
 }
 
 pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
-    state: &AppState,
+    runtime: &DispatchRuntime,
     circuit_key: RouteTargetKey,
     outcome: RetryOutcome<T>,
+    circuit_breaker_cfg: &sag_config::CircuitBreakerConfig,
 ) -> Option<T> {
     match outcome {
         RetryOutcome::Success(value) => {
-            state
+            runtime
                 .route_circuit_breaker
                 .write()
                 .await
@@ -199,13 +106,17 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
         }
         RetryOutcome::Exhausted(last_err) => {
             let hint = last_err.circuit_hint();
-            let duration_secs = hint.default_duration_secs();
+            let duration_secs = hint.duration_secs(
+                circuit_breaker_cfg.quota_exhausted_secs,
+                circuit_breaker_cfg.rate_limited_secs,
+                circuit_breaker_cfg.generic_secs,
+            );
             info!(
                 hint = ?hint,
                 duration_secs,
                 "opening circuit with error-based duration"
             );
-            state
+            runtime
                 .route_circuit_breaker
                 .write()
                 .await

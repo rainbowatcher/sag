@@ -2,7 +2,7 @@
 name = "sag-router"
 version = "0.1.0"
 edition = "2024"
-description = "Axum routing and middleware for SAG"
+description = "Axum HTTP routing, middleware, and thin request handlers for SAG"
 
 [dependencies]
 axum = { workspace = true }
@@ -18,9 +18,8 @@ sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
-reqwest = { workspace = true }
-fastrand = "2"
-futures-util = "0.3"
+sag-dispatch = { path = "../sag-dispatch" }
+sag-admin = { path = "../sag-admin" }
 
 [dev-dependencies]
 async-trait = "0.1"

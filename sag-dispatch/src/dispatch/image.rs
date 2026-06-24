@@ -11,8 +11,8 @@ use sag_core::{ChatCompletionRequest, ImageGenerationRequest, ImageGenerationRes
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
-    DispatchCtx, TargetAvailability, TargetPass, apply_circuit_outcome, circuit_check_target,
-    fallback_exhausted_response, log_per_target_failure, success_log,
+    DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
+    log_per_target_failure, success_log,
 };
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
@@ -25,6 +25,7 @@ use crate::dispatch::{
 pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     let DispatchCtx {
         state,
+        runtime,
         request,
         targets,
         api_endpoint: _,
@@ -32,99 +33,82 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
-        strategy,
     } = ctx;
 
     let img_request = build_image_request(request);
 
     // Snapshot the backoff config once for the whole dispatch — see
     // `dispatch_chat` for the rationale.
-    let backoff = state.config.read().await.backoff.clone();
+    let config = state.config.read().await.clone();
+    let backoff = config.backoff.clone();
+    let circuit_breaker_cfg = config.circuit_breaker.clone();
 
-    // FillFirst two-pass dispatch (same as dispatch_chat):
-    // pass 1 skips penalized, pass 2 clears penalized and retries.
-    let mut pass = TargetPass::new(strategy);
+    for (provider_name, real_model, target_extra, retries) in targets {
+        let Some(circuit_key) =
+            circuit_allows_target(runtime, &request.model, provider_name, real_model).await
+        else {
+            errors.push(format!("{provider_name}/{real_model}: circuit open"));
+            continue;
+        };
 
-    loop {
-        for (provider_name, real_model, target_extra, retries) in targets {
-            let avail =
-                circuit_check_target(state, &request.model, provider_name, real_model, strategy)
-                    .await;
-            pass.record_skip(&avail);
-            let circuit_key = match avail {
-                TargetAvailability::Allowed(k) => k,
-                TargetAvailability::CircuitOpen => {
-                    errors.push(format!("{provider_name}/{real_model}: circuit open"));
-                    continue;
+        let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+            continue;
+        };
+
+        let real_model = real_model.clone();
+        let target_extra = target_extra.clone();
+        let img_request = img_request.clone();
+
+        let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
+            provider_name,
+            *retries,
+            &backoff,
+            errors,
+            |_attempt| {
+                let provider = provider.clone();
+                let real_model = real_model.clone();
+                let target_extra = target_extra.clone();
+                let img_request = img_request.clone();
+                async move {
+                    provider
+                        .chat_image(&img_request, &real_model, &target_extra)
+                        .await
                 }
-                TargetAvailability::Penalized => {
-                    errors.push(format!(
-                        "{provider_name}/{real_model}: penalized (will retry when current target exhausts)"
-                    ));
-                    continue;
-                }
-            };
+            },
+        )
+        .await;
 
-            let Some(provider) = resolve_provider(state, provider_name, errors).await else {
-                continue;
-            };
-
-            let real_model = real_model.clone();
-            let target_extra = target_extra.clone();
-            let img_request = img_request.clone();
-
-            let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
-                provider_name,
-                *retries,
-                &backoff,
-                errors,
-                |_attempt| {
-                    let provider = provider.clone();
-                    let real_model = real_model.clone();
-                    let target_extra = target_extra.clone();
-                    let img_request = img_request.clone();
-                    async move {
-                        provider
-                            .chat_image(&img_request, &real_model, &target_extra)
-                            .await
-                    }
-                },
-            )
-            .await;
-
-            let Some(resp) = apply_circuit_outcome(state, circuit_key, outcome).await else {
-                // Per-provider failure: log a failure entry with the actual provider/real_model
-                // so the analytics table knows which provider was attempted.
-                log_per_target_failure(
-                    state,
-                    trace_id,
-                    provider_name,
-                    &request.model,
-                    &real_model,
-                    false,
-                    start,
-                    errors,
-                );
-                continue;
-            };
-
-            state.collector.log(success_log(
+        let Some(resp) =
+            apply_circuit_outcome(runtime, circuit_key, outcome, &circuit_breaker_cfg).await
+        else {
+            // Per-provider failure: log a failure entry with the actual provider/real_model
+            // so the analytics table knows which provider was attempted.
+            log_per_target_failure(
+                state,
                 trace_id,
                 provider_name,
                 &request.model,
                 &real_model,
                 false,
                 start,
-                None,
-                None, // reasoning_effort — not applicable for image generation
-                None, // upstream_duration_ms — image path timing is out of scope for stage 2
-                None, // ttft_ms — image generation is single-shot, conceptually non-streaming
-            ));
-            return (StatusCode::OK, Json(resp)).into_response();
-        }
-        if !pass.advance(state, &request.model, errors).await {
-            break;
-        }
+                errors,
+            );
+            continue;
+        };
+
+        state.collector.log(success_log(
+            trace_id,
+            provider_name,
+            &request.model,
+            &real_model,
+            false,
+            start,
+            None,
+            None, // reasoning_effort — not applicable for image generation
+            None, // upstream_duration_ms — image path timing is out of scope for stage 2
+            None, // ttft_ms — image generation is single-shot, conceptually non-streaming
+        ));
+        return (StatusCode::OK, Json(resp)).into_response();
     }
 
     fallback_exhausted_response(state, &request.model, false, trace_id, start, errors)
@@ -161,12 +145,13 @@ pub fn build_image_request(request: &ChatCompletionRequest) -> ImageGenerationRe
 mod tests {
     use super::*;
     use crate::dispatch::ResolvedTarget;
-    use crate::state::AppState;
+    use crate::state::{AppState, DispatchRuntime};
     use async_trait::async_trait;
     use futures_util::Stream;
 
     use sag_config::{
-        BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig, Strategy,
+        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
+        ServerConfig,
     };
     use sag_core::{AppError, ChatCompletionResponse, ChatMessage, ImageData, StreamChunk};
     use sag_providers::LlmProvider;
@@ -289,6 +274,7 @@ mod tests {
             logging: sag_config::LoggingConfig::default(),
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
 
         crate::testing::test_app_state(
@@ -304,12 +290,14 @@ mod tests {
 
     fn make_ctx<'a>(
         state: &'a AppState,
+        runtime: &'a DispatchRuntime,
         request: &'a ChatCompletionRequest,
         targets: &'a [ResolvedTarget],
         errors: &'a mut Vec<String>,
     ) -> DispatchCtx<'a> {
         DispatchCtx {
             state,
+            runtime,
             request,
             targets,
             api_endpoint: "/images/generations",
@@ -317,7 +305,6 @@ mod tests {
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
             errors,
-            strategy: Strategy::FillFirst,
         }
     }
 
@@ -382,6 +369,7 @@ mod tests {
         m2.push_image(ImageBehavior::Ok(build_image_response()));
         m2.push_image(ImageBehavior::Ok(build_image_response()));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("dall-e-3");
         let targets = vec![
             target("first", "dall-e-3", 0),
@@ -389,13 +377,14 @@ mod tests {
         ];
 
         let mut first_errors = Vec::new();
-        let first = dispatch_image(make_ctx(&state, &req, &targets, &mut first_errors)).await;
+        let first = dispatch_image(make_ctx(&state, &rt, &req, &targets, &mut first_errors)).await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(m1.image_calls(), 1);
         assert_eq!(m2.image_calls(), 1);
 
         let mut second_errors = Vec::new();
-        let second = dispatch_image(make_ctx(&state, &req, &targets, &mut second_errors)).await;
+        let second =
+            dispatch_image(make_ctx(&state, &rt, &req, &targets, &mut second_errors)).await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(m1.image_calls(), 1, "open circuit should skip first target");
         assert_eq!(m2.image_calls(), 2);

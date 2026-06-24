@@ -1,0 +1,28 @@
+[package]
+name = "sag-dispatch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-provider failover dispatch engine for SAG"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+fastrand = "2"
+futures-util = "0.3"
+sag-core = { path = "../sag-core" }
+sag-config = { path = "../sag-config" }
+sag-providers = { path = "../sag-providers" }
+sag-analytics = { path = "../sag-analytics" }
+
+[dev-dependencies]
+async-trait = "0.1"
+http-body-util = "0.1"

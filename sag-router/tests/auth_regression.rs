@@ -18,8 +18,8 @@ use axum::{
     middleware,
 };
 use sag_config::{
-    BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
-    ProviderType, RouteConfig, RouteTarget, ServerConfig, Strategy,
+    BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
+    KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, ServerConfig, Strategy,
 };
 use sag_router::AppState;
 use sag_router::admin::build_admin_routes;
@@ -58,6 +58,7 @@ async fn build_protected_state() -> AppState {
         providers,
         logging: sag_config::LoggingConfig::default(),
         shuffle_cache_ttl_secs: 7200,
+        circuit_breaker: CircuitBreakerConfig::default(),
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),

@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::dispatch::{ResolvedRoute, ResolvedTarget, failure_response};
 use crate::order::order_targets;
-use crate::state::AppState;
+use crate::state::{AppState, DispatchRuntime};
 
 /// Resolve a chat request to an ordered list of fallback targets and the
 /// configured `api_endpoint`. Returns a fully-built error response (with
@@ -20,6 +20,7 @@ use crate::state::AppState;
 /// pointing at disabled providers.
 pub async fn resolve_route(
     state: &AppState,
+    runtime: &DispatchRuntime,
     request: &ChatCompletionRequest,
     trace_id: uuid::Uuid,
     start: Instant,
@@ -85,8 +86,8 @@ pub async fn resolve_route(
         targets,
         &model_name,
         strategy,
-        &state.route_counters,
-        &state.fill_first_orders,
+        &runtime.route_counters,
+        &runtime.fill_first_orders,
         shuffle_cache_ttl_secs,
     )
     .await;

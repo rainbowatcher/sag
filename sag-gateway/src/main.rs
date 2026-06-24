@@ -60,18 +60,16 @@ async fn main() -> anyhow::Result<()> {
 
     let provider_registry = Arc::new(RwLock::new(providers));
 
-    // 8. Build AppState
+    // 8. Build AppState (shared resources) + DispatchRuntime (dispatch-only state)
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
         providers: provider_registry,
         collector,
-        route_counters: Arc::new(RwLock::new(HashMap::new())),
-        fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-        route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
     };
+    let dispatch_runtime = sag_router::DispatchRuntime::default();
 
     // 9. Build router
-    let app = sag_router::build_router(app_state);
+    let app = sag_router::build_router(app_state, dispatch_runtime);
 
     // 9a. When the `embed-ui` feature is on, route any unmatched path
     //     through the embedded SPA (assets + index.html fallback).

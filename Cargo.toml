@@ -5,7 +5,7 @@ members = [
     "sag-providers",
     "sag-router",
     "sag-analytics",
-    "sag-gateway",
+    "sag-gateway", "sag-dispatch", "sag-admin",
 ]
 resolver = "2"
 

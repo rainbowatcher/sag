@@ -12,8 +12,8 @@ use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
-    DispatchCtx, TargetAvailability, TargetPass, apply_circuit_outcome, circuit_check_target,
-    fallback_exhausted_response, log_per_target_failure, success_log,
+    DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
+    log_per_target_failure, success_log,
 };
 
 /// Unified result of a single chat attempt. The `Instant` records when
@@ -33,6 +33,7 @@ enum ChatAttempt {
 pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     let DispatchCtx {
         state,
+        runtime,
         request,
         targets,
         api_endpoint,
@@ -40,137 +41,115 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
-        strategy,
     } = ctx;
 
     // Snapshot the backoff config once so the per-target retry loop doesn't
     // hold the config read lock and so all targets within one request share
     // a consistent view (a hot-reload mid-dispatch shouldn't change the
     // schedule for an in-flight request).
-    let backoff = state.config.read().await.backoff.clone();
+    let config = state.config.read().await.clone();
+    let backoff = config.backoff.clone();
+    let circuit_breaker_cfg = config.circuit_breaker.clone();
     let api_endpoint = api_endpoint.to_string();
 
-    // FillFirst two-pass dispatch:
-    //   Pass 1 — skip penalized targets (previously tripped but circuit
-    //            now closed). Only try non-penalized targets.
-    //   Pass 2 — clear penalized and retry (allows previously-tripped
-    //            targets back in when the current active target fails).
-    // RoundRobin — single pass, penalized targets are skipped but
-    //             closed targets rejoin rotation naturally.
-    let mut pass = TargetPass::new(strategy);
+    for (provider_name, real_model, target_extra, retries) in targets {
+        let Some(circuit_key) =
+            circuit_allows_target(runtime, &request.model, provider_name, real_model).await
+        else {
+            errors.push(format!("{provider_name}/{real_model}: circuit open"));
+            continue;
+        };
 
-    loop {
-        for (provider_name, real_model, target_extra, retries) in targets {
-            let avail =
-                circuit_check_target(state, &request.model, provider_name, real_model, strategy)
-                    .await;
-            pass.record_skip(&avail);
-            let circuit_key = match avail {
-                TargetAvailability::Allowed(k) => k,
-                TargetAvailability::CircuitOpen => {
-                    errors.push(format!("{provider_name}/{real_model}: circuit open"));
-                    continue;
-                }
-                TargetAvailability::Penalized => {
-                    errors.push(format!(
-                        "{provider_name}/{real_model}: penalized (will retry when current target exhausts)"
-                    ));
-                    continue;
-                }
-            };
+        let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+            continue;
+        };
 
-            let Some(provider) = resolve_provider(state, provider_name, errors).await else {
-                continue;
-            };
+        // Clone per-target values once so the retry closure can cheaply clone
+        // them for each attempt.
+        let real_model = real_model.clone();
+        let target_extra = target_extra.clone();
 
-            // Clone per-target values once so the retry closure can cheaply clone
-            // them for each attempt.
-            let real_model = real_model.clone();
-            let target_extra = target_extra.clone();
-
-            let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
-                provider_name,
-                *retries,
-                &backoff,
-                errors,
-                |_attempt| {
-                    let provider = provider.clone();
-                    let real_model = real_model.clone();
-                    let target_extra = target_extra.clone();
-                    let api_endpoint = api_endpoint.clone();
-                    async move {
-                        // Capture the upstream start time immediately before the
-                        // provider call so retry/circuit overhead is excluded.
-                        let upstream_start = std::time::Instant::now();
-                        if is_stream {
-                            provider
-                                .chat_stream(request, &real_model, &api_endpoint, &target_extra)
-                                .await
-                                .map(|s| ChatAttempt::Stream(Box::pin(s), upstream_start))
-                        } else {
-                            provider
-                                .chat(request, &real_model, &api_endpoint, &target_extra)
-                                .await
-                                .map(|r| ChatAttempt::NonStream(r, upstream_start))
-                        }
+        let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
+            provider_name,
+            *retries,
+            &backoff,
+            errors,
+            |_attempt| {
+                let provider = provider.clone();
+                let real_model = real_model.clone();
+                let target_extra = target_extra.clone();
+                let api_endpoint = api_endpoint.clone();
+                async move {
+                    // Capture the upstream start time immediately before the
+                    // provider call so retry/circuit overhead is excluded.
+                    let upstream_start = std::time::Instant::now();
+                    if is_stream {
+                        provider
+                            .chat_stream(request, &real_model, &api_endpoint, &target_extra)
+                            .await
+                            .map(|s| ChatAttempt::Stream(Box::pin(s), upstream_start))
+                    } else {
+                        provider
+                            .chat(request, &real_model, &api_endpoint, &target_extra)
+                            .await
+                            .map(|r| ChatAttempt::NonStream(r, upstream_start))
                     }
-                },
-            )
-            .await;
+                }
+            },
+        )
+        .await;
 
-            let Some(attempt) = apply_circuit_outcome(state, circuit_key, outcome).await else {
-                // Per-provider failure: log a failure entry with the actual provider/real_model
-                // so the analytics table knows which provider was attempted.
-                log_per_target_failure(
+        let Some(attempt) =
+            apply_circuit_outcome(runtime, circuit_key, outcome, &circuit_breaker_cfg).await
+        else {
+            // Per-provider failure: log a failure entry with the actual provider/real_model
+            // so the analytics table knows which provider was attempted.
+            log_per_target_failure(
+                state,
+                trace_id,
+                provider_name,
+                &request.model,
+                &real_model,
+                is_stream,
+                start,
+                errors,
+            );
+            continue;
+        };
+
+        match attempt {
+            ChatAttempt::Stream(stream, upstream_start) => {
+                return build_streaming_response(
                     state,
+                    stream,
+                    provider_name,
+                    &request.model,
+                    &real_model,
+                    trace_id,
+                    start,
+                    upstream_start,
+                    request.reasoning_effort.clone(),
+                );
+            }
+            ChatAttempt::NonStream(resp, upstream_start) => {
+                // Non-streaming responses are single-shot: TTFT equals the
+                // total upstream duration.
+                let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
+                let timing = Some(upstream_duration_ms);
+                state.collector.log(success_log(
                     trace_id,
                     provider_name,
                     &request.model,
                     &real_model,
-                    is_stream,
+                    false,
                     start,
-                    errors,
-                );
-                continue;
-            };
-
-            match attempt {
-                ChatAttempt::Stream(stream, upstream_start) => {
-                    return build_streaming_response(
-                        state,
-                        stream,
-                        provider_name,
-                        &request.model,
-                        &real_model,
-                        trace_id,
-                        start,
-                        upstream_start,
-                        request.reasoning_effort.clone(),
-                    );
-                }
-                ChatAttempt::NonStream(resp, upstream_start) => {
-                    // Non-streaming responses are single-shot: TTFT equals the
-                    // total upstream duration.
-                    let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
-                    let timing = Some(upstream_duration_ms);
-                    state.collector.log(success_log(
-                        trace_id,
-                        provider_name,
-                        &request.model,
-                        &real_model,
-                        false,
-                        start,
-                        resp.usage.as_ref(),
-                        request.reasoning_effort.as_deref(),
-                        timing,
-                        timing,
-                    ));
-                    return (StatusCode::OK, Json(resp)).into_response();
-                }
+                    resp.usage.as_ref(),
+                    request.reasoning_effort.as_deref(),
+                    timing,
+                    timing,
+                ));
+                return (StatusCode::OK, Json(resp)).into_response();
             }
-        }
-        if !pass.advance(state, &request.model, errors).await {
-            break;
         }
     }
 
@@ -181,13 +160,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
 mod tests {
     use super::*;
     use crate::dispatch::ResolvedTarget;
-    use crate::state::AppState;
+    use crate::state::{AppState, DispatchRuntime};
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use futures_util::Stream;
     use sag_analytics::StatsFilter;
     use sag_config::{
-        BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig, Strategy,
+        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
+        ServerConfig,
     };
     use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
@@ -334,6 +314,7 @@ mod tests {
             logging: sag_config::LoggingConfig::default(),
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: CircuitBreakerConfig::default(),
         };
         let handle = ConfigHandle::from_config(config);
         crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
@@ -345,6 +326,7 @@ mod tests {
 
     fn make_ctx<'a>(
         state: &'a AppState,
+        runtime: &'a DispatchRuntime,
         request: &'a ChatCompletionRequest,
         targets: &'a [ResolvedTarget],
         is_stream: bool,
@@ -352,6 +334,7 @@ mod tests {
     ) -> DispatchCtx<'a> {
         DispatchCtx {
             state,
+            runtime,
             request,
             targets,
             api_endpoint: "/chat/completions",
@@ -359,7 +342,6 @@ mod tests {
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
             errors,
-            strategy: Strategy::FillFirst,
         }
     }
 
@@ -380,10 +362,11 @@ mod tests {
             }),
         )));
         let state = build_state(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("openai", "gpt-4o", 0)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, false, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(mock.chat_calls(), 1);
@@ -422,10 +405,11 @@ mod tests {
             StreamChunk::Done,
         ]));
         let state = build_state(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", true);
         let targets = vec![target("openai", "gpt-4o", 0)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, true, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(mock.stream_calls(), 1);
@@ -442,10 +426,11 @@ mod tests {
         mock.push_chat(ChatBehavior::Retryable(AppError::Internal("oops".into())));
         mock.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("openai", "gpt-4o", 1)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, false, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(mock.chat_calls(), 2);
@@ -459,10 +444,11 @@ mod tests {
             "bad".into(),
         )));
         let state = build_state(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("openai", "gpt-4o", 5)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, false, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
         let _ = dispatch_chat(ctx).await;
         assert_eq!(
             mock.chat_calls(),
@@ -479,10 +465,11 @@ mod tests {
         m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail".into())));
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, false, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(m1.chat_calls(), 1);
@@ -496,10 +483,11 @@ mod tests {
         m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail1".into())));
         m2.push_chat(ChatBehavior::Retryable(AppError::Internal("fail2".into())));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, false, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(errors.len(), 2);
@@ -513,18 +501,34 @@ mod tests {
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
 
         let mut first_errors = Vec::new();
-        let first = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut first_errors)).await;
+        let first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(m1.chat_calls(), 1);
         assert_eq!(m2.chat_calls(), 1);
 
         let mut second_errors = Vec::new();
-        let second =
-            dispatch_chat(make_ctx(&state, &req, &targets, false, &mut second_errors)).await;
+        let second = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut second_errors,
+        ))
+        .await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(m1.chat_calls(), 1, "open circuit should skip first target");
         assert_eq!(m2.chat_calls(), 2);
@@ -543,18 +547,34 @@ mod tests {
         )));
         m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("first", "gpt-4o", 1), target("second", "gpt-4o", 0)];
 
         let mut first_errors = Vec::new();
-        let first = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut first_errors)).await;
+        let first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(m1.chat_calls(), 2);
         assert_eq!(m2.chat_calls(), 0);
 
         let mut second_errors = Vec::new();
-        let second =
-            dispatch_chat(make_ctx(&state, &req, &targets, false, &mut second_errors)).await;
+        let second = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut second_errors,
+        ))
+        .await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
             m1.chat_calls(),
@@ -574,18 +594,34 @@ mod tests {
         )));
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
 
         let mut first_errors = Vec::new();
-        let first = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut first_errors)).await;
+        let first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(m1.chat_calls(), 1);
         assert_eq!(m2.chat_calls(), 1);
 
         let mut second_errors = Vec::new();
-        let second =
-            dispatch_chat(make_ctx(&state, &req, &targets, false, &mut second_errors)).await;
+        let second = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut second_errors,
+        ))
+        .await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
             m1.chat_calls(),
@@ -601,11 +637,12 @@ mod tests {
         let m2 = Arc::new(MockProvider::new("second"));
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
         // "first" is not in the registry — should be skipped, not retried
         let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
         let mut errors = Vec::new();
-        let ctx = make_ctx(&state, &req, &targets, false, &mut errors);
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
         let resp = dispatch_chat(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(m2.chat_calls(), 1);
@@ -614,69 +651,5 @@ mod tests {
             1,
             "missing provider should push an error and continue"
         );
-    }
-
-    /// Full penalized lifecycle integration test:
-    ///   1. Request 1: target A fails → circuit open + penalized, falls through to B (succeeds)
-    ///   2. Request 2: circuit still open on A → skipped, B succeeds
-    ///   3. Request 3: circuit expired but A penalized → skipped in pass 1,
-    ///      B also fails → pass 2 clears penalized, A retried and succeeds
-    #[tokio::test]
-    async fn dispatch_chat_penalized_flow_two_pass_retry() {
-        let a = Arc::new(MockProvider::new("a"));
-        let b = Arc::new(MockProvider::new("b"));
-        // Request 1: A fails, B succeeds
-        a.push_chat(ChatBehavior::Retryable(AppError::Internal("fail".into())));
-        b.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
-        // Request 2: A skipped (circuit open), B succeeds
-        b.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
-        // Request 3 pass 1: A penalized, B fails
-        b.push_chat(ChatBehavior::Retryable(AppError::Internal("b-fail".into())));
-        // Request 3 pass 2: penalized cleared, A retried and succeeds
-        a.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
-
-        let state = build_state(vec![a.clone(), b.clone()]).await;
-        let req = build_request("gpt-4o", false);
-        let targets = vec![target("a", "gpt-4o", 0), target("b", "gpt-4o", 0)];
-
-        // ── Request 1 ──
-        let mut errors = Vec::new();
-        let r1 = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut errors)).await;
-        assert_eq!(r1.status(), StatusCode::OK);
-        assert_eq!(a.chat_calls(), 1, "A attempted once then exhausted");
-        assert_eq!(b.chat_calls(), 1, "B succeeded on fallthrough");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("a:") && e.contains("retries exhausted"))
-        );
-
-        // ── Request 2: circuit still open on A ──
-        let mut errors2 = Vec::new();
-        let r2 = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut errors2)).await;
-        assert_eq!(r2.status(), StatusCode::OK);
-        assert_eq!(a.chat_calls(), 1, "A still blocked by open circuit");
-        assert_eq!(b.chat_calls(), 2, "B handled request 2");
-        assert!(errors2.iter().any(|e| e.contains("circuit open")));
-
-        // ── Force-close the circuit to simulate expiry ──
-        state.route_circuit_breaker.write().await.close(
-            &crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "a", "gpt-4o"),
-        );
-
-        // ── Request 3: circuit closed but A penalized ──
-        let mut errors3 = Vec::new();
-        let r3 = dispatch_chat(make_ctx(&state, &req, &targets, false, &mut errors3)).await;
-        assert_eq!(r3.status(), StatusCode::OK);
-        // A: penalized in pass 1 (skipped) → pass 2 cleared → retried → success
-        assert_eq!(
-            a.chat_calls(),
-            2,
-            "A retried in pass 2 after penalized cleared"
-        );
-        // B: tried in pass 1, failed → retries exhausted
-        assert_eq!(b.chat_calls(), 3, "B failed in pass 1");
-        assert!(errors3.iter().any(|e| e.contains("penalized")));
-        assert!(errors3.iter().any(|e| e.contains("clearing penalized")));
     }
 }

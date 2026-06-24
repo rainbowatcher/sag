@@ -2,7 +2,7 @@
 //!
 //! This file is intentionally thin: it only owns the router wiring and the
 //! `/v1/chat/completions` orchestrator. All dispatch, resolution, retry,
-//! and streaming logic lives under [`crate::dispatch`]; the miscellaneous
+//! and streaming logic lives under [`sag_dispatch`]; the miscellaneous
 //! `/health`, `/v1/models`, and `/v1/analytics/stats` handlers live under
 //! [`crate::handlers`].
 
@@ -20,17 +20,24 @@ use sag_core::ChatCompletionRequest;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::instrument;
 
-use crate::dispatch::{DispatchCtx, dispatch_chat, dispatch_image, resolve_route};
 use crate::handlers::{
     analytics_cache_stats, analytics_distribution, analytics_stats, analytics_trend, list_models,
     show_health,
 };
 use crate::middleware::auth::gateway_auth;
 use crate::middleware::trace::trace_middleware;
-use crate::state::AppState;
+use sag_admin::build_admin_routes;
+use sag_dispatch::{
+    AppState, DispatchCtx, DispatchRuntime, dispatch_chat, dispatch_image, resolve_route,
+};
 
 /// Build the main Axum router with all routes and middleware.
-pub fn build_router(state: AppState) -> Router {
+///
+/// `runtime` carries the dispatch-only state (circuit breaker, ordering
+/// caches) that `chat_completions` needs but the admin/analytics handlers
+/// don't. It is threaded into the orchestrator via a request extension so
+/// non-dispatch handlers never see it.
+pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
     // The three auth-protected sub-routers are built first, then wrapped
     // in a single `route_layer` so `gateway_auth` is registered once
     // (one `state.clone()`) instead of three times. The unprotected
@@ -39,10 +46,12 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .nest(
             "/v1/chat/completions",
-            Router::new().route("/", post(chat_completions)),
+            Router::new()
+                .route("/", post(chat_completions))
+                .layer(axum::Extension(runtime)),
         )
         .nest("/v1", Router::new().route("/models", get(list_models)))
-        .nest("/api", crate::admin::build_admin_routes(state.clone()))
+        .nest("/api", build_admin_routes(state.clone()))
         .route_layer(middleware::from_fn_with_state(state.clone(), gateway_auth));
 
     let cors = CorsLayer::new()
@@ -73,6 +82,7 @@ pub fn build_router(state: AppState) -> Router {
 async fn chat_completions(
     State(state): State<AppState>,
     Extension(trace_id): Extension<uuid::Uuid>,
+    Extension(runtime): Extension<DispatchRuntime>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response<Body> {
     let start = Instant::now();
@@ -83,8 +93,8 @@ async fn chat_completions(
     span.record("stream", is_stream);
 
     // Resolve route → ordered targets + api_endpoint + strategy
-    let (targets, api_endpoint, strategy) =
-        match resolve_route(&state, &request, trace_id, start, is_stream).await {
+    let (targets, api_endpoint, _strategy) =
+        match resolve_route(&state, &runtime, &request, trace_id, start, is_stream).await {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
@@ -94,6 +104,7 @@ async fn chat_completions(
     if api_endpoint.ends_with("/images/generations") {
         return dispatch_image(DispatchCtx {
             state: &state,
+            runtime: &runtime,
             request: &request,
             targets: &targets,
             api_endpoint: &api_endpoint,
@@ -101,13 +112,13 @@ async fn chat_completions(
             trace_id,
             start,
             errors: &mut errors,
-            strategy,
         })
         .await;
     }
 
     dispatch_chat(DispatchCtx {
         state: &state,
+        runtime: &runtime,
         request: &request,
         targets: &targets,
         api_endpoint: &api_endpoint,
@@ -115,7 +126,6 @@ async fn chat_completions(
         trace_id,
         start,
         errors: &mut errors,
-        strategy,
     })
     .await
 }
