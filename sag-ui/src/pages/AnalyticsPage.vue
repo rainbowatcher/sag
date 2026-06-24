@@ -57,13 +57,25 @@ const statsTotals = computed(() => {
     errors += r.error_count
     weightedMs += r.avg_duration_ms * r.call_count
   }
+  const successRate = calls > 0 ? ((calls - errors) / calls) * 100 : 0
   return {
     calls,
     tokens,
     avgMs: calls > 0 ? weightedMs / calls : 0,
-    errors,
+    successRate,
   }
 })
+
+function successRateClass(rate: number) {
+  if (rate >= 99) return "text-green-500"
+  if (rate >= 95) return "text-amber-500"
+  return "text-red-500"
+}
+
+function rowSuccessRate(row: { call_count: number; error_count: number }) {
+  if (row.call_count === 0) return null
+  return ((row.call_count - row.error_count) / row.call_count) * 100
+}
 </script>
 
 <template>
@@ -120,17 +132,22 @@ const statsTotals = computed(() => {
           <Card>
             <CardContent class="flex items-center gap-3 p-4">
               <div
-                class="text-destructive flex h-5 w-5 items-center justify-center rounded-full border-2 text-[10px] font-bold"
+                class="flex h-5 w-5 items-center justify-center rounded-full border-2 text-[10px] font-bold"
+                :class="
+                  statsTotals.successRate >= 95
+                    ? 'border-green-500 text-green-500'
+                    : 'border-red-500 text-red-500'
+                "
               >
-                !
+                {{ statsTotals.successRate >= 95 ? "✓" : "!" }}
               </div>
               <div>
-                <p class="text-muted-foreground text-xs">Errors</p>
+                <p class="text-muted-foreground text-xs">Success Rate</p>
                 <p
                   class="text-lg font-bold tabular-nums"
-                  :class="statsTotals.errors > 0 ? 'text-red-500' : ''"
+                  :class="successRateClass(statsTotals.successRate)"
                 >
-                  {{ statsTotals.errors }}
+                  {{ statsTotals.successRate.toFixed(1) }}%
                 </p>
               </div>
             </CardContent>
@@ -196,7 +213,7 @@ const statsTotals = computed(() => {
                 <TableHead class="text-right">Calls</TableHead>
                 <TableHead class="text-right">Tokens</TableHead>
                 <TableHead class="text-right">Avg Latency</TableHead>
-                <TableHead class="text-right">Errors</TableHead>
+                <TableHead class="text-right">Success Rate</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -213,11 +230,11 @@ const statsTotals = computed(() => {
                 <TableCell class="text-right font-mono text-xs tabular-nums">
                   {{ formatDuration(row.avg_duration_ms) }}
                 </TableCell>
-                <TableCell class="text-right tabular-nums">
-                  <Badge v-if="row.error_count > 0" variant="destructive">
-                    {{ row.error_count }}
-                  </Badge>
-                  <span v-else class="text-muted-foreground">{{ row.error_count }}</span>
+                <TableCell class="text-right font-mono text-xs tabular-nums">
+                  <span v-if="row.call_count > 0" :class="successRateClass(rowSuccessRate(row)!)">
+                    {{ rowSuccessRate(row)!.toFixed(1) }}%
+                  </span>
+                  <span v-else class="text-muted-foreground">—</span>
                 </TableCell>
               </TableRow>
             </TableBody>
