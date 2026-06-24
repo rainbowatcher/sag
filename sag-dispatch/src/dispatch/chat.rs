@@ -161,14 +161,12 @@ mod tests {
     use super::*;
     use crate::dispatch::ResolvedTarget;
     use crate::state::{AppState, DispatchRuntime};
+    use crate::testing::target;
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use futures_util::Stream;
     use sag_analytics::StatsFilter;
-    use sag_config::{
-        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-        ServerConfig,
-    };
+    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig};
     use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
     use sag_providers::LlmProvider;
@@ -300,28 +298,13 @@ mod tests {
             registry.insert(p.name().to_string(), p);
         }
         let config = GatewayConfig {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 3000,
-            },
-            analytics: None,
             gateway_auth: Some(GatewayAuthConfig {
                 api_keys: vec!["k".into()],
             }),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            providers: HashMap::new(),
-            logging: sag_config::LoggingConfig::default(),
-            routes: vec![],
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
+            ..sag_config::gateway_config_base!()
         };
         let handle = ConfigHandle::from_config(config);
         crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
-    }
-
-    fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {
-        (provider.into(), real_model.into(), HashMap::new(), retries)
     }
 
     fn make_ctx<'a>(

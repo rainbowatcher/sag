@@ -165,23 +165,9 @@ pub async fn resolve_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sag_config::{ProviderConfig, ProviderType, RouteTarget};
+    use crate::testing::provider_config;
+    use sag_config::RouteTarget;
     use std::collections::HashMap;
-
-    fn provider_config(enabled: bool) -> ProviderConfig {
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            enabled_models: vec![],
-            enabled,
-        }
-    }
 
     #[test]
     fn filter_enabled_targets_drops_disabled_providers() {

@@ -412,69 +412,18 @@ pub async fn delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{build_state, one_provider_config, test_app};
     use axum::{
-        Router,
         body::Body,
         http::{Request, StatusCode},
     };
-    use sag_config::{
-        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-        RouteConfig, RouteTarget, ServerConfig, Strategy,
-    };
+    use sag_config::{ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
 
-    /// Helper: build an in-memory `AppState` populated with the given
-    /// providers and routes. The runtime provider registry is also
-    /// pre-populated with `OpenAiProvider` adapters for every provider.
-    pub(super) async fn build_state(
-        providers: HashMap<String, ProviderConfig>,
-        routes: Vec<RouteConfig>,
-    ) -> AppState {
-        let config = GatewayConfig {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 3000,
-            },
-            analytics: None,
-            gateway_auth: Some(GatewayAuthConfig {
-                api_keys: vec!["test-key".into()],
-            }),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            providers,
-            logging: sag_config::LoggingConfig::default(),
-            routes,
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
-        };
-        let handle = ConfigHandle::from_config(config);
-
-        let cfg_read = handle.read().await;
-        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
-        for (name, pc) in cfg_read.providers.iter() {
-            let provider: Arc<dyn sag_providers::LlmProvider> =
-                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
-            registry.insert(name.clone(), provider);
-        }
-        drop(cfg_read);
-
-        sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
-    }
-
-    /// Build a small test app that mounts only the admin routes.
-    /// We don't add the gateway_auth middleware here so tests can focus on
-    /// the route logic itself.
-    pub(super) fn test_app(state: AppState) -> Router {
-        Router::new()
-            .nest("/api", crate::admin::build_admin_routes(state.clone()))
-            .with_state(state)
-    }
-
-    pub(super) async fn provider_names_from_response(
-        response: axum::response::Response,
-    ) -> Vec<String> {
+    async fn provider_names_from_response(response: axum::response::Response) -> Vec<String> {
         let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
@@ -485,45 +434,6 @@ mod tests {
             .iter()
             .map(|provider| provider["name"].as_str().unwrap().to_string())
             .collect()
-    }
-
-    pub(super) fn one_provider_config(
-        name: &str,
-        routes: Vec<(&str, &str, u32)>,
-    ) -> (HashMap<String, ProviderConfig>, Vec<RouteConfig>) {
-        let mut providers = HashMap::new();
-        providers.insert(
-            name.to_string(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-test".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                enabled_models: vec![],
-                enabled: true,
-            },
-        );
-        let routes = routes
-            .into_iter()
-            .map(|(model, real_model, prio)| RouteConfig {
-                model_name: model.into(),
-                api_endpoint: "/chat/completions".into(),
-                retries: None,
-                strategy: Strategy::FillFirst,
-                targets: vec![RouteTarget {
-                    provider: name.into(),
-                    real_model: Some(real_model.into()),
-                    retries: None,
-                    priority: prio,
-                    extra: HashMap::new(),
-                }],
-            })
-            .collect();
-        (providers, routes)
     }
 
     // 1. Happy path

@@ -85,53 +85,16 @@ pub async fn list_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{build_state, test_app};
     use axum::{
-        Router,
         body::Body,
         http::{Request, StatusCode},
     };
     use chrono::Utc;
-    use sag_config::{
-        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-        ServerConfig,
-    };
     use sag_core::{CallLog, Usage};
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
     use uuid::Uuid;
-
-    async fn build_state() -> AppState {
-        let config = GatewayConfig {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 3000,
-            },
-            analytics: None,
-            gateway_auth: Some(GatewayAuthConfig {
-                api_keys: vec!["test-key".into()],
-            }),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            providers: HashMap::new(),
-            logging: sag_config::LoggingConfig::default(),
-            routes: vec![],
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
-        };
-
-        let handle = ConfigHandle::from_config(config);
-        let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
-        sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
-    }
-
-    /// Build a test app mounting the admin routes without auth middleware.
-    fn test_app(state: AppState) -> Router {
-        Router::new()
-            .nest("/api", crate::admin::build_admin_routes(state.clone()))
-            .with_state(state)
-    }
 
     fn make_log(provider: &str, model: &str, real_model: &str, status_code: u16) -> CallLog {
         CallLog {
@@ -183,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_logs_returns_envelope_with_data_array() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(
             &state,
             vec![
@@ -209,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_logs_filters_by_provider() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(
             &state,
             vec![
@@ -238,7 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_logs_filters_by_status_code() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(
             &state,
             vec![
@@ -270,7 +233,7 @@ mod tests {
     /// locked in symmetrically with `provider` / `status_code`.
     #[tokio::test]
     async fn list_logs_filters_by_model_and_real_model() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(
             &state,
             vec![
@@ -301,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_logs_clamps_limit_to_max() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(
             &state,
             vec![
@@ -333,7 +296,7 @@ mod tests {
     /// clamp) — guards against accidentally capping one short.
     #[tokio::test]
     async fn list_logs_limit_at_max_passes_through() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(&state, vec![make_log("openai", "gpt-4o", "gpt-4o", 200)]).await;
 
         let app = test_app(state);
@@ -357,7 +320,7 @@ mod tests {
     /// confirm the envelope stays consistent.
     #[tokio::test]
     async fn list_logs_limit_zero_returns_empty_envelope() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(&state, vec![make_log("openai", "gpt-4o", "gpt-4o", 200)]).await;
 
         let app = test_app(state);
@@ -378,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_logs_applies_offset_pagination() {
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(
             &state,
             vec![
@@ -410,7 +373,7 @@ mod tests {
         // The Vue dashboard's `logsFilterProvider.value = ""` would send
         // ?provider= and expect zero filtering. The `filter(|s| !s.is_empty())`
         // step in `build_filter` keeps semantics consistent.
-        let state = build_state().await;
+        let state = build_state(HashMap::new(), vec![]).await;
         insert_logs(&state, vec![make_log("openai", "gpt-4o", "gpt-4o", 200)]).await;
 
         let app = test_app(state);

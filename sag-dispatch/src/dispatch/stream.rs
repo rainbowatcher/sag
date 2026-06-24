@@ -169,10 +169,7 @@ mod tests {
     use axum::body::to_bytes;
     use futures_util::stream;
     use sag_analytics::{LogFilter, StatsFilter};
-    use sag_config::{
-        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-        ServerConfig,
-    };
+    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig};
     use sag_core::Usage;
     use std::collections::HashMap;
     use std::pin::Pin;
@@ -183,21 +180,10 @@ mod tests {
 
     async fn build_state() -> AppState {
         let config = GatewayConfig {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 3000,
-            },
-            analytics: None,
             gateway_auth: Some(GatewayAuthConfig {
                 api_keys: vec!["k".into()],
             }),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            providers: HashMap::new(),
-            logging: sag_config::LoggingConfig::default(),
-            routes: vec![],
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
+            ..sag_config::gateway_config_base!()
         };
         let handle = ConfigHandle::from_config(config);
         let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();

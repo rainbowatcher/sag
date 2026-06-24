@@ -2,6 +2,48 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+/// Macro: produce a minimal `GatewayConfig` with sensible defaults for
+/// tests. Use struct-update syntax to override fields:
+///
+/// ```ignore
+/// let config = GatewayConfig {
+///     providers: my_providers,
+///     ..gateway_config_base!()
+/// };
+/// ```
+///
+/// Defaults:
+/// - `server`: 127.0.0.1:3000
+/// - `gateway_auth`: `Some(GatewayAuthConfig { api_keys: ["test-key"] })`
+/// - `retries`: 2
+/// - `backoff`: `BackoffConfig::default()` (base 100ms, max 5s, jitter)
+/// - `circuit_breaker`: `CircuitBreakerConfig::default()` (quota 1h, rate 10s, generic 60s)
+/// - `logging`: `LoggingConfig::default()` (info, compact)
+/// - `shuffle_cache_ttl_secs`: 7200
+/// - `analytics`, `providers`, `routes`: empty
+#[macro_export]
+macro_rules! gateway_config_base {
+    () => {
+        $crate::GatewayConfig {
+            server: $crate::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 3000,
+            },
+            analytics: ::std::option::Option::None,
+            gateway_auth: ::std::option::Option::Some($crate::GatewayAuthConfig {
+                api_keys: ::std::vec!["test-key".into()],
+            }),
+            providers: ::std::collections::HashMap::new(),
+            retries: 2,
+            backoff: $crate::BackoffConfig::default(),
+            logging: $crate::LoggingConfig::default(),
+            routes: ::std::vec::Vec::new(),
+            shuffle_cache_ttl_secs: 7200,
+            circuit_breaker: $crate::CircuitBreakerConfig::default(),
+        }
+    };
+}
+
 /// Root configuration for the SAG (Smart AI Gateway).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {

@@ -18,8 +18,8 @@ use axum::{
     middleware,
 };
 use sag_config::{
-    BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-    KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, ServerConfig, Strategy,
+    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+    RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::AppState;
 use sag_router::admin::build_admin_routes;
@@ -45,20 +45,10 @@ async fn build_protected_state() -> AppState {
         },
     );
     let config = GatewayConfig {
-        server: ServerConfig {
-            host: "127.0.0.1".into(),
-            port: 3000,
-        },
-        analytics: None,
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec!["regression-key".into()],
         }),
-        retries: 2,
-        backoff: BackoffConfig::default(),
         providers,
-        logging: sag_config::LoggingConfig::default(),
-        shuffle_cache_ttl_secs: 7200,
-        circuit_breaker: CircuitBreakerConfig::default(),
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),
@@ -72,6 +62,7 @@ async fn build_protected_state() -> AppState {
                 priority: 1,
             }],
         }],
+        ..sag_config::gateway_config_base!()
     };
     let handle = ConfigHandle::from_config(config);
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();

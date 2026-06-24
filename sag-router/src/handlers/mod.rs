@@ -186,77 +186,17 @@ pub async fn analytics_cache_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sag_config::{
-        BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-        KeyStrategy, ProviderConfig, ProviderType, RouteConfig, ServerConfig, Strategy,
-    };
-    use sag_providers::{LlmProvider, OpenAiProvider};
+    use sag_config::{ConfigHandle, GatewayConfig, RouteConfig, RouteTarget, Strategy};
+    use sag_dispatch::testing::{build_provider_registry, provider_config};
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    async fn build_test_state(
-        providers: HashMap<String, ProviderConfig>,
-        routes: Vec<RouteConfig>,
-    ) -> AppState {
-        let config = GatewayConfig {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 3000,
-            },
-            analytics: None,
-            gateway_auth: Some(GatewayAuthConfig {
-                api_keys: vec!["test-key".into()],
-            }),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            providers,
-            logging: sag_config::LoggingConfig::default(),
-            routes,
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
-        };
-        let handle = ConfigHandle::from_config(config);
-
-        let cfg_read = handle.read().await;
-        let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
-        for (name, pc) in cfg_read.providers.iter() {
-            if pc.enabled {
-                let provider: Arc<dyn LlmProvider> =
-                    Arc::new(OpenAiProvider::new(name.clone(), pc));
-                registry.insert(name.clone(), provider);
-            }
-        }
-        drop(cfg_read);
-
-        sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
-    }
-
-    fn provider_config(enabled: bool) -> ProviderConfig {
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            enabled_models: vec![],
-            enabled,
-        }
-    }
 
     #[tokio::test]
     async fn list_models_excludes_routes_with_only_disabled_providers() {
-        use sag_config::RouteTarget;
-
         let mut providers = HashMap::new();
         providers.insert("openai-enabled".into(), provider_config(true));
         providers.insert("openai-disabled".into(), provider_config(false));
 
         let routes = vec![
-            // Route with enabled provider → should appear
             RouteConfig {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -270,7 +210,6 @@ mod tests {
                     extra: HashMap::new(),
                 }],
             },
-            // Route with ONLY disabled providers → should NOT appear
             RouteConfig {
                 model_name: "claude-opus".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -284,7 +223,6 @@ mod tests {
                     extra: HashMap::new(),
                 }],
             },
-            // Route with mix of disabled and enabled → should appear
             RouteConfig {
                 model_name: "gpt-4o-mini".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -309,7 +247,14 @@ mod tests {
             },
         ];
 
-        let state = build_test_state(providers, routes).await;
+        let config = GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = ConfigHandle::from_config(config);
+        let provider_registry = build_provider_registry(&handle, true).await;
+        let state = sag_dispatch::testing::test_app_state(handle, provider_registry).await;
         let Json(response) = list_models(State(state)).await;
         let data = response["data"].as_array().unwrap();
         let model_ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();

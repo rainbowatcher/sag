@@ -82,19 +82,8 @@ mod tests {
     /// Helper: build an AppState for the test with optional auth keys.
     async fn test_state(auth_keys: Option<Vec<String>>) -> AppState {
         let config = sag_config::GatewayConfig {
-            server: sag_config::ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 3000,
-            },
-            analytics: None,
             gateway_auth: auth_keys.map(|keys| sag_config::GatewayAuthConfig { api_keys: keys }),
-            retries: 2,
-            backoff: sag_config::BackoffConfig::default(),
-            circuit_breaker: sag_config::CircuitBreakerConfig::default(),
-            providers: HashMap::new(),
-            logging: sag_config::LoggingConfig::default(),
-            routes: vec![],
-            shuffle_cache_ttl_secs: 7200,
+            ..sag_config::gateway_config_base!()
         };
         let handle = ConfigHandle::from_config(config);
         let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();

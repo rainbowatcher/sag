@@ -17,3 +17,6 @@ pub mod admin_routes;
 pub mod admin_testing;
 
 pub use admin::build_admin_routes;
+
+#[cfg(test)]
+mod test_utils;

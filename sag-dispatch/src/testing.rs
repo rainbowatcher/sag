@@ -19,7 +19,36 @@ use std::sync::Arc;
 use sag_config::ConfigHandle;
 use tokio::sync::RwLock;
 
+use crate::dispatch::ResolvedTarget;
 use crate::state::{AppState, DispatchRuntime};
+
+/// Shared test target constructor — avoids copy-paste across chat / image
+/// dispatch test modules.
+pub fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {
+    (
+        provider.into(),
+        real_model.into(),
+        std::collections::HashMap::new(),
+        retries,
+    )
+}
+
+/// Shared `ProviderConfig` builder for unit tests. Returns a minimal
+/// enabled OpenAI provider config.
+pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
+    sag_config::ProviderConfig {
+        provider_type: sag_config::ProviderType::OpenAI,
+        api_keys: vec!["sk-test".into()],
+        key_strategy: sag_config::KeyStrategy::FillFirst,
+        base_url: "https://api.openai.com/v1".into(),
+        models_endpoint: "models".into(),
+        timeout_secs: 120,
+        headers: std::collections::HashMap::new(),
+        body_overrides: std::collections::HashMap::new(),
+        enabled_models: vec![],
+        enabled,
+    }
+}
 
 /// Build an [`AppState`] with the given config and provider registry,
 /// backed by an in-memory analytics collector.
@@ -38,4 +67,24 @@ pub async fn test_app_state(
 /// state. Call once per test for isolation.
 pub fn test_dispatch_runtime() -> DispatchRuntime {
     DispatchRuntime::default()
+}
+
+/// Build a provider registry from the given config handle, optionally
+/// filtering to only enabled providers. Returns the registry wrapped in
+/// an `Arc<RwLock<...>>` ready for [`test_app_state`].
+pub async fn build_provider_registry(
+    handle: &ConfigHandle,
+    only_enabled: bool,
+) -> Arc<RwLock<HashMap<String, Arc<dyn sag_providers::LlmProvider>>>> {
+    let cfg_read = handle.read().await;
+    let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+    for (name, pc) in cfg_read.providers.iter() {
+        if !only_enabled || pc.enabled {
+            let provider: Arc<dyn sag_providers::LlmProvider> =
+                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+            registry.insert(name.clone(), provider);
+        }
+    }
+    drop(cfg_read);
+    Arc::new(RwLock::new(registry))
 }

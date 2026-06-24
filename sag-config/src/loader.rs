@@ -659,7 +659,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    use crate::config::CircuitBreakerConfig;
     use crate::config::*;
 
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -876,7 +875,6 @@ base_url = "https://api.anthropic.com"
                 host: "127.0.0.1".into(),
                 port: 9090,
             },
-            analytics: None,
             gateway_auth: None,
             providers: HashMap::from([(
                 "openai".into(),
@@ -893,11 +891,6 @@ base_url = "https://api.anthropic.com"
                     enabled_models: vec![],
                 },
             )]),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            logging: LoggingConfig::default(),
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -911,6 +904,7 @@ base_url = "https://api.anthropic.com"
                     extra: HashMap::new(),
                 }],
             }],
+            ..crate::gateway_config_base!()
         };
 
         save_config_to_file(&config, &path).unwrap();
@@ -1039,7 +1033,6 @@ key_strategy = "round_robin"
                 host: "127.0.0.1".into(),
                 port: 9090,
             },
-            analytics: None,
             gateway_auth: None,
             providers: HashMap::from([(
                 "openai".into(),
@@ -1056,12 +1049,7 @@ key_strategy = "round_robin"
                     enabled_models: vec![],
                 },
             )]),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            logging: LoggingConfig::default(),
-            routes: vec![],
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
+            ..crate::gateway_config_base!()
         };
 
         save_config_to_file(&config, &path).unwrap();
@@ -1195,7 +1183,6 @@ targets = [
                 host: "127.0.0.1".into(),
                 port: 9090,
             },
-            analytics: None,
             gateway_auth: None,
             providers: HashMap::from([(
                 "openai".into(),
@@ -1212,11 +1199,6 @@ targets = [
                     enabled_models: vec![],
                 },
             )]),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            logging: LoggingConfig::default(),
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1236,6 +1218,7 @@ targets = [
                     )]),
                 }],
             }],
+            ..crate::gateway_config_base!()
         };
 
         let result = save_config_to_file(&config, &path);
@@ -1263,7 +1246,6 @@ targets = [
                 host: "127.0.0.1".into(),
                 port: 9090,
             },
-            analytics: None,
             gateway_auth: None,
             providers: HashMap::from([(
                 "openai".into(),
@@ -1280,11 +1262,6 @@ targets = [
                     enabled_models: vec![],
                 },
             )]),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            logging: LoggingConfig::default(),
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1300,6 +1277,7 @@ targets = [
                     extra: HashMap::from([("list".into(), serde_json::json!([1, null, 3]))]),
                 }],
             }],
+            ..crate::gateway_config_base!()
         };
 
         let result = save_config_to_file(&config, &path);
@@ -1321,7 +1299,6 @@ targets = [
                 host: "127.0.0.1".into(),
                 port: 9090,
             },
-            analytics: None,
             gateway_auth: None,
             providers: HashMap::from([(
                 "openai".into(),
@@ -1338,11 +1315,6 @@ targets = [
                     enabled_models: vec![],
                 },
             )]),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            logging: LoggingConfig::default(),
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1356,6 +1328,7 @@ targets = [
                     extra: HashMap::from([("temperature".into(), serde_json::Value::Null)]),
                 }],
             }],
+            ..crate::gateway_config_base!()
         };
 
         let result = save_config_to_file(&config, &path);
@@ -1531,15 +1504,9 @@ targets = [
                 host: "127.0.0.1".into(),
                 port: 9090,
             },
-            analytics: None,
             gateway_auth: None,
             providers: HashMap::from([("openai".into(), minimal_provider())]),
-            retries: 2,
-            backoff: BackoffConfig::default(),
-            logging: LoggingConfig::default(),
-            routes: vec![],
-            shuffle_cache_ttl_secs: 7200,
-            circuit_breaker: CircuitBreakerConfig::default(),
+            ..crate::gateway_config_base!()
         }
     }
 
