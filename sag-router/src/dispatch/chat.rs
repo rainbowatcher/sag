@@ -185,7 +185,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use futures_util::Stream;
-    use sag_analytics::{CallLogCollector, StatsFilter};
+    use sag_analytics::StatsFilter;
     use sag_config::{
         BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig, Strategy,
     };
@@ -335,14 +335,8 @@ mod tests {
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
         };
-        AppState {
-            config: ConfigHandle::from_config(config),
-            providers: Arc::new(RwLock::new(registry)),
-            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
-            route_counters: Arc::new(RwLock::new(HashMap::new())),
-            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
-        }
+        let handle = ConfigHandle::from_config(config);
+        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {

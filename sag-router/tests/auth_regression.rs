@@ -17,7 +17,6 @@ use axum::{
     http::{Request, StatusCode},
     middleware,
 };
-use sag_analytics::CallLogCollector;
 use sag_config::{
     BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
     ProviderType, RouteConfig, RouteTarget, ServerConfig, Strategy,
@@ -82,14 +81,7 @@ async fn build_protected_state() -> AppState {
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);
-    AppState {
-        config: handle,
-        providers: Arc::new(RwLock::new(registry)),
-        collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
-        route_counters: Arc::new(RwLock::new(HashMap::new())),
-        fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-        route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
-    }
+    sag_router::test_app_state(handle, Arc::new(RwLock::new(registry))).await
 }
 
 fn protected_app(state: AppState) -> Router {

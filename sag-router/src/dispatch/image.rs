@@ -164,7 +164,7 @@ mod tests {
     use crate::state::AppState;
     use async_trait::async_trait;
     use futures_util::Stream;
-    use sag_analytics::CallLogCollector;
+
     use sag_config::{
         BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig, Strategy,
     };
@@ -291,14 +291,11 @@ mod tests {
             shuffle_cache_ttl_secs: 7200,
         };
 
-        AppState {
-            config: ConfigHandle::from_config(config),
-            providers: Arc::new(RwLock::new(registry)),
-            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
-            route_counters: Arc::new(RwLock::new(HashMap::new())),
-            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
-        }
+        crate::testing::test_app_state(
+            ConfigHandle::from_config(config),
+            Arc::new(RwLock::new(registry)),
+        )
+        .await
     }
 
     fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {

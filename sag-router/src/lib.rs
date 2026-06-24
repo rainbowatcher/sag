@@ -10,7 +10,9 @@ pub mod middleware;
 pub mod order;
 pub mod routes;
 pub mod state;
+pub mod testing;
 
 pub use admin::*;
 pub use routes::*;
 pub use state::*;
+pub use testing::test_app_state;

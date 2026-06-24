@@ -333,7 +333,6 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use sag_analytics::CallLogCollector;
     use sag_config::{
         BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
         ProviderType, RouteConfig, RouteTarget, ServerConfig,
@@ -373,14 +372,7 @@ mod tests {
         }
         drop(cfg_read);
 
-        AppState {
-            config: handle,
-            providers: Arc::new(RwLock::new(registry)),
-            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
-            route_counters: Arc::new(RwLock::new(HashMap::new())),
-            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
-        }
+        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     pub(super) fn test_app(state: AppState) -> Router {

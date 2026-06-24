@@ -168,7 +168,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use futures_util::stream;
-    use sag_analytics::{CallLogCollector, LogFilter, StatsFilter};
+    use sag_analytics::{LogFilter, StatsFilter};
     use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
     use sag_core::Usage;
     use std::collections::HashMap;
@@ -195,14 +195,9 @@ mod tests {
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
         };
-        AppState {
-            config: ConfigHandle::from_config(config),
-            providers: Arc::new(RwLock::new(HashMap::new())),
-            collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
-            route_counters: Arc::new(RwLock::new(HashMap::new())),
-            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
-        }
+        let handle = ConfigHandle::from_config(config);
+        let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     fn chunk_stream(chunks: Vec<StreamChunk>) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {

@@ -105,14 +105,9 @@ mod tests {
             routes: vec![],
             shuffle_cache_ttl_secs: 7200,
         };
-        AppState {
-            config: ConfigHandle::from_config(config),
-            providers: Arc::new(RwLock::new(HashMap::new())),
-            collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
-            route_counters: Arc::new(RwLock::new(HashMap::new())),
-            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
-            route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
-        }
+        let handle = ConfigHandle::from_config(config);
+        let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     /// Build a small test app: a single `GET /test` route protected by `gateway_auth`.
