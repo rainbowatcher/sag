@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         providers: provider_registry,
         collector,
         route_counters: Arc::new(RwLock::new(HashMap::new())),
+        fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
         route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
     };
 

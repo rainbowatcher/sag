@@ -16,6 +16,12 @@ pub struct GatewayConfig {
     /// Global exponential-backoff settings for retry delays.
     #[serde(default)]
     pub backoff: BackoffConfig,
+    /// Fill-first shuffle cache TTL in seconds. The shuffled target order
+    /// is re-randomised after this many seconds since the last shuffle.
+    /// Defaults to 7200 (2 hours). Set to 0 to disable automatic re-shuffle
+    /// (the cached order persists until the route config changes).
+    #[serde(default = "default_shuffle_cache_ttl_secs")]
+    pub shuffle_cache_ttl_secs: u64,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     /// Logging configuration (optional, default log level: "info").
@@ -433,6 +439,9 @@ pub fn default_backoff_max_ms() -> u64 {
 pub fn default_backoff_jitter() -> bool {
     true
 }
+fn default_shuffle_cache_ttl_secs() -> u64 {
+    7200
+}
 fn default_true() -> bool {
     true
 }
@@ -456,8 +465,9 @@ fn is_default_api_endpoint(v: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
-    /// Try targets in priority order; within the same priority, pick randomly.
-    /// On failure, fall back to the next priority tier.
+    /// Try targets in priority order; within the same priority, shuffle once
+    /// on first access and reuse the same order for all subsequent requests.
+    /// The first target absorbs all traffic until it becomes unavailable.
     #[default]
     FillFirst,
     /// Distribute requests across all targets in round-robin order.
@@ -471,7 +481,8 @@ pub enum Strategy {
 /// When a request matches this route, targets are selected based on the route's
 /// `strategy`:
 /// - `FillFirst`: sorted by priority (descending); same-priority targets are
-///   tried in random order. Higher-priority targets are tried first.
+///   shuffled once on first access and the order is cached. The first target
+///   absorbs all traffic until it becomes unavailable.
 /// - `RoundRobin`: targets are tried in a rotating order. Each request advances
 ///   the counter, distributing load evenly.
 ///
@@ -525,9 +536,9 @@ impl RouteConfig {
 /// A routing target: maps a logical model to a specific provider + real model name.
 ///
 /// Multiple targets in a route are grouped by priority and tried based on the
-/// route's `strategy`. Targets with the same priority are tried in random order
-/// when strategy is `FillFirst`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// route's `strategy`. Targets with the same priority are shuffled once then
+/// cached when strategy is `FillFirst`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Provider name (must match a key in `providers`).
     pub provider: String,

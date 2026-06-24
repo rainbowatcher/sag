@@ -11,8 +11,8 @@ use sag_core::{ChatCompletionRequest, ImageGenerationRequest, ImageGenerationRes
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
-    DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    log_per_target_failure, success_log,
+    DispatchCtx, TargetAvailability, TargetPass, apply_circuit_outcome, circuit_check_target,
+    fallback_exhausted_response, log_per_target_failure, success_log,
 };
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
@@ -32,6 +32,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
+        strategy,
     } = ctx;
 
     let img_request = build_image_request(request);
@@ -40,69 +41,90 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     // `dispatch_chat` for the rationale.
     let backoff = state.config.read().await.backoff.clone();
 
-    for (provider_name, real_model, target_extra, retries) in targets {
-        let Some(circuit_key) =
-            circuit_allows_target(state, &request.model, provider_name, real_model, errors).await
-        else {
-            continue;
-        };
+    // FillFirst two-pass dispatch (same as dispatch_chat):
+    // pass 1 skips penalized, pass 2 clears penalized and retries.
+    let mut pass = TargetPass::new(strategy);
 
-        let Some(provider) = resolve_provider(state, provider_name, errors).await else {
-            continue;
-        };
-
-        let real_model = real_model.clone();
-        let target_extra = target_extra.clone();
-        let img_request = img_request.clone();
-
-        let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
-            provider_name,
-            *retries,
-            &backoff,
-            errors,
-            |_attempt| {
-                let provider = provider.clone();
-                let real_model = real_model.clone();
-                let target_extra = target_extra.clone();
-                let img_request = img_request.clone();
-                async move {
-                    provider
-                        .chat_image(&img_request, &real_model, &target_extra)
-                        .await
+    loop {
+        for (provider_name, real_model, target_extra, retries) in targets {
+            let avail =
+                circuit_check_target(state, &request.model, provider_name, real_model, strategy)
+                    .await;
+            pass.record_skip(&avail);
+            let circuit_key = match avail {
+                TargetAvailability::Allowed(k) => k,
+                TargetAvailability::CircuitOpen => {
+                    errors.push(format!("{provider_name}/{real_model}: circuit open"));
+                    continue;
                 }
-            },
-        )
-        .await;
+                TargetAvailability::Penalized => {
+                    errors.push(format!(
+                        "{provider_name}/{real_model}: penalized (will retry when current target exhausts)"
+                    ));
+                    continue;
+                }
+            };
 
-        let Some(resp) = apply_circuit_outcome(state, circuit_key, outcome).await else {
-            // Per-provider failure: log a failure entry with the actual provider/real_model
-            // so the analytics table knows which provider was attempted.
-            log_per_target_failure(
-                state,
+            let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+                continue;
+            };
+
+            let real_model = real_model.clone();
+            let target_extra = target_extra.clone();
+            let img_request = img_request.clone();
+
+            let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
+                provider_name,
+                *retries,
+                &backoff,
+                errors,
+                |_attempt| {
+                    let provider = provider.clone();
+                    let real_model = real_model.clone();
+                    let target_extra = target_extra.clone();
+                    let img_request = img_request.clone();
+                    async move {
+                        provider
+                            .chat_image(&img_request, &real_model, &target_extra)
+                            .await
+                    }
+                },
+            )
+            .await;
+
+            let Some(resp) = apply_circuit_outcome(state, circuit_key, outcome).await else {
+                // Per-provider failure: log a failure entry with the actual provider/real_model
+                // so the analytics table knows which provider was attempted.
+                log_per_target_failure(
+                    state,
+                    trace_id,
+                    provider_name,
+                    &request.model,
+                    &real_model,
+                    false,
+                    start,
+                    errors,
+                );
+                continue;
+            };
+
+            state.collector.log(success_log(
                 trace_id,
                 provider_name,
                 &request.model,
                 &real_model,
                 false,
                 start,
-                errors,
-            );
-            continue;
-        };
-
-        state.collector.log(success_log(
-            trace_id,
-            provider_name,
-            &request.model,
-            &real_model,
-            false,
-            start,
-            None,
-            None, // reasoning_effort — not applicable for image generation
-            None, // upstream_duration_ms — image path timing is out of scope for stage 2
-            None, // ttft_ms — image generation is single-shot, conceptually non-streaming
-        ));
-        return (StatusCode::OK, Json(resp)).into_response();
+                None,
+                None, // reasoning_effort — not applicable for image generation
+                None, // upstream_duration_ms — image path timing is out of scope for stage 2
+                None, // ttft_ms — image generation is single-shot, conceptually non-streaming
+            ));
+            return (StatusCode::OK, Json(resp)).into_response();
+        }
+        if !pass.advance(state, &request.model, errors).await {
+            break;
+        }
     }
 
     fallback_exhausted_response(state, &request.model, false, trace_id, start, errors)
@@ -143,7 +165,9 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::Stream;
     use sag_analytics::CallLogCollector;
-    use sag_config::{BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig};
+    use sag_config::{
+        BackoffConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, ServerConfig, Strategy,
+    };
     use sag_core::{AppError, ChatCompletionResponse, ChatMessage, ImageData, StreamChunk};
     use sag_providers::LlmProvider;
     use serde_json::json;
@@ -264,6 +288,7 @@ mod tests {
             providers: HashMap::new(),
             logging: sag_config::LoggingConfig::default(),
             routes: vec![],
+            shuffle_cache_ttl_secs: 7200,
         };
 
         AppState {
@@ -271,6 +296,7 @@ mod tests {
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
             route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
@@ -294,6 +320,7 @@ mod tests {
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
             errors,
+            strategy: Strategy::FillFirst,
         }
     }
 

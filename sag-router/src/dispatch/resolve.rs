@@ -77,10 +77,19 @@ pub async fn resolve_route(
     let model_name = route.model_name.clone();
     let route_retries = route.retries;
     let global_retries = config_guard.retries;
+    let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
     drop(config_guard);
 
     // Apply target selection strategy
-    let ordered = order_targets(targets, &model_name, strategy, &state.route_counters).await;
+    let ordered = order_targets(
+        targets,
+        &model_name,
+        strategy,
+        &state.route_counters,
+        &state.fill_first_orders,
+        shuffle_cache_ttl_secs,
+    )
+    .await;
 
     // Resolve effective retries per target: target → route → global
     let resolved: Vec<ResolvedTarget> = ordered
@@ -92,7 +101,7 @@ pub async fn resolve_route(
         })
         .collect();
 
-    Ok((resolved, api_endpoint))
+    Ok((resolved, api_endpoint, strategy))
 }
 
 /// Drop targets whose provider is marked `enabled = false` in the config.

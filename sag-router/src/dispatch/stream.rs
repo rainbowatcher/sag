@@ -193,12 +193,14 @@ mod tests {
             providers: HashMap::new(),
             logging: sag_config::LoggingConfig::default(),
             routes: vec![],
+            shuffle_cache_ttl_secs: 7200,
         };
         AppState {
             config: ConfigHandle::from_config(config),
             providers: Arc::new(RwLock::new(HashMap::new())),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
             route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }

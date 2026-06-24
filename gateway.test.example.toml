@@ -19,6 +19,11 @@
 # Global default retry count (per target). Can be overridden per-route or per-target.
 retries = 2
 
+# FillFirst shuffle cache TTL in seconds. The shuffled target order is
+# re-randomised after this many seconds. Set to 0 to never expire (only
+# re-shuffle on config reload). Default: 7200 (2 hours).
+# shuffle_cache_ttl_secs = 7200
+
 # Logging configuration (optional, defaults below).
 # The RUST_LOG environment variable, if set, takes precedence over level.
 [logging]

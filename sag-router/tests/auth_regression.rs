@@ -58,6 +58,7 @@ async fn build_protected_state() -> AppState {
         backoff: BackoffConfig::default(),
         providers,
         logging: sag_config::LoggingConfig::default(),
+        shuffle_cache_ttl_secs: 7200,
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),
@@ -86,6 +87,7 @@ async fn build_protected_state() -> AppState {
         providers: Arc::new(RwLock::new(registry)),
         collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
         route_counters: Arc::new(RwLock::new(HashMap::new())),
+        fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
         route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
     }
 }

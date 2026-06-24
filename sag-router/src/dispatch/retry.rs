@@ -29,18 +29,21 @@ pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) ->
 /// Result of running the retry loop. Dispatchers use the distinction between
 /// retry exhaustion and non-retryable failures to update route target circuit
 /// state only when a target has actually spent its retry budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// [`Exhausted`](RetryOutcome::Exhausted) carries the last error so the
+/// caller can select an appropriate circuit-breaker open-duration.
+#[derive(Debug)]
 pub enum RetryOutcome<T> {
     Success(T),
     NonRetryable,
-    Exhausted,
+    Exhausted(AppError),
 }
 
 impl<T> RetryOutcome<T> {
     pub fn into_option(self) -> Option<T> {
         match self {
             Self::Success(value) => Some(value),
-            Self::NonRetryable | Self::Exhausted => None,
+            Self::NonRetryable | Self::Exhausted(_) => None,
         }
     }
 }
@@ -123,12 +126,12 @@ where
                 }
                 if attempt == max_retries {
                     errors.push(format!("{label}: {err} (retries exhausted)"));
-                    return RetryOutcome::Exhausted;
+                    return RetryOutcome::Exhausted(err);
                 }
             }
         }
     }
-    RetryOutcome::Exhausted
+    RetryOutcome::Exhausted(AppError::Internal("unreachable".into()))
 }
 
 /// Whether an error should trigger a retry on the same provider, or fall

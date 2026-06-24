@@ -3,6 +3,32 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+/// Circuit breaker open-duration hint extracted from an upstream error.
+///
+/// [`AppError::circuit_open_duration_secs`] returns one of these
+/// categories so the dispatch layer can choose an appropriate cooldown
+/// without string-matching on error bodies at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitHint {
+    /// Quota / billing exhausted — long cooldown (default 1 hour).
+    QuotaExhausted,
+    /// Rate-limited (HTTP 429) — short cooldown (default 10 seconds).
+    RateLimited,
+    /// Generic retryable failure — default cooldown (60 seconds).
+    Generic,
+}
+
+impl CircuitHint {
+    /// Default open-duration in seconds for each hint category.
+    pub fn default_duration_secs(self) -> u64 {
+        match self {
+            CircuitHint::QuotaExhausted => 3600,
+            CircuitHint::RateLimited => 10,
+            CircuitHint::Generic => 60,
+        }
+    }
+}
+
 /// Unified error type for the entire gateway.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -45,6 +71,40 @@ pub enum AppError {
     /// Convert anyhow errors explicitly (no auto-From).
     #[error("{0}")]
     Anyhow(#[from] anyhow::Error),
+}
+
+impl AppError {
+    /// Classify the error for circuit-breaker open-duration selection.
+    ///
+    /// - HTTP 429 with a body hinting at quota/billing → [`CircuitHint::QuotaExhausted`]
+    /// - HTTP 429 without quota language → [`CircuitHint::RateLimited`]
+    /// - Everything else → [`CircuitHint::Generic`]
+    pub fn circuit_hint(&self) -> CircuitHint {
+        match self {
+            AppError::Upstream {
+                status: 429, body, ..
+            } => {
+                let lower = body.to_lowercase();
+                if lower.contains("quota")
+                    || lower.contains("billing")
+                    || lower.contains("insufficient")
+                    || lower.contains("exceeded")
+                    || lower.contains("usage limit")
+                    || lower.contains("current quota")
+                {
+                    CircuitHint::QuotaExhausted
+                } else if lower.contains("rate limit") {
+                    CircuitHint::RateLimited
+                } else {
+                    // Unknown 429 — default to 60 s. A 10 s cooldown for
+                    // a quota-exhaustion 429 we didn't recognise would
+                    // hammer the upstream for an hour straight.
+                    CircuitHint::Generic
+                }
+            }
+            _ => CircuitHint::Generic,
+        }
+    }
 }
 
 impl IntoResponse for AppError {

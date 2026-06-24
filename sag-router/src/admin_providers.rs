@@ -475,6 +475,7 @@ mod tests {
             providers,
             logging: sag_config::LoggingConfig::default(),
             routes,
+            shuffle_cache_ttl_secs: 7200,
         };
         let handle = ConfigHandle::from_config(config);
 
@@ -492,6 +493,7 @@ mod tests {
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
             route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         }
     }
@@ -786,6 +788,7 @@ targets = [
             providers: Arc::new(RwLock::new(registry)),
             collector: Arc::new(CallLogCollector::new_memory().await.unwrap()),
             route_counters: Arc::new(RwLock::new(HashMap::new())),
+            fill_first_orders: Arc::new(RwLock::new(HashMap::new())),
             route_circuit_breaker: Arc::new(RwLock::new(Default::default())),
         };
         let app = test_app(state);

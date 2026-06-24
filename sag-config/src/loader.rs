@@ -895,6 +895,7 @@ base_url = "https://api.anthropic.com"
             retries: 2,
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
+            shuffle_cache_ttl_secs: 7200,
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1057,6 +1058,7 @@ key_strategy = "round_robin"
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
             routes: vec![],
+            shuffle_cache_ttl_secs: 7200,
         };
 
         save_config_to_file(&config, &path).unwrap();
@@ -1210,6 +1212,7 @@ targets = [
             retries: 2,
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
+            shuffle_cache_ttl_secs: 7200,
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1276,6 +1279,7 @@ targets = [
             retries: 2,
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
+            shuffle_cache_ttl_secs: 7200,
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1332,6 +1336,7 @@ targets = [
             retries: 2,
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
+            shuffle_cache_ttl_secs: 7200,
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
                 api_endpoint: "/chat/completions".into(),
@@ -1527,6 +1532,7 @@ targets = [
             backoff: BackoffConfig::default(),
             logging: LoggingConfig::default(),
             routes: vec![],
+            shuffle_cache_ttl_secs: 7200,
         }
     }
 

@@ -22,6 +22,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sag_config::Strategy;
 use sag_core::{AppError, CallLog, ChatCompletionRequest, Usage};
 use tracing::{error, info};
 
@@ -42,8 +43,8 @@ pub use resolve::resolve_route;
 /// A single resolved fallback target: (provider, real_model, extra, retries).
 pub type ResolvedTarget = (String, String, HashMap<String, serde_json::Value>, u32);
 
-/// Resolved route data: (ordered targets, configured `api_endpoint`).
-pub type ResolvedRoute = (Vec<ResolvedTarget>, String);
+/// Resolved route data: (ordered targets, configured `api_endpoint`, strategy).
+pub type ResolvedRoute = (Vec<ResolvedTarget>, String, Strategy);
 
 /// Bundled parameters for a single dispatch call. Replaces the 7–8
 /// argument lists on [`dispatch_chat`] / [`dispatch_image`] so the
@@ -57,40 +58,128 @@ pub struct DispatchCtx<'a> {
     pub trace_id: uuid::Uuid,
     pub start: Instant,
     pub errors: &'a mut Vec<String>,
+    /// The route's target-selection strategy. Used by the dispatch loop
+    /// to decide whether to skip penalized targets (FillFirst) or
+    /// include them in rotation (RoundRobin).
+    pub strategy: Strategy,
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // Circuit breaker helpers — shared across the dispatch submodules.
 // ═══════════════════════════════════════════════════════════════════
 
-pub(in crate::dispatch) async fn circuit_allows_target(
+/// Result of checking a target against the circuit breaker.
+///
+/// Replaces the previous `Option<RouteTargetKey>` return — callers now
+/// match on the reason a target was skipped instead of string-matching
+/// on error messages to detect penalized targets.
+#[derive(Debug)]
+pub(in crate::dispatch) enum TargetAvailability {
+    /// Target is healthy and may be tried.
+    Allowed(RouteTargetKey),
+    /// Circuit is still open (inside the cooldown window).
+    CircuitOpen,
+    /// FillFirst penalized — circuit closed but target not yet
+    /// promoted back to primary.
+    Penalized,
+}
+
+/// Check whether a target is available (circuit closed, not penalized).
+/// Returns the decision enum instead of a bare Option so callers can
+/// distinguish the skip reason without string-matching on error messages.
+pub(in crate::dispatch) async fn circuit_check_target(
     state: &AppState,
     model: &str,
     provider_name: &str,
     real_model: &str,
-    errors: &mut Vec<String>,
-) -> Option<RouteTargetKey> {
+    strategy: Strategy,
+) -> TargetAvailability {
     let circuit_key = RouteTargetKey::new(model, provider_name, real_model);
-    let remaining = state
-        .route_circuit_breaker
-        .read()
-        .await
-        .open_remaining(&circuit_key);
+    let breaker = state.route_circuit_breaker.read().await;
 
-    if let Some(remaining) = remaining {
+    // Still-open circuit → unconditionally skip.
+    if let Some(remaining) = breaker.open_remaining(&circuit_key) {
         info!(
             provider = %provider_name,
             real_model = %real_model,
             remaining_ms = remaining.as_millis() as u64,
             "skipping open route target circuit"
         );
-        errors.push(format!(
-            "{provider_name}/{real_model}: circuit open ({}ms remaining)",
-            remaining.as_millis()
-        ));
-        None
-    } else {
-        Some(circuit_key)
+        return TargetAvailability::CircuitOpen;
+    }
+
+    // FillFirst: skip penalized targets in the first pass.
+    if strategy == Strategy::FillFirst && breaker.is_penalized(model, &circuit_key) {
+        info!(
+            provider = %provider_name,
+            real_model = %real_model,
+            "skipping penalized route target (fill-first)"
+        );
+        return TargetAvailability::Penalized;
+    }
+
+    TargetAvailability::Allowed(circuit_key)
+}
+
+/// Two-pass dispatch state machine shared by [`dispatch_chat`] and
+/// [`dispatch_image`]. Handles the FillFirst penalized-target lifecycle
+/// so dispatch loops don't duplicate pass-management logic.
+pub(in crate::dispatch) struct TargetPass {
+    strategy: Strategy,
+    pass: u32,
+    penalized_skipped: bool,
+    max_pass: u32,
+}
+
+impl TargetPass {
+    pub fn new(strategy: Strategy) -> Self {
+        let max_pass = if strategy == Strategy::FillFirst {
+            2
+        } else {
+            1
+        };
+        Self {
+            strategy,
+            pass: 0,
+            penalized_skipped: false,
+            max_pass,
+        }
+    }
+
+    /// Track that a target was skipped on the current pass.
+    pub fn record_skip(&mut self, availability: &TargetAvailability) {
+        if self.pass == 0 && matches!(availability, TargetAvailability::Penalized) {
+            self.penalized_skipped = true;
+        }
+    }
+
+    /// Advance to the next pass, clearing penalized targets if
+    /// entering pass 2. Returns `true` if there are more targets
+    /// to try, `false` if dispatch is done.
+    pub async fn advance(
+        &mut self,
+        state: &AppState,
+        model: &str,
+        errors: &mut Vec<String>,
+    ) -> bool {
+        if self.pass + 1 >= self.max_pass {
+            return false;
+        }
+        // FillFirst: only enter pass 2 if pass 1 actually skipped
+        // penalized targets (otherwise every target was already tried).
+        if self.strategy == Strategy::FillFirst && self.pass == 0 && !self.penalized_skipped {
+            return false;
+        }
+        self.pass += 1;
+        if self.pass == 1 {
+            state
+                .route_circuit_breaker
+                .write()
+                .await
+                .clear_penalized(model);
+            errors.push("clearing penalized targets for retry".into());
+        }
+        true
     }
 }
 
@@ -108,8 +197,19 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
                 .close(&circuit_key);
             Some(value)
         }
-        RetryOutcome::Exhausted => {
-            state.route_circuit_breaker.write().await.open(circuit_key);
+        RetryOutcome::Exhausted(last_err) => {
+            let hint = last_err.circuit_hint();
+            let duration_secs = hint.default_duration_secs();
+            info!(
+                hint = ?hint,
+                duration_secs,
+                "opening circuit with error-based duration"
+            );
+            state
+                .route_circuit_breaker
+                .write()
+                .await
+                .open(circuit_key, duration_secs);
             None
         }
         RetryOutcome::NonRetryable => None,
