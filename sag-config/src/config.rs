@@ -411,6 +411,12 @@ pub struct ProviderConfig {
     /// or provider-specific parameters).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub body_overrides: HashMap<String, serde_json::Value>,
+    /// Role mapping table: maps request roles to upstream-supported roles.
+    /// For example, `{ "developer" = "system" }` converts all developer
+    /// messages to system messages. Keys and values are case-sensitive.
+    /// Empty by default — no mapping applied.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub role_mappings: HashMap<String, String>,
     /// Whether this provider is enabled. When `false`, the provider is skipped
     /// during routing and shown as disabled in the admin UI.
     #[serde(default = "default_true")]
@@ -946,6 +952,42 @@ targets = [
         assert!(result.is_ok(), "real_model should be optional");
         let config = result.unwrap();
         assert!(config.routes[0].targets[0].real_model.is_none());
+    }
+
+    #[test]
+    fn role_mappings_defaults_to_empty() {
+        let config: ProviderConfig = toml::from_str(r#"api_keys = ["sk-test"]"#).unwrap();
+        assert!(config.role_mappings.is_empty());
+    }
+
+    #[test]
+    fn role_mappings_parses_valid_mapping() {
+        let config: ProviderConfig = toml::from_str(
+            r#"
+api_keys = ["sk-test"]
+role_mappings = { "developer" = "system", "user" = "assistant" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.role_mappings["developer"], "system");
+        assert_eq!(config.role_mappings["user"], "assistant");
+        assert_eq!(config.role_mappings.len(), 2);
+    }
+
+    #[test]
+    fn role_mappings_empty_with_other_fields_is_backward_compatible() {
+        let config: ProviderConfig = toml::from_str(
+            r#"
+api_keys = ["sk-test"]
+base_url = "https://custom.example.com/v1"
+timeout_secs = 60
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(config.role_mappings.is_empty());
+        assert_eq!(config.base_url, "https://custom.example.com/v1");
+        assert!(!config.enabled);
     }
 
     mod validate_tests {

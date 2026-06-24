@@ -21,6 +21,16 @@
 - 内容块转换为 Anthropic 的格式
 - 认证使用 `x-api-key` 请求头
 
+## 角色映射
+
+某些 LLM 供应商不支持 OpenAI 的所有角色（如 `developer`）。角色映射功能允许将请求中的角色名映射为上游供应商支持的角色。
+
+- **配置方式**：在 `[providers.<name>]` 下设置 `role_mappings` 字段
+- **行为**：键值对匹配，大小写敏感，空映射时零开销
+- **示例**：`role_mappings = { "developer" = "system" }` 将所有 `developer` 消息转为 `system`
+
+**边界情况**：Anthropic 仅接受单条 system prompt。如果映射后产生多条 system 消息（例如原始请求同时包含 `system` 和 `developer` 消息且映射 `developer → system`），只有第一条 system 消息生效，其余被丢弃。这是 Anthropic Messages API 的约束。
+
 ## 自定义供应商
 
 实现 `LlmProvider` trait 以添加对其他供应商的支持：

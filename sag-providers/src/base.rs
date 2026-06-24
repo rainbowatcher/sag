@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use reqwest::RequestBuilder;
 use reqwest::header::CONTENT_TYPE;
 use sag_config::{KeyStrategy, ProviderConfig};
-use sag_core::AppError;
+use sag_core::{AppError, ChatMessage};
 use tracing::{debug, trace, warn};
 
 use crate::{apply_body_overrides, apply_headers};
@@ -25,6 +25,7 @@ pub struct ProviderBase {
     pub http_client: reqwest::Client,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
+    role_mappings: HashMap<String, String>,
 }
 
 impl ProviderBase {
@@ -51,6 +52,7 @@ impl ProviderBase {
             http_client,
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
+            role_mappings: config.role_mappings.clone(),
         }
     }
 
@@ -193,5 +195,91 @@ impl ProviderBase {
             });
         }
         Ok(response)
+    }
+
+    /// Apply role mappings to a mutable slice of chat messages.
+    ///
+    /// Messages whose role matches a key in `role_mappings` get their
+    /// role replaced with the corresponding value. Non-matching messages
+    /// are unchanged. Early-returns when role_mappings is empty.
+    /// Returns `true` if any role mappings are configured.
+    pub fn has_role_mappings(&self) -> bool {
+        !self.role_mappings.is_empty()
+    }
+
+    pub fn apply_role_mappings(&self, messages: &mut [ChatMessage]) {
+        if self.role_mappings.is_empty() {
+            return;
+        }
+        for msg in messages.iter_mut() {
+            if let Some(new_role) = self.role_mappings.get(&msg.role) {
+                msg.role = new_role.clone();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_base(role_mappings: HashMap<String, String>) -> ProviderBase {
+        let config = ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            provider_type: sag_config::ProviderType::OpenAI,
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://example.com".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 30,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            enabled: true,
+            enabled_models: Vec::new(),
+            role_mappings,
+        };
+        ProviderBase::new("test".into(), &config)
+    }
+
+    fn msg(role: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: serde_json::Value::String("content".into()),
+            name: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn empty_mappings_does_nothing() {
+        let base = make_base(HashMap::new());
+        let mut msgs = vec![msg("developer")];
+        base.apply_role_mappings(&mut msgs);
+        assert_eq!(msgs[0].role, "developer");
+    }
+
+    #[test]
+    fn replaces_matching_role() {
+        let base = make_base([("developer".into(), "system".into())].into());
+        let mut msgs = vec![msg("developer")];
+        base.apply_role_mappings(&mut msgs);
+        assert_eq!(msgs[0].role, "system");
+    }
+
+    #[test]
+    fn skips_non_matching_roles() {
+        let base = make_base([("developer".into(), "system".into())].into());
+        let mut msgs = vec![msg("user"), msg("assistant")];
+        base.apply_role_mappings(&mut msgs);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn partial_map_leaves_others_unchanged() {
+        let base = make_base([("developer".into(), "system".into())].into());
+        let mut msgs = vec![msg("developer"), msg("user")];
+        base.apply_role_mappings(&mut msgs);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
     }
 }

@@ -367,7 +367,13 @@ impl LlmProvider for AnthropicProvider {
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
-        let upstream = Self::to_anthropic_request(request, real_model);
+        let upstream = if self.base.has_role_mappings() {
+            let mut req = request.clone();
+            self.base.apply_role_mappings(&mut req.messages);
+            Self::to_anthropic_request(&req, real_model)
+        } else {
+            Self::to_anthropic_request(request, real_model)
+        };
 
         if !request.extra.is_empty() {
             let keys: Vec<&str> = request.extra.keys().map(|s| s.as_str()).collect();
@@ -404,7 +410,13 @@ impl LlmProvider for AnthropicProvider {
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
-        let mut upstream = Self::to_anthropic_request(request, real_model);
+        let mut upstream = if self.base.has_role_mappings() {
+            let mut req = request.clone();
+            self.base.apply_role_mappings(&mut req.messages);
+            Self::to_anthropic_request(&req, real_model)
+        } else {
+            Self::to_anthropic_request(request, real_model)
+        };
         upstream.stream = Some(true);
 
         if !request.extra.is_empty() {
@@ -510,5 +522,73 @@ mod tests {
         assert_eq!(usage.output_tokens, 300);
         assert!(usage.cache_read_input_tokens.is_none());
         assert!(usage.cache_creation_input_tokens.is_none());
+    }
+
+    #[test]
+    fn to_anthropic_request_maps_developer_to_system_when_mapped() {
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![ChatMessage {
+            role: "developer".into(),
+            content: serde_json::Value::String("you are helpful".into()),
+            name: None,
+            extra: serde_json::Map::new(),
+        }];
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        // Without mapping, developer would NOT be extracted as system
+        assert_eq!(anthropic_req.system, None);
+        // developer falls through to else → "user"
+        assert_eq!(anthropic_req.messages[0].role, "user");
+    }
+
+    #[test]
+    fn to_anthropic_request_developer_becomes_user_by_default() {
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![ChatMessage {
+            role: "developer".into(),
+            content: serde_json::Value::String("you are helpful".into()),
+            name: None,
+            extra: serde_json::Map::new(),
+        }];
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        // In the absence of role mappings, developer messages are treated as
+        // "user" by Anthropic's adapter (the else branch).
+        assert_eq!(anthropic_req.messages[0].role, "user");
+    }
+
+    #[test]
+    fn to_anthropic_request_extracts_system_from_mapped_developer() {
+        // Simulate what happens AFTER apply_role_mappings: developer → system
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![ChatMessage {
+            role: "system".into(), // already mapped
+            content: serde_json::Value::String("you are helpful".into()),
+            name: None,
+            extra: serde_json::Map::new(),
+        }];
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        assert_eq!(anthropic_req.system, Some("you are helpful".into()));
+        assert!(anthropic_req.messages.is_empty());
+    }
+
+    #[test]
+    fn to_anthropic_request_deduplicates_multiple_system_messages() {
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: serde_json::Value::String("first system".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            },
+            ChatMessage {
+                role: "system".into(),
+                content: serde_json::Value::String("second system".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            },
+        ];
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        // Only the first system message is kept
+        assert_eq!(anthropic_req.system, Some("first system".into()));
     }
 }

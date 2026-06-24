@@ -50,6 +50,8 @@ impl LlmProvider for OpenAiProvider {
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<ChatCompletionResponse> {
         let mut upstream_request = request.clone();
+        self.base
+            .apply_role_mappings(&mut upstream_request.messages);
         upstream_request.model = real_model.to_string();
 
         if !request.extra.is_empty() {
@@ -105,6 +107,8 @@ impl LlmProvider for OpenAiProvider {
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream_request = request.clone();
+        self.base
+            .apply_role_mappings(&mut upstream_request.messages);
         upstream_request.model = real_model.to_string();
         upstream_request.stream = Some(true);
 

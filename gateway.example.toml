@@ -69,11 +69,15 @@ api_keys = [
 api_keys = ["sk-your-openai-api-key"]
 base_url = "https://api.openai.com/v1"
 timeout_secs = 120
+# 角色映射：将不支持的角色映射为兼容角色
+# role_mappings = { "developer" = "system" }
 
 [providers.anthropic]
 api_keys = ["sk-ant-your-anthropic-api-key"]
 base_url = "https://api.anthropic.com/v1"
 timeout_secs = 120
+# 角色映射：将不支持的角色映射为兼容角色
+# role_mappings = { "developer" = "system" }
 
 # Custom headers override or add to the default request headers.
 # [providers.my-custom.headers]
