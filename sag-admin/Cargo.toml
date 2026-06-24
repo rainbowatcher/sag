@@ -1,0 +1,27 @@
+[package]
+name = "sag-admin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Admin REST API CRUD handlers for SAG"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+sag-core = { path = "../sag-core" }
+sag-config = { path = "../sag-config" }
+sag-providers = { path = "../sag-providers" }
+sag-analytics = { path = "../sag-analytics" }
+sag-dispatch = { path = "../sag-dispatch" }
+
+[dev-dependencies]
+http-body-util = "0.1"
