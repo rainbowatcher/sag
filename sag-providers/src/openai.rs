@@ -88,6 +88,11 @@ impl LlmProvider for OpenAiProvider {
                 .and_then(|v| v.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
+            usage.cache_creation_tokens = raw_usage
+                .get("prompt_tokens_details")
+                .and_then(|v| v.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
             usage.reasoning_tokens = raw_usage
                 .get("completion_tokens_details")
                 .and_then(|v| v.get("reasoning_tokens"))

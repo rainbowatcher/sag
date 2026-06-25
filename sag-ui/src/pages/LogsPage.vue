@@ -89,7 +89,7 @@ function fmtTps(row: CallLog): string | null {
 /** Per-request cache hit rate: cached_tokens / prompt_tokens, or null if not applicable. */
 function cacheHitRate(row: CallLog): number | null {
   const usage = row.usage
-  if (!usage || !usage.prompt_tokens || !row.cached_tokens) return null
+  if (!usage || !usage.prompt_tokens || row.cached_tokens == null) return null
   return row.cached_tokens / usage.prompt_tokens
 }
 </script>

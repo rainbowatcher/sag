@@ -82,23 +82,46 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
         let raw = format!("data: {json_str}\n\n").into_bytes();
         let _ = tx.send(StreamChunk::Data(raw));
 
-        // Try to extract token usage from the JSON payload
+        // Try to extract token usage from the JSON payload.
+        //
+        // Each token count field is extracted independently with a
+        // default of 0 so that cache/reasoning metadata is still
+        // captured even when upstream omits one of the counts
+        // (e.g. nvidia/glm sometimes omits completion_tokens from
+        // intermediate usage chunks).
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
             && let Some(usage_val) = val.get("usage")
             && !usage_val.is_null()
-            && let (Some(pt), Some(ct)) = (
-                usage_val.get("prompt_tokens").and_then(|v| v.as_u64()),
-                usage_val.get("completion_tokens").and_then(|v| v.as_u64()),
-            )
         {
+            let pt = usage_val
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let ct = usage_val
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+
+            // Skip entirely-zero usage objects to avoid noise; partial
+            // data (e.g. prompt_tokens present but completion_tokens
+            // absent) is still valuable for cache/reasoning extraction.
+            if pt == 0 && ct == 0 {
+                continue;
+            }
+
             let total = usage_val
                 .get("total_tokens")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(pt + ct) as u32;
+                .unwrap_or(pt as u64 + ct as u64) as u32;
             // OpenAI nests cache/reasoning tokens inside details objects.
             let cached_tokens = usage_val
                 .get("prompt_tokens_details")
                 .and_then(|v| v.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let cache_creation_tokens = usage_val
+                .get("prompt_tokens_details")
+                .and_then(|v| v.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let reasoning_tokens = usage_val
@@ -107,11 +130,11 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let _ = tx.send(StreamChunk::Usage(Usage {
-                prompt_tokens: pt as u32,
-                completion_tokens: ct as u32,
+                prompt_tokens: pt,
+                completion_tokens: ct,
                 total_tokens: total,
                 cached_tokens,
-                cache_creation_tokens: None,
+                cache_creation_tokens,
                 reasoning_tokens,
             }));
         }
@@ -167,7 +190,7 @@ mod tests {
         );
         assert!(
             usage.cache_creation_tokens.is_none(),
-            "OpenAI does not produce cache_creation_tokens"
+            "absent cache_creation_input_tokens → None"
         );
     }
 
@@ -194,5 +217,121 @@ mod tests {
             .expect("must contain a Usage chunk");
 
         assert_eq!(usage.total_tokens, 100, "80 + 20 fallback");
+    }
+
+    /// When upstream omits `completion_tokens` but includes
+    /// `prompt_tokens` and nested cache fields, `cached_tokens` must
+    /// still be extracted and `completion_tokens` defaults to 0.
+    #[test]
+    fn cached_tokens_extracted_when_completion_tokens_absent() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // nvidia/glm-style chunk: has prompt_tokens and cached_tokens
+        // but no completion_tokens field.
+        let frame = b"data: {\"usage\":{\"prompt_tokens\":500,\"prompt_tokens_details\":{\"cached_tokens\":400}}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Data + Usage");
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+
+        assert_eq!(usage.prompt_tokens, 500);
+        assert_eq!(usage.completion_tokens, 0, "default to 0 when absent");
+        assert_eq!(usage.total_tokens, 500, "prompt + 0 fallback");
+        assert_eq!(usage.cached_tokens, Some(400));
+    }
+
+    /// When upstream omits `prompt_tokens` but includes `completion_tokens`,
+    /// cached_tokens should still be extracted (symmetric test).
+    #[test]
+    fn cached_tokens_extracted_when_prompt_tokens_absent() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"usage\":{\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":200}}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Data + Usage");
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+
+        assert_eq!(usage.prompt_tokens, 0, "default to 0 when absent");
+        assert_eq!(usage.completion_tokens, 30);
+        assert_eq!(usage.total_tokens, 30, "0 + completion fallback");
+        assert_eq!(usage.cached_tokens, Some(200));
+    }
+
+    /// An entirely-zero usage object (pt=0, ct=0) should NOT produce a
+    /// Usage chunk — it's noise.
+    #[test]
+    fn all_zero_usage_is_skipped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        // Should only have the Data chunk, no Usage chunk.
+        assert_eq!(chunks.len(), 1, "only Data, no Usage for all-zero");
+        assert!(matches!(chunks[0], StreamChunk::Data(_)));
+    }
+
+    /// `cache_creation_input_tokens` from `prompt_tokens_details` must
+    /// be lifted into `Usage.cache_creation_tokens`.
+    #[test]
+    fn cache_creation_input_tokens_extracted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":30,\"cache_creation_input_tokens\":70}}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.cached_tokens, Some(30));
+        assert_eq!(
+            usage.cache_creation_tokens,
+            Some(70),
+            "must be lifted from prompt_tokens_details.cache_creation_input_tokens"
+        );
     }
 }
