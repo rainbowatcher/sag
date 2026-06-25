@@ -135,6 +135,7 @@ pub async fn create_route(
             model_name: req.model_name.clone(),
             api_endpoint: req.api_endpoint,
             retries: req.retries,
+            timeout_secs: None,
             strategy: req.strategy.unwrap_or_default(),
             targets: req
                 .targets
@@ -143,6 +144,7 @@ pub async fn create_route(
                     provider: t.provider,
                     real_model: t.real_model,
                     retries: t.retries,
+                    timeout_secs: None,
                     priority: t.priority,
                     extra: t.extra,
                 })
@@ -229,6 +231,7 @@ pub async fn update_route(
                     provider: t.provider,
                     real_model: t.real_model,
                     retries: t.retries,
+                    timeout_secs: None,
                     priority: t.priority,
                     extra: t.extra,
                 })
@@ -504,12 +507,14 @@ mod tests {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),
             retries: None,
+            timeout_secs: None,
             strategy: Strategy::FillFirst,
             targets: vec![RouteTarget {
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 10,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             }],
         }];

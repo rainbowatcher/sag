@@ -44,7 +44,10 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     let backoff = config.backoff.clone();
     let circuit_breaker_cfg = config.circuit_breaker.clone();
 
-    for (provider_name, real_model, target_extra, retries) in targets {
+    for target in targets {
+        let provider_name = &target.provider;
+        let real_model = &target.real_model;
+
         let Some(circuit_key) =
             circuit_allows_target(runtime, &request.model, provider_name, real_model).await
         else {
@@ -57,12 +60,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         };
 
         let real_model = real_model.clone();
-        let target_extra = target_extra.clone();
+        let target_extra = target.extra.clone();
+        let retries = target.retries;
+        let timeout_secs = target.timeout_secs;
         let img_request = img_request.clone();
 
         let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
             provider_name,
-            *retries,
+            retries,
             &backoff,
             errors,
             |_attempt| {
@@ -72,7 +77,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 let img_request = img_request.clone();
                 async move {
                     provider
-                        .chat_image(&img_request, &real_model, &target_extra)
+                        .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
                         .await
                 }
             },
@@ -212,6 +217,7 @@ mod tests {
             _real_model: &str,
             _api_endpoint: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
         ) -> sag_core::Result<ChatCompletionResponse> {
             unreachable!("image dispatch should not call chat")
         }
@@ -222,6 +228,7 @@ mod tests {
             _real_model: &str,
             _api_endpoint: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
         ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
             unreachable!("image dispatch should not call chat_stream")
         }
@@ -231,6 +238,7 @@ mod tests {
             _request: &ImageGenerationRequest,
             _real_model: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
         ) -> sag_core::Result<ImageGenerationResponse> {
             self.image_calls.fetch_add(1, Ordering::SeqCst);
             match self.image_queue.lock().unwrap().pop_front() {

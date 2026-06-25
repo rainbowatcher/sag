@@ -48,6 +48,7 @@ impl LlmProvider for OpenAiProvider {
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<ChatCompletionResponse> {
         let mut upstream_request = request.clone();
         self.base
@@ -63,11 +64,16 @@ impl LlmProvider for OpenAiProvider {
 
         let body = serde_json::to_value(&upstream_request)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
-
         let (auth_name, auth_value) = self.auth_header();
         let body_text = self
             .base
-            .send_json(&url, body, target_extra, &[(auth_name, &auth_value)])
+            .send_json(
+                &url,
+                body,
+                target_extra,
+                &[(auth_name, &auth_value)],
+                Some(timeout_secs),
+            )
             .await?;
 
         let mut completion: ChatCompletionResponse = serde_json::from_str(&body_text)
@@ -110,6 +116,7 @@ impl LlmProvider for OpenAiProvider {
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream_request = request.clone();
         self.base
@@ -135,7 +142,13 @@ impl LlmProvider for OpenAiProvider {
         let (auth_name, auth_value) = self.auth_header();
         let response = self
             .base
-            .send_json_stream(&url, body, target_extra, &[(auth_name, &auth_value)])
+            .send_json_stream(
+                &url,
+                body,
+                target_extra,
+                &[(auth_name, &auth_value)],
+                Some(timeout_secs),
+            )
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
@@ -191,6 +204,7 @@ impl LlmProvider for OpenAiProvider {
         request: &ImageGenerationRequest,
         real_model: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<ImageGenerationResponse> {
         let mut upstream = request.clone();
         upstream.model = real_model.to_string();
@@ -203,7 +217,13 @@ impl LlmProvider for OpenAiProvider {
         let (auth_name, auth_value) = self.auth_header();
         let body_text = self
             .base
-            .send_json(&url, body, target_extra, &[(auth_name, &auth_value)])
+            .send_json(
+                &url,
+                body,
+                target_extra,
+                &[(auth_name, &auth_value)],
+                Some(timeout_secs),
+            )
             .await?;
 
         serde_json::from_str(&body_text).map_err(|e| {

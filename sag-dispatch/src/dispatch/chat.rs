@@ -53,7 +53,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     let circuit_breaker_cfg = config.circuit_breaker.clone();
     let api_endpoint = api_endpoint.to_string();
 
-    for (provider_name, real_model, target_extra, retries) in targets {
+    for target in targets {
+        let provider_name = &target.provider;
+        let real_model = &target.real_model;
+
         let Some(circuit_key) =
             circuit_allows_target(runtime, &request.model, provider_name, real_model).await
         else {
@@ -68,11 +71,13 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         // Clone per-target values once so the retry closure can cheaply clone
         // them for each attempt.
         let real_model = real_model.clone();
-        let target_extra = target_extra.clone();
+        let target_extra = target.extra.clone();
+        let retries = target.retries;
+        let timeout_secs = target.timeout_secs;
 
         let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
             provider_name,
-            *retries,
+            retries,
             &backoff,
             errors,
             |_attempt| {
@@ -86,12 +91,24 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     let upstream_start = std::time::Instant::now();
                     if is_stream {
                         provider
-                            .chat_stream(request, &real_model, &api_endpoint, &target_extra)
+                            .chat_stream(
+                                request,
+                                &real_model,
+                                &api_endpoint,
+                                &target_extra,
+                                timeout_secs,
+                            )
                             .await
                             .map(|s| ChatAttempt::Stream(Box::pin(s), upstream_start))
                     } else {
                         provider
-                            .chat(request, &real_model, &api_endpoint, &target_extra)
+                            .chat(
+                                request,
+                                &real_model,
+                                &api_endpoint,
+                                &target_extra,
+                                timeout_secs,
+                            )
                             .await
                             .map(|r| ChatAttempt::NonStream(r, upstream_start))
                     }
@@ -245,6 +262,7 @@ mod tests {
             _real_model: &str,
             _api_endpoint: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
         ) -> sag_core::Result<ChatCompletionResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             match self.chat_queue.lock().unwrap().pop_front() {
@@ -267,6 +285,7 @@ mod tests {
             _real_model: &str,
             _api_endpoint: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
         ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
             match self.stream_queue.lock().unwrap().pop_front() {
@@ -688,6 +707,7 @@ mod tests {
                         real_model: None,
                         priority: 10,
                         retries: Some(0),
+                        timeout_secs: None,
                         extra: HashMap::new(),
                     },
                     sag_config::RouteTarget {
@@ -695,10 +715,12 @@ mod tests {
                         real_model: None,
                         priority: 5,
                         retries: Some(0),
+                        timeout_secs: None,
                         extra: HashMap::new(),
                     },
                 ],
                 retries: None,
+                timeout_secs: None,
             }],
             ..sag_config::gateway_config_base!()
         };
@@ -737,7 +759,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(resolved_targets[0].0, "second");
+        assert_eq!(resolved_targets[0].provider, "second");
 
         // Dispatch
         let mut errors = Vec::new();

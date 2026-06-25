@@ -136,18 +136,22 @@ impl ProviderBase {
     ///
     /// Combines `build_request` + `send` + `check_upstream_error`. Used by
     /// `chat()` and `chat_image()`.
+    ///
+    /// `timeout_secs` overrides the client-level timeout for this request
+    /// when `Some`. When `None`, the client-level timeout applies.
     pub async fn send_json(
         &self,
         url: &str,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
         extra_headers: &[(&str, &str)],
+        timeout_secs: Option<u64>,
     ) -> sag_core::Result<String> {
-        let response = self
-            .build_request(url, body, target_extra, extra_headers)
-            .send()
-            .await
-            .map_err(AppError::from)?;
+        let mut request = self.build_request(url, body, target_extra, extra_headers);
+        if let Some(secs) = timeout_secs {
+            request = request.timeout(std::time::Duration::from_secs(secs));
+        }
+        let response = request.send().await.map_err(AppError::from)?;
         let body_text = self.check_upstream_error(response).await?;
         trace!(response_body = %body_text, "upstream response body");
         Ok(body_text)
@@ -157,18 +161,22 @@ impl ProviderBase {
     ///
     /// Combines `build_request` + `send` + `ensure_success`. Used by
     /// `chat_stream()`.
+    ///
+    /// `timeout_secs` overrides the client-level timeout for this request
+    /// when `Some`. When `None`, the client-level timeout applies.
     pub async fn send_json_stream(
         &self,
         url: &str,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
         extra_headers: &[(&str, &str)],
+        timeout_secs: Option<u64>,
     ) -> sag_core::Result<reqwest::Response> {
-        let response = self
-            .build_request(url, body, target_extra, extra_headers)
-            .send()
-            .await
-            .map_err(AppError::from)?;
+        let mut request = self.build_request(url, body, target_extra, extra_headers);
+        if let Some(secs) = timeout_secs {
+            request = request.timeout(std::time::Duration::from_secs(secs));
+        }
+        let response = request.send().await.map_err(AppError::from)?;
         let response = self.ensure_success(response).await?;
         trace!("upstream stream connection established");
         debug!(

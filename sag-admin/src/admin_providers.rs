@@ -546,6 +546,7 @@ mod tests {
                 model_name: "gpt-4o".into(),
                 api_endpoint: "/chat/completions".into(),
                 retries: None,
+                timeout_secs: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![
                     RouteTarget {
@@ -553,12 +554,14 @@ mod tests {
                         real_model: Some("gpt-4o".into()),
                         priority: 1,
                         retries: None,
+                        timeout_secs: None,
                         extra: HashMap::new(),
                     },
                     RouteTarget {
                         provider: "anthropic".into(),
                         real_model: Some("claude-3-5-sonnet".into()),
                         retries: None,
+                        timeout_secs: None,
                         extra: HashMap::new(),
                         priority: 2,
                     },
@@ -568,11 +571,13 @@ mod tests {
                 model_name: "claude-sonnet".into(),
                 api_endpoint: "/chat/completions".into(),
                 retries: None,
+                timeout_secs: None,
                 strategy: Strategy::FillFirst,
                 targets: vec![RouteTarget {
                     provider: "anthropic".into(),
                     extra: HashMap::new(),
                     retries: None,
+                    timeout_secs: None,
                     real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
                 }],

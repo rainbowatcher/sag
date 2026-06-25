@@ -200,6 +200,7 @@ mod tests {
             real_model: None,
             priority,
             retries: None,
+            timeout_secs: None,
             extra: HashMap::new(),
         }
     }
@@ -221,6 +222,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             })
             .collect();
@@ -255,6 +257,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             })
             .collect();
@@ -323,6 +326,7 @@ mod tests {
             real_model: None,
             priority: 0,
             retries: None,
+            timeout_secs: None,
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
         }];
         let targets_b: Vec<RouteTarget> = vec![RouteTarget {
@@ -330,6 +334,7 @@ mod tests {
             real_model: None,
             priority: 0,
             retries: None,
+            timeout_secs: None,
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
         }];
 
@@ -356,6 +361,7 @@ mod tests {
             real_model: None,
             priority: 0,
             retries: Some(1),
+            timeout_secs: None,
             extra: HashMap::new(),
         }];
         let targets_b: Vec<RouteTarget> = vec![RouteTarget {
@@ -363,6 +369,7 @@ mod tests {
             real_model: None,
             priority: 0,
             retries: Some(3),
+            timeout_secs: None,
             extra: HashMap::new(),
         }];
 
@@ -575,6 +582,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
             },
             RouteTarget {
@@ -582,6 +590,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
         ];
@@ -591,6 +600,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
             },
             RouteTarget {
@@ -598,6 +608,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
         ];
@@ -661,6 +672,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: Some(1),
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
             RouteTarget {
@@ -668,6 +680,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
         ];
@@ -677,6 +690,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: Some(5),
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
             RouteTarget {
@@ -684,6 +698,7 @@ mod tests {
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
         ];

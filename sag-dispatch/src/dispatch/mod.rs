@@ -40,8 +40,15 @@ pub use chat::dispatch_chat;
 pub use image::dispatch_image;
 pub use resolve::resolve_route;
 
-/// A single resolved fallback target: (provider, real_model, extra, retries).
-pub type ResolvedTarget = (String, String, HashMap<String, serde_json::Value>, u32);
+/// A single resolved fallback target with effective values after
+/// three-tier fallback resolution.
+pub struct ResolvedTarget {
+    pub provider: String,
+    pub real_model: String,
+    pub extra: HashMap<String, serde_json::Value>,
+    pub retries: u32,
+    pub timeout_secs: u64,
+}
 
 /// Resolved route data: (ordered targets, configured `api_endpoint`, strategy).
 pub type ResolvedRoute = (Vec<ResolvedTarget>, String, Strategy);

@@ -917,11 +917,13 @@ base_url = "https://api.anthropic.com"
                 api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 retries: None,
+                timeout_secs: None,
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
                     real_model: None,
                     priority: 0,
                     retries: None,
+                    timeout_secs: None,
                     extra: HashMap::new(),
                 }],
             }],
@@ -1229,11 +1231,13 @@ targets = [
                 api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 retries: None,
+                timeout_secs: None,
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
                     real_model: None,
                     priority: 0,
                     retries: None,
+                    timeout_secs: None,
                     // Nested null — top-level value is an Object whose
                     // interior contains a Null. The previous flat check
                     // would have missed this.
@@ -1294,11 +1298,13 @@ targets = [
                 api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 retries: None,
+                timeout_secs: None,
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
                     real_model: None,
                     priority: 0,
                     retries: None,
+                    timeout_secs: None,
                     // Null buried inside a top-level array value
                     // (parallel to the object case in the other test).
                     extra: HashMap::from([("list".into(), serde_json::json!([1, null, 3]))]),
@@ -1349,11 +1355,13 @@ targets = [
                 api_endpoint: "/chat/completions".into(),
                 strategy: Strategy::FillFirst,
                 retries: None,
+                timeout_secs: None,
                 targets: vec![RouteTarget {
                     provider: "openai".into(),
                     real_model: None,
                     priority: 0,
                     retries: None,
+                    timeout_secs: None,
                     extra: HashMap::from([("temperature".into(), serde_json::Value::Null)]),
                 }],
             }],
@@ -1687,11 +1695,13 @@ targets = [
             api_endpoint: "/chat/completions".into(),
             strategy: Strategy::FillFirst,
             retries: None,
+            timeout_secs: None,
             targets: vec![RouteTarget {
                 provider: "openai".into(),
                 real_model: None,
                 priority: 0,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             }],
         });

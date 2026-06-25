@@ -520,6 +520,7 @@ impl LlmProvider for AnthropicProvider {
         real_model: &str,
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<ChatCompletionResponse> {
         let upstream = if self.base.has_role_mappings() {
             let mut req = request.clone();
@@ -547,6 +548,7 @@ impl LlmProvider for AnthropicProvider {
                 body,
                 target_extra,
                 &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
+                Some(timeout_secs),
             )
             .await?;
 
@@ -563,6 +565,7 @@ impl LlmProvider for AnthropicProvider {
         real_model: &str,
         _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream = if self.base.has_role_mappings() {
             let mut req = request.clone();
@@ -591,6 +594,7 @@ impl LlmProvider for AnthropicProvider {
                 body,
                 target_extra,
                 &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
+                Some(timeout_secs),
             )
             .await?;
 

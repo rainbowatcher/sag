@@ -25,12 +25,13 @@ use crate::state::{AppState, DispatchRuntime};
 /// Shared test target constructor — avoids copy-paste across chat / image
 /// dispatch test modules.
 pub fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {
-    (
-        provider.into(),
-        real_model.into(),
-        std::collections::HashMap::new(),
+    ResolvedTarget {
+        provider: provider.into(),
+        real_model: real_model.into(),
+        extra: std::collections::HashMap::new(),
         retries,
-    )
+        timeout_secs: 120,
+    }
 }
 
 /// Shared `ProviderConfig` builder for unit tests. Returns a minimal

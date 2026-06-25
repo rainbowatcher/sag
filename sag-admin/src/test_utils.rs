@@ -68,11 +68,13 @@ pub(crate) fn one_provider_config(
             model_name: model.into(),
             api_endpoint: "/chat/completions".into(),
             retries: None,
+            timeout_secs: None,
             strategy: Strategy::FillFirst,
             targets: vec![RouteTarget {
                 provider: name.into(),
                 real_model: Some(real_model.into()),
                 retries: None,
+                timeout_secs: None,
                 priority: prio,
                 extra: HashMap::new(),
             }],

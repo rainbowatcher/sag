@@ -22,6 +22,7 @@ pub trait LlmProvider: Send + Sync {
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<ChatCompletionResponse>;
 
     /// Send a streaming chat completion request. Returns a stream of
@@ -33,6 +34,7 @@ pub trait LlmProvider: Send + Sync {
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
 
     /// Send an image generation request. Returns image URLs or base64 data.
@@ -44,6 +46,7 @@ pub trait LlmProvider: Send + Sync {
         _request: &ImageGenerationRequest,
         _real_model: &str,
         _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
     ) -> sag_core::Result<ImageGenerationResponse> {
         Err(AppError::BadRequest(format!(
             "provider '{}' does not support image generation",

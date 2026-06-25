@@ -76,8 +76,14 @@ pub async fn resolve_route(
     let strategy = route.strategy;
     let api_endpoint = route.api_endpoint.clone();
     let route_retries = route.retries;
+    let route_timeout = route.timeout_secs;
     let global_retries = config_guard.backoff.retries;
     let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
+    let provider_timeouts: HashMap<String, u64> = config_guard
+        .providers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.timeout_secs))
+        .collect();
     drop(config_guard);
 
     // Apply target selection strategy
@@ -92,13 +98,25 @@ pub async fn resolve_route(
     )
     .await;
 
-    // Resolve effective retries per target: target → route → global
+    // Resolve effective retries and timeout per target:
+    // target → route → provider / global
     let resolved: Vec<ResolvedTarget> = ordered
         .into_iter()
         .map(|t| {
             let rm = t.real_model.unwrap_or_else(|| request.model.clone());
             let retries = t.retries.or(route_retries).unwrap_or(global_retries);
-            (t.provider, rm, t.extra, retries)
+            let timeout_secs = t
+                .timeout_secs
+                .or(route_timeout)
+                .or_else(|| provider_timeouts.get(&t.provider).copied())
+                .unwrap_or(sag_config::default_timeout_secs());
+            ResolvedTarget {
+                provider: t.provider,
+                real_model: rm,
+                extra: t.extra,
+                retries,
+                timeout_secs,
+            }
         })
         .collect();
 
@@ -181,6 +199,7 @@ mod tests {
                 real_model: None,
                 priority: 1,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
             RouteTarget {
@@ -188,6 +207,7 @@ mod tests {
                 real_model: None,
                 priority: 1,
                 retries: None,
+                timeout_secs: None,
                 extra: HashMap::new(),
             },
         ];
@@ -206,6 +226,7 @@ mod tests {
             real_model: None,
             priority: 1,
             retries: None,
+            timeout_secs: None,
             extra: HashMap::new(),
         }];
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");

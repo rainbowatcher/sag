@@ -55,10 +55,12 @@ async fn build_protected_state() -> AppState {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),
             retries: None,
+            timeout_secs: None,
             strategy: Strategy::FillFirst,
             targets: vec![RouteTarget {
                 extra: HashMap::new(),
                 retries: None,
+                timeout_secs: None,
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 1,

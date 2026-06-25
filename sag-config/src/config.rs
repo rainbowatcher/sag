@@ -188,6 +188,15 @@ impl GatewayConfig {
                 ));
             }
 
+            if let Some(ts) = route.timeout_secs
+                && ts == 0
+            {
+                errors.push(format!(
+                    "routes[{i}] (model='{}'): timeout_secs must be greater than 0",
+                    route.model_name
+                ));
+            }
+
             if route.targets.is_empty() {
                 errors.push(format!(
                     "routes[{i}] (model='{}'): must have at least one target",
@@ -207,6 +216,14 @@ impl GatewayConfig {
                 {
                     warnings.push(format!(
                         "routes[{i}] (model='{}'): target[{j}] retries={retries} seems unusually high",
+                        route.model_name
+                    ));
+                }
+                if let Some(ts) = target.timeout_secs
+                    && ts == 0
+                {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): target[{j}] timeout_secs must be greater than 0",
                         route.model_name
                     ));
                 }
@@ -616,6 +633,11 @@ pub struct RouteConfig {
     /// When `Some(n)`, each target in this route retries up to `n` times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+    /// Per-target timeout override for this route (seconds).
+    /// When `None` (default), falls back to the target-level, then to the
+    /// provider's `timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// List of targets for this route.
     pub targets: Vec<RouteTarget>,
 }
@@ -662,6 +684,11 @@ pub struct RouteTarget {
     /// settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+    /// Per-target timeout override (seconds).
+    /// When `None`, falls back to the route's `timeout_secs`, then to the
+    /// provider's `timeout_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     /// Per-target extra body fields merged into the upstream JSON body.
     /// Applied after provider-level body_overrides, so target-level
     /// keys take precedence.
@@ -859,6 +886,35 @@ retries = 5
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.backoff.retries, 2);
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeout_secs() {
+        let toml_str = r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+base_url = "https://api.openai.com/v1"
+
+[[routes]]
+model_name = "gpt-4o"
+api_endpoint = "/chat/completions"
+timeout_secs = 0
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 10, timeout_secs = 0 },
+]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let errors = config.validate().unwrap_err();
+        let timeout_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.contains("timeout_secs must be greater than 0"))
+            .collect();
+        assert_eq!(
+            timeout_errors.len(),
+            2,
+            "expected route + target timeout_secs errors, got: {errors:?}"
+        );
     }
 
     #[test]
@@ -1291,6 +1347,7 @@ api_keys = ["sk-test"]
                 api_endpoint: default_api_endpoint(),
                 strategy: Strategy::FillFirst,
                 retries: None,
+                timeout_secs: None,
                 targets: vec![],
             };
             assert!(route.uses_default_api_endpoint());
@@ -1316,6 +1373,7 @@ api_keys = ["sk-test"]
                     real_model: Some("gpt-4".into()),
                     priority: 10,
                     retries: None,
+                    timeout_secs: None,
                     extra: HashMap::new(),
                 },
                 RouteTarget {
@@ -1323,6 +1381,7 @@ api_keys = ["sk-test"]
                     real_model: Some("gpt-4".into()),
                     priority: 5,
                     retries: None,
+                    timeout_secs: None,
                     extra: HashMap::new(),
                 },
             ];
@@ -1348,6 +1407,7 @@ api_keys = ["sk-test"]
                     real_model: Some("gpt-4".into()),
                     priority: 10,
                     retries: None,
+                    timeout_secs: None,
                     extra: HashMap::new(),
                 },
                 RouteTarget {
@@ -1355,6 +1415,7 @@ api_keys = ["sk-test"]
                     real_model: Some("gpt-3.5-turbo".into()),
                     priority: 5,
                     retries: None,
+                    timeout_secs: None,
                     extra: HashMap::new(),
                 },
             ];
