@@ -445,7 +445,7 @@ impl AnthropicProvider {
 
         let stop_sequences = request.stop.clone().map(|s| s.into_vec());
 
-        let mut tools = request.tools.as_ref().and_then(|v| convert_tools(v));
+        let mut tools = request.tools.as_ref().and_then(convert_tools);
 
         // Inject cache_control breakpoints so Anthropic caches the
         // system prompt, tools, and conversation history.
@@ -711,13 +711,15 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_maps_developer_to_system_when_mapped() {
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![ChatMessage {
-            role: "developer".into(),
-            content: serde_json::Value::String("you are helpful".into()),
-            name: None,
-            extra: serde_json::Map::new(),
-        }];
+        let req = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "developer".into(),
+                content: serde_json::Value::String("you are helpful".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            ..Default::default()
+        };
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         // Without mapping, developer would NOT be extracted as system
         assert_eq!(anthropic_req.system, None);
@@ -727,13 +729,15 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_developer_becomes_user_by_default() {
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![ChatMessage {
-            role: "developer".into(),
-            content: serde_json::Value::String("you are helpful".into()),
-            name: None,
-            extra: serde_json::Map::new(),
-        }];
+        let req = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "developer".into(),
+                content: serde_json::Value::String("you are helpful".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            ..Default::default()
+        };
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         // In the absence of role mappings, developer messages are treated as
         // "user" by Anthropic's adapter (the else branch).

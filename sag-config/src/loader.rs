@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{
     GatewayConfig, KeyStrategy, LogFormat, ProviderConfig, ProviderType, RouteConfig, RouteTarget,
@@ -63,22 +63,45 @@ impl ConfigHandle {
 pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
     let content = match std::fs::read_to_string(path.as_ref()) {
         Ok(c) => c,
-        Err(_) => return ("info".into(), LogFormat::default()),
+        Err(e) => {
+            eprintln!(
+                "[sag] failed to read config file '{}' for logging peek: {e}",
+                path.as_ref().display()
+            );
+            return ("info".into(), LogFormat::default());
+        }
     };
-    let value: toml::Value = match content.parse() {
-        Ok(v) => v,
-        Err(_) => return ("info".into(), LogFormat::default()),
+    #[derive(serde::Deserialize)]
+    struct LoggingPeek {
+        level: Option<String>,
+        format: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ConfigPeek {
+        logging: Option<LoggingPeek>,
+    }
+    let config: ConfigPeek = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[sag] failed to parse config file '{}' as TOML for logging peek: {e}",
+                path.as_ref().display()
+            );
+            return ("info".into(), LogFormat::default());
+        }
     };
-    let logging = match value.get("logging") {
-        Some(v) => v,
-        None => return ("info".into(), LogFormat::default()),
+    let logging = match config.logging {
+        Some(l) => l,
+        None => {
+            eprintln!(
+                "[sag] no [logging] section found in config file '{}', using defaults",
+                path.as_ref().display()
+            );
+            return ("info".into(), LogFormat::default());
+        }
     };
-    let level = logging
-        .get("level")
-        .and_then(|v| v.as_str())
-        .unwrap_or("info")
-        .to_string();
-    let format = match logging.get("format").and_then(|v| v.as_str()) {
+    let level = logging.level.unwrap_or_else(|| "info".into());
+    let format = match logging.format.as_deref() {
         Some("json") => LogFormat::Json,
         _ => LogFormat::Compact,
     };
@@ -119,7 +142,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
         .validate()
         .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
 
-    info!(?config, "configuration loaded");
+    debug!(?config, "configuration loaded");
     Ok(ConfigHandle {
         inner: Arc::new(RwLock::new(config)),
         config_path: Some(Arc::new(path)),
