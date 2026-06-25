@@ -376,6 +376,7 @@ mod tests {
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -424,6 +425,7 @@ mod tests {
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -464,6 +466,7 @@ mod tests {
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -501,6 +504,7 @@ mod tests {
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         let routes = vec![RouteConfig {

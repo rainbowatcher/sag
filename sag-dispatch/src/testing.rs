@@ -50,6 +50,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         enabled_models: vec![],
         enabled,
         anthropic_cache_control: true,
+        chunk_timeout_secs: None,
     }
 }
 

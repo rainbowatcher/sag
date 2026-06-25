@@ -28,6 +28,9 @@ pub struct ProviderBase {
     role_mappings: HashMap<String, String>,
     /// Whether to inject `cache_control` breakpoints for Anthropic providers.
     pub anthropic_cache_control: bool,
+    /// Maximum idle time between stream chunks before the connection is
+    /// terminated. `None` = wait indefinitely.
+    chunk_timeout_secs: Option<u64>,
 }
 
 impl ProviderBase {
@@ -56,6 +59,7 @@ impl ProviderBase {
             body_overrides: config.body_overrides.clone(),
             role_mappings: config.role_mappings.clone(),
             anthropic_cache_control: config.anthropic_cache_control,
+            chunk_timeout_secs: config.chunk_timeout_secs,
         }
     }
 
@@ -78,6 +82,11 @@ impl ProviderBase {
         let base = self.base_url.trim_end_matches('/');
         let path = api_endpoint.trim_start_matches('/');
         format!("{}/{}", base, path)
+    }
+
+    /// Return the configured stream-chunk idle timeout, if any.
+    pub fn chunk_timeout_secs(&self) -> Option<u64> {
+        self.chunk_timeout_secs
     }
 
     /// Build a reqwest POST request with default + custom headers and body
@@ -248,6 +257,7 @@ mod tests {
             enabled_models: Vec::new(),
             role_mappings,
             anthropic_cache_control: true,
+            chunk_timeout_secs: None,
         };
         ProviderBase::new("test".into(), &config)
     }

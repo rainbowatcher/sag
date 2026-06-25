@@ -44,6 +44,7 @@ async fn build_protected_state() -> AppState {
             enabled_models: vec![],
             enabled: true,
             anthropic_cache_control: true,
+            chunk_timeout_secs: None,
         },
     );
     let config = GatewayConfig {

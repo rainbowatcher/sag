@@ -146,6 +146,13 @@ impl GatewayConfig {
                     "provider '{name}': timeout_secs must be greater than 0"
                 ));
             }
+            if let Some(cts) = provider.chunk_timeout_secs
+                && cts == 0
+            {
+                errors.push(format!(
+                    "provider '{name}': chunk_timeout_secs must be greater than 0"
+                ));
+            }
             if provider.key_strategy == KeyStrategy::RoundRobin && provider.api_keys.len() == 1 {
                 warnings.push(format!(
                     "provider '{name}': RoundRobin strategy with a single API key behaves the same as FillFirst"
@@ -411,6 +418,13 @@ pub struct ProviderConfig {
     /// Timeout in seconds for requests to this provider.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Maximum idle time in seconds between stream chunks before the
+    /// connection is terminated. When `None` (default), the stream waits
+    /// indefinitely for the next chunk. Only applies to streaming
+    /// requests; non-streaming requests use `timeout_secs` for the
+    /// entire HTTP round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_timeout_secs: Option<u64>,
     /// Custom headers to add to or override in upstream requests.
     /// These are applied after the provider's default headers,
     /// so they can override auth, content-type, etc.

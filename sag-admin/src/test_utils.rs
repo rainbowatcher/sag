@@ -60,6 +60,7 @@ pub(crate) fn one_provider_config(
             enabled_models: vec![],
             enabled: true,
             anthropic_cache_control: true,
+            chunk_timeout_secs: None,
         },
     );
     let routes = routes

@@ -599,6 +599,10 @@ impl LlmProvider for AnthropicProvider {
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let chunk_timeout = self
+            .base
+            .chunk_timeout_secs()
+            .map(std::time::Duration::from_secs);
 
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
@@ -615,13 +619,18 @@ impl LlmProvider for AnthropicProvider {
                     break;
                 }
 
-                match byte_stream.next().await {
-                    Some(Ok(chunk)) => {
+                let chunk_result: Result<_, tokio::time::error::Elapsed> = match &chunk_timeout {
+                    Some(dur) => tokio::time::timeout(*dur, byte_stream.next()).await,
+                    None => Ok(byte_stream.next().await),
+                };
+
+                match chunk_result {
+                    Ok(Some(Ok(chunk))) => {
                         trace!(received_bytes = chunk.len(), "received anthropic SSE chunk");
                         buffer.extend_from_slice(&chunk);
                         drain_anthropic_sse_frames(&mut buffer, &tx, &mut state);
                     }
-                    Some(Err(e)) => {
+                    Ok(Some(Err(e))) => {
                         error!(?e, "error reading anthropic stream chunk");
                         if !tx.is_closed() {
                             let _ = tx.send(StreamChunk::Error(e.to_string()));
@@ -629,7 +638,18 @@ impl LlmProvider for AnthropicProvider {
                         had_error = true;
                         break;
                     }
-                    None => break,
+                    Ok(None) => break,
+                    Err(_elapsed) => {
+                        error!(chunk_timeout_secs = ?chunk_timeout, "anthropic stream chunk idle timeout");
+                        if !tx.is_closed() {
+                            let _ = tx.send(StreamChunk::Error(format!(
+                                "stream chunk idle timeout after {}s",
+                                chunk_timeout.unwrap().as_secs()
+                            )));
+                        }
+                        had_error = true;
+                        break;
+                    }
                 }
             }
 

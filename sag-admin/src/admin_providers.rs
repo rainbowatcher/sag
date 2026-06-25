@@ -81,6 +81,8 @@ pub struct ProviderInfo {
     pub base_url: String,
     pub models_endpoint: String,
     pub timeout_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_timeout_secs: Option<u64>,
     pub headers: HashMap<String, String>,
     pub body_overrides: HashMap<String, serde_json::Value>,
     pub role_mappings: HashMap<String, String>,
@@ -129,6 +131,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         base_url: cfg.base_url.clone(),
         models_endpoint: cfg.models_endpoint.clone(),
         timeout_secs: cfg.timeout_secs,
+        chunk_timeout_secs: cfg.chunk_timeout_secs,
         headers: cfg.headers.clone(),
         body_overrides: cfg.body_overrides.clone(),
         role_mappings: cfg.role_mappings.clone(),
@@ -195,6 +198,7 @@ pub async fn add_provider(
             enabled_models: req.enabled_models.clone(),
             enabled: true,
             anthropic_cache_control: true,
+            chunk_timeout_secs: None,
         };
 
         config.providers.insert(req.name.clone(), pc.clone());
@@ -537,6 +541,7 @@ mod tests {
                     enabled_models: vec![],
                     enabled: true,
                     anthropic_cache_control: true,
+                    chunk_timeout_secs: None,
                 },
             );
         }
@@ -761,6 +766,7 @@ targets = [
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         providers.insert(
@@ -778,6 +784,7 @@ targets = [
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         providers.insert(
@@ -795,6 +802,7 @@ targets = [
                 enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
 
@@ -831,6 +839,7 @@ targets = [
                 enabled_models: vec![],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
         providers.insert(
@@ -848,6 +857,7 @@ targets = [
                 enabled_models: vec!["other-model".into()],
                 enabled: true,
                 anthropic_cache_control: true,
+                chunk_timeout_secs: None,
             },
         );
 

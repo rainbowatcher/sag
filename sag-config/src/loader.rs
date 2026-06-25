@@ -910,6 +910,7 @@ base_url = "https://api.anthropic.com"
                     enabled: true,
                     enabled_models: vec![],
                     anthropic_cache_control: true,
+                    chunk_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1072,6 +1073,7 @@ key_strategy = "round_robin"
                     enabled: true,
                     enabled_models: vec![],
                     anthropic_cache_control: true,
+                    chunk_timeout_secs: None,
                 },
             )]),
             ..crate::gateway_config_base!()
@@ -1224,6 +1226,7 @@ targets = [
                     enabled: true,
                     enabled_models: vec![],
                     anthropic_cache_control: true,
+                    chunk_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1291,6 +1294,7 @@ targets = [
                     enabled: true,
                     enabled_models: vec![],
                     anthropic_cache_control: true,
+                    chunk_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1348,6 +1352,7 @@ targets = [
                     enabled: true,
                     enabled_models: vec![],
                     anthropic_cache_control: true,
+                    chunk_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1534,6 +1539,7 @@ targets = [
             enabled: true,
             enabled_models: vec![],
             anthropic_cache_control: true,
+            chunk_timeout_secs: None,
         }
     }
 
