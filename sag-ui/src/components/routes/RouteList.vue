@@ -95,6 +95,21 @@ function disabledTargetCount(route: RouteConfig): number {
 
 const columnHelper = createColumnHelper<RouteConfig>()
 
+const strategyStyles: Record<string, string> = {
+  sticky_failover:
+    "bg-violet-500/10 text-violet-700 border-violet-500/20 dark:bg-violet-400/15 dark:text-violet-300 dark:border-violet-400/25",
+  fill_first:
+    "bg-emerald-500/10 text-emerald-700 border-emerald-500/20 dark:bg-emerald-400/15 dark:text-emerald-300 dark:border-emerald-400/25",
+  round_robin:
+    "bg-sky-500/10 text-sky-700 border-sky-500/20 dark:bg-sky-400/15 dark:text-sky-300 dark:border-sky-400/25",
+}
+
+const strategyLabels: Record<string, string> = {
+  sticky_failover: "sticky-failover",
+  fill_first: "fill-first",
+  round_robin: "round-robin",
+}
+
 const columns = [
   columnHelper.accessor("model_name", {
     header: "Model Name",
@@ -114,15 +129,12 @@ const columns = [
     cell: (info) => {
       const s = info.getValue()
       return h(
-        "span",
+        Badge,
         {
-          class: `rounded-full border px-2 py-0.5 text-[10px] ${
-            s === "round_robin"
-              ? "border-blue-200 text-blue-600"
-              : "border-green-200 text-green-600"
-          }`,
+          variant: "outline",
+          class: `rounded-full px-2 text-[10px] font-normal ${strategyStyles[s] || ""}`,
         },
-        s === "round_robin" ? "round-robin" : "fill-first",
+        () => strategyLabels[s] || s,
       )
     },
     meta: { class: "text-center" },

@@ -42,7 +42,7 @@ export interface RouteConfig {
   targets: RouteTarget[]
 }
 
-export type Strategy = "fill_first" | "round_robin"
+export type Strategy = "sticky_failover" | "fill_first" | "round_robin"
 
 export interface CreateRoutePayload {
   model_name: string

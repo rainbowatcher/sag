@@ -43,14 +43,14 @@ const endpointPresets = [
 const formSchema = z.object({
   model_name: z.string(),
   api_endpoint: z.string().min(1),
-  strategy: z.enum(["fill_first", "round_robin"]),
+  strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
 })
 
 const form = useForm({
   defaultValues: {
     model_name: "",
     api_endpoint: "/chat/completions",
-    strategy: "fill_first" as Strategy,
+    strategy: "sticky_failover" as Strategy,
   },
   validators: {
     onSubmit: formSchema,
@@ -162,13 +162,14 @@ async function handleSubmit(event: Event) {
             <Field>
               <FieldLabel :for="field.name">Strategy</FieldLabel>
               <ToggleGroup
-                :model-value="field.state.value ?? 'fill_first'"
+                :model-value="field.state.value ?? 'sticky_failover'"
                 @update:model-value="(v) => field.handleChange(v as Strategy)"
                 type="single"
                 variant="outline"
                 size="sm"
                 class="justify-start"
               >
+                <ToggleGroupItem value="sticky_failover">Sticky-failover</ToggleGroupItem>
                 <ToggleGroupItem value="fill_first">Fill-first</ToggleGroupItem>
                 <ToggleGroupItem value="round_robin">Round-robin</ToggleGroupItem>
               </ToggleGroup>

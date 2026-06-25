@@ -55,7 +55,7 @@ const endpointPresets = [
 
 const formSchema = z.object({
   api_endpoint: z.string().min(1),
-  strategy: z.enum(["fill_first", "round_robin"]),
+  strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
 })
 
 const form = useForm({
@@ -160,6 +160,7 @@ async function handleSubmit(event: Event) {
               variant="outline"
               class="justify-start"
             >
+              <ToggleGroupItem value="sticky_failover">Sticky-failover</ToggleGroupItem>
               <ToggleGroupItem value="fill_first">Fill-first</ToggleGroupItem>
               <ToggleGroupItem value="round_robin">Round-robin</ToggleGroupItem>
             </ToggleGroup>
