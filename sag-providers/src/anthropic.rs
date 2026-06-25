@@ -192,17 +192,56 @@ fn process_anthropic_sse_frame(
 
 // ── Anthropic wire types ─────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+/// Anthropic `cache_control` marker. Serializes as `{"type": "ephemeral"}`.
+#[derive(Debug, Clone, PartialEq)]
+struct CacheControl;
+
+impl serde::Serialize for CacheControl {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("CacheControl", 1)?;
+        s.serialize_field("type", "ephemeral")?;
+        s.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize)]
 struct AnthropicMessage {
     role: String,
     content: Vec<ContentBlock>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "type")]
 enum ContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+/// System prompt in Anthropic format: either a plain string or an array of
+/// content blocks. `#[serde(untagged)]` serializes `Text` as a bare string
+/// and `Blocks` as a JSON array, matching the Anthropic Messages API.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+enum SystemContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+/// A tool definition in Anthropic format, converted from OpenAI's
+/// `{type: "function", function: {name, description, parameters}}`.
+#[derive(Debug, PartialEq, Serialize)]
+struct AnthropicTool {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +249,9 @@ struct AnthropicRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<SystemContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -259,6 +300,105 @@ struct AnthropicUsage {
 
 // ── Provider ─────────────────────────────────────────────────────
 
+/// Convert OpenAI-format `tools` JSON to Anthropic tool definitions.
+///
+/// OpenAI format: `[{type: "function", function: {name, description, parameters}}]`
+/// Anthropic format: `[{name, description, input_schema}]`
+fn convert_tools(tools: &serde_json::Value) -> Option<Vec<AnthropicTool>> {
+    let arr = tools.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let converted: Vec<AnthropicTool> = arr
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            Some(AnthropicTool {
+                name: function.get("name")?.as_str()?.to_string(),
+                description: function
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                input_schema: function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                cache_control: None,
+            })
+        })
+        .collect();
+    if converted.is_empty() {
+        None
+    } else {
+        Some(converted)
+    }
+}
+
+/// Inject `cache_control` markers into the last content block of system,
+/// the last tool, and the last content block of the second-to-last user
+/// message. These breakpoints tell Anthropic to cache everything before them.
+fn inject_cache_control(
+    system: &mut Option<SystemContent>,
+    tools: &mut Option<Vec<AnthropicTool>>,
+    messages: &mut [AnthropicMessage],
+) {
+    // 1. System: mark the last content block. If the system prompt is a
+    //    plain string, convert it to a single-element Blocks array first.
+    if let Some(sys) = system {
+        match sys {
+            SystemContent::Text(text) => {
+                let t = std::mem::take(text);
+                if !t.is_empty() {
+                    *sys = SystemContent::Blocks(vec![ContentBlock::Text {
+                        text: t,
+                        cache_control: Some(CacheControl),
+                    }]);
+                }
+            }
+            SystemContent::Blocks(blocks) => {
+                if let Some(last) = blocks.last_mut() {
+                    set_cache_control(last);
+                }
+            }
+        }
+    }
+
+    // 2. Tools: mark the last tool definition
+    if let Some(tool_list) = tools
+        && let Some(last) = tool_list.last_mut()
+    {
+        last.cache_control = Some(CacheControl);
+    }
+
+    // 3. Messages: mark the last content block of the last user message
+    //    before the final turn. If there's only 0-1 messages, skip.
+    if messages.len() >= 2 {
+        // Find the last user message that is not the very last message
+        let mut user_idx: Option<usize> = None;
+        for (i, msg) in messages.iter().enumerate().rev().skip(1) {
+            if msg.role == "user" {
+                user_idx = Some(i);
+                break;
+            }
+        }
+        if let Some(idx) = user_idx
+            && let Some(msg) = messages.get_mut(idx)
+            && let Some(last) = msg.content.last_mut()
+        {
+            set_cache_control(last);
+        }
+    }
+}
+
+/// Set `cache_control` on the last content block, regardless of variant.
+fn set_cache_control(block: &mut ContentBlock) {
+    match block {
+        ContentBlock::Text { cache_control, .. } => {
+            *cache_control = Some(CacheControl);
+        }
+    }
+}
+
 /// Anthropic Messages API provider adapter.
 pub struct AnthropicProvider {
     base: ProviderBase,
@@ -273,14 +413,18 @@ impl AnthropicProvider {
     }
 
     /// Convert an OpenAI-format request to Anthropic Messages API format.
-    fn to_anthropic_request(request: &ChatCompletionRequest, real_model: &str) -> AnthropicRequest {
-        let system = request
+    fn to_anthropic_request(
+        request: &ChatCompletionRequest,
+        real_model: &str,
+        enable_cache_control: bool,
+    ) -> AnthropicRequest {
+        let mut system = request
             .messages
             .iter()
             .find(|m| m.role == "system")
-            .and_then(|m| m.text_content().map(String::from));
+            .and_then(|m| m.text_content().map(|s| SystemContent::Text(s.to_string())));
 
-        let messages: Vec<AnthropicMessage> = request
+        let mut messages: Vec<AnthropicMessage> = request
             .messages
             .iter()
             .filter(|m| m.role != "system")
@@ -292,6 +436,7 @@ impl AnthropicProvider {
                 },
                 content: vec![ContentBlock::Text {
                     text: m.text_content().unwrap_or_default().to_string(),
+                    cache_control: None,
                 }],
             })
             .collect();
@@ -300,10 +445,19 @@ impl AnthropicProvider {
 
         let stop_sequences = request.stop.clone().map(|s| s.into_vec());
 
+        let mut tools = request.tools.as_ref().and_then(|v| convert_tools(v));
+
+        // Inject cache_control breakpoints so Anthropic caches the
+        // system prompt, tools, and conversation history.
+        if enable_cache_control {
+            inject_cache_control(&mut system, &mut tools, &mut messages);
+        }
+
         AnthropicRequest {
             model: real_model.to_string(),
             messages,
             system,
+            tools,
             max_tokens,
             stream: request.stream,
             temperature: request.temperature,
@@ -370,9 +524,9 @@ impl LlmProvider for AnthropicProvider {
         let upstream = if self.base.has_role_mappings() {
             let mut req = request.clone();
             self.base.apply_role_mappings(&mut req.messages);
-            Self::to_anthropic_request(&req, real_model)
+            Self::to_anthropic_request(&req, real_model, self.base.anthropic_cache_control)
         } else {
-            Self::to_anthropic_request(request, real_model)
+            Self::to_anthropic_request(request, real_model, self.base.anthropic_cache_control)
         };
 
         if !request.extra.is_empty() {
@@ -413,9 +567,9 @@ impl LlmProvider for AnthropicProvider {
         let mut upstream = if self.base.has_role_mappings() {
             let mut req = request.clone();
             self.base.apply_role_mappings(&mut req.messages);
-            Self::to_anthropic_request(&req, real_model)
+            Self::to_anthropic_request(&req, real_model, self.base.anthropic_cache_control)
         } else {
-            Self::to_anthropic_request(request, real_model)
+            Self::to_anthropic_request(request, real_model, self.base.anthropic_cache_control)
         };
         upstream.stream = Some(true);
 
@@ -496,6 +650,13 @@ impl LlmProvider for AnthropicProvider {
 mod tests {
     use super::*;
 
+    /// Extract `cache_control` from a `ContentBlock` for test assertions.
+    fn cache_control_of(block: &ContentBlock) -> &Option<CacheControl> {
+        match block {
+            ContentBlock::Text { cache_control, .. } => cache_control,
+        }
+    }
+
     #[test]
     fn anthropic_usage_deserializes_cache_fields() {
         let json = r#"{
@@ -533,7 +694,7 @@ mod tests {
             name: None,
             extra: serde_json::Map::new(),
         }];
-        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         // Without mapping, developer would NOT be extracted as system
         assert_eq!(anthropic_req.system, None);
         // developer falls through to else → "user"
@@ -549,7 +710,7 @@ mod tests {
             name: None,
             extra: serde_json::Map::new(),
         }];
-        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         // In the absence of role mappings, developer messages are treated as
         // "user" by Anthropic's adapter (the else branch).
         assert_eq!(anthropic_req.messages[0].role, "user");
@@ -565,8 +726,11 @@ mod tests {
             name: None,
             extra: serde_json::Map::new(),
         }];
-        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
-        assert_eq!(anthropic_req.system, Some("you are helpful".into()));
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
+        assert_eq!(
+            anthropic_req.system,
+            Some(SystemContent::Text("you are helpful".into()))
+        );
         assert!(anthropic_req.messages.is_empty());
     }
 
@@ -587,8 +751,292 @@ mod tests {
                 extra: serde_json::Map::new(),
             },
         ];
-        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3");
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         // Only the first system message is kept
-        assert_eq!(anthropic_req.system, Some("first system".into()));
+        assert_eq!(
+            anthropic_req.system,
+            Some(SystemContent::Text("first system".into()))
+        );
+    }
+
+    // ── tools conversion ──────────────────────────────────────────
+
+    #[test]
+    fn convert_tools_parses_openai_function_tools() {
+        let tools: serde_json::Value = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        ]);
+        let result = convert_tools(&tools).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "get_weather");
+        assert_eq!(
+            result[0].description,
+            Some("Get the weather for a city".into())
+        );
+        assert_eq!(
+            result[0].input_schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}}
+            })
+        );
+        assert!(result[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn convert_tools_returns_none_for_empty_array() {
+        let tools = serde_json::json!([]);
+        assert!(convert_tools(&tools).is_none());
+    }
+
+    #[test]
+    fn convert_tools_returns_none_for_non_array() {
+        let tools = serde_json::json!("not an array");
+        assert!(convert_tools(&tools).is_none());
+    }
+
+    #[test]
+    fn convert_tools_skips_malformed_entries() {
+        let tools: serde_json::Value = serde_json::json!([
+            {"type": "function", "function": {"name": "valid"}},
+            {"type": "function"},  // missing function → skipped
+            {"type": "function", "function": {"name": "also_valid"}},
+        ]);
+        let result = convert_tools(&tools).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "valid");
+        assert_eq!(result[1].name, "also_valid");
+    }
+
+    #[test]
+    fn convert_tools_uses_empty_object_when_parameters_missing() {
+        let tools: serde_json::Value = serde_json::json!([
+            {"type": "function", "function": {"name": "no_params"}}
+        ]);
+        let result = convert_tools(&tools).unwrap();
+        assert_eq!(result[0].input_schema, serde_json::json!({}));
+    }
+
+    // ── cache_control injection ────────────────────────────────────
+
+    #[test]
+    fn inject_cache_control_marks_system_text() {
+        let mut system = Some(SystemContent::Text("you are helpful".into()));
+        let mut tools: Option<Vec<AnthropicTool>> = None;
+        let mut messages = vec![AnthropicMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+                cache_control: None,
+            }],
+        }];
+
+        inject_cache_control(&mut system, &mut tools, &mut messages);
+
+        // System should be converted to Blocks with cache_control on the block
+        match &system.unwrap() {
+            SystemContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        assert_eq!(text, "you are helpful");
+                        assert!(cache_control.is_some());
+                    }
+                }
+            }
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn inject_cache_control_marks_last_tool() {
+        let mut system: Option<SystemContent> = None;
+        let mut tools = Some(vec![
+            AnthropicTool {
+                name: "tool_a".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+            AnthropicTool {
+                name: "tool_b".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+        ]);
+        let mut messages = vec![AnthropicMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+                cache_control: None,
+            }],
+        }];
+
+        inject_cache_control(&mut system, &mut tools, &mut messages);
+
+        let tools = tools.unwrap();
+        assert!(tools[0].cache_control.is_none());
+        assert!(tools[1].cache_control.is_some());
+    }
+
+    #[test]
+    fn inject_cache_control_marks_last_user_message_before_final_turn() {
+        let mut system: Option<SystemContent> = None;
+        let mut tools: Option<Vec<AnthropicTool>> = None;
+        let mut messages = vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text {
+                    text: "first question".into(),
+                    cache_control: None,
+                }],
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "first answer".into(),
+                    cache_control: None,
+                }],
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text {
+                    text: "second question".into(),
+                    cache_control: None,
+                }],
+            },
+        ];
+
+        inject_cache_control(&mut system, &mut tools, &mut messages);
+
+        // The first user message (index 0) should be marked — it's the last
+        // user message before the final turn (index 2).
+        assert!(cache_control_of(&messages[0].content[0]).is_some());
+        // The assistant message should NOT be marked
+        assert!(cache_control_of(&messages[1].content[0]).is_none());
+        // The final user message should NOT be marked
+        assert!(cache_control_of(&messages[2].content[0]).is_none());
+    }
+
+    #[test]
+    fn inject_cache_control_skips_when_only_one_message() {
+        let mut system: Option<SystemContent> = None;
+        let mut tools: Option<Vec<AnthropicTool>> = None;
+        let mut messages = vec![AnthropicMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+                cache_control: None,
+            }],
+        }];
+
+        inject_cache_control(&mut system, &mut tools, &mut messages);
+
+        // Single message → nothing to cache before it
+        assert!(cache_control_of(&messages[0].content[0]).is_none());
+    }
+
+    // ── end-to-end with cache_control enabled ──────────────────────
+
+    #[test]
+    fn to_anthropic_request_injects_cache_control_when_enabled() {
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: serde_json::Value::String("you are helpful".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("hello".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            },
+        ];
+
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", true);
+
+        // System should be converted to Blocks with cache_control
+        match &anthropic_req.system.unwrap() {
+            SystemContent::Blocks(blocks) => {
+                assert!(cache_control_of(&blocks[0]).is_some());
+            }
+            _ => panic!("expected Blocks when cache_control enabled"),
+        }
+    }
+
+    #[test]
+    fn to_anthropic_request_forwards_tools() {
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![ChatMessage {
+            role: "user".into(),
+            content: serde_json::Value::String("what's the weather?".into()),
+            name: None,
+            extra: serde_json::Map::new(),
+        }];
+        req.tools = Some(serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }
+        ]));
+
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
+
+        let tools = anthropic_req.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn to_anthropic_request_tools_with_cache_control() {
+        let mut req = ChatCompletionRequest::default();
+        req.messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: serde_json::Value::String("you are helpful".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("hello".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            },
+        ];
+        req.tools = Some(serde_json::json!([
+            {"type": "function", "function": {"name": "tool_a"}},
+            {"type": "function", "function": {"name": "tool_b"}},
+        ]));
+
+        let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", true);
+
+        let tools = anthropic_req.tools.unwrap();
+        assert_eq!(tools.len(), 2);
+        // Only the last tool should have cache_control
+        assert!(tools[0].cache_control.is_none());
+        assert!(tools[1].cache_control.is_some());
     }
 }

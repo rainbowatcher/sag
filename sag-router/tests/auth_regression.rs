@@ -43,6 +43,7 @@ async fn build_protected_state() -> AppState {
             role_mappings: HashMap::new(),
             enabled_models: vec![],
             enabled: true,
+            anthropic_cache_control: true,
         },
     );
     let config = GatewayConfig {

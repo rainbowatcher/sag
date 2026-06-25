@@ -26,6 +26,8 @@ pub struct ProviderBase {
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
     role_mappings: HashMap<String, String>,
+    /// Whether to inject `cache_control` breakpoints for Anthropic providers.
+    pub anthropic_cache_control: bool,
 }
 
 impl ProviderBase {
@@ -53,6 +55,7 @@ impl ProviderBase {
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
             role_mappings: config.role_mappings.clone(),
+            anthropic_cache_control: config.anthropic_cache_control,
         }
     }
 
@@ -236,6 +239,7 @@ mod tests {
             enabled: true,
             enabled_models: Vec::new(),
             role_mappings,
+            anthropic_cache_control: true,
         };
         ProviderBase::new("test".into(), &config)
     }

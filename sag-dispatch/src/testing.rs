@@ -48,6 +48,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         role_mappings: std::collections::HashMap::new(),
         enabled_models: vec![],
         enabled,
+        anthropic_cache_control: true,
     }
 }
 

@@ -372,6 +372,7 @@ mod tests {
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -419,6 +420,7 @@ mod tests {
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -458,6 +460,7 @@ mod tests {
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -494,6 +497,7 @@ mod tests {
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         let routes = vec![RouteConfig {

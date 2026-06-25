@@ -84,6 +84,7 @@ pub struct CacheStatsRow {
     pub total_calls: i64,
     pub total_prompt_tokens: i64,
     pub total_cached_tokens: i64,
+    pub total_cache_creation_tokens: i64,
 }
 
 /// Filter for time-bucketed trend queries.

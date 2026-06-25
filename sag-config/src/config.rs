@@ -426,6 +426,13 @@ pub struct ProviderConfig {
     /// When empty (default), all models are allowed (backward compatible).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_models: Vec<String>,
+    /// Whether to inject `cache_control: {"type": "ephemeral"}` breakpoints
+    /// into Anthropic requests. Only meaningful for `provider_type = "anthropic"`.
+    /// When enabled, the gateway marks the system prompt, tools, and conversation
+    /// history for caching, which can significantly reduce costs for requests
+    /// with stable prefixes.
+    #[serde(default = "default_true")]
+    pub anthropic_cache_control: bool,
 }
 
 pub fn default_base_url() -> String {

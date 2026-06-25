@@ -59,6 +59,7 @@ pub(crate) fn one_provider_config(
             role_mappings: HashMap::new(),
             enabled_models: vec![],
             enabled: true,
+            anthropic_cache_control: true,
         },
     );
     let routes = routes

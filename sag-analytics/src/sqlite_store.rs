@@ -296,7 +296,8 @@ impl LogStore for SqliteLogStore {
                 real_model,
                 COUNT(*)                                   AS total_calls,
                 COALESCE(SUM(prompt_tokens), 0)            AS total_prompt_tokens,
-                COALESCE(SUM(cached_tokens), 0)            AS total_cached_tokens
+                COALESCE(SUM(cached_tokens), 0)            AS total_cached_tokens,
+                COALESCE(SUM(cache_creation_tokens), 0)    AS total_cache_creation_tokens
             FROM call_logs
             "#,
         );
@@ -913,10 +914,11 @@ mod tests {
             completion_tokens: 50,
             total_tokens: 150,
             cached_tokens: Some(30),
-            cache_creation_tokens: None,
+            cache_creation_tokens: Some(15),
             reasoning_tokens: Some(10),
         });
         with_cache.cached_tokens = Some(30);
+        with_cache.cache_creation_tokens = Some(15);
 
         let no_cache = make_log("openai", "gpt-4o", "gpt-4o");
 
@@ -931,5 +933,6 @@ mod tests {
         assert_eq!(rows[0].total_calls, 2);
         assert_eq!(rows[0].total_prompt_tokens, 110);
         assert_eq!(rows[0].total_cached_tokens, 30);
+        assert_eq!(rows[0].total_cache_creation_tokens, 15);
     }
 }

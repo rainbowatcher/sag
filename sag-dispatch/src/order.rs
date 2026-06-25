@@ -562,4 +562,173 @@ mod tests {
         // (no prepending happens).
         assert_eq!(ordered.len(), 3);
     }
+
+    #[tokio::test]
+    async fn sticky_failover_clears_active_when_extra_changes() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets_a = vec![
+            RouteTarget {
+                provider: "a".into(),
+                real_model: None,
+                priority: 0,
+                retries: None,
+                extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
+            },
+            RouteTarget {
+                provider: "b".into(),
+                real_model: None,
+                priority: 0,
+                retries: None,
+                extra: HashMap::new(),
+            },
+        ];
+        let targets_b = vec![
+            RouteTarget {
+                provider: "a".into(),
+                real_model: None,
+                priority: 0,
+                retries: None,
+                extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
+            },
+            RouteTarget {
+                provider: "b".into(),
+                real_model: None,
+                priority: 0,
+                retries: None,
+                extra: HashMap::new(),
+            },
+        ];
+
+        // First run with targets_a to initialize cached order
+        let _ = order_targets(
+            targets_a.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // Record "b" as the active target
+        {
+            let mut guard = active.write().await;
+            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+        }
+
+        // Run again with targets_b (extra changed but provider/real_model/priority identical)
+        let ordered = order_targets(
+            targets_b,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // Active target must have been cleared because targets_match now detects extra changes
+        {
+            let guard = active.read().await;
+            assert!(
+                guard.get("model").is_none(),
+                "active target must be cleared when extra changes"
+            );
+        }
+
+        // The returned targets must carry the new extra value
+        let a_target = ordered.iter().find(|t| t.provider == "a").unwrap();
+        assert_eq!(
+            a_target.extra.get("temperature").unwrap(),
+            &serde_json::json!(0.9)
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_clears_active_when_retries_changes() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets_a = vec![
+            RouteTarget {
+                provider: "a".into(),
+                real_model: None,
+                priority: 0,
+                retries: Some(1),
+                extra: HashMap::new(),
+            },
+            RouteTarget {
+                provider: "b".into(),
+                real_model: None,
+                priority: 0,
+                retries: None,
+                extra: HashMap::new(),
+            },
+        ];
+        let targets_b = vec![
+            RouteTarget {
+                provider: "a".into(),
+                real_model: None,
+                priority: 0,
+                retries: Some(5),
+                extra: HashMap::new(),
+            },
+            RouteTarget {
+                provider: "b".into(),
+                real_model: None,
+                priority: 0,
+                retries: None,
+                extra: HashMap::new(),
+            },
+        ];
+
+        // First run with targets_a to initialize cached order
+        let _ = order_targets(
+            targets_a.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // Record "b" as the active target
+        {
+            let mut guard = active.write().await;
+            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+        }
+
+        // Run again with targets_b (retries changed but provider/real_model/priority identical)
+        let ordered = order_targets(
+            targets_b,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // Active target must have been cleared because targets_match now detects retries changes
+        {
+            let guard = active.read().await;
+            assert!(
+                guard.get("model").is_none(),
+                "active target must be cleared when retries changes"
+            );
+        }
+
+        // The returned targets must carry the new retries value
+        let a_target = ordered.iter().find(|t| t.provider == "a").unwrap();
+        assert_eq!(a_target.retries, Some(5));
+    }
 }

@@ -194,6 +194,7 @@ pub async fn add_provider(
             role_mappings: req.role_mappings.clone(),
             enabled_models: req.enabled_models.clone(),
             enabled: true,
+            anthropic_cache_control: true,
         };
 
         config.providers.insert(req.name.clone(), pc.clone());
@@ -535,6 +536,7 @@ mod tests {
                     role_mappings: HashMap::new(),
                     enabled_models: vec![],
                     enabled: true,
+                    anthropic_cache_control: true,
                 },
             );
         }
@@ -753,6 +755,7 @@ targets = [
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         providers.insert(
@@ -769,6 +772,7 @@ targets = [
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         providers.insert(
@@ -785,6 +789,7 @@ targets = [
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
 
@@ -820,6 +825,7 @@ targets = [
                 role_mappings: HashMap::new(),
                 enabled_models: vec![],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
         providers.insert(
@@ -836,6 +842,7 @@ targets = [
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["other-model".into()],
                 enabled: true,
+                anthropic_cache_control: true,
             },
         );
 

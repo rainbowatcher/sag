@@ -891,6 +891,7 @@ base_url = "https://api.anthropic.com"
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
+                    anthropic_cache_control: true,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1050,6 +1051,7 @@ key_strategy = "round_robin"
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
+                    anthropic_cache_control: true,
                 },
             )]),
             ..crate::gateway_config_base!()
@@ -1201,6 +1203,7 @@ targets = [
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
+                    anthropic_cache_control: true,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1265,6 +1268,7 @@ targets = [
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
+                    anthropic_cache_control: true,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1319,6 +1323,7 @@ targets = [
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
+                    anthropic_cache_control: true,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1502,6 +1507,7 @@ targets = [
             role_mappings: HashMap::new(),
             enabled: true,
             enabled_models: vec![],
+            anthropic_cache_control: true,
         }
     }
 
