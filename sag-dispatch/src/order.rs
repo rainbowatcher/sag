@@ -30,9 +30,44 @@ pub async fn order_targets(
     strategy: Strategy,
     counters: &Arc<RwLock<HashMap<String, u64>>>,
     fill_first_orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
+    active_targets: &Arc<RwLock<HashMap<String, (String, String)>>>,
     shuffle_cache_ttl_secs: u64,
 ) -> Vec<RouteTarget> {
     match strategy {
+        Strategy::StickyFailover => {
+            let targets_changed = {
+                let guard = fill_first_orders.read().await;
+                if let Some(cached) = guard.get(model_name) {
+                    !targets_match(&targets, &cached.targets)
+                } else {
+                    false
+                }
+            };
+            if targets_changed {
+                let mut active = active_targets.write().await;
+                active.remove(model_name);
+            }
+
+            let mut shuffled = order_fill_first(
+                targets,
+                model_name,
+                fill_first_orders,
+                shuffle_cache_ttl_secs,
+            )
+            .await;
+
+            let active = active_targets.read().await;
+            if let Some((active_provider, active_real_model)) = active.get(model_name) {
+                if let Some(idx) = shuffled.iter().position(|t| {
+                    t.provider == *active_provider
+                        && t.real_model.as_deref().unwrap_or(model_name) == *active_real_model
+                }) {
+                    let active_target = shuffled.remove(idx);
+                    shuffled.insert(0, active_target);
+                }
+            }
+            shuffled
+        }
         Strategy::FillFirst => {
             order_fill_first(
                 targets,
@@ -231,7 +266,7 @@ mod tests {
         // Wait for TTL to expire. Sleep a bit longer than 1 s to
         // account for timer resolution — `as_secs()` truncates,
         // so we need age_secs ≥ 1.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
 
         // After expiry, we may or may not get the same order.
         // With 2 items, P[different] = 1/2 per call.
@@ -278,10 +313,15 @@ mod tests {
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
+    fn active_map() -> Arc<RwLock<HashMap<String, (String, String)>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
     #[tokio::test]
     async fn round_robin_rotates_by_counter() {
         let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
         let orders = orders_map();
+        let active = active_map();
         let ttl = 7200;
         let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
 
@@ -292,6 +332,7 @@ mod tests {
             Strategy::RoundRobin,
             &counters,
             &orders,
+            &active,
             ttl,
         )
         .await;
@@ -304,6 +345,7 @@ mod tests {
             Strategy::RoundRobin,
             &counters,
             &orders,
+            &active,
             ttl,
         )
         .await;
@@ -316,6 +358,7 @@ mod tests {
             Strategy::RoundRobin,
             &counters,
             &orders,
+            &active,
             ttl,
         )
         .await;
@@ -328,6 +371,7 @@ mod tests {
             Strategy::RoundRobin,
             &counters,
             &orders,
+            &active,
             ttl,
         )
         .await;
@@ -338,6 +382,7 @@ mod tests {
     async fn round_robin_keys_are_per_model() {
         let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
         let orders = orders_map();
+        let active = active_map();
         let ttl = 7200;
         let targets = vec![target("a", 0), target("b", 0)];
 
@@ -347,6 +392,7 @@ mod tests {
             Strategy::RoundRobin,
             &counters,
             &orders,
+            &active,
             ttl,
         )
         .await;
@@ -356,6 +402,7 @@ mod tests {
             Strategy::RoundRobin,
             &counters,
             &orders,
+            &active,
             ttl,
         )
         .await;
@@ -363,5 +410,92 @@ mod tests {
         // Each model has its own counter, so both should start at 0
         assert_eq!(r1[0].provider, "a");
         assert_eq!(r2[0].provider, "a");
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_prepends_active_target() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
+
+        // Record "b" as the active target
+        {
+            let mut guard = active.write().await;
+            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+        }
+
+        let ordered = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // "b" must be prepended to the front (index 0)
+        assert_eq!(ordered[0].provider, "b");
+        // Remaining targets are preserved
+        let remaining: Vec<String> = ordered[1..].iter().map(|t| t.provider.clone()).collect();
+        assert!(remaining.contains(&"a".to_string()));
+        assert!(remaining.contains(&"c".to_string()));
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_clears_active_on_target_change() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets_a = vec![target("a", 0), target("b", 0)];
+        let targets_b = vec![target("a", 0), target("b", 0), target("c", 0)];
+
+        // First run with targets_a to initialize cached order
+        let _ = order_targets(
+            targets_a.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // Record "b" as the active target
+        {
+            let mut guard = active.write().await;
+            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+        }
+
+        // Run again with targets_b (which is different)
+        let ordered = order_targets(
+            targets_b,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+        )
+        .await;
+
+        // Since targets changed, active target must have been cleared from active_targets
+        {
+            let guard = active.read().await;
+            assert!(
+                guard.get("model").is_none(),
+                "active target must be cleared on config change"
+            );
+        }
+
+        // And the first element should be whatever fill_first decided, not necessarily "b"
+        // (no prepending happens).
+        assert_eq!(ordered.len(), 3);
     }
 }

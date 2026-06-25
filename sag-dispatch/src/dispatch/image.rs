@@ -33,6 +33,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
+        strategy,
     } = ctx;
 
     let img_request = build_image_request(request);
@@ -95,6 +96,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             );
             continue;
         };
+
+        if strategy == sag_config::Strategy::StickyFailover {
+            let mut active = runtime.active_targets.write().await;
+            active.insert(
+                request.model.clone(),
+                (provider_name.clone(), real_model.clone()),
+            );
+        }
 
         state.collector.log(success_log(
             trace_id,
@@ -286,6 +295,7 @@ mod tests {
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
             errors,
+            strategy: sag_config::Strategy::StickyFailover,
         }
     }
 

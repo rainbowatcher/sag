@@ -93,7 +93,7 @@ async fn chat_completions(
     span.record("stream", is_stream);
 
     // Resolve route → ordered targets + api_endpoint + strategy
-    let (targets, api_endpoint, _strategy) =
+    let (targets, api_endpoint, strategy) =
         match resolve_route(&state, &runtime, &request, trace_id, start, is_stream).await {
             Ok(resolved) => resolved,
             Err(response) => return response,
@@ -112,6 +112,7 @@ async fn chat_completions(
             trace_id,
             start,
             errors: &mut errors,
+            strategy,
         })
         .await;
     }
@@ -126,6 +127,7 @@ async fn chat_completions(
         trace_id,
         start,
         errors: &mut errors,
+        strategy,
     })
     .await
 }

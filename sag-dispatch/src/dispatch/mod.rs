@@ -59,6 +59,7 @@ pub struct DispatchCtx<'a> {
     pub trace_id: uuid::Uuid,
     pub start: Instant,
     pub errors: &'a mut Vec<String>,
+    pub strategy: Strategy,
 }
 
 // ═══════════════════════════════════════════════════════════════════

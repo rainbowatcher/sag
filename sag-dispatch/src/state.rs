@@ -51,6 +51,9 @@ pub struct DispatchRuntime {
     /// until the targets for that route change (config reload) or the
     /// TTL expires (default 2 hours).
     pub fill_first_orders: Arc<RwLock<HashMap<String, CachedOrder>>>,
+    /// Sticky-failover active targets keyed by request model name.
+    /// Stores (provider, real_model) of the last successful target.
+    pub active_targets: Arc<RwLock<HashMap<String, (String, String)>>>,
     /// Runtime availability memory for route targets.
     pub route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
 }

@@ -559,8 +559,12 @@ fn is_default_api_endpoint(v: &str) -> bool {
 pub enum Strategy {
     /// Try targets in priority order; within the same priority, shuffle once
     /// on first access and reuse the same order for all subsequent requests.
-    /// The first target absorbs all traffic until it becomes unavailable.
+    /// Once switched to a backup target, keep using it until it fails.
     #[default]
+    StickyFailover,
+    /// Try targets in priority order; within the same priority, shuffle once
+    /// on first access and reuse the same order for all subsequent requests.
+    /// The first target absorbs all traffic until it becomes unavailable.
     FillFirst,
     /// Distribute requests across all targets in round-robin order.
     /// On failure, try the next target in sequence.
@@ -572,6 +576,8 @@ pub enum Strategy {
 ///
 /// When a request matches this route, targets are selected based on the route's
 /// `strategy`:
+/// - `StickyFailover`: similar to `FillFirst` but once switched to a backup target,
+///   keeps using it until it fails (maximizing cache hit rate).
 /// - `FillFirst`: sorted by priority (descending); same-priority targets are
 ///   shuffled once on first access and the order is cached. The first target
 ///   absorbs all traffic until it becomes unavailable.
@@ -595,7 +601,7 @@ pub struct RouteConfig {
         skip_serializing_if = "is_default_api_endpoint"
     )]
     pub api_endpoint: String,
-    /// Target selection strategy (default: `FillFirst`).
+    /// Target selection strategy (default: `StickyFailover`).
     #[serde(default, skip_serializing_if = "is_default_strategy")]
     pub strategy: Strategy,
     /// Per-target retry count override for this route.

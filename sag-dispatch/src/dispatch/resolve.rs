@@ -75,7 +75,6 @@ pub async fn resolve_route(
 
     let strategy = route.strategy;
     let api_endpoint = route.api_endpoint.clone();
-    let model_name = route.model_name.clone();
     let route_retries = route.retries;
     let global_retries = config_guard.retries;
     let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
@@ -84,10 +83,11 @@ pub async fn resolve_route(
     // Apply target selection strategy
     let ordered = order_targets(
         targets,
-        &model_name,
+        &request.model,
         strategy,
         &runtime.route_counters,
         &runtime.fill_first_orders,
+        &runtime.active_targets,
         shuffle_cache_ttl_secs,
     )
     .await;

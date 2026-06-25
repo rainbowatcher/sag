@@ -558,6 +558,7 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
     // strategy — skip if default
     if route.strategy != Strategy::default() {
         existing["strategy"] = toml_edit::value(match route.strategy {
+            Strategy::StickyFailover => "sticky_failover",
             Strategy::FillFirst => "fill_first",
             Strategy::RoundRobin => "round_robin",
         });

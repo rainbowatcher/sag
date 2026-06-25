@@ -41,6 +41,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
+        strategy,
     } = ctx;
 
     // Snapshot the backoff config once so the per-target retry loop doesn't
@@ -117,6 +118,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             continue;
         };
 
+        if strategy == sag_config::Strategy::StickyFailover {
+            let mut active = runtime.active_targets.write().await;
+            active.insert(
+                request.model.clone(),
+                (provider_name.clone(), real_model.clone()),
+            );
+        }
+
         match attempt {
             ChatAttempt::Stream(stream, upstream_start) => {
                 return build_streaming_response(
@@ -166,7 +175,7 @@ mod tests {
     use axum::body::to_bytes;
     use futures_util::Stream;
     use sag_analytics::StatsFilter;
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig};
+    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, Strategy};
     use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
     use sag_providers::LlmProvider;
@@ -315,6 +324,26 @@ mod tests {
         is_stream: bool,
         errors: &'a mut Vec<String>,
     ) -> DispatchCtx<'a> {
+        make_ctx_with_strategy(
+            state,
+            runtime,
+            request,
+            targets,
+            is_stream,
+            sag_config::Strategy::StickyFailover,
+            errors,
+        )
+    }
+
+    fn make_ctx_with_strategy<'a>(
+        state: &'a AppState,
+        runtime: &'a DispatchRuntime,
+        request: &'a ChatCompletionRequest,
+        targets: &'a [ResolvedTarget],
+        is_stream: bool,
+        strategy: sag_config::Strategy,
+        errors: &'a mut Vec<String>,
+    ) -> DispatchCtx<'a> {
         DispatchCtx {
             state,
             runtime,
@@ -325,6 +354,7 @@ mod tests {
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
             errors,
+            strategy,
         }
     }
 
@@ -634,5 +664,153 @@ mod tests {
             1,
             "missing provider should push an error and continue"
         );
+    }
+
+    async fn build_state_with_strategy(
+        providers: Vec<Arc<dyn LlmProvider>>,
+        strategy: Strategy,
+    ) -> AppState {
+        let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        for p in providers {
+            registry.insert(p.name().to_string(), p);
+        }
+        let config = GatewayConfig {
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["k".into()],
+            }),
+            routes: vec![sag_config::RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy,
+                targets: vec![
+                    sag_config::RouteTarget {
+                        provider: "first".into(),
+                        real_model: None,
+                        priority: 10,
+                        retries: Some(0),
+                        extra: HashMap::new(),
+                    },
+                    sag_config::RouteTarget {
+                        provider: "second".into(),
+                        real_model: None,
+                        priority: 5,
+                        retries: Some(0),
+                        extra: HashMap::new(),
+                    },
+                ],
+                retries: None,
+            }],
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = ConfigHandle::from_config(config);
+        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority() {
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+
+        let state =
+            build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::StickyFailover).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+
+        // Pre-record "second" as the active target (which has priority 5, lower than "first"'s 10)
+        {
+            let mut active = rt.active_targets.write().await;
+            active.insert(
+                "gpt-4o".to_string(),
+                ("second".to_string(), "gpt-4o".to_string()),
+            );
+        }
+
+        let trace_id = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Resolve route (should place "second" first due to sticky active target)
+        let (resolved_targets, api_endpoint, strategy) =
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false)
+                .await
+                .unwrap();
+
+        assert_eq!(resolved_targets[0].0, "second");
+
+        // Dispatch
+        let mut errors = Vec::new();
+        let ctx = DispatchCtx {
+            state: &state,
+            runtime: &rt,
+            request: &req,
+            targets: &resolved_targets,
+            api_endpoint: &api_endpoint,
+            is_stream: false,
+            trace_id,
+            start,
+            errors: &mut errors,
+            strategy,
+        };
+
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m2.chat_calls(), 1);
+        assert_eq!(
+            m1.chat_calls(),
+            0,
+            "first should not be called since second was sticky active"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_updates_active_target_on_success_after_failure() {
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        // "first" fails, "second" succeeds
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail".into())));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+
+        let state =
+            build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::StickyFailover).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+
+        let trace_id = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Resolve route
+        let (resolved_targets, api_endpoint, strategy) =
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false)
+                .await
+                .unwrap();
+
+        // Dispatch
+        let mut errors = Vec::new();
+        let ctx = DispatchCtx {
+            state: &state,
+            runtime: &rt,
+            request: &req,
+            targets: &resolved_targets,
+            api_endpoint: &api_endpoint,
+            is_stream: false,
+            trace_id,
+            start,
+            errors: &mut errors,
+            strategy,
+        };
+
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        // Now "second" must have been recorded as the active target
+        {
+            let active = rt.active_targets.read().await;
+            let active_target = active.get("gpt-4o").unwrap();
+            assert_eq!(active_target.0, "second");
+        }
     }
 }
