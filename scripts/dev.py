@@ -184,9 +184,6 @@ def main() -> None:
         log("SYS", "Nothing to start (both --skip-backend and --skip-ui)")
         return
 
-    log("SYS", "Gateway API: http://127.0.0.1:37210")
-    log("SYS", "Dashboard UI: http://localhost:5173")
-    log("SYS", "Press Ctrl+C to stop both processes.")
     print()
 
     wait_for_processes(procs)
