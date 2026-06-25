@@ -12,6 +12,7 @@ import {
   LogOut,
 } from "@lucide/vue"
 import { RouterView, useRoute, useRouter } from "vue-router"
+import { Badge } from "@/components/ui/badge"
 import { isDark, toggleDark } from "@/composables/useTheme"
 import { cn } from "@/lib/utils"
 import { useConnectionStore } from "@/stores/connection"
@@ -80,14 +81,14 @@ const navItems: NavItem[] = [
 
       <div class="space-y-2.5 border-t px-5 py-3">
         <div class="text-muted-foreground flex items-center justify-between text-xs">
-          <div class="flex items-center gap-1.5">
-            <component
-              :is="health.gatewayOnline ? Wifi : WifiOff"
-              class="h-3.5 w-3.5"
-              :class="health.gatewayOnline ? 'text-green-500' : 'text-red-500'"
-            />
-            <span>{{ health.gatewayOnline ? "Connected" : "Offline" }}</span>
-          </div>
+          <Badge
+            :variant="health.gatewayOnline ? 'secondary' : 'outline'"
+            class="gap-1.5 text-[10px]"
+            :class="health.gatewayOnline ? '' : 'text-destructive border-destructive/30'"
+          >
+            <component :is="health.gatewayOnline ? Wifi : WifiOff" class="h-3 w-3" />
+            {{ health.gatewayOnline ? "Connected" : "Offline" }}
+          </Badge>
           <Button
             variant="ghost"
             size="icon-sm"

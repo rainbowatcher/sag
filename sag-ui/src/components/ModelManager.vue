@@ -2,6 +2,7 @@
 import { Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { ref, watch } from "vue"
 import Combobox from "@/components/Combobox.vue"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
@@ -72,14 +73,15 @@ function onModelsEndpointChange(value: string | number) {
 
     <!-- Model list -->
     <div v-if="enabledModels.length > 0" class="space-y-1">
-      <div
+      <Badge
         v-for="model in enabledModels"
         :key="model"
-        class="bg-muted flex flex-wrap items-center gap-2 rounded px-2 py-1 text-xs"
+        variant="secondary"
+        class="w-full flex-wrap justify-between gap-1.5 py-0.5 pr-1 pl-2 text-xs font-normal"
       >
         <span class="font-mono">{{ model }}</span>
 
-        <div class="ml-auto flex flex-row items-center gap-2">
+        <div class="flex items-center gap-0.5">
           <TooltipProvider v-if="modelTestStates">
             <Tooltip :delay-duration="200">
               <TooltipTrigger as-child>
@@ -123,11 +125,11 @@ function onModelsEndpointChange(value: string | number) {
             </Tooltip>
           </TooltipProvider>
 
-          <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
+          <Button variant="ghost" size="icon-sm" class="h-5 w-5" @click="removeModel(model)">
             <Trash2 class="text-destructive h-3 w-3" />
           </Button>
         </div>
-      </div>
+      </Badge>
     </div>
 
     <!-- Multi-select model combobox -->

@@ -2,6 +2,7 @@
 import { AlertCircle, Search, RefreshCw, Loader2, TrendingUp, Zap, Clock } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -119,22 +120,18 @@ const statsTotals = computed(() => {
           </Card>
           <Card>
             <CardContent class="flex items-center gap-3 p-4">
-              <div
+              <Badge
                 v-if="statsTotals.successRate !== null"
-                class="flex h-5 w-5 items-center justify-center rounded-full border-2 text-[10px] font-bold"
+                variant="outline"
+                class="text-[10px]"
                 :style="{
                   borderColor: successRateColor(statsTotals.successRate),
                   color: successRateColor(statsTotals.successRate),
                 }"
               >
                 {{ statsTotals.successRate >= 95 ? "✓" : "!" }}
-              </div>
-              <div
-                v-else
-                class="border-muted-foreground/30 text-muted-foreground flex h-5 w-5 items-center justify-center rounded-full border-2 text-[10px] font-bold"
-              >
-                —
-              </div>
+              </Badge>
+              <Badge v-else variant="outline" class="text-muted-foreground text-[10px]"> — </Badge>
               <div>
                 <p class="text-muted-foreground text-xs">Success Rate</p>
                 <p
