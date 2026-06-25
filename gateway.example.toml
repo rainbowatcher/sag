@@ -3,9 +3,6 @@
 # Copy this to gateway.toml and fill in your keys.
 # ============================================================
 
-# Global default retry count (per target). Can be overridden per-route or per-target.
-retries = 2
-
 # FillFirst shuffle cache TTL in seconds. The shuffled target order is
 # re-randomised after this many seconds. Set to 0 to never expire (only
 # re-shuffle on config reload). Default: 7200 (2 hours).
@@ -25,6 +22,9 @@ format = "compact"
 # `min(base_ms * 2^attempt, max_ms)` with optional full jitter (random(0, cap)).
 # Override per deployment to trade off latency vs. upstream load.
 [backoff]
+# Global default retry count (per target). Can be overridden per-route or per-target.
+# Default: 2 (one initial attempt + one retry).
+retries = 2
 # Initial backoff delay in milliseconds (attempt 0). Default: 100.
 base_ms = 100
 # Maximum backoff delay cap in milliseconds. Default: 5000 (5s).

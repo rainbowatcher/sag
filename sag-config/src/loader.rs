@@ -12,9 +12,8 @@ use crate::config::{
 };
 use crate::toml_edit_util::{
     ensure_array_field, ensure_inline_table_field, ensure_nested_inline_table, prune_keys,
-    reformat_inline_table_arrays_multiline, set_scalar, sync_array_of_tables,
-    sync_inline_table_array_in_place, sync_inline_table_in_place, sync_string_array_in_place,
-    upsert_table,
+    reformat_inline_table_arrays_multiline, sync_array_of_tables, sync_inline_table_array_in_place,
+    sync_inline_table_in_place, sync_string_array_in_place, upsert_table,
 };
 
 /// A shared, hot-reloadable configuration handle.
@@ -86,6 +85,25 @@ pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
     (level, format)
 }
 
+/// Warn if the config still uses the legacy top-level `retries` key.
+///
+/// `retries` now lives under `[backoff]`. serde silently ignores unknown
+/// top-level fields, so without this check a user who kept `retries = N` at
+/// the top level would silently fall back to the default (2) with no
+/// indication. Parses the TOML a second time as a generic `Value` —
+/// acceptable since config load/reload is not on the hot path.
+fn warn_legacy_top_level_retries(content: &str) {
+    if let Ok(value) = toml::from_str::<toml::Value>(content)
+        && value.get("retries").is_some()
+    {
+        warn!(
+            "top-level `retries` is no longer supported; move it under [backoff] \
+             (e.g. `[backoff] retries = 2`). The top-level value is ignored — \
+             falling back to [backoff].retries (default 2)."
+        );
+    }
+}
+
 /// Load the initial configuration from a TOML file and return a `ConfigHandle`.
 pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::AppError> {
     let path = path.as_ref().to_path_buf();
@@ -93,6 +111,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
         sag_core::AppError::Config(format!("failed to read config {}: {e}", path.display()))
     })?;
 
+    warn_legacy_top_level_retries(&content);
     let config: GatewayConfig = toml::from_str(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
@@ -226,6 +245,7 @@ async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core
     let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
     })?;
+    warn_legacy_top_level_retries(&content);
     let config: GatewayConfig = toml::from_str(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
@@ -406,14 +426,12 @@ pub fn save_config_to_file(
             Ok(toml_edit::Item::Table((*pd).clone()))
         },
         |item| {
+            item["retries"] = toml_edit::value(config.backoff.retries as i64);
             item["base_ms"] = toml_edit::value(config.backoff.base_ms as i64);
             item["max_ms"] = toml_edit::value(config.backoff.max_ms as i64);
             item["jitter"] = toml_edit::value(config.backoff.jitter);
         },
     )?;
-
-    // ── retries — top-level scalar ──
-    set_scalar(&mut doc, &["retries"], config.retries as i64);
 
     // ── [[routes]] — array of tables, key-matched on model_name ──
     sync_array_of_tables(
@@ -1527,12 +1545,12 @@ targets = [
     fn save_persists_retries() {
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let mut config = openai_only_config();
-        config.retries = 7;
+        config.backoff.retries = 7;
 
         save_config_to_file(&config, &path).unwrap();
         let reloaded = load_config(&path).unwrap();
         let c = reloaded.inner.try_read().unwrap();
-        assert_eq!(c.retries, 7, "retries should be persisted to disk");
+        assert_eq!(c.backoff.retries, 7, "retries should be persisted to disk");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1542,6 +1560,7 @@ targets = [
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let mut config = openai_only_config();
         config.backoff = BackoffConfig {
+            retries: 2,
             base_ms: 250,
             max_ms: 30_000,
             jitter: false,

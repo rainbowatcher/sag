@@ -32,7 +32,7 @@ just build-test
 
 ## 热重载边界
 
-`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / retries / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](/configuration#热重载)。
+`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](/configuration#热重载)。
 
 ## Docker
 

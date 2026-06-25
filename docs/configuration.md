@@ -5,9 +5,6 @@ SAG 使用基于 TOML 的配置文件（默认：`gateway.toml`）。
 ## 示例
 
 ```toml
-# 全局默认重试次数（每个目标），可被 per-route 或 per-target 覆盖
-retries = 2
-
 # StickyFailover / FillFirst 策略的 shuffle 缓存有效期（秒）。默认 7200（2 小时）。
 # 设 0 表示永不过期，只在配置热重载时重新打乱。
 shuffle_cache_ttl_secs = 7200
@@ -25,7 +22,9 @@ generic_secs = 60
 # 可选 full jitter（实际等待 = random(0, 计算结果)）。
 # 调整这些值以在响应延迟和上游负载之间做权衡。
 [backoff]
-# 初始退避延迟（毫秒），对应第 0 次重试。默认：100。
+# 全局默认重试次数（每个目标），可被 per-route 或 per-target 覆盖。默认：2。
+retries = 2
+# 初始退避延迟（毫秒），对应第 0 次重试之前等待。默认：100。
 base_ms = 100
 # 最大退避延迟上限（毫秒）。默认：5000（5 秒）。
 max_ms = 5000

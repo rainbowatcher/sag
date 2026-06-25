@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Defaults:
 /// - `server`: 127.0.0.1:3000
 /// - `gateway_auth`: `Some(GatewayAuthConfig { api_keys: ["test-key"] })`
-/// - `retries`: 2
-/// - `backoff`: `BackoffConfig::default()` (base 100ms, max 5s, jitter)
+/// - `backoff`: `BackoffConfig::default()` (retries 2, base 100ms, max 5s, jitter)
 /// - `circuit_breaker`: `CircuitBreakerConfig::default()` (quota 1h, rate 10s, generic 60s)
 /// - `logging`: `LoggingConfig::default()` (info, compact)
 /// - `shuffle_cache_ttl_secs`: 7200
@@ -34,7 +33,6 @@ macro_rules! gateway_config_base {
                 api_keys: ::std::vec!["test-key".into()],
             }),
             providers: ::std::collections::HashMap::new(),
-            retries: 2,
             backoff: $crate::BackoffConfig::default(),
             logging: $crate::LoggingConfig::default(),
             routes: ::std::vec::Vec::new(),
@@ -51,11 +49,7 @@ pub struct GatewayConfig {
     pub analytics: Option<AnalyticsConfig>,
     pub gateway_auth: Option<GatewayAuthConfig>,
     pub providers: std::collections::HashMap<String, ProviderConfig>,
-    /// Global default for per-target retries (can be overridden per-route or per-target).
-    /// `1` → one attempt (no retries). `2` → one initial + one retry, etc.
-    #[serde(default = "default_retries")]
-    pub retries: u32,
-    /// Global exponential-backoff settings for retry delays.
+    /// Global exponential-backoff settings for retry delays (including global retries).
     #[serde(default)]
     pub backoff: BackoffConfig,
     /// Circuit-breaker cooldown durations by error category.
@@ -106,10 +100,10 @@ impl GatewayConfig {
         if self.providers.is_empty() {
             errors.push("at least one provider is required".into());
         }
-        if self.retries > 10 {
+        if self.backoff.retries > 10 {
             warnings.push(format!(
                 "global retries={} seems unusually high",
-                self.retries
+                self.backoff.retries
             ));
         }
 
@@ -458,12 +452,17 @@ pub fn default_timeout_secs() -> u64 {
 
 /// Exponential-backoff settings for retry delays between attempts.
 ///
-/// Formula: `min(base_ms * 2^attempt, max_ms)`, with optional full jitter
-/// (`delay = random(0, computed)`) to avoid thundering-herd retries across
-/// many concurrent clients. `attempt = 0` returns the base delay; `attempt = 1`
-/// doubles it; etc.
+/// Exponential-backoff settings for retry delays between attempts.
+///
+/// Each retry sleeps for `min(base_ms * 2^attempt, max_ms)` with
+/// optional full jitter (`random(0, cap)`). So attempt 0 waits
+/// `base_ms`, attempt 1 waits `2*base_ms` (capped at `max_ms`), and so on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackoffConfig {
+    /// Global default for per-target retries (can be overridden per-route or per-target).
+    /// `1` → one attempt (no retries). `2` → one initial + one retry, etc.
+    #[serde(default = "default_retries")]
+    pub retries: u32,
     /// Initial backoff delay in milliseconds (corresponds to attempt 0).
     #[serde(default = "default_backoff_base_ms")]
     pub base_ms: u64,
@@ -481,6 +480,7 @@ pub struct BackoffConfig {
 impl Default for BackoffConfig {
     fn default() -> Self {
         Self {
+            retries: default_retries(),
             base_ms: default_backoff_base_ms(),
             max_ms: default_backoff_max_ms(),
             jitter: default_backoff_jitter(),
@@ -594,7 +594,7 @@ pub enum Strategy {
 /// ## Retries
 ///
 /// The effective number of retries for each target is resolved via three-tier
-/// fallback: **target-level** → **route-level** → **global** (`GatewayConfig.retries`).
+/// fallback: **target-level** → **route-level** → **global** (`GatewayConfig.backoff.retries`).
 /// The first tier that explicitly sets a value wins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
@@ -612,7 +612,7 @@ pub struct RouteConfig {
     #[serde(default, skip_serializing_if = "is_default_strategy")]
     pub strategy: Strategy,
     /// Per-target retry count override for this route.
-    /// When `None` (default), falls back to the global `GatewayConfig.retries`.
+    /// When `None` (default), falls back to the global `GatewayConfig.backoff.retries`.
     /// When `Some(n)`, each target in this route retries up to `n` times.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
@@ -723,7 +723,7 @@ targets = [
         assert_eq!(openai.base_url, "https://api.openai.com/v1");
         assert_eq!(openai.models_endpoint, "models");
         assert_eq!(openai.timeout_secs, 120);
-        assert_eq!(config.retries, 2);
+        assert_eq!(config.backoff.retries, 2);
 
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
@@ -763,7 +763,7 @@ targets = [
 [providers]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.retries, 2);
+        assert_eq!(config.backoff.retries, 2);
     }
 
     #[test]
@@ -815,11 +815,12 @@ max_ms = 10_000
     #[test]
     fn parse_retries_tiered_override() {
         let toml_str = r#"
-retries = 5
-
 [server]
 
 [providers]
+
+[backoff]
+retries = 5
 
 [[routes]]
 model_name = "gpt-4o"
@@ -835,11 +836,29 @@ targets = [
 ]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.retries, 5);
+        assert_eq!(config.backoff.retries, 5);
         assert_eq!(config.routes[0].retries, None);
         assert_eq!(config.routes[0].targets[0].retries, None);
         assert_eq!(config.routes[1].retries, Some(3));
         assert_eq!(config.routes[1].targets[0].retries, Some(1));
+    }
+
+    #[test]
+    fn parse_legacy_top_level_retries_ignored() {
+        // `retries` moved under [backoff]; serde silently ignores the
+        // top-level key and backoff.retries falls back to its default (2).
+        // The loader emits a warning when it detects this (see
+        // warn_legacy_top_level_retries).
+        let toml_str = r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+base_url = "https://api.openai.com/v1"
+
+retries = 5
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backoff.retries, 2);
     }
 
     #[test]

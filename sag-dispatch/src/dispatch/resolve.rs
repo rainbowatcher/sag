@@ -76,7 +76,7 @@ pub async fn resolve_route(
     let strategy = route.strategy;
     let api_endpoint = route.api_endpoint.clone();
     let route_retries = route.retries;
-    let global_retries = config_guard.retries;
+    let global_retries = config_guard.backoff.retries;
     let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
     drop(config_guard);
 

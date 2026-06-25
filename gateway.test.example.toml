@@ -16,9 +16,6 @@
 # the [gateway_auth] block from gateway.example.toml after first-time setup.
 # ============================================================
 
-# Global default retry count (per target). Can be overridden per-route or per-target.
-retries = 2
-
 # FillFirst shuffle cache TTL in seconds. The shuffled target order is
 # re-randomised after this many seconds. Set to 0 to never expire (only
 # re-shuffle on config reload). Default: 7200 (2 hours).
@@ -44,6 +41,9 @@ format = "compact"
 # Exponential-backoff settings for retry delays. See gateway.example.toml
 # for full semantics; defaults preserved here for parity with prod.
 [backoff]
+# Global default retry count (per target). Can be overridden per-route or per-target.
+# Default: 2 (one initial attempt + one retry).
+retries = 2
 base_ms = 100
 max_ms = 5000
 jitter = true
