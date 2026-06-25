@@ -81,26 +81,27 @@ pub async fn order_targets(
     }
 }
 
-/// Returns true when the two target lists have the same set of
-/// `(provider, real_model, priority)` tuples — i.e. the
-/// ordering-relevant fields are identical so we can reuse a cached
-/// shuffled order. Order-agnostic: a passed-in sorted list matched
-/// against a previously cached shuffled permutation returns true.
+/// Returns true when the two target lists are semantically identical
+/// (same set of fully-populated `RouteTarget`s). Order-agnostic: a
+/// passed-in sorted list matched against a previously cached shuffled
+/// permutation returns true.
+///
+/// All `RouteTarget` fields — including `extra` and `retries` — are
+/// compared so that config hot-reloads changing any field invalidate
+/// the cached shuffle order.
 fn targets_match(a: &[RouteTarget], b: &[RouteTarget]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut a_keys: Vec<(&str, Option<&str>, u32)> = a
-        .iter()
-        .map(|t| (t.provider.as_str(), t.real_model.as_deref(), t.priority))
-        .collect();
-    let mut b_keys: Vec<(&str, Option<&str>, u32)> = b
-        .iter()
-        .map(|t| (t.provider.as_str(), t.real_model.as_deref(), t.priority))
-        .collect();
-    a_keys.sort();
-    b_keys.sort();
-    a_keys == b_keys
+    let mut a_sorted: Vec<&RouteTarget> = a.iter().collect();
+    let mut b_sorted: Vec<&RouteTarget> = b.iter().collect();
+    a_sorted.sort_by(|x, y| {
+        (&x.provider, &x.real_model, x.priority).cmp(&(&y.provider, &y.real_model, y.priority))
+    });
+    b_sorted.sort_by(|x, y| {
+        (&x.provider, &x.real_model, x.priority).cmp(&(&y.provider, &y.real_model, y.priority))
+    });
+    a_sorted == b_sorted
 }
 
 /// Shuffle same-priority targets once and cache the result.
@@ -309,6 +310,69 @@ mod tests {
         // Targets changed (added "c") → must re-shuffle
         let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl).await;
         assert_eq!(b1.len(), 3, "new target list includes c");
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl).await;
+        assert_eq!(b1, b2, "cached after re-shuffle");
+    }
+
+    #[tokio::test]
+    async fn fill_first_re_shuffles_when_extra_changes() {
+        let orders = orders_map();
+        let ttl = 7200;
+        let targets_a: Vec<RouteTarget> = vec![RouteTarget {
+            provider: "a".into(),
+            real_model: None,
+            priority: 0,
+            retries: None,
+            extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
+        }];
+        let targets_b: Vec<RouteTarget> = vec![RouteTarget {
+            provider: "a".into(),
+            real_model: None,
+            priority: 0,
+            retries: None,
+            extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
+        }];
+
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        assert_eq!(a1, a2, "same targets → cached");
+
+        // Extra changed → must re-shuffle even though provider/real_model/priority are identical
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl).await;
+        assert_eq!(
+            b1[0].extra.get("temperature").unwrap(),
+            &serde_json::json!(0.9)
+        );
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl).await;
+        assert_eq!(b1, b2, "cached after re-shuffle");
+    }
+
+    #[tokio::test]
+    async fn fill_first_re_shuffles_when_retries_changes() {
+        let orders = orders_map();
+        let ttl = 7200;
+        let targets_a: Vec<RouteTarget> = vec![RouteTarget {
+            provider: "a".into(),
+            real_model: None,
+            priority: 0,
+            retries: Some(1),
+            extra: HashMap::new(),
+        }];
+        let targets_b: Vec<RouteTarget> = vec![RouteTarget {
+            provider: "a".into(),
+            real_model: None,
+            priority: 0,
+            retries: Some(3),
+            extra: HashMap::new(),
+        }];
+
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        assert_eq!(a1, a2, "same targets → cached");
+
+        // Retries changed → must re-shuffle even though provider/real_model/priority are identical
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl).await;
+        assert_eq!(b1[0].retries, Some(3));
         let b2 = order_fill_first(targets_b, "m", &orders, ttl).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
