@@ -160,7 +160,7 @@ Content-Type: application/json
 |------|------|------|------|
 | `model_name` | string | 是 | 客户端请求的模型名，`"*"` 为兜底路由 |
 | `api_endpoint` | string | 否 | API 端点路径，默认 `"/chat/completions"` |
-| `strategy` | string | 否 | 目标选择策略（`fill_first` / `round_robin`），默认 `fill_first` |
+| `strategy` | string | 否 | 目标选择策略（`sticky_failover` / `fill_first` / `round_robin`），默认 `sticky_failover` |
 | `targets` | array | 是 | 目标供应商列表 |
 
 **target 字段说明**：

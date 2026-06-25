@@ -46,7 +46,7 @@ priority = 10
 |------|------|------|
 | `model_name` | string | 客户端请求的模型名。支持精确匹配，或使用 `"*"` 作为通配符匹配所有模型 |
 | `api_endpoint` | string | 上游 API 端点路径，默认 `"/v1/chat/completions"` |
-| `strategy` | string | 目标选择策略：`fill_first` (默认) 或 `round_robin` |
+| `strategy` | string | 目标选择策略：`sticky_failover` (默认)、`fill_first` 或 `round_robin` |
 | `retries` | integer (可选) | 每个目标的重试次数，覆盖全局 `retries`。省略则使用全局默认值 |
 | `targets` | array | 目标供应商列表，按优先级排序 |
 
@@ -69,11 +69,57 @@ priority = 10
 
 ## 目标选择策略
 
-SAG 提供两种目标选择策略：`fill_first`（默认）和 `round_robin`。
+SAG 提供三种目标选择策略：`sticky_failover`（默认）、`fill_first` 和 `round_robin`。
+
+### StickyFailover — 粘滞故障转移（默认）
+
+`sticky_failover` 是 FillFirst 的增强版本，核心语义是：**在 FillFirst 的 shuffle + 缓存基础上，额外记录每个模型最近一次成功调用的 target**。后续同模型请求会优先复用这个 target，直到它失败才会重新选择。
+
+```mermaid
+flowchart TD
+    A[请求到达] --> B[匹配路由]
+    B --> C{该路由已有 sticky active target?}
+    C -->|是| D{active target 仍有效?}
+    D -->|是| E[将 active target 移到队首]
+    D -->|否| F[清除 active target]
+    C -->|否| F
+    F --> G{该路由已有缓存顺序且未过期?}
+    G -->|否| H[按 priority 降序排列<br/>同优先级随机打乱<br/>缓存结果 + 时间戳]
+    G -->|是| I[使用缓存顺序]
+    H --> J[尝试下一个目标]
+    I --> J
+    E --> J
+    J --> K{目标可用?}
+    K -->|熔断器开| J
+    K -->|provider disabled| J
+    K -->|是| L[调用上游 API]
+    L --> M{响应结果}
+    M -->|成功| N[记录为 sticky active target<br/>返回 200]
+    M -->|4xx 错误| O[停止重试]
+    M -->|5xx/网络超时| P{该目标重试耗尽?}
+    P -->|否| L
+    P -->|是| J
+    J -->|全部失败| Q[返回 502]
+```
+
+**关键特性**：
+
+1. **继承 FillFirst 的 shuffle 特性** — 首次随机、顺序缓存、TTL 过期；路由 target 列表发生变更时 shuffle 缓存自动失效
+2. **粘滞复用** — 一旦某个 target 成功响应，同模型的后续请求会将它置顶优先尝试，最大化上游缓存命中率
+3. **失败自动切换** — 当 sticky target 因熔断、禁用或重试耗尽而失败时，自动 fallthrough 到下一个 target；成功后新的 target 成为 sticky active
+4. **配置变更清理** — 当路由 target 列表发生变更（增删、provider/real_model/priority 修改）时，自动清除该模型的 sticky active target，防止指向已不存在的 target
+
+**适用场景**：
+- 多供应商部署中，希望尽量复用同一个供应商以提高缓存命中和降低冷启动延迟
+- 主备模式下，failover 到 backup 后希望持续使用 backup（避免频繁在主备之间切换导致两边都冷启动）
+
+如果 TOML 中没有配 strategy，默认为 `sticky_failover`。
 
 ### FillFirst — 首次随机 + 缓存
 
 `fill_first` 的核心语义是：**每个优先级组内，首次访问时随机打乱顺序，之后所有请求复用同一顺序**。第一个目标承担所有流量，直到它不可用（被禁用、熔断器打开、或重试耗尽），才会 fallthrough 到下一个目标。
+
+> **与 StickyFailover 的区别**：FillFirst 不会"记住"上一次成功调用的 target。每次请求都严格按缓存的固定顺序尝试，即使上一次 failover 到了 backup，下一个请求仍会先尝试高优先级 target。这适合需要始终优先使用主供应商、不因偶发故障而长期漂移的场景。
 
 ```mermaid
 flowchart TD
@@ -130,8 +176,6 @@ priority = 0
 - 如果 anthropic 熔断：自动跳到 openai
 - 冷却结束后：重新尝试 anthropic（FillFirst 自然语义——优先用首选 target）
 
-如果 TOML 中没有配 strategy，默认为 `fill_first`。
-
 ### RoundRobin — 轮询
 
 `round_robin` 的核心语义是：**每个请求轮流使用下一个 target**。计数器按 `model_name` 独立维护，请求一次加一。
@@ -184,16 +228,16 @@ priority = 10
 - 请求 3 → openai（counter 2 % 2 = 0）
 - ...
 
-**两种策略对比**：
+**三种策略对比**：
 
-| 特性 | FillFirst | RoundRobin |
-|------|-----------|------------|
-| 目标选择 | 首次随机后固定 + TTL 过期重排 | 每次轮转 |
-| 适用场景 | 主备模式、成本优化 | 负载均衡 |
-| 缓存状态 | CachedOrder（TTL + 跨请求记忆） | 无（只记计数器） |
-| 配置热重载 | 重新随机 | 计数器继续递增 |
-| 熔断冷却后行为 | 自然回归首选（按优先级） | 自然回归轮转 |
-| 默认 | 是 | 否 |
+| 特性 | StickyFailover | FillFirst | RoundRobin |
+|------|----------------|-----------|------------|
+| 目标选择 | 首次随机后固定，成功后粘滞复用 | 首次随机后固定 | 每次轮转 |
+| 适用场景 | 多供应商缓存命中优化、主备持续 failover | 严格主备、成本优化 | 负载均衡 |
+| 缓存状态 | CachedOrder + active_targets | CachedOrder（TTL + 跨请求记忆） | 无（只记计数器） |
+| 配置热重载 | 重新随机 + 清除 sticky | 重新随机 | 计数器继续递增 |
+| 熔断冷却后行为 | 继续优先使用 sticky target | 自然回归首选（按优先级） | 自然回归轮转 |
+| 默认 | **是** | 否 | 否 |
 
 ## 熔断器策略
 
@@ -205,7 +249,7 @@ SAG 的熔断器根据**错误类型**自动选择冷却时长，三个 duration
 | 请求过频 | 10 秒 | 上游返回 `429`（速率限制），非额度相关 |
 | 通用故障 | 60 秒 | 5xx、网络超时、连接错误等 |
 
-冷却结束后，目标自然重新加入路由——FillFirst 按优先级尝试首选 target，RoundRobin 回到轮转顺序。
+冷却结束后，目标自然重新加入路由——StickyFailover 继续优先使用上一次成功的 sticky target，FillFirst 按优先级尝试首选 target，RoundRobin 回到轮转顺序。
 
 ```toml
 # 熔断器冷却时长（秒），省略则使用默认值。
@@ -217,10 +261,10 @@ generic_secs = 60             # 默认 60 秒
 
 ## shuffle_cache_ttl_secs
 
-控制 FillFirst 策略中 shuffle 缓存的有效期。配置在 `[gateway]` 顶层：
+控制 StickyFailover 和 FillFirst 策略中 shuffle 缓存的有效期。配置在 `[gateway]` 顶层：
 
 ```toml
-# FillFirst shuffle 缓存有效期（秒）。默认 7200（2 小时）。
+# StickyFailover / FillFirst shuffle 缓存有效期（秒）。默认 7200（2 小时）。
 # 设为 0 表示永不过期（只在配置变更时重新打乱）。
 shuffle_cache_ttl_secs = 7200
 ```
@@ -229,7 +273,7 @@ shuffle_cache_ttl_secs = 7200
 
 路由内的目标按 `priority` **降序**排列（值越大越优先）。这里的 `priority` 是 `RouteTarget` 级别字段，不是 `ProviderConfig` 级别字段。
 
-处理逻辑（两种策略共用）：
+处理逻辑（三种策略共用）：
 
 ```mermaid
 flowchart TD

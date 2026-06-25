@@ -8,7 +8,7 @@ SAG 使用基于 TOML 的配置文件（默认：`gateway.toml`）。
 # 全局默认重试次数（每个目标），可被 per-route 或 per-target 覆盖
 retries = 2
 
-# FillFirst 策略的 shuffle 缓存有效期（秒）。默认 7200（2 小时）。
+# StickyFailover / FillFirst 策略的 shuffle 缓存有效期（秒）。默认 7200（2 小时）。
 # 设 0 表示永不过期，只在配置热重载时重新打乱。
 shuffle_cache_ttl_secs = 7200
 
@@ -113,7 +113,7 @@ targets = [
 | `rate_limited_secs` | `10` | 速率限制（上游 429，非额度相关）后的冷却时长（秒） |
 | `generic_secs` | `60` | 通用故障（5xx / 网络超时 / 连接错误）后的冷却时长（秒） |
 
-冷却期内该 target 被跳过，调度器自动 fallthrough 到下一个 target。冷却结束后 target 自然回归路由——FillFirst 按优先级尝试首选，RoundRobin 回到轮转顺序。
+冷却期内该 target 被跳过，调度器自动 fallthrough 到下一个 target。冷却结束后 target 自然回归路由——StickyFailover 继续优先使用上一次成功的 sticky target，FillFirst 按优先级尝试首选，RoundRobin 回到轮转顺序。
 
 错误分类逻辑由 `sag_core::CircuitHint` 实现：对上游 429 body 做关键词匹配，先精确匹配 `"rate limit"`（→ `RateLimited` / 10s），再匹配 quota/billing 相关关键词（→ `QuotaExhausted` / 1h），未知 429 和 5xx/网络错误回退到 `Generic`（→ 60s）。详情见[路由 → 熔断器策略](/routing#熔断器策略)。
 
