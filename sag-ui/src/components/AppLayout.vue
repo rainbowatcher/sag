@@ -112,8 +112,8 @@ const navItems: NavItem[] = [
       </div>
     </aside>
 
-    <main class="flex-1 overflow-y-auto">
-      <div class="mx-auto max-w-6xl p-6 xl:max-w-7xl xl:p-8 2xl:max-w-[90rem] 2xl:p-10">
+    <main class="flex-1 overflow-hidden">
+      <div class="mx-auto h-full max-w-6xl p-6 xl:max-w-7xl xl:p-8 2xl:max-w-[90rem] 2xl:p-10">
         <RouterView />
       </div>
     </main>

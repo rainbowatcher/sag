@@ -20,6 +20,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
@@ -203,18 +211,13 @@ const table = useVueTable({
 
 <template>
   <!-- ── Table ─────────────────────────────────────────────────── -->
-  <div v-if="routeStore.routes.length > 0" class="overflow-hidden rounded-lg border">
-    <table class="w-full">
-      <thead>
-        <tr
-          v-for="headerGroup in table.getHeaderGroups()"
-          :key="headerGroup.id"
-          class="bg-muted/50 border-b"
-        >
-          <th
+  <div v-if="routeStore.routes.length > 0" class="h-full overflow-auto rounded-lg border">
+    <Table>
+      <TableHeader class="bg-background sticky top-0 z-10">
+        <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+          <TableHead
             v-for="header in headerGroup.headers"
             :key="header.id"
-            class="text-muted-foreground px-4 py-3 text-left text-xs font-medium"
             :class="[
               (header.column.columnDef.meta as any)?.class,
               header.column.getCanSort()
@@ -237,30 +240,28 @@ const table = useVueTable({
                 "
               />
             </div>
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr
+          </TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        <TableRow
           v-for="row in table.getRowModel().rows"
           :key="row.id"
-          class="hover:bg-muted/30 border-b transition-colors last:border-b-0"
           :class="{
             'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
             'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
           }"
         >
-          <td
+          <TableCell
             v-for="cell in row.getVisibleCells()"
             :key="cell.id"
-            class="px-4 py-3 text-sm"
             :class="(cell.column.columnDef.meta as any)?.class"
           >
             <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-          </td>
-        </tr>
-      </tbody>
-    </table>
+          </TableCell>
+        </TableRow>
+      </TableBody>
+    </Table>
   </div>
 
   <!-- ── Delete confirmation Dialog ────────────────────────────── -->

@@ -33,66 +33,71 @@ onMounted(refreshPage)
 </script>
 
 <template>
-  <div class="space-y-6">
-    <!-- ── Header ────────────────────────────────────────────────── -->
-    <div class="flex items-center justify-between">
-      <div>
-        <h2 class="text-2xl font-bold tracking-tight">Routes</h2>
-        <p class="text-muted-foreground mt-1 text-sm">管理模型路由规则与 API 端点映射</p>
+  <div class="flex h-full flex-col">
+    <div class="shrink-0 space-y-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-2xl font-bold tracking-tight">Routes</h2>
+          <p class="text-muted-foreground mt-1 text-sm">管理模型路由规则与 API 端点映射</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            :disabled="routeStore.routesLoading"
+            @click="refreshPage"
+          >
+            <RefreshCw
+              :class="routeStore.routesLoading ? 'animate-spin' : ''"
+              class="h-3.5 w-3.5"
+            />
+            Refresh
+          </Button>
+          <Button size="sm" @click="showAdd = true">
+            <Plus class="h-3.5 w-3.5" />
+            Add Route
+          </Button>
+        </div>
       </div>
-      <div class="flex items-center gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          :disabled="routeStore.routesLoading"
-          @click="refreshPage"
-        >
-          <RefreshCw :class="routeStore.routesLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-          Refresh
-        </Button>
-        <Button size="sm" @click="showAdd = true">
-          <Plus class="h-3.5 w-3.5" />
-          Add Route
-        </Button>
+
+      <RouteAddForm
+        v-if="showAdd"
+        :providers="providerStore.providers"
+        :provider-models="routeStore.providerModels"
+        :provider-models-loading="routeStore.providerModelsLoading"
+        @close="showAdd = false"
+        @created="handleRouteCreated"
+      />
+    </div>
+
+    <div class="min-h-0 flex-1 pt-6 pb-6">
+      <div
+        v-if="routeStore.routesLoading && routeStore.routes.length === 0"
+        class="text-muted-foreground py-12 text-center"
+      >
+        <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
+        Loading…
       </div>
+
+      <!-- ── Error ─────────────────────────────────────────────────── -->
+      <div
+        v-else-if="pageError"
+        class="text-destructive flex items-center justify-center gap-2 py-12 text-sm"
+      >
+        <AlertCircle class="h-4 w-4" />
+        {{ pageError }}
+      </div>
+
+      <!-- ── Empty ─────────────────────────────────────────────────── -->
+      <div
+        v-else-if="routeStore.routes.length === 0"
+        class="text-muted-foreground py-12 text-center text-sm"
+      >
+        No routes configured. Click "Add Route" to get started.
+      </div>
+
+      <!-- ── Route List (table + edit + delete) ──────────────────── -->
+      <RouteList v-else />
     </div>
-
-    <RouteAddForm
-      v-if="showAdd"
-      :providers="providerStore.providers"
-      :provider-models="routeStore.providerModels"
-      :provider-models-loading="routeStore.providerModelsLoading"
-      @close="showAdd = false"
-      @created="handleRouteCreated"
-    />
-
-    <!-- ── Loading ───────────────────────────────────────────────── -->
-    <div
-      v-if="routeStore.routesLoading && routeStore.routes.length === 0"
-      class="text-muted-foreground py-12 text-center"
-    >
-      <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
-      Loading…
-    </div>
-
-    <!-- ── Error ─────────────────────────────────────────────────── -->
-    <div
-      v-else-if="pageError"
-      class="text-destructive flex items-center justify-center gap-2 py-12 text-sm"
-    >
-      <AlertCircle class="h-4 w-4" />
-      {{ pageError }}
-    </div>
-
-    <!-- ── Empty ─────────────────────────────────────────────────── -->
-    <div
-      v-else-if="routeStore.routes.length === 0"
-      class="text-muted-foreground py-12 text-center text-sm"
-    >
-      No routes configured. Click "Add Route" to get started.
-    </div>
-
-    <!-- ── Route List (table + edit + delete) ──────────────────── -->
-    <RouteList v-else />
   </div>
 </template>

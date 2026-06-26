@@ -3,7 +3,9 @@ import ProviderList from "@/components/providers/ProviderList.vue"
 </script>
 
 <template>
-  <div class="space-y-6">
-    <ProviderList />
+  <div class="flex h-full flex-col">
+    <div class="min-h-0 flex-1 pb-6">
+      <ProviderList />
+    </div>
   </div>
 </template>

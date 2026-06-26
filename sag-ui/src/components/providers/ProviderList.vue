@@ -16,6 +16,14 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider } from "@/types/api"
@@ -213,173 +221,167 @@ const table = useVueTable({
 </script>
 
 <template>
-  <!-- ── Header ──────────────────────────────────────────────────── -->
-  <div class="flex items-center justify-between">
-    <div>
-      <h2 class="text-2xl font-bold tracking-tight">Providers</h2>
-      <p class="text-muted-foreground mt-1 text-sm">管理上游 LLM 供应商配置</p>
-    </div>
-    <div class="flex items-center gap-2">
-      <button
-        @click="fetchProviders()"
-        :disabled="store.providersLoading"
-        class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
-      >
-        <RefreshCw :class="store.providersLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-        Refresh
-      </button>
-      <button
-        @click="showAdd = !showAdd"
-        class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors"
-      >
-        <Plus class="h-3.5 w-3.5" />
-        Add Provider
-      </button>
-    </div>
-  </div>
-
-  <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
-
-  <!-- ── Filters ─────────────────────────────────────────────────── -->
-  <div class="grid gap-3 md:grid-cols-[1fr_200px_160px] md:items-end">
-    <div>
-      <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Model</label>
-      <Combobox
-        v-model="filterModelName"
-        :options="modelOptions"
-        :loading="modelsLoading"
-        placeholder="All models"
-        search-placeholder="Search models..."
-        empty-text="No models found"
-      />
-    </div>
-    <div>
-      <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Type</label>
-      <Select
-        :model-value="filterProviderType"
-        @update:model-value="(value) => (filterProviderType = value as string)"
-      >
-        <SelectTrigger>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="all">All types</SelectItem>
-          <SelectItem value="openai">OpenAI</SelectItem>
-          <SelectItem value="anthropic">Anthropic</SelectItem>
-        </SelectContent>
-      </Select>
-    </div>
-    <div>
-      <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Sort</label>
-      <Select
-        :model-value="sortByName ? 'name' : 'default'"
-        @update:model-value="(value) => (sortByName = value === 'name')"
-      >
-        <SelectTrigger>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="name">Name (A-Z)</SelectItem>
-          <SelectItem value="default">Default</SelectItem>
-        </SelectContent>
-      </Select>
-    </div>
-  </div>
-
-  <!-- ── Loading ─────────────────────────────────────────────────── -->
-  <div
-    v-if="store.providersLoading && store.providers.length === 0"
-    class="text-muted-foreground py-12 text-center"
-  >
-    <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
-    Loading…
-  </div>
-
-  <!-- ── Empty ───────────────────────────────────────────────────── -->
-  <div
-    v-else-if="store.providers.length === 0"
-    class="text-muted-foreground py-12 text-center text-sm"
-  >
-    {{
-      filterModelName || filterProviderType !== "all"
-        ? "No providers match the current filters."
-        : 'No providers configured. Click "Add Provider" to get started.'
-    }}
-  </div>
-
-  <!-- ── Table ───────────────────────────────────────────────────── -->
-  <div v-else class="overflow-hidden rounded-lg border">
-    <table class="w-full">
-      <thead>
-        <tr
-          v-for="headerGroup in table.getHeaderGroups()"
-          :key="headerGroup.id"
-          class="bg-muted/50 border-b"
-        >
-          <th
-            v-for="header in headerGroup.headers"
-            :key="header.id"
-            class="text-muted-foreground px-4 py-3 text-left text-xs font-medium"
-            :class="(header.column.columnDef.meta as any)?.class"
+  <div class="flex h-full flex-col space-y-6">
+    <!-- ── Header ────────────────────────────────────────────────── -->
+    <div class="shrink-0 space-y-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-2xl font-bold tracking-tight">Providers</h2>
+          <p class="text-muted-foreground mt-1 text-sm">管理上游 LLM 供应商配置</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button
+            @click="fetchProviders()"
+            :disabled="store.providersLoading"
+            class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
           >
-            <FlexRender
-              v-if="!header.isPlaceholder"
-              :render="header.column.columnDef.header!"
-              :props="header.getContext()"
-            />
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr
-          v-for="row in table.getRowModel().rows"
-          :key="row.id"
-          class="hover:bg-muted/30 border-b transition-colors last:border-b-0"
-        >
-          <td
-            v-for="cell in row.getVisibleCells()"
-            :key="cell.id"
-            class="px-4 py-3 text-sm"
-            :class="(cell.column.columnDef.meta as any)?.class"
+            <RefreshCw :class="store.providersLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
+            Refresh
+          </button>
+          <button
+            @click="showAdd = !showAdd"
+            class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors"
           >
-            <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-          </td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
+            <Plus class="h-3.5 w-3.5" />
+            Add Provider
+          </button>
+        </div>
+      </div>
 
-  <!-- ── Delete confirmation ─────────────────────────────────────── -->
-  <div
-    v-if="confirmingDelete"
-    class="bg-destructive/5 border-destructive/20 fixed inset-x-0 bottom-0 z-50 border-t p-4 shadow-lg md:relative md:inset-auto md:rounded-lg md:border md:shadow-none"
-  >
-    <div class="flex items-center justify-between gap-4">
-      <p class="text-sm">
-        Delete provider
-        <span class="font-semibold">{{ confirmingDelete }}</span
-        >?
-      </p>
-      <div class="flex gap-2">
-        <Button variant="outline" size="sm" @click="confirmingDelete = null"> Cancel </Button>
-        <Button
-          variant="destructive"
-          size="sm"
-          :disabled="deleting"
-          @click="confirmDelete(confirmingDelete)"
-        >
-          <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
-          {{ deleting ? "Deleting…" : "Delete" }}
-        </Button>
+      <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
+
+      <!-- ── Filters ─────────────────────────────────────────────── -->
+      <div class="grid gap-3 md:grid-cols-[1fr_200px_160px] md:items-end">
+        <div>
+          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Model</label>
+          <Combobox
+            v-model="filterModelName"
+            :options="modelOptions"
+            :loading="modelsLoading"
+            placeholder="All models"
+            search-placeholder="Search models..."
+            empty-text="No models found"
+          />
+        </div>
+        <div>
+          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Type</label>
+          <Select
+            :model-value="filterProviderType"
+            @update:model-value="(value) => (filterProviderType = value as string)"
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All types</SelectItem>
+              <SelectItem value="openai">OpenAI</SelectItem>
+              <SelectItem value="anthropic">Anthropic</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div>
+          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Sort</label>
+          <Select
+            :model-value="sortByName ? 'name' : 'default'"
+            @update:model-value="(value) => (sortByName = value === 'name')"
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="name">Name (A-Z)</SelectItem>
+              <SelectItem value="default">Default</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
       </div>
     </div>
-  </div>
 
-  <!-- ── Edit Drawer / Dialog ────────────────────────────────────── -->
-  <ProviderEditForm
-    v-if="editingProvider"
-    :provider="editingProvider"
-    @close="onEditClose"
-    @updated="onUpdated"
-  />
+    <!-- ── Loading ───────────────────────────────────────────────── -->
+    <div
+      v-if="store.providersLoading && store.providers.length === 0"
+      class="text-muted-foreground py-12 text-center"
+    >
+      <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
+      Loading…
+    </div>
+
+    <!-- ── Empty ─────────────────────────────────────────────────── -->
+    <div
+      v-else-if="store.providers.length === 0"
+      class="text-muted-foreground py-12 text-center text-sm"
+    >
+      {{
+        filterModelName || filterProviderType !== "all"
+          ? "No providers match the current filters."
+          : 'No providers configured. Click "Add Provider" to get started.'
+      }}
+    </div>
+
+    <!-- ── Table ─────────────────────────────────────────────────── -->
+    <div v-else class="min-h-0 flex-1 overflow-hidden rounded-lg border">
+      <Table>
+        <TableHeader class="bg-background">
+          <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+            <TableHead
+              v-for="header in headerGroup.headers"
+              :key="header.id"
+              :class="(header.column.columnDef.meta as any)?.class"
+            >
+              <FlexRender
+                v-if="!header.isPlaceholder"
+                :render="header.column.columnDef.header!"
+                :props="header.getContext()"
+              />
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody class="overflow-auto">
+          <TableRow v-for="row in table.getRowModel().rows" :key="row.id">
+            <TableCell
+              v-for="cell in row.getVisibleCells()"
+              :key="cell.id"
+              :class="(cell.column.columnDef.meta as any)?.class"
+            >
+              <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+            </TableCell>
+          </TableRow>
+        </TableBody>
+      </Table>
+    </div>
+
+    <!-- ── Delete confirmation ───────────────────────────────────── -->
+    <div
+      v-if="confirmingDelete"
+      class="bg-destructive/5 border-destructive/20 fixed inset-x-0 bottom-0 z-50 border-t p-4 shadow-lg md:relative md:inset-auto md:rounded-lg md:border md:shadow-none"
+    >
+      <div class="flex items-center justify-between gap-4">
+        <p class="text-sm">
+          Delete provider
+          <span class="font-semibold">{{ confirmingDelete }}</span
+          >?
+        </p>
+        <div class="flex gap-2">
+          <Button variant="outline" size="sm" @click="confirmingDelete = null"> Cancel </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            :disabled="deleting"
+            @click="confirmDelete(confirmingDelete)"
+          >
+            <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
+            {{ deleting ? "Deleting…" : "Delete" }}
+          </Button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Edit Drawer / Dialog ──────────────────────────────────── -->
+    <ProviderEditForm
+      v-if="editingProvider"
+      :provider="editingProvider"
+      @close="onEditClose"
+      @updated="onUpdated"
+    />
+  </div>
 </template>

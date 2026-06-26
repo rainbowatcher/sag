@@ -197,150 +197,156 @@ const pieChart = computed(() => ({
 </script>
 
 <template>
-  <div class="space-y-6">
-    <div>
+  <div class="flex h-full flex-col">
+    <div class="shrink-0 space-y-6">
       <h2 class="text-2xl font-bold tracking-tight">Dashboard</h2>
       <p class="text-muted-foreground mt-1 text-sm">SAG AI Gateway 运行概览</p>
-    </div>
 
-    <!-- Stat cards -->
-    <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
-      <Card v-for="card in cards" :key="card.label" class="transition-shadow hover:shadow-md">
-        <CardContent class="flex items-center gap-4 p-4 xl:gap-5">
-          <div class="bg-muted flex h-10 w-10 items-center justify-center rounded-lg">
-            <component :is="card.icon" class="h-5 w-5" :class="card.color" />
-          </div>
-          <div>
-            <p class="text-muted-foreground text-xs">{{ card.label }}</p>
-            <p class="text-xl font-bold xl:text-2xl">{{ card.value() }}</p>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
-
-    <!-- Trend & distribution charts -->
-    <div class="flex flex-wrap items-center gap-3">
-      <div class="bg-muted inline-flex rounded-md p-0.5">
-        <button
-          v-for="r in ['1h', '24h', '7d'] as TimeRange[]"
-          :key="r"
-          @click="dashRange = r"
-          class="rounded-sm px-3 py-1 text-sm transition-colors"
-          :class="dashRange === r ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground'"
-        >
-          {{ r }}
-        </button>
+      <!-- Stat cards -->
+      <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <Card v-for="card in cards" :key="card.label" class="transition-shadow hover:shadow-md">
+          <CardContent class="flex items-center gap-4 p-4 xl:gap-5">
+            <div class="bg-muted flex h-10 w-10 items-center justify-center rounded-lg">
+              <component :is="card.icon" class="h-5 w-5" :class="card.color" />
+            </div>
+            <div>
+              <p class="text-muted-foreground text-xs">{{ card.label }}</p>
+              <p class="text-xl font-bold xl:text-2xl">{{ card.value() }}</p>
+            </div>
+          </CardContent>
+        </Card>
       </div>
-      <Input v-model="dashProvider" class="w-40 xl:w-52" placeholder="provider" />
-      <Button
-        variant="outline"
-        class="ml-auto"
-        :disabled="analyticsStore.trendLoading || analyticsStore.distLoading"
-        @click="refreshDashboard()"
-      >
-        <RefreshCw
-          :class="analyticsStore.trendLoading || analyticsStore.distLoading ? 'animate-spin' : ''"
-          class="h-3.5 w-3.5"
-        />
-        Refresh
-      </Button>
+
+      <!-- Trend & distribution charts -->
+      <div class="flex flex-wrap items-center gap-3">
+        <div class="bg-muted inline-flex rounded-md p-0.5">
+          <button
+            v-for="r in ['1h', '24h', '7d'] as TimeRange[]"
+            :key="r"
+            @click="dashRange = r"
+            class="rounded-sm px-3 py-1 text-sm transition-colors"
+            :class="
+              dashRange === r ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground'
+            "
+          >
+            {{ r }}
+          </button>
+        </div>
+        <Input v-model="dashProvider" class="w-40 xl:w-52" placeholder="provider" />
+        <Button
+          variant="outline"
+          class="ml-auto"
+          :disabled="analyticsStore.trendLoading || analyticsStore.distLoading"
+          @click="refreshDashboard()"
+        >
+          <RefreshCw
+            :class="analyticsStore.trendLoading || analyticsStore.distLoading ? 'animate-spin' : ''"
+            class="h-3.5 w-3.5"
+          />
+          Refresh
+        </Button>
+      </div>
+
+      <Alert v-if="analyticsStore.trendError || analyticsStore.distError" variant="destructive">
+        <AlertCircle class="h-4 w-4" />
+        <AlertTitle>Failed to load dashboard data</AlertTitle>
+        <AlertDescription class="break-words">
+          {{ analyticsStore.trendError || analyticsStore.distError }}
+        </AlertDescription>
+      </Alert>
     </div>
 
-    <Alert v-if="analyticsStore.trendError || analyticsStore.distError" variant="destructive">
-      <AlertCircle class="h-4 w-4" />
-      <AlertTitle>Failed to load dashboard data</AlertTitle>
-      <AlertDescription class="break-words">
-        {{ analyticsStore.trendError || analyticsStore.distError }}
-      </AlertDescription>
-    </Alert>
+    <div class="min-h-0 flex-1 pt-6">
+      <div class="h-full overflow-y-auto">
+        <div class="grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
+          <!-- Distribution pie chart -->
+          <Card>
+            <CardHeader>
+              <CardTitle class="text-sm font-medium">Call Distribution</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div
+                v-if="analyticsStore.distLoading"
+                class="text-muted-foreground flex items-center justify-center py-16"
+              >
+                <Loader2 class="h-5 w-5 animate-spin" />
+              </div>
+              <div
+                v-else-if="analyticsStore.distribution.length === 0"
+                class="text-muted-foreground flex items-center justify-center py-16 text-sm"
+              >
+                No data available.
+              </div>
+              <div v-else class="mx-auto max-w-xs xl:max-w-sm">
+                <Pie
+                  :data="pieChart"
+                  :options="{ plugins: { legend: { position: 'bottom' as const } } }"
+                />
+              </div>
+            </CardContent>
+          </Card>
 
-    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
-      <!-- Distribution pie chart -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="text-sm font-medium">Call Distribution</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div
-            v-if="analyticsStore.distLoading"
-            class="text-muted-foreground flex items-center justify-center py-16"
-          >
-            <Loader2 class="h-5 w-5 animate-spin" />
-          </div>
-          <div
-            v-else-if="analyticsStore.distribution.length === 0"
-            class="text-muted-foreground flex items-center justify-center py-16 text-sm"
-          >
-            No data available.
-          </div>
-          <div v-else class="mx-auto max-w-xs xl:max-w-sm">
-            <Pie
-              :data="pieChart"
-              :options="{ plugins: { legend: { position: 'bottom' as const } } }"
-            />
-          </div>
-        </CardContent>
-      </Card>
+          <!-- Token trend line chart -->
+          <Card>
+            <CardHeader>
+              <CardTitle class="text-sm font-medium">Token Trend</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div
+                v-if="analyticsStore.trendLoading"
+                class="text-muted-foreground flex items-center justify-center py-16"
+              >
+                <Loader2 class="h-5 w-5 animate-spin" />
+              </div>
+              <div
+                v-else-if="analyticsStore.trend.length === 0"
+                class="text-muted-foreground flex items-center justify-center py-16 text-sm"
+              >
+                No data available.
+              </div>
+              <Line
+                v-else
+                :data="trendTokensChart"
+                :options="{
+                  responsive: true,
+                  scales: { y: { beginAtZero: true } },
+                  plugins: { legend: { position: 'bottom' as const } },
+                }"
+              />
+            </CardContent>
+          </Card>
 
-      <!-- Token trend line chart -->
-      <Card>
-        <CardHeader>
-          <CardTitle class="text-sm font-medium">Token Trend</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div
-            v-if="analyticsStore.trendLoading"
-            class="text-muted-foreground flex items-center justify-center py-16"
-          >
-            <Loader2 class="h-5 w-5 animate-spin" />
-          </div>
-          <div
-            v-else-if="analyticsStore.trend.length === 0"
-            class="text-muted-foreground flex items-center justify-center py-16 text-sm"
-          >
-            No data available.
-          </div>
-          <Line
-            v-else
-            :data="trendTokensChart"
-            :options="{
-              responsive: true,
-              scales: { y: { beginAtZero: true } },
-              plugins: { legend: { position: 'bottom' as const } },
-            }"
-          />
-        </CardContent>
-      </Card>
-
-      <!-- Call count trend line chart -->
-      <Card class="lg:col-span-2 xl:col-span-1">
-        <CardHeader>
-          <CardTitle class="text-sm font-medium">Call Count Trend</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div
-            v-if="analyticsStore.trendLoading"
-            class="text-muted-foreground flex items-center justify-center py-16"
-          >
-            <Loader2 class="h-5 w-5 animate-spin" />
-          </div>
-          <div
-            v-else-if="analyticsStore.trend.length === 0"
-            class="text-muted-foreground flex items-center justify-center py-16 text-sm"
-          >
-            No data available.
-          </div>
-          <Line
-            v-else
-            :data="trendCallsChart"
-            :options="{
-              responsive: true,
-              scales: { y: { beginAtZero: true } },
-              plugins: { legend: { position: 'bottom' as const } },
-            }"
-          />
-        </CardContent>
-      </Card>
+          <!-- Call count trend line chart -->
+          <Card class="lg:col-span-2 xl:col-span-1">
+            <CardHeader>
+              <CardTitle class="text-sm font-medium">Call Count Trend</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div
+                v-if="analyticsStore.trendLoading"
+                class="text-muted-foreground flex items-center justify-center py-16"
+              >
+                <Loader2 class="h-5 w-5 animate-spin" />
+              </div>
+              <div
+                v-else-if="analyticsStore.trend.length === 0"
+                class="text-muted-foreground flex items-center justify-center py-16 text-sm"
+              >
+                No data available.
+              </div>
+              <Line
+                v-else
+                :data="trendCallsChart"
+                :options="{
+                  responsive: true,
+                  scales: { y: { beginAtZero: true } },
+                  plugins: { legend: { position: 'bottom' as const } },
+                }"
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </div>
     </div>
   </div>
 </template>
