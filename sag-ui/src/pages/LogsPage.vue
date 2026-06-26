@@ -153,21 +153,21 @@ function cacheHitRate(row: CallLog): number | null {
     </div>
 
     <div class="min-h-0 flex-1 pt-6">
-      <div class="h-full overflow-auto rounded-lg border">
+      <div class="h-full rounded-lg border [&>div]:h-full">
         <div
           v-if="store.logsLoading"
-          class="text-muted-foreground flex items-center justify-center gap-2 py-12"
+          class="text-muted-foreground flex h-full items-center justify-center gap-2"
         >
           <Loader2 class="h-5 w-5 animate-spin" /> Loading...
         </div>
         <div
           v-else-if="store.logs.length === 0"
-          class="text-muted-foreground py-12 text-center text-sm"
+          class="text-muted-foreground flex h-full items-center justify-center text-sm"
         >
           No call logs match the current filter.
         </div>
         <Table v-else>
-          <TableHeader class="bg-background sticky top-0 z-10">
+          <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
             <TableRow>
               <TableHead class="min-w-[130px] text-left xl:min-w-[155px]">Time</TableHead>
               <TableHead class="min-w-[90px] text-left xl:min-w-[110px]">Provider</TableHead>

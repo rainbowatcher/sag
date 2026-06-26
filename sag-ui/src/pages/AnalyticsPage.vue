@@ -189,22 +189,22 @@ const statsTotals = computed(() => {
             </Alert>
           </div>
 
-          <div class="min-h-0 flex-1 overflow-auto">
-            <div class="rounded-lg border">
+          <div class="min-h-0 flex-1">
+            <div class="h-full rounded-lg border [&>div]:h-full">
               <div
                 v-if="store.statsLoading"
-                class="text-muted-foreground flex items-center justify-center gap-2 py-12"
+                class="text-muted-foreground flex h-full items-center justify-center gap-2"
               >
                 <Loader2 class="h-5 w-5 animate-spin" /> Loading...
               </div>
               <div
                 v-else-if="store.stats.length === 0"
-                class="text-muted-foreground py-12 text-center text-sm"
+                class="text-muted-foreground flex h-full items-center justify-center text-sm"
               >
                 No statistics available.
               </div>
               <Table v-else>
-                <TableHeader class="bg-background sticky top-0 z-10">
+                <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
                   <TableRow>
                     <TableHead class="text-left">Provider</TableHead>
                     <TableHead class="text-left">Model</TableHead>
@@ -297,22 +297,22 @@ const statsTotals = computed(() => {
             </Alert>
           </div>
 
-          <div class="min-h-0 flex-1 overflow-auto">
-            <div class="rounded-lg border">
+          <div class="min-h-0 flex-1">
+            <div class="h-full rounded-lg border [&>div]:h-full">
               <div
                 v-if="store.cacheLoading"
-                class="text-muted-foreground flex items-center justify-center gap-2 py-12"
+                class="text-muted-foreground flex h-full items-center justify-center gap-2"
               >
                 <Loader2 class="h-5 w-5 animate-spin" /> Loading...
               </div>
               <div
                 v-else-if="store.cache.length === 0"
-                class="text-muted-foreground py-12 text-center text-sm"
+                class="text-muted-foreground flex h-full items-center justify-center text-sm"
               >
                 No cache statistics available.
               </div>
               <Table v-else>
-                <TableHeader class="bg-background sticky top-0 z-10">
+                <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
                   <TableRow>
                     <TableHead class="text-left">Provider</TableHead>
                     <TableHead class="text-left">Model</TableHead>

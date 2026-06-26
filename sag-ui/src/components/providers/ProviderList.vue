@@ -319,9 +319,9 @@ const table = useVueTable({
     </div>
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
-    <div v-else class="min-h-0 flex-1 overflow-hidden rounded-lg border">
+    <div v-else class="min-h-0 flex-1 rounded-lg border [&>div]:h-full">
       <Table>
-        <TableHeader class="bg-background">
+        <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
           <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
             <TableHead
               v-for="header in headerGroup.headers"
@@ -336,7 +336,7 @@ const table = useVueTable({
             </TableHead>
           </TableRow>
         </TableHeader>
-        <TableBody class="overflow-auto">
+        <TableBody>
           <TableRow v-for="row in table.getRowModel().rows" :key="row.id">
             <TableCell
               v-for="cell in row.getVisibleCells()"

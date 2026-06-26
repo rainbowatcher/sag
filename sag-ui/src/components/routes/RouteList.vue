@@ -211,9 +211,9 @@ const table = useVueTable({
 
 <template>
   <!-- ── Table ─────────────────────────────────────────────────── -->
-  <div v-if="routeStore.routes.length > 0" class="h-full overflow-auto rounded-lg border">
+  <div v-if="routeStore.routes.length > 0" class="h-full rounded-lg border [&>div]:h-full">
     <Table>
-      <TableHeader class="bg-background sticky top-0 z-10">
+      <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
         <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
           <TableHead
             v-for="header in headerGroup.headers"
