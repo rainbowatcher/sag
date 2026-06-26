@@ -25,7 +25,9 @@ async fn main() -> anyhow::Result<()> {
     //    early startup log messages respect the configured level and format.
     //    If the file can't be read or the keys are missing, defaults apply.
     let (log_level, log_format) = sag_config::peek_logging_config(&config_path);
-    tracing_init::init(Some(&log_level), log_format);
+    // Declared first in main() → dropped last by Rust's reverse drop order,
+    // keeping the non-blocking writer alive through `info!("all subsystems shut down")`.
+    let _log_guard = tracing_init::init(Some(&log_level), log_format);
 
     info!(%config_path, "starting SAG gateway");
 

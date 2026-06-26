@@ -5,10 +5,13 @@ Subcommands
 -----------
 start
     Spawn `./target/release/sag gateway.test.toml` detached, write
-    `.test-env/{pid, build-info.json}`, append combined stdout/stderr to
-    `logs/test-env.log`. Locks are acquired atomically (O_EXCL) so two
-    concurrent `start` calls cannot both proceed past the lock check. On
-    any failure during start, lock + pid + build-info are removed.
+    `.test-env/{pid, build-info.json}`. The sag binary writes its own
+    logs to daily-rotating files under `logs/` via tracing-appender
+    (e.g. `logs/sag.2026-06-26.log`). stdout/stderr are redirected to
+    `os.devnull`; this launcher does NOT capture them.
+    Locks are acquired atomically (O_EXCL) so two concurrent `start`
+    calls cannot both proceed past the lock check. On any failure during
+    start, lock + pid + build-info are removed.
 
 stop
     Read `.test-env/pid` → SIGTERM the recorded PID, wait up to 5s for
@@ -19,7 +22,8 @@ restart
 
 status (default when no subcommand given)
     Print pid / started_at / uptime / binary mtime + size / config path +
-    config mtime / last 20 log lines. Exits 1 if no `.test-env/pid`.
+    config mtime / last 20 log lines (from the latest rolling log file).
+    Exits 1 if no `.test-env/pid`.
 
 This script does NOT trigger compilation. To rebuild the binary:
     just build-test
@@ -31,7 +35,7 @@ State under `.test-env/`:
     build-info.json — machine-readable summary of the launch
 
 Logs:
-    logs/test-env.log — append-only, stdout+stderr merged
+    logs/sag.YYYY-MM-DD.log — daily-rotating, managed by tracing-appender
 """
 
 import argparse
@@ -51,7 +55,7 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 PID_FILE = TEST_ENV_DIR / "pid"
 LOCK_FILE = TEST_ENV_DIR / "lock"
 BUILD_INFO = TEST_ENV_DIR / "build-info.json"
-LOG_FILE = LOGS_DIR / "test-env.log"
+LOG_GLOB = "logs/sag.*.log"
 
 DEFAULT_BINARY = PROJECT_ROOT / "target" / "release" / "sag"
 DEFAULT_CONFIG = PROJECT_ROOT / "gateway.test.toml"
@@ -166,16 +170,18 @@ def cmd_start(args: argparse.Namespace) -> None:
     # 3. Atomic lock — concurrent `start` invocations can't both pass.
     _acquire_lock()
 
-    log_handle = None
     try:
-        # 4. Spawn detached. start_new_session=True puts sag in its own
-        #    process group so SIGTERM targets only sag.
-        log_handle = open(LOG_FILE, "a")
+        # 4. Spawn detached. The sag binary writes its own logs to
+        #    daily-rotating files under `logs/` via tracing-appender;
+        #    we redirect stdout/stderr to DEVNULL so the launcher does
+        #    not interfere with file-based logging.
+        #    start_new_session=True puts sag in its own process group
+        #    so SIGTERM targets only sag.
         proc = subprocess.Popen(
             [str(binary), str(config)],
             cwd=PROJECT_ROOT,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -201,16 +207,11 @@ def cmd_start(args: argparse.Namespace) -> None:
         log("OK", f"test-env launched: PID {proc.pid}")
         log("SYS", f"binary: {binary}")
         log("SYS", f"config: {config}")
-        log("SYS", f"log:    {LOG_FILE}")
+        log("SYS", f"logs:   logs/sag.DATE.log (daily rotating)")
         log("SYS", f"info:   {BUILD_INFO}")
     except Exception:
         log("ERR", "start failed; cleaning up lock / pid / build-info")
         _cleanup_state()
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except OSError:
-                pass
         raise
 
 
@@ -324,11 +325,19 @@ def cmd_status(_args: Optional[argparse.Namespace] = None) -> None:
         if "config_mtime" in info:
             print(f"  mtime:    {info['config_mtime']}")
 
+    # 3. Find the latest rolling log file (logs/sag.*.log).
+    log_files = sorted(
+        PROJECT_ROOT.glob(LOG_GLOB),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    latest_log = log_files[0] if log_files else None
+
     print()
-    print(f"== log tail (last 20 of {LOG_FILE}) ==")
-    if LOG_FILE.exists():
+    if latest_log:
+        print(f"== log tail (last 20 of {latest_log}) ==")
         try:
-            with open(LOG_FILE, "rb") as log_f:
+            with open(latest_log, "rb") as log_f:
                 log_f.seek(0, os.SEEK_END)
                 size = log_f.tell()
                 log_f.seek(max(0, size - 4096))
@@ -338,7 +347,7 @@ def cmd_status(_args: Optional[argparse.Namespace] = None) -> None:
         except OSError as exc:
             print(f"  (could not read: {exc})")
     else:
-        print(f"  ({LOG_FILE} does not exist)")
+        print(f"  (no log files matching {LOG_GLOB})")
 
 
 # ── entrypoint ────────────────────────────────────────────────────────────
