@@ -48,6 +48,7 @@ priority = 10
 | `api_endpoint` | string | 上游 API 端点路径，默认 `"/v1/chat/completions"` |
 | `strategy` | string | 目标选择策略：`sticky_failover` (默认)、`fill_first` 或 `round_robin` |
 | `retries` | integer (可选) | 每个目标的重试次数，覆盖全局 `retries`。省略则使用全局默认值 |
+| `timeout_secs` | integer (可选) | 每个目标的超时时间（秒），覆盖 provider 的 `timeout_secs`。省略时三级回落：目标级 → 路由级 → provider `timeout_secs` |
 | `targets` | array | 目标供应商列表，按优先级排序 |
 
 ### `RouteTarget` — 路由目标
@@ -58,6 +59,7 @@ priority = 10
 | `real_model` | string (可选) | 实际发送给供应商的模型名。**省略此项**则透传客户端请求的原始模型名 |
 | `priority` | integer | 优先级，默认 `0`。**值越大优先级越高**，优先尝试 |
 | `retries` | integer (可选) | 此目标的重试次数，覆盖路由级别及全局的 `retries`。省略则回退到路由级别，再回退到全局默认值 |
+| `timeout_secs` | integer (可选) | 此目标的超时时间（秒），覆盖路由级别及 provider 的 `timeout_secs`。省略时三级回落：目标级 → 路由级 → provider `timeout_secs` |
 | `extra` | object (可选) | 针对该目标的额外 JSON 字段，合并到上游请求体中。**应用时机晚于供应商级别的 `body_overrides`**，因此目标级别的 key 具有更高优先级 |
 
 ### `api_endpoint` 说明

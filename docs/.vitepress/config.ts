@@ -1,5 +1,9 @@
 import { defineConfig } from 'vitepress'
 import { beautifulMermaidPlugin } from './plugins/beautiful-mermaid'
+import { generateSpecSidebar } from './sidebar'
+import path from 'node:path'
+
+const specDir = path.resolve(__dirname, '../spec')
 
 export default defineConfig({
   title: 'SAG Documentation',
@@ -11,28 +15,39 @@ export default defineConfig({
   ],
   themeConfig: {
     logo: '/favicon.svg',
-    siteTitle: 'SAG Documentation',
-    sidebar: [
-      { text: '概述', link: '/' },
-      {
-        text: '概念',
-        items: [
-          { text: '架构', link: '/architecture' },
-          { text: '配置', link: '/configuration' },
-          { text: '供应商', link: '/providers' },
-          { text: '路由', link: '/routing' },
-          { text: '分析', link: '/analytics' },
-        ],
-      },
-      {
-        text: 'API 参考',
-        items: [
-          { text: '模型 API', link: '/models-api' },
-          { text: '管理 API', link: '/admin-api' },
-        ],
-      },
-      { text: '部署', link: '/deployment' },
+    siteTitle: 'SAG',
+
+    // ── Navbar — two top-level entry points ──────────────────────────
+    nav: [
+      { text: '使用指南', link: '/guide/' },
+      { text: '技术规格', link: '/spec/' },
     ],
+
+    // ── Sidebar — path-based, separate for /guide/ and /spec/ ───────
+    sidebar: {
+      '/guide/': [
+        { text: '使用指南', link: '/guide/' },
+        { text: '配置', link: '/guide/configuration' },
+        { text: '路由', link: '/guide/routing' },
+        { text: '供应商', link: '/guide/providers' },
+        { text: '部署', link: '/guide/deployment' },
+        {
+          text: 'API 参考',
+          collapsed: false,
+          items: [
+            { text: '模型 API', link: '/guide/models-api' },
+            { text: '管理 API', link: '/guide/admin-api' },
+          ],
+        },
+        { text: '分析', link: '/guide/analytics' },
+      ],
+
+      '/spec/': [
+        { text: '技术规格', link: '/spec/' },
+        ...generateSpecSidebar(specDir),
+      ],
+    },
+
     socialLinks: [
       { icon: 'github', link: 'http://localhost:30001/rainbowatcher/sag.git' },
     ],

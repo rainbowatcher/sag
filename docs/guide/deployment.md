@@ -32,7 +32,7 @@ just build-test
 
 ## 热重载边界
 
-`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](/configuration#热重载)。
+`notify` 监听 `gateway.toml` 变更并热替换 providers / routes / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](/guide/configuration#热重载)。
 
 ## Docker
 
@@ -78,7 +78,17 @@ just test-env stop     # SIGTERM → 5s grace → SIGKILL
 
 > **默认行为提醒**：裸 `just test-env`（不带子命令）等价于 `just test-env status`，源自 `scripts/test-env.py` 中 argparse `args.cmd` 为 `None` 时 fallback 到 `cmd_status()` 的有意设计 —— status 是 read-only、作默认安全。想真正启动 gateway 必须**显式**写 `just test-env start`。无参调用看到 `[ERR] no test-env state` 不是错，是状态为空指针 —— 此时跑 `just test-env start` 即可拉起。
 
-State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analytics-test.db`）、日志（`logs/test-env.log`）均与开发环境互不干扰。
+State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analytics-test.db`）均与开发环境互不干扰。
+
+### 日志轮转与清理
+
+SAG 在非 TTY 环境（生产部署、test-env）下自动将日志写入 `logs/` 目录的**每日轮转文件**（如 `logs/sag.2026-06-26.log`），启动器不再重定向 stdout/stderr。
+
+- **轮转**：每日自动切换新文件（`tracing-appender` `Rotation::DAILY`）
+- **清理**：每次启动时自动删除 **7 天前**的旧日志文件，保留最近一周
+- **格式**：配置文件 `[logging].format` 控制（`compact` / `json`），TTY 环境默认 `compact` 输出到终端
+
+`just test-env status` 会从最新的轮转日志文件中读取末尾 20 行，而非固定路径文件。
 
 ## 优雅关闭
 

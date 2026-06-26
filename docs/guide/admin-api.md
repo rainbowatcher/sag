@@ -4,7 +4,7 @@
 
 ## 认证
 
-管理端点使用 Bearer token 认证，与[模型 API](/models-api#认证) 共享相同的 `[gateway_auth]` 配置：
+管理端点使用 Bearer token 认证，与[模型 API](/guide/models-api#认证) 共享相同的 `[gateway_auth]` 配置：
 
 ```
 Authorization: Bearer <api_key>
@@ -32,13 +32,40 @@ Content-Type: application/json
   "name": "my-provider",
   "provider_type": "openai",
   "api_keys": ["..."],
+  "key_strategy": "fill_first",
   "base_url": "https://api.openai.com/v1",
   "models_endpoint": "models",
-  "timeout_secs": 120
+  "timeout_secs": 120,
+  "chunk_timeout_secs": null,
+  "enabled": true,
+  "enabled_models": [],
+  "headers": {},
+  "body_overrides": {},
+  "role_mappings": {},
+  "anthropic_cache_control": true
 }
 ```
 
-`models_endpoint` 是可选字段，表示 provider 级 models 列表路径，默认 `models`。传入 `/v1/models/` 会被规范化为 `v1/models` 并持久化。
+**字段说明**：
+
+| 字段 | 类型 | 必需 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `name` | string | 是 | — | 供应商唯一名称 |
+| `provider_type` | string | 否 | `"openai"` | 供应商适配器类型：`"openai"` / `"anthropic"` |
+| `api_keys` | array | 否 | `[]` | API 密钥列表 |
+| `key_strategy` | string | 否 | `"fill_first"` | 多密钥选择策略：`"fill_first"` / `"round_robin"` |
+| `base_url` | string | 否 | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
+| `models_endpoint` | string | 否 | `"models"` | 模型列表端点路径，传入 `/v1/models/` 会被规范化为 `v1/models` |
+| `timeout_secs` | integer | 否 | `120` | 上游请求超时（秒） |
+| `chunk_timeout_secs` | integer \| null | 否 | `null` | 流式 chunk 间最大空闲时间（秒），`null` 表示无限等待 |
+| `enabled` | boolean | 否 | `true` | 是否启用。`false` 时路由跳过且管理面板显示禁用 |
+| `enabled_models` | array | 否 | `[]` | 模型白名单，空 = 全部允许 |
+| `headers` | object | 否 | `{}` | 附加自定义 HTTP 头 |
+| `body_overrides` | object | 否 | `{}` | 合并到上游请求体的字段覆盖 |
+| `role_mappings` | object | 否 | `{}` | 角色映射表，如 `{ "developer": "system" }` |
+| `anthropic_cache_control` | boolean | 否 | `true` | Anthropic 缓存控制注入，仅对 `"anthropic"` 类型有效 |
+
+
 
 ### 更新供应商
 
@@ -53,7 +80,7 @@ Content-Type: application/json
 }
 ```
 
-只更新请求体中传入的字段，未传入的字段保持原值。
+只更新请求体中传入的字段，未传入的字段保持原值。支持更新所有[添加供应商](#添加供应商)中列出的字段。
 
 > `priority` 不是供应商字段，不会参与路由排序。路由目标的优先级应在 `targets[].priority` 上配置。
 

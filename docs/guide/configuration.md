@@ -2,6 +2,27 @@
 
 SAG 使用基于 TOML 的配置文件（默认：`gateway.toml`）。
 
+## 日志
+
+`[logging]` 段控制日志级别和输出格式：
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `level` | `"info"` | 日志级别过滤器（`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`）。也支持 `EnvFilter` 指令，如 `"info,sag_router=debug"`。环境变量 `RUST_LOG` 优先于此值 |
+| `format` | `"compact"` | 输出格式：`"compact"`（人类可读单行）或 `"json"`（结构化日志，适合日志聚合器） |
+
+```toml
+[logging]
+level = "info"
+format = "compact"
+```
+
+### 日志文件与轮转
+
+在非 TTY 环境（生产部署、test-env）下，SAG 自动将日志写入 `logs/` 目录下的**每日轮转文件**（例如 `logs/sag.2026-06-26.log`），不依赖启动器的 stdout 重定向。开发环境（TTY）下日志输出到终端，保持不变。
+
+每次启动时，SAG 自动清理 **7 天前**的旧日志文件，保留最近一周的日志。
+
 ## 示例
 
 ```toml
@@ -88,6 +109,47 @@ targets = [
 
 `models_endpoint` 是 provider 级配置，用于管理面板刷新上游模型列表。默认值为 `models`，会拼接到 `base_url` 后；支持 `models`、`/models`、`v1/models` 等写法，保存时会规范化为相对路径。
 
+### Provider 完整字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `provider_type` | string | `"openai"` | 供应商适配器类型：`"openai"` / `"anthropic"` |
+| `api_keys` | array | `[]` | API 密钥列表 |
+| `key_strategy` | string | `"fill_first"` | 多密钥选择策略：`"fill_first"`（顺序使用，失败后切换）或 `"round_robin"`（轮询分发） |
+| `base_url` | string | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
+| `models_endpoint` | string | `"models"` | 模型列表端点路径（拼接在 `base_url` 后） |
+| `timeout_secs` | integer | `120` | 上游请求超时（秒） |
+| `chunk_timeout_secs` | integer (可选) | — | 流式请求中 chunk 间的最大空闲时间（秒），超时则断开连接。省略时无限等待 |
+| `enabled` | boolean | `true` | 是否启用此供应商。`false` 时在路由中跳过并在管理面板中显示为禁用 |
+| `enabled_models` | array | `[]` | 允许使用的模型 ID 列表。非空时仅此列表中的模型可使用此供应商。默认空（允许所有模型） |
+| `headers` | object | `{}` | 附加到上游请求的自定义 HTTP 头，应用于供应商默认头之后，可覆盖认证、Content-Type 等 |
+| `body_overrides` | object | `{}` | 合并到上游请求体顶层的字段覆盖（如 `max_tokens`、`temperature`），优先级低于目标级别的 `extra` |
+| `role_mappings` | object | `{}` | 角色映射表：将请求中的角色名映射为上游支持的角色。例如 `{ "developer" = "system" }` 将 developer 消息转为 system 消息。大小写敏感 |
+| `anthropic_cache_control` | boolean | `true` | 是否对 Anthropic 请求注入 `cache_control: {\"type\": \"ephemeral\"}` 断点。仅对 `provider_type = "anthropic"` 有效，可显著降低重复前缀请求的成本 |
+
+#### headers 示例
+
+```toml
+[providers.anthropic.headers]
+Authorization = "Bearer custom-token"
+X-Debug = "true"
+```
+
+#### body_overrides 示例
+
+```toml
+[providers.openai.body_overrides]
+max_tokens = 4096
+temperature = 0.8
+```
+
+#### role_mappings 示例
+
+```toml
+[providers.openai.role_mappings]
+developer = "system"
+```
+
 ## 重试退避
 
 `[backoff]` 段控制目标重试之间的退避策略，仅在 `retries` ≥ 1 时生效：
@@ -114,7 +176,7 @@ targets = [
 
 冷却期内该 target 被跳过，调度器自动 fallthrough 到下一个 target。冷却结束后 target 自然回归路由——StickyFailover 继续优先使用上一次成功的 sticky target，FillFirst 按优先级尝试首选，RoundRobin 回到轮转顺序。
 
-错误分类逻辑由 `sag_core::CircuitHint` 实现：对上游 429 body 做关键词匹配，先精确匹配 `"rate limit"`（→ `RateLimited` / 10s），再匹配 quota/billing 相关关键词（→ `QuotaExhausted` / 1h），未知 429 和 5xx/网络错误回退到 `Generic`（→ 60s）。详情见[路由 → 熔断器策略](/routing#熔断器策略)。
+错误分类逻辑由 `sag_core::CircuitHint` 实现：对上游 429 body 做关键词匹配，先精确匹配 `"rate limit"`（→ `RateLimited` / 10s），再匹配 quota/billing 相关关键词（→ `QuotaExhausted` / 1h），未知 429 和 5xx/网络错误回退到 `Generic`（→ 60s）。详情见[路由 → 熔断器策略](/guide/routing#熔断器策略)。
 
 ## 认证
 
