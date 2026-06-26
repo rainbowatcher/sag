@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tokio::sync::RwLock;
 use tracing::info;
@@ -28,6 +29,10 @@ async fn main() -> anyhow::Result<()> {
     // Declared first in main() → dropped last by Rust's reverse drop order,
     // keeping the non-blocking writer alive through `info!("all subsystems shut down")`.
     let _log_guard = tracing_init::init(Some(&log_level), log_format);
+
+    // Remove log files older than the retention period before any new
+    // log entries are written for this process.
+    cleanup_old_logs();
 
     info!(%config_path, "starting SAG gateway");
 
@@ -148,6 +153,66 @@ fn resolve_config_path() -> anyhow::Result<String> {
     Ok(explicit
         .or(positional)
         .unwrap_or_else(|| "gateway.toml".to_string()))
+}
+
+/// Number of days to retain rotating log files (logs/sag.*.log).
+/// Files with a modification time older than this are deleted on startup.
+const LOG_RETENTION_DAYS: u64 = 7;
+
+/// Delete log files in `logs/` older than [`LOG_RETENTION_DAYS`].
+///
+/// Best-effort: errors on individual files are logged and skipped;
+/// a missing `logs/` directory is a silent no-op.
+fn cleanup_old_logs() {
+    let log_dir = std::path::Path::new("logs");
+    let dir = match std::fs::read_dir(log_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read logs directory for cleanup");
+            return;
+        }
+    };
+
+    let cutoff = SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(LOG_RETENTION_DAYS * 86_400))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    for entry in dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read log directory entry during cleanup");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        // Only touch sag.*.log files — leave other files in logs/ alone.
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with("sag.") || !name.ends_with(".log") {
+            continue;
+        }
+
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read log file metadata, skipping cleanup");
+                continue;
+            }
+        };
+
+        if modified < cutoff {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!(path = %path.display(), "removed old log file"),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to remove old log file")
+                }
+            }
+        }
+    }
 }
 
 /// Waits for SIGTERM or SIGINT (Ctrl+C).
