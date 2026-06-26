@@ -105,19 +105,19 @@ function cacheHitRate(row: CallLog): number | null {
     <div class="flex flex-wrap items-center gap-3">
       <Input
         v-model="logsFilterProvider"
-        class="w-40"
+        class="w-40 xl:w-52"
         placeholder="provider"
         @keyup.enter="refreshLogs()"
       />
       <Input
         v-model="logsFilterModel"
-        class="w-40"
+        class="w-40 xl:w-52"
         placeholder="model"
         @keyup.enter="refreshLogs()"
       />
       <Input
         v-model="logsFilterRealModel"
-        class="w-40"
+        class="w-40 xl:w-52"
         placeholder="real_model"
         @keyup.enter="refreshLogs()"
       />
@@ -150,7 +150,7 @@ function cacheHitRate(row: CallLog): number | null {
       <AlertDescription class="break-words">{{ store.logsError }}</AlertDescription>
     </Alert>
 
-    <div class="rounded-lg border">
+    <div class="overflow-x-auto rounded-lg border 2xl:overflow-visible">
       <div
         v-if="store.logsLoading"
         class="text-muted-foreground flex items-center justify-center gap-2 py-12"
@@ -166,9 +166,9 @@ function cacheHitRate(row: CallLog): number | null {
       <Table v-else>
         <TableHeader>
           <TableRow>
-            <TableHead class="text-left">Time</TableHead>
-            <TableHead class="text-left">Provider</TableHead>
-            <TableHead class="text-left">Model</TableHead>
+            <TableHead class="min-w-[130px] text-left xl:min-w-[155px]">Time</TableHead>
+            <TableHead class="min-w-[90px] text-left xl:min-w-[110px]">Provider</TableHead>
+            <TableHead class="min-w-[100px] text-left xl:min-w-[130px]">Model</TableHead>
             <TableHead class="text-right">Status</TableHead>
             <TableHead class="text-right">Prompt</TableHead>
             <TableHead class="text-right">Completion</TableHead>

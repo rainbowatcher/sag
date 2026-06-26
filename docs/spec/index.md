@@ -30,3 +30,4 @@ updated: 2026-06-26
 | [分析](/spec/analytics/requirements) | SQLite 日志、统计聚合 |
 | [日志](/spec/logging/requirements) | Tracing、日志轮转、清理 |
 | [管理 API](/spec/admin/requirements) | REST 端点、CRUD 语义 |
+| [UI](/spec/ui/requirements) | 管理面板前端、响应式布局、主题切换 |

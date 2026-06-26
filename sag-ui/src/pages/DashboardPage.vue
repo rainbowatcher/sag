@@ -206,13 +206,13 @@ const pieChart = computed(() => ({
     <!-- Stat cards -->
     <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
       <Card v-for="card in cards" :key="card.label" class="transition-shadow hover:shadow-md">
-        <CardContent class="flex items-center gap-4 p-4">
+        <CardContent class="flex items-center gap-4 p-4 xl:gap-5">
           <div class="bg-muted flex h-10 w-10 items-center justify-center rounded-lg">
             <component :is="card.icon" class="h-5 w-5" :class="card.color" />
           </div>
           <div>
             <p class="text-muted-foreground text-xs">{{ card.label }}</p>
-            <p class="text-xl font-bold">{{ card.value() }}</p>
+            <p class="text-xl font-bold xl:text-2xl">{{ card.value() }}</p>
           </div>
         </CardContent>
       </Card>
@@ -231,7 +231,7 @@ const pieChart = computed(() => ({
           {{ r }}
         </button>
       </div>
-      <Input v-model="dashProvider" class="w-40" placeholder="provider" />
+      <Input v-model="dashProvider" class="w-40 xl:w-52" placeholder="provider" />
       <Button
         variant="outline"
         class="ml-auto"
@@ -254,7 +254,7 @@ const pieChart = computed(() => ({
       </AlertDescription>
     </Alert>
 
-    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
       <!-- Distribution pie chart -->
       <Card>
         <CardHeader>
@@ -273,7 +273,7 @@ const pieChart = computed(() => ({
           >
             No data available.
           </div>
-          <div v-else class="mx-auto max-w-xs">
+          <div v-else class="mx-auto max-w-xs xl:max-w-sm">
             <Pie
               :data="pieChart"
               :options="{ plugins: { legend: { position: 'bottom' as const } } }"
@@ -313,7 +313,7 @@ const pieChart = computed(() => ({
       </Card>
 
       <!-- Call count trend line chart -->
-      <Card class="lg:col-span-2">
+      <Card class="lg:col-span-2 xl:col-span-1">
         <CardHeader>
           <CardTitle class="text-sm font-medium">Call Count Trend</CardTitle>
         </CardHeader>

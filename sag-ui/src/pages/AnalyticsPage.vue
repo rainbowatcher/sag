@@ -86,40 +86,40 @@ const statsTotals = computed(() => {
       <TabsContent value="stats" class="space-y-6">
         <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <Card>
-            <CardContent class="flex items-center gap-3 p-4">
+            <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
               <TrendingUp class="h-5 w-5 text-blue-500" />
               <div>
                 <p class="text-muted-foreground text-xs">Total Calls</p>
-                <p class="text-lg font-bold tabular-nums">
+                <p class="text-lg font-bold tabular-nums xl:text-xl">
                   {{ statsTotals.calls.toLocaleString() }}
                 </p>
               </div>
             </CardContent>
           </Card>
           <Card>
-            <CardContent class="flex items-center gap-3 p-4">
+            <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
               <Zap class="h-5 w-5 text-amber-500" />
               <div>
                 <p class="text-muted-foreground text-xs">Total Tokens</p>
-                <p class="text-lg font-bold tabular-nums">
+                <p class="text-lg font-bold tabular-nums xl:text-xl">
                   {{ statsTotals.tokens.toLocaleString() }}
                 </p>
               </div>
             </CardContent>
           </Card>
           <Card>
-            <CardContent class="flex items-center gap-3 p-4">
+            <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
               <Clock class="h-5 w-5 text-green-500" />
               <div>
                 <p class="text-muted-foreground text-xs">Avg Latency</p>
-                <p class="text-lg font-bold tabular-nums">
+                <p class="text-lg font-bold tabular-nums xl:text-xl">
                   {{ formatDuration(statsTotals.avgMs) }}
                 </p>
               </div>
             </CardContent>
           </Card>
           <Card>
-            <CardContent class="flex items-center gap-3 p-4">
+            <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
               <Badge
                 v-if="statsTotals.successRate !== null"
                 variant="outline"
@@ -136,7 +136,7 @@ const statsTotals = computed(() => {
                 <p class="text-muted-foreground text-xs">Success Rate</p>
                 <p
                   v-if="statsTotals.successRate !== null"
-                  class="text-lg font-bold tabular-nums"
+                  class="text-lg font-bold tabular-nums xl:text-xl"
                   :style="{ color: successRateColor(statsTotals.successRate) }"
                 >
                   {{ statsTotals.successRate.toFixed(1) }}%
@@ -150,13 +150,13 @@ const statsTotals = computed(() => {
         <div class="flex items-center gap-3">
           <Input
             v-model="statsFilterProvider"
-            class="w-44"
+            class="w-44 xl:w-56"
             placeholder="Filter provider..."
             @keyup.enter="refreshStats()"
           />
           <Input
             v-model="statsFilterModel"
-            class="w-44"
+            class="w-44 xl:w-56"
             placeholder="Filter model..."
             @keyup.enter="refreshStats()"
           />
@@ -250,13 +250,13 @@ const statsTotals = computed(() => {
         <div class="flex items-center gap-3">
           <Input
             v-model="cacheFilterProvider"
-            class="w-44"
+            class="w-44 xl:w-56"
             placeholder="Filter provider..."
             @keyup.enter="refreshCache()"
           />
           <Input
             v-model="cacheFilterModel"
-            class="w-44"
+            class="w-44 xl:w-56"
             placeholder="Filter model..."
             @keyup.enter="refreshCache()"
           />

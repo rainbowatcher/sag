@@ -46,7 +46,7 @@ const navItems: NavItem[] = [
 
 <template>
   <div class="bg-muted/30 flex h-screen">
-    <aside class="bg-sidebar flex w-60 flex-col border-r">
+    <aside class="bg-sidebar flex w-60 flex-col border-r xl:w-64 2xl:w-72">
       <div class="flex items-center gap-2 border-b px-5 py-4">
         <div
           class="bg-primary text-primary-foreground flex h-7 w-7 items-center justify-center rounded text-xs font-bold"
@@ -113,7 +113,7 @@ const navItems: NavItem[] = [
     </aside>
 
     <main class="flex-1 overflow-y-auto">
-      <div class="mx-auto max-w-6xl p-6">
+      <div class="mx-auto max-w-6xl p-6 xl:max-w-7xl xl:p-8 2xl:max-w-[90rem] 2xl:p-10">
         <RouterView />
       </div>
     </main>

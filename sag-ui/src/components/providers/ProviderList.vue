@@ -136,11 +136,13 @@ const columns = [
     header: "Base URL",
     cell: (info) =>
       h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
+    meta: { class: "min-w-[200px] xl:min-w-[280px]" },
   }),
   columnHelper.accessor("models_endpoint", {
     header: "Models Endpoint",
     cell: (info) =>
       h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
+    meta: { class: "min-w-[200px] xl:min-w-[280px]" },
   }),
   columnHelper.accessor("provider_type", {
     header: "Type",

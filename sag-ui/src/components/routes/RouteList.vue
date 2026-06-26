@@ -137,7 +137,7 @@ const columns = [
         () => strategyLabels[s] || s,
       )
     },
-    meta: { class: "text-center" },
+    meta: { class: "text-center 2xl:min-w-[140px]" },
   }),
   columnHelper.accessor("targets", {
     header: "Targets",
@@ -158,7 +158,7 @@ const columns = [
         ]),
       ])
     },
-    meta: { class: "text-center" },
+    meta: { class: "text-center xl:min-w-[100px]" },
   }),
   columnHelper.display({
     id: "actions",
