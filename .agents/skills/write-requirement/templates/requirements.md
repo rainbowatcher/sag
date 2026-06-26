@@ -1,3 +1,8 @@
+---
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+---
+
 # <模块名> — 需求
 
 ## 目标

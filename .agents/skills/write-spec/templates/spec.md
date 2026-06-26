@@ -1,3 +1,8 @@
+---
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+---
+
 # <模块名> — 规格
 
 ## 关键文件

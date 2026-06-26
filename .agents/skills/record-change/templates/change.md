@@ -1,7 +1,10 @@
-# NNNN — <简短标题>
+---
+created: YYYY-MM-DD
+updated: YYYY-MM-DD
+type: 新增 | 修改 | 修复 | 移除
+---
 
-**日期**：YYYY-MM-DD
-**类型**：新增 | 修改 | 修复 | 移除
+# NNNN — <简短标题>
 
 ## 动机
 [为什么做这个变更。]

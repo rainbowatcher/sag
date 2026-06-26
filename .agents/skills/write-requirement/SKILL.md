@@ -43,9 +43,3 @@ description: Writes requirements documents (requirements.md) for SAG project fea
 - 不写实现细节。实现放 `spec.md`。
 - 文档间引用用相对路径（`](/guide/...)`、`](/spec/...)`）。
 - 中文书写，术语保留原文。
-
-## 参考
-
-- 模板：[templates/requirements.md](templates/requirements.md)
-- 完整示例：[路由需求](/spec/routing/requirements)
-- 简洁示例：[日志需求](/spec/logging/requirements)

@@ -44,9 +44,3 @@ description: Writes technical specification documents (spec.md) for SAG project 
 - 不重复 requirements.md 已有内容。
 - 不与需求文档矛盾。若发现矛盾，标注并告知用户。
 - 中文书写，术语保留原文。
-
-## 参考
-
-- 模板：[templates/spec.md](templates/spec.md)
-- 完整示例：[路由规格](/spec/routing/spec)
-- 简洁示例：[日志规格](/spec/logging/spec)

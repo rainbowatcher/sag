@@ -49,7 +49,3 @@ description: Records a completed feature change as a numbered changefile in docs
 - 日期用 YYYY-MM-DD 格式
 - 文件路径用 GitHub 绝对链接
 - 中文书写，术语保留原文
-
-## 参考
-
-- [日志 0002 变更](/spec/logging/changes/0002-rotation-and-cleanup)
