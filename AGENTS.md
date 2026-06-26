@@ -10,7 +10,7 @@ SAG 是一个 LLM API 反向代理网关，接收 OpenAI 兼容的 `/v1/chat/com
 |---|---|
 | **后端** | Rust 2024 edition, Axum 0.8, Tokio, Serde, SQLx (SQLite), Reqwest |
 | **前端** | Vue 3.5 (Composition API + `<script setup>`), TypeScript 5.7, Vite 6.4, Pinia, Tailwind CSS v4, shadcn-vue |
-| **工具** | Cargo workspace, just, pnpm, oxlint/oxfmt, mdBook |
+| **工具** | Cargo workspace, just, pnpm, oxlint/oxfmt, vitepress |
 
 ## 关键命令
 
