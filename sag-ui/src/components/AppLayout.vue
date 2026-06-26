@@ -98,11 +98,7 @@ const navItems: NavItem[] = [
             <component :is="isDark ? Sun : Moon" class="h-3.5 w-3.5" />
           </Button>
         </div>
-        <p
-          v-if="store.gatewayUrl"
-          class="text-muted-foreground truncate font-mono text-[10px]"
-          :title="store.gatewayUrl"
-        >
+        <p v-if="store.gatewayUrl" class="text-muted-foreground truncate font-mono text-[10px]">
           {{ store.gatewayUrl }}
         </p>
         <Button

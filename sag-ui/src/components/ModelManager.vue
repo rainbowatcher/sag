@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 function modelLabel(item: Record<string, unknown>): string {
   return (item.id ?? item.name ?? item.model ?? Object.values(item)[0]) as string
@@ -82,48 +82,46 @@ function onModelsEndpointChange(value: string | number) {
         <span class="font-mono">{{ model }}</span>
 
         <div class="flex items-center gap-0.5">
-          <TooltipProvider v-if="modelTestStates">
-            <Tooltip :delay-duration="200">
-              <TooltipTrigger as-child>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  :disabled="modelTestStates[model]?.loading"
-                  :class="
-                    modelTestStates[model]?.data?.length
-                      ? modelTestStates[model]!.data![0].success
-                        ? 'text-green-500'
-                        : 'text-destructive'
-                      : ''
-                  "
-                  @click="emit('testModel', model)"
+          <Tooltip v-if="modelTestStates">
+            <TooltipTrigger as-child>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                :disabled="modelTestStates[model]?.loading"
+                :class="
+                  modelTestStates[model]?.data?.length
+                    ? modelTestStates[model]!.data![0].success
+                      ? 'text-green-500'
+                      : 'text-destructive'
+                    : ''
+                "
+                @click="emit('testModel', model)"
+              >
+                <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
+                <Zap v-else class="h-3 w-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="end" class="max-w-xs">
+              <template v-if="modelTestStates[model]?.data">
+                <div
+                  v-for="r in modelTestStates[model]!.data"
+                  :key="r.key_prefix"
+                  class="break-words whitespace-normal"
                 >
-                  <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
-                  <Zap v-else class="h-3 w-3" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" align="end" class="max-w-xs">
-                <template v-if="modelTestStates[model]?.data">
-                  <div
-                    v-for="r in modelTestStates[model]!.data"
-                    :key="r.key_prefix"
-                    class="break-words whitespace-normal"
-                  >
-                    <span :class="r.success ? 'text-green-300' : 'text-red-300'">{{
-                      r.success ? "✓" : "✗"
-                    }}</span>
-                    {{ r.key_prefix }}: {{ r.message }}
-                  </div>
-                </template>
-                <template v-else-if="modelTestStates[model]?.error">
-                  <div class="break-words whitespace-normal text-red-300">
-                    {{ modelTestStates[model]!.error }}
-                  </div>
-                </template>
-                <template v-else> Click to test </template>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+                  <span :class="r.success ? 'text-green-300' : 'text-red-300'">{{
+                    r.success ? "✓" : "✗"
+                  }}</span>
+                  {{ r.key_prefix }}: {{ r.message }}
+                </div>
+              </template>
+              <template v-else-if="modelTestStates[model]?.error">
+                <div class="break-words whitespace-normal text-red-300">
+                  {{ modelTestStates[model]!.error }}
+                </div>
+              </template>
+              <template v-else> Click to test </template>
+            </TooltipContent>
+          </Tooltip>
 
           <Button variant="ghost" size="icon-sm" class="h-5 w-5" @click="removeModel(model)">
             <Trash2 class="text-destructive h-3 w-3" />

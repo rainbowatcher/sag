@@ -13,6 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
 import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import type { CallLog } from "@/types/api"
@@ -195,13 +196,19 @@ function cacheHitRate(row: CallLog): number | null {
               </div>
             </TableCell>
             <TableCell class="text-right">
-              <Badge
-                :variant="statusVariant(row.status_code)"
-                class="font-mono text-xs tabular-nums"
-                :title="row.error || undefined"
-              >
-                {{ row.status_code }}
-              </Badge>
+              <Tooltip>
+                <TooltipTrigger>
+                  <Badge
+                    :variant="statusVariant(row.status_code)"
+                    class="font-mono text-xs tabular-nums"
+                  >
+                    {{ row.status_code }}
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent v-if="row.error" class="max-w-md lg:max-w-lg">
+                  {{ row.error }}
+                </TooltipContent>
+              </Tooltip>
             </TableCell>
             <TableCell class="text-right tabular-nums">
               {{ row.usage?.prompt_tokens?.toLocaleString() ?? "—" }}
