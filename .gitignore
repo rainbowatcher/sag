@@ -37,6 +37,7 @@ node_modules
 .qoder/
 .claude/
 .mimocode/
+.openclaude/
 
 # test-env state (Phase 2 — see .plan/test-environment.md)
 .test-env/
