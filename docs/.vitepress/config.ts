@@ -60,8 +60,9 @@ export default defineConfig({
       text: '在 GitHub 上编辑此页',
     },
     search: { provider: 'local' },
+    outline: [2,3]
   },
-  ignoreDeadLinks: true,
+  // ignoreDeadLinks: true,
   markdown: {
     lineNumbers: true,
   },

@@ -47,3 +47,9 @@ description: Writes requirements documents (requirements.md) for SAG project fea
 - 文档间引用用相对路径（`](/guide/...)`、`](/spec/...)`）。
 - 文档末尾必须包含「变更记录」节，列出该模块所有 changefile。
 - 中文书写，术语保留原文。
+
+### 一级标题规范
+
+- `requirements.md` 的一级标题（H1）使用纯中文，不带「需求」后缀，例如 `# 管理 API`、`# 配置`、`# 路由`
+- 一级标题会被 `generateSpecSidebar()` 自动提取作为 VitePress 侧边栏的模块显示名，因此 H1 必须能独立作为模块标签
+- sidebar 不再使用 `MODULE_LABELS` 硬编码映射，标签完全来自文件内容，请确保每个需求文件的 H1 唯一且有明确表义
