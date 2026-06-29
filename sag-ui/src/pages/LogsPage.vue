@@ -172,7 +172,6 @@ function cacheHitRate(row: CallLog): number | null {
               <TableHead class="min-w-[130px] text-left xl:min-w-[155px]">Time</TableHead>
               <TableHead class="min-w-[90px] text-left xl:min-w-[110px]">Provider</TableHead>
               <TableHead class="min-w-[100px] text-left xl:min-w-[130px]">Model</TableHead>
-              <TableHead class="text-right">Status</TableHead>
               <TableHead class="text-right">Prompt</TableHead>
               <TableHead class="text-right">Completion</TableHead>
               <TableHead class="text-left">Reasoning</TableHead>
@@ -180,6 +179,7 @@ function cacheHitRate(row: CallLog): number | null {
               <TableHead class="text-right">Hit</TableHead>
               <TableHead class="text-right">Total</TableHead>
               <TableHead class="text-right">Duration</TableHead>
+              <TableHead class="text-right">Status</TableHead>
               <TableHead class="text-center">Effect</TableHead>
               <TableHead class="text-center">Mode</TableHead>
             </TableRow>
