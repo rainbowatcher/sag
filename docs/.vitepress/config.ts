@@ -1,8 +1,12 @@
 import { defineConfig } from 'vitepress'
 import { beautifulMermaidPlugin } from './plugins/beautiful-mermaid'
+import { vscodeFileLinkPlugin } from './plugins/vscode-file-link'
 import { generateSpecSidebar } from './sidebar'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const repoRoot = path.resolve(__dirname, '../..')
 const specDir = path.resolve(__dirname, '../spec')
 
 export default defineConfig({
@@ -62,6 +66,9 @@ export default defineConfig({
     lineNumbers: true,
   },
   vite: {
-    plugins: [beautifulMermaidPlugin()],
+    plugins: [
+      beautifulMermaidPlugin(),
+      vscodeFileLinkPlugin({ repoRoot }),
+    ],
   },
 })

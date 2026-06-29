@@ -66,7 +66,7 @@ CMD ["sag", "--config", "/etc/sag/gateway.toml"]
 
 ## 测试环境
 
-`scripts/test-env.py` 提供与开发环境**物理隔离**的 release 路径 —— 真实 release 二进制、内嵌 UI、独立端口、独立 SQLite。`start` / `stop` / `restart` / `status` 四子命令对应 systemd / supervisor 风格的 ops 下命令。详见仓库根 [`AGENTS.md`](https://github.com/rainbowatcher/sag/blob/main/AGENTS.md) 的「测试环境」节。
+`scripts/test-env.py` 提供与开发环境**物理隔离**的 release 路径 —— 真实 release 二进制、内嵌 UI、独立端口、独立 SQLite。`start` / `stop` / `restart` / `status` 四子命令对应 systemd / supervisor 风格的 ops 下命令。详见仓库根 [`AGENTS.md`](../../AGENTS.md) 的「测试环境」节。
 
 ```bash
 just build-test        # 一次性：pnpm build UI → cargo --features embed-ui
