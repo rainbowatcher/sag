@@ -19,7 +19,7 @@ updated: 2026-06-14
 |---------|---------|---------|
 | 额度耗尽 | HTTP 429 + body 含 quota/billing 关键词 | 3600s (1h) |
 | 速率限制 | HTTP 429（非额度相关） | 10s |
-| 通用故障 | 5xx / 网络超时 / 连接错误 | 60s |
+| 通用故障 | 5xx / 网络超时 / 连接错误 / 上游超时 | 60s |
 
 分类逻辑：先精确匹配 `"rate limit"` → `RateLimited`，再匹配 quota/billing 关键词 → `QuotaExhausted`，其余 429 和 5xx/网络错误 → `Generic`。
 
