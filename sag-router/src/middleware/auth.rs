@@ -11,12 +11,6 @@ use sag_dispatch::AppState;
 /// Axum middleware: validates the `Authorization: Bearer *** header
 /// against the configured gateway API keys.
 pub async fn gateway_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let trace_id = request
-        .extensions()
-        .get::<uuid::Uuid>()
-        .map(|id| id.to_string())
-        .unwrap_or_default();
-
     let auth_header = request
         .headers()
         .get("Authorization")
@@ -40,7 +34,7 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
                     let provided_key = match auth_header {
                         Some(key) => key,
                         None => {
-                            warn!(trace_id, "request missing Authorization header");
+                            warn!("request missing Authorization header");
                             return AppError::Unauthorized("missing Authorization header".into())
                                 .into_response();
                         }
@@ -56,7 +50,7 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
     };
 
     if !key_valid {
-        warn!(trace_id, "invalid gateway API key");
+        warn!("invalid gateway API key");
         return AppError::Unauthorized("invalid API key".into()).into_response();
     }
 

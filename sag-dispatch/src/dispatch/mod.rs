@@ -284,7 +284,6 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
     };
     error!(
         model = %model,
-        trace_id = %trace_id,
         duration_ms = %start.elapsed().as_millis() as u64,
         attempts = %errors.join("; "),
         "all providers exhausted"

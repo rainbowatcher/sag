@@ -7,7 +7,8 @@ const BODY_PREVIEW_MAX: usize = 512;
 
 /// Axum middleware that logs HTTP request/response bodies.
 ///
-/// - `debug!` level: `method`, `uri`, `auth` (masked), `trace_id`, body preview (first 512 bytes + total size)
+/// - `debug!` level: `method`, `uri`, `auth` (masked), body preview (first 512 bytes + total size)
+/// - `trace_id` is provided by the root span from `trace_middleware`, not duplicated here
 /// - `trace!` (target: "sag_router::http_log::full"): full body
 /// - SSE streaming responses are logged without body consumption
 pub async fn log_http(request: Request, next: Next) -> Response {
@@ -16,12 +17,6 @@ pub async fn log_http(request: Request, next: Next) -> Response {
 
     let method = &parts.method;
     let uri = &parts.uri;
-
-    let trace_id = parts
-        .extensions
-        .get::<uuid::Uuid>()
-        .map(|id| id.to_string())
-        .unwrap_or_default();
 
     let auth = parts
         .headers
@@ -47,22 +42,22 @@ pub async fn log_http(request: Request, next: Next) -> Response {
     if !bytes.is_empty() {
         let preview = truncate_body(&bytes);
         if let Some(ref auth) = auth {
-            debug!(%method, %uri, auth, trace_id, body_size, preview, "request");
+            debug!(%method, %uri, auth, body_size, preview, "request");
         } else {
-            debug!(%method, %uri, trace_id, body_size, preview, "request");
+            debug!(%method, %uri, body_size, preview, "request");
         }
         // Full body at trace level with dedicated target
         let body_str = String::from_utf8_lossy(&bytes);
         trace!(
             target: "sag_router::http_log::full",
-            %method, %uri, trace_id, body_size, body = %body_str,
+            %method, %uri, body_size, body = %body_str,
             "request full body"
         );
     } else {
         if let Some(ref auth) = auth {
-            debug!(%method, %uri, auth, trace_id, "request");
+            debug!(%method, %uri, auth, "request");
         } else {
-            debug!(%method, %uri, trace_id, "request");
+            debug!(%method, %uri, "request");
         }
     }
 
@@ -82,7 +77,7 @@ pub async fn log_http(request: Request, next: Next) -> Response {
     let status = parts.status.as_u16();
 
     if is_sse {
-        debug!(status, trace_id, "streaming response");
+        debug!(status, "streaming response");
         return Response::from_parts(parts, body);
     }
 
@@ -93,15 +88,15 @@ pub async fn log_http(request: Request, next: Next) -> Response {
     if !bytes.is_empty() {
         let preview = truncate_body(&bytes);
         let body_size = bytes.len();
-        debug!(status, trace_id, body_size, preview, "response");
+        debug!(status, body_size, preview, "response");
         let body_str = String::from_utf8_lossy(&bytes);
         trace!(
             target: "sag_router::http_log::full",
-            status, trace_id, body_size, body = %body_str,
+            status, body_size, body = %body_str,
             "response full body"
         );
     } else {
-        debug!(status, trace_id, "response");
+        debug!(status, "response");
     }
 
     Response::from_parts(parts, Body::from(bytes))
