@@ -55,7 +55,7 @@ const logsCurrentPage = computed(() => Math.floor(store.logsOffset / store.logsL
 function statusVariant(code: number) {
   if (code >= 500) return "destructive" as const
   if (code >= 400) return "secondary" as const
-  return "default" as const
+  return "outline" as const
 }
 
 onMounted(() => {
@@ -180,6 +180,7 @@ function cacheHitRate(row: CallLog): number | null {
               <TableHead class="text-right">Hit</TableHead>
               <TableHead class="text-right">Total</TableHead>
               <TableHead class="text-right">Duration</TableHead>
+              <TableHead class="text-center">Effect</TableHead>
               <TableHead class="text-center">Mode</TableHead>
             </TableRow>
           </TableHeader>
@@ -198,32 +199,14 @@ function cacheHitRate(row: CallLog): number | null {
                   {{ row.real_model }}
                 </div>
               </TableCell>
-              <TableCell class="text-right">
-                <Tooltip>
-                  <TooltipTrigger>
-                    <Badge
-                      :variant="statusVariant(row.status_code)"
-                      class="font-mono text-xs tabular-nums"
-                    >
-                      {{ row.status_code }}
-                    </Badge>
-                  </TooltipTrigger>
-                  <TooltipContent v-if="row.error" class="max-w-md lg:max-w-lg">
-                    {{ row.error }}
-                  </TooltipContent>
-                </Tooltip>
-              </TableCell>
               <TableCell class="text-right tabular-nums">
                 {{ row.usage?.prompt_tokens?.toLocaleString() ?? "—" }}
               </TableCell>
               <TableCell class="text-right tabular-nums">
                 {{ row.usage?.completion_tokens?.toLocaleString() ?? "—" }}
               </TableCell>
-              <TableCell class="text-xs">
-                <Badge v-if="row.reasoning_effort" variant="outline" class="font-medium">
-                  {{ row.reasoning_effort }}
-                </Badge>
-                <span v-else class="text-muted-foreground">—</span>
+              <TableCell class="text-right tabular-nums">
+                {{ row.usage?.reasoning_tokens }}
               </TableCell>
               <TableCell class="text-right tabular-nums">
                 {{ row.cached_tokens?.toLocaleString() ?? "—" }}
@@ -259,8 +242,28 @@ function cacheHitRate(row: CallLog): number | null {
                   {{ fmtTps(row) }}
                 </div>
               </TableCell>
+              <TableCell class="text-right">
+                <Tooltip>
+                  <TooltipTrigger>
+                    <Badge
+                      :variant="statusVariant(row.status_code)"
+                      class="font-mono text-xs tabular-nums"
+                    >
+                      {{ row.status_code }}
+                    </Badge>
+                  </TooltipTrigger>
+                  <TooltipContent v-if="row.error" class="max-w-md lg:max-w-lg">
+                    {{ row.error }}
+                  </TooltipContent>
+                </Tooltip>
+              </TableCell>
+              <TableCell>
+                <Badge variant="outline" class="text-xs">
+                  {{ row.reasoning_effort ?? "none" }}
+                </Badge>
+              </TableCell>
               <TableCell class="text-center">
-                <Badge v-if="row.stream" variant="secondary" class="text-[10px]">SSE</Badge>
+                <Badge v-if="row.stream" variant="outline" class="text-sx">SSE</Badge>
                 <span v-else class="text-muted-foreground text-xs">—</span>
               </TableCell>
             </TableRow>
