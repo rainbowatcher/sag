@@ -22,12 +22,12 @@ description: Records a completed feature change as a numbered changefile in docs
 **Step 1: 确定编号** — 查看 `changes/` 目录下最大编号，+1。用四位数字 `NNNN`。
 
 **Step 2: 写 changefile** — 从 [templates/change.md](templates/change.md) 复制模板填入。关键：
-- 「代码变更」表用 GitHub 绝对链接指向文件
+- 「代码变更」表用仓库根目录相对路径指向文件
 - 「需求变更」记录 requirements.md 的具体段落变化
 - 「测试」列出新增或修改的测试场景
 - 不引用 commit hash 或 PR 号
 
-**Step 3: 更新 requirements.md** — 如果变更影响了行为定义，更新对应节。追加新行为，不删除旧描述（旧描述留在 changefile 中）。
+**Step 3: 更新 requirements.md** — 如果变更影响了行为定义，更新对应节。追加新行为，不删除旧描述（旧描述留在 changefile 中）。同时在末尾「变更记录」节追加新条目。
 
 **Step 4: 更新 spec.md** — 如果变更影响了实现（新文件、新决策、新不变式），更新对应节。同时在末尾「变更记录」节追加新条目。
 
@@ -47,5 +47,5 @@ description: Records a completed feature change as a numbered changefile in docs
 - changefile 自包含，不依赖外部平台（不引用 commit / PR）
 - 代码变更表每行一个文件 + 一句话变更描述
 - 日期用 YYYY-MM-DD 格式
-- 文件路径用 GitHub 绝对链接
+- 文件路径用仓库根目录相对路径
 - 中文书写，术语保留原文
