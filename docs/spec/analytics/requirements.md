@@ -61,3 +61,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 - **调度**：每次调用完成后发送 `CallLog` 到 channel
 - **管理面板**：调用 stats API 展示图表
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)

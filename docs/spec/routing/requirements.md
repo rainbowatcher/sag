@@ -88,3 +88,7 @@ updated: 2026-06-26
 - **供应商**：检查 `provider.enabled` 和 `provider.enabled_models`
 - **调度**：触发 dispatch → provider 调用
 - **熔断器**：检查目标是否处于冷却期
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)

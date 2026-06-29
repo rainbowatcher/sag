@@ -91,3 +91,8 @@ format = "compact"
 
 - **架构**：tracing 在最早时刻初始化
 - **部署**：test-env 启动器不再重定向 stdout/stderr
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)
+- [0002 轮转与清理](changes/0002-rotation-and-cleanup.md)

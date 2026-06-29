@@ -98,3 +98,7 @@ updated: 2026-06-03
 - **路由**：选择 provider 和 real_model
 - **调度**：调用 provider.chat() / provider.chat_stream()
 - **配置**：provider 配置加载和热重载
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)

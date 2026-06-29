@@ -169,3 +169,8 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 - **分析**（`sag-analytics/`）：Analytics 和 Logs 页面从 SQLite 读取聚合统计数据
 - **Tailwind CSS v4**：提供响应式断点和工具类系统
 - **TanStack Table**：ProviderList 和 RouteList 使用 TanStack Table 进行列定义、排序和渲染
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)
+- [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)

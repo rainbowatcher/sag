@@ -75,3 +75,7 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 - 所有子包通过 `sag-core` 的类型定义通信
 - `sag-gateway` 是唯一包含 `main()` 的 crate
 - 前端 `sag-ui` 通过 HTTP 调用管理 API 和模型 API
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)

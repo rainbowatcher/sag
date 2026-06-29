@@ -54,3 +54,7 @@ updated: 2026-06-03
 - **模型 API**：中间件拦截，认证失败返回 401
 - **管理 API**：同一认证逻辑
 - **Dashboard 前端**：localStorage 持久化
+
+## 变更记录
+
+- [0001 初始化](changes/0001-initial.md)
