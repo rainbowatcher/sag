@@ -15,11 +15,11 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-providers/src/traits.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/traits.rs) | LlmProvider trait 定义 |
-| [sag-providers/src/base.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/base.rs) | 共享 HTTP client、headers、body_overrides |
-| [sag-providers/src/openai.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/openai.rs) | OpenAI 适配器 |
-| [sag-providers/src/anthropic.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/anthropic.rs) | Anthropic 适配器（请求/响应翻译） |
-| [sag-providers/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/lib.rs) | create_provider() 工厂函数 |
+| [sag-providers/src/traits.rs](../../../../sag-providers/src/traits.rs) | LlmProvider trait 定义 |
+| [sag-providers/src/base.rs](../../../../sag-providers/src/base.rs) | 共享 HTTP client、headers、body_overrides |
+| [sag-providers/src/openai.rs](../../../../sag-providers/src/openai.rs) | OpenAI 适配器 |
+| [sag-providers/src/anthropic.rs](../../../../sag-providers/src/anthropic.rs) | Anthropic 适配器（请求/响应翻译） |
+| [sag-providers/src/lib.rs](../../../../sag-providers/src/lib.rs) | create_provider() 工厂函数 |
 
 ## 影响的需求条目
 - 全部（初始定义）

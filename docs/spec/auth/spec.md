@@ -7,11 +7,13 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-router/src/middleware/auth.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/middleware/auth.rs) — 认证中间件（提取 Bearer token、比对 api_keys）
-- [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) — `GatewayAuthConfig`
-- [sag-ui/src/stores/connection.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/connection.ts) — 前端连接状态管理（localStorage 持久化）
+- [sag-router/src/middleware/auth.rs](../../../sag-router/src/middleware/auth.rs) — 认证中间件（提取 Bearer token、比对 api_keys）
+- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `GatewayAuthConfig`
+- [sag-ui/src/stores/connection.ts](../../../sag-ui/src/stores/connection.ts) — 前端连接状态管理（localStorage 持久化）
 
-## 认证数据流
+## 核心设计
+
+### 认证数据流
 
 ```mermaid
 flowchart LR

@@ -15,9 +15,9 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-dispatch/src/circuit_breaker.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/circuit_breaker.rs) | 熔断器状态管理（HashMap + 时间驱动冷却） |
-| [sag-core/src/types.rs](https://github.com/rainbowatcher/sag/blob/main/sag-core/src/types.rs) | CircuitHint 枚举（QuotaExhausted / RateLimited / Generic） |
-| [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) | CircuitBreakerConfig（三个冷却时长） |
+| [sag-dispatch/src/circuit_breaker.rs](../../../../sag-dispatch/src/circuit_breaker.rs) | 熔断器状态管理（HashMap + 时间驱动冷却） |
+| [sag-core/src/types.rs](../../../../sag-core/src/types.rs) | CircuitHint 枚举（QuotaExhausted / RateLimited / Generic） |
+| [sag-config/src/config.rs](../../../../sag-config/src/config.rs) | CircuitBreakerConfig（三个冷却时长） |
 
 ## 影响的需求条目
 - 全部（初始定义）

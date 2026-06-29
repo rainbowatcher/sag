@@ -18,10 +18,10 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-gateway/src/tracing_init.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/tracing_init.rs) | tracing-subscriber 初始化（TTY 检测） |
-| [sag-router/src/middleware/trace.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/middleware/trace.rs) | Trace ID 中间件（UUID v4 注入） |
-| [sag-router/src/middleware/http_log.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/middleware/http_log.rs) | HTTP 请求/响应体日志 |
-| [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) | LoggingConfig、LogFormat |
+| [sag-gateway/src/tracing_init.rs](../../../../sag-gateway/src/tracing_init.rs) | tracing-subscriber 初始化（TTY 检测） |
+| [sag-router/src/middleware/trace.rs](../../../../sag-router/src/middleware/trace.rs) | Trace ID 中间件（UUID v4 注入） |
+| [sag-router/src/middleware/http_log.rs](../../../../sag-router/src/middleware/http_log.rs) | HTTP 请求/响应体日志 |
+| [sag-config/src/config.rs](../../../../sag-config/src/config.rs) | LoggingConfig、LogFormat |
 
 ## 影响的需求条目
 - 全部（初始定义，不含轮转/清理）

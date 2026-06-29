@@ -18,11 +18,11 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-gateway/src/tracing_init.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/tracing_init.rs) | 非 TTY 模式改用 RollingFileAppender + non_blocking，返回 WorkerGuard |
-| [sag-gateway/src/main.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/main.rs) | 新增 cleanup_old_logs()（7 天保留），_log_guard 生命周期管理 |
-| [Cargo.toml](https://github.com/rainbowatcher/sag/blob/main/Cargo.toml) | 新增 tracing-appender 工作区依赖 |
-| [sag-gateway/Cargo.toml](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/Cargo.toml) | 新增 tracing-appender 依赖 |
-| [scripts/test-env.py](https://github.com/rainbowatcher/sag/blob/main/scripts/test-env.py) | 移除 stdout/stderr 重定向，status 改为 glob 最新轮转文件 |
+| [sag-gateway/src/tracing_init.rs](../../../../sag-gateway/src/tracing_init.rs) | 非 TTY 模式改用 RollingFileAppender + non_blocking，返回 WorkerGuard |
+| [sag-gateway/src/main.rs](../../../../sag-gateway/src/main.rs) | 新增 cleanup_old_logs()（7 天保留），_log_guard 生命周期管理 |
+| [Cargo.toml](../../../../Cargo.toml) | 新增 tracing-appender 工作区依赖 |
+| [sag-gateway/Cargo.toml](../../../../sag-gateway/Cargo.toml) | 新增 tracing-appender 依赖 |
+| [scripts/test-env.py](../../../../scripts/test-env.py) | 移除 stdout/stderr 重定向，status 改为 glob 最新轮转文件 |
 
 ## 测试
 - 手动验证：`just test-env start && just test-env status` 确认 `logs/sag.2026-06-26.log` 生成

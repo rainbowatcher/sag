@@ -7,11 +7,13 @@ updated: 2026-06-14
 
 ## 关键文件
 
-- [sag-dispatch/src/circuit_breaker.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/circuit_breaker.rs) — 熔断器状态管理
-- [sag-core/src/types.rs](https://github.com/rainbowatcher/sag/blob/main/sag-core/src/types.rs) — `CircuitHint` 枚举（错误分类）
-- [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) — `CircuitBreakerConfig` 配置段
+- [sag-dispatch/src/circuit_breaker.rs](../../../sag-dispatch/src/circuit_breaker.rs) — 熔断器状态管理
+- [sag-core/src/types.rs](../../../sag-core/src/types.rs) — `CircuitHint` 枚举（错误分类）
+- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `CircuitBreakerConfig` 配置段
 
-## 熔断器状态机
+## 核心设计
+
+### 熔断器状态机
 
 ```mermaid
 stateDiagram-v2

@@ -7,12 +7,14 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) — `GatewayConfig`、所有子结构体、`validate()`、序列化辅助函数
-- [sag-config/src/loader.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/loader.rs) — `load_config()`、`peek_logging_config()`、`spawn_hot_reload()`、`save_config_to_file()`
-- [sag-config/src/toml_edit_util.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/toml_edit_util.rs) — `toml_edit` 原地编辑工具函数
-- [sag-config/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/lib.rs) — `ConfigHandle` 类型别名
+- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `GatewayConfig`、所有子结构体、`validate()`、序列化辅助函数
+- [sag-config/src/loader.rs](../../../sag-config/src/loader.rs) — `load_config()`、`peek_logging_config()`、`spawn_hot_reload()`、`save_config_to_file()`
+- [sag-config/src/toml_edit_util.rs](../../../sag-config/src/toml_edit_util.rs) — `toml_edit` 原地编辑工具函数
+- [sag-config/src/lib.rs](../../../sag-config/src/lib.rs) — `ConfigHandle` 类型别名
 
-## 配置生命周期
+## 核心设计
+
+### 配置生命周期
 
 ```mermaid
 flowchart TD

@@ -15,11 +15,11 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-analytics/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/lib.rs) | CallLogCollector 公共 API |
-| [sag-analytics/src/collector.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/collector.rs) | mpsc channel + 后台写入任务 |
-| [sag-analytics/src/sqlite_store.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/sqlite_store.rs) | SQLite 连接池、写入、查询 |
-| [sag-analytics/src/store.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/store.rs) | Store trait |
-| [sag-analytics/migrations/](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/migrations/) | sqlx 迁移 |
+| [sag-analytics/src/lib.rs](../../../../sag-analytics/src/lib.rs) | CallLogCollector 公共 API |
+| [sag-analytics/src/collector.rs](../../../../sag-analytics/src/collector.rs) | mpsc channel + 后台写入任务 |
+| [sag-analytics/src/sqlite_store.rs](../../../../sag-analytics/src/sqlite_store.rs) | SQLite 连接池、写入、查询 |
+| [sag-analytics/src/store.rs](../../../../sag-analytics/src/store.rs) | Store trait |
+| [sag-analytics/migrations/](../../../../sag-analytics/migrations/) | sqlx 迁移 |
 
 ## 影响的需求条目
 - 全部（初始定义）

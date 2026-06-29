@@ -15,11 +15,11 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-dispatch/src/dispatch/chat.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/chat.rs) | 聊天补全分发（非流式 + 流式） |
-| [sag-dispatch/src/dispatch/image.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/image.rs) | 图片生成分发 |
-| [sag-dispatch/src/dispatch/stream.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/stream.rs) | SSE 流式处理 |
-| [sag-dispatch/src/dispatch/retry.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/retry.rs) | 指数退避重试 |
-| [sag-dispatch/src/state.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/state.rs) | DispatchRuntime |
+| [sag-dispatch/src/dispatch/chat.rs](../../../../sag-dispatch/src/dispatch/chat.rs) | 聊天补全分发（非流式 + 流式） |
+| [sag-dispatch/src/dispatch/image.rs](../../../../sag-dispatch/src/dispatch/image.rs) | 图片生成分发 |
+| [sag-dispatch/src/dispatch/stream.rs](../../../../sag-dispatch/src/dispatch/stream.rs) | SSE 流式处理 |
+| [sag-dispatch/src/dispatch/retry.rs](../../../../sag-dispatch/src/dispatch/retry.rs) | 指数退避重试 |
+| [sag-dispatch/src/state.rs](../../../../sag-dispatch/src/state.rs) | DispatchRuntime |
 
 ## 影响的需求条目
 - 全部（初始定义）

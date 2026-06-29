@@ -7,14 +7,16 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-providers/src/traits.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/traits.rs) — `LlmProvider` trait 定义
-- [sag-providers/src/base.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/base.rs) — 共享构建逻辑（HTTP client、headers、body_overrides 合并）
-- [sag-providers/src/openai.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/openai.rs) — OpenAI 适配器
-- [sag-providers/src/anthropic.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/anthropic.rs) — Anthropic 适配器（请求/响应翻译 + 缓存控制注入）
-- [sag-providers/src/util.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/util.rs) — 共享工具函数
-- [sag-providers/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-providers/src/lib.rs) — `create_provider()` 工厂函数
+- [sag-providers/src/traits.rs](../../../sag-providers/src/traits.rs) — `LlmProvider` trait 定义
+- [sag-providers/src/base.rs](../../../sag-providers/src/base.rs) — 共享构建逻辑（HTTP client、headers、body_overrides 合并）
+- [sag-providers/src/openai.rs](../../../sag-providers/src/openai.rs) — OpenAI 适配器
+- [sag-providers/src/anthropic.rs](../../../sag-providers/src/anthropic.rs) — Anthropic 适配器（请求/响应翻译 + 缓存控制注入）
+- [sag-providers/src/util.rs](../../../sag-providers/src/util.rs) — 共享工具函数
+- [sag-providers/src/lib.rs](../../../sag-providers/src/lib.rs) — `create_provider()` 工厂函数
 
-## Provider 创建数据流
+## 核心设计
+
+### Provider 创建数据流
 
 ```mermaid
 flowchart TD
@@ -26,7 +28,7 @@ flowchart TD
     E --> F[Provider Registry]
 ```
 
-## Trait 设计
+### Trait 设计
 
 ```rust
 #[async_trait]

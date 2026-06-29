@@ -9,47 +9,49 @@ updated: 2026-06-27
 
 ### 入口与路由
 
-- [sag-ui/src/main.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/main.ts) — Vue 应用入口：createPinia + createRouter + mount
-- [sag-ui/src/App.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/App.vue) — 根组件：TooltipProvider、连接验证 loading overlay、Toaster、RouterView
-- [sag-ui/src/router/index.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/router/index.ts) — 路由定义（懒加载 6 个路由）+ `beforeEach` 导航守卫
+- [sag-ui/src/main.ts](../../../sag-ui/src/main.ts) — Vue 应用入口：createPinia + createRouter + mount
+- [sag-ui/src/App.vue](../../../sag-ui/src/App.vue) — 根组件：TooltipProvider、连接验证 loading overlay、Toaster、RouterView
+- [sag-ui/src/router/index.ts](../../../sag-ui/src/router/index.ts) — 路由定义（懒加载 6 个路由）+ `beforeEach` 导航守卫
 
 ### 状态管理
 
-- [sag-ui/src/stores/connection.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/connection.ts) — 连接生命周期：localStorage 持久化、Bearer token 同步、健康检查验证、TTL 30 天过期、401 全局拦截
-- [sag-ui/src/stores/health.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/health.ts) — 网关版本号和在线状态轮询
-- [sag-ui/src/stores/providers.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/providers.ts) — Provider CRUD + 上游模型拉取 + 乐观删除+回滚
-- [sag-ui/src/stores/routes.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/routes.ts) — Route CRUD + provider models 懒加载
-- [sag-ui/src/stores/analytics.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/analytics.ts) — Stats、Logs、Cache、Trend、Distribution 查询 + 分页状态管理
+- [sag-ui/src/stores/connection.ts](../../../sag-ui/src/stores/connection.ts) — 连接生命周期：localStorage 持久化、Bearer token 同步、健康检查验证、TTL 30 天过期、401 全局拦截
+- [sag-ui/src/stores/health.ts](../../../sag-ui/src/stores/health.ts) — 网关版本号和在线状态轮询
+- [sag-ui/src/stores/providers.ts](../../../sag-ui/src/stores/providers.ts) — Provider CRUD + 上游模型拉取 + 乐观删除+回滚
+- [sag-ui/src/stores/routes.ts](../../../sag-ui/src/stores/routes.ts) — Route CRUD + provider models 懒加载
+- [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — Stats、Logs、Cache、Trend、Distribution 查询 + 分页状态管理
 
 ### 页面
 
-- [sag-ui/src/pages/DashboardPage.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/pages/DashboardPage.vue) — 仪表板：统计卡片 + Token/Calls 趋势折线图 + 调用分布饼图
-- [sag-ui/src/pages/ProvidersPage.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/pages/ProvidersPage.vue) — Provider 列表页（组合 ProviderList + ProviderAddForm）
-- [sag-ui/src/pages/RoutesPage.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/pages/RoutesPage.vue) — Route 列表页（组合 RouteList + RouteAddForm）
-- [sag-ui/src/pages/AnalyticsPage.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/pages/AnalyticsPage.vue) — 用量统计（Stats + Cache 双 Tab）
-- [sag-ui/src/pages/LogsPage.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/pages/LogsPage.vue) — 请求日志（12 列表格 + 筛选 + 分页）
-- [sag-ui/src/pages/ConnectPage.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/pages/ConnectPage.vue) — 连接配置页面
+- [sag-ui/src/pages/DashboardPage.vue](../../../sag-ui/src/pages/DashboardPage.vue) — 仪表板：统计卡片 + Token/Calls 趋势折线图 + 调用分布饼图
+- [sag-ui/src/pages/ProvidersPage.vue](../../../sag-ui/src/pages/ProvidersPage.vue) — Provider 列表页（组合 ProviderList + ProviderAddForm）
+- [sag-ui/src/pages/RoutesPage.vue](../../../sag-ui/src/pages/RoutesPage.vue) — Route 列表页（组合 RouteList + RouteAddForm）
+- [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) — 用量统计（Stats + Cache 双 Tab）
+- [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（12 列表格 + 筛选 + 分页）
+- [sag-ui/src/pages/ConnectPage.vue](../../../sag-ui/src/pages/ConnectPage.vue) — 连接配置页面
 
 ### 核心组件
 
-- [sag-ui/src/components/AppLayout.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/AppLayout.vue) — 侧边栏 + 主内容区布局，响应式断点控制内容宽度和侧边栏宽度
-- [sag-ui/src/components/providers/ProviderList.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/providers/ProviderList.vue) — Provider 列表（TanStack Table）
-- [sag-ui/src/components/providers/ProviderAddForm.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/providers/ProviderAddForm.vue) — Provider 添加表单
-- [sag-ui/src/components/providers/ProviderEditForm.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Drawer/Dialog 自适应）
-- [sag-ui/src/components/routes/RouteList.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）
-- [sag-ui/src/components/routes/RouteEditForm.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
-- [sag-ui/src/components/routes/TargetEditor.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries）
-- [sag-ui/src/components/Combobox.vue](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
+- [sag-ui/src/components/AppLayout.vue](../../../sag-ui/src/components/AppLayout.vue) — 侧边栏 + 主内容区布局，响应式断点控制内容宽度和侧边栏宽度
+- [sag-ui/src/components/providers/ProviderList.vue](../../../sag-ui/src/components/providers/ProviderList.vue) — Provider 列表（TanStack Table）
+- [sag-ui/src/components/providers/ProviderAddForm.vue](../../../sag-ui/src/components/providers/ProviderAddForm.vue) — Provider 添加表单
+- [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Drawer/Dialog 自适应）
+- [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）
+- [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
+- [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries）
+- [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
 
 ### 工具函数与类型
 
-- [sag-ui/src/lib/client.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/lib/client.ts) — 共享 axios 实例（Authorization header 由 connection store 同步）
-- [sag-ui/src/lib/utils.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
-- [sag-ui/src/types/api.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
-- [sag-ui/src/composables/useTheme.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
-- [sag-ui/src/composables/useChartTheme.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
+- [sag-ui/src/lib/client.ts](../../../sag-ui/src/lib/client.ts) — 共享 axios 实例（Authorization header 由 connection store 同步）
+- [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
+- [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
+- [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
+- [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
 
-## SPA 生命周期数据流
+## 核心设计
+
+### SPA 生命周期数据流
 
 ```mermaid
 flowchart TD
@@ -92,7 +94,7 @@ flowchart TD
     AA --> AB[hasMoreLogs via sentinel row]
 ```
 
-## 固定高度布局渲染数据流
+### 固定高度布局渲染数据流
 
 ```mermaid
 flowchart TD

@@ -7,13 +7,15 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [Cargo.toml](https://github.com/rainbowatcher/sag/blob/main/Cargo.toml) — workspace 定义
-- [sag-gateway/src/main.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/main.rs) — 启动编排
-- [sag-gateway/src/tracing_init.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/tracing_init.rs) — tracing 初始化
-- [sag-core/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-core/src/lib.rs) — 共享类型导出
-- [sag-router/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/lib.rs) — 路由器构建
+- [Cargo.toml](../../../Cargo.toml) — workspace 定义
+- [sag-gateway/src/main.rs](../../../sag-gateway/src/main.rs) — 启动编排
+- [sag-gateway/src/tracing_init.rs](../../../sag-gateway/src/tracing_init.rs) — tracing 初始化
+- [sag-core/src/lib.rs](../../../sag-core/src/lib.rs) — 共享类型导出
+- [sag-router/src/lib.rs](../../../sag-router/src/lib.rs) — 路由器构建
 
-## 启动数据流
+## 核心设计
+
+### 启动数据流
 
 ```mermaid
 flowchart TD

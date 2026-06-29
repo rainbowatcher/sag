@@ -7,14 +7,16 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-dispatch/src/dispatch/chat.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/chat.rs) — 聊天补全分发（非流式 + 流式）
-- [sag-dispatch/src/dispatch/image.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/image.rs) — 图片生成分发
-- [sag-dispatch/src/dispatch/stream.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理
-- [sag-dispatch/src/dispatch/retry.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/retry.rs) — 重试退避逻辑
-- [sag-dispatch/src/dispatch/resolve.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/resolve.rs) — 路由匹配 + 目标选择
-- [sag-dispatch/src/order.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/order.rs) — 目标排序
+- [sag-dispatch/src/dispatch/chat.rs](../../../sag-dispatch/src/dispatch/chat.rs) — 聊天补全分发（非流式 + 流式）
+- [sag-dispatch/src/dispatch/image.rs](../../../sag-dispatch/src/dispatch/image.rs) — 图片生成分发
+- [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理
+- [sag-dispatch/src/dispatch/retry.rs](../../../sag-dispatch/src/dispatch/retry.rs) — 重试退避逻辑
+- [sag-dispatch/src/dispatch/resolve.rs](../../../sag-dispatch/src/dispatch/resolve.rs) — 路由匹配 + 目标选择
+- [sag-dispatch/src/order.rs](../../../sag-dispatch/src/order.rs) — 目标排序
 
-## 分发数据流
+## 核心设计
+
+### 分发数据流
 
 ```mermaid
 flowchart TD

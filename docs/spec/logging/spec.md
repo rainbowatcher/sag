@@ -7,13 +7,15 @@ updated: 2026-06-26
 
 ## 关键文件
 
-- [sag-gateway/src/tracing_init.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/tracing_init.rs) — tracing 初始化（TTY 检测 + 双重输出路径）
-- [sag-gateway/src/main.rs](https://github.com/rainbowatcher/sag/blob/main/sag-gateway/src/main.rs) — `cleanup_old_logs()` + `WorkerGuard` 生命周期
-- [sag-router/src/middleware/trace.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/middleware/trace.rs) — Trace ID 中间件
-- [sag-router/src/middleware/http_log.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/middleware/http_log.rs) — HTTP 请求体日志
-- [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) — `LoggingConfig`、`LogFormat` 枚举
+- [sag-gateway/src/tracing_init.rs](../../../sag-gateway/src/tracing_init.rs) — tracing 初始化（TTY 检测 + 双重输出路径）
+- [sag-gateway/src/main.rs](../../../sag-gateway/src/main.rs) — `cleanup_old_logs()` + `WorkerGuard` 生命周期
+- [sag-router/src/middleware/trace.rs](../../../sag-router/src/middleware/trace.rs) — Trace ID 中间件
+- [sag-router/src/middleware/http_log.rs](../../../sag-router/src/middleware/http_log.rs) — HTTP 请求体日志
+- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `LoggingConfig`、`LogFormat` 枚举
 
-## 日志初始化数据流
+## 核心设计
+
+### 日志初始化数据流
 
 ```mermaid
 flowchart TD

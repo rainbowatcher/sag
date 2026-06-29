@@ -7,14 +7,16 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-admin/src/admin_routes.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin_routes.rs) — 管理路由注册
-- [sag-admin/src/admin_providers.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin_providers.rs) — 供应商 CRUD handler
-- [sag-admin/src/admin.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin.rs) — 路由 CRUD handler
-- [sag-admin/src/admin_logs.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin_logs.rs) — 日志查询 handler
-- [sag-admin/src/test_utils.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/test_utils.rs) — 配置一致性测试工具
-- [sag-admin/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/lib.rs) — `build_admin_routes()` 路由构建
+- [sag-admin/src/admin_routes.rs](../../../sag-admin/src/admin_routes.rs) — 管理路由注册
+- [sag-admin/src/admin_providers.rs](../../../sag-admin/src/admin_providers.rs) — 供应商 CRUD handler
+- [sag-admin/src/admin.rs](../../../sag-admin/src/admin.rs) — 路由 CRUD handler
+- [sag-admin/src/admin_logs.rs](../../../sag-admin/src/admin_logs.rs) — 日志查询 handler
+- [sag-admin/src/test_utils.rs](../../../sag-admin/src/test_utils.rs) — 配置一致性测试工具
+- [sag-admin/src/lib.rs](../../../sag-admin/src/lib.rs) — `build_admin_routes()` 路由构建
 
-## 配置持久化数据流
+## 核心设计
+
+### 配置持久化数据流
 
 ```mermaid
 flowchart LR

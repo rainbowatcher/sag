@@ -15,9 +15,9 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-router/src/middleware/auth.rs](https://github.com/rainbowatcher/sag/blob/main/sag-router/src/middleware/auth.rs) | 认证中间件（提取 Bearer token、比对 api_keys） |
-| [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) | GatewayAuthConfig |
-| [sag-ui/src/stores/connection.ts](https://github.com/rainbowatcher/sag/blob/main/sag-ui/src/stores/connection.ts) | 前端 localStorage 持久化 |
+| [sag-router/src/middleware/auth.rs](../../../../sag-router/src/middleware/auth.rs) | 认证中间件（提取 Bearer token、比对 api_keys） |
+| [sag-config/src/config.rs](../../../../sag-config/src/config.rs) | GatewayAuthConfig |
+| [sag-ui/src/stores/connection.ts](../../../../sag-ui/src/stores/connection.ts) | 前端 localStorage 持久化 |
 
 ## 影响的需求条目
 - 全部（初始定义）

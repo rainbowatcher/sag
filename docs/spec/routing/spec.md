@@ -7,13 +7,15 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) — `RouteConfig`, `RouteTarget`, `Strategy` 类型
-- [sag-dispatch/src/order.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/order.rs) — 目标排序、shuffle 缓存、stickiness
-- [sag-dispatch/src/dispatch/resolve.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/dispatch/resolve.rs) — 路由匹配、目标选择、重试循环
-- [sag-dispatch/src/circuit_breaker.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/circuit_breaker.rs) — 熔断器状态管理
-- [sag-dispatch/src/state.rs](https://github.com/rainbowatcher/sag/blob/main/sag-dispatch/src/state.rs) — `DispatchRuntime`（持有 shuffle 缓存、sticky active targets、round-robin 计数器）
+- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `RouteConfig`, `RouteTarget`, `Strategy` 类型
+- [sag-dispatch/src/order.rs](../../../sag-dispatch/src/order.rs) — 目标排序、shuffle 缓存、stickiness
+- [sag-dispatch/src/dispatch/resolve.rs](../../../sag-dispatch/src/dispatch/resolve.rs) — 路由匹配、目标选择、重试循环
+- [sag-dispatch/src/circuit_breaker.rs](../../../sag-dispatch/src/circuit_breaker.rs) — 熔断器状态管理
+- [sag-dispatch/src/state.rs](../../../sag-dispatch/src/state.rs) — `DispatchRuntime`（持有 shuffle 缓存、sticky active targets、round-robin 计数器）
 
-## 路由匹配数据流
+## 核心设计
+
+### 路由匹配数据流
 
 ```mermaid
 sequenceDiagram

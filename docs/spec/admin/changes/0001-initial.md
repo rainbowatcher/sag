@@ -15,11 +15,11 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-admin/src/admin_routes.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin_routes.rs) | 管理路由注册 |
-| [sag-admin/src/admin_providers.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin_providers.rs) | 供应商 CRUD handler |
-| [sag-admin/src/admin.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin.rs) | 路由 CRUD handler |
-| [sag-admin/src/admin_logs.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/admin_logs.rs) | 日志查询 handler |
-| [sag-admin/src/test_utils.rs](https://github.com/rainbowatcher/sag/blob/main/sag-admin/src/test_utils.rs) | 配置一致性测试 |
+| [sag-admin/src/admin_routes.rs](../../../../sag-admin/src/admin_routes.rs) | 管理路由注册 |
+| [sag-admin/src/admin_providers.rs](../../../../sag-admin/src/admin_providers.rs) | 供应商 CRUD handler |
+| [sag-admin/src/admin.rs](../../../../sag-admin/src/admin.rs) | 路由 CRUD handler |
+| [sag-admin/src/admin_logs.rs](../../../../sag-admin/src/admin_logs.rs) | 日志查询 handler |
+| [sag-admin/src/test_utils.rs](../../../../sag-admin/src/test_utils.rs) | 配置一致性测试 |
 
 ## 影响的需求条目
 - 全部（初始定义）

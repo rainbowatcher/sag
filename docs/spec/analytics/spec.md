@@ -7,13 +7,15 @@ updated: 2026-06-03
 
 ## 关键文件
 
-- [sag-analytics/src/lib.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/lib.rs) — `CallLogCollector` 结构体 + 公共 API
-- [sag-analytics/src/store.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/store.rs) — Store trait 定义
-- [sag-analytics/src/sqlite_store.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/sqlite_store.rs) — SQLite 实现（连接池、写入、查询）
-- [sag-analytics/src/collector.rs](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/src/collector.rs) — Channel 收集器（mpsc channel + 后台写入任务）
-- [sag-analytics/migrations/20260615000001_init.sqlite.sql](https://github.com/rainbowatcher/sag/blob/main/sag-analytics/migrations/20260615000001_init.sqlite.sql) — SQLite schema 迁移
+- [sag-analytics/src/lib.rs](../../../sag-analytics/src/lib.rs) — `CallLogCollector` 结构体 + 公共 API
+- [sag-analytics/src/store.rs](../../../sag-analytics/src/store.rs) — Store trait 定义
+- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现（连接池、写入、查询）
+- [sag-analytics/src/collector.rs](../../../sag-analytics/src/collector.rs) — Channel 收集器（mpsc channel + 后台写入任务）
+- [sag-analytics/migrations/20260615000001_init.sqlite.sql](../../../sag-analytics/migrations/20260615000001_init.sqlite.sql) — SQLite schema 迁移
 
-## 写入数据流
+## 核心设计
+
+### 写入数据流
 
 ```mermaid
 sequenceDiagram

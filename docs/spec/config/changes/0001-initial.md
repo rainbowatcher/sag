@@ -15,9 +15,9 @@ type: 新增
 ## 代码变更
 | 文件 | 变更 |
 |------|------|
-| [sag-config/src/config.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/config.rs) | GatewayConfig 及所有子结构体、validate() 全字段校验、serde 序列化规则 |
-| [sag-config/src/loader.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/loader.rs) | load_config()、peek_logging_config()、spawn_hot_reload()、save_config_to_file() |
-| [sag-config/src/toml_edit_util.rs](https://github.com/rainbowatcher/sag/blob/main/sag-config/src/toml_edit_util.rs) | toml_edit 原位编辑工具函数 |
+| [sag-config/src/config.rs](../../../../sag-config/src/config.rs) | GatewayConfig 及所有子结构体、validate() 全字段校验、serde 序列化规则 |
+| [sag-config/src/loader.rs](../../../../sag-config/src/loader.rs) | load_config()、peek_logging_config()、spawn_hot_reload()、save_config_to_file() |
+| [sag-config/src/toml_edit_util.rs](../../../../sag-config/src/toml_edit_util.rs) | toml_edit 原位编辑工具函数 |
 
 ## 影响的需求条目
 - 全部（初始定义）
