@@ -109,24 +109,24 @@ flowchart TD
         D_SCROLL[flex-1 overflow-y-auto<br/>图表网格: 饼图 / Token趋势 / Calls趋势]
     end
 
-    subgraph Providers[ProvidersPage]
+    subgraph Providers[ProvidersPage → ProviderList]
         P_FIXED[shrink-0: 标题 + Add/Refresh 按钮<br/>+ 筛选栏 Model/Type/Sort]
-        P_SCROLL[flex-1 overflow-y-auto<br/>Provider 表格 TanStack Table]
+        P_SCROLL[flex-1 → [&>div]:h-full → Table wrapper overflow-auto<br/>Provider 表格 TanStack Table: sticky 表头]
     end
 
-    subgraph Routes[RoutesPage]
+    subgraph Routes[RoutesPage → RouteList]
         R_FIXED[shrink-0: 标题 + Add Route 按钮]
-        R_SCROLL[flex-1 overflow-y-auto<br/>Route 表格 TanStack Table]
+        R_SCROLL[flex-1 → [&>div]:h-full → Table wrapper overflow-auto<br/>Route 表格 TanStack Table: sticky 表头]
     end
 
     subgraph Analytics[AnalyticsPage]
         A_FIXED[shrink-0: 标题 + Tabs 标签栏<br/>+ 4 张统计卡片 + 筛选栏]
-        A_SCROLL[flex-1 overflow-y-auto<br/>Stats 表格 / Cache 表格]
+        A_SCROLL[flex-1 → [&>div]:h-full → Table wrapper overflow-auto<br/>Stats 表格 / Cache 表格: sticky 表头 + backdrop-blur]
     end
 
     subgraph Logs[LogsPage]
         L_FIXED1[shrink-0: 标题 + 筛选栏]
-        L_SCROLL[flex-1 overflow-y-auto<br/>overflow-x-auto 2xl:overflow-visible<br/>日志表格 12 列]
+        L_SCROLL[flex-1 → [&>div]:h-full → Table wrapper overflow-auto<br/>日志表格 12 列: sticky 表头 + backdrop-blur]
         L_FIXED2[shrink-0: 分页控件]
     end
 
@@ -250,8 +250,9 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **滚动容器内边距**：滚动容器内的 `space-y-*` 或 `gap-*` 间距必须在滚动容器内部生效，而非外部——否则间距会参与 flex 高度计算导致溢出
 - **Logs 三区结构**：LogsPage 是唯一有三个区域的页面：固定头（筛选栏）+ 滚动体（表格）+ 固定尾（分页）。分页必须用 `shrink-0`，不能放在 `flex-1` 滚动区内
 - **侧边栏 flex 分配**：侧边栏 `<nav class="flex-1">` 自动占满 header 和 footer 之间的剩余高度，不需显式高度计算
-- **表格滚动容器层级**：表格所在的外层 `<div class="rounded-lg border">` 只能设置高度约束（`h-full`），不得设置 `overflow-auto`。overflow 必须由 `<Table>` 组件的包裹 div 处理。若外层也有 overflow，sticky 表头将相对于外层容器定位，而 Table 包裹 div 的 `overflow-auto` 会创建中间滚动上下文导致 sticky 失效
-- **sticky 表头**：所有使用 `<Table>` 的页面必须在 `<TableHeader>` 上设置 `class="sticky top-0 z-10 bg-background"`。`bg-background` 确保滚动时表头覆盖下方行内容不透明穿帮
+- **表格滚动容器层级**：表格所在的外层 `<div class="rounded-lg border">` 只能设置高度约束（`h-full`）+ `[&>div]:h-full`，不得设置 `overflow-auto` 或 `overflow-hidden`。overflow 必须由 `<Table>` 组件的包裹 div 处理。若外层也有 overflow，sticky 表头将相对于外层容器定位，而 Table 包裹 div 的 `overflow-auto` 会创建中间滚动上下文导致 sticky 失效。`<tbody>` 上不得设置 `overflow-auto` —— 会使 `<tbody>` 变为 `display: block`，破坏 `<thead>`/`<tbody>` 之间的原生列宽同步
+- **sticky 表头**：所有使用 `<Table>` 的页面必须在 `<TableHeader>` 上设置 `class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs"`。`bg-background/90` + `backdrop-blur-xs` 提供玻璃拟态效果，确保滚动时表头覆盖下方行内容且视觉层次清晰
+- **[&>div]:h-full 高度传递**：表格的外层 `<div class="rounded-lg border">` 使用 `[&>div]:h-full` 将高度约束传递给 `<Table>` 组件的包裹 div（`overflow-auto`），使其成为 sticky 表头的滚动参照点。不使用此模式时外层 div 不得设置 overflow，否则会创建多余滚动上下文导致 sticky 失效
 
 ## 测试策略
 
@@ -276,4 +277,5 @@ SAG UI 当前无自动化前端测试（需求文档已标注「不包含：端�
 7. **固定高度布局边界**：将浏览器窗口调至极小高度（如 600px）→ 图表/表格应有最小可见区域，固定区域不应挤压滚动区至零高度
 
 ## 变更记录
+- [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
 - [0001 初始化与大屏幕响应式优化](changes/0001-initial.md)
