@@ -9,7 +9,7 @@ const store = useConnectionStore()
 </script>
 
 <template>
-  <TooltipProvider :delay-duration="1800">
+  <TooltipProvider :delay-duration="1200">
     <!-- Loading overlay during auto-connect validation.
        Must NOT use v-if/v-else that toggles <RouterView> mount state,
        because the navigation guard may still be pending when validating

@@ -213,7 +213,7 @@ function cacheHitRate(row: CallLog): number | null {
               </TableCell>
               <TableCell class="text-right font-mono text-xs tabular-nums">
                 <span
-                  v-if="cacheHitRate(row) != null"
+                  v-if="cacheHitRate(row)"
                   :class="cacheHitRate(row)! > 0 ? 'text-green-600' : 'text-muted-foreground'"
                 >
                   {{ (cacheHitRate(row)! * 100).toFixed(1) + "%" }}
@@ -224,23 +224,33 @@ function cacheHitRate(row: CallLog): number | null {
                 {{ row.usage?.total_tokens?.toLocaleString() ?? "—" }}
               </TableCell>
               <TableCell class="text-right font-mono text-xs tabular-nums">
-                <div :title="`${row.duration_ms} ms`">{{ formatDuration(row.duration_ms) }}</div>
-                <div
-                  v-if="row.upstream_duration_ms != null"
-                  class="text-muted-foreground text-[10px]"
-                >
-                  upstream
-                  <span :title="`${row.upstream_duration_ms} ms`">{{
-                    formatDuration(row.upstream_duration_ms)
-                  }}</span>
-                </div>
-                <div v-if="row.ttft_ms != null" class="text-muted-foreground text-[10px]">
-                  ttft
-                  <span :title="`${row.ttft_ms} ms`">{{ formatDuration(row.ttft_ms) }}</span>
-                </div>
-                <div v-if="fmtTps(row)" class="text-muted-foreground text-[10px]">
-                  {{ fmtTps(row) }}
-                </div>
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <span class="cursor-default">{{ formatDuration(row.duration_ms) }}</span>
+                  </TooltipTrigger>
+                  <TooltipContent
+                    v-if="row.upstream_duration_ms || row.ttft_ms || fmtTps(row)"
+                    side="left"
+                    class="font-mono text-xs tabular-nums"
+                  >
+                    <div class="grid grid-cols-[auto_auto] gap-x-4 gap-y-0.5">
+                      <template v-if="row.upstream_duration_ms">
+                        <span>upstream</span>
+                        <span class="text-right">{{
+                          formatDuration(row.upstream_duration_ms)
+                        }}</span>
+                      </template>
+                      <template v-if="row.ttft_ms">
+                        <span>ttft</span>
+                        <span class="text-right">{{ formatDuration(row.ttft_ms) }}</span>
+                      </template>
+                      <template v-if="fmtTps(row)">
+                        <span>tps</span>
+                        <span class="text-right text-green-600">{{ fmtTps(row) }}</span>
+                      </template>
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
               </TableCell>
               <TableCell class="text-right">
                 <Tooltip>
