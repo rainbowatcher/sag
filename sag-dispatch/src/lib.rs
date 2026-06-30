@@ -7,11 +7,13 @@
 //! - [`order`] — target ordering strategies (FillFirst / RoundRobin).
 //! - [`dispatch`] — route resolution, per-target retry loop, chat & image
 //!   dispatch fallback, and SSE streaming response builder.
-//! - [`state`] — [`AppState`] (shared resources) and [`DispatchRuntime`]
-//!   (dispatch-only runtime state).
-//! - [`testing`] — shared test helpers for constructing [`AppState`] and
-//!   [`DispatchRuntime`] (not gated by `#[cfg(test)]` so integration
-//!   tests can reach them).
+//! - [`state`] — [`DispatchRuntime`] (dispatch-only runtime state).
+//!   [`AppState`] has moved to `sag-state`; this module re-exports it
+//!   for backwards compatibility.
+//! - [`testing`] — test helpers for constructing [`DispatchRuntime`]
+//!   (not gated by `#[cfg(test)]` so integration tests can reach them).
+//!   The `test_app_state` / `build_provider_registry` helpers have also
+//!   moved to `sag-state` and are re-exported here.
 
 pub mod circuit_breaker;
 pub mod dispatch;

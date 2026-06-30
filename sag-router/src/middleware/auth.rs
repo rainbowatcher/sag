@@ -6,7 +6,7 @@ use axum::{
 use sag_core::AppError;
 use tracing::warn;
 
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 /// Axum middleware: validates the `Authorization: Bearer *** header
 /// against the configured gateway API keys.
@@ -81,7 +81,7 @@ mod tests {
         };
         let handle = ConfigHandle::from_config(config);
         let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
-        sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
+        sag_state::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
     /// Build a small test app: a single `GET /test` route protected by `gateway_auth`.

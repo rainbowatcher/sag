@@ -21,7 +21,7 @@ sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
-sag-dispatch = { path = "../sag-dispatch" }
+sag-state = { path = "../sag-state" }
 
 [dev-dependencies]
 http-body-util = "0.1"

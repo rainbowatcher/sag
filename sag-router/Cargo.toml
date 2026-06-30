@@ -18,6 +18,7 @@ sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
+sag-state = { path = "../sag-state" }
 sag-dispatch = { path = "../sag-dispatch" }
 sag-admin = { path = "../sag-admin" }
 

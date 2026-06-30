@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::{instrument, warn};
 
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct RouteTargetInput {

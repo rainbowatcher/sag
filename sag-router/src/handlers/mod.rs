@@ -14,7 +14,7 @@ use serde_json::json;
 use tracing::{error, instrument};
 
 use sag_analytics::{StatsFilter, TrendFilter};
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 #[derive(Deserialize)]
 pub struct StatsQuery {
@@ -187,7 +187,8 @@ pub async fn analytics_cache_stats(
 mod tests {
     use super::*;
     use sag_config::{ConfigHandle, GatewayConfig, RouteConfig, RouteTarget, Strategy};
-    use sag_dispatch::testing::{build_provider_registry, provider_config};
+    use sag_dispatch::testing::provider_config;
+    use sag_state::testing::build_provider_registry;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -261,7 +262,7 @@ mod tests {
         };
         let handle = ConfigHandle::from_config(config);
         let provider_registry = build_provider_registry(&handle, true).await;
-        let state = sag_dispatch::testing::test_app_state(handle, provider_registry).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
         let Json(response) = list_models(State(state)).await;
         let data = response["data"].as_array().unwrap();
         let model_ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();

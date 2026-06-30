@@ -16,7 +16,7 @@ use sag_core::AppError;
 use serde_json::json;
 use tracing::{instrument, warn};
 
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AddProviderRequest {
@@ -683,7 +683,7 @@ targets = [
         drop(cfg_read);
 
         let state =
-            sag_dispatch::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await;
+            sag_state::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await;
         let app = test_app(state);
 
         let req = Request::builder()

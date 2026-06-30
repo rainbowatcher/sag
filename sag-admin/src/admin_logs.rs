@@ -16,7 +16,7 @@ use sag_core::AppError;
 use serde_json::json;
 use tracing::{error, instrument};
 
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 /// Query parameters accepted by `GET /api/logs`. Missing or empty
 /// values are treated as "no filter" rather than a 400.

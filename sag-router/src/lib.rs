@@ -3,11 +3,14 @@ pub mod handlers;
 pub mod middleware;
 pub mod routes;
 
+// ── 从 sag-state 重导出（共享状态） ───────────────────────────
+pub use sag_state::{AppState, testing::test_app_state};
+
 // ── 从 sag-dispatch 重导出（保持向后兼容） ──────────────────────
-pub use sag_dispatch::testing::{test_app_state, test_dispatch_runtime};
+pub use sag_dispatch::testing::test_dispatch_runtime;
 pub use sag_dispatch::{
-    AppState, CachedOrder, DispatchCtx, DispatchRuntime, RouteCircuitBreaker, RouteTargetKey,
-    dispatch_chat, dispatch_image, order_targets, resolve_route,
+    CachedOrder, DispatchCtx, DispatchRuntime, RouteCircuitBreaker, RouteTargetKey, dispatch_chat,
+    dispatch_image, order_targets, resolve_route,
 };
 
 // ── 从 sag-admin 重导出（保持向后兼容） ──────────────────────────

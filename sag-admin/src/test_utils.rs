@@ -12,7 +12,7 @@ use sag_config::{
     ConfigHandle, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, RouteConfig,
     RouteTarget, Strategy,
 };
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 /// Build an in-memory `AppState` with the given providers and routes.
 /// The runtime provider registry is pre-populated with `OpenAiProvider`
@@ -27,8 +27,8 @@ pub(crate) async fn build_state(
         ..sag_config::gateway_config_base!()
     };
     let handle = ConfigHandle::from_config(config);
-    let provider_registry = sag_dispatch::testing::build_provider_registry(&handle, false).await;
-    sag_dispatch::testing::test_app_state(handle, provider_registry).await
+    let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+    sag_state::testing::test_app_state(handle, provider_registry).await
 }
 
 /// Build a test Axum app mounting admin routes without auth middleware.

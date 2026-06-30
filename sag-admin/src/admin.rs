@@ -19,7 +19,7 @@ use crate::admin_providers::{
 };
 use crate::admin_routes::{create_route, delete_route, list_routes, update_route};
 use crate::admin_testing::{fetch_models, model_test};
-use sag_dispatch::AppState;
+use sag_state::AppState;
 
 /// Build admin routes under `/api/*` (all auth-protected by the parent).
 pub fn build_admin_routes(state: AppState) -> Router<AppState> {
