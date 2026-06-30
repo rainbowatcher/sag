@@ -362,37 +362,13 @@ pub async fn delete_provider(
     let provider_name = req.name;
     tracing::Span::current().record("provider_name", &provider_name);
     // ── Stage 1: update config + persist ─────────────────────────────
-    // Collect (model_name, removed_target_count) for every route that lost
-    // at least one target, so we can report it back to the caller.
-    let (cascaded_routes, removed_targets) = {
+    let cascade = {
         let mut config = state.config.write().await;
 
-        if !config.providers.contains_key(&provider_name) {
+        let Some(cascade) = config.remove_provider(&provider_name) else {
             return AppError::NotFound(format!("provider '{provider_name}' not found"))
                 .into_response();
-        }
-
-        // Cascade: walk every route, drop targets pointing at the deleted
-        // provider, and remember which routes were touched.
-        let mut cascaded_routes: Vec<String> = Vec::new();
-        let mut removed_targets: usize = 0;
-        for route in config.routes.iter_mut() {
-            let before = route.targets.len();
-            route.targets.retain(|t| t.provider != provider_name);
-            let dropped = before - route.targets.len();
-            if dropped > 0 {
-                removed_targets += dropped;
-                cascaded_routes.push(route.model_name.clone());
-            }
-        }
-
-        // Drop routes that ended up with no targets at all — keeping an
-        // empty `targets` list would just create a dead route that matches
-        // a model but has no fallback, silently failing every request.
-        config.routes.retain(|r| !r.targets.is_empty());
-
-        // Remove the provider from the config map.
-        config.providers.remove(&provider_name);
+        };
 
         // Persist to disk while we still hold the write lock.
         if let Some(path) = state.config.path()
@@ -401,7 +377,7 @@ pub async fn delete_provider(
             warn!(?e, "failed to persist config after deleting provider");
         }
 
-        (cascaded_routes, removed_targets)
+        cascade
     };
 
     // ── Stage 2: remove the runtime adapter ──────────────────────────
@@ -418,8 +394,9 @@ pub async fn delete_provider(
         StatusCode::OK,
         Json(json!({
             "name": provider_name,
-            "cascaded_routes": cascaded_routes,
-            "removed_targets": removed_targets,
+            "cascaded_routes": cascade.cascaded_routes,
+            "deleted_routes": cascade.deleted_routes,
+            "removed_targets": cascade.removed_targets,
         })),
     )
         .into_response()
@@ -476,6 +453,7 @@ mod tests {
         assert_eq!(body["name"], "openai");
         assert_eq!(body["removed_targets"], 1);
         assert_eq!(body["cascaded_routes"], serde_json::json!(["gpt-4o"]));
+        assert_eq!(body["deleted_routes"], serde_json::json!(["gpt-4o"]));
 
         let cfg = state.config.read().await;
         assert!(!cfg.providers.contains_key("openai"));
@@ -608,6 +586,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body["removed_targets"], 1);
         assert_eq!(body["cascaded_routes"], serde_json::json!(["gpt-4o"]));
+        assert_eq!(body["deleted_routes"], serde_json::json!([]));
 
         let cfg = state.config.read().await;
         assert!(!cfg.providers.contains_key("openai"));

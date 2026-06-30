@@ -69,7 +69,63 @@ pub struct GatewayConfig {
     pub logging: LoggingConfig,
 }
 
+/// Result of removing a provider from the configuration, describing which
+/// routes and targets were affected by the cascade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CascadeResult {
+    /// Names of routes that had at least one target referencing the deleted provider.
+    /// This includes routes that were entirely removed (listed in `deleted_routes`).
+    pub cascaded_routes: Vec<String>,
+    /// Names of routes that were entirely removed because all their targets
+    /// referenced the deleted provider (a subset of `cascaded_routes`).
+    pub deleted_routes: Vec<String>,
+    /// Total number of targets removed across all routes.
+    pub removed_targets: usize,
+}
+
 impl GatewayConfig {
+    /// Remove a provider from the configuration, cascading the deletion to all
+    /// routes that reference it.
+    ///
+    /// - Removes the named provider from `self.providers`.
+    /// - Walks every route and drops any `RouteTarget` referencing the deleted
+    ///   provider. Routes that end up with zero targets are entirely removed.
+    ///
+    /// Returns `None` when no provider with the given name exists; otherwise
+    /// returns a [`CascadeResult`] describing which routes were touched.
+    pub fn remove_provider(&mut self, name: &str) -> Option<CascadeResult> {
+        if !self.providers.contains_key(name) {
+            return None;
+        }
+
+        let mut cascaded_routes: Vec<String> = Vec::new();
+        let mut deleted_routes: Vec<String> = Vec::new();
+        let mut removed_targets: usize = 0;
+
+        for route in self.routes.iter_mut() {
+            let before = route.targets.len();
+            route.targets.retain(|t| t.provider != name);
+            let dropped = before - route.targets.len();
+            if dropped > 0 {
+                removed_targets += dropped;
+                cascaded_routes.push(route.model_name.clone());
+                if route.targets.is_empty() {
+                    deleted_routes.push(route.model_name.clone());
+                }
+            }
+        }
+
+        // Drop routes that ended up with no targets at all.
+        self.routes.retain(|r| !r.targets.is_empty());
+        self.providers.remove(name);
+
+        Some(CascadeResult {
+            cascaded_routes,
+            deleted_routes,
+            removed_targets,
+        })
+    }
+
     /// Validate the configuration, returning all semantic errors found.
     /// Returns `Ok(())` if no errors, `Err(Vec<String>)` with all error messages.
     pub fn validate(&self) -> std::result::Result<(), Vec<String>> {
@@ -1437,6 +1493,158 @@ api_keys = ["sk-test"]
                 config.validate().is_ok(),
                 "distinct real_models with the same provider must validate"
             );
+        }
+    }
+
+    // ── remove_provider unit tests ──────────────────────────────────
+    mod remove_provider {
+        use super::*;
+
+        /// Helper: build a minimal `GatewayConfig` with given providers and routes.
+        fn config_with(
+            providers: HashMap<String, ProviderConfig>,
+            routes: Vec<RouteConfig>,
+        ) -> GatewayConfig {
+            GatewayConfig {
+                providers,
+                routes,
+                ..gateway_config_base!()
+            }
+        }
+
+        /// Helper: a bare-bones `ProviderConfig` for testing.
+        fn test_provider(name: &str) -> (String, ProviderConfig) {
+            (
+                name.into(),
+                ProviderConfig {
+                    provider_type: ProviderType::OpenAI,
+                    api_keys: vec![format!("sk-{name}")],
+                    key_strategy: KeyStrategy::FillFirst,
+                    base_url: "https://example.com".into(),
+                    models_endpoint: "models".into(),
+                    timeout_secs: 120,
+                    chunk_timeout_secs: None,
+                    headers: HashMap::new(),
+                    body_overrides: HashMap::new(),
+                    role_mappings: HashMap::new(),
+                    enabled_models: vec![],
+                    enabled: true,
+                    anthropic_cache_control: false,
+                },
+            )
+        }
+
+        /// Helper: a `RouteTarget` referencing a provider by name.
+        fn target(provider: &str) -> RouteTarget {
+            RouteTarget {
+                provider: provider.into(),
+                real_model: Some(format!("model-{provider}")),
+                priority: 0,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            }
+        }
+
+        /// Helper: a `RouteConfig` with a model name and targets.
+        fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
+            RouteConfig {
+                model_name: model.into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy: Strategy::FillFirst,
+                retries: None,
+                timeout_secs: None,
+                targets,
+            }
+        }
+
+        #[test]
+        fn returns_none_when_provider_not_found() {
+            let mut config = config_with(HashMap::new(), vec![]);
+            let result = config.remove_provider("nonexistent");
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn removes_provider_no_route_refs() {
+            let providers = HashMap::from([test_provider("openai")]);
+            let mut config = config_with(providers, vec![]);
+            let result = config.remove_provider("openai").unwrap();
+            assert!(config.providers.is_empty());
+            assert!(result.cascaded_routes.is_empty());
+            assert!(result.deleted_routes.is_empty());
+            assert_eq!(result.removed_targets, 0);
+        }
+
+        #[test]
+        fn cascades_partial_route_targets() {
+            let providers = HashMap::from([test_provider("openai"), test_provider("anthropic")]);
+            let routes = vec![route("gpt-4o", vec![target("openai"), target("anthropic")])];
+            let mut config = config_with(providers, routes);
+
+            let result = config.remove_provider("openai").unwrap();
+            assert!(!config.providers.contains_key("openai"));
+            assert!(config.providers.contains_key("anthropic"));
+            assert_eq!(result.cascaded_routes, vec!["gpt-4o"]);
+            assert!(result.deleted_routes.is_empty());
+            assert_eq!(result.removed_targets, 1);
+
+            // The remaining route still has one target.
+            assert_eq!(config.routes.len(), 1);
+            assert_eq!(config.routes[0].targets.len(), 1);
+            assert_eq!(config.routes[0].targets[0].provider, "anthropic");
+        }
+
+        #[test]
+        fn deletes_route_with_only_deleted_provider() {
+            let providers = HashMap::from([test_provider("openai")]);
+            let routes = vec![
+                route("gpt-4o", vec![target("openai")]),
+                // This route references only "openai" and should be deleted.
+                route("gpt-3.5-turbo", vec![target("openai")]),
+            ];
+            let mut config = config_with(providers, routes);
+
+            let result = config.remove_provider("openai").unwrap();
+            assert!(config.providers.is_empty());
+            assert!(config.routes.is_empty());
+            assert_eq!(result.cascaded_routes, vec!["gpt-4o", "gpt-3.5-turbo"]);
+            assert_eq!(result.deleted_routes, vec!["gpt-4o", "gpt-3.5-turbo"]);
+            assert_eq!(result.removed_targets, 2);
+        }
+
+        #[test]
+        fn mixed_cascade_partial_and_full_deletion() {
+            let providers = HashMap::from([test_provider("openai"), test_provider("anthropic")]);
+            let routes = vec![
+                // Partial: one target removed, route survives.
+                route("gpt-4o", vec![target("openai"), target("anthropic")]),
+                // Full: only target is "openai", route deleted.
+                route("gpt-3.5-turbo", vec![target("openai")]),
+                // Unaffected: no reference to "openai".
+                route("claude", vec![target("anthropic")]),
+            ];
+            let mut config = config_with(providers, routes);
+
+            let result = config.remove_provider("openai").unwrap();
+            assert_eq!(result.cascaded_routes, vec!["gpt-4o", "gpt-3.5-turbo"]);
+            assert_eq!(result.deleted_routes, vec!["gpt-3.5-turbo"]);
+            assert_eq!(result.removed_targets, 2);
+
+            // Two routes survive: gpt-4o (with only anthropic) and claude.
+            assert_eq!(config.routes.len(), 2);
+            let gpt = config
+                .routes
+                .iter()
+                .find(|r| r.model_name == "gpt-4o")
+                .unwrap();
+            assert_eq!(gpt.targets.len(), 1);
+            let claude = config
+                .routes
+                .iter()
+                .find(|r| r.model_name == "claude")
+                .unwrap();
+            assert_eq!(claude.targets.len(), 1);
         }
     }
 }
