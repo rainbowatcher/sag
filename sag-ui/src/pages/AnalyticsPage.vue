@@ -15,7 +15,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
-import { formatDuration, successRateColor } from "@/lib/utils"
+import { formatCompactNumber, formatDuration, successRateColor } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 
 const store = useAnalyticsStore()
@@ -104,7 +104,7 @@ const statsTotals = computed(() => {
                   <div>
                     <p class="text-muted-foreground text-xs">Total Tokens</p>
                     <p class="text-lg font-bold tabular-nums xl:text-xl">
-                      {{ statsTotals.tokens.toLocaleString() }}
+                      {{ formatCompactNumber(statsTotals.tokens) }}
                     </p>
                   </div>
                 </CardContent>
@@ -224,7 +224,7 @@ const statsTotals = computed(() => {
                       {{ row.call_count.toLocaleString() }}
                     </TableCell>
                     <TableCell class="text-right tabular-nums">
-                      {{ row.total_tokens.toLocaleString() }}
+                      {{ formatCompactNumber(row.total_tokens) }}
                     </TableCell>
                     <TableCell class="text-right font-mono text-xs tabular-nums">
                       {{ formatDuration(row.avg_duration_ms) }}
@@ -332,10 +332,10 @@ const statsTotals = computed(() => {
                       {{ row.total_calls.toLocaleString() }}
                     </TableCell>
                     <TableCell class="text-right tabular-nums">
-                      {{ row.total_prompt_tokens.toLocaleString() }}
+                      {{ formatCompactNumber(row.total_prompt_tokens) }}
                     </TableCell>
                     <TableCell class="text-right tabular-nums">
-                      {{ row.total_cached_tokens.toLocaleString() }}
+                      {{ formatCompactNumber(row.total_cached_tokens) }}
                     </TableCell>
                     <TableCell class="text-right font-mono text-xs tabular-nums">
                       <span

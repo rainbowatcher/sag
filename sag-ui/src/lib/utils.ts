@@ -15,6 +15,19 @@ export function formatDuration(ms: number): string {
   return `${hours}h ${mins}m ${seconds}s`
 }
 
+export function formatCompactNumber(n: number): string {
+  if (n < 1_000) return n.toLocaleString()
+  if (n < 1_000_000) return `${fmtCompact(n / 1_000)}K`
+  if (n < 1_000_000_000) return `${fmtCompact(n / 1_000_000)}M`
+  return `${fmtCompact(n / 1_000_000_000)}B`
+}
+
+/** Format to one decimal place, stripping trailing ".0". */
+function fmtCompact(v: number): string {
+  const s = v.toFixed(1)
+  return s.endsWith(".0") ? s.slice(0, -2) : s
+}
+
 /**
  * Map a success rate percentage (0–100) to a colour via OKLCH hue sweep.
  *
