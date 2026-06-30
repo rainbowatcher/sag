@@ -1,8 +1,38 @@
 use std::collections::HashMap;
 
 use reqwest::RequestBuilder;
+use sag_config::ProviderType;
 use sag_core::{StreamChunk, Usage};
 use tokio::sync::mpsc;
+
+/// Return the (name, value) pairs for auth headers that a provider type uses
+/// for chat and models API requests.
+///
+/// - `OpenAI` → `Authorization: Bearer {key}`
+/// - `Anthropic` → `x-api-key: {key}` + `anthropic-version: 2023-06-01`
+pub fn provider_auth_headers(
+    provider_type: ProviderType,
+    api_key: &str,
+) -> Vec<(&'static str, String)> {
+    match provider_type {
+        ProviderType::OpenAI => vec![("Authorization", format!("Bearer {api_key}"))],
+        ProviderType::Anthropic => vec![
+            ("x-api-key", api_key.to_string()),
+            ("anthropic-version", "2023-06-01".to_string()),
+        ],
+    }
+}
+
+/// Return the canonical chat API endpoint path for a provider type.
+///
+/// - `OpenAI`   → `/chat/completions`
+/// - `Anthropic` → `/messages`
+pub fn provider_chat_endpoint(provider_type: ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::OpenAI => "/chat/completions",
+        ProviderType::Anthropic => "/messages",
+    }
+}
 
 /// Apply custom headers to a reqwest request builder.
 /// Custom headers override any previously set headers since they are

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use reqwest::header::CONTENT_TYPE;
 use sag_config::ProviderType;
+use sag_providers::{provider_auth_headers, provider_chat_endpoint};
 use serde_json::json;
 use tracing::{instrument, warn};
 
@@ -49,20 +50,15 @@ pub async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoRespo
     let models_url = build_models_url(&req.base_url, &req.models_endpoint);
     tracing::Span::current().record("url", &models_url);
 
+    let provider_type = req.provider_type.unwrap_or_default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("valid reqwest client with timeout");
-    let mut http_req = client
-        .get(&models_url)
-        .header("Authorization", format!("Bearer {}", api_key));
+    let mut http_req = client.get(&models_url);
 
-    // Anthropic uses x-api-key instead of Bearer
-    if req.provider_type == Some(ProviderType::Anthropic) {
-        http_req = client
-            .get(&models_url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
+    for (name, value) in provider_auth_headers(provider_type, api_key) {
+        http_req = http_req.header(name, value);
     }
 
     for (key, value) in &req.headers {
@@ -169,39 +165,24 @@ async fn test_single_key(
     req: &ModelTestRequest,
     api_key: &str,
 ) -> (bool, String) {
-    let (url, body, auth_header, auth_value): (String, serde_json::Value, &str, String) =
-        if req.provider_type == Some(ProviderType::Anthropic) {
-            (
-                format!("{}/messages", req.base_url.trim_end_matches('/')),
-                serde_json::json!({
-                    "model": req.model,
-                    "messages": [{"role": "user", "content": "say 'hi'"}],
-                    "max_tokens": 1
-                }),
-                "x-api-key",
-                api_key.to_string(),
-            )
-        } else {
-            (
-                format!("{}/chat/completions", req.base_url.trim_end_matches('/')),
-                serde_json::json!({
-                    "model": req.model,
-                    "messages": [{"role": "user", "content": "say 'hi'"}],
-                    "max_tokens": 1
-                }),
-                "Authorization",
-                format!("Bearer {api_key}"),
-            )
-        };
+    let provider_type = req.provider_type.unwrap_or_default();
+    let endpoint = provider_chat_endpoint(provider_type);
+    let url = format!(
+        "{}/{}",
+        req.base_url.trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
 
-    let mut http_req = client
-        .post(&url)
-        .header(auth_header, &auth_value)
-        .header(CONTENT_TYPE, "application/json");
+    let body = serde_json::json!({
+        "model": req.model,
+        "messages": [{"role": "user", "content": "say 'hi'"}],
+        "max_tokens": 1
+    });
 
-    // Anthropic also needs the version header
-    if req.provider_type == Some(ProviderType::Anthropic) {
-        http_req = http_req.header("anthropic-version", "2023-06-01");
+    let mut http_req = client.post(&url).header(CONTENT_TYPE, "application/json");
+
+    for (name, value) in provider_auth_headers(provider_type, api_key) {
+        http_req = http_req.header(name, value);
     }
 
     for (key, value) in &req.headers {
