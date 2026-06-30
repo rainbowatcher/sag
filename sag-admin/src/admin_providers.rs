@@ -213,13 +213,12 @@ pub async fn add_provider(
         pc
     };
 
-    // 2. Build the provider adapter and register it
-    let provider = sag_providers::create_provider(req.name.clone(), &provider_config);
-
-    {
-        let mut providers = state.providers.write().await;
-        providers.insert(req.name.clone(), provider);
-    }
+    // 2. Rebuild the runtime adapter from the updated config.
+    // NOTE: There is a brief window between the config write lock release
+    // above and the registry update here where config and registry are
+    // inconsistent (provider exists in config but not yet in registry).
+    // This is an accepted trade-off to avoid holding both locks simultaneously.
+    state.sync_provider(&req.name).await;
 
     (
         StatusCode::CREATED,
@@ -297,13 +296,10 @@ pub async fn update_provider(
         pc
     };
 
-    // Rebuild the provider adapter and register it
-    let provider = sag_providers::create_provider(req.name.clone(), &provider_config);
-
-    {
-        let mut providers = state.providers.write().await;
-        providers.insert(req.name.clone(), provider);
-    }
+    // Rebuild the runtime adapter from the updated config.
+    // NOTE: Same brief inconsistency window as add_provider — see the
+    // comment there for rationale.
+    state.sync_provider(&req.name).await;
 
     (
         StatusCode::OK,
@@ -385,10 +381,10 @@ pub async fn delete_provider(
     // contention. Any in-flight request that already snapshotted the
     // Arc<dyn LlmProvider> will continue to use it; new lookups will see
     // the absence and surface a clear "provider not found" error.
-    {
-        let mut providers = state.providers.write().await;
-        providers.remove(&provider_name);
-    }
+    // NOTE: Same brief inconsistency window as add_provider — between
+    // config write lock release and registry update, a lookup may see the
+    // provider in config but not yet removed from the registry.
+    state.remove_provider_runtime(&provider_name).await;
 
     (
         StatusCode::OK,

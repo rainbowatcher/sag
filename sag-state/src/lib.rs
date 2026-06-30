@@ -38,6 +38,36 @@ impl AppState {
         let guard = self.providers.read().await;
         guard.get(name).cloned()
     }
+
+    /// Rebuild the runtime adapter for a single provider from its current
+    /// config entry and insert it into the live registry.
+    ///
+    /// The provider must already exist in `config.providers`. If it doesn't,
+    /// this is a no-op (with a warning log).
+    pub async fn sync_provider(&self, name: &str) {
+        let config = self.config.read().await;
+        let Some(pc) = config.providers.get(name) else {
+            tracing::warn!(
+                "sync_provider called for '{}' but not found in config — skipping",
+                name
+            );
+            return;
+        };
+        let provider = sag_providers::create_provider(name.to_string(), pc);
+        drop(config);
+        let mut providers = self.providers.write().await;
+        providers.insert(name.to_string(), provider);
+    }
+
+    /// Remove a provider from the runtime adapter registry.
+    ///
+    /// Call after removing the provider from config; in-flight requests that
+    /// have already snapshotted the `Arc<dyn LlmProvider>` will continue to
+    /// use it, but new lookups will see the absence.
+    pub async fn remove_provider_runtime(&self, name: &str) {
+        let mut providers = self.providers.write().await;
+        providers.remove(name);
+    }
 }
 
 // ── Testing helpers (not #[cfg(test)] so integration tests can reach them) ──
