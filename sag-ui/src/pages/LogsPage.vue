@@ -71,6 +71,11 @@ function formatTs(iso: string): string {
   }
 }
 
+/** Show only the product token of a User-Agent (e.g. `curl/8.0` → `curl`). */
+function shortUserAgent(ua: string): string {
+  return ua.split("/")[0].trim() || ua
+}
+
 /** Tokens/sec over the generation window after TTFT; null when inputs are missing or invalid. */
 function tpsFor(row: CallLog): number | null {
   const usage = row.usage
@@ -171,6 +176,7 @@ function cacheHitRate(row: CallLog): number | null {
             <TableRow>
               <TableHead class="min-w-[130px] text-left xl:min-w-[155px]">Time</TableHead>
               <TableHead class="min-w-[90px] text-left xl:min-w-[110px]">Provider</TableHead>
+              <TableHead class="min-w-[140px] text-left">Client</TableHead>
               <TableHead class="min-w-[100px] text-left xl:min-w-[130px]">Model</TableHead>
               <TableHead class="text-right">Prompt</TableHead>
               <TableHead class="text-right">Completion</TableHead>
@@ -190,6 +196,21 @@ function cacheHitRate(row: CallLog): number | null {
                 {{ formatTs(row.timestamp) }}
               </TableCell>
               <TableCell class="font-medium">{{ row.provider }}</TableCell>
+              <TableCell class="font-mono text-xs">
+                <span
+                  v-if="row.user_agent"
+                  :title="row.user_agent"
+                  class="inline-block max-w-[140px] cursor-default truncate align-bottom"
+                >
+                  {{ shortUserAgent(row.user_agent) }}
+                </span>
+                <span v-if="row.client_ip" class="text-muted-foreground text-[10px]">
+                  {{ row.client_ip }}
+                </span>
+                <span v-if="!row.user_agent && !row.client_ip" class="text-muted-foreground">
+                  —
+                </span>
+              </TableCell>
               <TableCell class="font-mono text-xs">
                 <div>{{ row.model }}</div>
                 <div

@@ -25,6 +25,8 @@ pub async fn resolve_route(
     trace_id: uuid::Uuid,
     start: Instant,
     is_stream: bool,
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
 ) -> Result<ResolvedRoute, Response<Body>> {
     let config_guard = state.config.read().await;
 
@@ -45,6 +47,8 @@ pub async fn resolve_route(
             start,
             StatusCode::NOT_FOUND,
             AppError::ModelNotFound(request.model.clone()),
+            user_agent,
+            client_ip,
         ));
     };
 
@@ -70,6 +74,8 @@ pub async fn resolve_route(
             start,
             StatusCode::BAD_GATEWAY,
             err,
+            user_agent,
+            client_ip,
         ));
     }
 

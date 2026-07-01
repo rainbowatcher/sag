@@ -67,6 +67,8 @@ pub struct DispatchCtx<'a> {
     pub start: Instant,
     pub errors: &'a mut Vec<String>,
     pub strategy: Strategy,
+    pub user_agent: Option<String>,
+    pub client_ip: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -152,6 +154,8 @@ pub(in crate::dispatch) fn success_log(
     reasoning_effort: Option<&str>,
     upstream_duration_ms: Option<u64>,
     ttft_ms: Option<u64>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
 ) -> CallLog {
     let usage = usage.cloned();
     CallLog {
@@ -171,6 +175,8 @@ pub(in crate::dispatch) fn success_log(
         cache_creation_tokens: usage.as_ref().and_then(|u| u.cache_creation_tokens),
         reasoning_tokens: usage.as_ref().and_then(|u| u.reasoning_tokens),
         usage,
+        user_agent,
+        client_ip,
     }
 }
 
@@ -185,6 +191,8 @@ pub(in crate::dispatch) fn failure_log(
     start: Instant,
     status_code: u16,
     err: &AppError,
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
 ) -> CallLog {
     CallLog {
         request_id,
@@ -203,6 +211,8 @@ pub(in crate::dispatch) fn failure_log(
         cached_tokens: None,
         cache_creation_tokens: None,
         reasoning_tokens: None,
+        user_agent: user_agent.map(|s| s.to_string()),
+        client_ip: client_ip.map(|s| s.to_string()),
     }
 }
 
@@ -225,6 +235,8 @@ pub(in crate::dispatch) fn log_per_target_failure(
     is_stream: bool,
     start: Instant,
     errors: &[String],
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
 ) {
     let last_err = errors
         .last()
@@ -239,6 +251,8 @@ pub(in crate::dispatch) fn log_per_target_failure(
         start,
         502,
         &AppError::Internal(last_err),
+        user_agent,
+        client_ip,
     ));
 }
 
@@ -254,6 +268,8 @@ pub(in crate::dispatch) fn failure_response(
     start: Instant,
     status_code: StatusCode,
     err: AppError,
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
 ) -> Response<Body> {
     state.collector.log(failure_log(
         trace_id,
@@ -264,6 +280,8 @@ pub(in crate::dispatch) fn failure_response(
         start,
         status_code.as_u16(),
         &err,
+        user_agent,
+        client_ip,
     ));
     err.into_response()
 }
@@ -276,6 +294,8 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
     trace_id: uuid::Uuid,
     start: Instant,
     errors: &[String],
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
 ) -> Response<Body> {
     let reason = errors.join("; ");
     let err = AppError::AllProvidersExhausted {
@@ -289,7 +309,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         "all providers exhausted"
     );
     state.collector.log(failure_log(
-        trace_id, "", model, "", is_stream, start, 502, &err,
+        trace_id, "", model, "", is_stream, start, 502, &err, user_agent, client_ip,
     ));
     err.into_response()
 }

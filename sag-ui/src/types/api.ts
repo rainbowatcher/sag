@@ -126,6 +126,10 @@ export interface CallLog {
   cached_tokens?: number
   cache_creation_tokens?: number
   reasoning_tokens?: number
+  /** User-Agent header from the client HTTP request. */
+  user_agent?: string
+  /** Client IP from X-Forwarded-For / X-Real-IP headers. */
+  client_ip?: string
 }
 
 /** Time-bucketed trend row returned by `GET /v1/analytics/trend`. */

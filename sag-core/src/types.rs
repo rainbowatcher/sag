@@ -337,4 +337,10 @@ pub struct CallLog {
     /// Tokens consumed by the model's internal reasoning (copied from Usage at log time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    /// User-Agent header value from the client HTTP request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// Client IP extracted from X-Forwarded-For / X-Real-IP headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<String>,
 }

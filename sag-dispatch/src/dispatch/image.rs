@@ -34,6 +34,8 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         start,
         errors,
         strategy,
+        user_agent,
+        client_ip,
     } = ctx;
 
     let img_request = build_image_request(request);
@@ -98,6 +100,8 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 false,
                 start,
                 errors,
+                user_agent.as_deref(),
+                client_ip.as_deref(),
             );
             continue;
         };
@@ -121,11 +125,22 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             None, // reasoning_effort — not applicable for image generation
             None, // upstream_duration_ms — image path timing is out of scope for stage 2
             None, // ttft_ms — image generation is single-shot, conceptually non-streaming
+            user_agent.clone(),
+            client_ip.clone(),
         ));
         return (StatusCode::OK, Json(resp)).into_response();
     }
 
-    fallback_exhausted_response(state, &request.model, false, trace_id, start, errors)
+    fallback_exhausted_response(
+        state,
+        &request.model,
+        false,
+        trace_id,
+        start,
+        errors,
+        user_agent.as_deref(),
+        client_ip.as_deref(),
+    )
 }
 
 /// Build an `ImageGenerationRequest` from a chat completion request,
@@ -304,6 +319,8 @@ mod tests {
             start: Instant::now(),
             errors,
             strategy: sag_config::Strategy::StickyFailover,
+            user_agent: None,
+            client_ip: None,
         }
     }
 

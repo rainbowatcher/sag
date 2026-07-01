@@ -125,9 +125,11 @@ impl LogStore for SqliteLogStore {
                      error, timestamp,
                      reasoning_effort,
                      upstream_duration_ms, ttft_ms,
-                     cached_tokens, cache_creation_tokens, reasoning_tokens)
+                     cached_tokens, cache_creation_tokens, reasoning_tokens,
+                     user_agent, client_ip)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?,
+                        ?, ?)
                 "#,
             )
             .bind(log.request_id.to_string())
@@ -149,6 +151,8 @@ impl LogStore for SqliteLogStore {
             .bind(log.cached_tokens.map(|v| v as i64))
             .bind(log.cache_creation_tokens.map(|v| v as i64))
             .bind(log.reasoning_tokens.map(|v| v as i64))
+            .bind(log.user_agent.as_ref())
+            .bind(log.client_ip.as_ref())
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert call log: {e}")))?;
@@ -238,7 +242,8 @@ impl LogStore for SqliteLogStore {
                 error, timestamp,
                 reasoning_effort,
                 upstream_duration_ms, ttft_ms,
-                cached_tokens, cache_creation_tokens, reasoning_tokens
+                cached_tokens, cache_creation_tokens, reasoning_tokens,
+                user_agent, client_ip
             FROM call_logs
             "#,
         );
@@ -444,6 +449,8 @@ struct LogRow {
     cached_tokens: Option<i64>,
     cache_creation_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
 }
 
 impl LogRow {
@@ -502,6 +509,8 @@ impl LogRow {
             cached_tokens: self.cached_tokens.map(|v| v as u32),
             cache_creation_tokens: self.cache_creation_tokens.map(|v| v as u32),
             reasoning_tokens: self.reasoning_tokens.map(|v| v as u32),
+            user_agent: self.user_agent,
+            client_ip: self.client_ip,
         }
     }
 }
@@ -537,6 +546,8 @@ mod tests {
             cached_tokens: None,
             cache_creation_tokens: None,
             reasoning_tokens: None,
+            user_agent: None,
+            client_ip: None,
         }
     }
 
@@ -696,6 +707,8 @@ mod tests {
             cached_tokens: Some(80),
             cache_creation_tokens: None,
             reasoning_tokens: Some(20),
+            user_agent: Some("curl/8.0.1".into()),
+            client_ip: Some("203.0.113.7".into()),
         };
         store
             .insert_batch(std::slice::from_ref(&log))
@@ -720,6 +733,8 @@ mod tests {
         assert_eq!(fetched.cached_tokens, Some(80));
         assert!(fetched.cache_creation_tokens.is_none());
         assert_eq!(fetched.reasoning_tokens, Some(20));
+        assert_eq!(fetched.user_agent.as_deref(), Some("curl/8.0.1"));
+        assert_eq!(fetched.client_ip.as_deref(), Some("203.0.113.7"));
 
         let u = fetched.usage.as_ref().expect("usage round-trip");
         assert_eq!(u.prompt_tokens, 100);

@@ -31,6 +31,8 @@ pub fn build_streaming_response<S>(
     start: Instant,
     upstream_start: Instant,
     reasoning_effort: Option<String>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -54,6 +56,8 @@ where
         upstream_start: Instant,
         first_byte_at: Option<Instant>,
         reasoning_effort: Option<String>,
+        user_agent: Option<String>,
+        client_ip: Option<String>,
     }
 
     let collector = state.collector.clone();
@@ -71,6 +75,8 @@ where
         upstream_start,
         first_byte_at: None,
         reasoning_effort,
+        user_agent,
+        client_ip,
     };
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -147,6 +153,8 @@ where
                         cache_creation_tokens,
                         reasoning_tokens,
                         usage: Some(state.usage),
+                        user_agent: state.user_agent.clone(),
+                        client_ip: state.client_ip.clone(),
                     });
                     return None;
                 }
@@ -227,6 +235,8 @@ mod tests {
             Instant::now(),
             Instant::now(),
             None,
+            None,
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -270,6 +280,8 @@ mod tests {
             Uuid::new_v4(),
             Instant::now(),
             Instant::now(),
+            None,
+            None,
             None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -322,6 +334,8 @@ mod tests {
             Instant::now(),
             Instant::now(),
             None,
+            None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -348,6 +362,8 @@ mod tests {
             Uuid::new_v4(),
             Instant::now(),
             Instant::now(),
+            None,
+            None,
             None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -384,6 +400,8 @@ mod tests {
             Instant::now(),
             Instant::now(),
             None,
+            None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -411,6 +429,8 @@ mod tests {
             Uuid::new_v4(),
             Instant::now(),
             Instant::now(),
+            None,
+            None,
             None,
         );
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -445,6 +465,8 @@ mod tests {
             Uuid::new_v4(),
             Instant::now(),
             Instant::now(),
+            None,
+            None,
             None,
         );
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -486,6 +508,8 @@ mod tests {
             // completes — guarantees a positive upstream_duration_ms.
             Instant::now() - std::time::Duration::from_millis(50),
             Some("medium".into()),
+            None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -538,6 +562,8 @@ mod tests {
             Uuid::new_v4(),
             Instant::now(),
             Instant::now(),
+            None,
+            None,
             None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();

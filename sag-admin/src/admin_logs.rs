@@ -125,6 +125,8 @@ mod tests {
             cached_tokens: None,
             cache_creation_tokens: None,
             reasoning_tokens: None,
+            user_agent: None,
+            client_ip: None,
         }
     }
 

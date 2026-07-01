@@ -42,6 +42,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         start,
         errors,
         strategy,
+        user_agent,
+        client_ip,
     } = ctx;
 
     // Snapshot the backoff config once so the per-target retry loop doesn't
@@ -131,6 +133,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 is_stream,
                 start,
                 errors,
+                user_agent.as_deref(),
+                client_ip.as_deref(),
             );
             continue;
         };
@@ -155,6 +159,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     start,
                     upstream_start,
                     request.reasoning_effort.clone(),
+                    user_agent.clone(),
+                    client_ip.clone(),
                 );
             }
             ChatAttempt::NonStream(resp, upstream_start) => {
@@ -173,13 +179,24 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     request.reasoning_effort.as_deref(),
                     timing,
                     timing,
+                    user_agent.clone(),
+                    client_ip.clone(),
                 ));
                 return (StatusCode::OK, Json(resp)).into_response();
             }
         }
     }
 
-    fallback_exhausted_response(state, &request.model, is_stream, trace_id, start, errors)
+    fallback_exhausted_response(
+        state,
+        &request.model,
+        is_stream,
+        trace_id,
+        start,
+        errors,
+        user_agent.as_deref(),
+        client_ip.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -374,6 +391,8 @@ mod tests {
             start: Instant::now(),
             errors,
             strategy,
+            user_agent: None,
+            client_ip: None,
         }
     }
 
@@ -755,7 +774,7 @@ mod tests {
 
         // Resolve route (should place "second" first due to sticky active target)
         let (resolved_targets, api_endpoint, strategy) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false)
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
                 .await
                 .unwrap();
 
@@ -774,6 +793,8 @@ mod tests {
             start,
             errors: &mut errors,
             strategy,
+            user_agent: None,
+            client_ip: None,
         };
 
         let resp = dispatch_chat(ctx).await;
@@ -804,7 +825,7 @@ mod tests {
 
         // Resolve route
         let (resolved_targets, api_endpoint, strategy) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false)
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
                 .await
                 .unwrap();
 
@@ -821,6 +842,8 @@ mod tests {
             start,
             errors: &mut errors,
             strategy,
+            user_agent: None,
+            client_ip: None,
         };
 
         let resp = dispatch_chat(ctx).await;

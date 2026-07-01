@@ -12,6 +12,7 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     extract::State,
+    http::HeaderMap,
     middleware,
     response::Response,
     routing::{get, post},
@@ -83,6 +84,7 @@ async fn chat_completions(
     State(state): State<AppState>,
     Extension(trace_id): Extension<uuid::Uuid>,
     Extension(runtime): Extension<DispatchRuntime>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response<Body> {
     let start = Instant::now();
@@ -92,12 +94,39 @@ async fn chat_completions(
     span.record("model", request.model.as_str());
     span.record("stream", is_stream);
 
+    // Client identification (header-based only; reverse proxies set these).
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+
     // Resolve route → ordered targets + api_endpoint + strategy
-    let (targets, api_endpoint, strategy) =
-        match resolve_route(&state, &runtime, &request, trace_id, start, is_stream).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
+    let (targets, api_endpoint, strategy) = match resolve_route(
+        &state,
+        &runtime,
+        &request,
+        trace_id,
+        start,
+        is_stream,
+        user_agent.as_deref(),
+        client_ip.as_deref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
 
     let mut errors = Vec::new();
 
@@ -113,6 +142,8 @@ async fn chat_completions(
             start,
             errors: &mut errors,
             strategy,
+            user_agent,
+            client_ip,
         })
         .await;
     }
@@ -128,6 +159,8 @@ async fn chat_completions(
         start,
         errors: &mut errors,
         strategy,
+        user_agent,
+        client_ip,
     })
     .await
 }
