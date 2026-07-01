@@ -46,3 +46,6 @@ minimumReleaseAgeExclude:
   - axios@1.18.1
   - oxfmt@0.56.0
   - oxlint@1.71.0
+  - '@vue/language-core@3.3.6'
+  - vite@8.1.2
+  - vue-tsc@3.3.6
