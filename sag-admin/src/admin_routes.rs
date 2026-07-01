@@ -10,7 +10,7 @@ use sag_config::{RouteConfig, RouteTarget, Strategy};
 use sag_core::AppError;
 use serde::Serialize;
 use serde_json::json;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use sag_state::AppState;
 
@@ -153,11 +153,7 @@ pub async fn create_route(
 
         config.routes.push(route);
 
-        if let Some(path) = state.config.path()
-            && let Err(e) = sag_config::save_config_to_file(&config, path)
-        {
-            warn!(?e, "failed to persist config after creating route");
-        }
+        state.config.try_persist(&config, "creating route");
     }
 
     (
@@ -238,11 +234,7 @@ pub async fn update_route(
                 .collect();
         }
 
-        if let Some(path) = state.config.path()
-            && let Err(e) = sag_config::save_config_to_file(&config, path)
-        {
-            warn!(?e, "failed to persist config after updating route");
-        }
+        state.config.try_persist(&config, "updating route");
     }
 
     (
@@ -272,11 +264,7 @@ pub async fn delete_route(
                 .into_response();
         }
 
-        if let Some(path) = state.config.path()
-            && let Err(e) = sag_config::save_config_to_file(&config, path)
-        {
-            warn!(?e, "failed to persist config after deleting route");
-        }
+        state.config.try_persist(&config, "deleting route");
     }
 
     (

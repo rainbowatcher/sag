@@ -14,7 +14,7 @@ use axum::{
 use sag_config::{KeyStrategy, ProviderConfig, ProviderType};
 use sag_core::AppError;
 use serde_json::json;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use sag_state::AppState;
 
@@ -203,12 +203,7 @@ pub async fn add_provider(
 
         config.providers.insert(req.name.clone(), pc.clone());
 
-        // Persist to disk while holding the write lock
-        if let Some(path) = state.config.path()
-            && let Err(e) = sag_config::save_config_to_file(&config, path)
-        {
-            warn!(?e, "failed to persist config after adding provider");
-        }
+        state.config.try_persist(&config, "adding provider");
 
         pc
     };
@@ -286,12 +281,7 @@ pub async fn update_provider(
 
         let pc = existing.clone();
 
-        // Persist to disk while holding the write lock
-        if let Some(path) = state.config.path()
-            && let Err(e) = sag_config::save_config_to_file(&config, path)
-        {
-            warn!(?e, "failed to persist config after updating provider");
-        }
+        state.config.try_persist(&config, "updating provider");
 
         pc
     };
@@ -366,12 +356,7 @@ pub async fn delete_provider(
                 .into_response();
         };
 
-        // Persist to disk while we still hold the write lock.
-        if let Some(path) = state.config.path()
-            && let Err(e) = sag_config::save_config_to_file(&config, path)
-        {
-            warn!(?e, "failed to persist config after deleting provider");
-        }
+        state.config.try_persist(&config, "deleting provider");
 
         cascade
     };

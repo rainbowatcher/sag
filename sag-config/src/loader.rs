@@ -51,6 +51,19 @@ impl ConfigHandle {
     pub fn is_file_backed(&self) -> bool {
         self.config_path.is_some()
     }
+
+    /// Persist the in-memory config back to disk if this handle is file-backed.
+    ///
+    /// Logs a warning on failure but never returns an error — persistence is
+    /// best-effort so that an admin API mutation succeeds even if the disk
+    /// write fails (the in-memory config is already updated).
+    pub fn try_persist(&self, config: &GatewayConfig, action: &str) {
+        if let Some(path) = self.path() {
+            if let Err(e) = save_config_to_file(config, path) {
+                warn!(?e, "failed to persist config after {action}");
+            }
+        }
+    }
 }
 
 /// Quickly read `logging.level` and `logging.format` from a TOML file without
