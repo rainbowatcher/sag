@@ -39,22 +39,13 @@ impl AppState {
         guard.get(name).cloned()
     }
 
-    /// Rebuild the runtime adapter for a single provider from its current
-    /// config entry and insert it into the live registry.
+    /// Create or update a provider runtime adapter from the given config and
+    /// insert it into the live registry.
     ///
-    /// The provider must already exist in `config.providers`. If it doesn't,
-    /// this is a no-op (with a warning log).
-    pub async fn sync_provider(&self, name: &str) {
-        let config = self.config.read().await;
-        let Some(pc) = config.providers.get(name) else {
-            tracing::warn!(
-                "sync_provider called for '{}' but not found in config — skipping",
-                name
-            );
-            return;
-        };
-        let provider = sag_providers::create_provider(name.to_string(), pc);
-        drop(config);
+    /// The caller should pass the up-to-date [`ProviderConfig`] that was just
+    /// written to `config.providers`; this avoids an extra config read lock.
+    pub async fn upsert_provider(&self, name: &str, config: &sag_config::ProviderConfig) {
+        let provider = sag_providers::create_provider(name.to_string(), config);
         let mut providers = self.providers.write().await;
         providers.insert(name.to_string(), provider);
     }

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use sag_config::{RouteConfig, RouteTarget, Strategy};
+use sag_config::{GatewayConfig, RouteConfig, RouteTarget, Strategy};
 use sag_core::AppError;
 use serde::Serialize;
 use serde_json::json;
@@ -26,6 +26,19 @@ pub struct RouteTargetInput {
     pub retries: Option<u32>,
     #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl From<RouteTargetInput> for RouteTarget {
+    fn from(t: RouteTargetInput) -> Self {
+        RouteTarget {
+            provider: t.provider,
+            real_model: t.real_model,
+            retries: t.retries,
+            timeout_secs: None,
+            priority: t.priority,
+            extra: t.extra,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -76,6 +89,37 @@ pub struct RouteResponseItem<'a> {
     targets: &'a [RouteTarget],
 }
 
+/// Validate that every target references an existing provider and that the
+/// model (either `real_model` or the route's `model_name` as passthrough)
+/// is present in the provider's `enabled_models` when that list is non-empty.
+fn validate_targets(
+    config: &GatewayConfig,
+    targets: &[RouteTargetInput],
+    route_model_name: &str,
+) -> Result<(), AppError> {
+    for t in targets {
+        let pc = match config.providers.get(&t.provider) {
+            Some(pc) => pc,
+            None => {
+                return Err(AppError::BadRequest(format!(
+                    "provider '{}' not found",
+                    t.provider
+                )));
+            }
+        };
+        if !pc.enabled_models.is_empty() {
+            let model_to_check = t.real_model.as_deref().unwrap_or(route_model_name);
+            if !pc.enabled_models.iter().any(|m| m == model_to_check) {
+                return Err(AppError::BadRequest(format!(
+                    "model '{}' is not in provider '{}' enabled_models: {:?}",
+                    model_to_check, t.provider, pc.enabled_models
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Handlers
 // ═══════════════════════════════════════════════════════════════════
@@ -112,23 +156,8 @@ pub async fn create_route(
                 .into_response();
         }
 
-        for t in &req.targets {
-            if !config.providers.contains_key(&t.provider) {
-                return AppError::BadRequest(format!("provider '{}' not found", t.provider))
-                    .into_response();
-            }
-            // Validate target model against provider's enabled_models
-            let pc = &config.providers[&t.provider];
-            if !pc.enabled_models.is_empty() {
-                let model_to_check = t.real_model.as_deref().unwrap_or(&req.model_name);
-                if !pc.enabled_models.iter().any(|m| m == model_to_check) {
-                    return AppError::BadRequest(format!(
-                        "model '{}' is not in provider '{}' enabled_models: {:?}",
-                        model_to_check, t.provider, pc.enabled_models
-                    ))
-                    .into_response();
-                }
-            }
+        if let Err(e) = validate_targets(&config, &req.targets, &req.model_name) {
+            return e.into_response();
         }
 
         let route = RouteConfig {
@@ -137,18 +166,7 @@ pub async fn create_route(
             retries: req.retries,
             timeout_secs: None,
             strategy: req.strategy.unwrap_or_default(),
-            targets: req
-                .targets
-                .into_iter()
-                .map(|t| RouteTarget {
-                    provider: t.provider,
-                    real_model: t.real_model,
-                    retries: t.retries,
-                    timeout_secs: None,
-                    priority: t.priority,
-                    extra: t.extra,
-                })
-                .collect(),
+            targets: req.targets.into_iter().map(Into::into).collect(),
         };
 
         config.routes.push(route);
@@ -177,23 +195,8 @@ pub async fn update_route(
 
         // Validate targets upfront before any mutable borrow
         if let Some(ref targets) = req.targets {
-            for t in targets {
-                if !config.providers.contains_key(&t.provider) {
-                    return AppError::BadRequest(format!("provider '{}' not found", t.provider))
-                        .into_response();
-                }
-                // Validate target model against provider's enabled_models
-                let pc = &config.providers[&t.provider];
-                if !pc.enabled_models.is_empty() {
-                    let model_to_check = t.real_model.as_deref().unwrap_or(&req.model_name);
-                    if !pc.enabled_models.iter().any(|m| m == model_to_check) {
-                        return AppError::BadRequest(format!(
-                            "model '{}' is not in provider '{}' enabled_models: {:?}",
-                            model_to_check, t.provider, pc.enabled_models
-                        ))
-                        .into_response();
-                    }
-                }
+            if let Err(e) = validate_targets(&config, targets, &req.model_name) {
+                return e.into_response();
             }
         }
 
@@ -221,17 +224,7 @@ pub async fn update_route(
             existing.retries = Some(retries);
         }
         if let Some(targets) = req.targets {
-            existing.targets = targets
-                .into_iter()
-                .map(|t| RouteTarget {
-                    provider: t.provider,
-                    real_model: t.real_model,
-                    retries: t.retries,
-                    timeout_secs: None,
-                    priority: t.priority,
-                    extra: t.extra,
-                })
-                .collect();
+            existing.targets = targets.into_iter().map(Into::into).collect();
         }
 
         state.config.try_persist(&config, "updating route");

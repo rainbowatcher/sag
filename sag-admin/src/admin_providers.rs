@@ -213,7 +213,7 @@ pub async fn add_provider(
     // above and the registry update here where config and registry are
     // inconsistent (provider exists in config but not yet in registry).
     // This is an accepted trade-off to avoid holding both locks simultaneously.
-    state.sync_provider(&req.name).await;
+    state.upsert_provider(&req.name, &provider_config).await;
 
     (
         StatusCode::CREATED,
@@ -289,7 +289,7 @@ pub async fn update_provider(
     // Rebuild the runtime adapter from the updated config.
     // NOTE: Same brief inconsistency window as add_provider — see the
     // comment there for rationale.
-    state.sync_provider(&req.name).await;
+    state.upsert_provider(&req.name, &provider_config).await;
 
     (
         StatusCode::OK,
