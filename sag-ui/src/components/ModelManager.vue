@@ -1,12 +1,18 @@
 <script setup lang="ts">
-import { Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
+import { ChevronDown, ChevronUp, Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { ref, watch } from "vue"
 import Combobox from "@/components/Combobox.vue"
+import KvEditor from "@/components/KvEditor.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+
+interface KvPair {
+  key: string
+  value: string
+}
 
 function modelLabel(item: Record<string, unknown>): string {
   return (item.id ?? item.name ?? item.model ?? Object.values(item)[0]) as string
@@ -21,11 +27,11 @@ export interface ModelTestState {
 const props = withDefaults(
   defineProps<{
     enabledModels: string[]
+    modelOverrides: Record<string, KvPair[]>
     upstreamModels: Record<string, unknown>[]
     upstreamModelsLoading: boolean
     upstreamModelsError: string
     modelsEndpoint?: string
-    /** Per-model test states (optional — only shown when provided) */
     modelTestStates?: Record<string, ModelTestState | undefined>
     disabled?: boolean
   }>(),
@@ -37,6 +43,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   "update:enabledModels": [value: string[]]
+  "update:modelOverrides": [value: Record<string, KvPair[]>]
   "update:modelsEndpoint": [value: string]
   fetchModels: [modelsEndpoint: string]
   testModel: [model: string]
@@ -44,6 +51,7 @@ const emit = defineEmits<{
 
 // ── Internal state ─────────────────────────────────
 const modelsEndpoint = ref(props.modelsEndpoint ?? "models")
+const expandedOverride = ref<string | null>(null)
 
 watch(
   () => props.modelsEndpoint,
@@ -51,6 +59,35 @@ watch(
     modelsEndpoint.value = value ?? "models"
   },
 )
+
+// ── Clean up overrides when model removed ───────────
+watch(
+  () => props.enabledModels,
+  (models) => {
+    const updated = { ...props.modelOverrides }
+    let changed = false
+    for (const model of Object.keys(updated)) {
+      if (!models.includes(model)) {
+        delete updated[model]
+        changed = true
+        if (expandedOverride.value === model) expandedOverride.value = null
+      }
+    }
+    if (changed) emit("update:modelOverrides", updated)
+  },
+)
+
+function toggleOverride(model: string) {
+  expandedOverride.value = expandedOverride.value === model ? null : model
+}
+
+function overrideCount(model: string): number {
+  return props.modelOverrides[model]?.filter((p) => p.key.trim()).length ?? 0
+}
+
+function onOverrideUpdate(model: string, pairs: KvPair[]) {
+  emit("update:modelOverrides", { ...props.modelOverrides, [model]: pairs })
+}
 
 function removeModel(name: string) {
   emit(
@@ -71,63 +108,84 @@ function onModelsEndpointChange(value: string | number) {
       No models listed means all models are allowed (no restriction).
     </p>
 
-    <!-- Model list -->
+    <!-- Model list with integrated override editing -->
     <div v-if="enabledModels.length > 0" class="space-y-1">
-      <Badge
-        v-for="model in enabledModels"
-        :key="model"
-        variant="secondary"
-        class="w-full flex-wrap justify-between gap-1.5 py-0.5 pr-1 pl-2 text-xs font-normal"
-      >
-        <span class="font-mono">{{ model }}</span>
-
-        <div class="flex items-center gap-0.5">
-          <Tooltip v-if="modelTestStates">
-            <TooltipTrigger as-child>
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                :disabled="modelTestStates[model]?.loading"
-                :class="
-                  modelTestStates[model]?.data?.length
-                    ? modelTestStates[model]!.data![0].success
-                      ? 'text-green-500'
-                      : 'text-destructive'
-                    : ''
-                "
-                @click="emit('testModel', model)"
-              >
-                <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
-                <Zap v-else class="h-3 w-3" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" align="end" class="max-w-xs">
-              <template v-if="modelTestStates[model]?.data">
-                <div
-                  v-for="r in modelTestStates[model]!.data"
-                  :key="r.key_prefix"
-                  class="break-words whitespace-normal"
+      <div v-for="model in enabledModels" :key="model" class="rounded-md border">
+        <button
+          type="button"
+          class="hover:bg-muted/50 flex w-full items-center justify-between px-3 py-2 text-left text-sm"
+          @click="toggleOverride(model)"
+        >
+          <span class="font-mono">{{ model }}</span>
+          <div class="flex items-center gap-1">
+            <Tooltip v-if="modelTestStates">
+              <TooltipTrigger as-child>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  :disabled="modelTestStates[model]?.loading"
+                  :class="
+                    modelTestStates[model]?.data?.length
+                      ? modelTestStates[model]!.data![0].success
+                        ? 'text-green-500'
+                        : 'text-destructive'
+                      : ''
+                  "
+                  @click.stop="emit('testModel', model)"
                 >
-                  <span :class="r.success ? 'text-green-300' : 'text-red-300'">{{
-                    r.success ? "✓" : "✗"
-                  }}</span>
-                  {{ r.key_prefix }}: {{ r.message }}
-                </div>
-              </template>
-              <template v-else-if="modelTestStates[model]?.error">
-                <div class="break-words whitespace-normal text-red-300">
-                  {{ modelTestStates[model]!.error }}
-                </div>
-              </template>
-              <template v-else> Click to test </template>
-            </TooltipContent>
-          </Tooltip>
+                  <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
+                  <Zap v-else class="h-3 w-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" align="end" class="max-w-xs">
+                <template v-if="modelTestStates[model]?.data">
+                  <div
+                    v-for="r in modelTestStates[model]!.data"
+                    :key="r.key_prefix"
+                    class="break-words whitespace-normal"
+                  >
+                    <span :class="r.success ? 'text-green-300' : 'text-red-300'">{{
+                      r.success ? "✓" : "✗"
+                    }}</span>
+                    {{ r.key_prefix }}: {{ r.message }}
+                  </div>
+                </template>
+                <template v-else-if="modelTestStates[model]?.error">
+                  <div class="break-words whitespace-normal text-red-300">
+                    {{ modelTestStates[model]!.error }}
+                  </div>
+                </template>
+                <template v-else> Click to test </template>
+              </TooltipContent>
+            </Tooltip>
 
-          <Button variant="ghost" size="icon-sm" class="h-5 w-5" @click="removeModel(model)">
-            <Trash2 class="text-destructive h-3 w-3" />
-          </Button>
+            <Button variant="ghost" size="icon-sm" class="h-5 w-5" @click.stop="removeModel(model)">
+              <Trash2 class="text-destructive h-3 w-3" />
+            </Button>
+
+            <span class="text-muted-foreground flex items-center gap-2">
+              <Badge
+                v-if="overrideCount(model) > 0"
+                variant="secondary"
+                class="px-1 py-0 text-[10px] font-medium"
+              >
+                {{ overrideCount(model) }}
+              </Badge>
+              <ChevronDown v-if="expandedOverride !== model" class="h-3.5 w-3.5" />
+              <ChevronUp v-else class="h-3.5 w-3.5" />
+            </span>
+          </div>
+        </button>
+        <div v-if="expandedOverride === model" class="border-t px-3 py-3">
+          <KvEditor
+            :model-value="modelOverrides[model] ?? []"
+            @update:model-value="(v) => onOverrideUpdate(model, v as KvPair[])"
+            description='Values are parsed as JSON (e.g. 4096, true, "text"). Applied after provider-level overrides.'
+            key-placeholder="max_tokens"
+            value-placeholder="4096"
+          />
         </div>
-      </Badge>
+      </div>
     </div>
 
     <!-- Multi-select model combobox -->
