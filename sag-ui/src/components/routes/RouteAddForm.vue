@@ -10,7 +10,7 @@ import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/componen
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { getErrorMessage } from "@/lib/utils"
+import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, Strategy, CreateRoutePayload, TargetItem } from "@/types/api"
 
@@ -31,7 +31,7 @@ const adding = ref(false)
 const apiError = ref("")
 
 const targets = ref<TargetItem[]>([
-  { provider: "", real_model: "", priority: 0, retries: 0, extra: "" },
+  { id: 1, provider: "", real_model: "", priority: 0, retries: 0, extra: "" },
 ])
 
 const endpointPresets = [
@@ -86,13 +86,13 @@ const form = useForm({
             retries: t.retries || undefined,
           }
           if (t.extra.trim()) {
-            try {
-              entry.extra = JSON.parse(t.extra)
-            } catch {
+            const extraErr = validateExtraJson(t.extra)
+            if (extraErr) {
               throw new Error(
-                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
+                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: ${extraErr}`,
               )
             }
+            entry.extra = JSON.parse(t.extra)
           }
           return entry
         }),
@@ -202,7 +202,6 @@ async function handleSubmit(event: Event) {
           :providers="providers"
           :provider-models="providerModels"
           :provider-models-loading="providerModelsLoading"
-          show-priority-controls
         />
       </form>
     </CardContent>

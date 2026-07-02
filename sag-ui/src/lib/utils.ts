@@ -40,3 +40,21 @@ export function successRateColor(rate: number): string {
   const h = 142 - t * (142 - 25)
   return `oklch(0.52 0.2 ${h.toFixed(1)})`
 }
+
+/**
+ * Validate a JSON string intended for target `extra` fields.
+ * Returns an error message if non-empty but not a valid JSON object, else null.
+ */
+export function validateExtraJson(extra: string): string | null {
+  const trimmed = extra.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return "Expected a JSON object"
+    }
+    return null
+  } catch (e: any) {
+    return e?.message ? `Invalid JSON: ${e.message}` : "Invalid JSON"
+  }
+}

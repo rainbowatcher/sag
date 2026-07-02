@@ -8,6 +8,7 @@ export interface Provider {
   timeout_secs: number
   headers: Record<string, string>
   body_overrides: Record<string, any>
+  model_overrides: Record<string, Record<string, any>>
   enabled_models: string[]
   enabled: boolean
 }
@@ -27,6 +28,7 @@ export interface RouteTarget {
 }
 
 export interface TargetItem {
+  id: number
   provider: string
   real_model: string
   priority: number

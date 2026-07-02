@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { getErrorMessage } from "@/lib/utils"
+import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 import type { RouteConfig, Strategy, TargetItem } from "@/types/api"
@@ -28,8 +28,10 @@ const emit = defineEmits<{
 
 const saving = ref(false)
 const apiError = ref("")
+const submitted = ref(false)
 const targets = ref<TargetItem[]>(
-  props.route.targets.map((t) => ({
+  props.route.targets.map((t, i) => ({
+    id: i + 1,
     provider: t.provider,
     real_model: t.real_model ?? "",
     priority: t.priority,
@@ -67,6 +69,7 @@ const form = useForm({
     onSubmit: formSchema,
   },
   onSubmit: async ({ value }) => {
+    submitted.value = true
     apiError.value = ""
     try {
       if (targets.value.length === 0) {
@@ -98,13 +101,13 @@ const form = useForm({
             retries: t.retries || undefined,
           }
           if (t.extra.trim()) {
-            try {
-              entry.extra = JSON.parse(t.extra)
-            } catch {
+            const extraErr = validateExtraJson(t.extra)
+            if (extraErr) {
               throw new Error(
-                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: invalid JSON in extra field`,
+                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: ${extraErr}`,
               )
             }
+            entry.extra = JSON.parse(t.extra)
           }
           return entry
         }),
@@ -124,8 +127,10 @@ async function handleSubmit(event: Event) {
   event.preventDefault()
   apiError.value = ""
   saving.value = true
+  submitted.value = false
   try {
     await form.handleSubmit()
+    if (!submitted.value) return
     if (apiError.value) return
     onUpdated()
     emit("updated")
@@ -154,7 +159,7 @@ async function handleSubmit(event: Event) {
               >Strategy</FieldLabel
             >
             <ToggleGroup
-              :model-value="field.state.value || form.getFieldValue('strategy')"
+              :model-value="field.state.value ?? form.getFieldValue('strategy')"
               @update:model-value="(v) => field.handleChange(v as Strategy)"
               type="single"
               variant="outline"
@@ -164,6 +169,9 @@ async function handleSubmit(event: Event) {
               <ToggleGroupItem value="fill_first">Fill-first</ToggleGroupItem>
               <ToggleGroupItem value="round_robin">Round-robin</ToggleGroupItem>
             </ToggleGroup>
+            <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
+              {{ field.state.meta.errors[0] }}
+            </p>
           </Field>
         </form.Field>
 
@@ -174,7 +182,7 @@ async function handleSubmit(event: Event) {
                 >API Endpoint</FieldLabel
               >
               <ToggleGroup
-                :model-value="field.state.value || form.getFieldValue('api_endpoint')"
+                :model-value="field.state.value ?? form.getFieldValue('api_endpoint')"
                 @update:model-value="(v) => field.handleChange(v as string)"
                 type="single"
                 variant="outline"
@@ -184,6 +192,9 @@ async function handleSubmit(event: Event) {
                   {{ ep.label }}
                 </ToggleGroupItem>
               </ToggleGroup>
+              <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
+                {{ field.state.meta.errors[0] }}
+              </p>
             </Field>
           </form.Field>
         </div>

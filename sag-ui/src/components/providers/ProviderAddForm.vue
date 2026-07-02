@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2, X } from "@lucide/vue"
+import { ChevronDown, ChevronUp, Loader2, Settings2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { ref, watch } from "vue"
 import { toast } from "vue-sonner"
@@ -66,6 +66,34 @@ function onFetchModels(endpoint: string) {
 const headers = ref<{ key: string; value: string }[]>([])
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
 
+// ── Per-model body overrides ────────────────────────────────
+const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>({})
+const expandedModelOverride = ref<string | null>(null)
+
+// Clean up model overrides when a model is removed from enabledModels
+watch(enabledModels, (newModels) => {
+  for (const model of Object.keys(modelOverridesMap.value)) {
+    if (!newModels.includes(model)) {
+      delete modelOverridesMap.value[model]
+      if (expandedModelOverride.value === model) expandedModelOverride.value = null
+    }
+  }
+})
+
+function toggleModelOverride(model: string) {
+  expandedModelOverride.value = expandedModelOverride.value === model ? null : model
+}
+
+function modelOverrideCount(model: string): number {
+  return modelOverridesMap.value[model]?.filter((p) => p.key.trim()).length ?? 0
+}
+
+function ensureModelOverride(model: string) {
+  if (!modelOverridesMap.value[model]) {
+    modelOverridesMap.value[model] = []
+  }
+}
+
 // ── Base URL defaults per provider type ──────────────────────
 const DEFAULT_BASE_URLS: Record<string, string> = {
   openai: "https://api.openai.com/v1",
@@ -105,6 +133,24 @@ const form = useForm({
         }
       }
 
+      // Parse model_overrides
+      const parsedModelOverrides: Record<string, Record<string, any>> = {}
+      for (const [model, pairs] of Object.entries(modelOverridesMap.value)) {
+        const overrides: Record<string, any> = {}
+        for (const { key, value: val } of pairs) {
+          if (!key.trim()) continue
+          try {
+            overrides[key.trim()] = val.trim() ? JSON.parse(val) : val
+          } catch {
+            apiError.value = `Model override "${model}.${key}": invalid JSON value`
+            throw new Error("invalid model override JSON")
+          }
+        }
+        if (Object.keys(overrides).length > 0) {
+          parsedModelOverrides[model] = overrides
+        }
+      }
+
       // Build headers map
       const parsedHeaders: Record<string, string> = {}
       for (const { key, value: val } of headers.value) {
@@ -124,6 +170,7 @@ const form = useForm({
         timeout_secs: value.timeout_secs,
         headers: parsedHeaders,
         body_overrides: parsedBodyOverrides,
+        model_overrides: parsedModelOverrides,
         enabled_models: enabledModels.value,
         models_endpoint: modelsEndpoint.value.trim() || undefined,
       })
@@ -280,6 +327,64 @@ async function handleSubmit(event: Event) {
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
             />
+
+            <!-- Per-model body overrides -->
+            <div v-if="enabledModels.length > 0">
+              <p class="text-sm font-medium">Per-Model Body Overrides</p>
+              <p class="text-muted-foreground mb-2 text-xs">
+                Override request body fields per model. Applied after provider-level body overrides
+                but before route target extra.
+              </p>
+              <div class="space-y-1">
+                <div v-for="model in enabledModels" :key="model" class="rounded-md border">
+                  <button
+                    type="button"
+                    class="hover:bg-muted/50 flex w-full items-center justify-between px-3 py-2 text-left text-sm"
+                    @click="toggleModelOverride(model)"
+                  >
+                    <span class="font-mono">{{ model }}</span>
+                    <span class="text-muted-foreground flex items-center gap-2">
+                      <span
+                        v-if="modelOverrideCount(model) > 0"
+                        class="bg-primary/10 text-primary rounded px-1.5 py-0.5 text-xs font-medium"
+                      >
+                        {{ modelOverrideCount(model) }} override{{
+                          modelOverrideCount(model) > 1 ? "s" : ""
+                        }}
+                      </span>
+                      <span v-else class="text-xs">—</span>
+                      <ChevronDown v-if="expandedModelOverride !== model" class="h-3.5 w-3.5" />
+                      <ChevronUp v-else class="h-3.5 w-3.5" />
+                    </span>
+                  </button>
+                  <div v-if="expandedModelOverride === model" class="border-t px-3 py-3">
+                    <div v-if="!modelOverridesMap[model]" class="flex justify-center py-1">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        @click="ensureModelOverride(model)"
+                      >
+                        <Settings2 class="h-3.5 w-3.5" />
+                        Add Override
+                      </Button>
+                    </div>
+                    <template v-else>
+                      <KvEditor
+                        :model-value="modelOverridesMap[model]"
+                        @update:model-value="modelOverridesMap[model] = $event"
+                        description='Values are parsed as JSON (e.g. 4096, true, "text"). Applied after provider-level overrides.'
+                        key-placeholder="max_tokens"
+                        value-placeholder="4096"
+                      />
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <p v-else class="text-muted-foreground text-xs">
+              Enable models above to configure per-model overrides.
+            </p>
           </TabsContent>
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->

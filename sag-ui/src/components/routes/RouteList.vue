@@ -303,7 +303,7 @@ const table = useVueTable({
       }
     "
   >
-    <DialogContent class="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+    <DialogContent class="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
       <DialogHeader>
         <DialogTitle>Edit Route</DialogTitle>
         <DialogDescription>
