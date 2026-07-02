@@ -415,6 +415,12 @@ pub fn save_config_to_file(
             &provider.body_overrides,
             &format!("providers.{name}.body_overrides"),
         )?;
+        for (model, overrides) in &provider.model_overrides {
+            check_json_map(
+                overrides,
+                &format!("providers.{name}.model_overrides.{model}"),
+            )?;
+        }
     }
     for (i, route) in config.routes.iter().enumerate() {
         for (j, target) in route.targets.iter().enumerate() {
@@ -572,7 +578,60 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
             toml_edit::Value::from(v.as_str())
         });
     }
-    // body_overrides — inline table; remove the key entirely if empty.
+    // model_overrides — regular table keyed by model name; remove
+    // key entirely if empty.
+    if provider.model_overrides.is_empty() {
+        table.remove("model_overrides");
+    } else {
+        let mo_item = table
+            .entry("model_overrides")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let mo_table = mo_item
+            .as_table_mut()
+            .expect("model_overrides must be a table");
+        // Remove stale model entries.
+        let model_set: std::collections::HashSet<&str> = provider
+            .model_overrides
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let stale: Vec<String> = mo_table
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .filter(|k| !model_set.contains(k.as_str()))
+            .collect();
+        for k in stale {
+            mo_table.remove(k.as_str());
+        }
+        // Create or update each model's overrides as an inline table.
+        for (model, overrides) in &provider.model_overrides {
+            if overrides.is_empty() {
+                mo_table.remove(model);
+            } else {
+                let model_item = mo_table.entry(model).or_insert_with(|| {
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(
+                        toml_edit::InlineTable::new(),
+                    ))
+                });
+                let model_table = match model_item {
+                    toml_edit::Item::Value(v) if v.is_inline_table() => {
+                        v.as_inline_table_mut().unwrap()
+                    }
+                    _ => {
+                        *model_item = toml_edit::Item::Value(toml_edit::Value::InlineTable(
+                            toml_edit::InlineTable::new(),
+                        ));
+                        model_item
+                            .as_value_mut()
+                            .unwrap()
+                            .as_inline_table_mut()
+                            .unwrap()
+                    }
+                };
+                sync_inline_table_in_place(model_table, overrides, json_to_toml_value);
+            }
+        }
+    }
     if provider.body_overrides.is_empty() {
         table.remove("body_overrides");
     } else {
@@ -942,6 +1001,7 @@ base_url = "https://api.anthropic.com"
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
@@ -1105,6 +1165,7 @@ key_strategy = "round_robin"
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
@@ -1258,6 +1319,7 @@ targets = [
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
@@ -1326,6 +1388,7 @@ targets = [
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
@@ -1384,6 +1447,7 @@ targets = [
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
                     enabled_models: vec![],
@@ -1571,6 +1635,7 @@ targets = [
             timeout_secs: 120,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            model_overrides: HashMap::new(),
             role_mappings: HashMap::new(),
             enabled: true,
             enabled_models: vec![],
@@ -2362,6 +2427,122 @@ headers = { X-Trace = "on", X-Request-Id = "abc" }
         assert!(
             !saved.contains("X-Request-Id"),
             "removed header should be gone:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── model_overrides round-trip tests ──
+
+    #[test]
+    fn model_overrides_round_trip() {
+        // Test that model_overrides survive a save→load round-trip.
+        // Build the config programmatically (to avoid TOML parsing
+        // edge cases with nested inline tables under sub-headers),
+        // save it, then reload and compare.
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+        let mut config = openai_only_config();
+        let mut gpt4o = HashMap::new();
+        gpt4o.insert("max_tokens".into(), serde_json::json!(4096));
+        gpt4o.insert("temperature".into(), serde_json::json!(0.8));
+        let mut gpt35 = HashMap::new();
+        gpt35.insert("max_tokens".into(), serde_json::json!(2048));
+        config.providers.get_mut("openai").unwrap().model_overrides = HashMap::from([
+            ("gpt-4o".into(), gpt4o.clone()),
+            ("gpt-3.5-turbo".into(), gpt35.clone()),
+        ]);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let reloaded_mo = &reloaded.providers.get("openai").unwrap().model_overrides;
+        assert_eq!(
+            reloaded_mo,
+            &config.providers.get("openai").unwrap().model_overrides,
+            "model_overrides should survive round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn model_overrides_save_removes_stale_model() {
+        // When a model override entry is removed from the in-memory
+        // config, the save must drop it from the file too.
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[providers.openai.model_overrides]
+gpt-4o = { max_tokens = 4096 }
+gpt-3.5-turbo = { max_tokens = 2048 }
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        // Remove gpt-3.5-turbo from model overrides
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .model_overrides
+            .remove("gpt-3.5-turbo");
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("gpt-4o"),
+            "gpt-4o model override should remain, got:\n{saved}"
+        );
+        assert!(
+            !saved.contains("gpt-3.5-turbo"),
+            "gpt-3.5-turbo model override should be removed, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn model_overrides_save_empty_removes_section() {
+        // When all model_overrides are cleared, the
+        // [providers.X.model_overrides] section should disappear.
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[providers.openai.model_overrides]
+gpt-4o = { max_tokens = 4096 }
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .model_overrides
+            .clear();
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("model_overrides"),
+            "empty model_overrides section should be removed, got:\n{saved}"
         );
 
         let _ = std::fs::remove_file(&path);

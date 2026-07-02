@@ -12,7 +12,7 @@ use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    log_per_target_failure, success_log,
+    log_per_target_failure, merge_model_overrides, success_log,
 };
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
@@ -62,7 +62,8 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         };
 
         let real_model = real_model.clone();
-        let target_extra = target.extra.clone();
+        let target_extra =
+            merge_model_overrides(&config.providers, provider_name, &real_model, &target.extra);
         let retries = target.retries;
         let timeout_secs = target.timeout_secs;
         let img_request = img_request.clone();

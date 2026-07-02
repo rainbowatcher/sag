@@ -37,6 +37,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         timeout_secs: 120,
         headers: std::collections::HashMap::new(),
         body_overrides: std::collections::HashMap::new(),
+        model_overrides: std::collections::HashMap::new(),
         role_mappings: std::collections::HashMap::new(),
         enabled_models: vec![],
         enabled,

@@ -40,6 +40,9 @@ pub struct AddProviderRequest {
     /// Body field overrides merged into the upstream JSON request.
     #[serde(default)]
     pub body_overrides: HashMap<String, serde_json::Value>,
+    /// Per-model body field overrides, keyed by real_model name.
+    #[serde(default)]
+    pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Role mappings: maps request roles to upstream-supported roles.
     #[serde(default)]
     pub role_mappings: HashMap<String, String>,
@@ -61,6 +64,7 @@ pub struct UpdateProviderRequest {
     pub timeout_secs: Option<u64>,
     pub headers: Option<HashMap<String, String>>,
     pub body_overrides: Option<HashMap<String, serde_json::Value>>,
+    pub model_overrides: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
     pub role_mappings: Option<HashMap<String, String>>,
     pub enabled_models: Option<Vec<String>>,
     #[serde(default)]
@@ -85,6 +89,7 @@ pub struct ProviderInfo {
     pub chunk_timeout_secs: Option<u64>,
     pub headers: HashMap<String, String>,
     pub body_overrides: HashMap<String, serde_json::Value>,
+    pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
     pub role_mappings: HashMap<String, String>,
     pub enabled_models: Vec<String>,
     pub enabled: bool,
@@ -134,6 +139,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         chunk_timeout_secs: cfg.chunk_timeout_secs,
         headers: cfg.headers.clone(),
         body_overrides: cfg.body_overrides.clone(),
+        model_overrides: cfg.model_overrides.clone(),
         role_mappings: cfg.role_mappings.clone(),
         enabled_models: cfg.enabled_models.clone(),
         enabled: cfg.enabled,
@@ -194,6 +200,7 @@ pub async fn add_provider(
             timeout_secs: req.timeout_secs,
             headers: req.headers.clone(),
             body_overrides: req.body_overrides.clone(),
+            model_overrides: req.model_overrides.clone(),
             role_mappings: req.role_mappings.clone(),
             enabled_models: req.enabled_models.clone(),
             enabled: true,
@@ -269,6 +276,9 @@ pub async fn update_provider(
         if let Some(v) = req.body_overrides {
             existing.body_overrides = v;
         }
+        if let Some(v) = req.model_overrides {
+            existing.model_overrides = v;
+        }
         if let Some(v) = req.role_mappings {
             existing.role_mappings = v;
         }
@@ -301,6 +311,7 @@ pub async fn update_provider(
             "timeout_secs": provider_config.timeout_secs,
             "headers": provider_config.headers,
             "body_overrides": provider_config.body_overrides,
+            "model_overrides": provider_config.model_overrides,
             "role_mappings": provider_config.role_mappings,
             "enabled_models": provider_config.enabled_models,
         })),
@@ -496,6 +507,7 @@ mod tests {
                     timeout_secs: 120,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled_models: vec![],
                     enabled: true,
@@ -722,6 +734,7 @@ targets = [
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
@@ -740,6 +753,7 @@ targets = [
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
                 enabled: true,
@@ -758,6 +772,7 @@ targets = [
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
                 enabled: true,
@@ -795,6 +810,7 @@ targets = [
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec![],
                 enabled: true,
@@ -813,6 +829,7 @@ targets = [
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
+                model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["other-model".into()],
                 enabled: true,

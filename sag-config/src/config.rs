@@ -492,6 +492,19 @@ pub struct ProviderConfig {
     /// or provider-specific parameters).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub body_overrides: HashMap<String, serde_json::Value>,
+    /// Per-model body field overrides, keyed by `real_model` name.
+    /// Applied after provider-level `body_overrides` but before target-level
+    /// `extra`, so a model-level override can refine or replace a
+    /// provider-level default. Only the override map for the dispatched
+    /// `real_model` is applied — other models' maps are ignored.
+    ///
+    /// TOML example:
+    /// ```toml
+    /// [providers.openai.model_overrides]
+    /// gpt-4o = { max_tokens = 4096, temperature = 0.8 }
+    /// ```
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
     /// Role mapping table: maps request roles to upstream-supported roles.
     /// For example, `{ "developer" = "system" }` converts all developer
     /// messages to system messages. Keys and values are case-sensitive.
@@ -1526,6 +1539,7 @@ api_keys = ["sk-test"]
                     chunk_timeout_secs: None,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled_models: vec![],
                     enabled: true,

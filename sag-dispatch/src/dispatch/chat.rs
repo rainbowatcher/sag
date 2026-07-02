@@ -13,7 +13,7 @@ use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    log_per_target_failure, success_log,
+    log_per_target_failure, merge_model_overrides, success_log,
 };
 
 /// Unified result of a single chat attempt. The `Instant` records when
@@ -73,7 +73,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         // Clone per-target values once so the retry closure can cheaply clone
         // them for each attempt.
         let real_model = real_model.clone();
-        let target_extra = target.extra.clone();
+        let target_extra =
+            merge_model_overrides(&config.providers, provider_name, &real_model, &target.extra);
         let retries = target.retries;
         let timeout_secs = target.timeout_secs;
 

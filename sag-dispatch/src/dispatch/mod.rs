@@ -22,7 +22,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sag_config::Strategy;
+use sag_config::{ProviderConfig, Strategy};
 use sag_core::{AppError, CallLog, ChatCompletionRequest, Usage};
 use tracing::{error, info};
 
@@ -138,8 +138,126 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Model-override helpers — shared across the dispatch submodules.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Merge model-level overrides into target extra.
+///
+/// Provider-level `body_overrides` are already applied inside the
+/// provider adapter (`ProviderBase::build_request`). Model-level
+/// overrides sit between provider-level and target-level — they form
+/// the base, and target-level `extra` is inserted on top so the
+/// route-level config wins.
+pub(in crate::dispatch) fn merge_model_overrides(
+    providers: &HashMap<String, ProviderConfig>,
+    provider_name: &str,
+    real_model: &str,
+    target_extra: &HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let model_ov = providers
+        .get(provider_name)
+        .and_then(|pc| pc.model_overrides.get(real_model))
+        .cloned()
+        .unwrap_or_default();
+    let mut merged = model_ov;
+    for (k, v) in target_extra {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Logging / response helpers — shared across the dispatch submodules.
 // ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sag_config::ProviderConfig;
+
+    fn make_provider(
+        model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: sag_config::ProviderType::OpenAI,
+            api_keys: vec!["sk-test".into()],
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://api.openai.com/v1".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 120,
+            chunk_timeout_secs: None,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            model_overrides,
+            role_mappings: HashMap::new(),
+            enabled_models: vec![],
+            enabled: true,
+            anthropic_cache_control: false,
+        }
+    }
+
+    #[test]
+    fn merge_target_extra_overrides_model_override() {
+        // Model override sets max_tokens=4096; target extra sets
+        // max_tokens=2048 and adds temperature=0.5. The target value
+        // must win for the shared key, and the model-only key must
+        // still be present.
+        let mut mo = HashMap::new();
+        mo.insert("max_tokens".into(), serde_json::json!(4096));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("max_tokens".into(), serde_json::json!(2048));
+        target_extra.insert("temperature".into(), serde_json::json!(0.5));
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+
+        assert_eq!(
+            merged.get("max_tokens").and_then(|v| v.as_i64()),
+            Some(2048),
+            "target extra should override model override for shared key"
+        );
+        assert_eq!(
+            merged.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "target-only key should be present"
+        );
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_no_model_override_returns_target_extra() {
+        // When the provider has no model_overrides for this real_model,
+        // the result should be a clone of target_extra.
+        let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+
+        assert_eq!(merged, target_extra);
+    }
+
+    #[test]
+    fn merge_empty_target_extra_returns_model_overrides() {
+        // When target_extra is empty, the model overrides should pass
+        // through as-is.
+        let mut mo = HashMap::new();
+        mo.insert("max_tokens".into(), serde_json::json!(4096));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo.clone())])),
+        )]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
+
+        assert_eq!(merged, mo);
+    }
+}
 
 /// Build a `CallLog` for a successful response.
 #[allow(clippy::too_many_arguments)]
