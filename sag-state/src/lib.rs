@@ -45,9 +45,15 @@ impl AppState {
     /// The caller should pass the up-to-date [`ProviderConfig`] that was just
     /// written to `config.providers`; this avoids an extra config read lock.
     pub async fn upsert_provider(&self, name: &str, config: &sag_config::ProviderConfig) {
-        let provider = sag_providers::create_provider(name.to_string(), config);
-        let mut providers = self.providers.write().await;
-        providers.insert(name.to_string(), provider);
+        match sag_providers::create_provider(name.to_string(), config) {
+            Ok(provider) => {
+                let mut providers = self.providers.write().await;
+                providers.insert(name.to_string(), provider);
+            }
+            Err(e) => {
+                tracing::error!(provider = name, error = %e, "failed to create provider adapter");
+            }
+        }
     }
 
     /// Remove a provider from the runtime adapter registry.
@@ -98,7 +104,7 @@ pub mod testing {
         for (name, pc) in cfg_read.providers.iter() {
             if !only_enabled || pc.enabled {
                 let provider: Arc<dyn sag_providers::LlmProvider> =
-                    Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+                    Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
                 registry.insert(name.clone(), provider);
             }
         }

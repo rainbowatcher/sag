@@ -318,6 +318,7 @@ pub async fn update_provider(
             "model_overrides": provider_config.model_overrides,
             "role_mappings": provider_config.role_mappings,
             "enabled_models": provider_config.enabled_models,
+            "enabled": provider_config.enabled,
         })),
     )
         .into_response()
@@ -654,7 +655,7 @@ targets = [
         let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
         for (name, pc) in cfg_read.providers.iter() {
             let provider: Arc<dyn sag_providers::LlmProvider> =
-                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+                Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
             registry.insert(name.clone(), provider);
         }
         drop(cfg_read);

@@ -59,9 +59,15 @@ async fn main() -> anyhow::Result<()> {
     let mut providers: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
 
     for (name, provider_config) in &config.providers {
-        let provider = sag_providers::create_provider(name.clone(), provider_config);
-        info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
-        providers.insert(name.clone(), provider);
+        match sag_providers::create_provider(name.clone(), provider_config) {
+            Ok(provider) => {
+                info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
+                providers.insert(name.clone(), provider);
+            }
+            Err(e) => {
+                tracing::error!(name, error = %e, "failed to create provider adapter, skipping");
+            }
+        }
     }
     drop(config);
 

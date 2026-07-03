@@ -40,20 +40,21 @@ pub struct ProviderBase {
 
 impl ProviderBase {
     /// Create a new provider base from configuration.
-    pub fn new(name: String, config: &ProviderConfig) -> Self {
+    pub fn new(name: String, config: &ProviderConfig) -> sag_core::Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .expect("failed to build reqwest client");
 
-        assert!(
-            !config.api_keys.is_empty(),
-            "provider '{}': api_keys is empty",
-            name
-        );
+        if config.api_keys.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "provider '{}': api_keys is empty",
+                name
+            )));
+        }
         let api_keys = config.api_keys.clone();
 
-        Self {
+        Ok(Self {
             name,
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_keys,
@@ -66,7 +67,7 @@ impl ProviderBase {
             anthropic_cache_control: config.anthropic_cache_control,
             chunk_timeout_secs: config.chunk_timeout_secs,
             ttfb_timeout_secs: config.ttfb_timeout_secs,
-        }
+        })
     }
 
     /// Select the current API key based on the configured strategy.
@@ -294,7 +295,7 @@ mod tests {
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
         };
-        ProviderBase::new("test".into(), &config)
+        ProviderBase::new("test".into(), &config).unwrap()
     }
 
     fn msg(role: &str) -> ChatMessage {
@@ -324,7 +325,7 @@ mod tests {
             chunk_timeout_secs: None,
             ttfb_timeout_secs,
         };
-        ProviderBase::new("test".into(), &config)
+        ProviderBase::new("test".into(), &config).unwrap()
     }
 
     #[test]

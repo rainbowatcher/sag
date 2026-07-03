@@ -76,7 +76,7 @@ async fn build_protected_state() -> AppState {
     let cfg_read = handle.read().await;
     for (name, pc) in cfg_read.providers.iter() {
         let provider: Arc<dyn sag_providers::LlmProvider> =
-            Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc));
+            Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);

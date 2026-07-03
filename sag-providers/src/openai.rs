@@ -21,10 +21,10 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     /// Create a new OpenAI provider from configuration.
-    pub fn new(name: String, config: &sag_config::ProviderConfig) -> Self {
-        Self {
-            base: ProviderBase::new(name, config),
-        }
+    pub fn new(name: String, config: &sag_config::ProviderConfig) -> sag_core::Result<Self> {
+        Ok(Self {
+            base: ProviderBase::new(name, config)?,
+        })
     }
 
     fn auth_header(&self) -> (&str, String) {

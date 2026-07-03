@@ -19,11 +19,12 @@ pub use util::*;
 pub fn create_provider(
     name: String,
     config: &sag_config::ProviderConfig,
-) -> std::sync::Arc<dyn LlmProvider> {
-    match config.provider_type {
-        sag_config::ProviderType::OpenAI => std::sync::Arc::new(OpenAiProvider::new(name, config)),
+) -> sag_core::Result<std::sync::Arc<dyn LlmProvider>> {
+    let provider: std::sync::Arc<dyn LlmProvider> = match config.provider_type {
+        sag_config::ProviderType::OpenAI => std::sync::Arc::new(OpenAiProvider::new(name, config)?),
         sag_config::ProviderType::Anthropic => {
-            std::sync::Arc::new(AnthropicProvider::new(name, config))
+            std::sync::Arc::new(AnthropicProvider::new(name, config)?)
         }
-    }
+    };
+    Ok(provider)
 }
