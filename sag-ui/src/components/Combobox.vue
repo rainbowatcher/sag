@@ -132,7 +132,10 @@ function recalcVisible() {
     // Not laid out yet (e.g. inside a collapsed/hidden ancestor). Bail and let
     // the ResizeObserver re-run this once the container gets a real width,
     // otherwise we'd wrongly collapse to a single badge.
-    if (el.clientWidth === 0) return
+    if (el.clientWidth === 0) {
+      visibleCount.value = 0
+      return
+    }
 
     const gap = 4
     // el.children = one badge per selected value (in order) + optional "+N"
@@ -186,7 +189,6 @@ function scheduleRecalc() {
 
 onMounted(() => {
   observer = new ResizeObserver(scheduleRecalc)
-  recalcVisible()
 })
 
 // The badge container sits behind a `v-if`, so it appears/disappears as the
@@ -200,13 +202,13 @@ watch(
     if (prev) observer?.unobserve(prev)
     if (el) {
       observer?.observe(el)
-      nextTick(recalcVisible)
+      scheduleRecalc()
     }
   },
   { immediate: true },
 )
 
-watch(selectedValues, () => nextTick(recalcVisible))
+watch(selectedValues, () => scheduleRecalc())
 
 onUnmounted(() => {
   observer?.disconnect()

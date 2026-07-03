@@ -60,6 +60,10 @@ ui-dev:
 ui-preview:
     cd sag-ui && pnpm -C sag-ui run preview
 
+# 启动 Histoire 组件文档开发服务器
+ui-story:
+    cd sag-ui && pnpm run story:dev
+
 # ── 开发环境 ────────────────────────────────────────────────────────
 
 # 一键启动前后端开发环境 (推荐)
