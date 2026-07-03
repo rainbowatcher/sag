@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Check, ChevronDown, Loader2 } from "@lucide/vue"
-import { computed, ref } from "vue"
+import { computed, ref, watch, nextTick, onMounted, onUnmounted } from "vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -53,6 +53,12 @@ const emit = defineEmits<{
 }>()
 
 const open = ref(false)
+const badgeContainer = ref<HTMLDivElement>()
+const visibleCount = ref(0)
+
+const selectedValues = computed(() => selectedArray())
+
+const overflowCount = computed(() => Math.max(0, selectedValues.value.length - visibleCount.value))
 
 // ── Selected items helpers ───────────────────────────────────────
 function selectedArray(): string[] {
@@ -63,26 +69,20 @@ function selectedArray(): string[] {
 }
 
 function isSelected(value: string): boolean {
-  return selectedArray().includes(value)
+  return selectedValues.value.includes(value)
 }
 
-// ── Trigger display ──────────────────────────────────────────────
+// ── Trigger display (single-select only; multiple mode renders badges) ──
 const triggerLabel = computed(() => {
-  if (props.multiple) {
-    if (selectedArray().length === 0) return null
-    return `${selectedArray().length} selected`
-  }
-  // Single mode
   if (!props.modelValue) return null
   const opt = props.options.find((o) => o.value === props.modelValue)
-  const label = opt?.label ?? opt?.value
-  return label ?? null
+  return opt?.label ?? opt?.value ?? null
 })
 
 // ── Selection handler ────────────────────────────────────────────
 function handleSelect(currentValue: string) {
   if (props.multiple) {
-    const current = selectedArray()
+    const current = selectedValues.value
     if (current.includes(currentValue)) {
       emit(
         "update:modelValue",
@@ -102,12 +102,116 @@ function handleSelect(currentValue: string) {
 // ── Remove a selected item (from badge) ─────────────────────────
 function removeItem(value: string) {
   if (!props.multiple) return
-  const current = selectedArray()
+  const current = selectedValues.value
   emit(
     "update:modelValue",
     current.filter((v) => v !== value),
   )
 }
+
+// ── Overflow detection ────────────────────────────────────────
+// Cache each badge's natural width keyed by value. Measurement must NOT depend
+// on current visibility: v-show hides overflowed badges via `display:none`,
+// whose offsetWidth is 0. Feeding those zeros back into the fit calculation
+// makes `count` reach `all.length`, skips the shrink branch, and leaves
+// `visibleCount` stale — so the visible badges overflow the trigger. The cache
+// lets a currently-hidden badge fall back to its last measured width.
+const badgeWidths = new Map<string, number>()
+
+function recalcVisible() {
+  const el = badgeContainer.value
+  const all = selectedValues.value
+  if (!el || all.length === 0) {
+    visibleCount.value = 0
+    return
+  }
+
+  // Reveal every badge so this pass can measure real widths before shrinking.
+  visibleCount.value = all.length
+  nextTick(() => {
+    // Not laid out yet (e.g. inside a collapsed/hidden ancestor). Bail and let
+    // the ResizeObserver re-run this once the container gets a real width,
+    // otherwise we'd wrongly collapse to a single badge.
+    if (el.clientWidth === 0) return
+
+    const gap = 4
+    // el.children = one badge per selected value (in order) + optional "+N"
+    // chip at the end. Read each badge's width, refreshing the cache when it is
+    // actually visible, and fall back to the cache when it is not.
+    const widths = all.map((value, i) => {
+      const node = el.children[i] as HTMLElement | undefined
+      const w = node?.offsetWidth ?? 0
+      if (w > 0) badgeWidths.set(value, w)
+      return badgeWidths.get(value) ?? w
+    })
+
+    let acc = 0
+    let count = 0
+    for (const w of widths) {
+      const inc = w + (count > 0 ? gap : 0)
+      if (acc + inc > el.clientWidth) break
+      acc += inc
+      count++
+    }
+    // If overflow, reserve room for the "+N" chip.
+    if (count < all.length) {
+      const plusNW = 40
+      while (count > 0 && acc + plusNW > el.clientWidth) {
+        count--
+        acc -= widths[count] + (count > 0 ? gap : 0)
+      }
+      // Allow 0 so that when even one badge + "+N" overshoots the container,
+      // we fall back to showing just the "+N" chip instead of forcing a
+      // clipped badge. Without this floor the container always overflows.
+      count = Math.max(0, count)
+    }
+    visibleCount.value = count
+  })
+}
+
+let observer: ResizeObserver | null = null
+let rafId = 0
+
+// The observer watches the same container whose contents the callback mutates
+// (toggling badge visibility), which can trip the browser's "ResizeObserver
+// loop" warning. Defer the recalc to the next frame so each resize settles
+// before we remeasure, breaking the synchronous feedback loop.
+function scheduleRecalc() {
+  if (rafId) cancelAnimationFrame(rafId)
+  rafId = requestAnimationFrame(() => {
+    rafId = 0
+    recalcVisible()
+  })
+}
+
+onMounted(() => {
+  observer = new ResizeObserver(scheduleRecalc)
+  recalcVisible()
+})
+
+// The badge container sits behind a `v-if`, so it appears/disappears as the
+// selection changes. Attach the observer whenever it shows up (covering the
+// initial-mount case too) and detach when it goes away, so width changes always
+// trigger a recalc — otherwise `visibleCount` goes stale and the badges
+// overflow the trigger button.
+watch(
+  badgeContainer,
+  (el, prev) => {
+    if (prev) observer?.unobserve(prev)
+    if (el) {
+      observer?.observe(el)
+      nextTick(recalcVisible)
+    }
+  },
+  { immediate: true },
+)
+
+watch(selectedValues, () => nextTick(recalcVisible))
+
+onUnmounted(() => {
+  observer?.disconnect()
+  if (rafId) cancelAnimationFrame(rafId)
+})
 </script>
 
 <template>
@@ -118,15 +222,20 @@ function removeItem(value: string) {
         role="combobox"
         :aria-expanded="open"
         :disabled="disabled || loading"
-        class="bg-background hover:bg-background border-input min-h-[2.25rem] w-full justify-between px-3 font-normal outline-offset-0 outline-none focus-visible:outline-[3px]"
+        class="bg-background hover:bg-background border-input min-h-[2.25rem] w-full justify-between overflow-hidden px-3 font-normal outline-offset-0 outline-none focus-visible:outline-[3px]"
       >
         <!-- Multi-select badge display -->
-        <div v-if="multiple && selectedArray().length > 0" class="flex flex-1 flex-wrap gap-1">
+        <div
+          v-if="multiple && selectedValues.length > 0"
+          ref="badgeContainer"
+          class="flex min-w-0 flex-1 flex-nowrap items-center gap-1 overflow-hidden"
+        >
           <Badge
-            v-for="value in selectedArray()"
+            v-for="(value, idx) in selectedValues"
             :key="value"
+            v-show="idx < visibleCount"
             variant="secondary"
-            class="max-w-[150px] overflow-hidden text-ellipsis whitespace-nowrap"
+            class="max-w-[150px] shrink-0 overflow-hidden text-ellipsis whitespace-nowrap"
           >
             {{ options.find((o) => o.value === value)?.label ?? value }}
             <button
@@ -137,6 +246,9 @@ function removeItem(value: string) {
             >
               <span aria-hidden="true">×</span>
             </button>
+          </Badge>
+          <Badge v-if="overflowCount > 0" variant="secondary" class="shrink-0 text-xs">
+            +{{ overflowCount }}
           </Badge>
         </div>
         <!-- Single / placeholder label -->

@@ -243,19 +243,22 @@ async function handleSubmit() {
 
 <template>
   <component :is="Modal.Root" :open="open" @update:open="onOpenChange">
-    <component :is="Modal.Content" class="sm:max-w-2xl">
-      <component :is="Modal.Header">
+    <component :is="Modal.Content" class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
+      <component :is="Modal.Header" class="shrink-0">
         <component :is="Modal.Title">
           {{ provider.name }}
         </component>
         <component :is="Modal.Description"> Edit provider configuration </component>
       </component>
 
-      <div v-if="apiError" class="mx-6 mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
+      <div
+        v-if="apiError"
+        class="mx-6 mb-2 shrink-0 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500"
+      >
         {{ apiError }}
       </div>
 
-      <div class="px-2 pb-4 sm:px-6">
+      <div class="flex-1 overflow-y-auto px-2 pb-4 sm:px-6">
         <Tabs default-value="basic">
           <TabsList class="mb-4">
             <TabsTrigger value="basic">Basic</TabsTrigger>
@@ -352,7 +355,7 @@ async function handleSubmit() {
         </Tabs>
       </div>
 
-      <component :is="Modal.Footer">
+      <component :is="Modal.Footer" class="shrink-0">
         <component :is="Modal.Close" as-child>
           <Button variant="outline" size="sm" :disabled="saving"> Cancel </Button>
         </component>
