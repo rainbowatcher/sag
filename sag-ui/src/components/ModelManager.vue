@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ChevronDown, ChevronUp, Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
-import { ref, watch } from "vue"
+import { computed, ref, watch } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import { Badge } from "@/components/ui/badge"
@@ -50,15 +50,8 @@ const emit = defineEmits<{
 }>()
 
 // ── Internal state ─────────────────────────────────
-const modelsEndpoint = ref(props.modelsEndpoint ?? "models")
+const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
 const expandedOverride = ref<string | null>(null)
-
-watch(
-  () => props.modelsEndpoint,
-  (value) => {
-    modelsEndpoint.value = value ?? "models"
-  },
-)
 
 // ── Clean up overrides when model removed ───────────
 watch(
@@ -97,8 +90,7 @@ function removeModel(name: string) {
 }
 
 function onModelsEndpointChange(value: string | number) {
-  modelsEndpoint.value = String(value)
-  emit("update:modelsEndpoint", modelsEndpoint.value)
+  emit("update:modelsEndpoint", String(value))
 }
 </script>
 
@@ -113,7 +105,7 @@ function onModelsEndpointChange(value: string | number) {
       <div v-for="model in enabledModels" :key="model" class="rounded-md border">
         <button
           type="button"
-          class="hover:bg-muted/50 flex w-full items-center justify-between px-3 py-2 text-left text-sm"
+          class="hover:bg-muted/50 flex w-full items-center justify-between px-3 py-0.5 text-left text-sm"
           @click="toggleOverride(model)"
         >
           <span class="font-mono">{{ model }}</span>
