@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { Loader2, Pen, Plus, RefreshCw, Trash2 } from "@lucide/vue"
+import { Loader2, Pen, Plus, RefreshCw, Search, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
-import { h, onMounted, ref, watch } from "vue"
+import { computed, h, onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
-import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
 import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import { Badge } from "@/components/ui/badge"
@@ -31,13 +30,18 @@ import type { Provider } from "@/types/api"
 const store = useProviderStore()
 
 // ── Filters ───────────────────────────────────────────────────────
-const filterModelName = ref("")
+const searchInput = ref("")
 const filterProviderType = ref("all")
 const sortByName = ref(true)
 
-// Model combobox options — populated from all provider enabled_models
-const modelOptions = ref<ComboboxOption[]>([])
-const modelsLoading = ref(false)
+// Client-side filter: split search by spaces, all keywords must match a model in enabled_models.
+const filteredProviders = computed(() => {
+  if (!searchInput.value.trim()) return store.providers
+  const keywords = searchInput.value.trim().toLowerCase().split(/\s+/)
+  return store.providers.filter((p) =>
+    keywords.every((kw) => p.enabled_models.some((m) => m.toLowerCase().includes(kw))),
+  )
+})
 
 // Add form
 const showAdd = ref(false)
@@ -50,45 +54,38 @@ const confirmingDelete = ref<string | null>(null)
 const deleting = ref(false)
 
 // ── Data fetching ─────────────────────────────────────────────────
-async function loadModelOptions() {
-  modelsLoading.value = true
-  try {
-    await store.fetchAllProviderModels()
-    modelOptions.value = store.allProviderModels.map((m) => ({ value: m, label: m }))
-  } finally {
-    modelsLoading.value = false
-  }
-}
-
 async function fetchProviders() {
   await store.fetchProviders({
-    model_name: filterModelName.value || undefined,
     provider_type: filterProviderType.value === "all" ? undefined : filterProviderType.value,
     sort: sortByName.value ? "name" : undefined,
   })
 }
 
-watch([filterModelName, filterProviderType, sortByName], () => {
+watch([filterProviderType, sortByName], () => {
   fetchProviders()
 })
 
 onMounted(async () => {
-  await loadModelOptions()
   await fetchProviders()
 })
 
 // ── Enable / Disable toggle ───────────────────────────────────────
 async function toggleEnabled(provider: Provider) {
   const newState = !provider.enabled
-  await store.updateProvider(provider.name, { enabled: newState })
-  toast.success(`Provider "${provider.name}" ${newState ? "enabled" : "disabled"}`)
-  await fetchProviders()
+  try {
+    await store.updateProvider(provider.name, { enabled: newState })
+    toast.success(`Provider "${provider.name}" ${newState ? "enabled" : "disabled"}`)
+  } catch (e: any) {
+    const msg = getErrorMessage(e)
+    toast.error(msg)
+  } finally {
+    await fetchProviders()
+  }
 }
 
 // ── Add flow ──────────────────────────────────────────────────────
 async function onCreated() {
   showAdd.value = false
-  await loadModelOptions()
   await fetchProviders()
 }
 
@@ -104,7 +101,6 @@ function onEditClose() {
 
 async function onUpdated() {
   editingProvider.value = null
-  await loadModelOptions()
   await fetchProviders()
 }
 
@@ -119,7 +115,6 @@ async function confirmDelete(name: string) {
     await store.deleteProvider(name)
     toast.success(`Provider "${name}" deleted`)
     confirmingDelete.value = null
-    await loadModelOptions()
     await fetchProviders()
   } catch (e: any) {
     const msg = getErrorMessage(e)
@@ -213,7 +208,7 @@ const columns = [
 
 const table = useVueTable({
   get data() {
-    return store.providers
+    return filteredProviders.value
   },
   columns,
   getCoreRowModel: getCoreRowModel(),
@@ -253,15 +248,18 @@ const table = useVueTable({
       <!-- ── Filters ─────────────────────────────────────────────── -->
       <div class="grid gap-3 md:grid-cols-[1fr_200px_160px] md:items-end">
         <div>
-          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Model</label>
-          <Combobox
-            v-model="filterModelName"
-            :options="modelOptions"
-            :loading="modelsLoading"
-            placeholder="All models"
-            search-placeholder="Search models..."
-            empty-text="No models found"
-          />
+          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Name / Model</label>
+          <div class="relative">
+            <Search
+              class="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2"
+            />
+            <input
+              v-model="searchInput"
+              type="text"
+              placeholder="Search providers..."
+              class="border-input bg-background ring-offset-background placeholder:text-muted-foreground focus-visible:ring-ring flex h-9 w-full rounded-md border px-3 py-2 pl-8 text-sm file:border-0 file:bg-transparent file:text-sm file:font-medium focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            />
+          </div>
         </div>
         <div>
           <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Type</label>
@@ -308,11 +306,11 @@ const table = useVueTable({
 
     <!-- ── Empty ─────────────────────────────────────────────────── -->
     <div
-      v-else-if="store.providers.length === 0"
+      v-else-if="filteredProviders.length === 0"
       class="text-muted-foreground py-12 text-center text-sm"
     >
       {{
-        filterModelName || filterProviderType !== "all"
+        searchInput || filterProviderType !== "all"
           ? "No providers match the current filters."
           : 'No providers configured. Click "Add Provider" to get started.'
       }}
