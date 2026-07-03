@@ -27,7 +27,6 @@ const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
 
 async function refreshLogs() {
-  store.resetLogsPage()
   // The browser <input type="number"> only validates manual key entry —
   // pasted text like "abc" slips through and would yield `Number("abc") →
   // NaN`, which `String(NaN) → "NaN"` would then fail Option<u16>
@@ -42,12 +41,17 @@ async function refreshLogs() {
       status_code = n
     }
   }
-  await store.fetchLogs({
+  await store.applyLogsFilter({
     provider: logsFilterProvider.value || undefined,
     model: logsFilterModel.value || undefined,
     real_model: logsFilterRealModel.value || undefined,
     status_code,
   })
+}
+
+/** Refresh the current page in place without resetting the offset. */
+async function refreshCurrentPage() {
+  await store.fetchLogs()
 }
 
 const logsCurrentPage = computed(() => Math.floor(store.logsOffset / store.logsLimit) + 1)
@@ -59,6 +63,13 @@ function statusVariant(code: number) {
 }
 
 onMounted(() => {
+  // Sync filter inputs from the persisted store state so the UI
+  // reflects the active filter when returning to this page.
+  logsFilterProvider.value = store.activeLogFilter.provider ?? ""
+  logsFilterModel.value = store.activeLogFilter.model ?? ""
+  logsFilterRealModel.value = store.activeLogFilter.real_model ?? ""
+  logsFilterStatusCode.value =
+    store.activeLogFilter.status_code != null ? String(store.activeLogFilter.status_code) : ""
   store.fetchLogs()
 })
 
@@ -143,7 +154,7 @@ function cacheHitRate(row: CallLog): number | null {
           variant="outline"
           class="ml-auto"
           :disabled="store.logsLoading"
-          @click="refreshLogs()"
+          @click="refreshCurrentPage()"
         >
           <RefreshCw :class="store.logsLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
           Refresh

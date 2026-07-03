@@ -50,20 +50,42 @@ export const useAnalyticsStore = defineStore("analytics", () => {
   // This avoids the "last page is exactly full → fake Next button → empty
   // result" footgun that comes from comparing `logs.length >= limit`.
   const hasMoreLogs = ref(false)
+  // Persisted filter state so pagination (nextLogsPage / prevLogsPage)
+  // can reuse the active filter without requiring the component to pass
+  // the filter params on every navigation call.
+  const activeLogFilter = ref<LogFilter>({})
 
   /**
-   * Push the current `logsOffset`/`logsLimit` into the URL when omitted from
-   * the filter, so pagination state survives consecutive fetches. Caller
-   * can override either by passing them explicitly (used by `resetLogsPage`).
+   * Apply a new filter, reset offset to page 0, and fetch. Called by the
+   * component when the user clicks the "Query" button.
+   */
+  async function applyLogsFilter(filter: LogFilter) {
+    activeLogFilter.value = {
+      provider: filter.provider,
+      model: filter.model,
+      real_model: filter.real_model,
+      status_code: filter.status_code,
+    }
+    logsOffset.value = 0
+    await fetchLogs()
+  }
+
+  /**
+   * Fetch the current page of logs. The persisted `activeLogFilter` is
+   * always merged in, and the caller can override specific fields (e.g.
+   * `offset` for pagination). When called with no arguments the offset
+   * falls back to `logsOffset.value`, so a bare `fetchLogs()` reloads the
+   * current page in place — used by the "Refresh" button.
    *
-   * The server caps `limit` at `MAX_LOG_LIMIT = 500`, and we ask for
+   * The server caps `limit` at `MAX_LOG_LIMIT` (501), and we ask for
    * `limit + 1` purely to detect whether another page exists; the
    * sentinel row is trimmed before assigning to `logs`.
    */
-  async function fetchLogs(filter: LogFilter = {}) {
+  async function fetchLogs(overrides: LogFilter = {}) {
     logsLoading.value = true
     logsError.value = null
     try {
+      const filter: LogFilter = { ...activeLogFilter.value, ...overrides }
       const effectiveLimit = filter.limit ?? logsLimit.value
       const params = new URLSearchParams()
       if (filter.provider) params.set("provider", filter.provider)
@@ -93,17 +115,12 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     }
   }
 
-  /** Reset to page 0 (typically called after the user changes a filter). */
-  function resetLogsPage() {
-    logsOffset.value = 0
-  }
-
   /**
    * Page navigation: compute the target offset and pass it explicitly via
-   * `filter.offset` so `fetchLogs` only commits it on success. This avoids
-   * the asymmetric-rollback bug that a naïve `+=` / `-=` of state before
-   * the await would create — the catch path then doesn't need to know
-   * whether the bump was `next` (+limit) or `prev` (-limit).
+   * the `overrides` argument so `fetchLogs` only commits it on success.
+   * This avoids the asymmetric-rollback bug that a naïve `+=` / `-=` of
+   * state before the await would create — the catch path then doesn't
+   * need to know whether the bump was `next` (+limit) or `prev` (-limit).
    */
   async function nextLogsPage() {
     await fetchLogs({ offset: logsOffset.value + logsLimit.value })
@@ -234,8 +251,9 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     logsOffset,
     logsLimit,
     hasMoreLogs,
+    activeLogFilter,
+    applyLogsFilter,
     fetchLogs,
-    resetLogsPage,
     nextLogsPage,
     prevLogsPage,
   }
