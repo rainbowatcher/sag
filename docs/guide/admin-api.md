@@ -35,8 +35,9 @@ Content-Type: application/json
   "key_strategy": "fill_first",
   "base_url": "https://api.openai.com/v1",
   "models_endpoint": "models",
-  "timeout_secs": 120,
+  "timeout_secs": 600,
   "chunk_timeout_secs": null,
+  "ttfb_timeout_secs": null,
   "enabled": true,
   "enabled_models": [],
   "headers": {},
@@ -56,16 +57,15 @@ Content-Type: application/json
 | `key_strategy` | string | 否 | `"fill_first"` | 多密钥选择策略：`"fill_first"` / `"round_robin"` |
 | `base_url` | string | 否 | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
 | `models_endpoint` | string | 否 | `"models"` | 模型列表端点路径，传入 `/v1/models/` 会被规范化为 `v1/models` |
-| `timeout_secs` | integer | 否 | `120` | 上游请求超时（秒） |
+| `timeout_secs` | integer | 否 | `600` | 上游请求超时（秒），仅约束非流式请求 |
 | `chunk_timeout_secs` | integer \| null | 否 | `null` | 流式 chunk 间最大空闲时间（秒），`null` 表示无限等待 |
+| `ttfb_timeout_secs` | integer \| null | 否 | `null`（默认 60） | 流式等待上游响应头（首字节）的最大时间（秒），收到响应头后停止计时 |
 | `enabled` | boolean | 否 | `true` | 是否启用。`false` 时路由跳过且管理面板显示禁用 |
 | `enabled_models` | array | 否 | `[]` | 模型白名单，空 = 全部允许 |
 | `headers` | object | 否 | `{}` | 附加自定义 HTTP 头 |
 | `body_overrides` | object | 否 | `{}` | 合并到上游请求体的字段覆盖 |
 | `role_mappings` | object | 否 | `{}` | 角色映射表，如 `{ "developer": "system" }` |
 | `anthropic_cache_control` | boolean | 否 | `true` | Anthropic 缓存控制注入，仅对 `"anthropic"` 类型有效 |
-
-
 
 ### 更新供应商
 

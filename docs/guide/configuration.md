@@ -74,14 +74,16 @@ provider_type = "openai"
 api_keys = ["${OPENAI_API_KEY}"]
 base_url = "https://api.openai.com/v1"
 models_endpoint = "models"
-timeout_secs = 120
+timeout_secs = 600         # 非流式整体超时安全网
+ttfb_timeout_secs = 60     # 流式：等待首字节（响应头）的超时
+chunk_timeout_secs = 30    # 流式：chunk 间空闲超时
 
 [providers.anthropic]
 provider_type = "anthropic"
 api_keys = ["${ANTHROPIC_API_KEY}"]
 base_url = "https://api.anthropic.com/v1"
 models_endpoint = "models"
-timeout_secs = 120
+timeout_secs = 600
 
 [[routes]]
 model_name = "gpt-4o"
@@ -118,8 +120,9 @@ targets = [
 | `key_strategy` | string | `"fill_first"` | 多密钥选择策略：`"fill_first"`（顺序使用，失败后切换）或 `"round_robin"`（轮询分发） |
 | `base_url` | string | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
 | `models_endpoint` | string | `"models"` | 模型列表端点路径（拼接在 `base_url` 后） |
-| `timeout_secs` | integer | `120` | 上游请求超时（秒） |
+| `timeout_secs` | integer | `600` | 上游请求超时（秒）。流式请求不受此约束，仅作为非流式请求的整体安全网 |
 | `chunk_timeout_secs` | integer (可选) | — | 流式请求中 chunk 间的最大空闲时间（秒），超时则断开连接。省略时无限等待 |
+| `ttfb_timeout_secs` | integer (可选) | `60` | 流式请求等待上游响应头（首字节）的最大时间（秒）。收到响应头后停止计时，不约束 body 流；超时可重试并 fallback。省略时使用默认 60 秒 |
 | `enabled` | boolean | `true` | 是否启用此供应商。`false` 时在路由中跳过并在管理面板中显示为禁用 |
 | `enabled_models` | array | `[]` | 允许使用的模型 ID 列表。非空时仅此列表中的模型可使用此供应商。默认空（允许所有模型） |
 | `headers` | object | `{}` | 附加到上游请求的自定义 HTTP 头，应用于供应商默认头之后，可覆盖认证、Content-Type 等 |
@@ -152,10 +155,11 @@ developer = "system"
 
 ## 重试退避
 
-`[backoff]` 段控制目标重试之间的退避策略，仅在 `retries` ≥ 1 时生效：
+`[backoff]` 段控制每个上游 target 的重试次数与退避策略。注意 `retries` 可在三个层级分别覆盖（见下方[重试次数覆盖层级](#重试次数覆盖层级)）。
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
+| `retries` | `2` | 每个 target 的最大重试次数。`1` 表示只尝试一次（不重试），`2` 表示最多重试一次，以此类推。设置 `>10` 时会输出配置警告 |
 | `base_ms` | `100` | 初始退避延迟（毫秒），对应第 0 次重试前的等待 |
 | `max_ms` | `5000` | 退避上限（毫秒），避免高 `retries` 时等待无界增长 |
 | `jitter` | `true` | 是否对每次延迟应用 full jitter（`delay = random(0, cap)`） |
@@ -163,6 +167,36 @@ developer = "system"
 退避公式：`min(base_ms * 2^attempt, max_ms)`，其中 `attempt` 从 `0` 计数。例如默认配置下：第 1 次重试前等待 `0~100ms`、第 2 次 `0~200ms`、第 3 次 `0~400ms`、...，最大 `5s`。
 
 `jitter = true`（推荐）可以避免大量并发客户端在重试时同时冲击上游（thundering herd）；`jitter = false` 则使用确定性延迟，便于测试与排障。
+
+### 重试次数覆盖层级
+
+`retries` 按三级优先级解析（高到低）：
+
+1. **Target 级** — `[[routes]].targets[].retries`，只影响该 target
+2. **Route 级** — `[[routes]].retries`，影响该路由下所有未单独设置的 target
+3. **全局** — `[backoff].retries`，所有路由和 target 的兜底默认值
+
+```toml
+[backoff]
+retries = 2                        # 全局默认
+
+[[routes]]
+model_name = "claude-sonnet"
+retries = 3                        # 路由级覆盖：该路由下 target 默认重试 3 次
+targets = [
+    { provider = "anthropic", retries = 5 },   # target 级覆盖：仅此 target 重试 5 次
+    { provider = "openai" },                   # 继承路由级 retries = 3
+]
+
+[[routes]]
+model_name = "gpt-4o"
+# 未设置 retries，继承全局 retries = 2
+targets = [
+    { provider = "openai" },
+]
+```
+
+重试仅对**可重试错误**生效（5xx、网络超时、连接错误等）。4xx 类错误（参数错误、鉴权失败、模型不存在等）直接中止，不消耗重试次数。
 
 ## 熔断器
 

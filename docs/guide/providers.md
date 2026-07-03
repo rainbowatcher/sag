@@ -11,8 +11,9 @@
 | `api_keys` | API 密钥列表 |
 | `key_strategy` | 多密钥选择策略（`fill_first` / `round_robin`） |
 | `base_url` | 供应商 API 基础 URL |
-| `timeout_secs` | 上游请求超时（秒），默认 120 |
+| `timeout_secs` | 上游请求超时（秒），默认 600。流式请求不受此约束（见「流式超时」），仅作为非流式请求的整体安全网 |
 | `chunk_timeout_secs` | 流式 chunk 间最大空闲时间（秒），省略则无限等待 |
+| `ttfb_timeout_secs` | 流式请求等待上游响应头（首字节）的最大时间（秒），默认 60。收到响应头后停止计时，不约束后续 body 流 |
 | `enabled` | 是否启用，默认 `true` |
 | `enabled_models` | 模型白名单，空列表 = 全部允许 |
 | `headers` | 附加到上游请求的自定义 HTTP 头 |
@@ -52,11 +53,28 @@ anthropic_cache_control = false   # 关闭缓存控制
 
 ## 流式超时
 
+流式请求（`stream: true`）的超时分为两个独立阶段，互不影响：
+
+### 首字节超时 `ttfb_timeout_secs`
+
+`ttfb_timeout_secs` 控制从发起请求到收到上游**响应头**（time-to-first-byte）的最大等待时间，覆盖建连、TLS 握手与上游首字节延迟。
+
+- 默认 60 秒；省略时使用该默认值
+- 计时在收到响应头的一刻**停止**，此后 body 流式传输不再受任何整体死线约束——因此正常的长对话不会在固定时长（如旧版的 120s）被截断
+- 超时被视为**可重试**错误（HTTP 504 / `TTFB_TIMEOUT`），调度器会 fallback 到下一个 target
+- 仅对流式请求生效
+
+### chunk 空闲超时 `chunk_timeout_secs`
+
 `chunk_timeout_secs` 控制流式响应中两个 SSE chunk 之间的最大空闲时间。当上游长时间无数据时，SAG 会主动断开连接并返回超时错误，而非无限等待。这对防止「挂起」连接占用网关资源非常重要。
 
-- 为 `None` 时（默认）：流式连接无限等待
+- 为 `None` 时（默认）：流式连接在收到响应头后无限等待后续 chunk
 - 为 `Some(n)` 时：超过 `n` 秒无 chunk 则断开
-- 仅对流式请求（`stream: true`）生效；非流式请求使用 `timeout_secs` 控制整个 HTTP round-trip
+- 仅在收到响应头之后生效（与 `ttfb_timeout_secs` 阶段衔接）
+
+### 非流式
+
+非流式请求（`stream: false`）不使用上述两个超时，仍由 `timeout_secs`（默认 600）控制整个 HTTP round-trip。
 
 ## 角色映射
 
