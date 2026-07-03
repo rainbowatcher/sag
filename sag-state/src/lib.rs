@@ -44,14 +44,20 @@ impl AppState {
     ///
     /// The caller should pass the up-to-date [`ProviderConfig`] that was just
     /// written to `config.providers`; this avoids an extra config read lock.
-    pub async fn upsert_provider(&self, name: &str, config: &sag_config::ProviderConfig) {
+    pub async fn upsert_provider(
+        &self,
+        name: &str,
+        config: &sag_config::ProviderConfig,
+    ) -> sag_core::Result<()> {
         match sag_providers::create_provider(name.to_string(), config) {
             Ok(provider) => {
                 let mut providers = self.providers.write().await;
                 providers.insert(name.to_string(), provider);
+                Ok(())
             }
             Err(e) => {
                 tracing::error!(provider = name, error = %e, "failed to create provider adapter");
+                Err(e)
             }
         }
     }

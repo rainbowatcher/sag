@@ -224,7 +224,18 @@ pub async fn add_provider(
     // above and the registry update here where config and registry are
     // inconsistent (provider exists in config but not yet in registry).
     // This is an accepted trade-off to avoid holding both locks simultaneously.
-    state.upsert_provider(&req.name, &provider_config).await;
+    if let Err(e) = state.upsert_provider(&req.name, &provider_config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "code": "PROVIDER_ADAPTER_FAILED",
+                    "message": format!("Provider config saved but adapter creation failed: {}", e),
+                }
+            })),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::CREATED,
@@ -303,7 +314,18 @@ pub async fn update_provider(
     // Rebuild the runtime adapter from the updated config.
     // NOTE: Same brief inconsistency window as add_provider — see the
     // comment there for rationale.
-    state.upsert_provider(&req.name, &provider_config).await;
+    if let Err(e) = state.upsert_provider(&req.name, &provider_config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "code": "PROVIDER_ADAPTER_FAILED",
+                    "message": format!("Provider config saved but adapter creation failed: {}", e),
+                }
+            })),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::OK,
