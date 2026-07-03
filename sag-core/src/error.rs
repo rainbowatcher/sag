@@ -77,6 +77,12 @@ pub enum AppError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
+    /// Upstream did not send response headers within the time-to-first-byte
+    /// budget on a streaming request. Retryable so the dispatcher can fall
+    /// over to the next target.
+    #[error("upstream time-to-first-byte timeout after {secs}s (provider={provider})")]
+    TtfbTimeout { provider: String, secs: u64 },
+
     /// Generic internal error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -147,6 +153,11 @@ impl IntoResponse for AppError {
                 reason.clone(),
             ),
             AppError::Network(e) => (StatusCode::BAD_GATEWAY, "NETWORK_ERROR", e.to_string()),
+            AppError::TtfbTimeout { .. } => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "TTFB_TIMEOUT",
+                self.to_string(),
+            ),
             AppError::Internal(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -297,6 +308,23 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["error"]["code"], "NETWORK_ERROR");
         assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ttfb_timeout_returns_504() {
+        let (status, body) = extract(AppError::TtfbTimeout {
+            provider: "openai".into(),
+            secs: 60,
+        })
+        .await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body["error"]["code"], "TTFB_TIMEOUT");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("time-to-first-byte")
+        );
     }
 
     #[tokio::test]

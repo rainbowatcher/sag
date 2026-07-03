@@ -116,7 +116,7 @@ impl LlmProvider for OpenAiProvider {
         real_model: &str,
         api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
-        timeout_secs: u64,
+        _timeout_secs: u64,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream_request = request.clone();
         self.base
@@ -142,13 +142,7 @@ impl LlmProvider for OpenAiProvider {
         let (auth_name, auth_value) = self.auth_header();
         let response = self
             .base
-            .send_json_stream(
-                &url,
-                body,
-                target_extra,
-                &[(auth_name, &auth_value)],
-                Some(timeout_secs),
-            )
+            .send_json_stream(&url, body, target_extra, &[(auth_name, &auth_value)])
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();

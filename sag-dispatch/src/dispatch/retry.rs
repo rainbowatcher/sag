@@ -155,6 +155,10 @@ mod tests {
         assert!(!is_retryable_error(&AppError::ModelNotFound("m".into())));
         assert!(!is_retryable_error(&AppError::Unauthorized("u".into())));
         assert!(is_retryable_error(&AppError::Internal("i".into())));
+        assert!(is_retryable_error(&AppError::TtfbTimeout {
+            provider: "p".into(),
+            secs: 60,
+        }));
         assert!(is_retryable_error(&AppError::AllProvidersExhausted {
             model: "m".into(),
             reason: "r".into(),

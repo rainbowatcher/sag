@@ -58,10 +58,10 @@ impl ConfigHandle {
     /// best-effort so that an admin API mutation succeeds even if the disk
     /// write fails (the in-memory config is already updated).
     pub fn try_persist(&self, config: &GatewayConfig, action: &str) {
-        if let Some(path) = self.path() {
-            if let Err(e) = save_config_to_file(config, path) {
-                warn!(?e, "failed to persist config after {action}");
-            }
+        if let Some(path) = self.path()
+            && let Err(e) = save_config_to_file(config, path)
+        {
+            warn!(?e, "failed to persist config after {action}");
         }
     }
 }
@@ -1007,6 +1007,7 @@ base_url = "https://api.anthropic.com"
                     enabled_models: vec![],
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
+                    ttfb_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1171,6 +1172,7 @@ key_strategy = "round_robin"
                     enabled_models: vec![],
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
+                    ttfb_timeout_secs: None,
                 },
             )]),
             ..crate::gateway_config_base!()
@@ -1325,6 +1327,7 @@ targets = [
                     enabled_models: vec![],
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
+                    ttfb_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1394,6 +1397,7 @@ targets = [
                     enabled_models: vec![],
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
+                    ttfb_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1453,6 +1457,7 @@ targets = [
                     enabled_models: vec![],
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
+                    ttfb_timeout_secs: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1641,6 +1646,7 @@ targets = [
             enabled_models: vec![],
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
         }
     }
 

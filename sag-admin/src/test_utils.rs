@@ -62,6 +62,7 @@ pub(crate) fn one_provider_config(
             enabled: true,
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
         },
     );
     let routes = routes

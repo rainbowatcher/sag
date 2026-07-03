@@ -31,6 +31,11 @@ pub struct ProviderBase {
     /// Maximum idle time between stream chunks before the connection is
     /// terminated. `None` = wait indefinitely.
     chunk_timeout_secs: Option<u64>,
+    /// Maximum time to wait for the upstream response headers
+    /// (time-to-first-byte) on streaming requests. `None` = use the
+    /// crate default. Only used by the streaming path; once headers
+    /// arrive this no longer applies.
+    ttfb_timeout_secs: Option<u64>,
 }
 
 impl ProviderBase {
@@ -60,6 +65,7 @@ impl ProviderBase {
             role_mappings: config.role_mappings.clone(),
             anthropic_cache_control: config.anthropic_cache_control,
             chunk_timeout_secs: config.chunk_timeout_secs,
+            ttfb_timeout_secs: config.ttfb_timeout_secs,
         }
     }
 
@@ -87,6 +93,13 @@ impl ProviderBase {
     /// Return the configured stream-chunk idle timeout, if any.
     pub fn chunk_timeout_secs(&self) -> Option<u64> {
         self.chunk_timeout_secs
+    }
+
+    /// Return the effective time-to-first-byte timeout for streaming
+    /// requests, falling back to the crate default when unset.
+    pub fn ttfb_timeout_secs(&self) -> u64 {
+        self.ttfb_timeout_secs
+            .unwrap_or_else(sag_config::default_ttfb_timeout_secs)
     }
 
     /// Build a reqwest POST request with default + custom headers and body
@@ -171,21 +184,41 @@ impl ProviderBase {
     /// Combines `build_request` + `send` + `ensure_success`. Used by
     /// `chat_stream()`.
     ///
-    /// `timeout_secs` overrides the client-level timeout for this request
-    /// when `Some`. When `None`, the client-level timeout applies.
+    /// Unlike [`send_json`], streaming does **not** apply a total
+    /// request deadline (that would truncate a healthy long-lived
+    /// stream). Instead, only the time-to-first-byte phase — connecting
+    /// through receipt of the response headers — is bounded by
+    /// [`ProviderBase::ttfb_timeout_secs`]. `reqwest`'s `send()` future
+    /// resolves as soon as the response headers arrive and before the
+    /// body is consumed, so wrapping it in `tokio::time::timeout`
+    /// precisely bounds TTFB without constraining the subsequent body
+    /// stream. Once headers arrive, the body is governed solely by the
+    /// per-chunk idle timeout in `chat_stream()`.
+    ///
+    /// A TTFB timeout maps to a retryable [`AppError::TtfbTimeout`] so the
+    /// dispatcher can fall over to the next target.
     pub async fn send_json_stream(
         &self,
         url: &str,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
         extra_headers: &[(&str, &str)],
-        timeout_secs: Option<u64>,
     ) -> sag_core::Result<reqwest::Response> {
-        let mut request = self.build_request(url, body, target_extra, extra_headers);
-        if let Some(secs) = timeout_secs {
-            request = request.timeout(std::time::Duration::from_secs(secs));
-        }
-        let response = request.send().await.map_err(AppError::from)?;
+        let request = self.build_request(url, body, target_extra, extra_headers);
+        let ttfb = std::time::Duration::from_secs(self.ttfb_timeout_secs());
+        let response = match tokio::time::timeout(ttfb, request.send()).await {
+            Ok(result) => result.map_err(AppError::from)?,
+            Err(_elapsed) => {
+                warn!(
+                    ttfb_timeout_secs = ttfb.as_secs(),
+                    "upstream time-to-first-byte timeout"
+                );
+                return Err(AppError::TtfbTimeout {
+                    provider: self.name.clone(),
+                    secs: ttfb.as_secs(),
+                });
+            }
+        };
         let response = self.ensure_success(response).await?;
         trace!("upstream stream connection established");
         debug!(
@@ -259,6 +292,7 @@ mod tests {
             role_mappings,
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
         };
         ProviderBase::new("test".into(), &config)
     }
@@ -270,6 +304,126 @@ mod tests {
             name: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    fn make_base_with(base_url: String, ttfb_timeout_secs: Option<u64>) -> ProviderBase {
+        let config = ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            provider_type: sag_config::ProviderType::OpenAI,
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url,
+            models_endpoint: "models".into(),
+            timeout_secs: 30,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            model_overrides: HashMap::new(),
+            enabled: true,
+            enabled_models: Vec::new(),
+            role_mappings: HashMap::new(),
+            anthropic_cache_control: true,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs,
+        };
+        ProviderBase::new("test".into(), &config)
+    }
+
+    #[test]
+    fn ttfb_timeout_secs_falls_back_to_default() {
+        let base = make_base_with("https://example.com".into(), None);
+        assert_eq!(base.ttfb_timeout_secs(), 60);
+        let base = make_base_with("https://example.com".into(), Some(5));
+        assert_eq!(base.ttfb_timeout_secs(), 5);
+    }
+
+    /// Spawn a one-shot TCP server. `handler` receives the accepted stream
+    /// after the request bytes are (best-effort) drained, and drives the
+    /// response however the test needs. Returns the bound `http://` base URL.
+    async fn spawn_server<F, Fut>(handler: F) -> String
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Drain the request headers so the client's send side completes.
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            handler(stream).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn send_json_stream_times_out_before_headers() {
+        // Server accepts the connection but never sends response headers.
+        let base_url = spawn_server(|stream| async move {
+            // Hold the connection open well past the TTFB budget.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(stream);
+        })
+        .await;
+
+        let base = make_base_with(base_url.clone(), Some(1));
+        let url = base.build_url("chat/completions");
+        let start = std::time::Instant::now();
+        let result = base
+            .send_json_stream(&url, serde_json::json!({}), &HashMap::new(), &[])
+            .await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(sag_core::AppError::TtfbTimeout { secs, .. }) => assert_eq!(secs, 1),
+            other => panic!("expected TtfbTimeout, got: {other:?}"),
+        }
+        // Fired at ~1s, well before any total-request deadline.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "TTFB timeout fired too late: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_json_stream_does_not_time_out_on_slow_body() {
+        use tokio::io::AsyncWriteExt;
+        // Headers arrive immediately; the body then dribbles out over a
+        // span longer than the TTFB budget. TTFB must not truncate it.
+        let base_url = spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                stream.write_all(b"data: {}\n\n").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            drop(stream);
+        })
+        .await;
+
+        // TTFB budget (1s) is shorter than the total body duration (~1.2s).
+        let base = make_base_with(base_url.clone(), Some(1));
+        let url = base.build_url("chat/completions");
+        let response = base
+            .send_json_stream(&url, serde_json::json!({}), &HashMap::new(), &[])
+            .await
+            .expect("headers arrived within TTFB budget");
+
+        // Fully drain the slow body; the absence of any total deadline means
+        // this completes without a timeout error.
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut total = 0usize;
+        while let Some(chunk) = stream.next().await {
+            total += chunk.expect("body chunk read without timeout").len();
+        }
+        assert!(total > 0, "expected to receive streamed body bytes");
     }
 
     #[test]

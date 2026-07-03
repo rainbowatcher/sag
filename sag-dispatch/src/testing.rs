@@ -43,6 +43,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         enabled,
         anthropic_cache_control: true,
         chunk_timeout_secs: None,
+        ttfb_timeout_secs: None,
     }
 }
 

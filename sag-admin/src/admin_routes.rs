@@ -359,6 +359,7 @@ mod tests {
                 enabled: true,
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
+                ttfb_timeout_secs: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -409,6 +410,7 @@ mod tests {
                 enabled: true,
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
+                ttfb_timeout_secs: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -451,6 +453,7 @@ mod tests {
                 enabled: true,
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
+                ttfb_timeout_secs: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -490,6 +493,7 @@ mod tests {
                 enabled: true,
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
+                ttfb_timeout_secs: None,
             },
         );
         let routes = vec![RouteConfig {

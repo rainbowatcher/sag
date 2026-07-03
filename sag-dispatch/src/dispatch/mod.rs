@@ -186,6 +186,7 @@ mod tests {
             models_endpoint: "models".into(),
             timeout_secs: 120,
             chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
             model_overrides,

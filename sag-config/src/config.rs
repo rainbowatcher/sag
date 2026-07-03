@@ -209,6 +209,13 @@ impl GatewayConfig {
                     "provider '{name}': chunk_timeout_secs must be greater than 0"
                 ));
             }
+            if let Some(tts) = provider.ttfb_timeout_secs
+                && tts == 0
+            {
+                errors.push(format!(
+                    "provider '{name}': ttfb_timeout_secs must be greater than 0"
+                ));
+            }
             if provider.key_strategy == KeyStrategy::RoundRobin && provider.api_keys.len() == 1 {
                 warnings.push(format!(
                     "provider '{name}': RoundRobin strategy with a single API key behaves the same as FillFirst"
@@ -481,6 +488,17 @@ pub struct ProviderConfig {
     /// entire HTTP round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_timeout_secs: Option<u64>,
+    /// Maximum time in seconds to wait for the upstream response headers
+    /// (time-to-first-byte) on **streaming** requests. The clock starts
+    /// when the request begins connecting and stops as soon as the
+    /// response headers arrive; it does **not** constrain the subsequent
+    /// body stream (that is governed by `chunk_timeout_secs`). A TTFB
+    /// timeout is treated as a retryable failure so the dispatcher can
+    /// fall over to the next target. When `None`, the default
+    /// [`default_ttfb_timeout_secs`] applies. Non-streaming requests
+    /// ignore this and use `timeout_secs` for the entire round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_timeout_secs: Option<u64>,
     /// Custom headers to add to or override in upstream requests.
     /// These are applied after the provider's default headers,
     /// so they can override auth, content-type, etc.
@@ -547,7 +565,16 @@ pub fn default_retries() -> u32 {
     2
 }
 pub fn default_timeout_secs() -> u64 {
-    120
+    600
+}
+
+/// Default time-to-first-byte timeout for streaming requests (seconds).
+///
+/// Covers connection establishment plus the wait for the upstream
+/// response headers. Once headers arrive, this budget no longer applies
+/// and the body stream is governed by `chunk_timeout_secs`.
+pub fn default_ttfb_timeout_secs() -> u64 {
+    60
 }
 
 /// Exponential-backoff settings for retry delays between attempts.
@@ -832,7 +859,7 @@ targets = [
         assert_eq!(openai.api_keys, vec!["sk-test"]);
         assert_eq!(openai.base_url, "https://api.openai.com/v1");
         assert_eq!(openai.models_endpoint, "models");
-        assert_eq!(openai.timeout_secs, 120);
+        assert_eq!(openai.timeout_secs, 600);
         assert_eq!(config.backoff.retries, 2);
 
         assert_eq!(config.routes.len(), 1);
@@ -969,6 +996,51 @@ retries = 5
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.backoff.retries, 2);
+    }
+
+    #[test]
+    fn validate_rejects_zero_ttfb_timeout_secs() {
+        let toml_str = r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+ttfb_timeout_secs = 0
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o" },
+]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("ttfb_timeout_secs must be greater than 0")),
+            "expected ttfb_timeout_secs error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ttfb_timeout_secs_parses_and_defaults() {
+        let toml_str = r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+ttfb_timeout_secs = 45
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai", real_model = "gpt-4o" }]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.providers.get("openai").unwrap().ttfb_timeout_secs,
+            Some(45)
+        );
+        // Omitted at the provider layer resolves to this crate default.
+        assert_eq!(default_ttfb_timeout_secs(), 60);
     }
 
     #[test]
@@ -1537,6 +1609,7 @@ api_keys = ["sk-test"]
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
                     chunk_timeout_secs: None,
+                    ttfb_timeout_secs: None,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     model_overrides: HashMap::new(),
