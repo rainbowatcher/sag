@@ -1,8 +1,14 @@
 <script setup lang="ts">
-import { ChevronDown, ChevronUp, Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
+import { Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import KvEditor from "@/components/KvEditor.vue"
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
@@ -51,7 +57,7 @@ const emit = defineEmits<{
 
 // ── Internal state ─────────────────────────────────
 const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
-const expandedOverride = ref<string | null>(null)
+const expandedOverride = ref<string | undefined>(undefined)
 
 // ── Clean up overrides when model removed ───────────
 watch(
@@ -63,16 +69,12 @@ watch(
       if (!models.includes(model)) {
         delete updated[model]
         changed = true
-        if (expandedOverride.value === model) expandedOverride.value = null
+        if (expandedOverride.value === model) expandedOverride.value = undefined
       }
     }
     if (changed) emit("update:modelOverrides", updated)
   },
 )
-
-function toggleOverride(model: string) {
-  expandedOverride.value = expandedOverride.value === model ? null : model
-}
 
 function overrideCount(model: string): number {
   return props.modelOverrides[model]?.filter((p) => p.key.trim()).length ?? 0
@@ -101,15 +103,28 @@ function onModelsEndpointChange(value: string | number) {
     </p>
 
     <!-- Model list with integrated override editing -->
-    <div v-if="enabledModels.length > 0" class="space-y-1">
-      <div v-for="model in enabledModels" :key="model" class="rounded-md border">
-        <button
-          type="button"
-          class="hover:bg-muted/50 flex w-full items-center justify-between px-3 py-0.5 text-left text-sm"
-          @click="toggleOverride(model)"
-        >
-          <span class="font-mono">{{ model }}</span>
-          <div class="flex items-center gap-1">
+    <Accordion
+      v-if="enabledModels.length > 0"
+      type="single"
+      collapsible
+      v-model="expandedOverride"
+      class="rounded-md border"
+    >
+      <AccordionItem v-for="model in enabledModels" :key="model" :value="model">
+        <div class="hover:bg-muted/50 flex items-center [&>:first-child]:flex-1">
+          <AccordionTrigger class="px-3 py-0.5 hover:no-underline">
+            <span class="flex items-center gap-2">
+              <span class="font-mono text-sm">{{ model }}</span>
+              <Badge
+                v-if="overrideCount(model) > 0"
+                variant="secondary"
+                class="px-1 py-0 text-[10px] font-medium"
+              >
+                {{ overrideCount(model) }}
+              </Badge>
+            </span>
+          </AccordionTrigger>
+          <div class="flex items-center gap-1 pr-3">
             <Tooltip v-if="modelTestStates">
               <TooltipTrigger as-child>
                 <Button
@@ -123,7 +138,7 @@ function onModelsEndpointChange(value: string | number) {
                         : 'text-destructive'
                       : ''
                   "
-                  @click.stop="emit('testModel', model)"
+                  @click="emit('testModel', model)"
                 >
                   <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
                   <Zap v-else class="h-3 w-3" />
@@ -151,24 +166,12 @@ function onModelsEndpointChange(value: string | number) {
               </TooltipContent>
             </Tooltip>
 
-            <Button variant="ghost" size="icon-sm" class="h-5 w-5" @click.stop="removeModel(model)">
+            <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
               <Trash2 class="text-destructive h-3 w-3" />
             </Button>
-
-            <span class="text-muted-foreground flex items-center gap-2">
-              <Badge
-                v-if="overrideCount(model) > 0"
-                variant="secondary"
-                class="px-1 py-0 text-[10px] font-medium"
-              >
-                {{ overrideCount(model) }}
-              </Badge>
-              <ChevronDown v-if="expandedOverride !== model" class="h-3.5 w-3.5" />
-              <ChevronUp v-else class="h-3.5 w-3.5" />
-            </span>
           </div>
-        </button>
-        <div v-if="expandedOverride === model" class="border-t px-3 py-3">
+        </div>
+        <AccordionContent class="border-t px-3 py-3">
           <KvEditor
             :model-value="modelOverrides[model] ?? []"
             @update:model-value="(v) => onOverrideUpdate(model, v as KvPair[])"
@@ -176,9 +179,9 @@ function onModelsEndpointChange(value: string | number) {
             key-placeholder="max_tokens"
             value-placeholder="4096"
           />
-        </div>
-      </div>
-    </div>
+        </AccordionContent>
+      </AccordionItem>
+    </Accordion>
 
     <!-- Multi-select model combobox -->
     <div class="min-w-0">
