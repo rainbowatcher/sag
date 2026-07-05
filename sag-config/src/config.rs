@@ -139,6 +139,12 @@ impl GatewayConfig {
         if self.server.port == 0 {
             errors.push("server.port must be greater than 0".into());
         }
+        let server_addr = format!("{}:{}", self.server.host, self.server.port);
+        if server_addr.parse::<std::net::SocketAddr>().is_err() {
+            errors.push(format!(
+                "server address '{server_addr}' is not a valid socket address (must be IP:port)"
+            ));
+        }
 
         // ── Analytics validation ──
         if let Some(ref analytics) = self.analytics
@@ -150,12 +156,33 @@ impl GatewayConfig {
                 .push("analytics.storage_dsn must start with 'sqlite://' or be ':memory:'".into());
         }
 
+        // ── Gateway auth validation ──
+        if let Some(ref auth) = self.gateway_auth
+            && auth.api_keys.is_empty()
+        {
+            errors.push(
+                "gateway_auth.api_keys must not be empty when authentication is configured".into(),
+            );
+        }
+
         // ── Providers validation ──
         let provider_names: HashSet<&str> = self.providers.keys().map(String::as_str).collect();
 
         if self.providers.is_empty() {
             errors.push("at least one provider is required".into());
         }
+
+        // ── Circuit breaker validation ──
+        if self.circuit_breaker.quota_exhausted_secs == 0 {
+            errors.push("circuit_breaker.quota_exhausted_secs must be greater than 0".into());
+        }
+        if self.circuit_breaker.rate_limited_secs == 0 {
+            errors.push("circuit_breaker.rate_limited_secs must be greater than 0".into());
+        }
+        if self.circuit_breaker.generic_secs == 0 {
+            errors.push("circuit_breaker.generic_secs must be greater than 0".into());
+        }
+
         if self.backoff.retries > 10 {
             warnings.push(format!(
                 "global retries={} seems unusually high",
@@ -178,11 +205,21 @@ impl GatewayConfig {
             if provider.api_keys.is_empty() {
                 errors.push(format!("provider '{name}': api_keys must not be empty"));
             }
-            if !provider.base_url.contains("://") {
-                errors.push(format!(
-                    "provider '{name}': base_url '{}' is not a valid URL (missing scheme)",
-                    provider.base_url
-                ));
+            match url::Url::parse(&provider.base_url) {
+                Ok(url) => {
+                    if url.scheme() != "http" && url.scheme() != "https" {
+                        errors.push(format!(
+                            "provider '{name}': base_url '{}' has unsupported scheme '{}', expected 'http' or 'https'",
+                            provider.base_url, url.scheme()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "provider '{name}': base_url '{}' is not a valid URL: {e}",
+                        provider.base_url
+                    ));
+                }
             }
             if provider.models_endpoint.contains("://")
                 || provider.models_endpoint.contains('?')
@@ -224,6 +261,13 @@ impl GatewayConfig {
         }
 
         // ── Routes validation ──
+        if self.routes.is_empty() {
+            warnings.push(
+                "no routes configured; the gateway will not handle any /v1/chat/completions requests"
+                    .into(),
+            );
+        }
+
         let mut seen_model_names: HashSet<&str> = HashSet::new();
         let mut wildcard_index: Option<usize> = None;
 
@@ -299,6 +343,20 @@ impl GatewayConfig {
                 }
             }
 
+            // ── Route target availability ──
+            let has_enabled_target = route.targets.iter().any(|t| {
+                self.providers
+                    .get(&t.provider)
+                    .map(|p| p.enabled)
+                    .unwrap_or(false)
+            });
+            if !has_enabled_target && !route.targets.is_empty() {
+                warnings.push(format!(
+                    "routes[{i}] (model='{}'): no enabled targets — all referenced providers are disabled",
+                    route.model_name
+                ));
+            }
+
             // ── Composite (provider, real_model) uniqueness per route ──
             // The save path uses `(provider, real_model)` as the
             // composite key for `sync_inline_table_array_in_place`
@@ -334,6 +392,12 @@ impl GatewayConfig {
             warnings.push(format!(
                 "routes[{idx}] (model='*'): wildcard route should be the last route",
             ));
+            for after_idx in (idx + 1)..self.routes.len() {
+                warnings.push(format!(
+                    "routes[{after_idx}] (model='{}'): unreachable because wildcard route at index {idx} precedes it",
+                    self.routes[after_idx].model_name
+                ));
+            }
         }
 
         // Log warnings
@@ -1578,6 +1642,131 @@ api_keys = ["sk-test"]
                 config.validate().is_ok(),
                 "distinct real_models with the same provider must validate"
             );
+        }
+
+        #[test]
+        fn rejects_invalid_server_address() {
+            let mut config = valid_config();
+            config.server.host = "not-an-ip".into();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("not a valid socket address")),
+                "expected socket address error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_empty_gateway_auth_keys() {
+            let mut config = valid_config();
+            config.gateway_auth = Some(GatewayAuthConfig { api_keys: vec![] });
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("gateway_auth.api_keys must not be empty")),
+                "expected gateway_auth error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_no_gateway_auth() {
+            let mut config = valid_config();
+            config.gateway_auth = None;
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn accepts_empty_routes_as_warning() {
+            let mut config = valid_config();
+            config.routes.clear();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn accepts_disabled_targets_as_warning() {
+            let mut config = valid_config();
+            config.providers.get_mut("openai").unwrap().enabled = false;
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_invalid_base_url_scheme() {
+            let mut config = valid_config();
+            config.providers.get_mut("openai").unwrap().base_url = "ftp://api.openai.com/v1".into();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("unsupported scheme")),
+                "expected unsupported scheme error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_zero_circuit_breaker_quota() {
+            let mut config = valid_config();
+            config.circuit_breaker.quota_exhausted_secs = 0;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("quota_exhausted_secs must be greater than 0")),
+                "expected quota_exhausted_secs error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_zero_circuit_breaker_rate() {
+            let mut config = valid_config();
+            config.circuit_breaker.rate_limited_secs = 0;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("rate_limited_secs must be greater than 0")),
+                "expected rate_limited_secs error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_zero_circuit_breaker_generic() {
+            let mut config = valid_config();
+            config.circuit_breaker.generic_secs = 0;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("generic_secs must be greater than 0")),
+                "expected generic_secs error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_wildcard_not_last_as_warning() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai" },
+]
+
+[[routes]]
+model_name = "*"
+targets = [
+    { provider = "openai" },
+]
+
+[[routes]]
+model_name = "claude"
+targets = [
+    { provider = "openai" },
+]
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok());
         }
     }
 

@@ -69,6 +69,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Ensure at least one enabled provider adapter is available
+    let enabled_count = config.providers.values().filter(|p| p.enabled).count();
+    if providers.is_empty() && enabled_count > 0 {
+        return Err(anyhow::anyhow!(
+            "no provider adapters could be initialized; check provider configuration and credentials"
+        ));
+    }
     drop(config);
 
     let provider_registry = Arc::new(RwLock::new(providers));
@@ -93,7 +101,13 @@ async fn main() -> anyhow::Result<()> {
     let config = config_handle.read().await;
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
         .parse()
-        .expect("invalid server address");
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "invalid server address '{}:{}': {e}",
+                config.server.host,
+                config.server.port
+            )
+        })?;
 
     info!(%addr, "gateway listening");
     drop(config);

@@ -13,3 +13,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
 sag-core = { path = "../sag-core" }
+url = "2"
