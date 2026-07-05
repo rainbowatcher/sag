@@ -126,7 +126,8 @@ targets = [
 | `enabled` | boolean | `true` | 是否启用此供应商。`false` 时在路由中跳过并在管理面板中显示为禁用 |
 | `enabled_models` | array | `[]` | 允许使用的模型 ID 列表。非空时仅此列表中的模型可使用此供应商。默认空（允许所有模型） |
 | `headers` | object | `{}` | 附加到上游请求的自定义 HTTP 头，应用于供应商默认头之后，可覆盖认证、Content-Type 等 |
-| `body_overrides` | object | `{}` | 合并到上游请求体顶层的字段覆盖（如 `max_tokens`、`temperature`），优先级低于目标级别的 `extra` |
+| `body_overrides` | object | `{}` | 合并到上游请求体顶层的字段覆盖（如 `max_tokens`、`temperature`），对该供应商的**所有模型**生效。优先级低于 `model_overrides` 和目标级别的 `extra` |
+| `model_overrides` | object | `{}` | 逐模型的 body 字段覆盖，以 `real_model` 名称为 key。仅对匹配的模型生效，优先级高于 `body_overrides`，低于目标级别的 `extra`。用于避免在多个路由 target 中重复配置同一 `(provider, real_model)` 的参数 |
 | `role_mappings` | object | `{}` | 角色映射表：将请求中的角色名映射为上游支持的角色。例如 `{ "developer" = "system" }` 将 developer 消息转为 system 消息。大小写敏感 |
 | `anthropic_cache_control` | boolean | `true` | 是否对 Anthropic 请求注入 `cache_control: {\"type\": \"ephemeral\"}` 断点。仅对 `provider_type = "anthropic"` 有效，可显著降低重复前缀请求的成本 |
 
@@ -141,9 +142,19 @@ X-Debug = "true"
 #### body_overrides 示例
 
 ```toml
+# 对该供应商的所有请求都生效
 [providers.openai.body_overrides]
 max_tokens = 4096
 temperature = 0.8
+```
+
+#### model_overrides 示例
+
+```toml
+# 仅对指定 real_model 生效，避免在多个路由中重复配置 extra
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7, max_tokens = 4096 }
+gpt-4o-mini = { max_tokens = 2048 }
 ```
 
 #### role_mappings 示例
@@ -152,6 +163,59 @@ temperature = 0.8
 [providers.openai.role_mappings]
 developer = "system"
 ```
+
+## Body Override 优先级详解
+
+SAG 提供三层 body override 机制，按以下优先级从低到高排列：
+
+```
+客户端原始请求体
+    ↓ 被覆盖
+Provider body_overrides（全局，所有模型）
+    ↓ 被覆盖
+Provider model_overrides[real_model]（该模型专属）
+    ↓ 被覆盖
+RouteTarget extra（该路由目标最高优先级）
+```
+
+### 设计原则
+
+| 层级 | 配置位置 | 何时使用 |
+|------|---------|---------|
+| `body_overrides` | `[providers.<name>]` | 设置供应商级别的**全局默认值**，影响该供应商的所有模型 |
+| `model_overrides` | `[providers.<name>.model_overrides]` | 设置**模型专属参数**，避免在多个路由 target 中重复配置 `extra` |
+| `extra` | `[[routes]].targets[]` | **路由级微调**，仅在特定路由目标需要与 `model_overrides` 不同的参数时使用 |
+
+### 示例
+
+```toml
+[providers.openai]
+api_keys = ["${OPENAI_API_KEY}"]
+
+# 全局默认：所有 openai 请求 max_tokens=4096
+[providers.openai.body_overrides]
+max_tokens = 4096
+
+# 模型专属：gpt-4o 额外设置 temperature=0.7
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    # 最终参数：max_tokens=4096 + temperature=0.7
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+]
+
+[[routes]]
+model_name = "gpt-4o-creative"
+targets = [
+    # 最终参数：max_tokens=4096 + temperature=0.9（extra 覆盖 model_overrides）
+    { provider = "openai", real_model = "gpt-4o", priority = 10, extra = { temperature = 0.9 } },
+]
+```
+
+> **最佳实践**：优先使用 `model_overrides` 配置模型专属参数，只在需要路由级差异时才使用 `extra`。参见[路由 → Body Override 优先级与最佳实践](/guide/routing#body-override-优先级与最佳实践)。
 
 ## 重试退避
 

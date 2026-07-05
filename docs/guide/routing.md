@@ -60,7 +60,7 @@ priority = 10
 | `priority` | integer | 优先级，默认 `0`。**值越大优先级越高**，优先尝试 |
 | `retries` | integer (可选) | 此目标的重试次数，覆盖路由级别及全局的 `retries`。省略则回退到路由级别，再回退到全局默认值 |
 | `timeout_secs` | integer (可选) | 此目标的超时时间（秒），覆盖路由级别及 provider 的 `timeout_secs`。省略时三级回落：目标级 → 路由级 → provider `timeout_secs` |
-| `extra` | object (可选) | 针对该目标的额外 JSON 字段，合并到上游请求体中。**应用时机晚于供应商级别的 `body_overrides`**，因此目标级别的 key 具有更高优先级 |
+| `extra` | object (可选) | 针对该目标的额外 JSON 字段，合并到上游请求体中。**应用时机晚于 `body_overrides` 和 `model_overrides`**，因此目标级别的 key 具有最高优先级 |
 
 ### `api_endpoint` 说明
 
@@ -424,44 +424,178 @@ provider = "openai"
 priority = 10
 ```
 
-## `extra` 字段详解
+## Body Override 优先级与最佳实践
 
-`RouteTarget.extra` 允许为每个目标指定额外的 JSON 字段，这些字段会合并到发送给上游供应商的请求体中。
+SAG 提供了三层 body override 机制，让你在不同粒度上控制发送给上游供应商的请求参数。理解它们的优先级和适用场景，可以避免重复配置并写出更清晰的配置。
 
-**合并顺序**（后者覆盖前者）：
+### 三层 Override 机制
 
-1. 客户端原始请求体
-2. 供应商级别的 `body_overrides`
-3. 目标级别的 `extra`（**最高优先级**）
+| 层级 | 配置位置 | 作用范围 | 典型用途 |
+|------|---------|---------|---------|
+| **Provider 全局覆盖** | `ProviderConfig.body_overrides` | 该供应商的**所有**请求 | 设置供应商级别的默认参数（如全局 `max_tokens`） |
+| **Provider 模型覆盖** | `ProviderConfig.model_overrides.<real_model>` | 该供应商的**特定模型** | 设置某个模型在该供应商上的专属参数 |
+| **Route Target 覆盖** | `RouteTarget.extra` | **单个路由目标** | 路由级别的微调，或供应商特有的非标准参数 |
 
-### 使用场景
+### 合并优先级（从低到高）
 
-#### 固定模型参数
+当请求到达时，SAG 按以下顺序逐层合并字段，**后写入的覆盖先写入的**：
 
-某些供应商对同一模型有不同的参数要求：
-
-```toml
-[[routes]]
-model_name = "my-model"
-
-[[routes.targets]]
-provider = "openai"
-real_model = "gpt-4o"
-priority = 100
-extra = { temperature = 0.7, max_tokens = 4096 }
-
-[[routes.targets]]
-provider = "anthropic"
-real_model = "claude-sonnet-4-20250514"
-priority = 50
-extra = { max_tokens = 8192, thinking = { type = "enabled", budget_tokens = 1600 } }
+```
+客户端原始请求体
+    ↓ 被覆盖
+Provider body_overrides（全局，所有模型）
+    ↓ 被覆盖
+Provider model_overrides[real_model]（该模型专属）
+    ↓ 被覆盖
+RouteTarget extra（该路由目标最高优先级）
 ```
 
-#### 供应商特定的非标准参数
+> **示例**：假设 provider 的 `body_overrides` 设置了 `max_tokens = 2048`，同一 provider 的 `model_overrides.gpt-4o` 设置了 `max_tokens = 4096`，而路由 target 的 `extra` 又设置了 `max_tokens = 8192`。最终发送给上游的请求体中，`max_tokens` 的值为 **8192**。
+
+### 最佳实践
+
+#### 1. 优先使用 `model_overrides` 避免重复
+
+如果同一个 `(provider, real_model)` 在多个路由中需要相同的参数，**不要**在每个 target 的 `extra` 中重复配置，而是使用 `model_overrides`：
 
 ```toml
-[[routes.targets]]
-provider = "openai"
-real_model = "deepseek-chat"
-extra = { model_id = 39 }
+# ✅ 推荐：在 provider 级别配置模型专属参数，所有路由自动生效
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7, max_tokens = 4096 }
+
+gpt-4o-turbo = { temperature = 0.9 }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+]
+
+[[routes]]
+model_name = "creative-gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+    # 两个路由都使用 gpt-4o，但 model_overrides 中的配置自动生效，无需重复
+]
+```
+
+#### 2. 用 `body_overrides` 设置供应商全局默认值
+
+```toml
+# ✅ 推荐：该供应商所有请求都带上这些默认参数
+[providers.openai.body_overrides]
+max_tokens = 4096
+
+# 特定模型可以在此基础上微调
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }      # 最终 max_tokens=4096 + temperature=0.7
+gpt-4o-mini = { max_tokens = 2048 }  # 覆盖全局 max_tokens，最终 max_tokens=2048
+```
+
+#### 3. 只在 `extra` 中配置路由级差异
+
+`extra` 应作为「例外」而非「默认」——仅在某个路由目标需要与 `model_overrides` 不同的参数时才使用：
+
+```toml
+# ✅ 推荐：大部分配置在 model_overrides 中，extra 只处理差异
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+]
+
+[[routes]]
+model_name = "gpt-4o-creative"
+# 同一个模型，但在这个路由中需要不同的 temperature
+targets = [
+    { provider = "openai", real_model = "gpt-4o", priority = 10, extra = { temperature = 0.9 } },
+]
+```
+
+#### 4. 供应商特定参数用 `extra` 或 `model_overrides`
+
+某些供应商支持非标准参数（如 Anthropic 的 `thinking`）：
+
+```toml
+# ✅ 推荐：在 model_overrides 中配置供应商专属参数
+[providers.anthropic.model_overrides]
+claude-sonnet-4 = { thinking = { type = "enabled", budget_tokens = 1600 } }
+
+# 或仅在需要的路由中用 extra
+[[routes]]
+model_name = "claude-sonnet"
+targets = [
+    { provider = "anthropic", real_model = "claude-sonnet-4", priority = 10 },
+]
+
+[[routes]]
+model_name = "claude-sonnet-reasoning"
+targets = [
+    { provider = "anthropic", real_model = "claude-sonnet-4", priority = 10, extra = { thinking = { type = "enabled", budget_tokens = 3200 } } },
+]
+```
+
+### 常见反模式
+
+```toml
+# ❌ 反模式：在多个路由 target 中重复相同的 extra
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", extra = { temperature = 0.7 } },
+]
+
+[[routes]]
+model_name = "gpt-4o-fast"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", extra = { temperature = 0.7 } },
+]
+
+# ✅ 修正：提取到 model_overrides
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }
+```
+
+```toml
+# ❌ 反模式：用 body_overrides 设置模型专属参数
+[providers.openai.body_overrides]
+temperature = 0.7      # 这会应用到 openai 的所有模型！
+
+# ✅ 修正：模型专属参数用 model_overrides
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }
+```
+
+### 完整的 Override 示例
+
+```toml
+[providers.openai]
+api_keys = ["${OPENAI_API_KEY}"]
+base_url = "https://api.openai.com/v1"
+
+# 全局默认：所有 openai 请求都带 max_tokens=4096
+[providers.openai.body_overrides]
+max_tokens = 4096
+
+# 模型专属：gpt-4o 用 temperature=0.7；gpt-4o-mini 降低 token 上限
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }
+gpt-4o-mini = { max_tokens = 2048 }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    # 最终参数：max_tokens=4096 (body_overrides) + temperature=0.7 (model_overrides)
+    { provider = "openai", real_model = "gpt-4o", priority = 10 },
+]
+
+[[routes]]
+model_name = "gpt-4o-creative"
+targets = [
+    # 最终参数：max_tokens=4096 + temperature=0.9 (extra 覆盖 model_overrides)
+    { provider = "openai", real_model = "gpt-4o", priority = 10, extra = { temperature = 0.9 } },
+]
 ```

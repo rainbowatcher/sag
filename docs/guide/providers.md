@@ -17,7 +17,8 @@
 | `enabled` | 是否启用，默认 `true` |
 | `enabled_models` | 模型白名单，空列表 = 全部允许 |
 | `headers` | 附加到上游请求的自定义 HTTP 头 |
-| `body_overrides` | 合并到上游请求体的字段覆盖 |
+| `body_overrides` | 合并到上游请求体的字段覆盖，对该供应商**所有模型**生效。优先级低于 `model_overrides` 和路由 target 的 `extra` |
+| `model_overrides` | 逐模型 body 字段覆盖，以 `real_model` 为 key。优先级高于 `body_overrides`，低于路由 target 的 `extra`。推荐用于避免在多个路由中重复配置同一模型的参数 |
 | `role_mappings` | 角色名映射表（如 `{ "developer" = "system" }`） |
 
 ## 内置供应商
@@ -50,6 +51,36 @@
 provider_type = "anthropic"
 anthropic_cache_control = false   # 关闭缓存控制
 ```
+
+## Body Override
+
+SAG 提供三层 body override 机制，让你在不同粒度上控制上游请求参数。优先级从低到高：
+
+1. **`body_overrides`** — 供应商全局默认值，影响该供应商的所有模型
+2. **`model_overrides.<real_model>`** — 模型专属覆盖，仅对匹配的 `real_model` 生效
+3. **`RouteTarget.extra`** — 路由目标级覆盖，最高优先级
+
+### body_overrides vs model_overrides
+
+| 特性 | `body_overrides` | `model_overrides` |
+|------|------------------|-------------------|
+| 作用范围 | 供应商的所有模型 | 指定的 `real_model` |
+| 典型用途 | 全局默认参数（如统一 `max_tokens`） | 避免在多个路由中重复配置同一模型的参数 |
+| 优先级 | 低（可被 `model_overrides` 和 `extra` 覆盖） | 中（覆盖 `body_overrides`，可被 `extra` 覆盖） |
+| TOML 格式 | 扁平 key-value | 两级 map，以模型名为 key |
+
+```toml
+# body_overrides：所有 openai 请求都带 max_tokens=4096
+[providers.openai.body_overrides]
+max_tokens = 4096
+
+# model_overrides：仅对指定模型生效
+[providers.openai.model_overrides]
+gpt-4o = { temperature = 0.7 }
+gpt-4o-mini = { max_tokens = 2048 }  # 覆盖全局的 max_tokens
+```
+
+> **最佳实践**：优先使用 `model_overrides` 配置模型专属参数，将 `extra` 保留给路由级差异。详见[配置 → Body Override 优先级详解](/guide/configuration#body-override-优先级详解)。
 
 ## 流式超时
 
