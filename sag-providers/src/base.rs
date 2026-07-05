@@ -328,6 +328,34 @@ mod tests {
         ProviderBase::new("test".into(), &config).unwrap()
     }
 
+    fn make_base_with_body_overrides(
+        body_overrides: HashMap<String, serde_json::Value>,
+    ) -> ProviderBase {
+        let config = ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            provider_type: sag_config::ProviderType::OpenAI,
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://example.com".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 30,
+            headers: HashMap::new(),
+            body_overrides,
+            model_overrides: HashMap::new(),
+            enabled: true,
+            enabled_models: Vec::new(),
+            role_mappings: HashMap::new(),
+            anthropic_cache_control: true,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+        };
+        ProviderBase::new("test".into(), &config).unwrap()
+    }
+
+    fn extract_json_body(req: reqwest::Request) -> serde_json::Value {
+        let body_bytes = req.body().unwrap().as_bytes().unwrap();
+        serde_json::from_slice(body_bytes).unwrap()
+    }
+
     #[test]
     fn ttfb_timeout_secs_falls_back_to_default() {
         let base = make_base_with("https://example.com".into(), None);
@@ -425,6 +453,233 @@ mod tests {
             total += chunk.expect("body chunk read without timeout").len();
         }
         assert!(total > 0, "expected to receive streamed body bytes");
+    }
+
+    #[test]
+    fn target_extra_overrides_body_override_for_shared_key() {
+        // body_overrides sets temperature=0.5;
+        // target_extra (already merged model_override + target.extra) sets temperature=0.7.
+        // The target_extra value must win.
+        let mut body_overrides = HashMap::new();
+        body_overrides.insert("temperature".into(), serde_json::json!(0.5));
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+
+        let base = make_base_with_body_overrides(body_overrides);
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
+                &target_extra,
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "target_extra should override body_overrides for shared key"
+        );
+        assert_eq!(
+            body.get("model").unwrap(),
+            "gpt-4o",
+            "client key should be preserved"
+        );
+    }
+
+    #[test]
+    fn body_override_alone_overrides_client_key() {
+        // Only body_overrides is set; it should override the client-provided value.
+        let mut body_overrides = HashMap::new();
+        body_overrides.insert("temperature".into(), serde_json::json!(0.5));
+
+        let base = make_base_with_body_overrides(body_overrides);
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
+                &HashMap::new(),
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "body_overrides alone should override client key"
+        );
+        assert_eq!(body.get("model").unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn target_extra_alone_overrides_client_key() {
+        // Only target_extra is set (simulating merged model_overrides + target.extra);
+        // it should override the client-provided value.
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+
+        let base = make_base_with_body_overrides(HashMap::new());
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
+                &target_extra,
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "target_extra alone should override client key"
+        );
+        assert_eq!(body.get("model").unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn three_tier_same_key_body_override_then_model_override_then_target_extra() {
+        // Simulates the full three-tier chain end-to-end:
+        //   client body: { temperature: 1.0 }
+        //   → body_overrides: { temperature: 0.5 }         (tier 1)
+        //   → merged target_extra:
+        //       model_override: { temperature: 0.6 }       (tier 2)
+        //       target.extra:   { temperature: 0.7 }       (tier 3)
+        //       merged result:  { temperature: 0.7 }
+        //   → final body: { temperature: 0.7 }
+        let mut body_overrides = HashMap::new();
+        body_overrides.insert("temperature".into(), serde_json::json!(0.5));
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+
+        let base = make_base_with_body_overrides(body_overrides);
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
+                &target_extra,
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "in three-tier chain, target.extra (via merged target_extra) should win"
+        );
+    }
+
+    #[test]
+    fn distinct_keys_across_tiers_accumulate() {
+        // body_overrides has max_tokens; target_extra (merged) has temperature and top_p.
+        // All keys should be present in the final body.
+        let mut body_overrides = HashMap::new();
+        body_overrides.insert("max_tokens".into(), serde_json::json!(4096));
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+        target_extra.insert("top_p".into(), serde_json::json!(0.9));
+
+        let base = make_base_with_body_overrides(body_overrides);
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o" }),
+                &target_extra,
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(
+            body.get("max_tokens").and_then(|v| v.as_i64()),
+            Some(4096),
+            "body_overrides-only key should be present"
+        );
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "target_extra-only key should be present"
+        );
+        assert_eq!(
+            body.get("top_p").and_then(|v| v.as_f64()),
+            Some(0.9),
+            "target_extra-only key should be present"
+        );
+        assert_eq!(
+            body.get("model").unwrap(),
+            "gpt-4o",
+            "client key should be preserved"
+        );
+    }
+
+    #[test]
+    fn nested_object_replaced_wholly_by_target_extra() {
+        // body_overrides sets thinking = { type: "enabled" };
+        // target_extra sets thinking = { budget_tokens: 1600 }.
+        // The target_extra nested object replaces the body_overrides one entirely.
+        let mut body_overrides = HashMap::new();
+        body_overrides.insert("thinking".into(), serde_json::json!({ "type": "enabled" }));
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert(
+            "thinking".into(),
+            serde_json::json!({ "budget_tokens": 1600 }),
+        );
+
+        let base = make_base_with_body_overrides(body_overrides);
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o" }),
+                &target_extra,
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        let thinking = body.get("thinking").unwrap();
+        assert_eq!(
+            thinking.get("budget_tokens").and_then(|v| v.as_i64()),
+            Some(1600),
+            "target-extra nested object should win"
+        );
+        assert!(
+            thinking.get("type").is_none(),
+            "nested object should be replaced wholly, not deep-merged"
+        );
+    }
+
+    #[test]
+    fn empty_overrides_short_circuits() {
+        // Both body_overrides and target_extra are empty.
+        // The original body should pass through unchanged.
+        let base = make_base_with_body_overrides(HashMap::new());
+        let original = serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 });
+
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                original.clone(),
+                &HashMap::new(),
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(body, original, "empty overrides should not mutate the body");
     }
 
     #[test]

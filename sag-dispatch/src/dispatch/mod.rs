@@ -258,6 +258,77 @@ mod tests {
 
         assert_eq!(merged, mo);
     }
+
+    #[test]
+    fn merge_nested_object_replaced_wholly() {
+        // Model override sets thinking = { type: "enabled" };
+        // target extra sets thinking = { budget_tokens: 1600 }.
+        // The target value must replace the model value entirely
+        // (shallow merge, not deep merge).
+        let mut mo = HashMap::new();
+        mo.insert("thinking".into(), serde_json::json!({ "type": "enabled" }));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert(
+            "thinking".into(),
+            serde_json::json!({ "budget_tokens": 1600 }),
+        );
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+
+        let thinking = merged.get("thinking").unwrap();
+        assert_eq!(
+            thinking.get("budget_tokens").and_then(|v| v.as_i64()),
+            Some(1600),
+            "target-extra nested object should win"
+        );
+        assert!(
+            thinking.get("type").is_none(),
+            "nested object should be replaced wholly, not deep-merged"
+        );
+    }
+
+    #[test]
+    fn merge_distinct_keys_accumulate() {
+        // Model override has key A, target extra has key B.
+        // Result should contain both keys.
+        let mut mo = HashMap::new();
+        mo.insert("max_tokens".into(), serde_json::json!(4096));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+
+        assert_eq!(
+            merged.get("max_tokens").and_then(|v| v.as_i64()),
+            Some(4096),
+            "model-only key should be present"
+        );
+        assert_eq!(
+            merged.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "target-only key should be present"
+        );
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_both_empty_returns_empty() {
+        // When both model_overrides and target_extra are empty,
+        // the result should be an empty map.
+        let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
+        assert!(merged.is_empty());
+    }
 }
 
 /// Build a `CallLog` for a successful response.
