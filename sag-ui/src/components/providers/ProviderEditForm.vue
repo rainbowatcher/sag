@@ -6,6 +6,7 @@ import { toast } from "vue-sonner"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import ModelManager from "@/components/ModelManager.vue"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -343,6 +344,16 @@ async function handleSubmit() {
             />
 
             <Separator />
+
+            <Alert class="border-amber-200 bg-amber-50">
+              <AlertTitle class="text-amber-900">提示</AlertTitle>
+              <AlertDescription class="text-amber-800">
+                Body Overrides
+                对该供应商的<strong>所有模型</strong>生效。如需为特定模型设置不同参数，建议前往
+                <strong>Models Tab</strong> 配置 <strong>Model Overrides</strong>，避免在多个路由的
+                target 中重复配置 <code>extra</code>。
+              </AlertDescription>
+            </Alert>
 
             <KvEditor
               v-model="bodyOverridesList"

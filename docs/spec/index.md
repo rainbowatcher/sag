@@ -31,3 +31,4 @@ updated: 2026-06-26
 | [日志](/spec/logging/requirements) | Tracing、日志轮转、清理 |
 | [管理 API](/spec/admin/requirements) | REST 端点、CRUD 语义 |
 | [UI](/spec/ui/requirements) | 管理面板前端、响应式布局、主题切换 |
+| [Body Override](/spec/body-override/requirements) | 三层请求体字段覆盖（全局 / 模型级 / 路由目标级） |

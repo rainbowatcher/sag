@@ -85,10 +85,16 @@ timeout_secs = 120
 # x-custom-header = "value"
 
 # Body overrides merge into the upstream JSON request body at the top level.
-# Useful for setting provider-specific parameters or overriding defaults.
+# Applied to ALL requests for this provider. Use model_overrides for per-model overrides.
 # [providers.my-custom.body_overrides]
 # max_tokens = 4096
 # temperature = 0.8
+
+# Model overrides apply per real_model name, avoiding repeated extra configs across routes.
+# Priority: body_overrides < model_overrides < RouteTarget.extra
+# [providers.my-custom.model_overrides]
+# gpt-4o = { temperature = 0.7, max_tokens = 4096 }
+# gpt-4o-mini = { max_tokens = 2048 }
 
 # ============================================================
 # Model routing table
@@ -101,7 +107,8 @@ targets = [
     { provider = "openai", real_model = "gpt-4o", priority = 10 },
 ]
 
-# Per-target extra fields override provider body_overrides for this target.
+# Per-target extra fields have the highest priority among body overrides.
+# Use it for route-level tweaks; for model-level defaults prefer model_overrides.
 # Example: { provider = "openai", extra = { temperature = 0.7, max_tokens = 4096 } }
 
 [[routes]]
