@@ -561,10 +561,13 @@ pub fn ensure_nested_inline_table<'a>(
 /// # Why this lives here and not in `toml_edit`'s formatter
 ///
 /// In the `toml_edit` version pinned by this project, the
-/// array-of-inline-table formatter ignores per-item
-/// `decor_mut().set_prefix(...)` and emits the array on one line
-/// regardless of the prefix decor. The only stable way to get a
-/// multi-line output is to do it on the rendered `String`.
+/// array-of-inline-table formatter emits the array on one line
+/// when it was originally single-line (e.g.
+/// `targets = [{...}, {...}]`). `toml_edit` **does** preserve
+/// per-item prefix decor (comments) and any existing multi-line
+/// formatting — already-multi-line arrays round-trip correctly.
+/// The only stable way to convert single-line arrays to multi-line
+/// is to post-process the rendered `String`.
 ///
 /// # Inputs we leave alone
 ///
@@ -590,6 +593,44 @@ pub fn ensure_nested_inline_table<'a>(
 /// - **Nested braces inside strings** — double-quote tracking across
 ///   `\` escapes ensures that string contents (e.g.
 ///   `foo = "a{b}c"`) don't perturb the brace counter.
+///
+/// # Known unsupported scenarios
+///
+/// This function is a pragmatic workaround for a specific `toml_edit`
+/// formatting gap, not a general-purpose TOML reformatter. The
+/// following patterns are **not** handled and may produce incorrect
+/// output or silently corrupt the document:
+///
+/// - **Nested array-of-inline-tables**: if an inline-table item
+///   contains a nested `array_of_nested = [{ ... }, { ... }]` (e.g.
+///   `extra` that itself contains a targets-style array), the
+///   brace-depth tracker sees the nested `}` as the end of the top-level
+///   item, causing premature item splitting. Today's call sites only
+///   pass `targets` arrays whose items contain scalar fields and
+///   `extra = { ... }` (an inline table, not an array-of-inline-tables),
+///   so this is not exercised but is structurally fragile.
+///
+/// - **`toml_edit` version upgrades**: if a future `toml_edit` release
+///   changes the default rendering of `Array`→`String` (e.g. flips to
+///   multi-line by default or introduces a formatter API), this
+///   post-process may double-format (adding duplicate `\n    ` prefixes
+///   on already-multi-line output) or silently become a no-op while the
+///   output format changes. The multi-line detection guards against
+///   double-formatting but cannot predict format changes.
+///
+/// - **Trailing on-line comments after `[`**: as noted above in "Inputs
+///   we leave alone", a comment like `targets = [{ a = 1 }]  # note`
+///   is not guarded against — the comment text after `]` is preserved
+///   verbatim but the inside-payload reshaping still runs, which is
+///   safe as long as the comment doesn't contain brace-like patterns.
+///
+/// - **Non-ASCII or multi-byte codepoints adjacent to braces**: the
+///   brace walker operates on byte indices and only tracks `{`, `}`,
+///   `[`, `]`, `"`, `\\`, and `#`. Non-ASCII brace lookalikes (e.g.
+///   CJK quotation marks, fullwidth brackets) are not handled — they
+///   will either be misinterpreted or silently ignored. Real-world TOML
+///   configs use ASCII-only keys and values, so this is not a practical
+///   concern but is a correctness boundary.
 ///
 /// # Behaviour on reshaped output
 ///

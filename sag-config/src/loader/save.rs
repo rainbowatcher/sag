@@ -1,550 +1,65 @@
+#[cfg(test)]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::info;
 
 use crate::config::{
-    GatewayConfig, KeyStrategy, LogFormat, ProviderConfig, ProviderType, RouteConfig, RouteTarget,
-    Strategy,
+    GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
 };
+use crate::loader::json_util::{check_json_map, json_to_toml_value};
 use crate::toml_edit_util::{
     ensure_array_field, ensure_inline_table_field, ensure_nested_inline_table, prune_keys,
     reformat_inline_table_arrays_multiline, sync_array_of_tables, sync_inline_table_array_in_place,
     sync_inline_table_in_place, sync_string_array_in_place, upsert_table,
 };
 
-/// A shared, hot-reloadable configuration handle.
-#[derive(Debug, Clone)]
-pub struct ConfigHandle {
-    inner: Arc<RwLock<GatewayConfig>>,
-    config_path: Option<Arc<PathBuf>>,
-}
-
-impl ConfigHandle {
-    /// Build a `ConfigHandle` from an in-memory `GatewayConfig` (for testing / programmatic use).
-    pub fn from_config(config: GatewayConfig) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(config)),
-            config_path: None,
-        }
-    }
-
-    /// Read the current config (acquires a read lock).
-    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, GatewayConfig> {
-        self.inner.read().await
-    }
-
-    /// Acquire a write lock on the config (for runtime mutation via admin API).
-    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, GatewayConfig> {
-        self.inner.write().await
-    }
-
-    /// Returns the path to the config file, or `None` if the config is in-memory.
-    pub fn path(&self) -> Option<&Path> {
-        self.config_path.as_ref().map(|p| p.as_path())
-    }
-
-    /// Returns `true` if the config was loaded from a real file (not in-memory).
-    pub fn is_file_backed(&self) -> bool {
-        self.config_path.is_some()
-    }
-
-    /// Persist the in-memory config back to disk if this handle is file-backed.
-    ///
-    /// Logs a warning on failure but never returns an error — persistence is
-    /// best-effort so that an admin API mutation succeeds even if the disk
-    /// write fails (the in-memory config is already updated).
-    pub fn try_persist(&self, config: &GatewayConfig, action: &str) {
-        if let Some(path) = self.path()
-            && let Err(e) = save_config_to_file(config, path)
-        {
-            warn!(?e, "failed to persist config after {action}");
-        }
-    }
-}
-
-/// Quickly read `logging.level` and `logging.format` from a TOML file without
-/// full config parsing. Returns `(level, format)` filled with defaults where
-/// the file can't be read or the keys are missing.
-///
-/// This is used before tracing is initialized so that the log level and format
-/// from the config file can be applied early, without waiting for the full
-/// config load.
-pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
-    let content = match std::fs::read_to_string(path.as_ref()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[sag] failed to read config file '{}' for logging peek: {e}",
-                path.as_ref().display()
-            );
-            return ("info".into(), LogFormat::default());
-        }
-    };
-    #[derive(serde::Deserialize)]
-    struct LoggingPeek {
-        level: Option<String>,
-        format: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ConfigPeek {
-        logging: Option<LoggingPeek>,
-    }
-    let config: ConfigPeek = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[sag] failed to parse config file '{}' as TOML for logging peek: {e}",
-                path.as_ref().display()
-            );
-            return ("info".into(), LogFormat::default());
-        }
-    };
-    let logging = match config.logging {
-        Some(l) => l,
-        None => {
-            eprintln!(
-                "[sag] no [logging] section found in config file '{}', using defaults",
-                path.as_ref().display()
-            );
-            return ("info".into(), LogFormat::default());
-        }
-    };
-    let level = logging.level.unwrap_or_else(|| "info".into());
-    let format = match logging.format.as_deref() {
-        Some("json") => LogFormat::Json,
-        _ => LogFormat::Compact,
-    };
-    (level, format)
-}
-
-/// Warn if the config still uses the legacy top-level `retries` key.
-///
-/// `retries` now lives under `[backoff]`. serde silently ignores unknown
-/// top-level fields, so without this check a user who kept `retries = N` at
-/// the top level would silently fall back to the default (2) with no
-/// indication. Parses the TOML a second time as a generic `Value` —
-/// acceptable since config load/reload is not on the hot path.
-fn warn_legacy_top_level_retries(content: &str) {
-    if let Ok(value) = toml::from_str::<toml::Value>(content)
-        && value.get("retries").is_some()
-    {
-        warn!(
-            "top-level `retries` is no longer supported; move it under [backoff] \
-             (e.g. `[backoff] retries = 2`). The top-level value is ignored — \
-             falling back to [backoff].retries (default 2)."
-        );
-    }
-}
-
-/// Log a warning for each unknown key in a TOML table.
-fn check_unknown_keys(table: &toml::Table, known: &[&str], context: &str) {
-    for key in table.keys() {
-        if !known.contains(&key.as_str()) {
-            warn!("unknown config key '{key}' in {context}");
-        }
-    }
-}
-
-/// Scan the raw TOML document for keys that are not recognised by
-/// `GatewayConfig` and emit a `warn!` for each one. This catches
-/// typos, obsolete keys, and misplaced fields that serde would
-/// otherwise silently discard.
-///
-/// Covers: top level, [server], [analytics], [gateway_auth], [backoff],
-/// [circuit_breaker], [logging], [providers.*], [[routes]], and route
-/// target inline tables.
-fn warn_unknown_fields(doc: &toml::Value) {
-    let Some(top) = doc.as_table() else { return };
-
-    check_unknown_keys(
-        top,
-        &[
-            "server",
-            "analytics",
-            "gateway_auth",
-            "providers",
-            "backoff",
-            "circuit_breaker",
-            "shuffle_cache_ttl_secs",
-            "routes",
-            "logging",
-            // Legacy key — warn_legacy_top_level_retries gives a specific
-            // message, so we suppress the generic unknown-key warning here.
-            "retries",
-        ],
-        "top level",
-    );
-
-    if let Some(server) = top.get("server").and_then(|v| v.as_table()) {
-        check_unknown_keys(server, &["host", "port"], "[server]");
-    }
-
-    if let Some(analytics) = top.get("analytics").and_then(|v| v.as_table()) {
-        check_unknown_keys(analytics, &["enabled", "storage_dsn"], "[analytics]");
-    }
-
-    if let Some(auth) = top.get("gateway_auth").and_then(|v| v.as_table()) {
-        check_unknown_keys(auth, &["api_keys"], "[gateway_auth]");
-    }
-
-    if let Some(backoff) = top.get("backoff").and_then(|v| v.as_table()) {
-        check_unknown_keys(
-            backoff,
-            &["retries", "base_ms", "max_ms", "jitter"],
-            "[backoff]",
-        );
-    }
-
-    if let Some(cb) = top.get("circuit_breaker").and_then(|v| v.as_table()) {
-        check_unknown_keys(
-            cb,
-            &["quota_exhausted_secs", "rate_limited_secs", "generic_secs"],
-            "[circuit_breaker]",
-        );
-    }
-
-    if let Some(logging) = top.get("logging").and_then(|v| v.as_table()) {
-        check_unknown_keys(logging, &["level", "format"], "[logging]");
-    }
-
-    if let Some(providers) = top.get("providers").and_then(|v| v.as_table()) {
-        let known_provider = &[
-            "provider_type",
-            "api_keys",
-            "key_strategy",
-            "base_url",
-            "models_endpoint",
-            "timeout_secs",
-            "chunk_timeout_secs",
-            "ttfb_timeout_secs",
-            "headers",
-            "body_overrides",
-            "model_overrides",
-            "role_mappings",
-            "enabled",
-            "enabled_models",
-            "anthropic_cache_control",
-        ];
-        for (name, pv) in providers {
-            let Some(pt) = pv.as_table() else { continue };
-            check_unknown_keys(pt, known_provider, &format!("[providers.{name}]"));
-        }
-    }
-
-    if let Some(routes) = top.get("routes").and_then(|v| v.as_array()) {
-        let known_route = &[
-            "model_name",
-            "api_endpoint",
-            "strategy",
-            "retries",
-            "timeout_secs",
-            "targets",
-        ];
-        let known_target = &[
-            "provider",
-            "real_model",
-            "priority",
-            "retries",
-            "timeout_secs",
-            "extra",
-        ];
-        for (i, rv) in routes.iter().enumerate() {
-            let Some(rt) = rv.as_table() else { continue };
-            check_unknown_keys(rt, known_route, &format!("routes[{i}]"));
-            if let Some(targets) = rt.get("targets").and_then(|v| v.as_array()) {
-                for (j, tv) in targets.iter().enumerate() {
-                    let Some(tt) = tv.as_table() else { continue };
-                    check_unknown_keys(tt, known_target, &format!("routes[{i}].targets[{j}]"));
-                }
-            }
-        }
-    }
-}
-
-/// Load the initial configuration from a TOML file and return a `ConfigHandle`.
-pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::AppError> {
-    let path = path.as_ref().to_path_buf();
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        sag_core::AppError::Config(format!("failed to read config {}: {e}", path.display()))
-    })?;
-
-    warn_legacy_top_level_retries(&content);
-
-    // Parse raw TOML to detect unknown keys before discarding them via serde.
-    if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
-        warn_unknown_fields(&raw);
-    }
-
-    let config: GatewayConfig = toml::from_str(&content)
-        .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
-
-    config
-        .validate()
-        .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
-
-    debug!(?config, "configuration loaded");
-    Ok(ConfigHandle {
-        inner: Arc::new(RwLock::new(config)),
-        config_path: Some(Arc::new(path)),
-    })
-}
-
-/// Handle for the hot-reload background task, including a shutdown signal.
-pub struct HotReloadHandle {
-    /// The spawned tokio task.
-    pub task: tokio::task::JoinHandle<()>,
-    /// Send `()` to request graceful shutdown of the watcher.
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-}
-
-impl HotReloadHandle {
-    /// Signal the watcher to shut down gracefully and wait for it to finish.
-    ///
-    /// This ensures the `notify::Watcher` is properly dropped, which stops
-    /// OS-level file-watching threads (FSEvents on macOS, inotify on Linux).
-    pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await;
-    }
-}
-
-/// Spawn a background task that watches the config file for changes and reloads it.
-/// The returned handle will reflect the latest config. If `handle` is in-memory
-/// (no associated file path), the watcher task exits immediately.
-pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
-    let inner = handle.inner.clone();
-    let path = handle.config_path.clone();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let task = tokio::spawn(async move {
-        // If there is no backing file, skip the watcher entirely.
-        let Some(path) = path else {
-            info!("hot-reload skipped for in-memory config");
-            return;
-        };
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<notify::Event, notify::Error>>(16);
-
-        let mut watcher = match RecommendedWatcher::new(
-            move |res| {
-                let _ = tx.blocking_send(res);
-            },
-            notify::Config::default(),
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("failed to create file watcher: {e}");
-                return;
-            }
-        };
-
-        if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-            error!("failed to watch config file {}: {e}", path.display());
-            return;
-        }
-
-        info!("hot-reload watcher started for {}", path.display());
-
-        // Debounce: wait 500ms after last event before reloading
-        let mut debounce = tokio::time::Instant::now();
-
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    info!("hot-reload watcher shutting down");
-                    // Drop the watcher explicitly — this stops OS file-watch threads.
-                    drop(watcher);
-                    return;
-                }
-                event_res = rx.recv() => {
-                    match event_res {
-                        Some(Ok(event)) => {
-                            if is_modify_event(&event) {
-                                let now = tokio::time::Instant::now();
-                                if now.duration_since(debounce).as_millis() < 500 {
-                                    continue; // debounce
-                                }
-                                debounce = now;
-
-                                // Small delay to let the file system settle
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                                match reload_config(&path).await {
-                                    Ok(new_config) => {
-                                        let mut guard = inner.write().await;
-                                        *guard = new_config;
-                                        info!("configuration hot-reloaded");
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to reload config: {e}");
-                                    }
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            error!("file watcher error: {e}");
-                        }
-                        None => {
-                            // All senders dropped — watcher was destroyed.
-                            // This is a belt-and-suspenders safety net; in
-                            // practice the shutdown signal arm handles exit.
-                            info!("file watcher channel closed, exiting");
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    HotReloadHandle { task, shutdown_tx }
-}
-
-fn is_modify_event(event: &Event) -> bool {
-    matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-}
-
-async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_core::AppError> {
-    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-        sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
-    })?;
-    warn_legacy_top_level_retries(&content);
-
-    if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
-        warn_unknown_fields(&raw);
-    }
-
-    let config: GatewayConfig = toml::from_str(&content)
-        .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
-
-    config
-        .validate()
-        .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
-
-    Ok(config)
-}
-
-/// Convert a `serde_json::Value` into a `toml_edit::Value`.
-///
-/// TOML has no `null`. `Null` is rejected (panic) rather than coerced to
-/// the string `"null"` because silent coercion would corrupt the
-/// config file: a `Null` written today would come back as the string
-/// `"null"` on the next load and the user-visible behaviour would
-/// drift silently.
-///
-/// Validation lives upstream in [`check_json_map`] (called from
-/// [`save_config_to_file`] for both `body_overrides` and target
-/// `extra`), which recursively walks the JSON tree and rejects nulls
-/// at any depth. If this panic ever fires, one of two things has
-/// happened: (a) a new call site was added without going through
-/// validation, or (b) `check_json_map`'s recursion has a gap. Either
-/// way, fail loudly rather than write a broken file.
-fn json_to_toml_value(v: &serde_json::Value) -> toml_edit::Value {
-    match v {
-        serde_json::Value::Null => panic!(
-            "json_to_toml_value called with Null at {v:?} — TOML has no null \
-             representation and upstream validation (check_json_map) should \
-             have rejected this value before reaching here. The panic indicates \
-             either a new write path that bypasses validation, or a recursion \
-             gap in check_json_map itself; investigate before re-running."
-        ),
-        serde_json::Value::Bool(b) => toml_edit::value(*b).into_value().unwrap(),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                toml_edit::value(i).into_value().unwrap()
-            } else if let Some(f) = n.as_f64() {
-                toml_edit::value(f).into_value().unwrap()
-            } else {
-                toml_edit::value(n.to_string()).into_value().unwrap()
-            }
-        }
-        serde_json::Value::String(s) => toml_edit::value(s.as_str()).into_value().unwrap(),
-        serde_json::Value::Array(items) => {
-            let mut arr = toml_edit::Array::new();
-            for item in items {
-                arr.push(json_to_toml_value(item));
-            }
-            toml_edit::Value::Array(arr)
-        }
-        serde_json::Value::Object(map) => {
-            let mut table = toml_edit::InlineTable::new();
-            for (k, val) in map {
-                table.insert(k, json_to_toml_value(val));
-            }
-            toml_edit::Value::InlineTable(table)
-        }
-    }
-}
-
-/// Recursively validate a JSON value (or anything reachable through it)
-/// for null at any depth. A null anywhere — top-level, inside an
-/// array, or inside a nested object — is rejected because TOML has
-/// no representation for it and any newline-coerced value would
-/// silently drift on round-trip.
-///
-/// Returns the dotted-path index of the FIRST null encountered
-/// (matches the previous top-level-only behaviour: first-null-wins
-/// with a clear location). The path uses `[i]` for array indices and
-/// `.field` for object keys, e.g. `extra.foo.bar` or `extra.list[0]`.
-fn check_json_value_path(v: &serde_json::Value, path: &str) -> Result<(), sag_core::AppError> {
-    match v {
-        serde_json::Value::Null => Err(sag_core::AppError::Config(format!(
-            "{path}: null value cannot be stored as TOML, remove the key or set an explicit value"
-        ))),
-        serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => Ok(()),
-        serde_json::Value::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                check_json_value_path(item, &format!("{path}[{i}]"))?;
-            }
-            Ok(())
-        }
-        serde_json::Value::Object(map) => {
-            for (k, val) in map {
-                check_json_value_path(val, &format!("{path}.{k}"))?;
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Validate that a JSON map (top-level or nested somewhere under it)
-/// doesn't contain null values. Walks recursively so that
-/// `body_overrides = { foo: { bar: null } }` or `extra = { x: [null] }`
-/// are also rejected — previously only top-level nulls were caught,
-/// which let nested nulls reach [`json_to_toml_value`] and corrupt the
-/// saved file. See [`check_json_value_path`] for the recursive scanner.
-fn check_json_map(
-    map: &HashMap<String, serde_json::Value>,
-    context: &str,
-) -> Result<(), sag_core::AppError> {
-    for (key, val) in map {
-        check_json_value_path(val, &format!("{context}.{key}"))?;
-    }
-    Ok(())
-}
-
 /// Persist the in-memory `GatewayConfig` back to the TOML file.
 ///
 /// Uses `toml_edit` to parse the existing file and performs fine-grained
 /// in-place updates. **All mutable sections are written back precisely:**
-/// `[providers.*]`, `[[routes]]`, `[backoff]`, and the top-level `retries`
-/// scalar are all updated in place, preserving comments and field order in
-/// any field/table the in-memory config does not explicitly touch.
+/// `[providers.*]`, `[[routes]]`, and `[backoff]` are all updated in
+/// place, preserving comments and field order in any field/table the
+/// in-memory config does not explicitly touch.
 ///
-/// The remaining top-level sections (`[server]`, `[analytics]`,
-/// `[gateway_auth]`) are intentionally **not** written back — the admin
-/// save path only mutates the four sections above, and any user-authored
-/// versions of those untouched sections are preserved verbatim.
-pub fn save_config_to_file(
-    config: &GatewayConfig,
-    path: &std::path::Path,
-) -> Result<(), sag_core::AppError> {
+/// All other sections — `[server]`, `[analytics]`, `[gateway_auth]`,
+/// `[circuit_breaker]`, `[logging]`, and the top-level scalar
+/// `shuffle_cache_ttl_secs` — are intentionally **not** written back.
+/// The admin save path only mutates the three sections above, so any
+/// user-authored values (and comments) in these untouched sections are
+/// preserved verbatim across saves. This also means admin-initiated
+/// saves won't accidentally revert hand-edited tuning of these
+/// read-only fields.
+///
+/// # Concurrency and crash-safety
+///
+/// This function performs a **read-then-write** (parse existing file →
+/// mutate in-memory → `std::fs::write`). It does **not** use atomic
+/// `tmp + rename` or file locking.
+///
+/// **Process-level serialization**: the admin API acquires the config
+/// `RwLock` write guard (`state.config.write().await`) across config
+/// mutation and `try_persist`. Concurrent admin requests within the same
+/// process are serialized — the second request re-reads the file the
+/// first just wrote, so no lost-update occurs within a single process.
+///
+/// **Error-path behaviour**: if `existing.parse()` or `config.validate()`
+/// fails, the function returns `Err` without touching the file on disk —
+/// the original config file is preserved untouched (all-or-nothing).
+///
+/// **Crash-safety gap**: a crash during `std::fs::write` would leave a
+/// truncated or partially-written file. In practice, admin API mutations
+/// are infrequent, and the config file can be restored from version
+/// control or the `gateway.example.toml` template. If crash-safety
+/// becomes important, replace `std::fs::write` with `write(tmp) →
+/// fs::rename(tmp, path)`.
+///
+/// **Cross-process gap**: an external editor saving concurrently with an
+/// admin API mutation would race the read and write. The hot-reload
+/// watcher is read-only (it never writes the config file), so it does
+/// not participate in the race. If cross-process mutation is a concern,
+/// add OS-level file locking (`flock` / `LockFile`).
+pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sag_core::AppError> {
     // Validate no null values before writing.
     for (name, provider) in &config.providers {
         check_json_map(
@@ -630,9 +145,12 @@ pub fn save_config_to_file(
     // ── Write back ──
     // Render the document, then post-process inline-table-arrays to
     // a multi-line layout for hand-editing readability. We do this as
-    // a string-level pass because `toml_edit`'s formatter ignores
-    // per-item prefix decor in the version this project uses and
-    // emits single-line arrays unconditionally otherwise — see
+    // a string-level pass because `toml_edit` renders single-line
+    // arrays on one line (e.g. `targets = [{...}, {...}]`).
+    // `toml_edit` **does** preserve per-item prefix decor (comments)
+    // and multi-line formatting when it already existed on input, so
+    // the reformat is a no-op for already-multi-line arrays — it only
+    // converts single-line arrays to multi-line. See
     // `reformat_inline_table_arrays_multiline` for the rationale.
     let mut rendered = doc.to_string();
     reformat_inline_table_arrays_multiline(&mut rendered, "targets", "    ");
@@ -774,6 +292,29 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
         let body_overrides = ensure_inline_table_field(table, "body_overrides");
         sync_inline_table_in_place(body_overrides, &provider.body_overrides, json_to_toml_value);
     }
+    // chunk_timeout_secs — skip if None (mirrors skip_serializing_if = "Option::is_none")
+    if let Some(secs) = provider.chunk_timeout_secs {
+        table["chunk_timeout_secs"] = toml_edit::value(secs as i64);
+    } else {
+        table.remove("chunk_timeout_secs");
+    }
+    // ttfb_timeout_secs — same treatment
+    if let Some(secs) = provider.ttfb_timeout_secs {
+        table["ttfb_timeout_secs"] = toml_edit::value(secs as i64);
+    } else {
+        table.remove("ttfb_timeout_secs");
+    }
+    // role_mappings — inline table, remove if empty
+    if provider.role_mappings.is_empty() {
+        table.remove("role_mappings");
+    } else {
+        let rm = ensure_inline_table_field(table, "role_mappings");
+        sync_inline_table_in_place(rm, &provider.role_mappings, |v| {
+            toml_edit::Value::from(v.as_str())
+        });
+    }
+    // anthropic_cache_control — always write (no skip_serializing_if)
+    table["anthropic_cache_control"] = toml_edit::value(provider.anthropic_cache_control);
 }
 
 /// Update fields of an existing route's TOML sub-table (a single
@@ -822,6 +363,13 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
         existing.remove("retries");
     }
 
+    // timeout_secs — skip if None (mirrors skip_serializing_if = "Option::is_none")
+    if let Some(ts) = route.timeout_secs {
+        existing["timeout_secs"] = toml_edit::value(ts as i64);
+    } else {
+        existing.remove("timeout_secs");
+    }
+
     // ── targets — sync as inline table array, matched on ──
     // `(provider, real_model)` composite key. See doc on this function for
     // why composite keying is required; single-field `provider` matching
@@ -845,10 +393,11 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
     // Force multi-line layout (`[\n    { ... },\n    { ... }\n]`) is
     // applied as a string-level post-process on the rendered doc in
     // `save_config_to_file` — see `reformat_inline_table_arrays_multiline`.
-    // We don't try to coax the multi-line format out of `toml_edit`'s
-    // array-of-inline-table formatter here; in this `toml_edit` version
-    // it ignores per-item prefix decor and emits the array on one line
-    // regardless.
+    // `toml_edit` preserves per-item prefix decor (comments) and any
+    // existing multi-line formatting natively; the reformat step only
+    // converts arrays that were originally single-line. Already-multi-line
+    // arrays are left untouched by the reformatter (it detects `\n` in
+    // the payload and skips).
 }
 
 /// Build a brand-new `InlineTable` for a route target. Used by
@@ -893,6 +442,13 @@ fn write_target_fields(existing: &mut toml_edit::InlineTable, target: &RouteTarg
         existing.remove("retries");
     }
 
+    // timeout_secs — skip if None (mirrors skip_serializing_if = "Option::is_none")
+    if let Some(ts) = target.timeout_secs {
+        existing.insert("timeout_secs", toml_edit::Value::from(ts as i64));
+    } else {
+        existing.remove("timeout_secs");
+    }
+
     // extra — serialized as a single nested inline table
     // (`extra = { ... }`). If empty, drop the field entirely; otherwise
     // ensure the inline table exists and sync its keys in on-disk order.
@@ -910,239 +466,52 @@ mod tests {
     use std::io::Write;
 
     use crate::config::*;
+    use crate::loader::load::load_config;
 
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    /// Create a temp TOML file with the given content and return its path.
     fn temp_toml(content: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir();
         let id = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let file_path = dir.join(format!("sag-test-{}-{}.toml", std::process::id(), id));
+        let file_path = dir.join(format!("sag-save-test-{}-{}.toml", std::process::id(), id));
         let mut file = std::fs::File::create(&file_path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file_path
     }
 
-    fn valid_toml() -> &'static str {
-        r#"[server]
-host = "127.0.0.1"
-port = 9090
-
-[gateway_auth]
-api_keys = ["test-key"]
-
-[providers.openai]
-api_keys = ["sk-test"]
-"#
+    fn minimal_provider() -> ProviderConfig {
+        ProviderConfig {
+            provider_type: ProviderType::OpenAI,
+            api_keys: vec!["sk-test".into()],
+            key_strategy: KeyStrategy::FillFirst,
+            base_url: "https://api.openai.com/v1".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 120,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            model_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
+            enabled: true,
+            enabled_models: vec![],
+            anthropic_cache_control: true,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+        }
     }
 
-    #[test]
-    fn load_config_success() {
-        let path = temp_toml(valid_toml());
-        let handle = load_config(&path).unwrap();
-        assert_eq!(handle.path(), Some(path.as_path()));
-
-        // Can read the config synchronously via try_read
-        let config = handle.inner.try_read().unwrap();
-        assert_eq!(config.server.port, 9090);
-        assert_eq!(
-            config.gateway_auth.as_ref().unwrap().api_keys,
-            vec!["test-key"]
-        );
+    fn openai_only_config() -> GatewayConfig {
+        GatewayConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 9090,
+            },
+            gateway_auth: None,
+            providers: HashMap::from([("openai".into(), minimal_provider())]),
+            ..crate::gateway_config_base!()
+        }
     }
 
-    #[test]
-    fn load_config_missing_file() {
-        let result = load_config("/tmp/does-not-exist-sag-test.toml");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("failed to read config"));
-    }
-
-    #[test]
-    fn load_config_invalid_toml() {
-        let path = temp_toml("this is not valid toml {{{ ");
-        let result = load_config(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("failed to parse config"));
-    }
-
-    #[test]
-    fn load_config_missing_providers() {
-        let path = temp_toml("[server]\n");
-        let result = load_config(&path);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("failed to parse config")
-        );
-    }
-
-    // ── unknown key warning tests ──
-
-    #[test]
-    fn warn_unknown_fields_detects_top_level_typos() {
-        let doc = toml::from_str::<toml::Value>(
-            r#"
-host = "127.0.0.1"
-serverr = "oops"
-[server]
-port = 8080
-[providers]
-"#,
-        )
-        .unwrap();
-        // Should not panic; the warning is emitted via tracing::warn!
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn warn_unknown_fields_detects_unknown_server_keys() {
-        let doc = toml::from_str::<toml::Value>(
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-bind = "0.0.0.0"
-[providers]
-"#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn warn_unknown_fields_detects_unknown_provider_keys() {
-        let doc = toml::from_str::<toml::Value>(
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.openai]
-api_keys = ["sk-test"]
-max_tokens = 4096
-"#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn warn_unknown_fields_detects_unknown_route_keys() {
-        let doc = toml::from_str::<toml::Value>(
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers]
-
-[[routes]]
-model_name = "gpt-4o"
-endpoint = "/v1/chat"
-targets = [
-    { provider = "openai" },
-]
-"#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn warn_unknown_fields_detects_unknown_target_keys() {
-        let doc = toml::from_str::<toml::Value>(
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers]
-
-[[routes]]
-model_name = "gpt-4o"
-targets = [
-    { provider = "openai", model = "gpt-4" },
-]
-"#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn warn_unknown_fields_ignores_known_keys() {
-        // Full valid config — should not produce any warnings.
-        let doc = toml::from_str::<toml::Value>(valid_toml()).unwrap();
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn warn_unknown_fields_suppresses_legacy_retries() {
-        // Top-level `retries` is a known legacy key — warn_legacy_top_level_retries
-        // handles it with a specific message, so warn_unknown_fields should NOT
-        // emit a duplicate generic warning.
-        let doc = toml::from_str::<toml::Value>(
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-retries = 5
-[providers]
-"#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
-    }
-
-    #[test]
-    fn config_handle_clone_shares_state() {
-        let path = temp_toml(valid_toml());
-        let h1 = load_config(&path).unwrap();
-        let h2 = h1.clone();
-
-        let c1 = h1.inner.try_read().unwrap();
-        let c2 = h2.inner.try_read().unwrap();
-        assert_eq!(c1.server.port, c2.server.port);
-        // They point to the same Arc — same address
-        let ptr1 = &*c1 as *const GatewayConfig;
-        let ptr2 = &*c2 as *const GatewayConfig;
-        assert_eq!(ptr1, ptr2, "Clone should share the same inner Arc");
-    }
-
-    #[test]
-    fn is_modify_event_detects_modify() {
-        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
-            notify::event::DataChange::Any,
-        )));
-        assert!(is_modify_event(&event));
-    }
-
-    #[test]
-    fn is_modify_event_detects_create() {
-        let event = Event::new(EventKind::Create(notify::event::CreateKind::File));
-        assert!(is_modify_event(&event));
-    }
-
-    #[test]
-    fn is_modify_event_ignores_access() {
-        let event = Event::new(EventKind::Access(notify::event::AccessKind::Close(
-            notify::event::AccessMode::Write,
-        )));
-        assert!(!is_modify_event(&event));
-    }
-
-    #[test]
-    fn is_modify_event_ignores_remove() {
-        let event = Event::new(EventKind::Remove(notify::event::RemoveKind::File));
-        assert!(!is_modify_event(&event));
-    }
-
-    // ── save_config_to_file tests ──
+    // ── basic save tests ──
 
     #[test]
     fn save_preserves_provider_subtable_format() {
@@ -1285,11 +654,6 @@ base_url = "https://api.anthropic.com"
         save_config_to_file(&config, &path).unwrap();
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        // Tighten the assertion: route-level retries=None and target-level
-        // retries=None / real_model=None must all be absent from the saved
-        // file. The previous `!saved.contains("retries")` was too coarse —
-        // it also matched the top-level `retries = 2` line, so the test
-        // would have passed even if route-level retries were being written.
         let doc: toml_edit::DocumentMut = saved
             .parse()
             .expect("saved file should still be valid TOML");
@@ -1325,15 +689,6 @@ base_url = "https://api.anthropic.com"
 
     #[test]
     fn save_skips_default_provider_type_and_key_strategy_on_roundtrip() {
-        // Regression: `update_existing_provider` used to unconditionally
-        // write both `provider_type` and `key_strategy`, polluting the
-        // file with defaults that a user's minimum-viable [providers.X]
-        // block intentionally omitted. With the fix the update path
-        // mirrors `skip_serializing_if`: default values are dropped,
-        // non-default values are written. This test goes load→save
-        // (the path the bug exercised); `default_fields_not_written`
-        // already covers the create-from-scratch path which was always
-        // correct.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -1364,11 +719,6 @@ api_keys = ["sk-test"]
 
     #[test]
     fn save_writes_non_default_provider_type_and_key_strategy() {
-        // Symmetry check: the same predicate that drops defaults must
-        // also write non-defaults when the in-memory value differs from
-        // the declared default. Without this, an admin-API mutation
-        // that flips `key_strategy` to `round_robin` would silently
-        // not be persisted.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -1535,28 +885,10 @@ targets = [
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    #[should_panic(expected = "json_to_toml_value called with Null")]
-    fn json_to_toml_value_panics_on_null() {
-        // Defence-in-depth test: even if a future call site forgets to
-        // route through check_json_map, the silent "write the string
-        // \"null\"" coercion is gone — a Null reaching json_to_toml_value
-        // panics loudly so the bug surfaces instead of corrupting the
-        // config file. The previous code mapped Null to the string
-        // "null" defensively, which meant a regression in the upstream
-        // null check would silently produce broken-but-parseable TOML.
-        let _ = json_to_toml_value(&serde_json::Value::Null);
-    }
+    // ── null value tests ──
 
     #[test]
     fn extra_with_nested_null_in_object_returns_error() {
-        // Regression: `check_json_map` previously only caught top-level
-        // nulls (and nulls in top-level arrays). A null nested inside a
-        // map value — e.g. `extra = { nested: { temperature: null } }` —
-        // would slip past validation and reach json_to_toml_value, which
-        // then silently wrote the string "null" into the saved file.
-        // After the recursive refactor, ALL nulls in the JSON tree are
-        // caught.
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let config = GatewayConfig {
             server: ServerConfig {
@@ -1596,9 +928,6 @@ targets = [
                     priority: 0,
                     retries: None,
                     timeout_secs: None,
-                    // Nested null — top-level value is an Object whose
-                    // interior contains a Null. The previous flat check
-                    // would have missed this.
                     extra: HashMap::from([(
                         "nested".into(),
                         serde_json::json!({ "temperature": null }),
@@ -1624,9 +953,6 @@ targets = [
 
     #[test]
     fn extra_with_null_in_nested_array_returns_error() {
-        // Same regression as `extra_with_nested_null_in_object_...` but
-        // along the Array branch: a null inside an Array nested under a
-        // top-level object also used to slip past the flat check.
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let config = GatewayConfig {
             server: ServerConfig {
@@ -1666,8 +992,6 @@ targets = [
                     priority: 0,
                     retries: None,
                     timeout_secs: None,
-                    // Null buried inside a top-level array value
-                    // (parallel to the object case in the other test).
                     extra: HashMap::from([("list".into(), serde_json::json!([1, null, 3]))]),
                 }],
             }],
@@ -1747,13 +1071,6 @@ targets = [
 
     #[test]
     fn save_targets_with_same_provider_distinct_real_models_preserves_both() {
-        // Regression for Problem 1: with single-field `provider`
-        // keying, two targets sharing `provider="openai"` but differing
-        // in `real_model` would silently overwrite each other on save
-        // (the position-by-key map only had one slot for "openai"). The
-        // composite `(provider, real_model)` key gives each a distinct
-        // slot, so load → save → reload preserves both entries with
-        // their distinct priorities and extras.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -1788,9 +1105,6 @@ targets = [
             targets
         );
 
-        // Both target entries reachable, with distinct real_models AND
-        // distinct priorities (i.e. neither got overwritten by the
-        // other — the original bug).
         let gpt4 = targets
             .iter()
             .find(|t| t.real_model.as_deref() == Some("gpt-4o"))
@@ -1807,11 +1121,6 @@ targets = [
 
     #[test]
     fn save_targets_mutates_one_target_without_disturbing_its_sibling() {
-        // Update only one of the two same-provider targets and verify
-        // the sibling's other fields (priority, extras) are preserved
-        // verbatim. This is the precise-edit promise of the composite
-        // key — the position-by-key map anchors `on_update` to the
-        // exact entry, not the "first one with this provider" entry.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -1833,8 +1142,6 @@ targets = [
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Bump the gpt-3.5 entry's priority and add an extra —
-        // gpt-4 entry must NOT be touched.
         let gpt35_idx = config.routes[0]
             .targets
             .iter()
@@ -1883,38 +1190,6 @@ targets = [
     }
 
     // ── retries / [backoff] / routes comment-preservation round-trip tests ──
-
-    fn minimal_provider() -> ProviderConfig {
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled: true,
-            enabled_models: vec![],
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-        }
-    }
-
-    fn openai_only_config() -> GatewayConfig {
-        GatewayConfig {
-            server: ServerConfig {
-                host: "127.0.0.1".into(),
-                port: 9090,
-            },
-            gateway_auth: None,
-            providers: HashMap::from([("openai".into(), minimal_provider())]),
-            ..crate::gateway_config_base!()
-        }
-    }
 
     #[test]
     fn save_persists_retries() {
@@ -2030,9 +1305,6 @@ targets = [
 
     #[test]
     fn save_route_insert_then_update_preserves_other_route_comments() {
-        // After inserting a new route, comments on the OTHER (pre-existing)
-        // route should survive — this is the precise-edit promise of
-        // sync_array_of_tables (only the matched entry is mutated).
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2056,7 +1328,6 @@ targets = [
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Add a second route via the in-memory config
         config.routes.push(RouteConfig {
             model_name: "claude".into(),
             api_endpoint: "/chat/completions".into(),
@@ -2076,12 +1347,10 @@ targets = [
         save_config_to_file(&config, &path).unwrap();
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        // The pre-existing route's comment should still be there
         assert!(
             saved.contains("# Keep me"),
             "unrelated route's comment should be preserved, got:\n{saved}"
         );
-        // The new route should be appended
         assert!(saved.contains("model_name = \"claude\""));
 
         let _ = std::fs::remove_file(&path);
@@ -2106,16 +1375,18 @@ base_url = "https://api.anthropic.com"
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Remove anthropic from in-memory config
         config.providers.remove("anthropic");
 
         save_config_to_file(&config, &path).unwrap();
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("openai"), "openai should remain");
         assert!(
-            !saved.contains("anthropic"),
-            "anthropic should be removed, got:\n{saved}"
+            saved.contains("[providers.openai]"),
+            "openai provider section should remain, got:\n{saved}"
+        );
+        assert!(
+            !saved.contains("[providers.anthropic]"),
+            "anthropic provider section should be removed, got:\n{saved}"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -2144,7 +1415,6 @@ targets = [
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Empty out routes
         config.routes.clear();
 
         save_config_to_file(&config, &path).unwrap();
@@ -2162,15 +1432,6 @@ targets = [
 
     #[test]
     fn save_preserves_extra_key_order() {
-        // The on-disk order of `extra` keys should be preserved on save.
-        // Previously, `extra` was iterated as a `HashMap` so the order was
-        // non-deterministic across saves — this test pins the order.
-        //
-        // `RouteTarget::extra` is serialized as a nested inline table
-        // (`extra = { ... }`). The `toml` crate (used for parsing) only
-        // supports single-line inline tables, so we cannot put comments
-        // between `extra` keys; we rely on the per-key order check below
-        // to verify the precise-edit logic.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2208,10 +1469,6 @@ targets = [
 
     #[test]
     fn save_preserves_extra_inline_table_on_rewrite() {
-        // The `extra = { ... }` inline table itself is preserved across a
-        // round-trip. We can't put comments between its fields (the `toml`
-        // crate only supports single-line inline tables), but the keys
-        // and values must survive verbatim.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2244,8 +1501,6 @@ targets = [
 
     #[test]
     fn save_extra_remove_removes_key() {
-        // Removing an `extra` key from the in-memory config should drop
-        // it from the file too.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2283,9 +1538,6 @@ targets = [
 
     #[test]
     fn save_extra_add_appends_new_key() {
-        // Adding an `extra` key should append it at the end (sorted
-        // alongside any other new keys) without disturbing the existing
-        // keys' positions.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2316,7 +1568,6 @@ targets = [
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("temperature"));
         assert!(saved.contains("max_tokens"));
-        // New key should come after the existing one (preserved order)
         let temp_pos = saved.find("temperature").unwrap();
         let max_pos = saved.find("max_tokens").unwrap();
         assert!(
@@ -2329,9 +1580,6 @@ targets = [
 
     #[test]
     fn save_targets_preserves_unrelated_target_comments() {
-        // A comment on one target should be preserved even when the
-        // sibling targets are resaved — the precise-edit promise for
-        // `targets` is the same as for the rest of the file.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2371,8 +1619,6 @@ targets = [
 
     #[test]
     fn save_targets_removes_stale_target() {
-        // Removing a target from in-memory should remove it from the
-        // saved file.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2405,9 +1651,6 @@ targets = [
         save_config_to_file(&config, &path).unwrap();
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        // The provider block still exists (we only removed the *target*),
-        // but only one `provider = "..."` should appear inside the
-        // targets array.
         let after_routes = saved
             .split("[[routes]]")
             .nth(1)
@@ -2423,10 +1666,6 @@ targets = [
 
     #[test]
     fn save_targets_formatted_multiline_when_input_is_single_line() {
-        // When the on-disk config has `targets = [{...}, {...}]` (single
-        // line, user-authored or written by an older save), the saver
-        // must convert to multi-line format on the next save so the
-        // targets are readable / hand-editable.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2476,10 +1715,6 @@ targets = [{ provider = "kimchi", real_model = "kimi-k2.6" }, { provider = "jx",
 
     #[test]
     fn save_preserves_api_keys_order() {
-        // On-disk order of api_keys should be preserved; previously these
-        // were rebuilt from Vec iteration which lost user comments but
-        // happened to be deterministic. Now `sync_string_array_in_place`
-        // preserves position for keys that are still present.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2566,8 +1801,6 @@ api_keys = ["sk-1"]
 
     #[test]
     fn save_api_keys_empty_removes_field() {
-        // When api_keys becomes empty, the field should be removed
-        // (matching skip_serializing_if).
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2626,9 +1859,6 @@ enabled_models = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
 
     #[test]
     fn save_preserves_headers_key_order() {
-        // Previously, `headers` was rebuilt from a HashMap so the order
-        // was non-deterministic across saves. Now it uses
-        // `sync_inline_table_in_place` which preserves on-disk order.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2696,10 +1926,6 @@ headers = { X-Trace = "on", X-Request-Id = "abc" }
 
     #[test]
     fn model_overrides_round_trip() {
-        // Test that model_overrides survive a save→load round-trip.
-        // Build the config programmatically (to avoid TOML parsing
-        // edge cases with nested inline tables under sub-headers),
-        // save it, then reload and compare.
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let mut config = openai_only_config();
         let mut gpt4o = HashMap::new();
@@ -2728,8 +1954,6 @@ headers = { X-Trace = "on", X-Request-Id = "abc" }
 
     #[test]
     fn model_overrides_save_removes_stale_model() {
-        // When a model override entry is removed from the in-memory
-        // config, the save must drop it from the file too.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2747,7 +1971,6 @@ gpt-3.5-turbo = { max_tokens = 2048 }
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Remove gpt-3.5-turbo from model overrides
         config
             .providers
             .get_mut("openai")
@@ -2772,8 +1995,6 @@ gpt-3.5-turbo = { max_tokens = 2048 }
 
     #[test]
     fn model_overrides_save_empty_removes_section() {
-        // When all model_overrides are cleared, the
-        // [providers.X.model_overrides] section should disappear.
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -2833,6 +2054,450 @@ body_overrides = { max_tokens = 4096, temperature = 0.8, top_p = 0.9 }
         assert!(
             max < temp && temp < top,
             "body_overrides on-disk order should be preserved, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── chunk_timeout_secs / ttfb_timeout_secs / role_mappings /
+    //    anthropic_cache_control round-trip tests ──
+
+    #[test]
+    fn save_round_trips_chunk_and_ttfb_timeout_secs() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .chunk_timeout_secs = Some(30);
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .ttfb_timeout_secs = Some(45);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let p = reloaded.providers.get("openai").unwrap();
+        assert_eq!(
+            p.chunk_timeout_secs,
+            Some(30),
+            "chunk_timeout_secs round-trip"
+        );
+        assert_eq!(
+            p.ttfb_timeout_secs,
+            Some(45),
+            "ttfb_timeout_secs round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_chunk_and_ttfb_removed_when_none() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+chunk_timeout_secs = 30
+ttfb_timeout_secs = 45
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .chunk_timeout_secs = None;
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .ttfb_timeout_secs = None;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("chunk_timeout_secs"),
+            "None chunk_timeout_secs should be removed from disk, got:\n{saved}"
+        );
+        assert!(
+            !saved.contains("ttfb_timeout_secs"),
+            "None ttfb_timeout_secs should be removed from disk, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_role_mappings() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        let mut mappings = HashMap::new();
+        mappings.insert("developer".into(), "system".into());
+        mappings.insert("user".into(), "assistant".into());
+        config.providers.get_mut("openai").unwrap().role_mappings = mappings;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let p = reloaded.providers.get("openai").unwrap();
+        assert_eq!(p.role_mappings.get("developer").unwrap(), "system");
+        assert_eq!(p.role_mappings.get("user").unwrap(), "assistant");
+        assert_eq!(p.role_mappings.len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_removes_empty_role_mappings() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+role_mappings = { developer = "system" }
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .role_mappings
+            .clear();
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("role_mappings"),
+            "empty role_mappings should be removed from disk, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── route / target timeout_secs round-trip tests ──
+
+    #[test]
+    fn save_round_trips_route_timeout_secs() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4"
+targets = [
+    { provider = "openai" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].timeout_secs = Some(300);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.routes[0].timeout_secs,
+            Some(300),
+            "route timeout_secs should survive round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_removes_route_timeout_secs_when_none() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4"
+timeout_secs = 300
+targets = [
+    { provider = "openai" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].timeout_secs = None;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let after_routes = saved
+            .split("[[routes]]")
+            .nth(1)
+            .expect("should have a routes section");
+        assert!(
+            !after_routes.contains("timeout_secs"),
+            "None route timeout_secs should be removed from disk, got:\n{after_routes}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_target_timeout_secs() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4"
+targets = [
+    { provider = "openai" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].targets[0].timeout_secs = Some(180);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.routes[0].targets[0].timeout_secs,
+            Some(180),
+            "target timeout_secs should survive round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_removes_target_timeout_secs_when_none() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4"
+targets = [
+    { provider = "openai", timeout_secs = 180 },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].targets[0].timeout_secs = None;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let after_routes = saved
+            .split("[[routes]]")
+            .nth(1)
+            .expect("should have a routes section");
+        assert!(
+            !after_routes.contains("timeout_secs"),
+            "None target timeout_secs should be removed from disk, got:\n{after_routes}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_all_provider_fields_with_non_default_values() {
+        // Table-driven round-trip test: every field of ProviderConfig is
+        // set to a non-default value, saved through the update path
+        // (provider already exists on disk), then reloaded. If any field
+        // is missing from `update_existing_provider`, this test catches
+        // it — the reloaded value will be the default, not our non-default.
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        let mut model_overrides = HashMap::new();
+        let mut inner = HashMap::new();
+        inner.insert("max_tokens".into(), serde_json::json!(4096));
+        model_overrides.insert("gpt-4o".into(), inner);
+
+        let mut role_mappings = HashMap::new();
+        role_mappings.insert("developer".into(), "system".into());
+
+        let mut body_overrides = HashMap::new();
+        body_overrides.insert("temperature".into(), serde_json::json!(0.3));
+
+        let mut headers = HashMap::new();
+        headers.insert("X-Test".into(), "1".into());
+
+        config.providers.insert(
+            "openai".into(),
+            ProviderConfig {
+                provider_type: ProviderType::Anthropic,
+                api_keys: vec!["sk-a".into(), "sk-b".into()],
+                key_strategy: KeyStrategy::RoundRobin,
+                base_url: "https://custom.example.com/v1".into(),
+                models_endpoint: "v1/list".into(),
+                timeout_secs: 300,
+                chunk_timeout_secs: Some(30),
+                ttfb_timeout_secs: Some(45),
+                headers,
+                body_overrides,
+                model_overrides,
+                role_mappings,
+                enabled: false,
+                enabled_models: vec!["gpt-4o".into()],
+                anthropic_cache_control: false,
+            },
+        );
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let p = reloaded.providers.get("openai").unwrap();
+
+        assert_eq!(p.provider_type, ProviderType::Anthropic);
+        assert_eq!(p.api_keys, vec!["sk-a", "sk-b"]);
+        assert_eq!(p.key_strategy, KeyStrategy::RoundRobin);
+        assert_eq!(p.base_url, "https://custom.example.com/v1");
+        assert_eq!(p.models_endpoint, "v1/list");
+        assert_eq!(p.timeout_secs, 300);
+        assert_eq!(p.chunk_timeout_secs, Some(30));
+        assert_eq!(p.ttfb_timeout_secs, Some(45));
+        assert_eq!(p.headers.get("X-Test").map(String::as_str), Some("1"));
+        assert_eq!(p.headers.len(), 1);
+        assert_eq!(
+            p.body_overrides.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.3)
+        );
+        assert_eq!(p.body_overrides.len(), 1);
+        let mo = &p.model_overrides;
+        assert_eq!(mo.len(), 1);
+        let gpt4 = mo.get("gpt-4o").unwrap();
+        assert_eq!(gpt4.get("max_tokens").and_then(|v| v.as_u64()), Some(4096));
+        assert_eq!(
+            p.role_mappings.get("developer").map(String::as_str),
+            Some("system")
+        );
+        assert_eq!(p.role_mappings.len(), 1);
+        assert!(!p.enabled);
+        assert_eq!(p.enabled_models, vec!["gpt-4o"]);
+        assert!(!p.anthropic_cache_control);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_anthropic_cache_control_false() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .anthropic_cache_control = false;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let p = reloaded.providers.get("openai").unwrap();
+        assert!(
+            !p.anthropic_cache_control,
+            "anthropic_cache_control=false should survive round-trip"
         );
 
         let _ = std::fs::remove_file(&path);

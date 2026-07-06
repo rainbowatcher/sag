@@ -540,6 +540,12 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Upstream endpoint path used by admin APIs to fetch available models.
     /// Defaults to `models`, appended to `base_url`.
+    ///
+    /// Deliberately has **no** `skip_serializing_if` — this field is always
+    /// written to disk even when equal to the default. The create path
+    /// (`to_document`) and the update path (`update_existing_provider`)
+    /// both write it unconditionally. Do not add `skip_serializing_if`
+    /// without also updating the update path to mirror the skip rule.
     #[serde(default = "default_models_endpoint")]
     pub models_endpoint: String,
     /// Timeout in seconds for requests to this provider.
@@ -1048,8 +1054,8 @@ targets = [
     fn parse_legacy_top_level_retries_ignored() {
         // `retries` moved under [backoff]; serde silently ignores the
         // top-level key and backoff.retries falls back to its default (2).
-        // The loader emits a warning when it detects this (see
-        // warn_legacy_top_level_retries).
+        // The loader's unknown-key detection will warn about top-level
+        // `retries` as an unrecognised key.
         let toml_str = r#"
 [server]
 [providers.openai]
