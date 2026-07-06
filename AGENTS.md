@@ -1,17 +1,5 @@
 # SAG (Smart AI Gateway) 项目指南
 
-## 项目概述
-
-SAG 是一个 LLM API 反向代理网关，接收 OpenAI 兼容的 `/v1/chat/completions` 请求，按优先级自动故障转移到多个上游 LLM 提供商，并附带用量统计和管理面板。
-
-## 技术栈
-
-| 层面 | 技术 |
-|---|---|
-| **后端** | Rust 2024 edition, Axum 0.8, Tokio, Serde, SQLx (SQLite), Reqwest |
-| **前端** | Vue 3.5 (Composition API + `<script setup>`), TypeScript 5.7, Vite 6.4, Pinia, Tailwind CSS v4, shadcn-vue |
-| **工具** | Cargo workspace, just, pnpm, oxlint/oxfmt, vitepress |
-
 ## 关键命令
 
 ### 后端 (Rust)
@@ -28,22 +16,6 @@ SAG 是一个 LLM API 反向代理网关，接收 OpenAI 兼容的 `/v1/chat/com
 - `pnpm lint` — oxlint 检查
 - `pnpm format` — oxfmt 格式化
 - `pnpm typecheck` — vue-tsc 类型检查
-
-## 目录结构
-
-```
-sag/
-├── sag-core/           # 共享类型、错误枚举、工具函数
-├── sag-config/         # TOML 配置定义 + 热重载
-├── sag-providers/      # LLM 提供商适配器 (OpenAI, Anthropic)
-├── sag-router/         # Axum 路由、中间件、Handler
-├── sag-analytics/      # SQLite 用量统计
-├── sag-gateway/        # 二进制入口 main.rs
-├── sag-ui/             # Vue 3 管理面板
-├── docs/               # mdBook 文档 (中文)
-├── scripts/            # 开发工具脚本
-└── gateway.toml        # 网关配置 (gitignored)
-```
 
 ## 代码规范
 
@@ -87,16 +59,9 @@ sag/
 - 遇到框架/库相关的使用问题、API 语法、配置选项或版本迁移时，**优先通过 `find-docs` skill 查阅最新官方文档**，不要依赖训练数据中的知识。
 - **排查问题时尤其要遵循此原则**——先查官方文档确认 API 签名、配置项、版本差异，再下结论，避免凭记忆或过时经验猜测。
 
-## 开发流程
-
-1. 确保安装了 `mise.toml` 中列出的工具 (just, node, pnpm 等)
-2. `just setup` — 初始化开发环境（配置 git hooks、生成配置、安装前端依赖）
-3. `just dev` 或 `python3 scripts/dev.py` — 启动开发环境
-4. 提交前运行 `just test` + `just lint` 确保代码质量
-
 ## 测试环境
 
-仓库根目录的 `scripts/test-env.py` 提供与开发环境**物理隔离**的 release 路径 —— 真实 release 二进制、内嵌 UI、独立端口、独立 SQLite、独立的 PID / 锁 / 元数据目录。这与 `just dev` 走的 hot-loop 路径是平行的两条轨道，agent 工具与运维脚本应在同一表面工作。
+`scripts/test-env.py` 提供与开发环境物理隔离的 release 路径，agent 工具与运维脚本均通过 `just test-env <子命令>` 操作。
 
 ### 两轨对比
 
@@ -109,13 +74,6 @@ sag/
 | 日志 | stdout（watchexec 接管） | `logs/test-env.log`（append，grep 友好） |
 | 配置 | `gateway.toml` | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
 | SQLite | `analytics.db` | `analytics-test.db` |
-
-### 物理隔离的意义
-
-- **真实二进制形态**：release 与 debug 编译路径在 serde / chrono / tokio 调度层面差异显著，debug 形态的请求日志、错误堆栈、内存布局无法代表 ops 上的实际表现。
-- **生产同款热重载**：开发轨的 watchexec 会清掉运行时状态；测试轨走文件级 `notify`，与 ops 部署时的热重载语义完全一致。其中 **`[server].host` / `[server].port` 改动不触发 listen socket 重新 bind**，修改这两字段后必须 `stop` + `start`（详见 `docs/src/deployment.md` 的「热重载边界」节）。
-- **避免相互污染**：独立端口避免 dev 与 test-env 同时拉起时的 socket 竞争，独立 SQLite 让长跑测试不会覆盖常规用量统计。
-- **operator-driven 仿真**：四子命令 `start` / `stop` / `restart` / `status` 对应 systemd / supervisor 的下命令形态，agent 与运维在同一接口工作。
 
 ### 启动顺序
 
