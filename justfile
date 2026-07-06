@@ -34,9 +34,9 @@ ui-install:
 
 # ── 测试 ────────────────────────────────────────────────────────────
 
-# 运行所有 Rust 测试
-test:
-    cargo test --no-fail-fast
+# 运行 Rust 测试（可追加参数，例如 `just test --tests` 仅运行单元/集成测试）
+test *args:
+    cargo test --no-fail-fast {{ args }}
 
 # 运行单个 crate 的测试 (e.g. just test-crate sag-config)
 test-crate crate:

@@ -4,7 +4,9 @@
 
 ### 后端 (Rust)
 - `just build` — 构建 release
-- `just test` — 运行所有测试 (`cargo test --no-fail-fast`)
+- `just test` — 运行 Rust 测试（可追加参数，如 `just test --tests` 仅运行单元/集成测试）
+- `just test --tests` — 仅运行单元测试和集成测试（跳过 doc test），验证 codebase 时优先使用
+- `just test --doc` — 仅运行文档测试
 - `just lint` — clippy + 前端 lint
 - `just fmt` — rustfmt 格式化
 - `just run` — 以 debug 模式运行网关
@@ -23,6 +25,8 @@
 
 - **错误处理**: 使用 `AppError` (thiserror) + `sag_core::Result<T>`，通过 `IntoResponse` 转为 JSON 错误响应
 - **测试**: 使用 `#[cfg(test)] mod tests` + `#[tokio::test]`，优先内联测试
+- **验证 codebase**: 使用 `just test --tests`（仅运行单元/集成测试，不包含 doc test）；需要 doc test 时请用 `just test --doc`
+- **当前仓库现状**: 无 doc test、无 examples、无 bin 测试
 - **共享状态**: `AppState` 使用 `Arc<RwLock<...>>` + `ConfigHandle`
 - **Provider 模式**: `#[async_trait] pub trait LlmProvider`，通过 `Arc<dyn LlmProvider>` 存储
 - **导入顺序**: 标准库 → 外部 crate → 内部 crate, 空行分组
