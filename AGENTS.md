@@ -55,6 +55,7 @@ sag/
 - **Provider 模式**: `#[async_trait] pub trait LlmProvider`，通过 `Arc<dyn LlmProvider>` 存储
 - **导入顺序**: 标准库 → 外部 crate → 内部 crate, 空行分组
 - **模块导出**: `lib.rs` 统一 `pub use ...` 重新导出公开类型
+- **格式化**: 任何对 `.rs` 文件的修改完成后，必须运行 `cargo fmt`（或 `just fmt`）确保代码符合 rustfmt 风格。提交前 `pre-commit` hook 会检查 `cargo fmt --check`，未格式化的代码无法通过。
 
 ### 前端 (Vue/TypeScript)
 - **组件**: `<script setup lang="ts">` Composition API
