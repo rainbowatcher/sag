@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -207,6 +208,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
     Ok(ConfigHandle {
         inner: Arc::new(RwLock::new(config)),
         config_path: Some(Arc::new(path)),
+        routes_version: Arc::new(AtomicU64::new(1)),
     })
 }
 

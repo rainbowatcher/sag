@@ -171,6 +171,7 @@ pub async fn create_route(
 
         config.routes.push(route);
 
+        state.config.bump_routes_version();
         state.config.try_persist(&config, "creating route");
     }
 
@@ -227,6 +228,7 @@ pub async fn update_route(
             existing.targets = targets.into_iter().map(Into::into).collect();
         }
 
+        state.config.bump_routes_version();
         state.config.try_persist(&config, "updating route");
     }
 
@@ -257,6 +259,7 @@ pub async fn delete_route(
                 .into_response();
         }
 
+        state.config.bump_routes_version();
         state.config.try_persist(&config, "deleting route");
     }
 

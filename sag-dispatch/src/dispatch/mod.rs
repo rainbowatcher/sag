@@ -367,6 +367,7 @@ pub(in crate::dispatch) fn success_log(
         usage,
         user_agent,
         client_ip,
+        error_category: None,
     }
 }
 
@@ -403,6 +404,7 @@ pub(in crate::dispatch) fn failure_log(
         reasoning_tokens: None,
         user_agent: user_agent.map(|s| s.to_string()),
         client_ip: client_ip.map(|s| s.to_string()),
+        error_category: Some(err.error_category().to_string()),
     }
 }
 
@@ -415,6 +417,10 @@ pub(in crate::dispatch) fn failure_log(
 /// loops (chat, image, …) to keep attribution symmetric.
 ///
 /// The most-recent entry in `errors` is recorded as the failure reason.
+/// `error_category` is supplied by the caller based on the dispatch context
+/// (e.g. `"provider_error"` for upstream failures, `"network_error"` for
+/// transport errors, etc.) because the wrapped `AppError::Internal(...)` would
+/// otherwise lose the original error classification.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn log_per_target_failure(
     state: &AppState,
@@ -425,6 +431,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
     is_stream: bool,
     start: Instant,
     errors: &[String],
+    error_category: &str,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
 ) {
@@ -432,7 +439,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
         .last()
         .cloned()
         .unwrap_or_else(|| "unknown".to_string());
-    state.collector.log(failure_log(
+    let mut log = failure_log(
         trace_id,
         provider_name,
         model,
@@ -443,7 +450,12 @@ pub(in crate::dispatch) fn log_per_target_failure(
         &AppError::Internal(last_err),
         user_agent,
         client_ip,
-    ));
+    );
+    // Override the error_category that `failure_log` derived from
+    // `AppError::Internal` with the caller-supplied category so the
+    // per-target row carries the real failure type.
+    log.error_category = Some(error_category.to_string());
+    state.collector.log(log);
 }
 
 /// Log a non-success entry and return the matching JSON error response.
@@ -499,7 +511,16 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         "all providers exhausted"
     );
     state.collector.log(failure_log(
-        trace_id, "", model, "", is_stream, start, 502, &err, user_agent, client_ip,
+        trace_id,
+        "__all_exhausted__",
+        model,
+        "__all_exhausted__",
+        is_stream,
+        start,
+        502,
+        &err,
+        user_agent,
+        client_ip,
     ));
     err.into_response()
 }

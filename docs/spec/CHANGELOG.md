@@ -7,6 +7,10 @@ updated: 2026-06-27
 
 按时间倒序列出所有模块的变更记录。
 
+## 2026-07-06
+
+- **调度**：[0002 路由删除后缓存泄漏修复](dispatch/changes/0002-cache-leak-fix.md) — `resolve_route()` 开头惰性清理已删除路由的 `fill_first_orders`、`route_counters`、`active_targets` 缓存条目
+
 ## 2026-06-27
 
 - **UI**：[0002 表格固定表头与玻璃拟态效果](ui/changes/0002-sticky-header.md) — 四个表格页面 sticky 表头、`[&>div]:h-full` 高度传递模式、玻璃拟态表头

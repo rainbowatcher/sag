@@ -98,6 +98,7 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 
 ## 不变式
 
+- `resolve_route()` 通过对比 `ConfigHandle.routes_version` 与 `DispatchRuntime.last_prune_version` 实现惰性缓存清理；仅在版本差异时移除已不存在路由对应的 `fill_first_orders`、`route_counters`、`active_targets` 条目。路由变更方（admin API / 热重载）负责递增 `routes_version`
 - 4xx 错误永远不会触发重试（不管 retries 设多少）
 - 非流式请求使用 `timeout_secs` 做整体超时；流式请求使用 `chunk_timeout_secs` 做 chunk 间超时
 - backoff 在每次重试前 sleep（不是在失败后立即 sleep）
@@ -110,4 +111,5 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 - 关键场景：熔断器交互、重试耗尽、流式超时、4xx 立即停止、时间穿越（UTC 时间戳）
 
 ## 变更记录
+- [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
 - [0001 初始化](changes/0001-initial.md)

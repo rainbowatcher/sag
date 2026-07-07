@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -17,6 +18,10 @@ use std::collections::HashMap;
 pub struct ConfigHandle {
     pub(crate) inner: Arc<RwLock<GatewayConfig>>,
     pub(crate) config_path: Option<Arc<PathBuf>>,
+    /// Monotonically increasing counter bumped on every routes mutation
+    /// (admin CRUD or hot-reload). Used by the dispatch layer to skip
+    /// stale-entry pruning when the route set hasn't changed.
+    pub(crate) routes_version: Arc<AtomicU64>,
 }
 
 impl ConfigHandle {
@@ -25,6 +30,7 @@ impl ConfigHandle {
         Self {
             inner: Arc::new(RwLock::new(config)),
             config_path: None,
+            routes_version: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -59,6 +65,17 @@ impl ConfigHandle {
         {
             warn!(?e, "failed to persist config after {action}");
         }
+    }
+
+    /// Bump the routes version. Call after any mutation to the routes list
+    /// (admin CRUD or hot-reload) so the dispatch layer can detect staleness.
+    pub fn bump_routes_version(&self) {
+        self.routes_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Return the current routes version (used by the dispatch prune guard).
+    pub fn routes_version(&self) -> u64 {
+        self.routes_version.load(Ordering::Acquire)
     }
 }
 

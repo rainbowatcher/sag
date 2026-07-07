@@ -1,6 +1,6 @@
 //! Route resolution: model → ordered fallback targets + `api_endpoint`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,6 +30,26 @@ pub async fn resolve_route(
 ) -> Result<ResolvedRoute, Response<Body>> {
     let config_guard = state.config.read().await;
 
+    // Prune stale cache entries for routes that have been deleted
+    // (e.g. via admin API or config hot-reload). Skip when the
+    // routes_version hasn't changed — in steady state every request
+    // avoids three write-lock acquisitions.
+    let current_version = state.config.routes_version();
+    let last = runtime
+        .last_prune_version
+        .load(std::sync::atomic::Ordering::Acquire);
+    if current_version != last {
+        let valid_names: HashSet<&str> = config_guard
+            .routes
+            .iter()
+            .map(|r| r.model_name.as_str())
+            .collect();
+        runtime.prune_stale_entries(&valid_names).await;
+        runtime
+            .last_prune_version
+            .store(current_version, std::sync::atomic::Ordering::Release);
+    }
+
     let route = config_guard
         .routes
         .iter()
@@ -40,9 +60,9 @@ pub async fn resolve_route(
         return Err(failure_response(
             state,
             trace_id,
-            "",
+            "__no_route__",
             &request.model,
-            "",
+            "__no_route__",
             is_stream,
             start,
             StatusCode::NOT_FOUND,
@@ -67,9 +87,9 @@ pub async fn resolve_route(
         return Err(failure_response(
             state,
             trace_id,
-            "",
+            "__all_disabled__",
             &request.model,
-            "",
+            "__all_disabled__",
             is_stream,
             start,
             StatusCode::BAD_GATEWAY,
@@ -237,5 +257,122 @@ mod tests {
         }];
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");
         assert_eq!(filtered.len(), 1);
+    }
+
+    // ── resolve_route prune-stale-entries tests ───────────────────
+
+    /// Build a minimal [`AppState`] with a single route for testing
+    /// resolve_route + prune behaviour.
+    async fn build_state_for_prune_test() -> (AppState, DispatchRuntime) {
+        use std::collections::HashMap;
+
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        providers.insert("openai".into(), crate::testing::provider_config(true));
+
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![sag_config::RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            }],
+        }];
+
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+        (state, runtime)
+    }
+
+    fn test_request(model: &str) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid test request")
+    }
+
+    #[tokio::test]
+    async fn resolve_route_prunes_stale_entries_after_route_deletion() {
+        let (state, runtime) = build_state_for_prune_test().await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        // Pre-populate all three caches so we can verify prune clears
+        // every map, not just fill_first_orders.
+        runtime
+            .route_counters
+            .write()
+            .await
+            .insert("gpt-4o".into(), 42);
+        runtime
+            .active_targets
+            .write()
+            .await
+            .insert("gpt-4o".into(), ("openai".into(), "gpt-4o".into()));
+
+        // 1. First call: resolve route → populates fill_first_orders.
+        let result =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        assert!(result.is_ok(), "route should resolve successfully");
+
+        // All three caches are populated.
+        assert!(
+            runtime
+                .fill_first_orders
+                .read()
+                .await
+                .contains_key("gpt-4o")
+        );
+        assert!(runtime.route_counters.read().await.contains_key("gpt-4o"));
+        assert!(runtime.active_targets.read().await.contains_key("gpt-4o"));
+
+        // 2. Simulate route deletion: remove it from config and bump
+        //    the routes version so the prune guard knows to run.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.routes.retain(|r| r.model_name != "gpt-4o");
+            state.config.bump_routes_version();
+        }
+
+        // 3. Second call: route gone → ModelNotFound, but prune ran first.
+        let result2 =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        assert!(
+            result2.is_err(),
+            "second resolve should fail with ModelNotFound"
+        );
+
+        // 4. Verify all stale cache entries are cleaned up.
+        assert!(
+            !runtime
+                .fill_first_orders
+                .read()
+                .await
+                .contains_key("gpt-4o"),
+            "stale fill_first_orders entry must be pruned"
+        );
+        assert!(
+            !runtime.route_counters.read().await.contains_key("gpt-4o"),
+            "stale route_counters entry must be pruned"
+        );
+        assert!(
+            !runtime.active_targets.read().await.contains_key("gpt-4o"),
+            "stale active_targets entry must be pruned"
+        );
     }
 }

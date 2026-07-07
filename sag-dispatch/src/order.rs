@@ -10,8 +10,9 @@ use tokio::sync::RwLock;
 /// full target vector (including per-target `HashMap` extra fields).
 #[derive(Debug, Clone)]
 pub struct CachedOrder {
-    targets: Arc<[RouteTarget]>,
-    created_at: Instant,
+    // `pub(crate)` so sibling module tests can construct test instances.
+    pub(crate) targets: Arc<[RouteTarget]>,
+    pub(crate) created_at: Instant,
 }
 
 /// Order the target list according to the route's strategy.

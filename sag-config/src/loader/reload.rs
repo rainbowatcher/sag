@@ -29,6 +29,7 @@ impl HotReloadHandle {
 pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
     let inner = handle.inner.clone();
     let path = handle.config_path.clone();
+    let routes_version = handle.routes_version.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let task = tokio::spawn(async move {
@@ -88,6 +89,7 @@ pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
                                     Ok(new_config) => {
                                         let mut guard = inner.write().await;
                                         *guard = new_config;
+                                        routes_version.fetch_add(1, std::sync::atomic::Ordering::Release);
                                         info!("configuration hot-reloaded");
                                     }
                                     Err(e) => {

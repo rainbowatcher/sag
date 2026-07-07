@@ -14,14 +14,15 @@ updated: 2026-06-29
 ### 分发流程
 
 1. 接收客户端请求（ChatCompletionRequest / ImageGenerationRequest）
-2. 匹配路由 → 按策略排序 targets
-3. 对每个 target，反复尝试至重试耗尽：
+2. 检查 `routes_version`，仅在路由集发生变更时执行惰性缓存清理（`prune_stale_entries`），移除 config 路由中已不存在的 model_name 对应的 `fill_first_orders`、`route_counters`、`active_targets` 条目；版本未变则跳过，避免不必要的写锁竞争
+3. 匹配路由 → 按策略排序 targets
+4. 对每个 target，反复尝试至重试耗尽：
    a. 检查熔断器状态（冷却中则跳过）
    b. 检查 provider 是否 enabled
    c. 调用 provider（chat / chat_stream / chat_image）
    d. 成功 → 返回响应
    e. 失败 → 根据错误类型决定重试或 fallthrough
-4. 全部 targets 耗尽 → 返回聚合错误
+5. 全部 targets 耗尽 → 返回聚合错误
 
 ### 重试退避
 
@@ -90,4 +91,5 @@ updated: 2026-06-29
 
 ## 变更记录
 
+- [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
 - [0001 初始化](changes/0001-initial.md)
