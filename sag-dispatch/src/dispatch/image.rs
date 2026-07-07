@@ -9,6 +9,7 @@ use axum::{
 use sag_core::{ChatCompletionRequest, ImageGenerationRequest, ImageGenerationResponse};
 
 use crate::dispatch::resolve::resolve_provider;
+use crate::dispatch::retry::RetryOutcome;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
@@ -87,6 +88,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         )
         .await;
 
+        // Extract the error_category from the outcome before
+        // `apply_circuit_outcome` consumes it.
+        let category = match &outcome {
+            RetryOutcome::Exhausted(e) => e.error_category(),
+            RetryOutcome::NonRetryable => "bad_request",
+            RetryOutcome::Success(_) => "", // never logged
+        };
+
         let Some(resp) =
             apply_circuit_outcome(runtime, circuit_key, outcome, &circuit_breaker_cfg).await
         else {
@@ -101,6 +110,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 false,
                 start,
                 errors,
+                category,
                 user_agent.as_deref(),
                 client_ip.as_deref(),
             );

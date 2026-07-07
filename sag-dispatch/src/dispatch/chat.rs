@@ -9,6 +9,7 @@ use axum::{
 use sag_core::{ChatCompletionResponse, StreamChunk};
 
 use crate::dispatch::resolve::resolve_provider;
+use crate::dispatch::retry::RetryOutcome;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
@@ -120,6 +121,16 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         )
         .await;
 
+        // Extract the error_category from the outcome before
+        // `apply_circuit_outcome` consumes it, so per-target
+        // failure logs carry the real failure type instead of a
+        // generic "provider_error".
+        let category = match &outcome {
+            RetryOutcome::Exhausted(e) => e.error_category(),
+            RetryOutcome::NonRetryable => "bad_request",
+            RetryOutcome::Success(_) => "", // never logged — Success never reaches the else block
+        };
+
         let Some(attempt) =
             apply_circuit_outcome(runtime, circuit_key, outcome, &circuit_breaker_cfg).await
         else {
@@ -134,6 +145,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 is_stream,
                 start,
                 errors,
+                category,
                 user_agent.as_deref(),
                 client_ip.as_deref(),
             );

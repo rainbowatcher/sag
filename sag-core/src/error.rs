@@ -128,6 +128,27 @@ impl AppError {
             _ => CircuitHint::Generic,
         }
     }
+
+    /// Map the error variant to a machine-readable category for analytics.
+    ///
+    /// Used by [`crate::CallLog::error_category`] so dashboards can filter
+    /// and aggregate by error type without string-matching on `error`.
+    pub fn error_category(&self) -> &'static str {
+        match self {
+            AppError::Config(_) => "internal_error",
+            AppError::Unauthorized(_) => "auth_error",
+            AppError::Upstream { .. } => "provider_error",
+            AppError::BadRequest(_) => "bad_request",
+            AppError::ModelNotFound(_) => "model_not_found",
+            AppError::NotFound(_) => "internal_error",
+            AppError::Conflict(_) => "internal_error",
+            AppError::AllProvidersExhausted { .. } => "all_exhausted",
+            AppError::Network(_) => "network_error",
+            AppError::TtfbTimeout { .. } => "timeout",
+            AppError::Internal(_) => "internal_error",
+            AppError::Anyhow(_) => "internal_error",
+        }
+    }
 }
 
 impl IntoResponse for AppError {

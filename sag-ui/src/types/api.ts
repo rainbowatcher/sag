@@ -132,6 +132,8 @@ export interface CallLog {
   user_agent?: string
   /** Client IP from X-Forwarded-For / X-Real-IP headers. */
   client_ip?: string
+  /** Machine-readable error category (e.g. "model_not_found", "provider_error", "timeout"). */
+  error_category?: string
 }
 
 /** Time-bucketed trend row returned by `GET /v1/analytics/trend`. */

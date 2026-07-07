@@ -126,10 +126,12 @@ impl LogStore for SqliteLogStore {
                      reasoning_effort,
                      upstream_duration_ms, ttft_ms,
                      cached_tokens, cache_creation_tokens, reasoning_tokens,
-                     user_agent, client_ip)
+                     user_agent, client_ip,
+                     error_category)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?,
-                        ?, ?)
+                        ?, ?,
+                        ?)
                 "#,
             )
             .bind(log.request_id.to_string())
@@ -153,6 +155,7 @@ impl LogStore for SqliteLogStore {
             .bind(log.reasoning_tokens.map(|v| v as i64))
             .bind(log.user_agent.as_ref())
             .bind(log.client_ip.as_ref())
+            .bind(log.error_category.as_ref())
             .execute(&self.pool)
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert call log: {e}")))?;
@@ -243,7 +246,8 @@ impl LogStore for SqliteLogStore {
                 reasoning_effort,
                 upstream_duration_ms, ttft_ms,
                 cached_tokens, cache_creation_tokens, reasoning_tokens,
-                user_agent, client_ip
+                user_agent, client_ip,
+                error_category
             FROM call_logs
             "#,
         );
@@ -451,6 +455,7 @@ struct LogRow {
     reasoning_tokens: Option<i64>,
     user_agent: Option<String>,
     client_ip: Option<String>,
+    error_category: Option<String>,
 }
 
 impl LogRow {
@@ -511,6 +516,7 @@ impl LogRow {
             reasoning_tokens: self.reasoning_tokens.map(|v| v as u32),
             user_agent: self.user_agent,
             client_ip: self.client_ip,
+            error_category: self.error_category,
         }
     }
 }
@@ -548,6 +554,7 @@ mod tests {
             reasoning_tokens: None,
             user_agent: None,
             client_ip: None,
+            error_category: None,
         }
     }
 
@@ -639,6 +646,7 @@ mod tests {
 
         let log = CallLog {
             usage: None,
+            error_category: None,
             ..make_log("openai", "gpt-4o", "gpt-4o")
         };
         store.insert_batch(&[log]).await.unwrap();
@@ -709,6 +717,7 @@ mod tests {
             reasoning_tokens: Some(20),
             user_agent: Some("curl/8.0.1".into()),
             client_ip: Some("203.0.113.7".into()),
+            error_category: None,
         };
         store
             .insert_batch(std::slice::from_ref(&log))

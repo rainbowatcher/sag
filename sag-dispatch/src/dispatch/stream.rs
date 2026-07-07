@@ -155,6 +155,11 @@ where
                         usage: Some(state.usage),
                         user_agent: state.user_agent.clone(),
                         client_ip: state.client_ip.clone(),
+                        error_category: if status_code == 200 {
+                            None
+                        } else {
+                            Some("stream_error".to_string())
+                        },
                     });
                     return None;
                 }

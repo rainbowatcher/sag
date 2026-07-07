@@ -97,6 +97,7 @@ mod tests {
     use uuid::Uuid;
 
     fn make_log(provider: &str, model: &str, real_model: &str, status_code: u16) -> CallLog {
+        let is_error = status_code >= 400;
         CallLog {
             request_id: Uuid::new_v4(),
             provider: provider.into(),
@@ -113,7 +114,7 @@ mod tests {
                 cache_creation_tokens: None,
                 reasoning_tokens: None,
             }),
-            error: if status_code >= 400 {
+            error: if is_error {
                 Some("upstream failed".into())
             } else {
                 None
@@ -127,6 +128,11 @@ mod tests {
             reasoning_tokens: None,
             user_agent: None,
             client_ip: None,
+            error_category: if is_error {
+                Some("provider_error".into())
+            } else {
+                None
+            },
         }
     }
 
