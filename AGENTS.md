@@ -25,6 +25,10 @@
 
 - **错误处理**: 使用 `AppError` (thiserror) + `sag_core::Result<T>`，通过 `IntoResponse` 转为 JSON 错误响应
 - **测试**: 使用 `#[cfg(test)] mod tests` + `#[tokio::test]`，优先内联测试
+- **单元测试 vs 集成测试目录规范**:
+  - **单元测试**: 放在 `src/` 文件中，通过 `#[cfg(test)] mod tests` 内联于被测模块底部。只测试当前模块的内部细节，不依赖外部资源（文件系统、网络、环境变量、config handle）。使用 `test_dispatch_runtime()` 或 `test_app_state()` 等内存 fixture
+  - **集成测试**: 放在 crate 级 `tests/` 目录下（如 `sag-router/tests/auth_regression.rs`）。测试跨模块的公共 API 或完整请求生命周期，允许配置文件和端到端请求
+  - **何时写哪个**: 逻辑正确性验证 → 单元测试（内联）；跨模块协作 / 完整流程 / admin API → 集成测试（`tests/` 目录）
 - **验证 codebase**: 使用 `just test --tests`（仅运行单元/集成测试，不包含 doc test）；需要 doc test 时请用 `just test --doc`
 - **当前仓库现状**: 无 doc test、无 examples、无 bin 测试
 - **共享状态**: `AppState` 使用 `Arc<RwLock<...>>` + `ConfigHandle`
