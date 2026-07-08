@@ -49,7 +49,7 @@ const displayTargets = computed(() => {
   const targets = [...props.modelValue]
   if (expandedId.value === null) {
     targets.sort((a, b) => {
-      const cmp = a.priority - b.priority
+      const cmp = (a.priority ?? 0) - (b.priority ?? 0)
       return sortDirection.value === "desc" ? -cmp : cmp
     })
   }
@@ -57,7 +57,7 @@ const displayTargets = computed(() => {
 })
 
 // --- Priority badge ---
-const maxPriority = computed(() => Math.max(1, ...props.modelValue.map((t) => t.priority)))
+const maxPriority = computed(() => Math.max(1, ...props.modelValue.map((t) => t.priority ?? 0)))
 
 function priorityBadgeVariant(p: number): "default" | "secondary" | "outline" {
   if (p <= 0) return "outline"
