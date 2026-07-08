@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2, RefreshCw, Trash2, Zap } from "@lucide/vue"
+import { Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import KvEditor from "@/components/KvEditor.vue"
@@ -58,6 +58,15 @@ const emit = defineEmits<{
 // ── Internal state ─────────────────────────────────
 const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
 const expandedOverride = ref<string | undefined>(undefined)
+const customModel = ref("")
+
+function addCustomModel() {
+  const trimmed = customModel.value.trim()
+  if (trimmed && !props.enabledModels.includes(trimmed)) {
+    emit("update:enabledModels", [...props.enabledModels, trimmed])
+  }
+  customModel.value = ""
+}
 
 // ── Clean up overrides when model removed ───────────
 watch(
@@ -195,6 +204,27 @@ function onModelsEndpointChange(value: string | number) {
         multiple
         @update:model-value="(v) => emit('update:enabledModels', v as string[])"
       />
+    </div>
+
+    <!-- Custom model input -->
+    <div class="flex items-center gap-2">
+      <Input
+        :model-value="customModel"
+        placeholder="Or type a model name..."
+        class="flex-1"
+        :disabled="disabled"
+        @update:model-value="customModel = String($event)"
+      />
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        :disabled="!customModel.trim()"
+        @click="addCustomModel"
+      >
+        <Plus class="h-3.5 w-3.5" />
+        Add
+      </Button>
     </div>
 
     <!-- Refresh + loading / error -->
