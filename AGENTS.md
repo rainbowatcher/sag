@@ -29,7 +29,7 @@
   - **单元测试**: 放在 `src/` 文件中，通过 `#[cfg(test)] mod tests` 内联于被测模块底部。只测试当前模块的内部细节，不依赖外部资源（文件系统、网络、环境变量、config handle）。使用 `test_dispatch_runtime()` 或 `test_app_state()` 等内存 fixture
   - **集成测试**: 放在 crate 级 `tests/` 目录下（如 `sag-router/tests/auth_regression.rs`）。测试跨模块的公共 API 或完整请求生命周期，允许配置文件和端到端请求
   - **何时写哪个**: 逻辑正确性验证 → 单元测试（内联）；跨模块协作 / 完整流程 / admin API → 集成测试（`tests/` 目录）
-- **验证 codebase**: 使用 `just test --tests`（仅运行单元/集成测试，不包含 doc test）；需要 doc test 时请用 `just test --doc`
+- **验证 codebase**: 使用 `just test --tests`（仅运行单元/集成测试，不包含 doc test）；仅在需要 doc test 时用 `just test --doc`
 - **当前仓库现状**: 无 doc test、无 examples、无 bin 测试
 - **共享状态**: `AppState` 使用 `Arc<RwLock<...>>` + `ConfigHandle`
 - **Provider 模式**: `#[async_trait] pub trait LlmProvider`，通过 `Arc<dyn LlmProvider>` 存储
@@ -63,6 +63,9 @@
 - 错误响应格式: `{ "error": { "code": "...", "message": "..." } }`
 - 避免使用路径参数
 
+### 网关设计原则
+- **对网关而言，拒绝未知值是反模式**：解析配置或请求体时应容忍未知字段（如额外字段、未知枚举值），采取「忽略 / 透传」而非「报错拒绝」的策略，以保证前向兼容与多 provider 适配。
+
 ### 文档优先原则
 - 遇到框架/库相关的使用问题、API 语法、配置选项或版本迁移时，**优先通过 `find-docs` skill 查阅最新官方文档**，不要依赖训练数据中的知识。
 - **排查问题时尤其要遵循此原则**——先查官方文档确认 API 签名、配置项、版本差异，再下结论，避免凭记忆或过时经验猜测。
@@ -79,7 +82,7 @@
 | 前端 | Vite dev server 独立 HMR | emit 后的产物通过 `rust-embed` 嵌入二进制（`--features embed-ui`） |
 | 默认端口 | 37210（读 `gateway.toml`） | 37211（读 `gateway.test.toml`） |
 | 状态目录 | n/a | `.test-env/{pid,lock,build-info.json}` |
-| 日志 | stdout（watchexec 接管） | `logs/test-env.log`（append，grep 友好） |
+| 日志 | `logs/sag.YYYY-MM-DD.log`（每日滚动，tracing-appender 写入；dev.py 将子进程 stdout 以 `[BE]` 标签回显到终端） | `logs/sag.YYYY-MM-DD.log`（每日滚动，grep 友好；stdout/stderr 重定向到 DEVNULL） |
 | 配置 | `gateway.toml` | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
 | SQLite | `analytics.db` | `analytics-test.db` |
 
@@ -105,7 +108,7 @@ just test-env start    # 真正启动 gateway；同上必须显式写
 
 误输 `just test-env` 看到 `[ERR] no test-env state (`.test-env/pid` missing)` 不是错，是状态为空 —— 跑 `just test-env start` 即可拉起。启动路径上的 4 类常见 bail 见下一小节。
 
-State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analytics-test.db`）、日志（`logs/test-env.log`）均列入 `.gitignore`，不会污染版本控制。
+State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analytics-test.db`）、日志（`logs/sag.*.log`）均列入 `.gitignore`，不会污染版本控制。
 
 ### Agent 工具接入要点
 
@@ -113,7 +116,7 @@ State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analyti
 - **start 的 fail-fast 路径**：缺 `./target/release/sag` → exit 1 + `[ERR] binary not found ... did you run \`just build-test\`?` ；缺 `gateway.test.toml` → exit 1 + `[ERR] config not found`。Agent 拿到 exit code 后追查即可，无须自己预先验证。
 - **`_acquire_lock()`** 走 `O_CREAT | O_EXCL` 原子获取，并发 `start` 互斥；agent 调 `restart` 时无须自己加锁。
 - **PID 文件是 canonical pointer**：status 路径先看 `.test-env/pid`，再 best-effort 读 `build-info.json`（缺失时打 `(build-info.json unavailable — partial state)` 而不是硬退）。无状态目录 → exit 1 + `[ERR] no test-env state`，agent 可作为运行探针使用。
-- **日志路径不变**：`logs/test-env.log` append 模式；SAG 进程不会自己重开该文件，reader agent 可放心 `tail -f` 或 `grep`。
+- **日志路径**：`logs/sag.YYYY-MM-DD.log` 每日滚动（tracing-appender 管理）；SAG 进程不会自己重开该文件，reader agent 可放心 `tail -f` 或 `grep`。
 - **隐式前置依赖**：改 `sag-ui/**.{ts,vue}` 之后必须重跑 `just build-test`，不然 `./target/release/sag` 仍是上一版 UI；改 `gateway.test.toml` 不需重建二进制（文件级 notify 热重载）。
 
 ## 开发环境与测试环境的边界
