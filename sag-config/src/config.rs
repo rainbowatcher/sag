@@ -588,8 +588,7 @@ pub struct ProviderConfig {
     ///
     /// TOML example:
     /// ```toml
-    /// [providers.openai.model_overrides]
-    /// gpt-4o = { max_tokens = 4096, temperature = 0.8 }
+    /// model_overrides = { "gpt-4o" = { max_tokens = 4096, temperature = 0.8 } }
     /// ```
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,

@@ -232,56 +232,35 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
             toml_edit::Value::from(v.as_str())
         });
     }
-    // model_overrides — regular table keyed by model name; remove
-    // key entirely if empty.
+    // model_overrides — inline table keyed by model name; remove
+    // key entirely if empty. Saved as inline-table syntax (like
+    // headers / body_overrides / role_mappings):
+    //   model_overrides = { "model-a" = { k = "v" } }
     if provider.model_overrides.is_empty() {
         table.remove("model_overrides");
     } else {
-        let mo_item = table
-            .entry("model_overrides")
-            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-        let mo_table = mo_item
-            .as_table_mut()
-            .expect("model_overrides must be a table");
+        let mo_inline = ensure_inline_table_field(table, "model_overrides");
+
         // Remove stale model entries.
         let model_set: std::collections::HashSet<&str> = provider
             .model_overrides
             .keys()
             .map(String::as_str)
             .collect();
-        let stale: Vec<String> = mo_table
+        let stale: Vec<String> = mo_inline
             .iter()
             .map(|(k, _)| k.to_string())
             .filter(|k| !model_set.contains(k.as_str()))
             .collect();
         for k in stale {
-            mo_table.remove(k.as_str());
+            mo_inline.remove(k.as_str());
         }
-        // Create or update each model's overrides as an inline table.
+        // Create or update each model's overrides as a nested inline table.
         for (model, overrides) in &provider.model_overrides {
             if overrides.is_empty() {
-                mo_table.remove(model);
+                mo_inline.remove(model);
             } else {
-                let model_item = mo_table.entry(model).or_insert_with(|| {
-                    toml_edit::Item::Value(toml_edit::Value::InlineTable(
-                        toml_edit::InlineTable::new(),
-                    ))
-                });
-                let model_table = match model_item {
-                    toml_edit::Item::Value(v) if v.is_inline_table() => {
-                        v.as_inline_table_mut().unwrap()
-                    }
-                    _ => {
-                        *model_item = toml_edit::Item::Value(toml_edit::Value::InlineTable(
-                            toml_edit::InlineTable::new(),
-                        ));
-                        model_item
-                            .as_value_mut()
-                            .unwrap()
-                            .as_inline_table_mut()
-                            .unwrap()
-                    }
-                };
+                let model_table = ensure_nested_inline_table(mo_inline, model);
                 sync_inline_table_in_place(model_table, overrides, json_to_toml_value);
             }
         }
@@ -2498,6 +2477,70 @@ api_keys = ["sk-test"]
         assert!(
             !p.anthropic_cache_control,
             "anthropic_cache_control=false should survive round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_then_update_model_overrides_does_not_panic() {
+        // Regression test: when a provider with non-empty model_overrides is
+        // first created (create path, saved as inline table via to_document),
+        // then modified and saved again (update path), the second save must
+        // NOT panic. The old code used `as_table_mut().expect(...)` on the
+        // model_overrides field, but the create path produces an inline table
+        // (not a sub-table), so `as_table_mut()` returned None -> panic.
+        //
+        // Setup: [providers] empty table, so the provider goes through the
+        // create path on first save.
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+        let mut config = openai_only_config();
+
+        // Add non-empty model_overrides.
+        let mut gpt4o = HashMap::new();
+        gpt4o.insert("max_tokens".into(), serde_json::json!(4096));
+        gpt4o.insert("temperature".into(), serde_json::json!(0.8));
+        config.providers.get_mut("openai").unwrap().model_overrides =
+            HashMap::from([("gpt-4o".into(), gpt4o.clone())]);
+
+        // First save: create path (provider doesn't exist on disk yet).
+        save_config_to_file(&config, &path).unwrap();
+
+        // Verify inline table format on disk.
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("model_overrides = {"),
+            "model_overrides should be inline table format on first save, got:\n{saved}"
+        );
+        assert!(
+            !saved.contains("[providers.openai.model_overrides]"),
+            "model_overrides should NOT be sub-table format, got:\n{saved}"
+        );
+
+        // Modify any field (e.g. timeout_secs) and save again: update path.
+        config.providers.get_mut("openai").unwrap().timeout_secs = 300;
+        // This must not panic.
+        save_config_to_file(&config, &path).unwrap();
+
+        // Reload and verify model_overrides values are preserved.
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let reloaded_mo = &reloaded.providers.get("openai").unwrap().model_overrides;
+        assert_eq!(
+            reloaded_mo,
+            &config.providers.get("openai").unwrap().model_overrides,
+            "model_overrides should survive create-then-update round-trip"
+        );
+
+        // Verify inline table format persists after second save.
+        let saved2 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved2.contains("model_overrides = {"),
+            "model_overrides should remain inline table format after update, got:\n{saved2}"
+        );
+        assert!(
+            !saved2.contains("[providers.openai.model_overrides]"),
+            "model_overrides should NOT become sub-table format after update, got:\n{saved2}"
         );
 
         let _ = std::fs::remove_file(&path);
