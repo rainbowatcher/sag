@@ -18,7 +18,9 @@ stop
     graceful exit, then SIGKILL. Cleans up lock + pid + build-info.
 
 restart
-    stop + start. If start fails, also clean up state.
+    stop + start. If start fails, also clean up state. `restart` tolerates
+    a missing pid file (nothing to stop) so it can bring up a fresh
+    instance even when no prior service exists.
 
 status (default when no subcommand given)
     Print pid / started_at / uptime / binary mtime + size / config path +
@@ -215,9 +217,14 @@ def cmd_start(args: argparse.Namespace) -> None:
         raise
 
 
-def cmd_stop(_args: Optional[argparse.Namespace] = None) -> None:
+def cmd_stop(
+    _args: Optional[argparse.Namespace] = None, allow_missing: bool = True
+) -> None:
     if not PID_FILE.exists():
-        log("ERR", "no pid file — nothing to stop")
+        if allow_missing:
+            log("SYS", "no pid file - nothing to stop (continuing)")
+            return
+        log("ERR", "no pid file - nothing to stop")
         sys.exit(1)
 
     try:
@@ -225,6 +232,8 @@ def cmd_stop(_args: Optional[argparse.Namespace] = None) -> None:
     except (ValueError, OSError) as exc:
         log("ERR", f"corrupt pid file: {exc}")
         _cleanup_state()
+        if allow_missing:
+            return
         sys.exit(1)
 
     if not pid_alive(pid):
@@ -268,7 +277,7 @@ def _cleanup_state() -> None:
 
 def cmd_restart(args: argparse.Namespace) -> None:
     log("SYS", "restart: stopping existing instance (if any)")
-    cmd_stop()
+    cmd_stop(allow_missing=True)
     log("SYS", "restart: starting fresh instance")
     cmd_start(args)
 
