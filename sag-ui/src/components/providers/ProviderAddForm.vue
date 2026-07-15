@@ -81,7 +81,7 @@ const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
   provider_type: z.string(),
   base_url: z.string(),
-  timeout_secs: z.number(),
+  timeout_secs: z.union([z.number(), z.undefined()]),
 })
 
 const form = useForm({
@@ -89,7 +89,7 @@ const form = useForm({
     name: "",
     provider_type: "openai",
     base_url: "https://api.openai.com/v1",
-    timeout_secs: 120,
+    timeout_secs: undefined as number | undefined,
   },
   validators: {
     onSubmit: formSchema,
@@ -137,19 +137,21 @@ const form = useForm({
 
       const validKeys = apiKeys.value.filter((k) => k.trim())
 
-      await store.addProvider({
+      // Omit timeout_secs when left blank so the backend applies its
+      // default (600s) — single source of truth, no frontend/backend drift.
+      const payload: Parameters<typeof store.addProvider>[0] = {
         name: value.name,
         api_keys: validKeys,
         key_strategy: keyStrategy.value,
         provider_type: value.provider_type,
         base_url: value.base_url || undefined,
-        timeout_secs: value.timeout_secs,
         headers: parsedHeaders,
         body_overrides: parsedBodyOverrides,
         model_overrides: parsedModelOverrides,
         enabled_models: enabledModels.value,
         models_endpoint: modelsEndpoint.value.trim() || undefined,
-      })
+      }
+      await store.addProvider(payload)
       toast.success(`Provider "${value.name}" created`)
       emit("created")
     } catch (e: any) {
@@ -282,9 +284,16 @@ async function handleSubmit(event: Event) {
                     :id="field.name"
                     type="number"
                     :model-value="field.state.value"
+                    placeholder="600 (默认)"
                     :aria-invalid="isInvalid(field)"
                     @blur="field.handleBlur"
-                    @input="field.handleChange(Number(($event.target as HTMLInputElement).value))"
+                    @input="
+                      field.handleChange(
+                        ($event.target as HTMLInputElement).value === ''
+                          ? undefined
+                          : Number(($event.target as HTMLInputElement).value),
+                      )
+                    "
                   />
                   <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
                 </Field>
