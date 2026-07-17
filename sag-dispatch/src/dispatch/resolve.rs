@@ -67,6 +67,7 @@ pub async fn resolve_route(
             start,
             StatusCode::NOT_FOUND,
             AppError::ModelNotFound(request.model.clone()),
+            request.reasoning_effort.as_deref(),
             user_agent,
             client_ip,
         ));
@@ -94,6 +95,7 @@ pub async fn resolve_route(
             start,
             StatusCode::BAD_GATEWAY,
             err,
+            request.reasoning_effort.as_deref(),
             user_agent,
             client_ip,
         ));
@@ -487,5 +489,45 @@ mod tests {
         assert_eq!(log.model, "gpt-4o");
         assert_eq!(log.status_code, 502);
         assert_eq!(log.error_category.as_deref(), Some("all_exhausted"));
+    }
+
+    // ── reasoning_effort round-trip test ─────────────────
+
+    fn test_request_with_reasoning(model: &str, reasoning_effort: &str) -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": reasoning_effort,
+        }))
+        .expect("valid test request")
+    }
+
+    #[tokio::test]
+    async fn resolve_route_failure_preserves_reasoning_effort() {
+        let (state, runtime) = build_state_no_routes().await;
+        let req = test_request_with_reasoning("gpt-4o", "low");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        let result =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        assert!(result.is_err(), "expected ModelNotFound error");
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].reasoning_effort.as_deref(),
+            Some("low"),
+            "reasoning_effort must round-trip through resolve failure path"
+        );
     }
 }

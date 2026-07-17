@@ -165,6 +165,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 start,
                 errors,
                 category,
+                request.reasoning_effort.as_deref(),
                 user_agent.as_deref(),
                 client_ip.as_deref(),
             );
@@ -226,6 +227,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
+        request.reasoning_effort.as_deref(),
         user_agent.as_deref(),
         client_ip.as_deref(),
     )

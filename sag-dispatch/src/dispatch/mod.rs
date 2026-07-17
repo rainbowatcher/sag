@@ -503,6 +503,7 @@ mod tests {
             &["openai: timeout".into(), "anthropic: 500".into()],
             None,
             None,
+            None,
         );
 
         state.collector.flush().await;
@@ -540,6 +541,7 @@ mod tests {
             start,
             StatusCode::BAD_REQUEST,
             AppError::BadRequest("unsupported param".into()),
+            None,
             None,
             None,
         );
@@ -580,6 +582,7 @@ mod tests {
             "provider_error",
             None,
             None,
+            None,
         );
 
         state.collector.flush().await;
@@ -597,6 +600,83 @@ mod tests {
             logs[0].error_category.as_deref(),
             Some("provider_error"),
             "error_category must be the caller-supplied value, not 'internal_error'"
+        );
+    }
+
+    // ── reasoning_effort round-trip tests ─────────────────────
+
+    #[tokio::test]
+    async fn fallback_exhausted_preserves_reasoning_effort() {
+        let state = build_test_state().await;
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        fallback_exhausted_response(
+            &state,
+            "gpt-4o",
+            false,
+            trace_id,
+            start,
+            &["openai: timeout".into()],
+            Some("high"),
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].reasoning_effort.as_deref(),
+            Some("high"),
+            "reasoning_effort must round-trip through fallback_exhausted_response"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_per_target_failure_preserves_reasoning_effort() {
+        let state = build_test_state().await;
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        log_per_target_failure(
+            &state,
+            trace_id,
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            false,
+            start,
+            &["upstream 500".into()],
+            "provider_error",
+            Some("medium"),
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].reasoning_effort.as_deref(),
+            Some("medium"),
+            "reasoning_effort must round-trip through log_per_target_failure"
         );
     }
 }
@@ -652,6 +732,7 @@ pub(in crate::dispatch) fn failure_log(
     start: Instant,
     status_code: u16,
     err: &AppError,
+    reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
 ) -> CallLog {
@@ -666,7 +747,7 @@ pub(in crate::dispatch) fn failure_log(
         usage: None,
         error: Some(err.to_string()),
         timestamp: chrono::Utc::now(),
-        reasoning_effort: None,
+        reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         upstream_duration_ms: None,
         ttft_ms: None,
         cached_tokens: None,
@@ -702,6 +783,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
     start: Instant,
     errors: &[String],
     error_category: &str,
+    reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
 ) {
@@ -718,6 +800,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
         start,
         502,
         &AppError::Internal(last_err),
+        reasoning_effort,
         user_agent,
         client_ip,
     );
@@ -740,6 +823,7 @@ pub(in crate::dispatch) fn failure_response(
     start: Instant,
     status_code: StatusCode,
     err: AppError,
+    reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
 ) -> Response<Body> {
@@ -752,6 +836,7 @@ pub(in crate::dispatch) fn failure_response(
         start,
         status_code.as_u16(),
         &err,
+        reasoning_effort,
         user_agent,
         client_ip,
     ));
@@ -766,6 +851,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
     trace_id: uuid::Uuid,
     start: Instant,
     errors: &[String],
+    reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
 ) -> Response<Body> {
@@ -789,6 +875,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         start,
         502,
         &err,
+        reasoning_effort,
         user_agent,
         client_ip,
     ));

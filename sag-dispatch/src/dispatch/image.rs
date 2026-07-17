@@ -130,6 +130,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 start,
                 errors,
                 category,
+                None, // reasoning_effort — not applicable for image generation
                 user_agent.as_deref(),
                 client_ip.as_deref(),
             );
@@ -168,6 +169,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         start,
         errors,
+        None, // reasoning_effort — not applicable for image generation
         user_agent.as_deref(),
         client_ip.as_deref(),
     )
@@ -311,6 +313,15 @@ mod tests {
             "messages": [{"role": "user", "content": "draw a cat"}],
         }))
         .expect("valid image test request")
+    }
+
+    fn build_request_with_reasoning(model: &str) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "draw a cat"}],
+            "reasoning_effort": "high",
+        }))
+        .expect("valid image test request with reasoning_effort")
     }
 
     async fn build_state(providers: Vec<Arc<dyn LlmProvider>>) -> AppState {
@@ -615,5 +626,43 @@ mod tests {
         );
         assert_eq!(img.extra.get("style"), Some(&serde_json::json!("vivid")));
         assert!(!img.extra.contains_key("unsupported_field"));
+    }
+
+    // ── reasoning_effort round-trip test ─────────────────
+
+    #[tokio::test]
+    async fn image_failure_always_writes_reasoning_effort_none() {
+        // Even when the client request includes reasoning_effort, the image
+        // dispatch path must always write None because image generation has
+        // no reasoning concept.
+        let m1 = Arc::new(MockImageProvider::new("first"));
+        m1.push_image(ImageBehavior::Retryable(AppError::Internal("fail".into())));
+        let state = build_state(vec![m1.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request_with_reasoning("dall-e-3");
+        let targets = vec![target("first", "dall-e-3", 0)];
+        let mut errors = Vec::new();
+
+        let _ = dispatch_image(make_ctx(&state, &rt, &req, &targets, &mut errors)).await;
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Two logs: per-target failure + fallback_exhausted_response
+        assert_eq!(logs.len(), 2);
+        for log in &logs {
+            assert_eq!(
+                log.reasoning_effort, None,
+                "image dispatch path must always write reasoning_effort=None, got {:?} for provider={}",
+                log.reasoning_effort, log.provider,
+            );
+        }
     }
 }
