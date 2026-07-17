@@ -81,13 +81,21 @@ async fn main() -> anyhow::Result<()> {
 
     let provider_registry = Arc::new(RwLock::new(providers));
 
-    // 8. Build AppState (shared resources) + DispatchRuntime (dispatch-only state)
+    // 8. Build AppState (shared resources) + DispatchRuntime (dispatch-only state).
+    //    The circuit breaker Arc is created first and injected into both
+    //    objects so they share the *same* live breaker instance.
+    let route_circuit_breaker: Arc<RwLock<sag_core::RouteCircuitBreaker>> =
+        Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default()));
+
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
         providers: provider_registry,
         collector,
+        circuit_breaker: route_circuit_breaker.clone(),
     };
-    let dispatch_runtime = sag_router::DispatchRuntime::default();
+    // `with_circuit_breaker` shares the same Arc (rather than creating a
+    // default one) so AppState and DispatchRuntime observe the same breaker.
+    let dispatch_runtime = sag_router::DispatchRuntime::with_circuit_breaker(route_circuit_breaker);
 
     // 9. Build router
     let app = sag_router::build_router(app_state, dispatch_runtime);

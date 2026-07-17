@@ -163,3 +163,18 @@ export interface LogFilter {
   offset?: number
   limit?: number
 }
+
+/** Circuit breaker entry returned by `GET /api/circuit-breaker`. */
+export interface CircuitBreakerEntry {
+  model: string
+  provider: string
+  real_model: string
+  state: "open" | "half_open"
+  /** UNIX timestamp (seconds) of the hard cooldown lower bound. */
+  cooldown_until_secs: number
+  /** `null` when HalfOpen (probe ready, no future schedule).
+   *  `number` when Open — next moment a probe is allowed (UNIX seconds). */
+  next_probe_at_secs: number | null
+  /** Whether a probe request is currently in flight (HalfOpen only). */
+  probe_in_flight: boolean
+}

@@ -57,6 +57,19 @@ impl Default for DispatchRuntime {
 }
 
 impl DispatchRuntime {
+    /// Construct a `DispatchRuntime` that shares the given circuit-breaker
+    /// `Arc` (instead of creating its own default). Used by `main.rs` so that
+    /// `AppState` and `DispatchRuntime` observe the *same* live breaker.
+    ///
+    /// All other fields (counters, ordering cache, active targets,
+    /// prune version) are initialized to their defaults.
+    pub fn with_circuit_breaker(route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>) -> Self {
+        Self {
+            route_circuit_breaker,
+            ..Default::default()
+        }
+    }
+
     /// Remove cached entries for model names that no longer exist
     /// in the current config routes. Called at the start of every
     /// `resolve_route` to prevent unbounded growth from

@@ -22,12 +22,14 @@ import {
 } from "chart.js"
 import { ref, onMounted, computed, watch } from "vue"
 import { Line, Pie } from "vue-chartjs"
+import CircuitBreakerPanel from "@/components/circuit/CircuitBreakerPanel.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { useChartTheme } from "@/composables/useChartTheme"
 import { useAnalyticsStore } from "@/stores/analytics"
+import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useHealthStore } from "@/stores/health"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
@@ -48,6 +50,7 @@ const providerStore = useProviderStore()
 const routeStore = useRouteStore()
 const analyticsStore = useAnalyticsStore()
 const healthStore = useHealthStore()
+const circuitBreakerStore = useCircuitBreakerStore()
 const { chartColors } = useChartTheme()
 
 onMounted(async () => {
@@ -56,6 +59,7 @@ onMounted(async () => {
     routeStore.fetchRoutes(),
     analyticsStore.fetchStats(),
     healthStore.checkHealth(),
+    circuitBreakerStore.fetchBreakers(),
   ])
 })
 
@@ -216,6 +220,9 @@ const pieChart = computed(() => ({
           </CardContent>
         </Card>
       </div>
+
+      <!-- Circuit breaker panel -->
+      <CircuitBreakerPanel />
 
       <!-- Trend & distribution charts -->
       <div class="flex flex-wrap items-center gap-3">

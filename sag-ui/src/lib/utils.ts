@@ -58,3 +58,26 @@ export function validateExtraJson(extra: string): string | null {
     return e?.message ? `Invalid JSON: ${e.message}` : "Invalid JSON"
   }
 }
+
+/**
+ * Format a static remaining-time label from a UNIX-seconds timestamp.
+ *
+ * `epochSecs` is in **seconds**; `Date.now()` is in **milliseconds**, so the
+ * delta is `epochSecs * 1000 - Date.now()`.
+ *
+ * @param epochSecs  UNIX timestamp in seconds.
+ * @param expiredLabel  Text to show when the moment has already elapsed.
+ *   Defaults to "已可恢复" (for cooldown). Pass "已可探测" for probe times.
+ * @returns Human-readable remaining time like "3m 45s", or `expiredLabel`.
+ */
+export function formatRemaining(epochSecs: number, expiredLabel = "已可恢复"): string {
+  const ms = epochSecs * 1000 - Date.now()
+  if (ms <= 0) return expiredLabel
+  const totalSec = Math.floor(ms / 1000)
+  const hours = Math.floor(totalSec / 3600)
+  const minutes = Math.floor((totalSec % 3600) / 60)
+  const seconds = totalSec % 60
+  if (hours > 0) return `${hours}h ${minutes}m`
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}

@@ -11,6 +11,7 @@
 //!   `POST /api/model/test`.
 
 pub mod admin;
+pub mod admin_circuit_breaker;
 pub mod admin_logs;
 pub mod admin_providers;
 pub mod admin_routes;

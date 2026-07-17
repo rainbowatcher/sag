@@ -79,3 +79,4 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 - [0001 初始化](changes/0001-initial.md)
 - [0002 熔断半开探测与冷却期周期探测](changes/0002-half-open-periodic-probe.md)
 - [0003 探测失败隐瞒冷却下界与流式取消探测槽泄漏修复](changes/0003-probe-lifetime-fix.md)
+- [0004 熔断状态可观测化](changes/0004-observability.md)

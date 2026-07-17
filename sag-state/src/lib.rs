@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use sag_analytics::CallLogCollector;
 use sag_config::ConfigHandle;
+use sag_core::RouteCircuitBreaker;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
 
@@ -21,7 +22,10 @@ use tokio::sync::RwLock;
 ///
 /// Holds only the cross-cutting resources that every handler family
 /// (proxy dispatch, admin CRUD, health/analytics) needs: the hot-reloadable
-/// config, the provider registry, and the analytics collector.
+/// config, the provider registry, the analytics collector, and the shared
+/// circuit-breaker handle. The circuit breaker is shared with
+/// [`sag_dispatch::DispatchRuntime`] via the same `Arc` so admin handlers
+/// can observe live breaker state without depending on the dispatch crate.
 #[derive(Clone)]
 pub struct AppState {
     /// Hot-reloadable gateway configuration.
@@ -30,6 +34,9 @@ pub struct AppState {
     pub providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>>,
     /// Async call log collector for analytics.
     pub collector: Arc<CallLogCollector>,
+    /// Shared route-target circuit breaker. The same `Arc` is injected into
+    /// `DispatchRuntime` at startup, so this handle observes live state.
+    pub circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
 }
 
 impl AppState {
@@ -95,6 +102,7 @@ pub mod testing {
             config,
             providers,
             collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
+            circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
         }
     }
 

@@ -23,7 +23,9 @@ pub mod testing;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
-pub use circuit_breaker::{RouteCircuitBreaker, RouteTargetKey};
+pub use circuit_breaker::{
+    CircuitBreakerEntry, CircuitStateKind, RouteCircuitBreaker, RouteTargetKey,
+};
 pub use dispatch::{
     DispatchCtx, ResolvedRoute, ResolvedTarget, dispatch_chat, dispatch_image, resolve_route,
 };

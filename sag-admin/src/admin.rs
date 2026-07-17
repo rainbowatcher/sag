@@ -13,6 +13,7 @@
 
 use axum::{Router, routing::get, routing::post};
 
+use crate::admin_circuit_breaker::{close_circuit_breaker, list_circuit_breakers};
 use crate::admin_logs::list_logs;
 use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
@@ -42,5 +43,7 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .delete(delete_route),
         )
         .route("/logs", get(list_logs))
+        .route("/circuit-breaker", get(list_circuit_breakers))
+        .route("/circuit-breaker/close", post(close_circuit_breaker))
         .with_state(state)
 }
