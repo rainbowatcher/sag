@@ -109,6 +109,18 @@ function cacheHitRate(row: CallLog): number | null {
   if (!usage || !usage.prompt_tokens || row.cached_tokens == null) return null
   return row.cached_tokens / usage.prompt_tokens
 }
+
+/** Map sentinel provider values to human-readable labels. */
+const SENTINEL_LABELS: Record<string, string> = {
+  __no_route__: "No Route",
+  __all_disabled__: "All Disabled",
+  __all_exhausted__: "All Exhausted",
+}
+
+function formatProvider(raw: string): { label: string; isSentinel: boolean } {
+  const label = SENTINEL_LABELS[raw]
+  return label != null ? { label, isSentinel: true } : { label: raw, isSentinel: false }
+}
 </script>
 
 <template>
@@ -206,7 +218,15 @@ function cacheHitRate(row: CallLog): number | null {
               <TableCell class="text-muted-foreground font-mono text-xs whitespace-nowrap">
                 {{ formatTs(row.timestamp) }}
               </TableCell>
-              <TableCell class="font-medium">{{ row.provider }}</TableCell>
+              <TableCell
+                :class="[
+                  formatProvider(row.provider).isSentinel
+                    ? 'text-muted-foreground font-medium italic'
+                    : 'font-medium',
+                ]"
+              >
+                {{ formatProvider(row.provider).label }}
+              </TableCell>
               <TableCell class="font-mono text-xs">
                 <span
                   v-if="row.user_agent"
@@ -226,9 +246,14 @@ function cacheHitRate(row: CallLog): number | null {
                 <div>{{ row.model }}</div>
                 <div
                   v-if="row.real_model && row.real_model !== row.model"
-                  class="text-muted-foreground text-[10px]"
+                  :class="[
+                    'text-[10px]',
+                    formatProvider(row.real_model).isSentinel
+                      ? 'text-muted-foreground/60 italic'
+                      : 'text-muted-foreground',
+                  ]"
                 >
-                  {{ row.real_model }}
+                  {{ formatProvider(row.real_model).label }}
                 </div>
               </TableCell>
               <TableCell class="text-right tabular-nums">
