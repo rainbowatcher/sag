@@ -75,36 +75,113 @@ pub struct DispatchCtx<'a> {
 // Circuit breaker helpers — shared across the dispatch submodules.
 // ═══════════════════════════════════════════════════════════════════
 
-/// Check whether a target's circuit is open. Returns `Some(key)` if the
-/// target is healthy, `None` if the circuit is still open (in cooldown).
+/// Verdict returned by [`circuit_allows_target`].
+///
+/// `key` is the resolved target identity; `is_probe` is `true` when the
+/// target's circuit is `HalfOpen` and this request was granted the single
+/// probe slot — meaning the attempt that follows should be treated as a
+/// recovery probe (its outcome re-opens the circuit on failure rather than
+/// just opening it for the first time).
+pub(in crate::dispatch) struct CircuitVerdict {
+    pub key: RouteTargetKey,
+    pub is_probe: bool,
+}
+
+/// Check whether a target's circuit allows a try.
+///
+/// Returns `None` if the target is `Open` (cooling down) or is `HalfOpen`
+/// with a probe already in flight — in both cases the caller should skip to
+/// the next target. Returns `Some(CircuitVerdict)` when the target may be
+/// tried: `is_probe` is `true` iff this request was handed the half-open
+/// probe slot.
 pub(in crate::dispatch) async fn circuit_allows_target(
     runtime: &DispatchRuntime,
     model: &str,
     provider_name: &str,
     real_model: &str,
-) -> Option<RouteTargetKey> {
+) -> Option<CircuitVerdict> {
     let circuit_key = RouteTargetKey::new(model, provider_name, real_model);
-    let breaker = runtime.route_circuit_breaker.read().await;
 
-    if let Some(remaining) = breaker.open_remaining(&circuit_key) {
+    // Single read pass. `can_probe_now` returns true for a healthy (Closed)
+    // target as well as a due `Open`/`HalfOpen` one.
+    {
+        let breaker = runtime.route_circuit_breaker.read().await;
+        if !breaker.can_probe_now(&circuit_key) {
+            let next_ms = breaker
+                .next_probe_in(&circuit_key)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            info!(
+                provider = %provider_name,
+                real_model = %real_model,
+                next_probe_in_ms = next_ms,
+                "skipping open route target circuit (next probe not due)"
+            );
+            return None;
+        }
+        // Healthy (Closed) target: allow as a normal attempt without taking a
+        // write lock or claiming a probe slot.
+        if breaker.is_closed(&circuit_key) {
+            return Some(CircuitVerdict {
+                key: circuit_key,
+                is_probe: false,
+            });
+        }
+    }
+
+    // Upgrade to a write pass to transition a due `Open` to `HalfOpen`
+    // and claim the single probe slot.
+    let mut breaker = runtime.route_circuit_breaker.write().await;
+    if !breaker.to_half_open_if_due(&circuit_key) {
+        // Not due after the transition check (race) — treat as skipped.
+        return None;
+    }
+
+    let is_probe = breaker.try_acquire_probe(&circuit_key);
+    if is_probe {
         info!(
             provider = %provider_name,
             real_model = %real_model,
-            remaining_ms = remaining.as_millis() as u64,
-            "skipping open route target circuit"
+            "half-open circuit probe allowed"
+        );
+    } else {
+        // Half-open but a probe is already in flight: skip this request.
+        info!(
+            provider = %provider_name,
+            real_model = %real_model,
+            "skipping route target: half-open probe already in flight"
         );
         return None;
     }
 
-    Some(circuit_key)
+    Some(CircuitVerdict {
+        key: circuit_key,
+        is_probe,
+    })
 }
 
+/// Apply the outcome of a single target attempt to the circuit breaker.
+///
+/// # Asymmetry note (intentional)
+///
+/// A non-retryable (4xx) error on a *healthy* target does **not** open the
+/// circuit — the target stays usable, because a 4xx is usually a client-side
+/// request problem, not a target fault. The same 4xx arriving during a
+/// *probe* (`is_probe = true`) instead re-schedules the next probe one
+/// interval later (effectively a short cooldown). This asymmetry is
+/// deliberate: a probe must always report an outcome, and a 4xx during a probe
+/// means "not usable right now", so it is treated as a failed probe rather
+/// than left half-open forever. The practical effect — a target that returns
+/// 4xx to probe requests is briefly skipped — is acceptable and self-heals on
+/// the next interval.
 pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
     runtime: &DispatchRuntime,
     circuit_key: RouteTargetKey,
     outcome: RetryOutcome<T>,
     circuit_breaker_cfg: &sag_config::CircuitBreakerConfig,
+    is_probe: bool,
 ) -> Option<T> {
+    let interval = circuit_breaker_cfg.probe_interval_secs;
     match outcome {
         RetryOutcome::Success(value) => {
             runtime
@@ -112,6 +189,13 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
                 .write()
                 .await
                 .close(&circuit_key);
+            if is_probe {
+                info!(
+                    provider = %circuit_key.provider,
+                    real_model = %circuit_key.real_model,
+                    "half-open circuit probe succeeded, circuit closed"
+                );
+            }
             Some(value)
         }
         RetryOutcome::Exhausted(last_err) => {
@@ -121,20 +205,80 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
                 circuit_breaker_cfg.rate_limited_secs,
                 circuit_breaker_cfg.generic_secs,
             );
-            info!(
-                hint = ?hint,
-                duration_secs,
-                "opening circuit with error-based duration"
-            );
-            runtime
-                .route_circuit_breaker
-                .write()
-                .await
-                .open(circuit_key, duration_secs);
+            if is_probe {
+                // A probe during cooldown failed: reschedule the next probe
+                // one interval later (steady, low-traffic cadence) rather than
+                // re-opening the full cooldown — otherwise early recovery
+                // would again be invisible until the whole window elapsed.
+                info!(
+                    provider = %circuit_key.provider,
+                    real_model = %circuit_key.real_model,
+                    hint = ?hint,
+                    interval_secs = interval,
+                    "half-open circuit probe failed, rescheduling next probe"
+                );
+                runtime
+                    .route_circuit_breaker
+                    .write()
+                    .await
+                    .record_probe_result(circuit_key, false, interval);
+            } else {
+                // First failure (target was Closed/healthy): open the circuit
+                // with the error-derived cooldown as the hard lower bound and
+                // `interval` as the periodic probe cadence.
+                info!(
+                    hint = ?hint,
+                    duration_secs,
+                    interval_secs = interval,
+                    "opening circuit with error-based duration"
+                );
+                runtime.route_circuit_breaker.write().await.open(
+                    circuit_key,
+                    duration_secs,
+                    interval,
+                );
+            }
             None
         }
-        RetryOutcome::NonRetryable => None,
+        RetryOutcome::NonRetryable => {
+            if is_probe {
+                // A non-retryable (4xx) probe means the target is not usable
+                // right now — reschedule the next probe one interval later
+                // rather than leaving it half-open forever.
+                runtime
+                    .route_circuit_breaker
+                    .write()
+                    .await
+                    .record_probe_result(circuit_key, false, interval);
+            }
+            None
+        }
     }
+}
+
+/// Release a half-open probe slot without having actually attempted the
+/// upstream.
+///
+/// Claiming a probe slot (via [`circuit_allows_target`]) creates an obligation
+/// to report the probe outcome through [`apply_circuit_outcome`]. Some early
+/// exits between claiming the slot and the retry loop — notably when
+/// [`resolve_provider`](crate::dispatch::resolve::resolve_provider) returns
+/// `None` because the provider is disabled or no longer registered — skip that
+/// call. Without this release the `HalfOpen` + `probe_in_flight = true` entry
+/// would never be cleared (`try_acquire_probe` would reject every later
+/// request), permanently skipping the target. Treating the un-attempted probe
+/// as a failure reschedules the next probe one interval later, matching the
+/// normal failed-probe path.
+pub(in crate::dispatch) async fn release_probe_slot(
+    runtime: &DispatchRuntime,
+    circuit_key: RouteTargetKey,
+    probe_interval_secs: u64,
+) {
+    runtime
+        .route_circuit_breaker
+        .write()
+        .await
+        .record_probe_result(circuit_key, false, probe_interval_secs);
 }
 
 // ═══════════════════════════════════════════════════════════════════

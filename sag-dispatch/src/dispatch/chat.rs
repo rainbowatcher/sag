@@ -14,7 +14,7 @@ use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    log_per_target_failure, merge_model_overrides, success_log,
+    log_per_target_failure, merge_model_overrides, release_probe_slot, success_log,
 };
 
 /// Unified result of a single chat attempt. The `Instant` records when
@@ -60,14 +60,27 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         let provider_name = &target.provider;
         let real_model = &target.real_model;
 
-        let Some(circuit_key) =
+        let Some(verdict) =
             circuit_allows_target(runtime, &request.model, provider_name, real_model).await
         else {
             errors.push(format!("{provider_name}/{real_model}: circuit open"));
             continue;
         };
+        let circuit_key = verdict.key;
+        let is_probe = verdict.is_probe;
 
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+            // Provider is disabled / unregistered. If this request claimed the
+            // half-open probe slot we must release it, otherwise the target
+            // would be skipped forever (probe_in_flight stuck true).
+            if is_probe {
+                release_probe_slot(
+                    runtime,
+                    circuit_key.clone(),
+                    circuit_breaker_cfg.probe_interval_secs,
+                )
+                .await;
+            }
             continue;
         };
 
@@ -131,8 +144,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             RetryOutcome::Success(_) => "", // never logged — Success never reaches the else block
         };
 
-        let Some(attempt) =
-            apply_circuit_outcome(runtime, circuit_key, outcome, &circuit_breaker_cfg).await
+        let Some(attempt) = apply_circuit_outcome(
+            runtime,
+            circuit_key,
+            outcome,
+            &circuit_breaker_cfg,
+            is_probe,
+        )
+        .await
         else {
             // Per-provider failure: log a failure entry with the actual provider/real_model
             // so the analytics table knows which provider was attempted.
@@ -222,7 +241,9 @@ mod tests {
     use axum::body::to_bytes;
     use futures_util::Stream;
     use sag_analytics::StatsFilter;
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, Strategy};
+    use sag_config::{
+        CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, Strategy,
+    };
     use sag_core::AppError;
     use sag_core::types::{ChatCompletionRequest, Usage};
     use sag_providers::LlmProvider;
@@ -359,6 +380,27 @@ mod tests {
             gateway_auth: Some(GatewayAuthConfig {
                 api_keys: vec!["k".into()],
             }),
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = ConfigHandle::from_config(config);
+        crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
+    }
+
+    /// Like [`build_state`] but with a custom circuit-breaker config. Used to
+    /// drive cooldowns to ~0 so half-open recovery can be exercised quickly.
+    async fn build_state_with_cb(
+        providers: Vec<Arc<dyn LlmProvider>>,
+        circuit_breaker: CircuitBreakerConfig,
+    ) -> AppState {
+        let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        for p in providers {
+            registry.insert(p.name().to_string(), p);
+        }
+        let config = GatewayConfig {
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["k".into()],
+            }),
+            circuit_breaker,
             ..sag_config::gateway_config_base!()
         };
         let handle = ConfigHandle::from_config(config);
@@ -599,6 +641,334 @@ mod tests {
         assert!(
             second_errors.iter().any(|e| e.contains("circuit open")),
             "second request should record why the first target was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_half_open_probe_recovers_target() {
+        // First request: `first` fails (retryable) → circuit opens. With a
+        // 0-second generic cooldown the circuit is already half-open by the
+        // next request, which probes `first` and succeeds, recovering it.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail".into())));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 0,
+            rate_limited_secs: 0,
+            generic_secs: 0,
+            probe_interval_secs: 0,
+        };
+        let state = build_state_with_cb(vec![m1.clone(), m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
+        // First request: first fails → fall through to second (success).
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        let mut second_errors = Vec::new();
+        let second = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut second_errors,
+        ))
+        .await;
+        // Second request: circuit is half-open, probe `first` succeeds →
+        // target recovered, no longer skipped.
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            m1.chat_calls(),
+            2,
+            "half-open probe should hit first target"
+        );
+        assert_eq!(m2.chat_calls(), 1, "recovered target should absorb traffic");
+        assert!(second_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_probes_during_cooldown_not_after() {
+        // The whole point of periodic probing: a probe is allowed *while the
+        // target is still cooling down* (long `generic_secs` cooldown, short
+        // `probe_interval_secs`), so a target that recovers mid-cooldown is
+        // discovered early instead of staying skipped until the full window
+        // elapses.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        // First request: `first` fails (retryable) → circuit opens with a long
+        // cooldown. Immediately after, `first` has actually recovered.
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail".into())));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 3600,
+            rate_limited_secs: 10,
+            generic_secs: 3600,     // long cooldown — would stay skipped for 1h
+            probe_interval_secs: 0, // but a probe is due immediately
+        };
+        let state = build_state_with_cb(vec![m1.clone(), m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        // Second request arrives while the 1h cooldown is still in effect — but
+        // a periodic probe is due, hits the recovered `first`, and restores it.
+        let mut second_errors = Vec::new();
+        let second = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut second_errors,
+        ))
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            m1.chat_calls(),
+            2,
+            "periodic probe during cooldown should hit recovered first target"
+        );
+        assert_eq!(m2.chat_calls(), 1, "recovered target absorbs traffic");
+        assert!(second_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_half_open_probe_failure_reschedules() {
+        // `first` keeps failing. Because probes are allowed every interval, each
+        // request probes `first` once more; a failed probe reschedules the next
+        // probe (it does NOT re-open the whole cooldown), so further requests
+        // keep falling through to `second` until `first` recovers.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail1".into())));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail2".into())));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail3".into())));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 0,
+            rate_limited_secs: 0,
+            generic_secs: 0,
+            probe_interval_secs: 0,
+        };
+        let state = build_state_with_cb(vec![m1.clone(), m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        let mut first_errors = Vec::new();
+        let _first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        let mut probe_errors = Vec::new();
+        let _probe = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut probe_errors,
+        ))
+        .await;
+        // Probe hits first again (failure) → re-opens; second still serves.
+        assert_eq!(m1.chat_calls(), 2, "half-open probe should retry first");
+        assert_eq!(m2.chat_calls(), 2);
+
+        let mut third_errors = Vec::new();
+        let third = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut third_errors,
+        ))
+        .await;
+        // Cooldown (0s) elapsed again → another probe; first still failing →
+        // falls through again.
+        assert_eq!(third.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 3);
+        assert_eq!(m2.chat_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_releases_probe_slot_when_provider_unresolved() {
+        // Regression: when `circuit_allows_target` claims the half-open probe
+        // slot but `resolve_provider` returns `None` (provider disabled or no
+        // longer registered, e.g. after a config hot-reload), the slot must be
+        // released. Otherwise `probe_in_flight` stays true and the target's
+        // half-open recovery is defeated for the rest of the cooldown window.
+        let m2 = Arc::new(MockProvider::new("second"));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        // Only `second` is registered; `first` is referenced by the route but
+        // gone from the registry, so `resolve_provider("first")` returns None.
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 0,
+            rate_limited_secs: 0,
+            generic_secs: 0,
+            probe_interval_secs: 0,
+        };
+        let state = build_state_with_cb(vec![m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // Pre-open `first`'s circuit so the next request finds it probe-due
+        // and claims the slot before `resolve_provider` fails.
+        rt.route_circuit_breaker.write().await.open(
+            crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
+            0,
+            0,
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "falls through to second");
+        assert_eq!(m2.chat_calls(), 1);
+
+        // The slot must have been released: the target is probeable again and
+        // the single probe slot can be claimed once more.
+        let mut b = rt.route_circuit_breaker.write().await;
+        assert!(
+            b.to_half_open_if_due(&crate::circuit_breaker::RouteTargetKey::new(
+                "gpt-4o", "first", "gpt-4o"
+            )),
+            "after release, target should be probeable again (not stuck half-open)"
+        );
+        assert!(
+            b.try_acquire_probe(&crate::circuit_breaker::RouteTargetKey::new(
+                "gpt-4o", "first", "gpt-4o"
+            )),
+            "released probe slot should be claimable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_half_open_probe_in_flight_skips_others() {
+        // When a target is half-open with a probe already in flight, a
+        // concurrent request must skip it and fall through to the next target
+        // rather than launching a second probe.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowProbe {
+            name: String,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl LlmProvider for SlowProbe {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            async fn chat(
+                &self,
+                _r: &ChatCompletionRequest,
+                _m: &str,
+                _e: &str,
+                _t: &HashMap<String, serde_json::Value>,
+                _to: u64,
+            ) -> sag_core::Result<ChatCompletionResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Simulate a slow upstream so the probe is "in flight" while a
+                // second request arrives.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(build_response("gpt-4o", None))
+            }
+            async fn chat_stream(
+                &self,
+                _r: &ChatCompletionRequest,
+                _m: &str,
+                _e: &str,
+                _t: &HashMap<String, serde_json::Value>,
+                _to: u64,
+            ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+                Ok(Box::pin(futures_util::stream::empty()))
+            }
+        }
+
+        let m1 = Arc::new(SlowProbe {
+            name: "first".into(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let m2 = Arc::new(MockProvider::new("second"));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 0,
+            rate_limited_secs: 0,
+            generic_secs: 0,
+            probe_interval_secs: 0,
+        };
+        let state = build_state_with_cb(vec![m1.clone(), m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // Pre-open the circuit for `first` so the next concurrent requests
+        // find it half-open and race for the single probe slot.
+        rt.route_circuit_breaker.write().await.open(
+            crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
+            0,
+            0,
+        );
+
+        let mut e1 = Vec::new();
+        let mut e2 = Vec::new();
+        let r1 = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut e1));
+        let r2 = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut e2));
+        let (a, b) = tokio::join!(r1, r2);
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        // Exactly one probe should have hit `first`; the other must have been
+        // skipped (probe in flight) and served by `second`.
+        assert_eq!(
+            m1.calls.load(Ordering::SeqCst),
+            1,
+            "only one half-open probe should hit first"
+        );
+        assert_eq!(
+            m2.chat_calls(),
+            1,
+            "skipped request falls through to second"
         );
     }
 

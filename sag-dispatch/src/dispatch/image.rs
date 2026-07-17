@@ -13,7 +13,7 @@ use crate::dispatch::retry::RetryOutcome;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
-    log_per_target_failure, merge_model_overrides, success_log,
+    log_per_target_failure, merge_model_overrides, release_probe_slot, success_log,
 };
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
@@ -51,14 +51,27 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         let provider_name = &target.provider;
         let real_model = &target.real_model;
 
-        let Some(circuit_key) =
+        let Some(verdict) =
             circuit_allows_target(runtime, &request.model, provider_name, real_model).await
         else {
             errors.push(format!("{provider_name}/{real_model}: circuit open"));
             continue;
         };
+        let circuit_key = verdict.key;
+        let is_probe = verdict.is_probe;
 
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+            // Provider is disabled / unregistered. If this request claimed the
+            // half-open probe slot we must release it, otherwise the target
+            // would be skipped forever (probe_in_flight stuck true).
+            if is_probe {
+                release_probe_slot(
+                    runtime,
+                    circuit_key.clone(),
+                    circuit_breaker_cfg.probe_interval_secs,
+                )
+                .await;
+            }
             continue;
         };
 
@@ -96,8 +109,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             RetryOutcome::Success(_) => "", // never logged
         };
 
-        let Some(resp) =
-            apply_circuit_outcome(runtime, circuit_key, outcome, &circuit_breaker_cfg).await
+        let Some(resp) = apply_circuit_outcome(
+            runtime,
+            circuit_key,
+            outcome,
+            &circuit_breaker_cfg,
+            is_probe,
+        )
+        .await
         else {
             // Per-provider failure: log a failure entry with the actual provider/real_model
             // so the analytics table knows which provider was attempted.
@@ -190,7 +209,7 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::Stream;
 
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig};
+    use sag_config::{CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig};
     use sag_core::{AppError, ChatCompletionResponse, ChatMessage, ImageData, StreamChunk};
     use sag_providers::LlmProvider;
     use serde_json::json;
@@ -312,6 +331,30 @@ mod tests {
         .await
     }
 
+    /// Like [`build_state`] but with a custom circuit-breaker config, used to
+    /// drive cooldowns/intervals to ~0 so half-open behavior is exercisable.
+    async fn build_state_with_cb(
+        providers: Vec<Arc<dyn LlmProvider>>,
+        circuit_breaker: CircuitBreakerConfig,
+    ) -> AppState {
+        let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+        for provider in providers {
+            registry.insert(provider.name().to_string(), provider);
+        }
+        let config = GatewayConfig {
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["k".into()],
+            }),
+            circuit_breaker,
+            ..sag_config::gateway_config_base!()
+        };
+        crate::testing::test_app_state(
+            ConfigHandle::from_config(config),
+            Arc::new(RwLock::new(registry)),
+        )
+        .await
+    }
+
     fn make_ctx<'a>(
         state: &'a AppState,
         runtime: &'a DispatchRuntime,
@@ -418,6 +461,94 @@ mod tests {
         assert!(
             second_errors.iter().any(|e| e.contains("circuit open")),
             "second request should record why the first target was skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_image_half_open_probe_recovers_target() {
+        // Mirrors the chat half-open recovery path for image dispatch: `first`
+        // fails once (circuit opens), then a probe during cooldown hits the
+        // recovered `first` and restores it.
+        let m1 = Arc::new(MockImageProvider::new("first"));
+        let m2 = Arc::new(MockImageProvider::new("second"));
+        m1.push_image(ImageBehavior::Retryable(AppError::Internal("fail".into())));
+        m1.push_image(ImageBehavior::Ok(build_image_response()));
+        m2.push_image(ImageBehavior::Ok(build_image_response()));
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 0,
+            rate_limited_secs: 0,
+            generic_secs: 0,
+            probe_interval_secs: 0,
+        };
+        let state = build_state_with_cb(vec![m1.clone(), m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("dall-e-3");
+        let targets = vec![
+            target("first", "dall-e-3", 0),
+            target("second", "dall-e-3", 0),
+        ];
+
+        let mut first_errors = Vec::new();
+        let first = dispatch_image(make_ctx(&state, &rt, &req, &targets, &mut first_errors)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(m1.image_calls(), 1);
+        assert_eq!(m2.image_calls(), 1);
+
+        let mut second_errors = Vec::new();
+        let second =
+            dispatch_image(make_ctx(&state, &rt, &req, &targets, &mut second_errors)).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            m1.image_calls(),
+            2,
+            "half-open probe should hit first target and recover it"
+        );
+        assert_eq!(m2.image_calls(), 1, "recovered target absorbs traffic");
+    }
+
+    #[tokio::test]
+    async fn dispatch_image_releases_probe_slot_when_provider_unresolved() {
+        // Same regression guard as the chat path: a claimed probe slot must be
+        // released when `resolve_provider` returns `None` (provider gone).
+        let m2 = Arc::new(MockImageProvider::new("second"));
+        m2.push_image(ImageBehavior::Ok(build_image_response()));
+        let cb = CircuitBreakerConfig {
+            quota_exhausted_secs: 0,
+            rate_limited_secs: 0,
+            generic_secs: 0,
+            probe_interval_secs: 0,
+        };
+        let state = build_state_with_cb(vec![m2.clone()], cb).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("dall-e-3");
+        let targets = vec![
+            target("first", "dall-e-3", 0),
+            target("second", "dall-e-3", 0),
+        ];
+
+        rt.route_circuit_breaker.write().await.open(
+            crate::circuit_breaker::RouteTargetKey::new("dall-e-3", "first", "dall-e-3"),
+            0,
+            0,
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_image(make_ctx(&state, &rt, &req, &targets, &mut errors)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m2.image_calls(), 1);
+
+        let mut b = rt.route_circuit_breaker.write().await;
+        assert!(
+            b.to_half_open_if_due(&crate::circuit_breaker::RouteTargetKey::new(
+                "dall-e-3", "first", "dall-e-3"
+            )),
+            "after release, target should be probeable again"
+        );
+        assert!(
+            b.try_acquire_probe(&crate::circuit_breaker::RouteTargetKey::new(
+                "dall-e-3", "first", "dall-e-3"
+            )),
+            "released probe slot should be claimable again"
         );
     }
 

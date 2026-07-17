@@ -182,6 +182,9 @@ impl GatewayConfig {
         if self.circuit_breaker.generic_secs == 0 {
             errors.push("circuit_breaker.generic_secs must be greater than 0".into());
         }
+        if self.circuit_breaker.probe_interval_secs == 0 {
+            errors.push("circuit_breaker.probe_interval_secs must be greater than 0".into());
+        }
 
         if self.backoff.retries > 10 {
             warnings.push(format!(
@@ -713,6 +716,12 @@ pub struct CircuitBreakerConfig {
     /// Default: 60.
     #[serde(default = "default_generic_secs")]
     pub generic_secs: u64,
+    /// How often a half-open probe is allowed while a target is still cooling
+    /// down. Lets a target recover as soon as the upstream is healthy again
+    /// (e.g. quota topped up mid-cooldown) instead of staying skipped for the
+    /// whole cooldown. Default: 60.
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -721,6 +730,7 @@ impl Default for CircuitBreakerConfig {
             quota_exhausted_secs: default_quota_exhausted_secs(),
             rate_limited_secs: default_rate_limited_secs(),
             generic_secs: default_generic_secs(),
+            probe_interval_secs: default_probe_interval_secs(),
         }
     }
 }
@@ -732,6 +742,9 @@ fn default_rate_limited_secs() -> u64 {
     10
 }
 fn default_generic_secs() -> u64 {
+    60
+}
+fn default_probe_interval_secs() -> u64 {
     60
 }
 fn default_shuffle_cache_ttl_secs() -> u64 {
@@ -1737,6 +1750,18 @@ api_keys = ["sk-test"]
                 err.iter()
                     .any(|e| e.contains("generic_secs must be greater than 0")),
                 "expected generic_secs error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_zero_circuit_breaker_probe_interval() {
+            let mut config = valid_config();
+            config.circuit_breaker.probe_interval_secs = 0;
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("probe_interval_secs must be greater than 0")),
+                "expected probe_interval_secs error, got {err:?}"
             );
         }
 
