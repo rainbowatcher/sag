@@ -318,6 +318,8 @@ pub(in crate::dispatch) fn merge_model_overrides(
 mod tests {
     use super::*;
     use sag_config::ProviderConfig;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     fn make_provider(
         model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -472,6 +474,130 @@ mod tests {
         let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
         let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
         assert!(merged.is_empty());
+    }
+
+    // ── Sentinel value & error_category tests ────────────────────
+
+    async fn build_test_state() -> AppState {
+        let config = sag_config::GatewayConfig {
+            routes: vec![],
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let registry = Arc::new(RwLock::new(HashMap::new()));
+        sag_state::testing::test_app_state(handle, registry).await
+    }
+
+    #[tokio::test]
+    async fn fallback_exhausted_response_logs_sentinel() {
+        let state = build_test_state().await;
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        fallback_exhausted_response(
+            &state,
+            "gpt-4o",
+            false,
+            trace_id,
+            start,
+            &["openai: timeout".into(), "anthropic: 500".into()],
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "one call log should be written");
+        let log = &logs[0];
+        assert_eq!(log.provider, "__all_exhausted__");
+        assert_eq!(log.real_model, "__all_exhausted__");
+        assert_eq!(log.model, "gpt-4o");
+        assert_eq!(log.status_code, 502);
+        assert_eq!(log.error_category.as_deref(), Some("all_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn failure_response_preserves_error_category() {
+        let state = build_test_state().await;
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        failure_response(
+            &state,
+            trace_id,
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            false,
+            start,
+            StatusCode::BAD_REQUEST,
+            AppError::BadRequest("unsupported param".into()),
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].error_category.as_deref(),
+            Some("bad_request"),
+            "error_category must reflect the original AppError variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_per_target_failure_uses_caller_error_category() {
+        let state = build_test_state().await;
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        log_per_target_failure(
+            &state,
+            trace_id,
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            false,
+            start,
+            &["upstream 500".into()],
+            "provider_error",
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].error_category.as_deref(),
+            Some("provider_error"),
+            "error_category must be the caller-supplied value, not 'internal_error'"
+        );
     }
 }
 

@@ -46,32 +46,14 @@
 //! `HalfOpen + probe_in_flight` can become permanently stuck when the future
 //! holding the probe slot is cancelled (e.g. client disconnect causes axum to
 //! drop the handler before `apply_circuit_outcome` runs). `try_acquire_probe`
-//! detects these stale slots and reclaims them after a timeout
-//! ([`STALE_PROBE_THRESHOLD`]), ensuring no entry leaks forever.
+//! detects these stale slots and reclaims them after the configured
+//! `stale_probe_threshold` (see [`RouteCircuitBreaker::new`] and
+//! [`compute_stale_probe_threshold`]), ensuring no entry leaks forever.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
-
-/// `HalfOpen + probe_in_flight` that persists longer than this threshold is
-/// considered stale (probe future was cancelled without releasing the slot).
-/// `try_acquire_probe` reclaims such slots before attempting a new acquire.
-///
-/// ## Trade-off
-///
-/// This threshold must exceed the worst-case probe duration in the deployment:
-/// `max(timeout_secs) × (max_retries + 1)`.  Default configuration gives
-/// `timeout_secs=600` and `max_retries=2` → worst case ≈ 1800 s.  We set
-/// 3600 s to leave ample headroom.  The cost: a genuinely stuck probe slot
-/// can take up to 1 h to be reclaimed.  However, because the target is in
-/// cooldown, every new request hitting `try_acquire_probe` checks the
-/// threshold – so actual reclamation happens on the first request after
-/// the threshold elapses, not after a full hour.
-///
-/// If your deployment uses higher `timeout_secs` or `max_retries`, adjust
-/// this constant accordingly (or lower those timeouts).
-const STALE_PROBE_THRESHOLD: Duration = Duration::from_secs(3600);
 
 /// Per-target circuit state.
 ///
@@ -162,12 +144,61 @@ pub struct CircuitBreakerEntry {
 }
 
 /// Minimal circuit state for all route targets.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RouteCircuitBreaker {
     entries: HashMap<RouteTargetKey, CircuitEntry>,
+    /// 探针槽位失效阈值。超过此时间仍 `probe_in_flight` 的 HalfOpen 槽位
+    /// 视为已取消（探测 future 被 drop 而 `apply_circuit_outcome` 未跑），
+    /// 由 `try_acquire_probe` 回收。
+    ///
+    /// 生产路径应通过 [`compute_stale_probe_threshold`] + 配置计算后
+    /// 用 [`RouteCircuitBreaker::new`] 构造；[`Default`] 仅供测试使用
+    /// （固定 3600s，不跟随配置变化）。
+    stale_probe_threshold: Duration,
+}
+
+impl Default for RouteCircuitBreaker {
+    /// 仅供测试 fixture 使用。**生产路径必须通过
+    /// [`compute_stale_probe_threshold`] 计算阈值并使用
+    /// [`RouteCircuitBreaker::new`] 构造**——本实现使用与旧硬编码相等的
+    /// 3600s，不跟随 provider / route / target 配置变化。
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            stale_probe_threshold: Duration::from_secs(3600),
+        }
+    }
 }
 
 impl RouteCircuitBreaker {
+    /// Construct a breaker with a config-derived stale-probe threshold.
+    ///
+    /// Use [`compute_stale_probe_threshold`] (and the config-walking helper
+    /// `stale_probe_threshold_from_config` in `sag-dispatch`) to compute
+    /// `stale_probe_threshold` from the current gateway configuration.
+    pub fn new(stale_probe_threshold: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            stale_probe_threshold,
+        }
+    }
+
+    /// Update the stale-probe threshold. Called when the config changes
+    /// (hot-reload or admin mutation) to keep the threshold in sync with
+    /// the current provider/route timeout settings.
+    ///
+    /// In-flight probe state (entries, `probe_in_flight`) is fully preserved —
+    /// only the threshold parameter used by [`try_acquire_probe`] is updated.
+    pub fn set_stale_probe_threshold(&mut self, threshold: Duration) {
+        self.stale_probe_threshold = threshold;
+    }
+
+    /// Test-only accessor for the configured stale-probe threshold.
+    #[cfg(test)]
+    pub(crate) fn stale_probe_threshold(&self) -> Duration {
+        self.stale_probe_threshold
+    }
+
     /// How long until the next probe is permitted for an `Open` target, or
     /// `None` if the target is not in a state that skips (Closed / HalfOpen).
     /// Used only for diagnostics/logging.
@@ -247,13 +278,11 @@ impl RouteCircuitBreaker {
                 ..
             }) if *next_probe_at <= now
         );
-        if due {
-            if let Some(entry) = self.entries.get_mut(key) {
-                entry.state = CircuitState::HalfOpen;
-                // cooldown_until is preserved across the transition.
-                entry.probe_in_flight = false;
-                entry.probe_acquired_at = None;
-            }
+        if due && let Some(entry) = self.entries.get_mut(key) {
+            entry.state = CircuitState::HalfOpen;
+            // cooldown_until is preserved across the transition.
+            entry.probe_in_flight = false;
+            entry.probe_acquired_at = None;
         }
         matches!(
             self.entries.get(key),
@@ -274,9 +303,9 @@ impl RouteCircuitBreaker {
     /// # Stale probe reclamation
     ///
     /// Before checking the slot, this method reclaims any `HalfOpen +
-    /// probe_in_flight` slot whose [`probe_acquired_at`] is older than
-    /// [`STALE_PROBE_THRESHOLD`]. This handles the case where a probe future
-    /// was cancelled (e.g. client disconnect) before
+    /// probe_in_flight` slot whose `probe_acquired_at` is older than the
+    /// breaker's `stale_probe_threshold`. This handles the case where a probe
+    /// future was cancelled (e.g. client disconnect) before
     /// [`apply_circuit_outcome`] released the slot, preventing permanent
     /// entry leaks.
     pub fn try_acquire_probe(&mut self, key: &RouteTargetKey) -> bool {
@@ -287,7 +316,7 @@ impl RouteCircuitBreaker {
                 && entry.probe_in_flight
                 && entry
                     .probe_acquired_at
-                    .map(|t| now.duration_since(t) > STALE_PROBE_THRESHOLD)
+                    .map(|t| now.duration_since(t) > self.stale_probe_threshold)
                     .unwrap_or(false)
             {
                 entry.probe_in_flight = false;
@@ -401,6 +430,52 @@ impl RouteCircuitBreaker {
     }
 }
 
+/// 根据配置计算探针槽位失效阈值。超过此阈值仍 `HalfOpen + probe_in_flight`
+/// 的槽位视为已被取消（探测 future 被 drop 而 `apply_circuit_outcome` 未跑），
+/// 由 `try_acquire_probe` 回收。
+///
+/// 公式：
+/// ```text
+/// per_attempt   = max_per_attempt_secs
+/// probe_worst   = per_attempt × (effective_retries + 1)
+/// backoff_total = (max_backoff_ms × effective_retries) / 1000   // 保守上界
+/// threshold     = max(probe_worst + backoff_total, FLOOR)
+/// ```
+///
+/// - `max_per_attempt_secs`：单次尝试的 wall-clock 上界。非流式由
+///   `effective_timeout` 决定；流式请求不受 `effective_timeout` 限制，取
+///   `ttfb_timeout_secs` 起步值参与比较，保证 ttfb 跑满时一次尝试仍落在
+///   阈值内。调用方应传入 `max(effective_timeout, max_ttfb_timeout)`。
+/// - `effective_retries`：每 (route, target) 实际生效的重试次数
+///   （target → route → global 三层回退后的最终值）。
+/// - `max_backoff_ms`：`backoff.max_ms`，全局退避上限。
+/// - `FLOOR = 600s`：与 `sag_config::default_timeout_secs()` 一致，覆盖配置
+///   极端 reduced 的情况，并对超长 streaming 探针提供最低安全垫。
+///
+/// # Streaming 与「误回收」
+///
+/// 流式请求在 ttfb 之后由 `chunk_timeout_secs` 治理过程中的 idle 间隔。只要
+/// token 持续吐出，wall-clock 可远超 `per_attempt × attempts`。这意味着一个
+/// 仍在合法吐 chunk 的活跃 probe 可能越过阈值被 `try_acquire_probe` 回收，
+/// 触发该目标的二次探针，**但 doubled probe 至多多打一次**，不破坏「同时
+/// 最多一个探针」不变式（回收逻辑串行于 `to_half_open_if_due` 之后），也不
+/// 会让坏上游 escape。
+///
+/// 因此本公式对流式采取「合理上界 + 显式承认极端误回收」，而非追求严格边界。
+pub fn compute_stale_probe_threshold(
+    max_per_attempt_secs: u64,
+    effective_retries: u32,
+    max_backoff_ms: u64,
+) -> Duration {
+    const FLOOR: u64 = 600; // 与 sag_config::default_timeout_secs() 一致
+
+    let attempts = effective_retries as u64 + 1;
+    let probe_worst = max_per_attempt_secs.saturating_mul(attempts);
+    let backoff_total = max_backoff_ms.saturating_mul(effective_retries as u64) / 1000;
+    let raw = probe_worst.saturating_add(backoff_total);
+    Duration::from_secs(raw.max(FLOOR))
+}
+
 /// Compute a probe interval with jitter in `[interval, interval + interval/2]`.
 ///
 /// Jitter spreads probes from many targets that opened together, avoiding a
@@ -492,7 +567,7 @@ mod tests {
         breaker.to_half_open_if_due(&key("openai", "gpt-4o"));
         breaker.record_probe_result(key("openai", "gpt-4o"), true, 60);
         assert!(breaker.is_closed(&key("openai", "gpt-4o")));
-        assert!(breaker.entries.get(&key("openai", "gpt-4o")).is_none());
+        assert!(!breaker.entries.contains_key(&key("openai", "gpt-4o")));
     }
 
     #[test]
@@ -558,7 +633,8 @@ mod tests {
     fn stale_probe_slot_is_reclaimed() {
         // Bug B regression: a probe future that was cancelled (client
         // disconnect) leaves probe_in_flight=true permanently. After
-        // STALE_PROBE_THRESHOLD elapses, try_acquire_probe must reclaim
+        // stale_probe_threshold (3600s via Default) elapses, try_acquire_probe
+        // must reclaim
         // the slot.
         let mut breaker = RouteCircuitBreaker::default();
         breaker.open(key("openai", "gpt-4o"), 3600, 0); // interval 0 → first probe due immediately
@@ -579,7 +655,7 @@ mod tests {
 
     #[test]
     fn stale_probe_within_threshold_not_reclaimed() {
-        // Verify that an in-flight probe slot within STALE_PROBE_THRESHOLD
+        // Verify that an in-flight probe slot within stale_probe_threshold
         // is NOT reclaimed, preserving the "one probe at a time" invariant.
         let mut breaker = RouteCircuitBreaker::default();
         breaker.open(key("openai", "gpt-4o"), 7200, 0);
@@ -689,6 +765,99 @@ mod tests {
         assert!(
             json2.contains("\"state\":\"half_open\""),
             "serialized state should be snake_case 'half_open', got: {json2}"
+        );
+    }
+
+    // ── compute_stale_probe_threshold() tests ─────────────────────
+
+    #[test]
+    fn compute_threshold_floor_kicks_in_for_small_values() {
+        // timeout=0, retries=0, max_ms=0 → raw=0, floor=600
+        let threshold = compute_stale_probe_threshold(0, 0, 0);
+        assert_eq!(threshold, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn compute_threshold_floor_kicks_in_for_normal_but_small() {
+        // timeout=120, retries=2, max_ms=5000 → 120×3 + 10 = 370 < 600 → floor
+        let threshold = compute_stale_probe_threshold(120, 2, 5000);
+        assert_eq!(threshold, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn compute_threshold_above_floor() {
+        // timeout=600, retries=2, max_ms=5000 → 600×3 + 10 = 1810 > 600
+        let threshold = compute_stale_probe_threshold(600, 2, 5000);
+        assert_eq!(threshold, Duration::from_secs(1810));
+    }
+
+    #[test]
+    fn compute_threshold_saturating_no_overflow() {
+        // u64 boundaries — saturating_mul/add must not panic
+        let threshold = compute_stale_probe_threshold(u64::MAX, 10, u64::MAX);
+        // Should saturate at u64::MAX seconds (practically infinite, but no panic)
+        assert_eq!(threshold, Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn compute_threshold_retries_zero_single_attempt() {
+        // retries=0 → attempts=1, no backoff
+        let threshold = compute_stale_probe_threshold(600, 0, 5000);
+        assert_eq!(threshold, Duration::from_secs(600));
+    }
+
+    // ── set_stale_probe_threshold() tests ──────────────────────────
+
+    #[test]
+    fn set_stale_probe_threshold_preserves_in_flight_probe() {
+        // Updating the threshold must not disturb in-flight probe state:
+        // entries, `probe_in_flight`, and `probe_acquired_at` survive.
+        let mut breaker = RouteCircuitBreaker::new(Duration::from_secs(3600));
+        breaker.open(key("openai", "gpt-4o"), 3600, 0);
+        breaker.to_half_open_if_due(&key("openai", "gpt-4o"));
+        assert!(breaker.try_acquire_probe(&key("openai", "gpt-4o")));
+        let acquired_at = breaker
+            .entries
+            .get(&key("openai", "gpt-4o"))
+            .unwrap()
+            .probe_acquired_at;
+
+        // Lower the threshold (e.g. config hot-reload reduced timeouts).
+        breaker.set_stale_probe_threshold(Duration::from_secs(600));
+        assert_eq!(breaker.stale_probe_threshold(), Duration::from_secs(600));
+
+        let entry = breaker.entries.get(&key("openai", "gpt-4o")).unwrap();
+        assert!(
+            entry.probe_in_flight,
+            "probe_in_flight must survive threshold update"
+        );
+        assert_eq!(
+            entry.probe_acquired_at, acquired_at,
+            "probe_acquired_at must survive threshold update"
+        );
+        // Second acquire must still be denied (slot still held).
+        assert!(!breaker.try_acquire_probe(&key("openai", "gpt-4o")));
+    }
+
+    #[test]
+    fn set_stale_probe_threshold_affects_reclamation_window() {
+        // After lowering the threshold, a slot older than the new threshold
+        // (but younger than the old) must now be reclaimed.
+        let mut breaker = RouteCircuitBreaker::new(Duration::from_secs(3600));
+        breaker.open(key("openai", "gpt-4o"), 3600, 0);
+        breaker.to_half_open_if_due(&key("openai", "gpt-4o"));
+        breaker.try_acquire_probe(&key("openai", "gpt-4o"));
+        // 1000s in flight — within old 3600s, beyond new 600s.
+        if let Some(entry) = breaker.entries.get_mut(&key("openai", "gpt-4o")) {
+            entry.probe_acquired_at = Some(Instant::now() - Duration::from_secs(1000));
+        }
+        // Still held under old threshold.
+        assert!(!breaker.try_acquire_probe(&key("openai", "gpt-4o")));
+        // Lower threshold → 1000s now exceeds 600s → reclaim + re-acquire.
+        breaker.set_stale_probe_threshold(Duration::from_secs(600));
+        assert!(
+            breaker.try_acquire_probe(&key("openai", "gpt-4o")),
+            "lowered threshold must reclaim the now-stale slot"
         );
     }
 }

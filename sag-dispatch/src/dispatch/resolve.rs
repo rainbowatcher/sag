@@ -212,6 +212,7 @@ mod tests {
     use crate::testing::provider_config;
     use sag_config::RouteTarget;
     use std::collections::HashMap;
+    use tokio::sync::RwLock;
 
     #[test]
     fn filter_enabled_targets_drops_disabled_providers() {
@@ -374,5 +375,117 @@ mod tests {
             !runtime.active_targets.read().await.contains_key("gpt-4o"),
             "stale active_targets entry must be pruned"
         );
+    }
+
+    // ── Sentinel value tests ─────────────────────────────────────
+
+    /// Build state with an empty route table for __no_route__ tests.
+    async fn build_state_no_routes() -> (AppState, DispatchRuntime) {
+        let config = sag_config::GatewayConfig {
+            providers: HashMap::new(),
+            routes: vec![],
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = Arc::new(RwLock::new(HashMap::new()));
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+        (state, runtime)
+    }
+
+    /// Build state where the only provider is disabled, so all route targets
+    /// are filtered out → __all_disabled__.
+    async fn build_state_all_disabled() -> (AppState, DispatchRuntime) {
+        use std::collections::HashMap;
+
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        providers.insert("off".into(), provider_config(false));
+
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![sag_config::RouteTarget {
+                provider: "off".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            }],
+        }];
+
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+        (state, runtime)
+    }
+
+    #[tokio::test]
+    async fn resolve_route_no_routes_logs_no_route_sentinel() {
+        let (state, runtime) = build_state_no_routes().await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        let result =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        assert!(result.is_err(), "expected ModelNotFound error");
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "one call log should be written");
+        let log = &logs[0];
+        assert_eq!(log.provider, "__no_route__");
+        assert_eq!(log.real_model, "__no_route__");
+        assert_eq!(log.model, "gpt-4o");
+        assert_eq!(log.status_code, 404);
+        assert_eq!(log.error_category.as_deref(), Some("model_not_found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_route_all_disabled_logs_sentinel() {
+        let (state, runtime) = build_state_all_disabled().await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        let result =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        assert!(result.is_err(), "expected AllProvidersExhausted error");
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "one call log should be written");
+        let log = &logs[0];
+        assert_eq!(log.provider, "__all_disabled__");
+        assert_eq!(log.real_model, "__all_disabled__");
+        assert_eq!(log.model, "gpt-4o");
+        assert_eq!(log.status_code, 502);
+        assert_eq!(log.error_category.as_deref(), Some("all_exhausted"));
     }
 }

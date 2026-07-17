@@ -30,7 +30,7 @@ pub use dispatch::{
     DispatchCtx, ResolvedRoute, ResolvedTarget, dispatch_chat, dispatch_image, resolve_route,
 };
 pub use order::{CachedOrder, order_targets};
-pub use state::{AppState, DispatchRuntime};
+pub use state::{AppState, DispatchRuntime, stale_probe_threshold_from_config};
 
 // Re-export test helpers (not #[cfg(test)] so integration tests can use them).
 pub use testing::{test_app_state, test_dispatch_runtime};

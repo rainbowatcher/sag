@@ -387,4 +387,110 @@ mod tests {
         assert!(msg.contains("500"));
         assert!(msg.contains("boom"));
     }
+
+    // ── error_category mapping tests ────────────────────────────
+
+    #[test]
+    fn error_category_model_not_found() {
+        assert_eq!(
+            AppError::ModelNotFound("gpt-5".into()).error_category(),
+            "model_not_found"
+        );
+    }
+
+    #[test]
+    fn error_category_all_exhausted() {
+        assert_eq!(
+            AppError::AllProvidersExhausted {
+                model: "gpt-4o".into(),
+                reason: "all failed".into()
+            }
+            .error_category(),
+            "all_exhausted"
+        );
+    }
+
+    #[test]
+    fn error_category_upstream() {
+        assert_eq!(
+            AppError::Upstream {
+                provider: "openai".into(),
+                status: 500,
+                body: "boom".into()
+            }
+            .error_category(),
+            "provider_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_category_network() {
+        // Build a minimal reqwest::Error
+        let req_err = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(5))
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(AppError::from(req_err).error_category(), "network_error");
+    }
+
+    #[test]
+    fn error_category_ttfb_timeout() {
+        assert_eq!(
+            AppError::TtfbTimeout {
+                provider: "openai".into(),
+                secs: 60
+            }
+            .error_category(),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn error_category_bad_request() {
+        assert_eq!(
+            AppError::BadRequest("bad param".into()).error_category(),
+            "bad_request"
+        );
+    }
+
+    #[test]
+    fn error_category_unauthorized() {
+        assert_eq!(
+            AppError::Unauthorized("bad key".into()).error_category(),
+            "auth_error"
+        );
+    }
+
+    #[test]
+    fn error_category_internal() {
+        assert_eq!(
+            AppError::Internal("boom".into()).error_category(),
+            "internal_error"
+        );
+        assert_eq!(
+            AppError::Config("bad".into()).error_category(),
+            "internal_error"
+        );
+        assert_eq!(
+            AppError::NotFound("gone".into()).error_category(),
+            "internal_error"
+        );
+        assert_eq!(
+            AppError::Conflict("dup".into()).error_category(),
+            "internal_error"
+        );
+    }
+
+    #[test]
+    fn error_category_anyhow() {
+        assert_eq!(
+            AppError::Anyhow(anyhow::anyhow!("oops")).error_category(),
+            "internal_error"
+        );
+    }
 }

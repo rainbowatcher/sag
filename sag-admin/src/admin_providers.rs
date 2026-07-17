@@ -214,6 +214,10 @@ pub async fn add_provider(
 
         config.providers.insert(req.name.clone(), pc.clone());
 
+        // Bump the config version so downstream watchers (e.g. the
+        // stale-probe-threshold watcher in main.rs) recompute derived
+        // state that depends on provider settings (timeout_secs / ttfb).
+        state.config.bump_routes_version();
         state.config.try_persist(&config, "adding provider");
 
         pc
@@ -306,6 +310,9 @@ pub async fn update_provider(
 
         let pc = existing.clone();
 
+        // Bump the config version so downstream watchers recompute derived
+        // state that depends on provider settings (timeout_secs / ttfb).
+        state.config.bump_routes_version();
         state.config.try_persist(&config, "updating provider");
 
         pc
@@ -394,6 +401,11 @@ pub async fn delete_provider(
                 .into_response();
         };
 
+        // Bump the config version so downstream watchers recompute derived
+        // state. `remove_provider` may cascade to routes/targets, but even
+        // a pure provider removal (no route targets) changes the set of
+        // providers the threshold is computed from.
+        state.config.bump_routes_version();
         state.config.try_persist(&config, "deleting provider");
 
         cascade

@@ -15,6 +15,7 @@ pub mod types;
 // Re-export key types at crate level for convenience
 pub use circuit_breaker::{
     CircuitBreakerEntry, CircuitStateKind, RouteCircuitBreaker, RouteTargetKey,
+    compute_stale_probe_threshold,
 };
 pub use error::AppError;
 pub use types::{

@@ -18,9 +18,13 @@ use std::collections::HashMap;
 pub struct ConfigHandle {
     pub(crate) inner: Arc<RwLock<GatewayConfig>>,
     pub(crate) config_path: Option<Arc<PathBuf>>,
-    /// Monotonically increasing counter bumped on every routes mutation
-    /// (admin CRUD or hot-reload). Used by the dispatch layer to skip
-    /// stale-entry pruning when the route set hasn't changed.
+    /// Monotonically increasing counter bumped on every config mutation
+    /// that affects routing or provider-derived state — route CRUD, provider
+    /// CRUD (add/update/delete), and hot-reload. Used by the dispatch layer
+    /// to skip stale-entry pruning when the route set hasn't changed, and by
+    /// the stale-probe-threshold watcher in `main.rs` to recompute the
+    /// circuit-breaker threshold when provider `timeout_secs` / `ttfb_timeout_secs`
+    /// settings change.
     pub(crate) routes_version: Arc<AtomicU64>,
 }
 
@@ -67,8 +71,10 @@ impl ConfigHandle {
         }
     }
 
-    /// Bump the routes version. Call after any mutation to the routes list
-    /// (admin CRUD or hot-reload) so the dispatch layer can detect staleness.
+    /// Bump the config version. Call after any mutation to the routes or
+    /// providers (admin CRUD or hot-reload) so the dispatch layer can detect
+    /// staleness and downstream watchers (e.g. the stale-probe-threshold
+    /// watcher) can recompute derived state.
     pub fn bump_routes_version(&self) {
         self.routes_version.fetch_add(1, Ordering::Release);
     }

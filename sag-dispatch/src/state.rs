@@ -13,6 +13,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
+use std::time::Duration;
+
+use sag_config::{GatewayConfig, default_timeout_secs, default_ttfb_timeout_secs};
+use sag_core::compute_stale_probe_threshold;
+
 use crate::circuit_breaker::RouteCircuitBreaker;
 use crate::order::CachedOrder;
 
@@ -88,6 +93,119 @@ impl DispatchRuntime {
             guard.retain(|k, _| valid_model_names.contains(k.as_str()));
         }
     }
+}
+
+/// Compute the stale-probe threshold for the circuit breaker from the current
+/// gateway configuration.
+///
+/// Walks every (route, target), applying the **same fallback resolution** used
+/// by `resolve.rs` to derive the effective `timeout_secs` and `retries` for each
+/// target:
+/// - `timeout_secs`: **three-tier** fallback —
+///   `target → route → provider → global default`.
+/// - `retries`: **two-tier** fallback —
+///   `target → route → global` (there is no provider tier, since `retries` is
+///   not a provider-level field).
+///
+/// The per-attempt upper bound also considers the max effective
+/// `ttfb_timeout_secs` across providers (streaming requests are bounded by ttfb,
+/// not by `timeout_secs`).
+///
+/// # Conservative over-approximation
+///
+/// `max_per_attempt_secs` and `max_retries` are taken **independently** across
+/// all targets — i.e. one target may supply the max timeout while another
+/// supplies the max retries. The resulting threshold is therefore an upper
+/// bound on the true per-target worst case, never an underestimate. For a
+/// stale-probe reclamation threshold this is the safe direction: it may
+/// delay reclamation slightly but never reclaims a slot too eagerly.
+///
+/// The resulting `max_per_attempt_secs`, `max_retries`, and
+/// `config.backoff.max_ms` are fed to [`compute_stale_probe_threshold`].
+///
+/// # Edge cases
+/// - Routes with no targets still contribute their route-level `retries` /
+///   `timeout_secs` overrides (they are valid upper bounds for a future target).
+/// - Empty `routes` / no contributing values fall back to the provider defaults
+///   for `timeout_secs` / `ttfb_timeout_secs` (or the global defaults), and to
+///   the global default for `retries`, so the threshold is never zero — the
+///   `compute_stale_probe_threshold` floor (600s) is the final safety net.
+///
+/// This is a pure, synchronous function over a config snapshot; callers should
+/// hold a read lock on the [`ConfigHandle`] when invoking it during hot-reload.
+pub fn stale_probe_threshold_from_config(config: &GatewayConfig) -> Duration {
+    let global_retries = config.backoff.retries;
+    let max_backoff_ms = config.backoff.max_ms;
+    let provider_timeouts: HashMap<String, u64> = config
+        .providers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.timeout_secs))
+        .collect();
+    let provider_ttfbs: HashMap<String, u64> = config
+        .providers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                v.ttfb_timeout_secs.unwrap_or(default_ttfb_timeout_secs()),
+            )
+        })
+        .collect();
+
+    let mut max_per_attempt: u64 = 0;
+    let mut max_retries: u32 = 0;
+
+    for route in &config.routes {
+        let rt_timeout = route.timeout_secs;
+        let rt_retries = route.retries;
+        for target in &route.targets {
+            // Mirror resolve.rs fallback: `timeout_secs` uses three-tier resolution
+            // (target → route → provider → default), while `retries` uses two-tier
+            // (target → route → global; there is no provider tier).
+            let t_retries = target.retries.or(rt_retries).unwrap_or(global_retries);
+            let t_timeout = target
+                .timeout_secs
+                .or(rt_timeout)
+                .or_else(|| provider_timeouts.get(&target.provider).copied())
+                .unwrap_or(default_timeout_secs());
+            let t_ttfb = provider_ttfbs
+                .get(&target.provider)
+                .copied()
+                .unwrap_or(default_ttfb_timeout_secs());
+
+            max_per_attempt = max_per_attempt.max(t_timeout).max(t_ttfb);
+            max_retries = max_retries.max(t_retries);
+        }
+
+        // Route with no targets: route-level overrides are still valid upper
+        // bounds for any future target added to this route.
+        if route.targets.is_empty() {
+            if let Some(t) = rt_timeout {
+                max_per_attempt = max_per_attempt.max(t);
+            }
+            if let Some(r) = rt_retries {
+                max_retries = max_retries.max(r);
+            }
+        }
+    }
+
+    // No routes contributed (e.g. empty `routes`): fall back to provider
+    // defaults so the threshold is never zero — the floor is the final net.
+    // Consider both `timeout_secs` and `ttfb_timeout_secs` so a provider with
+    // a high ttfb but default timeout still seeds the per-attempt bound.
+    if max_per_attempt == 0 {
+        max_per_attempt = provider_timeouts
+            .values()
+            .copied()
+            .chain(provider_ttfbs.values().copied())
+            .max()
+            .unwrap_or(default_timeout_secs());
+    }
+    if max_retries == 0 {
+        max_retries = global_retries;
+    }
+
+    compute_stale_probe_threshold(max_per_attempt, max_retries, max_backoff_ms)
 }
 
 #[cfg(test)]
@@ -178,5 +296,179 @@ mod tests {
         assert!(rt.fill_first_orders.read().await.contains_key("m1"));
         assert!(rt.route_counters.read().await.contains_key("m1"));
         assert!(rt.active_targets.read().await.contains_key("m1"));
+    }
+
+    // ── stale_probe_threshold_from_config tests ────────────────────
+
+    use sag_config::{
+        BackoffConfig, GatewayConfig, ProviderConfig, ProviderType, RouteConfig, RouteTarget,
+        Strategy,
+    };
+
+    /// Minimal provider config with a custom `timeout_secs` and optional ttfb.
+    fn prov(timeout_secs: u64, ttfb: Option<u64>) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: ProviderType::OpenAI,
+            api_keys: vec!["sk-test".into()],
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://api.openai.com/v1".into(),
+            models_endpoint: "models".into(),
+            timeout_secs,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            model_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
+            enabled_models: vec![],
+            enabled: true,
+            anthropic_cache_control: true,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: ttfb,
+        }
+    }
+
+    fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
+        RouteConfig {
+            model_name: model.into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::FillFirst,
+            targets,
+        }
+    }
+
+    fn target(provider: &str) -> RouteTarget {
+        RouteTarget {
+            provider: provider.into(),
+            real_model: None,
+            priority: 0,
+            retries: None,
+            timeout_secs: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    fn config_with(
+        providers: HashMap<String, ProviderConfig>,
+        routes: Vec<RouteConfig>,
+        backoff: BackoffConfig,
+    ) -> GatewayConfig {
+        GatewayConfig {
+            providers,
+            routes,
+            backoff,
+            ..sag_config::gateway_config_base!()
+        }
+    }
+
+    #[test]
+    fn threshold_takes_per_target_timeout_override() {
+        // provider timeout=120, but one target overrides to 1200.
+        // per-attempt should be 1200, retries=2 (global) → 1200×3 + 10 = 3610
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(120, None));
+        let mut t = target("p1");
+        t.timeout_secs = Some(1200);
+        let routes = vec![route("m1", vec![t])];
+        let config = config_with(providers, routes, BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(3610));
+    }
+
+    #[test]
+    fn threshold_takes_per_target_retries_override() {
+        // global retries=2, but target overrides to 5.
+        // per-attempt=120 (provider), attempts=6 → 120×6 + backoff(5000×5/1000=25)=745
+        // 745 > 600 (floor) so no floor intervention.
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(120, None));
+        let mut t = target("p1");
+        t.retries = Some(5);
+        let routes = vec![route("m1", vec![t])];
+        let config = config_with(providers, routes, BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(745));
+    }
+
+    #[test]
+    fn threshold_takes_route_level_retries_fallback() {
+        // target.retries=None, route.retries=4 → effective retries=4.
+        // per-attempt=120, attempts=5 → 120×5 + 5000×4/1000=20 = 620
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(120, None));
+        let mut r = route("m1", vec![target("p1")]);
+        r.retries = Some(4);
+        let config = config_with(providers, vec![r], BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(620));
+    }
+
+    #[test]
+    fn threshold_applies_ttfb_max() {
+        // provider timeout=120 but ttfb=900 → per-attempt = max(120, 900) = 900.
+        // retries=2 → 900×3 + 10 = 2710
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(120, Some(900)));
+        let routes = vec![route("m1", vec![target("p1")])];
+        let config = config_with(providers, routes, BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(2710));
+    }
+
+    #[test]
+    fn threshold_floor_kicks_in_for_extreme_small() {
+        // timeout=10, retries=0 → 10×1 + 0 = 10 < 600 → floor
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(10, None));
+        let mut t = target("p1");
+        t.retries = Some(0);
+        let routes = vec![route("m1", vec![t])];
+        let config = config_with(providers, routes, BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn threshold_empty_routes_uses_provider_default() {
+        // routes=[], one provider timeout=300, retries=2 (global default).
+        // per-attempt=300 (from provider fallback), attempts=3 → 300×3 + 10 = 910
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(300, None));
+        let config = config_with(providers, vec![], BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(910));
+    }
+
+    #[test]
+    fn threshold_route_timeout_beats_provider_timeout() {
+        // Core fallback chain: target → route → provider → default.
+        // target leaves timeout unset, route sets 200, provider sets 100.
+        // Route must win over provider: per-attempt=200, retries=2 (global)
+        // → 200×3 + 10 = 610.
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(100, None));
+        let mut r = route("m1", vec![target("p1")]);
+        r.timeout_secs = Some(200);
+        let config = config_with(providers, vec![r], BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(610));
+    }
+
+    #[test]
+    fn threshold_takes_independent_max_across_targets() {
+        // `max_per_attempt` and `max_retries` are taken independently across
+        // all targets (conservative over-approximation): target A supplies the
+        // max retries (5), target B supplies the max per-attempt timeout (500).
+        // per-attempt = 500, attempts = 6 → 500×6 + 5000×5/1000 = 3000 + 25 = 3025.
+        let mut providers = HashMap::new();
+        providers.insert("p1".into(), prov(120, None));
+        providers.insert("p2".into(), prov(500, None));
+        let mut a = target("p1");
+        a.retries = Some(5);
+        let b = target("p2");
+        let routes = vec![route("m1", vec![a, b])];
+        let config = config_with(providers, routes, BackoffConfig::default());
+        let threshold = stale_probe_threshold_from_config(&config);
+        assert_eq!(threshold, Duration::from_secs(3025));
     }
 }

@@ -10,7 +10,7 @@ pub use sag_state::{AppState, testing::test_app_state};
 pub use sag_dispatch::testing::test_dispatch_runtime;
 pub use sag_dispatch::{
     CachedOrder, DispatchCtx, DispatchRuntime, RouteCircuitBreaker, RouteTargetKey, dispatch_chat,
-    dispatch_image, order_targets, resolve_route,
+    dispatch_image, order_targets, resolve_route, stale_probe_threshold_from_config,
 };
 
 // ── 从 sag-admin 重导出（保持向后兼容） ──────────────────────────
