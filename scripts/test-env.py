@@ -222,7 +222,14 @@ def cmd_stop(
 ) -> None:
     if not PID_FILE.exists():
         if allow_missing:
-            log("SYS", "no pid file - nothing to stop (continuing)")
+            # A lock without a pid is always orphaned (the pid is the canonical
+            # pointer). Clear stale lock/build-info so the next `start` isn't
+            # blocked by a leftover lock from an interrupted run.
+            if LOCK_FILE.exists() or BUILD_INFO.exists():
+                log("SYS", "no pid file; clearing orphaned lock/build-info")
+                _cleanup_state()
+            else:
+                log("SYS", "no pid file - nothing to stop (continuing)")
             return
         log("ERR", "no pid file - nothing to stop")
         sys.exit(1)
