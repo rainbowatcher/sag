@@ -62,7 +62,7 @@ export default defineConfig({
     search: { provider: 'local' },
     outline: [2,3]
   },
-  // ignoreDeadLinks: true,
+  ignoreDeadLinks: true,
   markdown: {
     lineNumbers: true,
   },
