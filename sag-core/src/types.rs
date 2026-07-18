@@ -77,7 +77,9 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<serde_json::Value>,
     /// Constrains effort on reasoning for reasoning models.
-    /// Supported values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+    /// Supported values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+    /// Not all reasoning models support every value — see the
+    /// [reasoning guide](https://platform.openai.com/docs/guides/reasoning).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Set of 16 key-value pairs that can be attached to the completion for structured metadata.
@@ -154,6 +156,28 @@ pub struct ChatCompletionRequest {
     /// Filtered per-provider against supported params.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ChatCompletionRequest {
+    /// Normalize the `reasoning_effort` field in-place.
+    ///
+    /// Applies `trim()` + `to_ascii_lowercase()` so variants like
+    /// `" High "` / `"XHIGH"` / `"Medium"` are collapsed to their
+    /// canonical forms before storage in the call log and forwarding
+    /// to upstream providers.
+    ///
+    /// Call this once after deserialization, before the request enters
+    /// the dispatch layer.
+    pub fn normalize_reasoning_effort(&mut self) {
+        if let Some(ref mut v) = self.reasoning_effort {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                self.reasoning_effort = None;
+            } else {
+                *v = trimmed.to_ascii_lowercase();
+            }
+        }
+    }
 }
 
 /// Represents the `stop` parameter which can be either a single string or an
@@ -319,6 +343,10 @@ pub struct CallLog {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// `reasoning_effort` parameter from the client request (OpenAI o-series).
     /// `None` means the client did not specify it.
+    ///
+    /// Note: for Anthropic providers, this field reflects client intent and may
+    /// not correspond to upstream behavior unless the mapping table in
+    /// `to_anthropic_request` translates it to `thinking.budget_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Duration spent waiting for and receiving the upstream response only
@@ -345,7 +373,69 @@ pub struct CallLog {
     pub client_ip: Option<String>,
     /// Machine-readable error category derived from the [`AppError`] variant
     /// (e.g. `"model_not_found"`, `"provider_error"`, `"timeout"`). `None`
-    /// for successful calls.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// for successful calls.    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── normalize_reasoning_effort tests ──────────────────────────
+
+    #[test]
+    fn normalize_trims_and_lowercases() {
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model":"m","messages":[],"reasoning_effort":" High "}))
+                .unwrap();
+        req.normalize_reasoning_effort();
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn normalize_lowercases_xhigh() {
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model":"m","messages":[],"reasoning_effort":"XHIGH"}))
+                .unwrap();
+        req.normalize_reasoning_effort();
+        assert_eq!(req.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn normalize_lowercases_max() {
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model":"m","messages":[],"reasoning_effort":"MAX"}))
+                .unwrap();
+        req.normalize_reasoning_effort();
+        assert_eq!(req.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn normalize_whitespace_only_becomes_none() {
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model":"m","messages":[],"reasoning_effort":"   "}))
+                .unwrap();
+        req.normalize_reasoning_effort();
+        assert_eq!(req.reasoning_effort, None);
+    }
+
+    #[test]
+    fn normalize_none_passes_through() {
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model":"m","messages":[]})).unwrap();
+        req.normalize_reasoning_effort();
+        assert_eq!(req.reasoning_effort, None);
+    }
+
+    #[test]
+    fn normalize_unknown_value_preserved() {
+        // Unknown values are not rejected (gateway design principle); they
+        // are lowercased and forwarded so the upstream provider can decide.
+        let mut req: ChatCompletionRequest =
+            serde_json::from_value(json!({"model":"m","messages":[],"reasoning_effort":"ultra"}))
+                .unwrap();
+        req.normalize_reasoning_effort();
+        assert_eq!(req.reasoning_effort.as_deref(), Some("ultra"));
+    }
 }

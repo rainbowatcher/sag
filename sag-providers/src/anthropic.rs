@@ -244,6 +244,16 @@ struct AnthropicTool {
     cache_control: Option<CacheControl>,
 }
 
+/// Anthropic Extended Thinking configuration.
+/// Serializes as `{"type": "enabled", "budget_tokens": N}`.
+/// Omitted from the request when thinking is not enabled (no `"disabled"` value).
+#[derive(Debug, PartialEq, Serialize)]
+struct AnthropicThinking {
+    #[serde(rename = "type")]
+    think_type: &'static str,
+    budget_tokens: u32,
+}
+
 #[derive(Debug, Serialize)]
 struct AnthropicRequest {
     model: String,
@@ -261,6 +271,8 @@ struct AnthropicRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +411,34 @@ fn set_cache_control(block: &mut ContentBlock) {
     }
 }
 
+/// Output margin: `budget_tokens` must be ≤ `max_tokens − OUTPUT_MARGIN` so
+/// the model has enough tokens left for a visible reply after thinking.
+/// 1,024 is the minimum recommended by Anthropic (1,024–2,048).
+const OUTPUT_MARGIN: u32 = 1024;
+
+/// Map a normalized `reasoning_effort` to an Anthropic thinking budget,
+/// downgrading recursively when `max_tokens` is too small.
+///
+/// Returns `None` when:
+/// - `effort` is `"none"` or an unknown value (no thinking requested),
+/// - even the smallest budget (1,024) cannot fit within `max_tokens − OUTPUT_MARGIN`.
+fn resolve_budget(effort: &str, max_tokens: u32) -> Option<u32> {
+    const LEVELS: &[(&str, u32)] = &[
+        ("max", 32768),
+        ("xhigh", 16384),
+        ("high", 8192),
+        ("medium", 4096),
+        ("low", 2048),
+        ("minimal", 1024),
+    ];
+    let available = max_tokens.saturating_sub(OUTPUT_MARGIN);
+    let start = LEVELS.iter().position(|(l, _)| *l == effort)?;
+    LEVELS[start..]
+        .iter()
+        .find(|(_, budget)| *budget <= available)
+        .map(|(_, budget)| *budget)
+}
+
 /// Anthropic Messages API provider adapter.
 pub struct AnthropicProvider {
     base: ProviderBase,
@@ -453,6 +493,15 @@ impl AnthropicProvider {
             inject_cache_control(&mut system, &mut tools, &mut messages);
         }
 
+        let thinking = request
+            .reasoning_effort
+            .as_deref()
+            .and_then(|effort| resolve_budget(effort, max_tokens))
+            .map(|budget_tokens| AnthropicThinking {
+                think_type: "enabled",
+                budget_tokens,
+            });
+
         AnthropicRequest {
             model: real_model.to_string(),
             messages,
@@ -463,6 +512,7 @@ impl AnthropicProvider {
             temperature: request.temperature,
             top_p: request.top_p,
             stop_sequences,
+            thinking,
         }
     }
 
@@ -1065,5 +1115,139 @@ mod tests {
         // Only the last tool should have cache_control
         assert!(tools[0].cache_control.is_none());
         assert!(tools[1].cache_control.is_some());
+    }
+
+    // ── resolve_budget unit tests ─────────────────────────────────
+
+    #[test]
+    fn resolve_budget_high_hits_direct() {
+        assert_eq!(resolve_budget("high", 10000), Some(8192));
+    }
+
+    #[test]
+    fn resolve_budget_xhigh_downgrades_to_high() {
+        // 16384 > 10000 − 1024 = 8976 → downgrade to high
+        assert_eq!(resolve_budget("xhigh", 10000), Some(8192));
+    }
+
+    #[test]
+    fn resolve_budget_high_downgrades_to_low() {
+        // 8192 > 4096 − 1024 = 3072 → medium 4096 > 3072 → low 2048 ≤ 3072
+        assert_eq!(resolve_budget("high", 4096), Some(2048));
+    }
+
+    #[test]
+    fn resolve_budget_medium_downgrades_to_minimal() {
+        // 4096 > 2048 − 1024 = 1024 → low 2048 > 1024 → minimal 1024 ≤ 1024
+        assert_eq!(resolve_budget("medium", 2048), Some(1024));
+    }
+
+    #[test]
+    fn resolve_budget_minimal_hits_direct() {
+        assert_eq!(resolve_budget("minimal", 2048), Some(1024));
+    }
+
+    #[test]
+    fn resolve_budget_max_hits_direct() {
+        assert_eq!(resolve_budget("max", 40000), Some(32768));
+    }
+
+    #[test]
+    fn resolve_budget_all_fail_when_max_tokens_too_small() {
+        // 1024 − 1024 = 0, no budget fits
+        assert_eq!(resolve_budget("high", 1024), None);
+    }
+
+    #[test]
+    fn resolve_budget_unknown_effort_returns_none() {
+        assert_eq!(resolve_budget("ultra", 10000), None);
+    }
+
+    #[test]
+    fn resolve_budget_boundary_exact_fit() {
+        // low=2048, available = 3072 − 1024 = 2048 → fits exactly
+        assert_eq!(resolve_budget("low", 3072), Some(2048));
+    }
+
+    #[test]
+    fn resolve_budget_low_downgrades_to_minimal_at_boundary() {
+        // low=2048 > 3071−1024=2047 → downgrade to minimal=1024 ≤ 2047
+        assert_eq!(resolve_budget("low", 3071), Some(1024));
+    }
+
+    #[test]
+    fn resolve_budget_all_fail_when_even_minimal_cannot_fit() {
+        // 2047 − 1024 = 1023 < minimal 1024 → nothing fits
+        assert_eq!(resolve_budget("low", 2047), None);
+    }
+
+    // ── to_anthropic_request thinking integration tests ────────────
+
+    fn req_with_reasoning(effort: &str, max_tokens: u32) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "claude-sonnet-4-20250514".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("hello".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            max_tokens: Some(max_tokens),
+            reasoning_effort: Some(effort.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn to_anthropic_request_enables_thinking_for_high_with_room() {
+        let req = req_with_reasoning("high", 10000);
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        let thinking = anthropic_req.thinking.unwrap();
+        assert_eq!(thinking.think_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 8192);
+    }
+
+    #[test]
+    fn to_anthropic_request_no_thinking_when_reasoning_effort_none() {
+        let req = ChatCompletionRequest {
+            model: "claude-sonnet-4-20250514".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("hello".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            max_tokens: Some(10000),
+            ..Default::default()
+        };
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        assert!(anthropic_req.thinking.is_none());
+    }
+
+    #[test]
+    fn to_anthropic_request_no_thinking_for_none_effort() {
+        let req = req_with_reasoning("none", 10000);
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        assert!(anthropic_req.thinking.is_none());
+    }
+
+    #[test]
+    fn to_anthropic_request_no_thinking_when_downgraded_out() {
+        // default max_tokens=1024 → nothing fits
+        let req = req_with_reasoning("high", 1024);
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        assert!(anthropic_req.thinking.is_none());
+    }
+
+    #[test]
+    fn to_anthropic_request_no_thinking_for_unknown_effort() {
+        let req = req_with_reasoning("ultra", 10000);
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        assert!(anthropic_req.thinking.is_none());
     }
 }

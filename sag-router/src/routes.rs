@@ -85,9 +85,10 @@ async fn chat_completions(
     Extension(trace_id): Extension<uuid::Uuid>,
     Extension(runtime): Extension<DispatchRuntime>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(mut request): Json<ChatCompletionRequest>,
 ) -> Response<Body> {
     let start = Instant::now();
+    request.normalize_reasoning_effort();
     let is_stream = request.stream.unwrap_or(false);
     let span = tracing::Span::current();
     span.record("request_id", trace_id.to_string());
