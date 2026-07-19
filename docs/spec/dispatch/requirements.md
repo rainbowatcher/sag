@@ -24,6 +24,8 @@ updated: 2026-06-29
    e. 失败 → 根据错误类型决定重试或 fallthrough
 5. 全部 targets 耗尽 → 返回聚合错误
 
+**失败路径**在写入 `call_logs` 时携带 `request.reasoning_effort`，确保失败请求的推理意图可被审计——与成功路径一致。图片生成路径传 `None`（不适用）。
+
 ### 重试退避
 
 每次重试前等待指数退避延迟：
@@ -91,5 +93,6 @@ updated: 2026-06-29
 
 ## 变更记录
 
+- [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)
 - [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
 - [0001 初始化](changes/0001-initial.md)

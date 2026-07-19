@@ -10,6 +10,7 @@ updated: 2026-06-03
 - [sag-dispatch/src/dispatch/chat.rs](../../../sag-dispatch/src/dispatch/chat.rs) — 聊天补全分发（非流式 + 流式）
 - [sag-dispatch/src/dispatch/image.rs](../../../sag-dispatch/src/dispatch/image.rs) — 图片生成分发
 - [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理
+- [sag-dispatch/src/dispatch/mod.rs](../../../sag-dispatch/src/dispatch/mod.rs) — `failure_log`、`success_log` 等日志构造函数
 - [sag-dispatch/src/dispatch/retry.rs](../../../sag-dispatch/src/dispatch/retry.rs) — 重试退避逻辑
 - [sag-dispatch/src/dispatch/resolve.rs](../../../sag-dispatch/src/dispatch/resolve.rs) — 路由匹配 + 目标选择
 - [sag-dispatch/src/order.rs](../../../sag-dispatch/src/order.rs) — 目标排序
@@ -108,8 +109,12 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 
 - `sag-dispatch/src/testing.rs` — 集成测试
 - `sag-dispatch/src/dispatch/retry.rs` — 退避公式单元测试
+- `sag-dispatch/src/dispatch/mod.rs` — `failure_log` / `success_log` round-trip 测试（含 `reasoning_effort` 字段）
+- `sag-dispatch/src/dispatch/resolve.rs` — resolve 失败路径 `reasoning_effort` round-trip 测试
+- `sag-dispatch/src/dispatch/image.rs` — 图片路径 `reasoning_effort=None` 断言
 - 关键场景：熔断器交互、重试耗尽、流式超时、4xx 立即停止、时间穿越（UTC 时间戳）
 
 ## 变更记录
+- [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)
 - [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
 - [0001 初始化](changes/0001-initial.md)
