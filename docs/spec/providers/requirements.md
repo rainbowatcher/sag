@@ -11,21 +11,28 @@ updated: 2026-06-03
 
 ## 预期行为
 
+### reasoning_effort 归一化
+
+1. 请求入口（`sag-router/src/routes.rs`）在 dispatch 前对 `reasoning_effort` 做归一化：`trim()` + `to_ascii_lowercase()`
+2. 空字符串（`""` 或纯空白）归一化为 `None`
+3. 未知值不拒绝，仅小写化后透传（网关设计原则：拒绝未知值是反模式）
+
 ### 请求翻译
 
 1. 客户端发送 OpenAI 兼容请求（JSON body）
-2. 根据 `provider_type` 选择适配器
-3. 适配器将请求翻译为上游格式：
+2. `reasoning_effort` 在入口处归一化（见上节）
+3. 根据 `provider_type` 选择适配器
+4. 适配器将请求翻译为上游格式：
    - **OpenAI**：透传（本身就是 OpenAI 格式）
-   - **Anthropic**：提取 system messages → 合并为 `system` 参数，翻译 content blocks、stop_sequences、tool_choice
-4. 发送请求到上游（认证根据供应商类型：OpenAI → `Authorization: Bearer`，Anthropic → `x-api-key`）
-5. 收到响应后翻译回 OpenAI 格式
+   - **Anthropic**：提取 system messages → 合并为 `system` 参数，翻译 content blocks、stop_sequences、tool_choice；**将 `reasoning_effort` 翻译为 `thinking: {type: "enabled", budget_tokens: N}`**（见「Anthropic Extended Thinking 翻译」节）
+5. 发送请求到上游（认证根据供应商类型：OpenAI → `Authorization: Bearer`，Anthropic → `x-api-key`）
+6. 收到响应后翻译回 OpenAI 格式
 
 ### 响应翻译（Anthropic → OpenAI）
 
 - `content` 块映射：`text` → `text`，`tool_use` → `tool_calls`
 - `stop_reason` 映射：`end_turn` / `stop_sequence` → `stop`，`max_tokens` → `length`，`tool_use` → `tool_calls`
-- Usage 直译：`input_tokens` → `prompt_tokens`，`output_tokens` → `completion_tokens`
+- Usage 直译：`input_tokens` → `prompt_tokens`，`output_tokens` → `completion_tokens`，`thinking_tokens` → `reasoning_tokens`（Anthropic Extended Thinking 专属）
 
 ### 角色映射
 
@@ -35,6 +42,24 @@ updated: 2026-06-03
 - 空映射时零开销（不额外遍历）
 
 > **Anthropic 边界情况**：Anthropic 仅接受单条 system prompt。如果映射后产生多条 system 消息，只有第一条生效，其余被丢弃。
+
+### Anthropic Extended Thinking 翻译
+
+客户端 `reasoning_effort` 字段通过 7 档映射表翻译为 Anthropic 的 `thinking: {type: "enabled", budget_tokens: N}`：
+
+| 档位 | `budget_tokens` | 场景 |
+|------|----------------|------|
+| `none` | **省略 thinking** | 不需要推理 |
+| `minimal` | 1,024 | 简单事实查询 |
+| `low` | 2,048 | 简单分类、格式化 |
+| `medium` | 4,096 | 摘要、邮件、简单编码 |
+| `high` | 8,192 | 复杂推理、多步逻辑 |
+| `xhigh` | 16,384 | 深度分析、架构规划 |
+| `max` | 32,768 | 极限推理 |
+
+**递归降级**：约束 `budget_tokens ≤ max_tokens - 1024`（预留 1,024 token 输出余量）。若目标档位不满足，向下搜索第一个满足约束的档位；连 `minimal(1024)` 都塞不下则放弃 thinking。不悄悄抬高 `max_tokens`（避免成本不可预期）。
+
+未知档位：不启用 thinking，与网关设计原则一致（不拒绝、不 panic）。
 
 ### Anthropic 缓存控制
 
@@ -101,4 +126,5 @@ updated: 2026-06-03
 
 ## 变更记录
 
+- [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)

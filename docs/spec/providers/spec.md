@@ -13,6 +13,8 @@ updated: 2026-06-03
 - [sag-providers/src/anthropic.rs](../../../sag-providers/src/anthropic.rs) — Anthropic 适配器（请求/响应翻译 + 缓存控制注入）
 - [sag-providers/src/util.rs](../../../sag-providers/src/util.rs) — 共享工具函数
 - [sag-providers/src/lib.rs](../../../sag-providers/src/lib.rs) — `create_provider()` 工厂函数
+- [sag-core/src/types.rs](../../../sag-core/src/types.rs) — `normalize_reasoning_effort()` 方法
+- [sag-router/src/routes.rs](../../../sag-router/src/routes.rs) — 请求入口归一化调用点
 
 ## 核心设计
 
@@ -87,6 +89,25 @@ RoundRobin 计数器通过 `DispatchRuntime` 中的 `Arc<AtomicUsize>` 维护，
 
 **Trade-off**: 这个顺序允许 provider 设置默认参数，target 可以覆盖特定目标。但也意味着 target 无法"恢复"被 provider overrides 覆盖的客户端字段。
 
+### Anthropic reasoning_effort → thinking 翻译
+
+客户端 `reasoning_effort` 经 7 档映射表 + 递归降级算法翻译为 Anthropic `thinking.budget_tokens`。
+
+**设计决策**：
+
+| 决策 | 内容 |
+|------|------|
+| 映射表 | 固定 7 档 `(none/minimal/low/medium/high/xhigh/max)` → 绝对值 `(0/1024/2048/4096/8192/16384/32768)` |
+| 递归降级 | 从目标档位向下搜索第一个满足 `budget ≤ max_tokens - 1024` 的档位 |
+| 不自增 max_tokens | 若 `max_tokens=1024`（默认），所有档位均无法启用 thinking——用户需显式设大 `max_tokens` |
+| 未知档位 | 不 panic、不启用 thinking，与网关设计原则一致 |
+
+**Trade-off**:
+- ✅ 固定映射表简单、可预测，不会因模型或请求上下文产生意外行为
+- ✅ 递归降级保证 `budget_tokens` 始终有效，不会因档位过高而放弃 thinking
+- ❌ 绝对值映射无法适配所有模型上下文（如超长 context 时适当降低 budget 更合理）
+- ❌ 不自增 `max_tokens` 意味着默认配置下 thinking 不生效——需文档引导用户显式设置
+
 ### Anthropic 缓存控制注入
 
 在 system prompt、tools、conversation history 中插入 `cache_control: {"type": "ephemeral"}` 断点。默认启用。
@@ -106,8 +127,10 @@ RoundRobin 计数器通过 `DispatchRuntime` 中的 `Arc<AtomicUsize>` 维护，
 ## 测试策略
 
 - `sag-providers/src/openai.rs` — OpenAI 适配器单元测试
-- `sag-providers/src/anthropic.rs` — Anthropic 翻译测试（请求构造、响应解析）
+- `sag-providers/src/anthropic.rs` — Anthropic 翻译测试（请求构造、响应解析、reasoning_effort → thinking 翻译、reasoning_tokens 捕获）
 - `sag-providers/src/base.rs` — body_overrides 合并测试
+- `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
 
 ## 变更记录
+- [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)
