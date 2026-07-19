@@ -46,7 +46,10 @@ fn extract_anthropic_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender
             total_tokens: (input + output) as u32,
             cached_tokens,
             cache_creation_tokens,
-            reasoning_tokens: None,
+            reasoning_tokens: usage
+                .get("thinking_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
         }));
     }
 }
@@ -308,6 +311,10 @@ struct AnthropicUsage {
     cache_read_input_tokens: Option<u32>,
     #[serde(default)]
     cache_creation_input_tokens: Option<u32>,
+    /// Tokens consumed by the model's internal thinking process when
+    /// Extended Thinking is enabled. Maps to `Usage.reasoning_tokens`.
+    #[serde(default)]
+    thinking_tokens: Option<u32>,
 }
 
 // ── Provider ─────────────────────────────────────────────────────
@@ -534,7 +541,7 @@ impl AnthropicProvider {
             total_tokens: u.input_tokens + u.output_tokens,
             cached_tokens: u.cache_read_input_tokens,
             cache_creation_tokens: u.cache_creation_input_tokens,
-            reasoning_tokens: None,
+            reasoning_tokens: u.thinking_tokens,
         });
 
         ChatCompletionResponse {
@@ -756,6 +763,18 @@ mod tests {
         assert_eq!(usage.output_tokens, 300);
         assert!(usage.cache_read_input_tokens.is_none());
         assert!(usage.cache_creation_input_tokens.is_none());
+        assert!(usage.thinking_tokens.is_none());
+    }
+
+    #[test]
+    fn anthropic_usage_deserializes_thinking_tokens() {
+        let json = r#"{
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "thinking_tokens": 2048
+        }"#;
+        let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.thinking_tokens, Some(2048));
     }
 
     #[test]
