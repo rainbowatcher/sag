@@ -10,8 +10,8 @@ use crate::config::{
 use crate::loader::json_util::{check_json_map, json_to_toml_value};
 use crate::toml_edit_util::{
     ensure_array_field, ensure_inline_table_field, ensure_nested_inline_table, prune_keys,
-    reformat_inline_table_arrays_multiline, sync_array_of_tables, sync_inline_table_array_in_place,
-    sync_inline_table_in_place, sync_string_array_in_place, upsert_table,
+    sync_array_of_tables, sync_inline_table_array_in_place, sync_inline_table_in_place,
+    sync_string_array_in_place, upsert_table,
 };
 
 /// Persist the in-memory `GatewayConfig` back to the TOML file.
@@ -143,17 +143,13 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
     )?;
 
     // ── Write back ──
-    // Render the document, then post-process inline-table-arrays to
-    // a multi-line layout for hand-editing readability. We do this as
-    // a string-level pass because `toml_edit` renders single-line
-    // arrays on one line (e.g. `targets = [{...}, {...}]`).
-    // `toml_edit` **does** preserve per-item prefix decor (comments)
-    // and multi-line formatting when it already existed on input, so
-    // the reformat is a no-op for already-multi-line arrays — it only
-    // converts single-line arrays to multi-line. See
-    // `reformat_inline_table_arrays_multiline` for the rationale.
-    let mut rendered = doc.to_string();
-    reformat_inline_table_arrays_multiline(&mut rendered, "targets", "    ");
+    // Multi-line layout for inline-table-arrays (e.g. `targets`) is
+    // handled natively by `toml_edit` 0.24.1 via per-item
+    // `decor_mut().set_prefix()` set inside
+    // `sync_inline_table_array_in_place`. No string-level
+    // post-processing is needed — the rendered document already
+    // contains multi-line arrays.
+    let rendered = doc.to_string();
     std::fs::write(path, rendered)
         .map_err(|e| sag_core::AppError::Config(format!("failed to write config file: {e}")))?;
 
@@ -369,13 +365,11 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
         write_target_fields,
     );
 
-    // Force multi-line layout (`[\n    { ... },\n    { ... }\n]`) is
-    // applied as a string-level post-process on the rendered doc in
-    // `save_config_to_file` — see `reformat_inline_table_arrays_multiline`.
-    // `toml_edit` preserves per-item prefix decor (comments) and any
-    // existing multi-line formatting natively; the reformat step only
-    // converts arrays that were originally single-line. Already-multi-line
-    // arrays are left untouched by the reformatter (it detects `\n` in
+    // Multi-line layout (`[\n    { ... },\n    { ... }\n]`) for
+    // inline-table arrays is handled natively by `toml_edit` 0.24.1
+    // via per-item `decor_mut().set_prefix()` set inside
+    // `sync_inline_table_array_in_place` — no string-level
+    // post-processing is needed.
     // the payload and skips).
 }
 

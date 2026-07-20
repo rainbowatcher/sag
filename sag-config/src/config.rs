@@ -37,6 +37,7 @@ macro_rules! gateway_config_base {
             logging: $crate::LoggingConfig::default(),
             routes: ::std::vec::Vec::new(),
             shuffle_cache_ttl_secs: 7200,
+            sticky_failover_reset_secs: 7200,
             circuit_breaker: $crate::CircuitBreakerConfig::default(),
         }
     };
@@ -61,6 +62,11 @@ pub struct GatewayConfig {
     /// (the cached order persists until the route config changes).
     #[serde(default = "default_shuffle_cache_ttl_secs")]
     pub shuffle_cache_ttl_secs: u64,
+    /// Sticky-failover active target 重置超时（秒）。
+    /// active target 在该时长后失效，回到正常 fill-first 顺序。
+    /// 默认 7200（2 小时）。设为 0 则永不过期。
+    #[serde(default = "default_sticky_failover_reset_secs")]
+    pub sticky_failover_reset_secs: u64,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     /// Logging configuration (optional, default log level: "info").
@@ -751,6 +757,9 @@ fn default_probe_interval_secs() -> u64 {
     60
 }
 fn default_shuffle_cache_ttl_secs() -> u64 {
+    7200
+}
+fn default_sticky_failover_reset_secs() -> u64 {
     7200
 }
 fn default_true() -> bool {

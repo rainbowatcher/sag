@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sag_config::{GatewayConfig, default_timeout_secs, default_ttfb_timeout_secs};
 use sag_core::compute_stale_probe_threshold;
@@ -39,8 +39,10 @@ pub struct DispatchRuntime {
     /// TTL expires (default 2 hours).
     pub fill_first_orders: Arc<RwLock<HashMap<String, CachedOrder>>>,
     /// Sticky-failover active targets keyed by request model name.
-    /// Stores (provider, real_model) of the last successful target.
-    pub active_targets: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Stores (provider, real_model, stick_start_time) of the last successful target.
+    /// The third element is the `Instant` when the sticky target was recorded,
+    /// used for the configurable expiry mechanism.
+    pub active_targets: Arc<RwLock<HashMap<String, (String, String, Instant)>>>,
     /// Runtime availability memory for route targets.
     pub route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
     /// Last routes version seen by the prune guard. When this matches
@@ -228,10 +230,10 @@ mod tests {
             .write()
             .await
             .insert("deleted-model".into(), 42);
-        rt.active_targets
-            .write()
-            .await
-            .insert("deleted-model".into(), ("p".into(), "m".into()));
+        rt.active_targets.write().await.insert(
+            "deleted-model".into(),
+            ("p".into(), "m".into(), Instant::now()),
+        );
 
         // Also add a valid entry that should survive.
         rt.fill_first_orders.write().await.insert(
@@ -245,10 +247,10 @@ mod tests {
             .write()
             .await
             .insert("valid-model".into(), 1);
-        rt.active_targets
-            .write()
-            .await
-            .insert("valid-model".into(), ("p2".into(), "m2".into()));
+        rt.active_targets.write().await.insert(
+            "valid-model".into(),
+            ("p2".into(), "m2".into(), Instant::now()),
+        );
 
         let valid: HashSet<&str> = ["valid-model"].into_iter().collect();
         rt.prune_stale_entries(&valid).await;
@@ -288,7 +290,7 @@ mod tests {
         rt.active_targets
             .write()
             .await
-            .insert("m1".into(), ("p".into(), "rm".into()));
+            .insert("m1".into(), ("p".into(), "rm".into(), Instant::now()));
 
         let valid: HashSet<&str> = ["m1"].into_iter().collect();
         rt.prune_stale_entries(&valid).await;

@@ -93,6 +93,7 @@ fn warn_unknown_fields(doc: &toml::Value) {
             "backoff",
             "circuit_breaker",
             "shuffle_cache_ttl_secs",
+            "sticky_failover_reset_secs",
             "routes",
             "logging",
         ],

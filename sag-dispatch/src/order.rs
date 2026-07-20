@@ -31,8 +31,9 @@ pub async fn order_targets(
     strategy: Strategy,
     counters: &Arc<RwLock<HashMap<String, u64>>>,
     fill_first_orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
-    active_targets: &Arc<RwLock<HashMap<String, (String, String)>>>,
+    active_targets: &Arc<RwLock<HashMap<String, (String, String, Instant)>>>,
     shuffle_cache_ttl_secs: u64,
+    sticky_failover_reset_secs: u64,
 ) -> Vec<RouteTarget> {
     match strategy {
         Strategy::StickyFailover => {
@@ -59,8 +60,19 @@ pub async fn order_targets(
             .await;
 
             let active = active_targets.read().await;
-            if let Some((active_provider, active_real_model)) = active.get(model_name) {
-                if let Some(idx) = shuffled.iter().position(|t| {
+            if let Some((active_provider, active_real_model, created_at)) = active.get(model_name) {
+                let expired = sticky_failover_reset_secs > 0
+                    && created_at.elapsed().as_secs() >= sticky_failover_reset_secs;
+                if expired {
+                    // 过期：不做任何事，自然 fall through 到 fill-first 顺序。
+                    // 不在此处删除 entry——避免 read-then-write 竞态；
+                    // stale entry 下次成功调度时会被 insert 覆盖。
+                    tracing::debug!(
+                        model = %model_name,
+                        sticky_failover_reset_secs,
+                        "sticky-failover active target expired, using fill-first order"
+                    );
+                } else if let Some(idx) = shuffled.iter().position(|t| {
                     t.provider == *active_provider
                         && t.real_model.as_deref().unwrap_or(model_name) == *active_real_model
                 }) {
@@ -379,7 +391,7 @@ mod tests {
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
-    fn active_map() -> Arc<RwLock<HashMap<String, (String, String)>>> {
+    fn active_map() -> Arc<RwLock<HashMap<String, (String, String, Instant)>>> {
         Arc::new(RwLock::new(HashMap::new()))
     }
 
@@ -400,6 +412,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
         assert_eq!(r1[0].provider, "a");
@@ -413,6 +426,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
         assert_eq!(r2[0].provider, "b");
@@ -426,6 +440,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
         assert_eq!(r3[0].provider, "c");
@@ -439,6 +454,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
         assert_eq!(r4[0].provider, "a");
@@ -460,6 +476,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
         let r2 = order_targets(
@@ -470,6 +487,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
@@ -489,7 +507,10 @@ mod tests {
         // Record "b" as the active target
         {
             let mut guard = active.write().await;
-            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+            guard.insert(
+                "model".to_string(),
+                ("b".to_string(), "model".to_string(), Instant::now()),
+            );
         }
 
         let ordered = order_targets(
@@ -500,6 +521,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
@@ -530,13 +552,17 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
         // Record "b" as the active target
         {
             let mut guard = active.write().await;
-            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+            guard.insert(
+                "model".to_string(),
+                ("b".to_string(), "model".to_string(), Instant::now()),
+            );
         }
 
         // Run again with targets_b (which is different)
@@ -548,6 +574,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
@@ -617,13 +644,17 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
         // Record "b" as the active target
         {
             let mut guard = active.write().await;
-            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+            guard.insert(
+                "model".to_string(),
+                ("b".to_string(), "model".to_string(), Instant::now()),
+            );
         }
 
         // Run again with targets_b (extra changed but provider/real_model/priority identical)
@@ -635,6 +666,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
@@ -707,13 +739,17 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
         // Record "b" as the active target
         {
             let mut guard = active.write().await;
-            guard.insert("model".to_string(), ("b".to_string(), "model".to_string()));
+            guard.insert(
+                "model".to_string(),
+                ("b".to_string(), "model".to_string(), Instant::now()),
+            );
         }
 
         // Run again with targets_b (retries changed but provider/real_model/priority identical)
@@ -725,6 +761,7 @@ mod tests {
             &orders,
             &active,
             ttl,
+            0,
         )
         .await;
 
@@ -740,5 +777,136 @@ mod tests {
         // The returned targets must carry the new retries value
         let a_target = ordered.iter().find(|t| t.provider == "a").unwrap();
         assert_eq!(a_target.retries, Some(5));
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_resets_active_after_ttl() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
+
+        // Baseline: no active entry -> primes the fill-first cache with a
+        // fixed shuffled order.
+        let baseline = order_targets(
+            targets.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            7200,
+            3600, // reset window, irrelevant: no active entry exists
+        )
+        .await;
+
+        // Insert an EXPIRED active entry pointing at "b".
+        {
+            let mut guard = active.write().await;
+            guard.insert(
+                "model".to_string(),
+                (
+                    "b".to_string(),
+                    "model".to_string(),
+                    Instant::now() - std::time::Duration::from_secs(7200),
+                ),
+            );
+        }
+
+        // Re-run: cache is already primed (same shuffle), only difference
+        // is the expired active entry.
+        let ordered = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            7200,
+            3600, // entry is 7200s old, window is 3600s -> expired
+        )
+        .await;
+
+        // Expired entry must NOT alter the order: result equals the
+        // no-active-entry baseline (same fill-first cache).
+        assert_eq!(
+            ordered, baseline,
+            "expired active target must not prepend; result must equal fill-first baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_preserves_non_expired() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
+
+        // Record "b" as the active target, freshly created.
+        {
+            let mut guard = active.write().await;
+            guard.insert(
+                "model".to_string(),
+                ("b".to_string(), "model".to_string(), Instant::now()),
+            );
+        }
+
+        let ordered = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            3600, // reset window: 3600s - the fresh entry is not expired
+        )
+        .await;
+
+        // "b" must be prepended to the front (index 0).
+        assert_eq!(ordered[0].provider, "b");
+        let remaining: Vec<String> = ordered[1..].iter().map(|t| t.provider.clone()).collect();
+        assert!(remaining.contains(&"a".to_string()));
+        assert!(remaining.contains(&"c".to_string()));
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_never_resets_with_zero_ttl() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
+
+        // Record "b" as the active target, but with an expired timestamp.
+        {
+            let mut guard = active.write().await;
+            guard.insert(
+                "model".to_string(),
+                (
+                    "b".to_string(),
+                    "model".to_string(),
+                    Instant::now() - std::time::Duration::from_secs(7200),
+                ),
+            );
+        }
+
+        let ordered = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0, // reset window: 0 -> never expire
+        )
+        .await;
+
+        // Even though the entry is old, ttl=0 means never reset - "b" must
+        // still be prepended.
+        assert_eq!(ordered[0].provider, "b");
     }
 }

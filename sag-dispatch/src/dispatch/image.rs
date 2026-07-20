@@ -141,7 +141,11 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             let mut active = runtime.active_targets.write().await;
             active.insert(
                 request.model.clone(),
-                (provider_name.clone(), real_model.clone()),
+                (
+                    provider_name.clone(),
+                    real_model.clone(),
+                    std::time::Instant::now(),
+                ),
             );
         }
 

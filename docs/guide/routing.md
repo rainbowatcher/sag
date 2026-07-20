@@ -271,6 +271,18 @@ generic_secs = 60             # 默认 60 秒
 shuffle_cache_ttl_secs = 7200
 ```
 
+## sticky_failover_reset_secs
+
+控制 StickyFailover 策略中 active target 的重置超时。active target 是上一次成功调用的目标 provider，StickyFailover 会将其置于目标列表最前面以保持粘性。配置在 `[gateway]` 顶层：
+
+```toml
+# Sticky-failover active target 重置超时（秒）。超过该时长后 active target
+# 失效，回到正常 fill-first 顺序。默认 7200（2 小时）。设为 0 则永不过期。
+sticky_failover_reset_secs = 7200
+```
+
+过期后不会主动删除 active target 记录，而是在下一次请求时跳过 prepend、使用 fill-first 顺序；该 stale 记录会在下一次成功调度时被新的成功目标覆盖。设为 `0` 时永不过期，行为与该配置引入前一致（active target 仅在路由配置变更时清除）。
+
 ## 优先级与故障转移
 
 路由内的目标按 `priority` **降序**排列（值越大越优先）。这里的 `priority` 是 `RouteTarget` 级别字段，不是 `ProviderConfig` 级别字段。

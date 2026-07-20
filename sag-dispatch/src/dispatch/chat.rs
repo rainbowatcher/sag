@@ -176,7 +176,11 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             let mut active = runtime.active_targets.write().await;
             active.insert(
                 request.model.clone(),
-                (provider_name.clone(), real_model.clone()),
+                (
+                    provider_name.clone(),
+                    real_model.clone(),
+                    std::time::Instant::now(),
+                ),
             );
         }
 
@@ -1150,7 +1154,11 @@ mod tests {
             let mut active = rt.active_targets.write().await;
             active.insert(
                 "gpt-4o".to_string(),
-                ("second".to_string(), "gpt-4o".to_string()),
+                (
+                    "second".to_string(),
+                    "gpt-4o".to_string(),
+                    std::time::Instant::now(),
+                ),
             );
         }
 

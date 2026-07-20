@@ -103,6 +103,7 @@ mod tests {
             logging: crate::config::LoggingConfig::default(),
             routes: Vec::new(),
             shuffle_cache_ttl_secs: 7200,
+            sticky_failover_reset_secs: 7200,
             circuit_breaker: CircuitBreakerConfig::default(),
         };
         let h1 = ConfigHandle::from_config(config);

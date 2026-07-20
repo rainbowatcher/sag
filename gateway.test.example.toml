@@ -21,6 +21,11 @@
 # re-shuffle on config reload). Default: 7200 (2 hours).
 # shuffle_cache_ttl_secs = 7200
 
+# Sticky-failover active target reset timeout in seconds. After this many
+# seconds the active target expires and routing falls back to the normal
+# fill-first order. Set to 0 to never expire. Default: 7200 (2 hours).
+# sticky_failover_reset_secs = 7200
+
 # Circuit breaker cooldown durations by error category (seconds).
 # Omitted keys use the defaults shown below.
 # [circuit_breaker]

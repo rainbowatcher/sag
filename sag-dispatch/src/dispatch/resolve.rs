@@ -107,6 +107,7 @@ pub async fn resolve_route(
     let route_timeout = route.timeout_secs;
     let global_retries = config_guard.backoff.retries;
     let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
+    let sticky_failover_reset_secs = config_guard.sticky_failover_reset_secs;
     let provider_timeouts: HashMap<String, u64> = config_guard
         .providers
         .iter()
@@ -123,6 +124,7 @@ pub async fn resolve_route(
         &runtime.fill_first_orders,
         &runtime.active_targets,
         shuffle_cache_ttl_secs,
+        sticky_failover_reset_secs,
     )
     .await;
 
@@ -322,11 +324,10 @@ mod tests {
             .write()
             .await
             .insert("gpt-4o".into(), 42);
-        runtime
-            .active_targets
-            .write()
-            .await
-            .insert("gpt-4o".into(), ("openai".into(), "gpt-4o".into()));
+        runtime.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ("openai".into(), "gpt-4o".into(), std::time::Instant::now()),
+        );
 
         // 1. First call: resolve route → populates fill_first_orders.
         let result =
