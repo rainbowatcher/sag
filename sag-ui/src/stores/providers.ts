@@ -181,7 +181,7 @@ export const useProviderStore = defineStore("providers", () => {
       await api.put("/api/providers", { name, ...payload })
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
-      console.warn("[updateProvider] error:", e.code, e.message, e.response?.data)
+      console.error("[updateProvider] error:", e.code, e.message, e.response?.data)
       throw e
     }
   }

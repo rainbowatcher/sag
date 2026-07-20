@@ -76,6 +76,9 @@ const editingProvider = ref<Provider | null>(null)
 const confirmingDelete = ref<string | null>(null)
 const deleting = ref(false)
 
+// Toggle loading state (prevents UI flicker during enable/disable)
+const togglingProvider = ref<string | null>(null)
+
 // ── Data fetching ─────────────────────────────────────────────────
 async function fetchProviders() {
   await store.fetchProviders({
@@ -99,6 +102,7 @@ async function refreshAll() {
 // ── Enable / Disable toggle ───────────────────────────────────────
 async function toggleEnabled(provider: Provider) {
   const newState = !provider.enabled
+  togglingProvider.value = provider.name
   try {
     await store.updateProvider(provider.name, { enabled: newState })
     toast.success(`Provider "${provider.name}" ${newState ? "enabled" : "disabled"}`)
@@ -106,6 +110,7 @@ async function toggleEnabled(provider: Provider) {
     const msg = getErrorMessage(e)
     toast.error(msg)
   } finally {
+    togglingProvider.value = null
     await fetchProviders()
   }
 }
@@ -194,6 +199,7 @@ const columns = [
       const provider = info.row.original
       return h(Switch, {
         modelValue: info.getValue(),
+        disabled: togglingProvider.value === provider.name,
         "onUpdate:modelValue": () => toggleEnabled(provider),
       })
     },

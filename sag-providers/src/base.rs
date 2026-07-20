@@ -44,7 +44,7 @@ impl ProviderBase {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(|e| AppError::Internal(format!("failed to build reqwest client: {e}")))?;
 
         if config.api_keys.is_empty() {
             return Err(AppError::BadRequest(format!(
