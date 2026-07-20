@@ -143,7 +143,7 @@ function onProviderChange(index: number, value: string) {
               </TableCell>
               <TableCell>
                 <Badge :variant="priorityBadgeVariant(t.priority)" class="font-mono text-xs">
-                  {{ t.priority || "—" }}
+                  {{ t.priority ?? "—" }}
                 </Badge>
               </TableCell>
               <TableCell>
@@ -209,7 +209,7 @@ function onProviderChange(index: number, value: string) {
                     <Label class="text-xs">Priority</Label>
                     <Input
                       type="number"
-                      :model-value="t.priority || ''"
+                      :model-value="t.priority ?? ''"
                       @update:model-value="
                         (v) => updateTarget(modelValue.indexOf(t), { priority: Number(v) })
                       "
