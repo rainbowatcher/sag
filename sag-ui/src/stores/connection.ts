@@ -40,6 +40,24 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  /** Extract origin from a URL string (scheme + host + port). */
+  function getOrigin(url: string): string {
+    try {
+      const u = new URL(url)
+      return u.origin
+    } catch {
+      return ""
+    }
+  }
+
+  /** Same-origin gating: return empty string for relative baseURL to
+   *  bypass browser CORS preflight entirely.
+   *  Named `resolveEmbeddedBaseURL` to signal the assumption that the
+   *  gateway serves at root (rust-embed), not under a path prefix. */
+  function resolveEmbeddedBaseURL(url: string): string {
+    return getOrigin(url) === window.location.origin ? "" : url
+  }
+
   function loadConnection(): boolean {
     if (!connection.value) {
       localStorage.removeItem(LS_KEY)
@@ -51,14 +69,14 @@ export const useConnectionStore = defineStore("connection", () => {
       return false
     }
 
-    api.defaults.baseURL = connection.value.gatewayUrl
+    api.defaults.baseURL = resolveEmbeddedBaseURL(connection.value.gatewayUrl)
     setBearer(connection.value.apiKey)
     return true
   }
 
   function saveConnection(url: string, key: string) {
     connection.value = { gatewayUrl: url, apiKey: key, savedAt: Date.now() }
-    api.defaults.baseURL = url
+    api.defaults.baseURL = resolveEmbeddedBaseURL(url)
     setBearer(key)
   }
 

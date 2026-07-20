@@ -6,7 +6,7 @@
 //! `/health`, `/v1/models`, and `/v1/analytics/stats` handlers live under
 //! [`crate::handlers`].
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     Extension, Json, Router,
@@ -58,7 +58,8 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .max_age(Duration::from_secs(600));
 
     Router::new()
         .route("/health", get(show_health))
