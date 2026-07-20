@@ -577,10 +577,13 @@ pub struct ProviderConfig {
     /// so they can override auth, content-type, etc.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
-    /// Request body field overrides merged into the upstream JSON body.
-    /// Key-value pairs are inserted at the top level of the body,
-    /// allowing you to set or override any field (e.g. max_tokens, temperature,
-    /// or provider-specific parameters).
+    /// Provider-wide request body field overrides merged into the upstream
+    /// JSON body. Applied to **all** requests sent to this provider, forming
+    /// the lowest-priority layer in the three-layer override chain:
+    /// `body_overrides` < `model_overrides[real_model]` < `RouteTarget.extra`.
+    /// Key-value pairs are inserted at the top level of the body, allowing you
+    /// to set or override any field (e.g. max_tokens, temperature, or
+    /// provider-specific parameters).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub body_overrides: HashMap<String, serde_json::Value>,
     /// Per-model body field overrides, keyed by `real_model` name.
@@ -882,8 +885,9 @@ pub struct RouteTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Per-target extra body fields merged into the upstream JSON body.
-    /// Applied after provider-level body_overrides, so target-level
-    /// keys take precedence.
+    /// Applied after provider-level `body_overrides` and
+    /// `model_overrides[real_model]`, so target-level keys take
+    /// the highest precedence in the three-layer override chain.
     ///
     /// Serialized as a single nested inline table (`extra = { ... }`)
     /// within the target's inline table, e.g.

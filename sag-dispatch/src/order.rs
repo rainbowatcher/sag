@@ -54,6 +54,7 @@ pub async fn order_targets(
                 model_name,
                 fill_first_orders,
                 shuffle_cache_ttl_secs,
+                Instant::now(),
             )
             .await;
 
@@ -75,6 +76,7 @@ pub async fn order_targets(
                 model_name,
                 fill_first_orders,
                 shuffle_cache_ttl_secs,
+                Instant::now(),
             )
             .await
         }
@@ -122,12 +124,11 @@ async fn order_fill_first(
     model_name: &str,
     orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
     ttl_secs: u64,
+    now: Instant,
 ) -> Vec<RouteTarget> {
     // Stable sort by priority descending so same-priority items are
     // adjacent and in TOML insertion order before shuffling.
     targets.sort_by_key(|t| std::cmp::Reverse(t.priority));
-
-    let now = Instant::now();
     let mut guard = orders.write().await;
 
     // Reuse cached order when targets haven't changed AND TTL hasn't expired.
@@ -228,9 +229,9 @@ mod tests {
             })
             .collect();
 
-        let first = order_fill_first(targets.clone(), "m", &orders, ttl).await;
-        let second = order_fill_first(targets.clone(), "m", &orders, ttl).await;
-        let third = order_fill_first(targets, "m", &orders, ttl).await;
+        let first = order_fill_first(targets.clone(), "m", &orders, ttl, Instant::now()).await;
+        let second = order_fill_first(targets.clone(), "m", &orders, ttl, Instant::now()).await;
+        let third = order_fill_first(targets, "m", &orders, ttl, Instant::now()).await;
 
         assert_eq!(first, second, "cached order must be stable");
         assert_eq!(second, third, "cached order must be stable");
@@ -247,8 +248,6 @@ mod tests {
     #[tokio::test]
     async fn fill_first_re_shuffles_when_ttl_expires() {
         let orders = orders_map();
-        // Use ttl=1 (1-second expiry) so the cached order is valid
-        // only for the immediate next call.
         let ttl = 1;
 
         // 2 targets: shuffle probability of same order = 1/2.
@@ -263,28 +262,23 @@ mod tests {
             })
             .collect();
 
-        let first = order_fill_first(targets.clone(), "m", &orders, ttl).await;
+        let t0 = Instant::now();
+        let first = order_fill_first(targets.clone(), "m", &orders, ttl, t0).await;
         // Cache is fresh — next call returns same order.
-        let second = order_fill_first(targets.clone(), "m", &orders, ttl).await;
+        let second = order_fill_first(targets.clone(), "m", &orders, ttl, t0).await;
         assert_eq!(first, second, "same order while cache is fresh");
 
-        // Wait for TTL to expire. Sleep a bit longer than 1 s to
-        // account for timer resolution — `as_secs()` truncates,
-        // so we need age_secs ≥ 1.
-        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
-
-        // After expiry, we may or may not get the same order.
-        // With 2 items, P[different] = 1/2 per call.
-        // 10 calls ⇒ (1/2)^10 ≈ 1e-3 chance of all-same.
-        let mut any_different = false;
-        for _ in 0..10 {
-            let next = order_fill_first(targets.clone(), "m", &orders, ttl).await;
-            if next != first {
-                any_different = true;
-                break;
-            }
-        }
-        assert!(any_different, "ttl=1 must cause re-shuffle after expiry");
+        // Advance time past TTL — the first call must expire and update
+        // the cache timestamp. This directly proves the TTL expiry path
+        // executed, without relying on shuffle probability.
+        let t1 = t0 + std::time::Duration::from_secs(2);
+        let _next = order_fill_first(targets.clone(), "m", &orders, ttl, t1).await;
+        let guard = orders.read().await;
+        let cached = guard.get("m").expect("cache entry must exist");
+        assert!(
+            cached.created_at > t0,
+            "cache must be refreshed after TTL expiry"
+        );
     }
 
     #[tokio::test]
@@ -293,7 +287,7 @@ mod tests {
         let orders = orders_map();
         let ttl = 7200;
         let targets = vec![target("low", 1), target("high-b", 10), target("high-a", 10)];
-        let ordered = order_fill_first(targets, "m", &orders, ttl).await;
+        let ordered = order_fill_first(targets, "m", &orders, ttl, Instant::now()).await;
 
         let priorities: Vec<u32> = ordered.iter().map(|t| t.priority).collect();
         assert_eq!(&priorities[..2], &[10, 10], "first two must be priority 10");
@@ -307,14 +301,14 @@ mod tests {
         let targets_a: Vec<RouteTarget> = vec![target("a", 0), target("b", 0)];
         let targets_b: Vec<RouteTarget> = vec![target("a", 0), target("b", 0), target("c", 0)];
 
-        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
-        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
         assert_eq!(a1, a2, "same targets → cached");
 
         // Targets changed (added "c") → must re-shuffle
-        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl).await;
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now()).await;
         assert_eq!(b1.len(), 3, "new target list includes c");
-        let b2 = order_fill_first(targets_b, "m", &orders, ttl).await;
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now()).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
@@ -339,17 +333,17 @@ mod tests {
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
         }];
 
-        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
-        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
         assert_eq!(a1, a2, "same targets → cached");
 
         // Extra changed → must re-shuffle even though provider/real_model/priority are identical
-        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl).await;
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now()).await;
         assert_eq!(
             b1[0].extra.get("temperature").unwrap(),
             &serde_json::json!(0.9)
         );
-        let b2 = order_fill_first(targets_b, "m", &orders, ttl).await;
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now()).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
@@ -374,14 +368,14 @@ mod tests {
             extra: HashMap::new(),
         }];
 
-        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
-        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl).await;
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
         assert_eq!(a1, a2, "same targets → cached");
 
         // Retries changed → must re-shuffle even though provider/real_model/priority are identical
-        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl).await;
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now()).await;
         assert_eq!(b1[0].retries, Some(3));
-        let b2 = order_fill_first(targets_b, "m", &orders, ttl).await;
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now()).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
