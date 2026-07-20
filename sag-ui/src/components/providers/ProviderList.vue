@@ -23,11 +23,34 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { getErrorMessage } from "@/lib/utils"
+import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useProviderStore } from "@/stores/providers"
-import type { Provider } from "@/types/api"
+import type { CircuitBreakerEntry, Provider } from "@/types/api"
 
 const store = useProviderStore()
+const cbStore = useCircuitBreakerStore()
+
+// ── Circuit breaker aggregation ────────────────────────────────────
+
+/// Breaker entries grouped by provider name.
+interface BreakerGroup {
+  open: number
+  halfOpen: number
+  entries: CircuitBreakerEntry[]
+}
+
+const breakersByProvider = computed(() => {
+  const map: Record<string, BreakerGroup> = {}
+  for (const b of cbStore.breakers) {
+    const entry = (map[b.provider] ??= { open: 0, halfOpen: 0, entries: [] })
+    if (b.state === "open") entry.open++
+    else entry.halfOpen++
+    entry.entries.push(b)
+  }
+  return map
+})
 
 // ── Filters ───────────────────────────────────────────────────────
 const searchInput = ref("")
@@ -66,8 +89,12 @@ watch([filterProviderType, sortByName], () => {
 })
 
 onMounted(async () => {
-  await fetchProviders()
+  await Promise.all([fetchProviders(), cbStore.fetchBreakers()])
 })
+
+async function refreshAll() {
+  await Promise.all([fetchProviders(), cbStore.fetchBreakers()])
+}
 
 // ── Enable / Disable toggle ───────────────────────────────────────
 async function toggleEnabled(provider: Provider) {
@@ -138,14 +165,18 @@ const columns = [
   columnHelper.accessor("base_url", {
     header: "Base URL",
     cell: (info) =>
-      h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
-    meta: { class: "min-w-[200px] xl:min-w-[280px]" },
+      h(
+        "span",
+        { class: "font-mono text-xs text-muted-foreground", title: info.getValue() },
+        info.getValue(),
+      ),
+    meta: { class: "min-w-[200px] max-w-[12rem] overflow-hidden truncate" },
   }),
   columnHelper.accessor("models_endpoint", {
     header: "Models Endpoint",
     cell: (info) =>
       h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
-    meta: { class: "min-w-[200px] xl:min-w-[280px]" },
+    meta: { class: "min-w-[80px]" },
   }),
   columnHelper.accessor("provider_type", {
     header: "Type",
@@ -167,6 +198,63 @@ const columns = [
       })
     },
     meta: { class: "text-center" },
+  }),
+  columnHelper.display({
+    id: "breakers",
+    header: "CB",
+    cell: (info) => {
+      const provider = info.row.original
+      const counts = breakersByProvider.value[provider.name]
+
+      // Healthy: green badge.
+      if (!counts) {
+        return h(Tooltip, null, () => [
+          h(TooltipTrigger, { asChild: true }, () =>
+            h("div", { class: "flex items-center gap-1" }, [
+              h(
+                Badge,
+                {
+                  variant: "outline",
+                  class: "text-[10px] px-1.5 border-green-500/30 bg-green-500/10 text-green-600",
+                },
+                () => "0",
+              ),
+            ]),
+          ),
+          h(TooltipContent, { side: "left", class: "max-w-xs text-xs" }, () =>
+            h("pre", { class: "whitespace-pre-wrap font-mono text-[11px]" }, "All targets healthy"),
+          ),
+        ])
+      }
+
+      // Tripped: amber/red badge with per-target breakdown.
+      const openList = counts.entries.filter((b) => b.state === "open")
+      const halfOpenList = counts.entries.filter((b) => b.state === "half_open")
+
+      const tooltipRows: string[] = []
+      if (openList.length > 0) {
+        tooltipRows.push(`Open (${openList.length}):`)
+        for (const b of openList) tooltipRows.push(`  ${b.model} → ${b.real_model}`)
+      }
+      if (halfOpenList.length > 0) {
+        tooltipRows.push(`Half-Open (${halfOpenList.length}):`)
+        for (const b of halfOpenList) tooltipRows.push(`  ${b.model} → ${b.real_model}`)
+      }
+
+      return h(Tooltip, null, () => [
+        h(TooltipTrigger, { asChild: true }, () =>
+          h("div", { class: "flex items-center gap-1" }, [
+            h(Badge, { variant: "destructive", class: "text-[10px] px-1.5" }, () =>
+              String(counts.open + counts.halfOpen),
+            ),
+          ]),
+        ),
+        h(TooltipContent, { side: "left", class: "max-w-xs text-xs" }, () =>
+          h("pre", { class: "whitespace-pre-wrap font-mono text-[11px]" }, tooltipRows.join("\n")),
+        ),
+      ])
+    },
+    meta: { class: "text-center w-10" },
   }),
   columnHelper.display({
     id: "actions",
@@ -226,7 +314,7 @@ const table = useVueTable({
         </div>
         <div class="flex items-center gap-2">
           <button
-            @click="fetchProviders()"
+            @click="refreshAll()"
             :disabled="store.providersLoading"
             class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
           >
@@ -318,34 +406,36 @@ const table = useVueTable({
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
     <div v-else class="min-h-0 flex-1 rounded-lg border [&>div]:h-full">
-      <Table>
-        <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
-          <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
-            <TableHead
-              v-for="header in headerGroup.headers"
-              :key="header.id"
-              :class="(header.column.columnDef.meta as any)?.class"
-            >
-              <FlexRender
-                v-if="!header.isPlaceholder"
-                :render="header.column.columnDef.header!"
-                :props="header.getContext()"
-              />
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          <TableRow v-for="row in table.getRowModel().rows" :key="row.id">
-            <TableCell
-              v-for="cell in row.getVisibleCells()"
-              :key="cell.id"
-              :class="(cell.column.columnDef.meta as any)?.class"
-            >
-              <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-            </TableCell>
-          </TableRow>
-        </TableBody>
-      </Table>
+      <TooltipProvider :delay-duration="200">
+        <Table>
+          <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
+            <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+              <TableHead
+                v-for="header in headerGroup.headers"
+                :key="header.id"
+                :class="(header.column.columnDef.meta as any)?.class"
+              >
+                <FlexRender
+                  v-if="!header.isPlaceholder"
+                  :render="header.column.columnDef.header!"
+                  :props="header.getContext()"
+                />
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <TableRow v-for="row in table.getRowModel().rows" :key="row.id">
+              <TableCell
+                v-for="cell in row.getVisibleCells()"
+                :key="cell.id"
+                :class="(cell.column.columnDef.meta as any)?.class"
+              >
+                <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+              </TableCell>
+            </TableRow>
+          </TableBody>
+        </Table>
+      </TooltipProvider>
     </div>
 
     <!-- ── Delete confirmation ───────────────────────────────────── -->
