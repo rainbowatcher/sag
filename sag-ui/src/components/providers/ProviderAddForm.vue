@@ -65,6 +65,7 @@ function onFetchModels(endpoint: string) {
 // ── KV pairs ─────────────────────────────────────────────────
 const headers = ref<{ key: string; value: string }[]>([])
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
+const stripFields = ref<string[]>([])
 
 // ── Per-model body overrides ────────────────────────────────
 // Cleanup of stale entries is handled by ModelOverrideEditor internally.
@@ -147,6 +148,7 @@ const form = useForm({
         base_url: value.base_url || undefined,
         headers: parsedHeaders,
         body_overrides: parsedBodyOverrides,
+        strip_fields: stripFields.value.filter((s) => s.trim()).map((s) => s.trim()),
         model_overrides: parsedModelOverrides,
         enabled_models: enabledModels.value,
         models_endpoint: modelsEndpoint.value.trim() || undefined,
@@ -334,6 +336,28 @@ async function handleSubmit(event: Event) {
               key-placeholder="max_tokens"
               value-placeholder="4096"
             />
+
+            <Separator />
+
+            <div>
+              <FieldLabel>Strip Fields</FieldLabel>
+              <p class="text-muted-foreground mb-2 text-xs">
+                Top-level fields to remove from the upstream JSON body before sending. Applied last,
+                after all overrides. Use for fields the upstream rejects (e.g.
+                <code>chat_template_kwargs</code> for pydantic <code>extra=forbid</code>).
+              </p>
+              <div v-for="(_, idx) in stripFields" :key="idx" class="mb-2 flex items-center gap-2">
+                <Input
+                  :model-value="stripFields[idx]"
+                  placeholder="field_name"
+                  @input="stripFields[idx] = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="outline" size="icon-sm" @click="stripFields.splice(idx, 1)">
+                  <X class="h-3 w-3" />
+                </Button>
+              </div>
+              <Button variant="outline" size="sm" @click="stripFields.push('')"> Add Field </Button>
+            </div>
           </TabsContent>
         </Tabs>
       </form>

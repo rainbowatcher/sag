@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2 } from "@lucide/vue"
+import { Loader2, X } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
 import { computed, ref } from "vue"
 import { toast } from "vue-sonner"
@@ -110,6 +110,7 @@ const bodyOverridesList = ref<{ key: string; value: string }[]>(
     value: typeof v === "string" ? v : JSON.stringify(v),
   })),
 )
+const stripFieldsList = ref<string[]>([...(props.provider.strip_fields ?? [])])
 
 // ── Per-model body overrides ────────────────────────────────
 const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>(
@@ -193,6 +194,11 @@ async function handleSubmit() {
       JSON.stringify(parsedBodyOverrides) !== JSON.stringify(props.provider.body_overrides ?? {})
     ) {
       payload.body_overrides = parsedBodyOverrides
+    }
+
+    const parsedStripFields = stripFieldsList.value.filter((s) => s.trim()).map((s) => s.trim())
+    if (JSON.stringify(parsedStripFields) !== JSON.stringify(props.provider.strip_fields ?? [])) {
+      payload.strip_fields = parsedStripFields
     }
 
     // Parse model_overrides
@@ -362,6 +368,34 @@ async function handleSubmit() {
               key-placeholder="max_tokens"
               value-placeholder="4096"
             />
+
+            <Separator />
+
+            <div>
+              <FieldLabel>Strip Fields</FieldLabel>
+              <p class="text-muted-foreground mb-2 text-xs">
+                Top-level fields to remove from the upstream JSON body before sending. Applied last,
+                after all overrides. Use for fields the upstream rejects (e.g.
+                <code>chat_template_kwargs</code> for pydantic <code>extra=forbid</code>).
+              </p>
+              <div
+                v-for="(_, idx) in stripFieldsList"
+                :key="idx"
+                class="mb-2 flex items-center gap-2"
+              >
+                <Input
+                  :model-value="stripFieldsList[idx]"
+                  placeholder="field_name"
+                  @input="stripFieldsList[idx] = ($event.target as HTMLInputElement).value"
+                />
+                <Button variant="outline" size="icon-sm" @click="stripFieldsList.splice(idx, 1)">
+                  <X class="h-3 w-3" />
+                </Button>
+              </div>
+              <Button variant="outline" size="sm" @click="stripFieldsList.push('')">
+                Add Field
+              </Button>
+            </div>
           </TabsContent>
         </Tabs>
       </div>

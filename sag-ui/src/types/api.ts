@@ -8,6 +8,7 @@ export interface Provider {
   timeout_secs: number
   headers: Record<string, string>
   body_overrides: Record<string, any>
+  strip_fields: string[]
   model_overrides: Record<string, Record<string, any>>
   enabled_models: string[]
   enabled: boolean
