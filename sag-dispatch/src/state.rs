@@ -318,6 +318,7 @@ mod tests {
             timeout_secs,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            strip_fields: vec![],
             model_overrides: HashMap::new(),
             role_mappings: HashMap::new(),
             enabled_models: vec![],

@@ -75,6 +75,11 @@ api_keys = ["sk-your-openai-api-key"]
 base_url = "https://api.openai.com/v1"
 timeout_secs = 120
 
+# Fields to strip from the upstream request body before forwarding.
+# Use for fields the upstream rejects with strict schema validation
+# (e.g. vLLM-specific `chat_template_kwargs` sent to OpenAI-compatible providers).
+# strip_fields = ["chat_template_kwargs"]
+
 [providers.anthropic]
 api_keys = ["sk-ant-your-anthropic-api-key"]
 base_url = "https://api.anthropic.com/v1"

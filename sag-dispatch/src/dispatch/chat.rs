@@ -29,8 +29,10 @@ enum ChatAttempt {
     NonStream(ChatCompletionResponse, std::time::Instant),
 }
 
-/// Try each target in order. On a retryable error, fall through to the next
-/// target. On a non-retryable error (4xx), bail out immediately.
+/// Try each target in order. On a retryable error, retry the same target with
+/// exponential backoff. On a non-retryable 4xx error (client-side request
+/// problem), do **not** retry the same target and do **not** open the circuit
+/// breaker — instead, failover to the next target in the list.
 pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     let DispatchCtx {
         state,
@@ -1067,6 +1069,79 @@ mod tests {
             m1.chat_calls(),
             2,
             "non-retryable failure should not open circuit"
+        );
+        assert_eq!(m2.chat_calls(), 1);
+        assert!(second_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_upstream_4xx_does_not_retry_or_open_circuit() {
+        // Regression test: AppError::Upstream { status: 400 } is a
+        // client-side error and must be treated as non-retryable:
+        //   (1) no retries on the failing provider,
+        //   (2) circuit breaker stays closed (no cooldown),
+        //   (3) immediately failover to the next target.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 400,
+            body: "bad request from upstream".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // First request: first fails with 4xx, should not retry or open circuit.
+        let mut first_errors = Vec::new();
+        let first = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut first_errors,
+        ))
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            m1.chat_calls(),
+            1,
+            "4xx upstream should not retry the same provider"
+        );
+        assert_eq!(
+            m2.chat_calls(),
+            1,
+            "should failover to the next target after non-retryable"
+        );
+
+        // Circuit must still be closed — a 4xx on a healthy target should
+        // not open the breaker (mod.rs:167 design intent).
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        assert!(
+            rt.route_circuit_breaker.read().await.is_closed(&key),
+            "non-retryable 4xx upstream error must not open the circuit"
+        );
+
+        // Second request: first should still be callable (not circuit-open).
+        let mut second_errors = Vec::new();
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let second = dispatch_chat(make_ctx(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            false,
+            &mut second_errors,
+        ))
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            m1.chat_calls(),
+            2,
+            "first should be callable again — circuit was not opened"
         );
         assert_eq!(m2.chat_calls(), 1);
         assert!(second_errors.is_empty());

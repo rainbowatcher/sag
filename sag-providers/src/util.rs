@@ -64,6 +64,23 @@ pub fn apply_body_overrides(
     body
 }
 
+/// Remove the listed top-level fields from a serialized JSON body.
+///
+/// Applied after all override layers (`body_overrides`, `model_overrides`,
+/// `RouteTarget.extra`) so a stripped field is guaranteed absent from the
+/// final upstream body. No-op for non-object bodies or empty `fields`.
+pub fn apply_body_strip(mut body: serde_json::Value, fields: &[String]) -> serde_json::Value {
+    if fields.is_empty() {
+        return body;
+    }
+    if let serde_json::Value::Object(map) = &mut body {
+        for key in fields {
+            map.remove(key);
+        }
+    }
+    body
+}
+
 // ── SSE stream parsing helpers ─────────────────────────────────────
 
 /// Iterate the byte buffer, extract complete SSE frames (delimited by `\n\n`),
@@ -174,6 +191,68 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── apply_body_strip tests ───────────────────────────────────
+
+    #[test]
+    fn strip_removes_specified_field() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "chat_template_kwargs": { "enable_thinking": false },
+            "temperature": 0.7,
+        });
+        let fields = vec!["chat_template_kwargs".to_string()];
+        let result = apply_body_strip(body, &fields);
+        assert!(result.get("chat_template_kwargs").is_none());
+        assert_eq!(result.get("model").unwrap(), "gpt-4o");
+        assert_eq!(
+            result.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7)
+        );
+    }
+
+    #[test]
+    fn strip_empty_fields_is_noop() {
+        let body = serde_json::json!({ "model": "gpt-4o", "temperature": 0.7 });
+        let result = apply_body_strip(body.clone(), &[]);
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn strip_applied_after_insert_removes_field() {
+        // Simulate: body_overrides inserts chat_template_kwargs, then strip removes it.
+        let body = serde_json::json!({ "model": "gpt-4o" });
+        let mut with_override = body.clone();
+        if let serde_json::Value::Object(map) = &mut with_override {
+            map.insert(
+                "chat_template_kwargs".into(),
+                serde_json::json!({ "enable_thinking": false }),
+            );
+        }
+        let fields = vec!["chat_template_kwargs".to_string()];
+        let result = apply_body_strip(with_override, &fields);
+        assert!(result.get("chat_template_kwargs").is_none());
+        assert_eq!(result.get("model").unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn strip_non_object_body_is_noop() {
+        let body = serde_json::json!([1, 2, 3]);
+        let fields = vec!["chat_template_kwargs".to_string()];
+        let result = apply_body_strip(body.clone(), &fields);
+        assert_eq!(result, body, "array body must pass through unchanged");
+    }
+
+    #[test]
+    fn strip_nonexistent_field_is_noop() {
+        let body = serde_json::json!({ "model": "gpt-4o", "temperature": 0.7 });
+        let fields = vec!["nonexistent".to_string()];
+        let result = apply_body_strip(body.clone(), &fields);
+        assert_eq!(
+            result, body,
+            "body unchanged when stripping nonexistent field"
+        );
+    }
 
     /// Construct an SSE frame with a usage chunk that includes the
     /// OpenAI-style nested cache/reasoning details, feed it through

@@ -7,7 +7,7 @@ use sag_config::{KeyStrategy, ProviderConfig};
 use sag_core::{AppError, ChatMessage};
 use tracing::{debug, trace, warn};
 
-use crate::{apply_body_overrides, apply_headers};
+use crate::{apply_body_overrides, apply_body_strip, apply_headers};
 
 /// Shared state and helper methods for all provider adapters.
 ///
@@ -25,6 +25,10 @@ pub struct ProviderBase {
     pub http_client: reqwest::Client,
     headers: HashMap<String, String>,
     body_overrides: HashMap<String, serde_json::Value>,
+    /// Top-level fields to strip from the upstream body before sending.
+    /// Applied after all override layers, guaranteeing absence in the
+    /// final body.
+    strip_fields: Vec<String>,
     role_mappings: HashMap<String, String>,
     /// Whether to inject `cache_control` breakpoints for Anthropic providers.
     pub anthropic_cache_control: bool,
@@ -63,6 +67,7 @@ impl ProviderBase {
             http_client,
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
+            strip_fields: config.strip_fields.clone(),
             role_mappings: config.role_mappings.clone(),
             anthropic_cache_control: config.anthropic_cache_control,
             chunk_timeout_secs: config.chunk_timeout_secs,
@@ -126,6 +131,7 @@ impl ProviderBase {
         let req = apply_headers(req, &self.headers);
         let body = apply_body_overrides(body, &self.body_overrides);
         let body = apply_body_overrides(body, target_extra);
+        let body = apply_body_strip(body, &self.strip_fields);
         let body_str = serde_json::to_string(&body).unwrap_or_default();
         debug!(url, "sending upstream request");
         trace!(url, body = %body_str, "upstream request body");
@@ -287,6 +293,7 @@ mod tests {
             timeout_secs: 30,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            strip_fields: vec![],
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -317,6 +324,7 @@ mod tests {
             timeout_secs: 30,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            strip_fields: vec![],
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -340,6 +348,7 @@ mod tests {
             timeout_secs: 30,
             headers: HashMap::new(),
             body_overrides,
+            strip_fields: vec![],
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -680,6 +689,63 @@ mod tests {
 
         let body = extract_json_body(req);
         assert_eq!(body, original, "empty overrides should not mutate the body");
+    }
+
+    #[test]
+    fn strip_fields_removes_field_after_all_overrides() {
+        // strip_fields removes chat_template_kwargs even after
+        // body_overrides and target_extra insert it.
+        let mut body_overrides: HashMap<String, serde_json::Value> = HashMap::new();
+        body_overrides.insert("temperature".into(), serde_json::json!(0.5));
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert(
+            "chat_template_kwargs".into(),
+            serde_json::json!({ "enable_thinking": false }),
+        );
+
+        let config = ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            provider_type: sag_config::ProviderType::OpenAI,
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://example.com".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 30,
+            headers: HashMap::new(),
+            body_overrides,
+            strip_fields: vec!["chat_template_kwargs".to_string()],
+            model_overrides: HashMap::new(),
+            enabled: true,
+            enabled_models: Vec::new(),
+            role_mappings: HashMap::new(),
+            anthropic_cache_control: true,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+        };
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o" }),
+                &target_extra,
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        // chat_template_kwargs must be absent despite target_extra inserting it
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "strip_fields must remove chat_template_kwargs even if target_extra inserted it"
+        );
+        // Other overrides still apply
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "body_overrides should still be applied"
+        );
+        assert_eq!(body.get("model").unwrap(), "gpt-4o");
     }
 
     #[test]

@@ -592,6 +592,20 @@ pub struct ProviderConfig {
     /// provider-specific parameters).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub body_overrides: HashMap<String, serde_json::Value>,
+    /// Provider-wide request body fields to **remove** from the upstream JSON
+    /// body before sending. Applied last, after `body_overrides`,
+    /// `model_overrides[real_model]`, and `RouteTarget.extra`, so a stripped
+    /// field is guaranteed absent from the final body even if an earlier layer
+    /// inserted it. Use this for fields the upstream rejects with strict schema
+    /// validation (e.g. pydantic `extra=forbid`), such as vLLM-specific
+    /// `chat_template_kwargs` when forwarding to an OpenAI-compatible provider.
+    ///
+    /// TOML example:
+    /// ```toml
+    /// strip_fields = ["chat_template_kwargs"]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip_fields: Vec<String>,
     /// Per-model body field overrides, keyed by `real_model` name.
     /// Applied after provider-level `body_overrides` but before target-level
     /// `extra`, so a model-level override can refine or replace a
@@ -1844,6 +1858,7 @@ targets = [
                     ttfb_timeout_secs: None,
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
+                    strip_fields: vec![],
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled_models: vec![],

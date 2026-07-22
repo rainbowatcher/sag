@@ -335,6 +335,7 @@ mod tests {
             ttfb_timeout_secs: None,
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
+            strip_fields: vec![],
             model_overrides,
             role_mappings: HashMap::new(),
             enabled_models: vec![],

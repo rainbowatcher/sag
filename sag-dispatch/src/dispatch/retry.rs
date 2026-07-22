@@ -76,8 +76,8 @@ where
 /// … capped at `backoff.max_ms`. See [`compute_backoff`].
 ///
 /// Behavior:
-/// - Non-retryable errors (4xx-class) abort the loop immediately and
-///   push a `{label}: {err}` entry to `errors`.
+/// - Non-retryable errors (client-side 4xx except 408/429) abort the loop
+///   immediately and push a `{label}: {err}` entry to `errors`.
 /// - Retryable errors at the final attempt push a `{label}: {err}
 ///   (retries exhausted)` entry and stop.
 pub async fn run_with_retries_outcome<T, F, Fut>(
@@ -135,13 +135,23 @@ where
 }
 
 /// Whether an error should trigger a retry on the same provider, or fall
-/// through to the next target. 4xx-class errors are terminal; everything
-/// else (5xx, network, timeout) is retryable.
+/// through to the next target.
+///
+/// The following errors are **not** retryable:
+/// - `BadRequest`, `ModelNotFound`, `Unauthorized`
+/// - `Upstream` with a 4xx status code **except** 408 (timeout) and 429 (rate
+///   limited), which are treated as transient and retryable — 429 already has
+///   its own short-circuit-breaker cooldown path via [`CircuitHint::RateLimited`].
+///
+/// Everything else (5xx, network, timeout, internal) is retryable.
 pub fn is_retryable_error(err: &AppError) -> bool {
-    !matches!(
-        err,
-        AppError::BadRequest(_) | AppError::ModelNotFound(_) | AppError::Unauthorized(_)
-    )
+    match err {
+        AppError::BadRequest(_) | AppError::ModelNotFound(_) | AppError::Unauthorized(_) => false,
+        AppError::Upstream { status, .. } => {
+            matches!(status, 429 | 408 | 500..=599)
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +172,49 @@ mod tests {
         assert!(is_retryable_error(&AppError::AllProvidersExhausted {
             model: "m".into(),
             reason: "r".into(),
+        }));
+
+        // Upstream 4xx (except 408/429) are not retryable — client-side error.
+        assert!(!is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 400,
+            body: "bad".into()
+        }));
+        assert!(!is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 403,
+            body: "forbidden".into()
+        }));
+        assert!(!is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 422,
+            body: "unprocessable".into()
+        }));
+
+        // 429 (rate limited) is retryable — short-circuit-breaker cooldown.
+        assert!(is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 429,
+            body: "rate limited".into()
+        }));
+
+        // 408 (timeout) is retryable — transient.
+        assert!(is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 408,
+            body: "timeout".into()
+        }));
+
+        // 5xx upstream errors are retryable.
+        assert!(is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 500,
+            body: "internal".into()
+        }));
+        assert!(is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 503,
+            body: "unavailable".into()
         }));
     }
 
