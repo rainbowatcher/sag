@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-29
+updated: 2026-07-22
 ---
 
 # 调度
@@ -21,7 +21,9 @@ updated: 2026-06-29
    b. 检查 provider 是否 enabled
    c. 调用 provider（chat / chat_stream / chat_image）
    d. 成功 → 返回响应
-   e. 失败 → 根据错误类型决定重试或 fallthrough
+   e. 失败 → 根据错误类型决定重试或 fallthrough：
+      - **non-retryable 4xx**（除 408 超时、429 限流外）：不重试、不开熔断，直接 failover 到下一 target
+      - **retryable 错误**（408/429/5xx/超时/网络错误）：按退避策略重试，耗尽后开熔断（429 走 `CircuitHint::RateLimited` 短冷却路径）
 5. 全部 targets 耗尽 → 返回聚合错误
 
 **失败路径**在写入 `call_logs` 时携带 `request.reasoning_effort`，确保失败请求的推理意图可被审计——与成功路径一致。图片生成路径传 `None`（不适用）。
@@ -33,6 +35,18 @@ updated: 2026-06-29
 - `attempt` 从 0 计数（第 0 次重试前等待 `base_ms`）
 - `jitter = true` 时：`delay = random(0, computed_cap)`（防 thundering herd）
 - `jitter = false` 时：`delay = computed_cap`（确定性，便于测试）
+
+### 上游 4xx 错误分类
+
+上游返回的 HTTP 4xx 状态码按以下规则分类，决定重试与熔断行为：
+
+| 状态码 | 分类 | 行为 |
+|--------|------|------|
+| 408 Request Timeout | 可重试 | 按退避策略重试，耗尽后开熔断 |
+| 429 Too Many Requests | 可重试（短冷却） | 走 `CircuitHint::RateLimited` 短冷却路径，不按常规退避重试 |
+| 400/403/422 等其余 4xx | 不可重试 | 不重试、不开熔断，立即 failover 到下一 target |
+
+**原则**：上游返回的业务性 4xx（请求被拒）意味着请求体本身有问题，重试相同请求体不会改变结果；而 408 表示上游可能还活着但暂时忙不过来，429 表示上游限流——这两类值得重试或冷却等待。
 
 ### 流式处理
 
@@ -93,6 +107,7 @@ updated: 2026-06-29
 
 ## 变更记录
 
+- [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)
 - [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)
 - [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
 - [0001 初始化](changes/0001-initial.md)

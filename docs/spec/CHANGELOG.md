@@ -6,6 +6,10 @@ updated: 2026-07-22
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-07-22
+
+- **调度**：[0004 上游 4xx 不再触发重试与熔断](dispatch/changes/0004-upstream-4xx-non-retryable.md) — `is_retryable_error` 对 `Upstream` 按 status 判定，4xx（除 408/429）不可重试、不熔断、failover
 - **Body Override**：[0002 per-provider strip_fields 字段剥离](body-override/changes/0002-strip-fields.md) — 新增 provider 级字段剥离，在三层 override 之后硬性移除指定字段
 
 ## 2026-07-19

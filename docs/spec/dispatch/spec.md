@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-07-22
 ---
 
 # 调度 — 规格
@@ -11,7 +11,7 @@ updated: 2026-06-03
 - [sag-dispatch/src/dispatch/image.rs](../../../sag-dispatch/src/dispatch/image.rs) — 图片生成分发
 - [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理
 - [sag-dispatch/src/dispatch/mod.rs](../../../sag-dispatch/src/dispatch/mod.rs) — `failure_log`、`success_log` 等日志构造函数
-- [sag-dispatch/src/dispatch/retry.rs](../../../sag-dispatch/src/dispatch/retry.rs) — 重试退避逻辑
+- [sag-dispatch/src/dispatch/retry.rs](../../../sag-dispatch/src/dispatch/retry.rs) — 重试退避逻辑 + `is_retryable_error` 错误分类判定
 - [sag-dispatch/src/dispatch/resolve.rs](../../../sag-dispatch/src/dispatch/resolve.rs) — 路由匹配 + 目标选择
 - [sag-dispatch/src/order.rs](../../../sag-dispatch/src/order.rs) — 目标排序
 
@@ -36,14 +36,17 @@ flowchart TD
     J --> L{success?}
     K --> L
     L -->|yes| M[return response]
-    L -->|4xx| N[stop immediately]
-    L -->|5xx/timeout| O{retries left?}
+    L -->|non-retryable 4xx(1)| N[stop retries → failover]
+    L -->|retryable (408/429/5xx/timeout)| O{retries left?}
     O -->|yes| P[backoff sleep]
     P --> K
     O -->|no| Q[open circuit breaker]
     Q --> D
+    N --> D
     D -->|all exhausted| R[502 aggregated errors]
 ```
+
+(1) 400/403/422 等上游业务性 4xx（除 408 超时、429 限流外）。non-retryable 4xx 不触发重试、不开熔断，直接 failover 到下一 target。
 
 ## 关键决策
 
@@ -100,7 +103,8 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 ## 不变式
 
 - `resolve_route()` 通过对比 `ConfigHandle.routes_version` 与 `DispatchRuntime.last_prune_version` 实现惰性缓存清理；仅在版本差异时移除已不存在路由对应的 `fill_first_orders`、`route_counters`、`active_targets` 条目。路由变更方（admin API / 热重载）负责递增 `routes_version`
-- 4xx 错误永远不会触发重试（不管 retries 设多少）
+- non-retryable 4xx（除 408/429 外）不触发重试、不开熔断，直接 failover 到下一 target
+- 408 Timeout 和 429 Rate Limited 属于可重试 4xx，429 走 `CircuitHint::RateLimited` 短冷却路径
 - 非流式请求使用 `timeout_secs` 做整体超时；流式请求使用 `chunk_timeout_secs` 做 chunk 间超时
 - backoff 在每次重试前 sleep（不是在失败后立即 sleep）
 - 流式请求的 response body 不等待（不缓存整个响应）
@@ -112,9 +116,10 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 - `sag-dispatch/src/dispatch/mod.rs` — `failure_log` / `success_log` round-trip 测试（含 `reasoning_effort` 字段）
 - `sag-dispatch/src/dispatch/resolve.rs` — resolve 失败路径 `reasoning_effort` round-trip 测试
 - `sag-dispatch/src/dispatch/image.rs` — 图片路径 `reasoning_effort=None` 断言
-- 关键场景：熔断器交互、重试耗尽、流式超时、4xx 立即停止、时间穿越（UTC 时间戳）
+- 关键场景：熔断器交互、重试耗尽、流式超时、4xx 分类判定（non-retryable vs retryable）、时间穿越（UTC 时间戳）
 
 ## 变更记录
+- [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)
 - [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)
 - [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
 - [0001 初始化](changes/0001-initial.md)
