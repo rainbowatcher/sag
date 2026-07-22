@@ -1,6 +1,6 @@
 ---
 created: 2026-06-14
-updated: 2026-07-17
+updated: 2026-07-22
 ---
 
 # 熔断器 — 规格
@@ -100,8 +100,14 @@ pub enum CircuitHint {
 - `sag-dispatch/src/dispatch/chat.rs` 与 `image.rs` — 集成测试：冷却期内提前恢复、探测失败重排、并发 in-flight skip、探测槽泄漏回归（`resolve_provider` 失败路径）
 - `sag-config/src/config.rs` — `probe_interval_secs` 校验
 
+## 关键文件
+
+- [sag-admin/src/admin_circuit_breaker.rs](../../../sag-admin/src/admin_circuit_breaker.rs) — admin 端点：`GET /api/circuit-breaker`、`POST /api/circuit-breaker/close`（close 同步清除 `active_targets[model]`）
+- [sag-state/src/lib.rs](../../../sag-state/src/lib.rs) — `AppState` 共享 `circuit_breaker` 与 `active_targets` Arc
+
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
 - [0002 熔断半开探测与冷却期周期探测](changes/0002-half-open-periodic-probe.md)
 - [0003 探测失败隐瞒冷却下界与流式取消探测槽泄漏修复](changes/0003-probe-lifetime-fix.md)
 - [0004 熔断状态可观测化](changes/0004-observability.md)
+- [0005 手动关闭熔断时清除 StickyFailover 粘性记忆](changes/0005-manual-close-clears-sticky.md)

@@ -95,17 +95,26 @@ async fn main() -> anyhow::Result<()> {
     let route_circuit_breaker: Arc<RwLock<sag_core::RouteCircuitBreaker>> = Arc::new(RwLock::new(
         sag_core::RouteCircuitBreaker::new(stale_probe_threshold),
     ));
+    // Sticky-failover active-target memory. Shared between `AppState` and
+    // `DispatchRuntime` via the same `Arc` so that admin mutations — notably
+    // clearing sticky routing when a breaker is manually closed — are
+    // immediately visible to dispatch ordering.
+    let active_targets: sag_router::ActiveTargets = Arc::default();
 
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
         providers: provider_registry,
         collector,
         circuit_breaker: route_circuit_breaker.clone(),
+        active_targets: active_targets.clone(),
     };
-    // `with_circuit_breaker` shares the same Arc (rather than creating a
-    // default one) so AppState and DispatchRuntime observe the same breaker.
-    let dispatch_runtime =
-        sag_router::DispatchRuntime::with_circuit_breaker(route_circuit_breaker.clone());
+    // `with_shared_state` shares the same Arcs (rather than creating
+    // defaults) so AppState and DispatchRuntime observe the same breaker and
+    // the same sticky memory.
+    let dispatch_runtime = sag_router::DispatchRuntime::with_shared_state(
+        route_circuit_breaker.clone(),
+        active_targets,
+    );
 
     // 8a. Spawn a watcher that recomputes the stale-probe threshold whenever
     //     the config changes (hot-reload of `gateway.toml` or admin API

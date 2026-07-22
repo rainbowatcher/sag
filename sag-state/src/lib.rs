@@ -11,12 +11,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use sag_analytics::CallLogCollector;
 use sag_config::ConfigHandle;
 use sag_core::RouteCircuitBreaker;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
+
+/// Sticky-failover active-target memory: `model → (provider, real_model,
+/// recorded_at)`. Shared between [`AppState`] and `DispatchRuntime` via the
+/// same `Arc` so admin mutations (e.g. clearing sticky memory when a breaker
+/// is manually closed) are immediately visible to dispatch ordering.
+pub type ActiveTargets = Arc<RwLock<HashMap<String, (String, String, Instant)>>>;
 
 /// Shared application state for all Axum handlers.
 ///
@@ -37,6 +44,12 @@ pub struct AppState {
     /// Shared route-target circuit breaker. The same `Arc` is injected into
     /// `DispatchRuntime` at startup, so this handle observes live state.
     pub circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
+    /// Sticky-failover active-target memory, shared with `DispatchRuntime`
+    /// via the same `Arc`. Admin handlers clear an entry here to reset
+    /// sticky routing after a manual breaker close; dispatch reads it in
+    /// `order_targets` to prepend the active target, and writes the active
+    /// target on a successful response.
+    pub active_targets: ActiveTargets,
 }
 
 impl AppState {
@@ -103,6 +116,7 @@ pub mod testing {
             providers,
             collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
+            active_targets: Arc::default(),
         }
     }
 

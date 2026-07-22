@@ -9,6 +9,7 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- **熔断器**：[0005 手动关闭熔断时清除 StickyFailover 粘性记忆](circuit-breaker/changes/0005-manual-close-clears-sticky.md) — `active_targets` 提升为 `AppState` 共享 Arc，`close` handler 无条件清除 sticky 记忆
 - **调度**：[0004 上游 4xx 不再触发重试与熔断](dispatch/changes/0004-upstream-4xx-non-retryable.md) — `is_retryable_error` 对 `Upstream` 按 status 判定，4xx（除 408/429）不可重试、不熔断、failover
 - **Body Override**：[0002 per-provider strip_fields 字段剥离](body-override/changes/0002-strip-fields.md) — 新增 provider 级字段剥离，在三层 override 之后硬性移除指定字段
 

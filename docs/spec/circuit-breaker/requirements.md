@@ -1,6 +1,6 @@
 ---
 created: 2026-06-14
-updated: 2026-07-17
+updated: 2026-07-22
 ---
 
 # 熔断器
@@ -73,6 +73,7 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 
 - **路由**：检查目标的熔断器状态
 - **调度**：重试耗尽后打开熔断器；`resolve_provider` 失败时若已占用探测槽须释放
+- **StickyFailover 粘性记忆**：手动关闭熔断器（`POST /api/circuit-breaker/close`）时同步清除该 model 的 sticky active target 记忆，使下一次请求回退到 fill-first 优先级顺序。语义与 `sticky_failover_reset_secs` 自然过期一致。
 
 ## 变更记录
 
@@ -80,3 +81,4 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 - [0002 熔断半开探测与冷却期周期探测](changes/0002-half-open-periodic-probe.md)
 - [0003 探测失败隐瞒冷却下界与流式取消探测槽泄漏修复](changes/0003-probe-lifetime-fix.md)
 - [0004 熔断状态可观测化](changes/0004-observability.md)
+- [0005 手动关闭熔断时清除 StickyFailover 粘性记忆](changes/0005-manual-close-clears-sticky.md)

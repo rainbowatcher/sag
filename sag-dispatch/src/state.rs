@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sag_config::{GatewayConfig, default_timeout_secs, default_ttfb_timeout_secs};
 use sag_core::compute_stale_probe_threshold;
@@ -42,7 +42,12 @@ pub struct DispatchRuntime {
     /// Stores (provider, real_model, stick_start_time) of the last successful target.
     /// The third element is the `Instant` when the sticky target was recorded,
     /// used for the configurable expiry mechanism.
-    pub active_targets: Arc<RwLock<HashMap<String, (String, String, Instant)>>>,
+    ///
+    /// Shared with [`AppState`] via the same `Arc` (injected through
+    /// [`DispatchRuntime::with_shared_state`]) so admin mutations — e.g.
+    /// clearing sticky memory when a breaker is manually closed — are
+    /// immediately visible to dispatch ordering.
+    pub active_targets: sag_state::ActiveTargets,
     /// Runtime availability memory for route targets.
     pub route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
     /// Last routes version seen by the prune guard. When this matches
@@ -65,14 +70,22 @@ impl Default for DispatchRuntime {
 
 impl DispatchRuntime {
     /// Construct a `DispatchRuntime` that shares the given circuit-breaker
-    /// `Arc` (instead of creating its own default). Used by `main.rs` so that
-    /// `AppState` and `DispatchRuntime` observe the *same* live breaker.
+    /// and sticky-failover active-target `Arc`s (instead of creating its
+    /// own defaults). Used by `main.rs` so that `AppState` and
+    /// `DispatchRuntime` observe the *same* live breaker and the *same*
+    /// sticky memory — admin mutations to `active_targets` (e.g. clearing
+    /// sticky routing when a breaker is manually closed) are immediately
+    /// visible to dispatch ordering.
     ///
-    /// All other fields (counters, ordering cache, active targets,
-    /// prune version) are initialized to their defaults.
-    pub fn with_circuit_breaker(route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>) -> Self {
+    /// All other fields (counters, ordering cache, prune version) are
+    /// initialized to their defaults.
+    pub fn with_shared_state(
+        route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
+        active_targets: sag_state::ActiveTargets,
+    ) -> Self {
         Self {
             route_circuit_breaker,
+            active_targets,
             ..Default::default()
         }
     }
@@ -213,6 +226,7 @@ pub fn stale_probe_threshold_from_config(config: &GatewayConfig) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[tokio::test]
     async fn prune_stale_entries_removes_deleted_routes() {
