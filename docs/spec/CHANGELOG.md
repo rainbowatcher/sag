@@ -1,11 +1,12 @@
 ---
 created: 2026-06-03
-updated: 2026-07-17
+updated: 2026-07-22
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+- **Body Override**：[0002 per-provider strip_fields 字段剥离](body-override/changes/0002-strip-fields.md) — 新增 provider 级字段剥离，在三层 override 之后硬性移除指定字段
 
 ## 2026-07-19
 
