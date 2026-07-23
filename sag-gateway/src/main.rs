@@ -5,9 +5,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 
+use async_trait::async_trait;
+use sag_config::ConfigReloadHandler;
+use sag_state::ConfigMutationCoordinator;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -39,10 +44,7 @@ async fn main() -> anyhow::Result<()> {
     // 3. Load configuration with hot-reload support
     let config_handle = sag_config::load_config(&config_path)?;
 
-    // 4. Start config hot-reload watcher
-    let hot_reload_handle = sag_config::spawn_hot_reload(config_handle.clone());
-
-    // 5. Determine analytics storage DSN from config
+    // 4. Determine analytics storage DSN from config
     let config = config_handle.read().await;
     let analytics_dsn = config
         .analytics
@@ -51,10 +53,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "sqlite://analytics.db".into());
     drop(config);
 
-    // 6. Initialize analytics collector with SQLite persistence
+    // 5. Initialize analytics collector with SQLite persistence
     let collector = Arc::new(sag_analytics::CallLogCollector::new(&analytics_dsn).await?);
 
-    // 7. Initialize provider registry from config and compute the
+    // 6. Initialize provider registry from config and compute the
     //    stale-probe threshold for the circuit breaker in the same read
     //    lock (avoiding an extra lock acquisition).
     let config = config_handle.read().await;
@@ -88,6 +90,13 @@ async fn main() -> anyhow::Result<()> {
 
     let provider_registry = Arc::new(RwLock::new(providers));
 
+    // 7. Create config mutation coordinator (serialises all production
+    //    config writes: hot-reload + Admin CRUD).
+    let coordinator = Arc::new(ConfigMutationCoordinator::new(
+        config_handle.clone(),
+        provider_registry.clone(),
+    ));
+
     // 8. Build AppState (shared resources) + DispatchRuntime (dispatch-only state).
     //    The circuit breaker Arc is created first and injected into both
     //    objects so they share the *same* live breaker instance. The breaker
@@ -104,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
         providers: provider_registry,
+        coordinator: coordinator.clone(),
         collector,
         circuit_breaker: route_circuit_breaker.clone(),
         active_targets: active_targets.clone(),
@@ -116,7 +126,15 @@ async fn main() -> anyhow::Result<()> {
         active_targets,
     );
 
-    // 8a. Spawn a watcher that recomputes the stale-probe threshold whenever
+    // 9. Start config hot-reload watcher with a coordinator-backed handler
+    //    that re-reads the file, validates it, and atomically publishes
+    //    config + provider registry + routes_version.
+    let handler: Arc<dyn ConfigReloadHandler> = Arc::new(GatewayReloadHandler {
+        coordinator: coordinator.clone(),
+    });
+    let hot_reload_handle = sag_config::spawn_hot_reload(config_handle.clone(), Some(handler));
+
+    // 10. Spawn a watcher that recomputes the stale-probe threshold whenever
     //     the config changes (hot-reload of `gateway.toml` or admin API
     //     mutation). It polls the config's `routes_version` counter (bumped by
     //     every config write path) and updates the shared breaker in place —
@@ -133,15 +151,15 @@ async fn main() -> anyhow::Result<()> {
         initial_routes_version,
     );
 
-    // 9. Build router
+    // 11. Build router
     let app = sag_router::build_router(app_state, dispatch_runtime);
 
-    // 9a. When the `embed-ui` feature is on, route any unmatched path
+    // 11a. When the `embed-ui` feature is on, route any unmatched path
     //     through the embedded SPA (assets + index.html fallback).
     #[cfg(feature = "embed-ui")]
     let app = app.fallback(crate::ui_routes::ui_handler);
 
-    // 10. Determine listen address
+    // 12. Determine listen address
     let config = config_handle.read().await;
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
         .parse()
@@ -156,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     info!(%addr, "gateway listening");
     drop(config);
 
-    // 11. Start server with graceful shutdown
+    // 13. Start server with graceful shutdown
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -164,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("gateway shut down");
 
-    // 12. Gracefully shut down the hot-reload watcher and the threshold
+    // 14. Gracefully shut down the hot-reload watcher and the threshold
     //     watcher. These MUST happen after the server stops because the
     //     hot-reload watcher uses `notify` which spawns OS-level threads
     //     (FSEvents on macOS). Using `abort()` on the JoinHandle would skip
@@ -180,6 +198,58 @@ async fn main() -> anyhow::Result<()> {
     info!("all subsystems shut down");
 
     Ok(())
+}
+
+/// Handler that wraps the [`ConfigMutationCoordinator`] for the hot-reload
+/// watcher. Each file event triggers a coordinated re-read, validation, and
+/// atomic publication of config + provider registry + routes_version.
+struct GatewayReloadHandler {
+    coordinator: Arc<ConfigMutationCoordinator>,
+}
+
+#[async_trait]
+impl ConfigReloadHandler for GatewayReloadHandler {
+    async fn reload_from_path(&self, path: &Path) -> sag_core::Result<()> {
+        match self.coordinator.reload_from_path(path).await {
+            Ok(report) => {
+                tracing::info!(
+                    added = report.providers_added.len(),
+                    rebuilt = report.providers_rebuilt.len(),
+                    removed = report.providers_removed.len(),
+                    "config hot-reloaded via coordinator"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("unstable") {
+                    // File is still changing within the retry window.
+                    // Schedule a one-shot fallback reload after 2s so
+                    // the editor has time to finish writing.
+                    tracing::warn!("config file unstable, scheduling fallback reload in 2s");
+                    let coord = self.coordinator.clone();
+                    let path = path.to_path_buf();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        match coord.reload_from_path(&path).await {
+                            Ok(r) => tracing::info!(
+                                added = r.providers_added.len(),
+                                rebuilt = r.providers_rebuilt.len(),
+                                removed = r.providers_removed.len(),
+                                "fallback reload succeeded"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "fallback reload also failed, waiting for next file event")
+                            }
+                        }
+                    });
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "config reload rejected");
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Watch the config's `routes_version` counter and recompute the circuit

@@ -19,6 +19,9 @@ use sag_core::RouteCircuitBreaker;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
 
+pub mod config_mutation;
+pub use config_mutation::{ConfigMutationCoordinator, FileRevision, MutationReport};
+
 /// Sticky-failover active-target memory: `model → (provider, real_model,
 /// recorded_at)`. Shared between [`AppState`] and `DispatchRuntime` via the
 /// same `Arc` so admin mutations (e.g. clearing sticky memory when a breaker
@@ -39,6 +42,9 @@ pub struct AppState {
     pub config: ConfigHandle,
     /// Map of provider name → initialized provider adapter.
     pub providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>>,
+    /// Config mutation coordinator: serialises all production writes to
+    /// config + provider registry + routes_version.
+    pub coordinator: Arc<ConfigMutationCoordinator>,
     /// Async call log collector for analytics.
     pub collector: Arc<CallLogCollector>,
     /// Shared route-target circuit breaker. The same `Arc` is injected into
@@ -104,6 +110,7 @@ pub mod testing {
     use tokio::sync::RwLock;
 
     use super::AppState;
+    use super::ConfigMutationCoordinator;
 
     /// Build an [`AppState`] with the given config and provider registry,
     /// backed by an in-memory analytics collector.
@@ -111,9 +118,14 @@ pub mod testing {
         config: ConfigHandle,
         providers: Arc<RwLock<HashMap<String, Arc<dyn sag_providers::LlmProvider>>>>,
     ) -> AppState {
+        let coordinator = Arc::new(ConfigMutationCoordinator::new(
+            config.clone(),
+            providers.clone(),
+        ));
         AppState {
             config,
             providers,
+            coordinator,
             collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),

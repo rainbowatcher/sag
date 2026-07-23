@@ -22,6 +22,8 @@ sag-config = { path = "../sag-config" }
 sag-router = { path = "../sag-router" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
+sag-state = { path = "../sag-state" }
+async-trait = { workspace = true }
 
 # Optional deps for the `embed-ui` feature (see [features] below).
 rust-embed = { workspace = true, optional = true }

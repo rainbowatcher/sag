@@ -533,7 +533,7 @@ pub enum KeyStrategy {
 ///
 /// Provider-level priority is not part of routing selection. Target ordering is
 /// controlled by `RouteTarget.priority` inside each route.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Provider adapter type (default: `openai`).
     #[serde(default, skip_serializing_if = "is_default_provider_type")]
@@ -831,7 +831,7 @@ pub enum Strategy {
 /// The effective number of retries for each target is resolved via three-tier
 /// fallback: **target-level** → **route-level** → **global** (`GatewayConfig.backoff.retries`).
 /// The first tier that explicitly sets a value wins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// The model name as requested by the client.
     /// Use `"*"` as a wildcard to match any model not matched by an exact route.

@@ -1,8 +1,33 @@
+use std::path::Path;
+use std::sync::Arc;
+
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tracing::{error, info, warn};
 
 use crate::loader::handle::ConfigHandle;
 use crate::loader::load::reload_config;
+
+/// Handler invoked by the hot-reload watcher after a debounced file event.
+///
+/// When registered via [`spawn_hot_reload`], the watcher delegates all
+/// serialized re-read, validation, and atomic runtime publication to the
+/// handler. This lets the gateway coordinate config reload with the
+/// provider-registry sync (see `ConfigMutationCoordinator` in `sag-state`)
+/// without `sag-config` depending on `sag-state` or `sag-providers`.
+///
+/// When `None` is passed to `spawn_hot_reload`, the watcher falls back to
+/// the legacy behavior of replacing only the in-memory config and bumping
+/// `routes_version`.
+#[async_trait::async_trait]
+pub trait ConfigReloadHandler: Send + Sync {
+    /// Re-read, validate, and atomically publish the config at `path`.
+    ///
+    /// Called after the watcher has debounced an event. The handler owns
+    /// serialized re-read/validation and atomic runtime publication
+    /// (config + provider registry + version bump). On `Err` the watcher
+    /// logs the rejection and leaves the running config untouched.
+    async fn reload_from_path(&self, path: &Path) -> sag_core::Result<()>;
+}
 
 /// Handle for the hot-reload background task, including a shutdown signal.
 pub struct HotReloadHandle {
@@ -24,9 +49,18 @@ impl HotReloadHandle {
 }
 
 /// Spawn a background task that watches the config file for changes and reloads it.
+///
+/// If `handler` is `Some`, file events are delegated to the handler which
+/// owns the full reload protocol (re-read, validate, publish config + registry).
+/// If `handler` is `None`, the watcher falls back to legacy config-only reload
+/// (replaces the in-memory `GatewayConfig` and bumps `routes_version`).
+///
 /// The returned handle will reflect the latest config. If `handle` is in-memory
 /// (no associated file path), the watcher task exits immediately.
-pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
+pub fn spawn_hot_reload(
+    handle: ConfigHandle,
+    handler: Option<Arc<dyn ConfigReloadHandler>>,
+) -> HotReloadHandle {
     let inner = handle.inner.clone();
     let path = handle.config_path.clone();
     let routes_version = handle.routes_version.clone();
@@ -68,7 +102,7 @@ pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
             tokio::select! {
                 _ = &mut shutdown_rx => {
                     info!("hot-reload watcher shutting down");
-                    // Drop the watcher explicitly — this stops OS file-watch threads.
+                    // Drop the watcher explicitly - this stops OS file-watch threads.
                     drop(watcher);
                     return;
                 }
@@ -85,15 +119,32 @@ pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
                                 // Small delay to let the file system settle
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-                                match reload_config(&path).await {
-                                    Ok(new_config) => {
-                                        let mut guard = inner.write().await;
-                                        *guard = new_config;
-                                        routes_version.fetch_add(1, std::sync::atomic::Ordering::Release);
-                                        info!("configuration hot-reloaded");
+                                if let Some(ref handler) = handler {
+                                    // Delegated reload: handler owns re-read,
+                                    // validation, and atomic publication of
+                                    // config + provider registry + version.
+                                    match handler.reload_from_path(&path).await {
+                                        Ok(()) => {
+                                            info!("configuration hot-reloaded");
+                                        }
+                                        Err(e) => {
+                                            warn!("failed to reload config: {e}");
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!("failed to reload config: {e}");
+                                } else {
+                                    // Legacy config-only reload (backward compat,
+                                    // tests, and in-memory scenarios that still
+                                    // have a file path).
+                                    match reload_config(&path).await {
+                                        Ok(new_config) => {
+                                            let mut guard = inner.write().await;
+                                            *guard = new_config;
+                                            routes_version.fetch_add(1, std::sync::atomic::Ordering::Release);
+                                            info!("configuration hot-reloaded");
+                                        }
+                                        Err(e) => {
+                                            warn!("failed to reload config: {e}");
+                                        }
                                     }
                                 }
                             }
@@ -102,9 +153,7 @@ pub fn spawn_hot_reload(handle: ConfigHandle) -> HotReloadHandle {
                             error!("file watcher error: {e}");
                         }
                         None => {
-                            // All senders dropped — watcher was destroyed.
-                            // This is a belt-and-suspendors safety net; in
-                            // practice the shutdown signal arm handles exit.
+                            // All senders dropped - watcher was destroyed.
                             info!("file watcher channel closed, exiting");
                             return;
                         }

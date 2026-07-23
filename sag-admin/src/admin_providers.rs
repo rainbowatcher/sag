@@ -187,77 +187,46 @@ pub async fn add_provider(
 ) -> impl IntoResponse {
     tracing::Span::current().record("provider_name", &req.name);
     tracing::Span::current().record("provider_type", req.provider_type.as_str());
-    // 1. Write-lock config, insert provider, and persist to disk
-    let provider_config = {
-        let mut config = state.config.write().await;
 
-        if config.providers.contains_key(&req.name) {
-            return AppError::Conflict(format!("provider '{}' already exists", req.name))
-                .into_response();
-        }
-
-        if req.api_keys.is_empty() {
-            return AppError::BadRequest("at least one api_key required".into()).into_response();
-        }
-
-        let pc = ProviderConfig {
-            provider_type: req.provider_type,
-            api_keys: req.api_keys.clone(),
-            key_strategy: req.key_strategy,
-            base_url: req.base_url.clone(),
-            models_endpoint: sag_config::normalize_models_endpoint(&req.models_endpoint),
-            timeout_secs: req.timeout_secs,
-            headers: req.headers.clone(),
-            body_overrides: req.body_overrides.clone(),
-            model_overrides: req.model_overrides.clone(),
-            strip_fields: req.strip_fields.clone(),
-            role_mappings: req.role_mappings.clone(),
-            enabled_models: req.enabled_models.clone(),
-            enabled: true,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-        };
-
-        config.providers.insert(req.name.clone(), pc.clone());
-
-        // Bump the config version so downstream watchers (e.g. the
-        // stale-probe-threshold watcher in main.rs) recompute derived
-        // state that depends on provider settings (timeout_secs / ttfb).
-        state.config.bump_routes_version();
-        state.config.try_persist(&config, "adding provider");
-
-        pc
-    };
-
-    // 2. Rebuild the runtime adapter from the updated config.
-    // NOTE: There is a brief window between the config write lock release
-    // above and the registry update here where config and registry are
-    // inconsistent (provider exists in config but not yet in registry).
-    // This is an accepted trade-off to avoid holding both locks simultaneously.
-    if let Err(e) = state.upsert_provider(&req.name, &provider_config).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": {
-                    "code": "PROVIDER_ADAPTER_FAILED",
-                    "message": format!("Provider config saved but adapter creation failed: {}", e),
-                }
-            })),
-        )
-            .into_response();
+    // Validate: at least one API key is required (early check).
+    if req.api_keys.is_empty() {
+        return AppError::BadRequest("at least one api_key required".into()).into_response();
     }
 
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "name": req.name,
-            "provider_type":            provider_config.provider_type.as_str(),
-            "base_url": provider_config.base_url,
-            "models_endpoint": provider_config.models_endpoint,
-        })),
-    )
-        .into_response()
+    let pc = ProviderConfig {
+        provider_type: req.provider_type,
+        api_keys: req.api_keys.clone(),
+        key_strategy: req.key_strategy,
+        base_url: req.base_url.clone(),
+        models_endpoint: sag_config::normalize_models_endpoint(&req.models_endpoint),
+        timeout_secs: req.timeout_secs,
+        headers: req.headers.clone(),
+        body_overrides: req.body_overrides.clone(),
+        model_overrides: req.model_overrides.clone(),
+        strip_fields: req.strip_fields.clone(),
+        role_mappings: req.role_mappings.clone(),
+        enabled_models: req.enabled_models.clone(),
+        enabled: true,
+        anthropic_cache_control: true,
+        chunk_timeout_secs: None,
+        ttfb_timeout_secs: None,
+    };
+
+    // Delegate to the coordinator which atomically writes config + provider
+    // registry + version, and persists to disk.
+    match state.coordinator.add_provider(req.name.clone(), pc).await {
+        Ok(_report) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "name": req.name,
+                "provider_type": req.provider_type.as_str(),
+                "base_url": req.base_url,
+                "models_endpoint": sag_config::normalize_models_endpoint(&req.models_endpoint),
+            })),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// PUT /api/providers — update an existing provider's configuration.
@@ -267,10 +236,12 @@ pub async fn update_provider(
     Json(req): Json<UpdateProviderRequest>,
 ) -> impl IntoResponse {
     tracing::Span::current().record("provider_name", &req.name);
-    let provider_config = {
-        let mut config = state.config.write().await;
 
-        let existing = match config.providers.get_mut(&req.name) {
+    // 1. Read the current config, clone the existing provider, merge fields.
+    let provider_config = {
+        let config = state.config.read().await;
+
+        let existing = match config.providers.get(&req.name) {
             Some(p) => p,
             None => {
                 return AppError::NotFound(format!("provider '{}' not found", req.name))
@@ -278,90 +249,61 @@ pub async fn update_provider(
             }
         };
 
+        let mut pc = existing.clone();
+
         if let Some(v) = req.api_keys {
-            existing.api_keys = v;
+            pc.api_keys = v;
         }
         if let Some(v) = req.key_strategy {
-            existing.key_strategy = v;
+            pc.key_strategy = v;
         }
         if let Some(v) = req.provider_type {
-            existing.provider_type = v;
+            pc.provider_type = v;
         }
         if let Some(v) = req.base_url {
-            existing.base_url = v;
+            pc.base_url = v;
         }
         if let Some(v) = req.models_endpoint {
-            existing.models_endpoint = sag_config::normalize_models_endpoint(&v);
+            pc.models_endpoint = sag_config::normalize_models_endpoint(&v);
         }
         if let Some(v) = req.timeout_secs {
-            existing.timeout_secs = v;
+            pc.timeout_secs = v;
         }
         if let Some(v) = req.headers {
-            existing.headers = v;
+            pc.headers = v;
         }
         if let Some(v) = req.body_overrides {
-            existing.body_overrides = v;
+            pc.body_overrides = v;
         }
         if let Some(v) = req.strip_fields {
-            existing.strip_fields = v;
+            pc.strip_fields = v;
         }
         if let Some(v) = req.model_overrides {
-            existing.model_overrides = v;
+            pc.model_overrides = v;
         }
         if let Some(v) = req.role_mappings {
-            existing.role_mappings = v;
+            pc.role_mappings = v;
         }
         if let Some(v) = req.enabled_models {
-            existing.enabled_models = v;
+            pc.enabled_models = v;
         }
         if let Some(v) = req.enabled {
-            existing.enabled = v;
+            pc.enabled = v;
         }
-
-        let pc = existing.clone();
-
-        // Bump the config version so downstream watchers recompute derived
-        // state that depends on provider settings (timeout_secs / ttfb).
-        state.config.bump_routes_version();
-        state.config.try_persist(&config, "updating provider");
 
         pc
     };
 
-    // Rebuild the runtime adapter from the updated config.
-    // NOTE: Same brief inconsistency window as add_provider — see the
-    // comment there for rationale.
-    if let Err(e) = state.upsert_provider(&req.name, &provider_config).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": {
-                    "code": "PROVIDER_ADAPTER_FAILED",
-                    "message": format!("Provider config saved but adapter creation failed: {}", e),
-                }
-            })),
-        )
-            .into_response();
+    // 2. Delegate to the coordinator which atomically writes config + provider
+    //    registry + version, and persists to disk.
+    match state
+        .coordinator
+        .update_provider(&req.name, provider_config)
+        .await
+    {
+        Ok(_report) => (StatusCode::OK, Json(json!({ "name": req.name }))).into_response(),
+        Err(e) => e.into_response(),
     }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "name": req.name,
-            "provider_type":            provider_config.provider_type.as_str(),
-            "base_url": provider_config.base_url,
-            "models_endpoint": provider_config.models_endpoint,
-            "timeout_secs": provider_config.timeout_secs,
-            "headers": provider_config.headers,
-            "body_overrides": provider_config.body_overrides,
-            "strip_fields": provider_config.strip_fields,
-            "model_overrides": provider_config.model_overrides,
-            "role_mappings": provider_config.role_mappings,
-            "enabled_models": provider_config.enabled_models,
-            "enabled": provider_config.enabled,
-        })),
-    )
-        .into_response()
 }
 
 /// GET /api/providers/{name}/models — list models enabled for this provider.
@@ -403,45 +345,22 @@ pub async fn delete_provider(
 ) -> impl IntoResponse {
     let provider_name = req.name;
     tracing::Span::current().record("provider_name", &provider_name);
-    // ── Stage 1: update config + persist ─────────────────────────────
-    let cascade = {
-        let mut config = state.config.write().await;
 
-        let Some(cascade) = config.remove_provider(&provider_name) else {
-            return AppError::NotFound(format!("provider '{provider_name}' not found"))
-                .into_response();
-        };
-
-        // Bump the config version so downstream watchers recompute derived
-        // state. `remove_provider` may cascade to routes/targets, but even
-        // a pure provider removal (no route targets) changes the set of
-        // providers the threshold is computed from.
-        state.config.bump_routes_version();
-        state.config.try_persist(&config, "deleting provider");
-
-        cascade
-    };
-
-    // ── Stage 2: remove the runtime adapter ──────────────────────────
-    // Done after the config write lock is released to minimize lock
-    // contention. Any in-flight request that already snapshotted the
-    // Arc<dyn LlmProvider> will continue to use it; new lookups will see
-    // the absence and surface a clear "provider not found" error.
-    // NOTE: Same brief inconsistency window as add_provider — between
-    // config write lock release and registry update, a lookup may see the
-    // provider in config but not yet removed from the registry.
-    state.remove_provider_runtime(&provider_name).await;
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "name": provider_name,
-            "cascaded_routes": cascade.cascaded_routes,
-            "deleted_routes": cascade.deleted_routes,
-            "removed_targets": cascade.removed_targets,
-        })),
-    )
-        .into_response()
+    // Delegate to the coordinator which atomically removes the provider
+    // from config + registry + version, handles cascade, and persists.
+    match state.coordinator.delete_provider(&provider_name).await {
+        Ok((_report, cascade)) => (
+            StatusCode::OK,
+            Json(json!({
+                "name": provider_name,
+                "cascaded_routes": cascade.cascaded_routes,
+                "deleted_routes": cascade.deleted_routes,
+                "removed_targets": cascade.removed_targets,
+            })),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 #[cfg(test)]

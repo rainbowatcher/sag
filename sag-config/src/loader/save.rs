@@ -33,32 +33,30 @@ use crate::toml_edit_util::{
 ///
 /// # Concurrency and crash-safety
 ///
-/// This function performs a **read-then-write** (parse existing file →
-/// mutate in-memory → `std::fs::write`). It does **not** use atomic
-/// `tmp + rename` or file locking.
+/// This function performs a **read-then-render-then-atomic-write** (parse
+/// existing file -> mutate in-memory -> write temp file -> `sync_all` ->
+/// `rename`). The final `rename(2)` is atomic on Unix, so a crash during
+/// the write leaves the old file intact rather than a truncated partial
+/// write.
 ///
-/// **Process-level serialization**: the admin API acquires the config
-/// `RwLock` write guard (`state.config.write().await`) across config
-/// mutation and `try_persist`. Concurrent admin requests within the same
-/// process are serialized — the second request re-reads the file the
-/// first just wrote, so no lost-update occurs within a single process.
+/// **Process-level serialization**: the `ConfigMutationCoordinator` in
+/// `sag-state` serializes all production writers (admin API + hot-reload)
+/// via a `tokio::sync::Mutex`. Concurrent mutations within the same
+/// process are serialized, so no lost-update occurs.
 ///
-/// **Error-path behaviour**: if `existing.parse()` or `config.validate()`
-/// fails, the function returns `Err` without touching the file on disk —
-/// the original config file is preserved untouched (all-or-nothing).
+/// **Error-path behaviour**: if `existing.parse()`, `config.validate()`,
+/// temp-file creation, or `sync_all` fails, the function returns `Err`
+/// without touching the destination file – the original config file is
+/// preserved untouched (all-or-nothing). The temp file is cleaned up on
+/// failure.
 ///
-/// **Crash-safety gap**: a crash during `std::fs::write` would leave a
-/// truncated or partially-written file. In practice, admin API mutations
-/// are infrequent, and the config file can be restored from version
-/// control or the `gateway.example.toml` template. If crash-safety
-/// becomes important, replace `std::fs::write` with `write(tmp) →
-/// fs::rename(tmp, path)`.
-///
-/// **Cross-process gap**: an external editor saving concurrently with an
-/// admin API mutation would race the read and write. The hot-reload
-/// watcher is read-only (it never writes the config file), so it does
-/// not participate in the race. If cross-process mutation is a concern,
-/// add OS-level file locking (`flock` / `LockFile`).
+/// **Cross-process TOCTOU**: an external editor saving concurrently with
+/// an admin API mutation can still race the read and rename. The
+/// `ConfigMutationCoordinator` detects external edits by comparing the
+/// file's content hash against an accepted revision before writing; if
+/// they differ, it returns `AppError::Conflict`. A narrow TOCTOU window
+/// remains between the final check and the rename when the external
+/// editor does not participate in any lock protocol.
 pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sag_core::AppError> {
     // Validate no null values before writing.
     for (name, provider) in &config.providers {
@@ -142,18 +140,67 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
         write_route_fields,
     )?;
 
-    // ── Write back ──
+    // ── Write back (atomic: temp-file + rename) ──
     // Multi-line layout for inline-table-arrays (e.g. `targets`) is
     // handled natively by `toml_edit` 0.24.1 via per-item
     // `decor_mut().set_prefix()` set inside
     // `sync_inline_table_array_in_place`. No string-level
-    // post-processing is needed — the rendered document already
+    // post-processing is needed - the rendered document already
     // contains multi-line arrays.
     let rendered = doc.to_string();
-    std::fs::write(path, rendered)
-        .map_err(|e| sag_core::AppError::Config(format!("failed to write config file: {e}")))?;
+    atomic_write(path, &rendered)?;
 
     info!("config persisted to {}", path.display());
+    Ok(())
+}
+
+/// Atomically write `content` to `path` via a temp-file in the same
+/// directory followed by `rename(2)`.
+///
+/// On Unix, `rename` atomically overwrites the destination. On Windows,
+/// `std::fs::rename` fails if the target exists, so this function is
+/// currently Unix-only for the overwrite case. SAG targets Linux/macOS
+/// deployments; Windows support would require a separate
+/// `rename-with-replace` implementation.
+///
+/// Steps:
+/// 1. Write `content` to a unique temp file in the same directory.
+/// 2. `sync_all` the temp file so data reaches disk before the rename.
+/// 3. `rename(temp, path)` – atomic on Unix.
+/// 4. On any failure, clean up the temp file and return `Err` without
+///    touching the destination.
+fn atomic_write(path: &Path, content: &str) -> Result<(), sag_core::AppError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| sag_core::AppError::Config("config path has no parent directory".into()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let temp_path = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+
+    // 1. Write to temp file.
+    std::fs::write(&temp_path, content).map_err(|e| {
+        sag_core::AppError::Config(format!("failed to write temp config file: {e}"))
+    })?;
+
+    // 2. Sync the temp file.
+    let file = std::fs::File::open(&temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        sag_core::AppError::Config(format!("failed to open temp config for sync: {e}"))
+    })?;
+    file.sync_all().map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        sag_core::AppError::Config(format!("failed to sync temp config file: {e}"))
+    })?;
+    drop(file);
+
+    // 3. Atomic rename (overwrites destination on Unix).
+    std::fs::rename(&temp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        sag_core::AppError::Config(format!("failed to rename temp config file: {e}"))
+    })?;
+
     Ok(())
 }
 

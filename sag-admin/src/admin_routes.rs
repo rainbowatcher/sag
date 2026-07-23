@@ -148,40 +148,36 @@ pub async fn create_route(
     Json(req): Json<CreateRouteRequest>,
 ) -> impl IntoResponse {
     tracing::Span::current().record("model_name", &req.model_name);
+
+    // Read-only validation: check targets reference existing providers and
+    // compatible enabled_models. The coordinator handles duplicate name check
+    // and atomic commit.
     {
-        let mut config = state.config.write().await;
-
-        if config.routes.iter().any(|r| r.model_name == req.model_name) {
-            return AppError::Conflict(format!("route '{}' already exists", req.model_name))
-                .into_response();
-        }
-
+        let config = state.config.read().await;
         if let Err(e) = validate_targets(&config, &req.targets, &req.model_name) {
             return e.into_response();
         }
-
-        let route = RouteConfig {
-            model_name: req.model_name.clone(),
-            api_endpoint: req.api_endpoint,
-            retries: req.retries,
-            timeout_secs: None,
-            strategy: req.strategy.unwrap_or_default(),
-            targets: req.targets.into_iter().map(Into::into).collect(),
-        };
-
-        config.routes.push(route);
-
-        state.config.bump_routes_version();
-        state.config.try_persist(&config, "creating route");
     }
 
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "model_name": req.model_name,
-        })),
-    )
-        .into_response()
+    let route = RouteConfig {
+        model_name: req.model_name.clone(),
+        api_endpoint: req.api_endpoint,
+        retries: req.retries,
+        timeout_secs: None,
+        strategy: req.strategy.unwrap_or_default(),
+        targets: req.targets.into_iter().map(Into::into).collect(),
+    };
+
+    match state.coordinator.create_route(route).await {
+        Ok(_report) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "model_name": req.model_name,
+            })),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// PUT /api/routes — update an existing route (partial update).
@@ -191,54 +187,59 @@ pub async fn update_route(
     Json(req): Json<UpdateRouteRequest>,
 ) -> impl IntoResponse {
     tracing::Span::current().record("model_name", &req.model_name);
-    {
-        let mut config = state.config.write().await;
 
-        // Validate targets upfront before any mutable borrow
+    // 1. Read current config, validate targets (if changed), find existing
+    //    route, merge fields.
+    let route = {
+        let config = state.config.read().await;
+
+        // Validate targets upfront before any clone.
         if let Some(ref targets) = req.targets {
             if let Err(e) = validate_targets(&config, targets, &req.model_name) {
                 return e.into_response();
             }
         }
 
-        let idx = match config
+        let existing = match config
             .routes
             .iter()
-            .position(|r| r.model_name == req.model_name)
+            .find(|r| r.model_name == req.model_name)
         {
-            Some(i) => i,
+            Some(r) => r,
             None => {
                 return AppError::NotFound(format!("route '{}' not found", req.model_name))
                     .into_response();
             }
         };
 
-        let existing = &mut config.routes[idx];
-
+        let mut route = existing.clone();
         if let Some(endpoint) = req.api_endpoint {
-            existing.api_endpoint = endpoint;
+            route.api_endpoint = endpoint;
         }
         if let Some(strategy) = req.strategy {
-            existing.strategy = strategy;
+            route.strategy = strategy;
         }
         if let Some(retries) = req.retries {
-            existing.retries = Some(retries);
+            route.retries = Some(retries);
         }
         if let Some(targets) = req.targets {
-            existing.targets = targets.into_iter().map(Into::into).collect();
+            route.targets = targets.into_iter().map(Into::into).collect();
         }
 
-        state.config.bump_routes_version();
-        state.config.try_persist(&config, "updating route");
-    }
+        route
+    };
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "model_name": req.model_name,
-        })),
-    )
-        .into_response()
+    // 2. Delegate to the coordinator.
+    match state.coordinator.update_route(&req.model_name, route).await {
+        Ok(_report) => (
+            StatusCode::OK,
+            Json(json!({
+                "model_name": req.model_name,
+            })),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// DELETE /api/routes — delete a route by model_name.
@@ -248,28 +249,17 @@ pub async fn delete_route(
     Json(req): Json<DeleteRouteRequest>,
 ) -> impl IntoResponse {
     tracing::Span::current().record("model_name", &req.model_name);
-    {
-        let mut config = state.config.write().await;
 
-        let before = config.routes.len();
-        config.routes.retain(|r| r.model_name != req.model_name);
-
-        if config.routes.len() == before {
-            return AppError::NotFound(format!("route '{}' not found", req.model_name))
-                .into_response();
-        }
-
-        state.config.bump_routes_version();
-        state.config.try_persist(&config, "deleting route");
+    match state.coordinator.delete_route(&req.model_name).await {
+        Ok(_report) => (
+            StatusCode::OK,
+            Json(json!({
+                "model_name": req.model_name,
+            })),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
     }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "model_name": req.model_name,
-        })),
-    )
-        .into_response()
 }
 
 #[cfg(test)]
