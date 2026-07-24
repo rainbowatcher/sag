@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { AlertCircle, Search, RefreshCw, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
+import { AlertCircle, RefreshCw, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
 import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import {
   Table,
   TableBody,
@@ -18,10 +17,12 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip
 import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useProviderStore } from "@/stores/providers"
+import { useRouteStore } from "@/stores/routes"
 import type { CallLog } from "@/types/api"
 
 const store = useAnalyticsStore()
 const providerStore = useProviderStore()
+const routeStore = useRouteStore()
 
 // ── Filters ───────────────────────────────────────────────────────
 const logsFilterProvider = ref("")
@@ -29,27 +30,30 @@ const logsFilterModel = ref("")
 const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
 
+const statusCodeOptions = [
+  { value: "200", label: "200 OK" },
+  { value: "400", label: "400 Bad Request" },
+  { value: "401", label: "401 Unauthorized" },
+  { value: "403", label: "403 Forbidden" },
+  { value: "404", label: "404 Not Found" },
+  { value: "422", label: "422 Unprocessable Entity" },
+  { value: "429", label: "429 Too Many Requests" },
+  { value: "500", label: "500 Internal Server Error" },
+  { value: "502", label: "502 Bad Gateway" },
+  { value: "503", label: "503 Service Unavailable" },
+  { value: "504", label: "504 Gateway Timeout" },
+]
+
 const providerOptions = computed(() =>
   providerStore.providers.map((p) => ({ value: p.name, label: p.name })),
 )
 
 const modelOptions = computed(() => providerStore.allProviderModels.map((m) => ({ value: m })))
 
+const routeModelOptions = computed(() => routeStore.routes.map((r) => ({ value: r.model_name })))
+
 async function refreshLogs() {
-  // The browser <input type="number"> only validates manual key entry —
-  // pasted text like "abc" slips through and would yield `Number("abc") →
-  // NaN`, which `String(NaN) → "NaN"` would then fail Option<u16>
-  // deserialization in the backend with HTTP 400. Reject on the client
-  // and silently drop the filter (treat as "no status filter") instead of
-  // forwarding an invalid value.
-  let status_code: number | undefined
-  const trim = logsFilterStatusCode.value.trim()
-  if (trim.length > 0) {
-    const n = Number(trim)
-    if (Number.isFinite(n) && Number.isInteger(n) && n >= 0 && n <= 65535) {
-      status_code = n
-    }
-  }
+  const status_code = logsFilterStatusCode.value ? Number(logsFilterStatusCode.value) : undefined
   await store.applyLogsFilter({
     provider: logsFilterProvider.value || undefined,
     model: logsFilterModel.value || undefined,
@@ -86,6 +90,9 @@ onMounted(() => {
   }
   if (providerStore.allProviderModels.length === 0) {
     providerStore.fetchAllProviderModels()
+  }
+  if (routeStore.routes.length === 0) {
+    routeStore.fetchRoutes()
   }
 
   store.fetchLogs()
@@ -156,7 +163,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
         <p class="text-muted-foreground mt-1 text-sm">请求记录明细 / 调用日志</p>
       </div>
 
-      <div class="flex flex-wrap items-center gap-3">
+      <div class="flex flex-nowrap items-center gap-3">
         <SearchSelect
           v-model="logsFilterProvider"
           :options="providerOptions"
@@ -167,7 +174,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
         />
         <SearchSelect
           v-model="logsFilterModel"
-          :options="modelOptions"
+          :options="routeModelOptions"
           placeholder="model"
           search-placeholder="Search model..."
           class="w-40 xl:w-52"
@@ -181,21 +188,17 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           class="w-40 xl:w-52"
           @update:model-value="refreshLogs()"
         />
-        <Input
+        <SearchSelect
           v-model="logsFilterStatusCode"
-          type="number"
-          min="0"
-          class="w-28"
+          :options="statusCodeOptions"
           placeholder="status"
-          @keyup.enter="refreshLogs()"
+          search-placeholder="Search status..."
+          class="w-40"
+          @update:model-value="refreshLogs()"
         />
-        <Button @click="refreshLogs()">
-          <Search class="h-3.5 w-3.5" />
-          Query
-        </Button>
         <Button
           variant="outline"
-          class="ml-auto"
+          class="ml-auto shrink-0"
           :disabled="store.logsLoading"
           @click="refreshCurrentPage()"
         >
@@ -203,7 +206,6 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           Refresh
         </Button>
       </div>
-
       <Alert v-if="store.logsError" variant="destructive">
         <AlertCircle class="h-4 w-4" />
         <AlertTitle>Failed to load call logs</AlertTitle>
