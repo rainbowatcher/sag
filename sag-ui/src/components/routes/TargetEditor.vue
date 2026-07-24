@@ -43,16 +43,22 @@ const sortDirection = ref<"desc" | "asc">("desc")
 
 // --- Expand state: which target's config bar is open (tracked by id, stable across sorts) ---
 const expandedId = ref<number | null>(null)
+const frozenOrder = ref<TargetItem[] | null>(null)
 
-// --- Display order: sort only when nothing is expanded ---
+// --- Display order: frozen while editing, sorted by priority when collapsed ---
 const displayTargets = computed(() => {
-  const targets = [...props.modelValue]
-  if (expandedId.value === null) {
-    targets.sort((a, b) => {
-      const cmp = (a.priority ?? 0) - (b.priority ?? 0)
-      return sortDirection.value === "desc" ? -cmp : cmp
-    })
+  if (frozenOrder.value !== null) {
+    // 编辑区打开期间：按快照顺序，但字段值取 modelValue 最新数据
+    return frozenOrder.value
+      .map((snap) => props.modelValue.find((t) => t.id === snap.id) ?? snap)
+      .filter(Boolean) as TargetItem[]
   }
+  // 编辑区关闭：按 priority 排序
+  const targets = [...props.modelValue]
+  targets.sort((a, b) => {
+    const cmp = (a.priority ?? 0) - (b.priority ?? 0)
+    return sortDirection.value === "desc" ? -cmp : cmp
+  })
   return targets
 })
 
@@ -69,6 +75,18 @@ function priorityBadgeVariant(p: number): "default" | "secondary" | "outline" {
 
 function toggleSort() {
   sortDirection.value = sortDirection.value === "desc" ? "asc" : "desc"
+}
+
+function toggleExpand(id: number) {
+  if (expandedId.value === id) {
+    // 关闭：先清快照，computed 重新按 priority 排序
+    expandedId.value = null
+    frozenOrder.value = null
+  } else {
+    // 展开：先拍当前顺序快照，再记录展开的 id
+    frozenOrder.value = [...displayTargets.value]
+    expandedId.value = id
+  }
 }
 
 // --- Mutations ---
@@ -182,7 +200,7 @@ function onProviderChange(index: number, value: string) {
                     size="icon"
                     class="size-8"
                     :aria-label="expandedId === t.id ? 'Close configuration' : 'Open configuration'"
-                    @click="expandedId = expandedId === t.id ? null : t.id"
+                    @click="toggleExpand(t.id)"
                   >
                     <EllipsisVertical class="h-3.5 w-3.5" />
                   </Button>
