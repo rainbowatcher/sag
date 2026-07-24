@@ -7,6 +7,7 @@ import type {
   CallLog,
   DistributionRow,
   LogFilter,
+  LogsResponse,
   StatsRow,
   TrendRow,
 } from "@/types/api"
@@ -41,18 +42,12 @@ export const useAnalyticsStore = defineStore("analytics", () => {
 
   // ── Logs (raw call history) ──────────────────────────────────────
   const logs = ref<CallLog[]>([])
+  const logsTotal = ref(0)
   const logsLoading = ref(false)
   const logsError = ref<string | null>(null)
   const logsOffset = ref(0)
   const logsLimit = ref(DEFAULT_LOG_LIMIT)
-  // Precise "has next page" indicator: we request `limit + 1` rows and
-  // flip this when the server actually returns the extra sentinel row.
-  // This avoids the "last page is exactly full → fake Next button → empty
-  // result" footgun that comes from comparing `logs.length >= limit`.
   const hasMoreLogs = ref(false)
-  // Persisted filter state so pagination (nextLogsPage / prevLogsPage)
-  // can reuse the active filter without requiring the component to pass
-  // the filter params on every navigation call.
   const activeLogFilter = ref<LogFilter>({})
 
   /**
@@ -76,10 +71,6 @@ export const useAnalyticsStore = defineStore("analytics", () => {
    * `offset` for pagination). When called with no arguments the offset
    * falls back to `logsOffset.value`, so a bare `fetchLogs()` reloads the
    * current page in place — used by the "Refresh" button.
-   *
-   * The server caps `limit` at `MAX_LOG_LIMIT` (501), and we ask for
-   * `limit + 1` purely to detect whether another page exists; the
-   * sentinel row is trimmed before assigning to `logs`.
    */
   async function fetchLogs(overrides: LogFilter = {}) {
     logsLoading.value = true
@@ -87,32 +78,37 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     try {
       const filter: LogFilter = { ...activeLogFilter.value, ...overrides }
       const effectiveLimit = filter.limit ?? logsLimit.value
+      const targetOffset = filter.offset ?? logsOffset.value
       const params = new URLSearchParams()
       if (filter.provider) params.set("provider", filter.provider)
       if (filter.model) params.set("model", filter.model)
       if (filter.real_model) params.set("real_model", filter.real_model)
       if (filter.status_code != null) params.set("status_code", String(filter.status_code))
-      params.set("offset", String(filter.offset ?? logsOffset.value))
-      // Probe for an extra row to determine `hasMoreLogs` precisely.
-      params.set("limit", String(effectiveLimit + 1))
-      const { data } = await api.get<{ data: CallLog[] }>(`/api/logs?${params}`)
-      const rows = data.data
-      hasMoreLogs.value = rows.length > effectiveLimit
-      logs.value = hasMoreLogs.value ? rows.slice(0, effectiveLimit) : rows
-      logsOffset.value = filter.offset ?? logsOffset.value
+      params.set("offset", String(targetOffset))
+      params.set("limit", String(effectiveLimit))
+      const { data } = await api.get<LogsResponse>(`/api/logs?${params}`)
+      logs.value = data.data ?? []
+      logsTotal.value = data.total ?? 0
+      hasMoreLogs.value = targetOffset + logs.value.length < logsTotal.value
+      logsOffset.value = targetOffset
       logsLimit.value = effectiveLimit
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       logsError.value = getErrorMessage(e, "Failed to load call logs")
-      // The actual offset mutation lives in nextLogsPage/prevLogsPage via
-      // `filter.offset`, so a failed fetch leaves `logsOffset` untouched
-      // and the user automatically stays on the page they were viewing.
-      // No rollback math needed here — pre-vs-post offset is symmetric for
-      // both Next and Prev, and explicit-offset callers (future use) won't
-      // accidentally lose state to this catch.
     } finally {
       logsLoading.value = false
     }
+  }
+
+  /** Direct 1-based page navigation. */
+  async function setLogsPage(page: number) {
+    const targetOffset = Math.max(0, (page - 1) * logsLimit.value)
+    await fetchLogs({ offset: targetOffset })
+  }
+
+  /** Change page size and reset offset to page 1. */
+  async function setLogsLimit(limit: number) {
+    await fetchLogs({ offset: 0, limit })
   }
 
   /**
@@ -246,6 +242,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     fetchDistribution,
     // logs
     logs,
+    logsTotal,
     logsLoading,
     logsError,
     logsOffset,
@@ -254,6 +251,8 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     activeLogFilter,
     applyLogsFilter,
     fetchLogs,
+    setLogsPage,
+    setLogsLimit,
     nextLogsPage,
     prevLogsPage,
   }

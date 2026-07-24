@@ -165,6 +165,12 @@ export interface LogFilter {
   limit?: number
 }
 
+/** Response envelope returned by `GET /api/logs`. */
+export interface LogsResponse {
+  data: CallLog[]
+  total: number
+}
+
 /** Circuit breaker entry returned by `GET /api/circuit-breaker`. */
 export interface CircuitBreakerEntry {
   model: string

@@ -20,6 +20,9 @@ pub trait LogStore: Send + Sync {
     /// Query individual call log entries with pagination.
     async fn query_logs(&self, filter: LogFilter) -> sag_core::Result<Vec<CallLog>>;
 
+    /// Count total call log entries matching the filter (for pagination metadata).
+    async fn count_logs(&self, filter: LogFilter) -> sag_core::Result<u64>;
+
     /// Query cache hit-rate statistics grouped by `(provider, model, real_model)`.
     async fn query_cache_stats(&self, filter: StatsFilter) -> sag_core::Result<Vec<CacheStatsRow>>;
 

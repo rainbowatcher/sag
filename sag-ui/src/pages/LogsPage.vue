@@ -1,10 +1,19 @@
 <script setup lang="ts">
 import { AlertCircle, RefreshCw, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
+import type { AcceptableValue } from "reka-ui"
 import { ref, onMounted, computed } from "vue"
 import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Pagination,
+  PaginationContent,
+  PaginationEllipsis,
+  PaginationItem,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination"
 import {
   Table,
   TableBody,
@@ -68,6 +77,12 @@ async function refreshCurrentPage() {
 }
 
 const logsCurrentPage = computed(() => Math.floor(store.logsOffset / store.logsLimit) + 1)
+const showingStart = computed(() => (store.logsTotal === 0 ? 0 : store.logsOffset + 1))
+const showingEnd = computed(() => Math.min(store.logsOffset + store.logs.length, store.logsTotal))
+
+function onPageChange(page: number) {
+  store.setLogsPage(page)
+}
 
 function statusVariant(code: number) {
   if (code >= 500) return "destructive" as const
@@ -381,33 +396,74 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
     </div>
 
     <div class="shrink-0 pt-6">
-      <div class="flex items-center justify-between gap-4 text-sm">
-        <div class="text-muted-foreground">
-          Page <span class="text-foreground font-medium tabular-nums">{{ logsCurrentPage }}</span>
-          <span v-if="store.logs.length > 0">
-            · showing {{ store.logs.length }} row{{ store.logs.length === 1 ? "" : "s" }}
-          </span>
+      <div class="flex flex-wrap items-center justify-between gap-4 text-sm">
+        <!-- Range info -->
+        <div class="text-muted-foreground text-xs sm:text-sm">
+          Showing
+          <span class="text-foreground font-medium tabular-nums">{{ showingStart }}</span>
+          to
+          <span class="text-foreground font-medium tabular-nums">{{ showingEnd }}</span>
+          of
+          <span class="text-foreground font-medium tabular-nums">{{ store.logsTotal }}</span>
+          rows
         </div>
-        <div class="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            :disabled="store.logsOffset === 0 || store.logsLoading"
-            @click="store.prevLogsPage()"
+
+        <!-- comp-461 style Pagination aligned to the right -->
+        <Pagination
+          v-if="store.logsTotal > 0"
+          :page="logsCurrentPage"
+          :items-per-page="store.logsLimit"
+          :total="store.logsTotal"
+          :sibling-count="1"
+          :show-edges="true"
+          class="mx-0 w-auto"
+          @update:page="onPageChange"
+        >
+          <PaginationContent
+            v-slot="{ items }"
+            class="flex items-center justify-end gap-0 -space-x-px"
           >
-            <ChevronLeft class="h-3.5 w-3.5" />
-            Prev
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            :disabled="!store.hasMoreLogs || store.logsLoading"
-            @click="store.nextLogsPage()"
-          >
-            Next
-            <ChevronRight class="h-3.5 w-3.5" />
-          </Button>
-        </div>
+            <PaginationPrevious as-child>
+              <Button
+                variant="outline"
+                class="size-8 rounded-none shadow-none first:rounded-s-md last:rounded-e-md focus-visible:z-10 aria-disabled:pointer-events-none [&[aria-disabled]>svg]:opacity-50"
+                :disabled="logsCurrentPage <= 1 || store.logsLoading"
+              >
+                <ChevronLeft class="h-4 w-4" />
+              </Button>
+            </PaginationPrevious>
+
+            <template v-for="(item, index) in items">
+              <PaginationItem v-if="item.type === 'page'" :key="index" :value="item.value" as-child>
+                <Button
+                  variant="outline"
+                  class="size-8 rounded-none shadow-none focus-visible:z-10 aria-disabled:pointer-events-none [&[aria-disabled]>svg]:opacity-50"
+                  :class="item.value === logsCurrentPage && 'bg-accent font-semibold'"
+                  :disabled="store.logsLoading"
+                  @click="onPageChange(item.value)"
+                >
+                  {{ item.value }}
+                </Button>
+              </PaginationItem>
+              <PaginationEllipsis
+                v-else
+                :key="item.type"
+                :index="index"
+                class="border-input flex size-8 items-center justify-center rounded-none border shadow-none"
+              />
+            </template>
+
+            <PaginationNext as-child>
+              <Button
+                variant="outline"
+                class="size-8 rounded-none shadow-none first:rounded-s-md last:rounded-e-md focus-visible:z-10 aria-disabled:pointer-events-none [&[aria-disabled]>svg]:opacity-50"
+                :disabled="!store.hasMoreLogs || store.logsLoading"
+              >
+                <ChevronRight class="h-4 w-4" />
+              </Button>
+            </PaginationNext>
+          </PaginationContent>
+        </Pagination>
       </div>
     </div>
   </div>

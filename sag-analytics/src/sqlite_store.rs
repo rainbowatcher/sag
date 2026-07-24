@@ -296,6 +296,49 @@ impl LogStore for SqliteLogStore {
         Ok(rows.into_iter().map(|r| r.into_call_log()).collect())
     }
 
+    async fn count_logs(&self, filter: LogFilter) -> sag_core::Result<u64> {
+        let mut sql = String::from("SELECT COUNT(*) FROM call_logs");
+
+        let mut conditions: Vec<&'static str> = Vec::new();
+        if filter.provider.as_deref().is_some_and(|p| !p.is_empty()) {
+            conditions.push("provider = ?");
+        }
+        if filter.model.as_deref().is_some_and(|m| !m.is_empty()) {
+            conditions.push("model = ?");
+        }
+        if filter.real_model.as_deref().is_some_and(|m| !m.is_empty()) {
+            conditions.push("real_model = ?");
+        }
+        if filter.status_code.is_some() {
+            conditions.push("status_code = ?");
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
+            query = query.bind(p);
+        }
+        if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
+            query = query.bind(m);
+        }
+        if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
+            query = query.bind(rm);
+        }
+        if let Some(sc) = filter.status_code {
+            query = query.bind(sc as i32);
+        }
+
+        let count = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("count_logs failed: {e}")))?;
+
+        Ok(count.max(0) as u64)
+    }
+
     async fn query_cache_stats(&self, filter: StatsFilter) -> sag_core::Result<Vec<CacheStatsRow>> {
         let mut sql = String::from(
             r#"

@@ -60,23 +60,31 @@ fn build_filter(query: LogsQuery) -> LogFilter {
 }
 
 /// GET `/api/logs` — return a page of recent call-log entries with
-/// optional filters. The response envelope `{ "data": [CallLog...] }`
-/// matches the shape the Vue LogsPage already expects in
-/// `src/stores/analytics.ts`.
+/// optional filters. The response envelope `{ "data": [CallLog...], "total": total }`
+/// matches the shape expected by the frontend pagination.
 ///
-/// Rows are ordered `ORDER BY timestamp DESC` (newest first) — this
-/// matches what the LogsPage renders top-down. The frontend's
-/// `limit + 1` probe sentinel detects whether a next page exists.
+/// Rows are ordered `ORDER BY timestamp DESC` (newest first).
 #[instrument(skip(state))]
 pub async fn list_logs(
     State(state): State<AppState>,
     Query(params): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let filter = build_filter(params);
-    match state.collector.store().query_logs(filter).await {
-        Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
-        Err(e) => {
-            error!(?e, "logs query failed");
+    let store = state.collector.store();
+    let logs_res = store.query_logs(filter.clone()).await;
+    let count_res = store.count_logs(filter).await;
+
+    match (logs_res, count_res) {
+        (Ok(rows), Ok(total)) => (
+            StatusCode::OK,
+            Json(json!({
+                "data": rows,
+                "total": total,
+            })),
+        )
+            .into_response(),
+        (Err(e), _) | (_, Err(e)) => {
+            error!(?e, "logs query or count failed");
             AppError::Internal(e.to_string()).into_response()
         }
     }
@@ -176,6 +184,7 @@ mod tests {
         let body = json_body(response).await;
         let data = body["data"].as_array().expect("data must be an array");
         assert_eq!(data.len(), 2);
+        assert_eq!(body["total"], 2);
     }
 
     #[tokio::test]
