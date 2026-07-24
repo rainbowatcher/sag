@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { AlertCircle, Search, RefreshCw, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
+import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -16,15 +17,23 @@ import {
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
 import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
+import { useProviderStore } from "@/stores/providers"
 import type { CallLog } from "@/types/api"
 
 const store = useAnalyticsStore()
+const providerStore = useProviderStore()
 
 // ── Filters ───────────────────────────────────────────────────────
 const logsFilterProvider = ref("")
 const logsFilterModel = ref("")
 const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
+
+const providerOptions = computed(() =>
+  providerStore.providers.map((p) => ({ value: p.name, label: p.name })),
+)
+
+const modelOptions = computed(() => providerStore.allProviderModels.map((m) => ({ value: m })))
 
 async function refreshLogs() {
   // The browser <input type="number"> only validates manual key entry —
@@ -70,6 +79,15 @@ onMounted(() => {
   logsFilterRealModel.value = store.activeLogFilter.real_model ?? ""
   logsFilterStatusCode.value =
     store.activeLogFilter.status_code != null ? String(store.activeLogFilter.status_code) : ""
+
+  // Load provider and model data for SearchSelect options if not already loaded.
+  if (providerStore.providers.length === 0) {
+    providerStore.fetchProviders()
+  }
+  if (providerStore.allProviderModels.length === 0) {
+    providerStore.fetchAllProviderModels()
+  }
+
   store.fetchLogs()
 })
 
@@ -139,23 +157,29 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
       </div>
 
       <div class="flex flex-wrap items-center gap-3">
-        <Input
+        <SearchSelect
           v-model="logsFilterProvider"
-          class="w-40 xl:w-52"
+          :options="providerOptions"
           placeholder="provider"
-          @keyup.enter="refreshLogs()"
+          search-placeholder="Search provider..."
+          class="w-40 xl:w-52"
+          @update:model-value="refreshLogs()"
         />
-        <Input
+        <SearchSelect
           v-model="logsFilterModel"
-          class="w-40 xl:w-52"
+          :options="modelOptions"
           placeholder="model"
-          @keyup.enter="refreshLogs()"
-        />
-        <Input
-          v-model="logsFilterRealModel"
+          search-placeholder="Search model..."
           class="w-40 xl:w-52"
+          @update:model-value="refreshLogs()"
+        />
+        <SearchSelect
+          v-model="logsFilterRealModel"
+          :options="modelOptions"
           placeholder="real_model"
-          @keyup.enter="refreshLogs()"
+          search-placeholder="Search real model..."
+          class="w-40 xl:w-52"
+          @update:model-value="refreshLogs()"
         />
         <Input
           v-model="logsFilterStatusCode"

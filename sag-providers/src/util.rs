@@ -4,6 +4,7 @@ use reqwest::RequestBuilder;
 use sag_config::ProviderType;
 use sag_core::{StreamChunk, Usage};
 use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 /// Return the (name, value) pairs for auth headers that a provider type uses
 /// for chat and models API requests.
@@ -149,10 +150,29 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
 
+            // Diagnostic for "Completion=0" in call logs. A frame that
+            // credits prompt tokens but zero completion tokens is always
+            // anomalous for an OpenAI-compatible stream and is exactly what
+            // leaves the call log with completion_tokens=0 on an otherwise
+            // successful (status 200) request. WARN so it surfaces under the
+            // default `info` filter; the raw `usage` object is included to
+            // reveal the upstream field layout (explicit 0 vs. absent field,
+            // top-level reasoning_tokens, etc.) for root-causing.
+            if ct == 0 && pt > 0 {
+                warn!(
+                    pt = pt,
+                    ct = ct,
+                    usage = %usage_val,
+                    "upstream usage frame credits zero completion_tokens despite non-zero prompt; \
+                     this is the source of Completion=0 in the call log"
+                );
+            }
+
             // Skip entirely-zero usage objects to avoid noise; partial
             // data (e.g. prompt_tokens present but completion_tokens
             // absent) is still valuable for cache/reasoning extraction.
             if pt == 0 && ct == 0 {
+                debug!(usage = %usage_val, "skipping all-zero usage frame");
                 continue;
             }
 
