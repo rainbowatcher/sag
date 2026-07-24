@@ -87,8 +87,8 @@ function shortUserAgent(ua: string): string {
   return ua.split("/")[0].trim() || ua
 }
 
-/** Tokens/sec over the generation window after TTFT; null when inputs are missing or invalid. */
-function tpsFor(row: CallLog): number | null {
+/** Tokens/sec over the generation window after TTFT (post-TTFT streaming speed). */
+function streamTpsFor(row: CallLog): number | null {
   const usage = row.usage
   const ttft = row.ttft_ms
   const upstream = row.upstream_duration_ms
@@ -98,9 +98,16 @@ function tpsFor(row: CallLog): number | null {
   return (usage.completion_tokens * 1000) / genMs
 }
 
-function fmtTps(row: CallLog): string | null {
-  const tps = tpsFor(row)
-  return tps == null ? null : `${tps.toFixed(1)} tps`
+/** Tokens/sec over the entire upstream duration (overall throughput including TTFT). */
+function overallTpsFor(row: CallLog): number | null {
+  const usage = row.usage
+  const upstream = row.upstream_duration_ms
+  if (!usage || !upstream) return null
+  return (usage.completion_tokens * 1000) / upstream
+}
+
+function fmtTps(v: number | null): string | null {
+  return v == null ? null : `${v.toFixed(1)} tps`
 }
 
 /** Per-request cache hit rate: cached_tokens / prompt_tokens, or null if not applicable. */
@@ -286,7 +293,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                     <span class="cursor-default">{{ formatDuration(row.duration_ms) }}</span>
                   </TooltipTrigger>
                   <TooltipContent
-                    v-if="row.upstream_duration_ms || row.ttft_ms || fmtTps(row)"
+                    v-if="row.upstream_duration_ms || row.ttft_ms || fmtTps(overallTpsFor(row))"
                     side="left"
                     class="font-mono text-xs tabular-nums"
                   >
@@ -301,9 +308,17 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                         <span>ttft</span>
                         <span class="text-right">{{ formatDuration(row.ttft_ms) }}</span>
                       </template>
-                      <template v-if="fmtTps(row)">
+                      <template v-if="fmtTps(overallTpsFor(row))">
                         <span>tps</span>
-                        <span class="text-right text-green-600">{{ fmtTps(row) }}</span>
+                        <span class="text-right text-green-600">{{
+                          fmtTps(overallTpsFor(row))
+                        }}</span>
+                      </template>
+                      <template v-if="fmtTps(streamTpsFor(row))">
+                        <span>stream</span>
+                        <span class="text-right text-blue-600">{{
+                          fmtTps(streamTpsFor(row))
+                        }}</span>
                       </template>
                     </div>
                   </TooltipContent>
