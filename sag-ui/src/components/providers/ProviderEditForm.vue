@@ -351,9 +351,9 @@ async function handleSubmit() {
 
             <Separator />
 
-            <Alert class="border-amber-200 bg-amber-50">
-              <AlertTitle class="text-amber-900">提示</AlertTitle>
-              <AlertDescription class="text-amber-800">
+            <Alert variant="warning">
+              <AlertTitle>提示</AlertTitle>
+              <AlertDescription>
                 Body Overrides
                 对该供应商的<strong>所有模型</strong>生效。如需为特定模型设置不同参数，建议前往
                 <strong>Models Tab</strong> 配置 <strong>Model Overrides</strong>，避免在多个路由的
