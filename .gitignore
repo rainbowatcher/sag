@@ -55,3 +55,4 @@ docs/.vitepress/dist
 # misc
 .plan/
 gateway.toml
+.zcode/
