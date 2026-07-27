@@ -28,10 +28,16 @@ struct AnthropicStreamState {
 
 /// Extract and send token usage from an Anthropic usage JSON object.
 fn extract_anthropic_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender<StreamChunk>) {
-    if let (Some(input), Some(output)) = (
-        usage.get("input_tokens").and_then(|v| v.as_u64()),
-        usage.get("output_tokens").and_then(|v| v.as_u64()),
-    ) {
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let output = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    if input > 0 || output > 0 {
         let cached_tokens = usage
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64())
@@ -40,16 +46,18 @@ fn extract_anthropic_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let reasoning_tokens = usage
+            .get("thinking_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         let _ = tx.send(StreamChunk::Usage(Usage {
-            prompt_tokens: input as u32,
-            completion_tokens: output as u32,
-            total_tokens: (input + output) as u32,
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input.saturating_add(output),
             cached_tokens,
             cache_creation_tokens,
-            reasoning_tokens: usage
-                .get("thinking_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+            reasoning_tokens,
         }));
     }
 }
@@ -73,12 +81,25 @@ fn drain_anthropic_sse_frames(
 ) {
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
-        let delim_len = if buffer.len() >= 4 && buffer[..4] == *b"\r\n\r\n" {
+        let delim_len = if buffer.starts_with(b"\r\n\r\n") {
             4
         } else {
             2
         };
         buffer.drain(..delim_len);
+        process_anthropic_sse_frame(&frame, tx, state);
+    }
+}
+
+/// Drain remaining frames and flush any un-delimited trailing frame upon stream end.
+fn flush_anthropic_sse_buffer(
+    buffer: &mut Vec<u8>,
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    state: &mut AnthropicStreamState,
+) {
+    drain_anthropic_sse_frames(buffer, tx, state);
+    if !buffer.is_empty() {
+        let frame = std::mem::take(buffer);
         process_anthropic_sse_frame(&frame, tx, state);
     }
 }
@@ -93,10 +114,10 @@ fn process_anthropic_sse_frame(
 
     for line in text.lines() {
         let line = line.trim();
-        let Some(json_str) = line.strip_prefix("data: ") else {
+        let Some(rest) = line.strip_prefix("data:") else {
             continue;
         };
-        let json_str = json_str.trim();
+        let json_str = rest.trim_start();
 
         let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
             // Forward non-JSON payloads (e.g. `[DONE]`) as-is
@@ -710,7 +731,7 @@ impl LlmProvider for AnthropicProvider {
             }
 
             if !buffer.is_empty() {
-                drain_anthropic_sse_frames(&mut buffer, &tx, &mut state);
+                flush_anthropic_sse_buffer(&mut buffer, &tx, &mut state);
             }
 
             if !had_error {
@@ -1278,5 +1299,27 @@ mod tests {
         let anthropic_req =
             AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
         assert!(anthropic_req.thinking.is_none());
+    }
+
+    #[test]
+    fn flush_anthropic_sse_buffer_flushes_un_delimited_trailing_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut state = AnthropicStreamState::default();
+        let mut buffer = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}".to_vec();
+
+        flush_anthropic_sse_buffer(&mut buffer, &tx, &mut state);
+        drop(tx);
+
+        assert!(buffer.is_empty());
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Usage(u) = chunk {
+                chunks.push(u);
+            }
+        }
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].completion_tokens, 42);
     }
 }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reqwest::RequestBuilder;
-use reqwest::header::CONTENT_TYPE;
 use sag_config::{KeyStrategy, ProviderConfig};
 use sag_core::{AppError, ChatMessage};
 use tracing::{debug, trace, warn};
@@ -124,14 +123,8 @@ impl ProviderBase {
         target_extra: &HashMap<String, serde_json::Value>,
         extra_headers: &[(&str, &str)],
     ) -> RequestBuilder {
-        let mut req = self
-            .http_client
-            .post(url)
-            .header(CONTENT_TYPE, "application/json");
-        for (k, v) in extra_headers {
-            req = req.header(*k, *v);
-        }
-        let req = apply_headers(req, &self.headers);
+        let req = self.http_client.post(url);
+        let req = apply_headers(req, extra_headers, &self.headers);
         let body = apply_body_overrides(body, &self.body_overrides);
         let body = apply_body_overrides(body, target_extra);
 

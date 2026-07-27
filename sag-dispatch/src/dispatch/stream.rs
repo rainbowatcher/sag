@@ -93,14 +93,35 @@ where
                     return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(raw)), state));
                 }
                 Some(StreamChunk::Usage(u)) => {
-                    // Token-count fields accumulate across multiple Usage
-                    // chunks (Anthropic emits two: message_start + message_delta).
-                    state.usage.prompt_tokens += u.prompt_tokens;
-                    state.usage.completion_tokens += u.completion_tokens;
-                    state.usage.total_tokens += u.total_tokens;
-                    // Cache/reasoning fields appear at most once per stream
-                    // (in message_start). Taking the last non-None value avoids
-                    // double-counting if a future second chunk repeats them.
+                    // Token-count heuristics & aggregation strategy:
+                    // 1. prompt_tokens: Take maximum across frames because providers report cumulative
+                    //    prompt_tokens (handling GLM echoes as well as Anthropic tool-use/web-search
+                    //    prompt token expansion).
+                    // 2. completion_tokens: Take maximum across frames because providers (including Anthropic
+                    //    message_start + message_delta) report cumulative completion_tokens in usage events.
+                    // 3. total_tokens: Respect upstream's reported total_tokens when specified, while
+                    //    ensuring total_tokens is at least prompt_tokens + completion_tokens.
+                    if u.prompt_tokens > 0 {
+                        state.usage.prompt_tokens = state.usage.prompt_tokens.max(u.prompt_tokens);
+                    }
+                    state.usage.completion_tokens =
+                        state.usage.completion_tokens.max(u.completion_tokens);
+
+                    let derived_total = state
+                        .usage
+                        .prompt_tokens
+                        .saturating_add(state.usage.completion_tokens);
+
+                    state.usage.total_tokens = if u.total_tokens > 0 {
+                        state
+                            .usage
+                            .total_tokens
+                            .max(u.total_tokens)
+                            .max(derived_total)
+                    } else {
+                        derived_total
+                    };
+                    // Cache/reasoning fields take the last non-None value.
                     if u.cached_tokens.is_some() {
                         state.usage.cached_tokens = u.cached_tokens;
                     }
@@ -291,7 +312,7 @@ mod tests {
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
-        // CallLog should record the accumulated usage: 10+5=15 prompt, 20+0=20 completion, 30+5=35 total
+        // CallLog should record the max cumulative usage across chunks: max(10,5)=10 prompt, 20 completion, 30 total
         state.collector.flush().await;
         let rows = state
             .collector
@@ -303,9 +324,9 @@ mod tests {
         assert_eq!(rows[0].provider, "openai");
         assert_eq!(rows[0].call_count, 1);
         assert_eq!(rows[0].error_count, 0);
-        assert_eq!(rows[0].total_prompt_tokens, 15);
+        assert_eq!(rows[0].total_prompt_tokens, 10);
         assert_eq!(rows[0].total_completion_tokens, 20);
-        assert_eq!(rows[0].total_tokens, 35);
+        assert_eq!(rows[0].total_tokens, 30);
     }
 
     /// Regression for the streaming cache-passthrough bug: the flat
@@ -580,7 +601,149 @@ mod tests {
         );
         assert!(
             log.ttft_ms.is_none(),
-            "ttft_ms must be None when no Data chunk was observed"
+            "ttft_ms must remain None when no Data chunk was emitted"
         );
+    }
+
+    #[tokio::test]
+    async fn multiple_usage_chunks_max_aggregated_without_double_counting() {
+        let state = build_state().await;
+        let chunks = vec![
+            // Chunk 1: Intermediate usage with prompt_tokens = 100
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 0,
+                total_tokens: 100,
+                cached_tokens: Some(30),
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            // Chunk 2: Final usage repeating prompt_tokens = 100 (cumulative) and adding completion_tokens = 50
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: Some(20),
+            }),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let log = latest_call_log(&state).await;
+        let usage = log.usage.expect("usage must be set in call log");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.cached_tokens, Some(30));
+        assert_eq!(usage.reasoning_tokens, Some(20));
+    }
+
+    #[tokio::test]
+    async fn anthropic_cumulative_usage_chunks_max_aggregated() {
+        let state = build_state().await;
+        let chunks = vec![
+            // Chunk 1: message_start with prompt_tokens=25, output_tokens=1
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 25,
+                completion_tokens: 1,
+                total_tokens: 26,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            // Chunk 2: message_delta with cumulative output_tokens=15
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 15,
+                total_tokens: 15,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "anthropic",
+            "claude-3-5-sonnet",
+            "claude-3-5-sonnet",
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+
+        let _body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let log = latest_call_log(&state).await;
+        let usage = log.usage.expect("usage must be set in call log");
+        assert_eq!(usage.prompt_tokens, 25);
+        assert_eq!(usage.completion_tokens, 15);
+        assert_eq!(usage.total_tokens, 40);
+    }
+
+    #[tokio::test]
+    async fn anthropic_prompt_tokens_expansion_max_aggregated() {
+        let state = build_state().await;
+        let chunks = vec![
+            // Chunk 1: message_start with initial prompt_tokens=25
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 25,
+                completion_tokens: 1,
+                total_tokens: 26,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            // Chunk 2: message_delta with web-search / tool-use expanded prompt_tokens=10682
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 10682,
+                completion_tokens: 510,
+                total_tokens: 11192,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "anthropic",
+            "claude-3-5-sonnet",
+            "claude-3-5-sonnet",
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+
+        let _body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        let log = latest_call_log(&state).await;
+        let usage = log.usage.expect("usage must be set in call log");
+        assert_eq!(usage.prompt_tokens, 10682);
+        assert_eq!(usage.completion_tokens, 510);
+        assert_eq!(usage.total_tokens, 11192);
     }
 }

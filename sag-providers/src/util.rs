@@ -35,15 +35,36 @@ pub fn provider_chat_endpoint(provider_type: ProviderType) -> &'static str {
     }
 }
 
-/// Apply custom headers to a reqwest request builder.
-/// Custom headers override any previously set headers since they are
-/// applied last.
-pub fn apply_headers(req: RequestBuilder, headers: &HashMap<String, String>) -> RequestBuilder {
-    let mut req = req;
-    for (key, value) in headers {
-        req = req.header(key.as_str(), value.as_str());
+/// Apply extra and custom headers to a reqwest request builder.
+/// Custom headers override default/extra headers (such as Content-Type or Auth headers)
+/// when key names match (case-insensitive).
+pub fn apply_headers(
+    req: RequestBuilder,
+    extra_headers: &[(&str, &str)],
+    custom_headers: &HashMap<String, String>,
+) -> RequestBuilder {
+    let mut map = reqwest::header::HeaderMap::new();
+    map.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    for (k, v) in extra_headers {
+        if let (Ok(k), Ok(v)) = (
+            reqwest::header::HeaderName::try_from(*k),
+            reqwest::header::HeaderValue::try_from(*v),
+        ) {
+            map.insert(k, v);
+        }
     }
-    req
+    for (k, v) in custom_headers {
+        if let (Ok(k), Ok(v)) = (
+            reqwest::header::HeaderName::try_from(k.as_str()),
+            reqwest::header::HeaderValue::try_from(v.as_str()),
+        ) {
+            map.insert(k, v);
+        }
+    }
+    req.headers(map)
 }
 
 /// Merge body overrides into a serialized JSON value at the top level.
@@ -84,13 +105,13 @@ pub fn apply_body_strip(mut body: serde_json::Value, fields: &[String]) -> serde
 
 // ── SSE stream parsing helpers ─────────────────────────────────────
 
-/// Iterate the byte buffer, extract complete SSE frames (delimited by `\n\n`),
+/// Iterate the byte buffer, extract complete SSE frames (delimited by `\n\n` or `\r\n\r\n`),
 /// parse them, and send the resulting `StreamChunk` items through the channel.
 pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) {
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
         // Remove the delimiter (\n\n or \r\n\r\n)
-        let delim_len = if buffer.len() >= 4 && buffer[..4] == *b"\r\n\r\n" {
+        let delim_len = if buffer.starts_with(b"\r\n\r\n") {
             4
         } else {
             2
@@ -100,14 +121,31 @@ pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamC
     }
 }
 
-/// Search for the SSE frame delimiter `\n\n` (or `\r\n\r\n`).
-pub(crate) fn find_sse_boundary(buf: &[u8]) -> Option<usize> {
-    if buf.len() >= 4
-        && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-    {
-        return Some(pos);
+/// Drain remaining frames and flush any un-delimited trailing frame upon stream end.
+pub fn flush_sse_buffer(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) {
+    drain_sse_frames(buffer, tx);
+    if !buffer.is_empty() {
+        let frame = std::mem::take(buffer);
+        process_sse_frame(&frame, tx);
     }
-    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Search for the SSE frame delimiter `\n\n` (or `\r\n\r\n`), returning the
+/// earliest match in the buffer.
+pub(crate) fn find_sse_boundary(buf: &[u8]) -> Option<usize> {
+    let p_crlf = if buf.len() >= 4 {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
+    } else {
+        None
+    };
+    let p_lf = buf.windows(2).position(|w| w == b"\n\n");
+
+    match (p_crlf, p_lf) {
+        (Some(c), Some(l)) => Some(c.min(l)),
+        (Some(c), None) => Some(c),
+        (None, Some(l)) => Some(l),
+        (None, None) => None,
+    }
 }
 
 /// Parse a single SSE frame and send chunks through the channel.
@@ -116,10 +154,10 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
 
     for line in text.lines() {
         let line = line.trim();
-        let Some(json_str) = line.strip_prefix("data: ") else {
+        let Some(rest) = line.strip_prefix("data:") else {
             continue;
         };
-        let json_str = json_str.trim();
+        let json_str = rest.trim_start();
 
         if json_str == "[DONE]" {
             let _ = tx.send(StreamChunk::Data(b"data: [DONE]\n\n".to_vec()));
@@ -130,17 +168,12 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
         let raw = format!("data: {json_str}\n\n").into_bytes();
         let _ = tx.send(StreamChunk::Data(raw));
 
-        // Try to extract token usage from the JSON payload.
-        //
-        // Each token count field is extracted independently with a
-        // default of 0 so that cache/reasoning metadata is still
-        // captured even when upstream omits one of the counts
-        // (e.g. nvidia/glm sometimes omits completion_tokens from
-        // intermediate usage chunks).
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
-            && let Some(usage_val) = val.get("usage")
-            && !usage_val.is_null()
-        {
+        // Parse json to extract usage stats
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            continue;
+        };
+
+        if let Some(usage_val) = val.get("usage") {
             let pt = usage_val
                 .get("prompt_tokens")
                 .and_then(|v| v.as_u64())
@@ -164,6 +197,7 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
             let cache_creation_tokens = usage_val
                 .get("prompt_tokens_details")
                 .and_then(|v| v.get("cache_creation_input_tokens"))
+                .or_else(|| usage_val.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let reasoning_tokens = usage_val
@@ -215,7 +249,7 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 continue;
             }
 
-            let total = total_from_upstream.unwrap_or(pt + ct);
+            let total = total_from_upstream.unwrap_or_else(|| pt.saturating_add(ct));
             let _ = tx.send(StreamChunk::Usage(Usage {
                 prompt_tokens: pt,
                 completion_tokens: ct,
@@ -533,5 +567,86 @@ mod tests {
         assert_eq!(usage3.completion_tokens, 50);
         assert_eq!(usage3.total_tokens, 110);
         assert_eq!(usage3.reasoning_tokens, Some(50));
+    }
+
+    #[test]
+    fn apply_headers_overrides_existing_headers() {
+        let client = reqwest::Client::new();
+        let req = client.post("https://example.com");
+
+        let extra = [("Authorization", "Bearer old-token")];
+
+        let mut custom = HashMap::new();
+        custom.insert("authorization".into(), "Bearer new-token".into());
+        custom.insert("content-type".into(), "text/plain".into());
+
+        let req = apply_headers(req, &extra, &custom).build().unwrap();
+        let headers = req.headers();
+
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer new-token");
+        assert_eq!(headers.get("content-type").unwrap(), "text/plain");
+        // Verify only 1 header value per key exists (not multiple via append)
+        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(headers.get_all("content-type").iter().count(), 1);
+    }
+
+    #[test]
+    fn find_sse_boundary_finds_earliest_delimiter() {
+        // \n\n appears at pos 10, \r\n\r\n appears at pos 20
+        let buf = b"data: AAAA\n\ndata: BBBBBBBB\r\n\r\n";
+        assert_eq!(find_sse_boundary(buf), Some(10));
+
+        // \r\n\r\n appears at pos 10, \n\n appears at pos 24
+        let buf2 = b"data: AAAA\r\n\r\ndata: BBBBBBBB\n\n";
+        assert_eq!(find_sse_boundary(buf2), Some(10));
+    }
+
+    #[test]
+    fn process_sse_frame_supports_flexible_spaces() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // data: without space
+        let frame1 = b"data:{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n";
+        process_sse_frame(frame1, &tx);
+
+        // data:  with multiple spaces
+        let frame2 = b"data:   {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":10}}\n\n";
+        process_sse_frame(frame2, &tx);
+
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Usage(u) = chunk {
+                chunks.push(u);
+            }
+        }
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].prompt_tokens, 10);
+        assert_eq!(chunks[1].prompt_tokens, 20);
+    }
+
+    #[test]
+    fn flush_sse_buffer_flushes_un_delimited_trailing_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut buffer =
+            b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20}}".to_vec();
+
+        flush_sse_buffer(&mut buffer, &tx);
+        drop(tx);
+
+        assert!(buffer.is_empty());
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Usage(u) = chunk {
+                chunks.push(u);
+            }
+        }
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].prompt_tokens, 100);
+        assert_eq!(chunks[0].completion_tokens, 20);
     }
 }

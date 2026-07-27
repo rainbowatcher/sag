@@ -55,15 +55,12 @@ pub async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoRespo
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("valid reqwest client with timeout");
-    let mut http_req = client.get(&models_url);
+    let http_req = client.get(&models_url);
 
-    for (name, value) in provider_auth_headers(provider_type, api_key) {
-        http_req = http_req.header(name, value);
-    }
-
-    for (key, value) in &req.headers {
-        http_req = http_req.header(key.as_str(), value.as_str());
-    }
+    let auth_headers = provider_auth_headers(provider_type, api_key);
+    let extra_refs: Vec<(&str, &str)> =
+        auth_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let http_req = sag_providers::apply_headers(http_req, &extra_refs, &req.headers);
 
     match http_req.send().await {
         Ok(resp) => {

@@ -197,7 +197,7 @@ impl LlmProvider for OpenAiProvider {
             }
 
             if !buffer.is_empty() {
-                drain_sse_frames(&mut buffer, &tx);
+                crate::flush_sse_buffer(&mut buffer, &tx);
             }
 
             if !had_error {
