@@ -184,7 +184,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="providerOptions"
           placeholder="provider"
           search-placeholder="Search provider..."
-          class="w-40 xl:w-52"
+          class="flex min-w-0 flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
@@ -192,7 +192,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="routeModelOptions"
           placeholder="model"
           search-placeholder="Search model..."
-          class="w-40 xl:w-52"
+          class="flex min-w-0 flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
@@ -200,7 +200,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="modelOptions"
           placeholder="real_model"
           search-placeholder="Search real model..."
-          class="w-40 xl:w-52"
+          class="hidden xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
@@ -208,12 +208,12 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="statusCodeOptions"
           placeholder="status"
           search-placeholder="Search status..."
-          class="w-40"
+          class="hidden xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
         <Button
           variant="outline"
-          class="ml-auto shrink-0"
+          class="hidden xl:ml-auto xl:inline-flex xl:shrink-0"
           :disabled="store.logsLoading"
           @click="refreshCurrentPage()"
         >

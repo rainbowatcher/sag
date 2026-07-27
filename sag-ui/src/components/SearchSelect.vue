@@ -1,9 +1,15 @@
 <script setup lang="ts">
 import { Check, X } from "@lucide/vue"
+import type { HTMLAttributes } from "vue"
 import { computed, ref, watch, nextTick, onMounted, onUnmounted } from "vue"
 import { Badge } from "@/components/ui/badge"
 import { Command, CommandGroup, CommandItem, CommandList } from "@/components/ui/command"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { cn } from "@/lib/utils"
+
+defineOptions({
+  inheritAttrs: false,
+})
 
 export interface SearchSelectOption {
   value: string
@@ -21,6 +27,7 @@ const props = withDefaults(
     emptyText?: string
     disabled?: boolean
     hideClearAll?: boolean
+    class?: HTMLAttributes["class"]
   }>(),
   {
     placeholder: "Select...",
@@ -217,7 +224,12 @@ onUnmounted(() => {
         role="combobox"
         :aria-expanded="open"
         :aria-disabled="disabled"
-        class="border-input bg-background flex min-h-[2.25rem] w-full cursor-text flex-nowrap items-center gap-1 rounded-md border px-3 py-1 outline-offset-0 outline-none focus-within:outline-[3px]"
+        :class="
+          cn(
+            'border-input bg-background flex min-h-[2.25rem] w-full cursor-text flex-nowrap items-center gap-1 rounded-md border px-3 py-1 outline-offset-0 outline-none focus-within:outline-[3px]',
+            props.class,
+          )
+        "
       >
         <!-- Single select: search input (opens popover on focus) + selected label -->
         <template v-if="!multiple">
