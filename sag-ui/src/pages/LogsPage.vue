@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { AlertCircle, RefreshCw, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
+import { AlertCircle, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
 import type { AcceptableValue } from "reka-ui"
 import { ref, onMounted, computed } from "vue"
+import RefreshButton from "@/components/RefreshButton.vue"
 import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -172,19 +173,14 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
 
 <template>
   <div class="flex h-full flex-col">
-    <div class="shrink-0 space-y-6">
-      <div>
-        <h2 class="text-2xl font-bold tracking-tight">Request Logs</h2>
-        <p class="text-muted-foreground mt-1 text-sm">请求记录明细 / 调用日志</p>
-      </div>
-
-      <div class="flex flex-nowrap items-center gap-3">
+    <div class="shrink-0 space-y-4">
+      <div class="flex flex-nowrap items-center gap-2">
         <SearchSelect
           v-model="logsFilterProvider"
           :options="providerOptions"
           placeholder="provider"
           search-placeholder="Search provider..."
-          class="flex min-w-0 flex-1"
+          class="flex min-h-[2rem] min-w-0 flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
@@ -192,7 +188,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="routeModelOptions"
           placeholder="model"
           search-placeholder="Search model..."
-          class="flex min-w-0 flex-1"
+          class="flex min-h-[2rem] min-w-0 flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
@@ -200,7 +196,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="modelOptions"
           placeholder="real_model"
           search-placeholder="Search real model..."
-          class="hidden xl:flex xl:min-w-0 xl:flex-1"
+          class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
@@ -208,18 +204,14 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :options="statusCodeOptions"
           placeholder="status"
           search-placeholder="Search status..."
-          class="hidden xl:flex xl:min-w-0 xl:flex-1"
+          class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
-        <Button
-          variant="outline"
+        <RefreshButton
+          :loading="store.logsLoading"
           class="hidden xl:ml-auto xl:inline-flex xl:shrink-0"
-          :disabled="store.logsLoading"
           @click="refreshCurrentPage()"
-        >
-          <RefreshCw :class="store.logsLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-          Refresh
-        </Button>
+        />
       </div>
       <Alert v-if="store.logsError" variant="destructive">
         <AlertCircle class="h-4 w-4" />
@@ -228,7 +220,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
       </Alert>
     </div>
 
-    <div class="min-h-0 flex-1 pt-6">
+    <div class="min-h-0 flex-1 pt-4">
       <div class="h-full rounded-lg border [&>div]:h-full">
         <div
           v-if="store.logsLoading"
