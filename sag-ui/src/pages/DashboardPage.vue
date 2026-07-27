@@ -1,13 +1,5 @@
 <script setup lang="ts">
-import {
-  Server,
-  GitBranch,
-  MessageSquare,
-  AlertTriangle,
-  AlertCircle,
-  RefreshCw,
-  Loader2,
-} from "@lucide/vue"
+import { Server, GitBranch, MessageSquare, AlertTriangle, AlertCircle, Loader2 } from "@lucide/vue"
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -23,8 +15,8 @@ import {
 import { ref, onMounted, computed, watch } from "vue"
 import { Line, Pie } from "vue-chartjs"
 import CircuitBreakerPanel from "@/components/circuit/CircuitBreakerPanel.vue"
+import RefreshButton from "@/components/RefreshButton.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { useChartTheme } from "@/composables/useChartTheme"
@@ -240,18 +232,12 @@ const pieChart = computed(() => ({
           </button>
         </div>
         <Input v-model="dashProvider" class="w-40 xl:w-52" placeholder="provider" />
-        <Button
-          variant="outline"
+        <RefreshButton
+          :loading="analyticsStore.trendLoading || analyticsStore.distLoading"
+          size="default"
           class="ml-auto"
-          :disabled="analyticsStore.trendLoading || analyticsStore.distLoading"
           @click="refreshDashboard()"
-        >
-          <RefreshCw
-            :class="analyticsStore.trendLoading || analyticsStore.distLoading ? 'animate-spin' : ''"
-            class="h-3.5 w-3.5"
-          />
-          Refresh
-        </Button>
+        />
       </div>
 
       <Alert v-if="analyticsStore.trendError || analyticsStore.distError" variant="destructive">

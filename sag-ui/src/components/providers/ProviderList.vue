@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { Loader2, Pen, Plus, RefreshCw, Search, Trash2 } from "@lucide/vue"
+import { Loader2, Pen, Plus, Search, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
 import { computed, h, onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import ProviderAddForm from "@/components/providers/ProviderAddForm.vue"
 import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
+import RefreshButton from "@/components/RefreshButton.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -319,14 +320,7 @@ const table = useVueTable({
           <p class="text-muted-foreground mt-1 text-sm">管理上游 LLM 供应商配置</p>
         </div>
         <div class="flex items-center gap-2">
-          <button
-            @click="refreshAll()"
-            :disabled="store.providersLoading"
-            class="hover:bg-accent inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors"
-          >
-            <RefreshCw :class="store.providersLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-            Refresh
-          </button>
+          <RefreshButton :loading="store.providersLoading" @click="refreshAll()" />
           <button
             @click="showAdd = !showAdd"
             class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors"

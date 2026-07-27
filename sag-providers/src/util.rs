@@ -164,12 +164,15 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
             return;
         }
 
-        // Forward the raw SSE data line
+        // Compute the raw SSE data line; forwarding is deferred until after
+        // JSON/usage parsing so that anomalous usage frames (see below) can be
+        // selectively intercepted rather than forwarded unconditionally.
         let raw = format!("data: {json_str}\n\n").into_bytes();
-        let _ = tx.send(StreamChunk::Data(raw));
 
-        // Parse json to extract usage stats
+        // Non-JSON text (e.g. provider-specific keepalive comments) is forwarded
+        // verbatim without further inspection.
         let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+            let _ = tx.send(StreamChunk::Data(raw));
             continue;
         };
 
@@ -223,22 +226,71 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 ct = rt;
             }
 
-            // Diagnostic for "Completion=0" in call logs. A frame that
-            // credits prompt tokens but zero completion tokens is always
-            // anomalous for an OpenAI-compatible stream and is exactly what
-            // leaves the call log with completion_tokens=0 on an otherwise
-            // successful (status 200) request. WARN so it surfaces under the
-            // default `info` filter; the raw `usage` object is included to
-            // reveal the upstream field layout (explicit 0 vs. absent field,
-            // top-level reasoning_tokens, etc.) for root-causing.
-            if ct == 0 && pt > 0 {
+            // A frame that credits prompt tokens but zero completion tokens
+            // (after all fallback strategies) is anomalous. When such a frame
+            // also lacks meaningful choices, forwarding the raw SSE data to the
+            // client is actively harmful:
+            //
+            //   1. Many third-party clients unconditionally index `choices[0]`
+            //      and crash with IndexError on the empty `choices: []` that
+            //      accompanies the usage-only final chunk.
+            //   2. The OpenAI Python SDK's `CompletionUsage` pydantic model
+            //      requires `completion_tokens` as a mandatory `int`; when the
+            //      upstream omits the field entirely (as observed in production
+            //      logs) the SDK raises `APIResponseValidationError`. An
+            //      explicit `0` is a valid int, but the empty `choices` still
+            //      triggers point 1.
+            //
+            // We therefore intercept the raw data frame (skip the Data send)
+            // while still emitting `StreamChunk::Usage` so the gateway's own
+            // CallLog records the anomalous token counts for diagnosis.
+            let is_anomalous = ct == 0 && pt > 0;
+
+            // Guard against false positives: if the frame also carries a
+            // meaningful choice (non-empty content / reasoning_content /
+            // refusal / tool_calls, or a non-null finish_reason) we must
+            // forward it to avoid dropping content or the stream-termination
+            // signal.
+            let has_meaningful_choice =
+                val.get("choices")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|choice| {
+                            let has_finish =
+                                choice.get("finish_reason").is_some_and(|f| !f.is_null());
+                            let has_delta = choice.get("delta").is_some_and(|d| {
+                                d.get("content")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|s| !s.is_empty())
+                                    || d.get("reasoning_content")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|s| !s.is_empty())
+                                    || d.get("refusal")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|s| !s.is_empty())
+                                    || d.get("tool_calls")
+                                        .and_then(|t| t.as_array())
+                                        .is_some_and(|a| !a.is_empty())
+                            });
+                            has_finish || has_delta
+                        })
+                    });
+
+            let intercept = is_anomalous && !has_meaningful_choice;
+
+            if is_anomalous {
                 warn!(
                     pt = pt,
                     ct = ct,
                     usage = %usage_val,
+                    intercepted = intercept,
                     "upstream usage frame credits zero completion_tokens despite non-zero prompt; \
-                     this is the source of Completion=0 in the call log"
+                     this is the source of Completion=0 in the call log",
                 );
+            }
+
+            if !intercept {
+                let _ = tx.send(StreamChunk::Data(raw));
             }
 
             // Skip entirely-zero usage objects to avoid noise; partial
@@ -258,6 +310,9 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 cache_creation_tokens,
                 reasoning_tokens,
             }));
+        } else {
+            // JSON frame without a usage field — forward verbatim.
+            let _ = tx.send(StreamChunk::Data(raw));
         }
     }
 }
@@ -402,9 +457,11 @@ mod tests {
         assert_eq!(usage.total_tokens, 100, "80 + 20 fallback");
     }
 
-    /// When upstream omits `completion_tokens` but includes
-    /// `prompt_tokens` and nested cache fields, `cached_tokens` must
-    /// still be extracted and `completion_tokens` defaults to 0.
+    /// When upstream omits `completion_tokens` but includes `prompt_tokens`
+    /// and nested cache fields, `cached_tokens` must still be extracted.
+    /// Because `pt=500, ct=0` and the frame has no `choices`, the raw Data
+    /// frame is intercepted (anomalous usage) and only the Usage chunk is
+    /// emitted.
     #[test]
     fn cached_tokens_extracted_when_completion_tokens_absent() {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
@@ -419,7 +476,7 @@ mod tests {
         while let Ok(chunk) = rx.try_recv() {
             chunks.push(chunk);
         }
-        assert_eq!(chunks.len(), 2, "Data + Usage");
+        assert_eq!(chunks.len(), 1, "Usage only, Data intercepted");
 
         let usage = chunks
             .iter()
@@ -567,6 +624,199 @@ mod tests {
         assert_eq!(usage3.completion_tokens, 50);
         assert_eq!(usage3.total_tokens, 110);
         assert_eq!(usage3.reasoning_tokens, Some(50));
+    }
+
+    // ── anomalous usage frame interception tests ────────────────
+
+    /// A pure anomalous usage frame (`pt > 0`, `ct == 0`, no `choices`) must
+    /// have its raw Data intercepted while the Usage chunk is still emitted for
+    /// CallLog accounting.
+    #[test]
+    fn anomalous_pure_usage_frame_data_intercepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0,\"total_tokens\":100}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 1, "Data intercepted, only Usage emitted");
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 100);
+    }
+
+    /// A combined frame carrying `finish_reason: "stop"` alongside an anomalous
+    /// usage (`pt > 0`, `ct == 0`) must NOT be intercepted — the client needs
+    /// the stream-termination signal.
+    #[test]
+    fn combined_frame_with_finish_reason_not_intercepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Data + Usage both forwarded");
+
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Data(_))),
+            "must contain a Data chunk"
+        );
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    /// A combined frame carrying non-empty `content` delta alongside an
+    /// anomalous usage must NOT be intercepted — the client needs the text.
+    #[test]
+    fn combined_frame_with_content_delta_not_intercepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Data + Usage both forwarded");
+
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Data(_))),
+            "must contain a Data chunk"
+        );
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    /// An empty `choices: []` array is not a meaningful choice — the frame is
+    /// still a pure anomalous usage frame and must be intercepted.
+    #[test]
+    fn empty_choices_array_treated_as_no_meaningful_choice() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 1, "Data intercepted, only Usage emitted");
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    /// A choice with an empty `delta: {}` and `finish_reason: null` carries no
+    /// meaningful payload - the frame must still be intercepted.
+    #[test]
+    fn empty_delta_null_finish_treated_as_no_meaningful_choice() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 1, "Data intercepted, only Usage emitted");
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| match c {
+                StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("must contain a Usage chunk");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    /// A combined frame carrying non-empty `reasoning_content` delta alongside
+    /// an anomalous usage must NOT be intercepted.
+    #[test]
+    fn combined_frame_with_reasoning_content_not_intercepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Data + Usage both forwarded");
+
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Data(_))),
+            "must contain a Data chunk"
+        );
+    }
+
+    /// A combined frame carrying non-empty `tool_calls` delta alongside an
+    /// anomalous usage must NOT be intercepted.
+    #[test]
+    fn combined_frame_with_tool_calls_not_intercepted() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"foo\"}}]}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0}}\n\n";
+        process_sse_frame(frame, &tx);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Data + Usage both forwarded");
+
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Data(_))),
+            "must contain a Data chunk"
+        );
     }
 
     #[test]

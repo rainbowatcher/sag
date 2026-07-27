@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { AlertCircle, Search, RefreshCw, Loader2, TrendingUp, Zap, Clock } from "@lucide/vue"
+import { AlertCircle, Search, Loader2, TrendingUp, Zap, Clock } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
+import RefreshButton from "@/components/RefreshButton.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -168,15 +169,12 @@ const statsTotals = computed(() => {
                 <Search class="h-3.5 w-3.5" />
                 Query
               </Button>
-              <Button
-                variant="outline"
+              <RefreshButton
+                :loading="store.statsLoading"
+                size="default"
                 class="ml-auto"
-                :disabled="store.statsLoading"
                 @click="refreshStats()"
-              >
-                <RefreshCw :class="store.statsLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-                Refresh
-              </Button>
+              />
             </div>
 
             <Alert v-if="store.statsError" variant="destructive">
@@ -276,15 +274,12 @@ const statsTotals = computed(() => {
                 <Search class="h-3.5 w-3.5" />
                 Query
               </Button>
-              <Button
-                variant="outline"
+              <RefreshButton
+                :loading="store.cacheLoading"
+                size="default"
                 class="ml-auto"
-                :disabled="store.cacheLoading"
                 @click="refreshCache()"
-              >
-                <RefreshCw :class="store.cacheLoading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-                Refresh
-              </Button>
+              />
             </div>
 
             <Alert v-if="store.cacheError" variant="destructive">

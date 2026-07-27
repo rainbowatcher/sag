@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { AlertCircle, Loader2, Plus, RefreshCw } from "@lucide/vue"
+import { AlertCircle, Loader2, Plus } from "@lucide/vue"
 import { onMounted, ref } from "vue"
+import RefreshButton from "@/components/RefreshButton.vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
@@ -41,18 +42,7 @@ onMounted(refreshPage)
           <p class="text-muted-foreground mt-1 text-sm">管理模型路由规则与 API 端点映射</p>
         </div>
         <div class="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            :disabled="routeStore.routesLoading"
-            @click="refreshPage"
-          >
-            <RefreshCw
-              :class="routeStore.routesLoading ? 'animate-spin' : ''"
-              class="h-3.5 w-3.5"
-            />
-            Refresh
-          </Button>
+          <RefreshButton :loading="routeStore.routesLoading" @click="refreshPage" />
           <Button size="sm" @click="showAdd = true">
             <Plus class="h-3.5 w-3.5" />
             Add Route
