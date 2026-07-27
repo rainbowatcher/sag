@@ -144,6 +144,8 @@ fn warn_unknown_fields(doc: &toml::Value) {
             "ttfb_timeout_secs",
             "headers",
             "body_overrides",
+            "strip_fields",
+            "model_strip_fields",
             "model_overrides",
             "role_mappings",
             "enabled",

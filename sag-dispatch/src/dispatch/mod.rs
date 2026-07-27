@@ -312,375 +312,6 @@ pub(in crate::dispatch) fn merge_model_overrides(
 
 // ═══════════════════════════════════════════════════════════════════
 // Logging / response helpers — shared across the dispatch submodules.
-// ═══════════════════════════════════════════════════════════════════
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sag_config::ProviderConfig;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    fn make_provider(
-        model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
-    ) -> ProviderConfig {
-        ProviderConfig {
-            provider_type: sag_config::ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_overrides,
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: false,
-        }
-    }
-
-    #[test]
-    fn merge_target_extra_overrides_model_override() {
-        // Model override sets max_tokens=4096; target extra sets
-        // max_tokens=2048 and adds temperature=0.5. The target value
-        // must win for the shared key, and the model-only key must
-        // still be present.
-        let mut mo = HashMap::new();
-        mo.insert("max_tokens".into(), serde_json::json!(4096));
-        let providers = HashMap::from([(
-            "openai".into(),
-            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
-        )]);
-
-        let mut target_extra = HashMap::new();
-        target_extra.insert("max_tokens".into(), serde_json::json!(2048));
-        target_extra.insert("temperature".into(), serde_json::json!(0.5));
-
-        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
-
-        assert_eq!(
-            merged.get("max_tokens").and_then(|v| v.as_i64()),
-            Some(2048),
-            "target extra should override model override for shared key"
-        );
-        assert_eq!(
-            merged.get("temperature").and_then(|v| v.as_f64()),
-            Some(0.5),
-            "target-only key should be present"
-        );
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn merge_no_model_override_returns_target_extra() {
-        // When the provider has no model_overrides for this real_model,
-        // the result should be a clone of target_extra.
-        let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
-
-        let mut target_extra = HashMap::new();
-        target_extra.insert("temperature".into(), serde_json::json!(0.7));
-
-        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
-
-        assert_eq!(merged, target_extra);
-    }
-
-    #[test]
-    fn merge_empty_target_extra_returns_model_overrides() {
-        // When target_extra is empty, the model overrides should pass
-        // through as-is.
-        let mut mo = HashMap::new();
-        mo.insert("max_tokens".into(), serde_json::json!(4096));
-        let providers = HashMap::from([(
-            "openai".into(),
-            make_provider(HashMap::from([("gpt-4o".into(), mo.clone())])),
-        )]);
-
-        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
-
-        assert_eq!(merged, mo);
-    }
-
-    #[test]
-    fn merge_nested_object_replaced_wholly() {
-        // Model override sets thinking = { type: "enabled" };
-        // target extra sets thinking = { budget_tokens: 1600 }.
-        // The target value must replace the model value entirely
-        // (shallow merge, not deep merge).
-        let mut mo = HashMap::new();
-        mo.insert("thinking".into(), serde_json::json!({ "type": "enabled" }));
-        let providers = HashMap::from([(
-            "openai".into(),
-            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
-        )]);
-
-        let mut target_extra = HashMap::new();
-        target_extra.insert(
-            "thinking".into(),
-            serde_json::json!({ "budget_tokens": 1600 }),
-        );
-
-        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
-
-        let thinking = merged.get("thinking").unwrap();
-        assert_eq!(
-            thinking.get("budget_tokens").and_then(|v| v.as_i64()),
-            Some(1600),
-            "target-extra nested object should win"
-        );
-        assert!(
-            thinking.get("type").is_none(),
-            "nested object should be replaced wholly, not deep-merged"
-        );
-    }
-
-    #[test]
-    fn merge_distinct_keys_accumulate() {
-        // Model override has key A, target extra has key B.
-        // Result should contain both keys.
-        let mut mo = HashMap::new();
-        mo.insert("max_tokens".into(), serde_json::json!(4096));
-        let providers = HashMap::from([(
-            "openai".into(),
-            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
-        )]);
-
-        let mut target_extra = HashMap::new();
-        target_extra.insert("temperature".into(), serde_json::json!(0.7));
-
-        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
-
-        assert_eq!(
-            merged.get("max_tokens").and_then(|v| v.as_i64()),
-            Some(4096),
-            "model-only key should be present"
-        );
-        assert_eq!(
-            merged.get("temperature").and_then(|v| v.as_f64()),
-            Some(0.7),
-            "target-only key should be present"
-        );
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn merge_both_empty_returns_empty() {
-        // When both model_overrides and target_extra are empty,
-        // the result should be an empty map.
-        let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
-        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
-        assert!(merged.is_empty());
-    }
-
-    // ── Sentinel value & error_category tests ────────────────────
-
-    async fn build_test_state() -> AppState {
-        let config = sag_config::GatewayConfig {
-            routes: vec![],
-            ..sag_config::gateway_config_base!()
-        };
-        let handle = sag_config::ConfigHandle::from_config(config);
-        let registry = Arc::new(RwLock::new(HashMap::new()));
-        sag_state::testing::test_app_state(handle, registry).await
-    }
-
-    #[tokio::test]
-    async fn fallback_exhausted_response_logs_sentinel() {
-        let state = build_test_state().await;
-        let trace_id = uuid::Uuid::new_v4();
-        let start = std::time::Instant::now();
-
-        fallback_exhausted_response(
-            &state,
-            "gpt-4o",
-            false,
-            trace_id,
-            start,
-            &["openai: timeout".into(), "anthropic: 500".into()],
-            None,
-            None,
-            None,
-        );
-
-        state.collector.flush().await;
-        let logs = state
-            .collector
-            .store()
-            .query_logs(sag_analytics::LogFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(logs.len(), 1, "one call log should be written");
-        let log = &logs[0];
-        assert_eq!(log.provider, "__all_exhausted__");
-        assert_eq!(log.real_model, "__all_exhausted__");
-        assert_eq!(log.model, "gpt-4o");
-        assert_eq!(log.status_code, 502);
-        assert_eq!(log.error_category.as_deref(), Some("all_exhausted"));
-    }
-
-    #[tokio::test]
-    async fn failure_response_preserves_error_category() {
-        let state = build_test_state().await;
-        let trace_id = uuid::Uuid::new_v4();
-        let start = std::time::Instant::now();
-
-        failure_response(
-            &state,
-            trace_id,
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            false,
-            start,
-            StatusCode::BAD_REQUEST,
-            AppError::BadRequest("unsupported param".into()),
-            None,
-            None,
-            None,
-        );
-
-        state.collector.flush().await;
-        let logs = state
-            .collector
-            .store()
-            .query_logs(sag_analytics::LogFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(
-            logs[0].error_category.as_deref(),
-            Some("bad_request"),
-            "error_category must reflect the original AppError variant"
-        );
-    }
-
-    #[tokio::test]
-    async fn log_per_target_failure_uses_caller_error_category() {
-        let state = build_test_state().await;
-        let trace_id = uuid::Uuid::new_v4();
-        let start = std::time::Instant::now();
-
-        log_per_target_failure(
-            &state,
-            trace_id,
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            false,
-            start,
-            &["upstream 500".into()],
-            "provider_error",
-            None,
-            None,
-            None,
-        );
-
-        state.collector.flush().await;
-        let logs = state
-            .collector
-            .store()
-            .query_logs(sag_analytics::LogFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(
-            logs[0].error_category.as_deref(),
-            Some("provider_error"),
-            "error_category must be the caller-supplied value, not 'internal_error'"
-        );
-    }
-
-    // ── reasoning_effort round-trip tests ─────────────────────
-
-    #[tokio::test]
-    async fn fallback_exhausted_preserves_reasoning_effort() {
-        let state = build_test_state().await;
-        let trace_id = uuid::Uuid::new_v4();
-        let start = std::time::Instant::now();
-
-        fallback_exhausted_response(
-            &state,
-            "gpt-4o",
-            false,
-            trace_id,
-            start,
-            &["openai: timeout".into()],
-            Some("high"),
-            None,
-            None,
-        );
-
-        state.collector.flush().await;
-        let logs = state
-            .collector
-            .store()
-            .query_logs(sag_analytics::LogFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(
-            logs[0].reasoning_effort.as_deref(),
-            Some("high"),
-            "reasoning_effort must round-trip through fallback_exhausted_response"
-        );
-    }
-
-    #[tokio::test]
-    async fn log_per_target_failure_preserves_reasoning_effort() {
-        let state = build_test_state().await;
-        let trace_id = uuid::Uuid::new_v4();
-        let start = std::time::Instant::now();
-
-        log_per_target_failure(
-            &state,
-            trace_id,
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            false,
-            start,
-            &["upstream 500".into()],
-            "provider_error",
-            Some("medium"),
-            None,
-            None,
-        );
-
-        state.collector.flush().await;
-        let logs = state
-            .collector
-            .store()
-            .query_logs(sag_analytics::LogFilter {
-                limit: 10,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(
-            logs[0].reasoning_effort.as_deref(),
-            Some("medium"),
-            "reasoning_effort must round-trip through log_per_target_failure"
-        );
-    }
-}
 
 /// Build a `CallLog` for a successful response.
 #[allow(clippy::too_many_arguments)]
@@ -845,6 +476,7 @@ pub(in crate::dispatch) fn failure_response(
 }
 
 /// Log a final "all providers exhausted" entry and return its response.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn fallback_exhausted_response(
     state: &AppState,
     model: &str,
@@ -881,4 +513,239 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         client_ip,
     ));
     err.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sag_config::ProviderConfig;
+    use std::sync::Arc;
+
+    fn make_provider(
+        model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            provider_type: sag_config::ProviderType::OpenAI,
+            api_keys: vec!["sk-test".into()],
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://api.openai.com/v1".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 120,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
+            model_overrides,
+            role_mappings: HashMap::new(),
+            enabled_models: vec![],
+            enabled: true,
+            anthropic_cache_control: false,
+        }
+    }
+
+    #[test]
+    fn merge_target_extra_overrides_model_override() {
+        let mut mo = HashMap::new();
+        mo.insert("max_tokens".into(), serde_json::json!(4096));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let target_extra = HashMap::from([
+            ("max_tokens".into(), serde_json::json!(2048)),
+            ("temperature".into(), serde_json::json!(0.5)),
+        ]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+        assert_eq!(merged.get("max_tokens").unwrap(), 2048);
+        assert_eq!(merged.get("temperature").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn merge_distinct_keys_accumulate() {
+        let mut mo = HashMap::new();
+        mo.insert("top_p".into(), serde_json::json!(0.9));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let target_extra = HashMap::from([("temperature".into(), serde_json::json!(0.5))]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+        assert_eq!(merged.get("top_p").unwrap(), 0.9);
+        assert_eq!(merged.get("temperature").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn merge_no_model_override_returns_target_extra() {
+        let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
+
+        let target_extra = HashMap::from([("temperature".into(), serde_json::json!(0.5))]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("temperature").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn merge_empty_target_extra_returns_model_overrides() {
+        let mut mo = HashMap::new();
+        mo.insert("max_tokens".into(), serde_json::json!(4096));
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("max_tokens").unwrap(), 4096);
+    }
+
+    #[test]
+    fn merge_both_empty_returns_empty() {
+        let providers = HashMap::from([("openai".into(), make_provider(HashMap::new()))]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &HashMap::new());
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_nested_object_replaced_wholly() {
+        let mut mo = HashMap::new();
+        mo.insert(
+            "response_format".into(),
+            serde_json::json!({ "type": "text" }),
+        );
+        let providers = HashMap::from([(
+            "openai".into(),
+            make_provider(HashMap::from([("gpt-4o".into(), mo)])),
+        )]);
+
+        let target_extra = HashMap::from([(
+            "response_format".into(),
+            serde_json::json!({ "type": "json_object" }),
+        )]);
+
+        let merged = merge_model_overrides(&providers, "openai", "gpt-4o", &target_extra);
+        assert_eq!(
+            merged.get("response_format").unwrap(),
+            &serde_json::json!({ "type": "json_object" })
+        );
+    }
+
+    async fn build_test_state() -> AppState {
+        let config = sag_config::GatewayConfig {
+            routes: vec![],
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let registry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        sag_state::testing::test_app_state(handle, registry).await
+    }
+
+    #[tokio::test]
+    async fn failure_response_preserves_error_category() {
+        let state = build_test_state().await;
+
+        let resp = failure_response(
+            &state,
+            uuid::Uuid::new_v4(),
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            false,
+            Instant::now(),
+            StatusCode::BAD_GATEWAY,
+            AppError::AllProvidersExhausted {
+                model: "gpt-4o".into(),
+                reason: "no targets".into(),
+            },
+            Some("high"),
+            None,
+            None,
+        );
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn fallback_exhausted_response_logs_sentinel() {
+        let state = build_test_state().await;
+
+        let trace_id = uuid::Uuid::new_v4();
+        let resp = fallback_exhausted_response(
+            &state,
+            "gpt-4o",
+            false,
+            trace_id,
+            Instant::now(),
+            &["openai: 500".into()],
+            Some("high"),
+            None,
+            None,
+        );
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        state.collector.flush().await;
+
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].provider, "__all_exhausted__");
+        assert_eq!(logs[0].real_model, "__all_exhausted__");
+        assert_eq!(logs[0].reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn log_per_target_failure_preserves_reasoning_effort() {
+        let state = build_test_state().await;
+
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        log_per_target_failure(
+            &state,
+            trace_id,
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            false,
+            start,
+            &["upstream 500".into()],
+            "provider_error",
+            Some("medium"),
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].reasoning_effort.as_deref(),
+            Some("medium"),
+            "reasoning_effort must round-trip through log_per_target_failure"
+        );
+    }
 }

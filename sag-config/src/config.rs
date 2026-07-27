@@ -606,6 +606,16 @@ pub struct ProviderConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strip_fields: Vec<String>,
+    /// Per-model body field strip list, keyed by `real_model` name (matched against final `body.model`).
+    /// Applied alongside provider-level `strip_fields` as a union of field names
+    /// to strip after all overrides are applied.
+    ///
+    /// TOML example:
+    /// ```toml
+    /// model_strip_fields = { "glm-5.2" = ["chat_template_kwargs"] }
+    /// ```
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_strip_fields: HashMap<String, Vec<String>>,
     /// Per-model body field overrides, keyed by `real_model` name.
     /// Applied after provider-level `body_overrides` but before target-level
     /// `extra`, so a model-level override can refine or replace a
@@ -1859,6 +1869,7 @@ targets = [
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled_models: vec![],

@@ -194,10 +194,10 @@ pub async fn update_route(
         let config = state.config.read().await;
 
         // Validate targets upfront before any clone.
-        if let Some(ref targets) = req.targets {
-            if let Err(e) = validate_targets(&config, targets, &req.model_name) {
-                return e.into_response();
-            }
+        if let Some(ref targets) = req.targets
+            && let Err(e) = validate_targets(&config, targets, &req.model_name)
+        {
+            return e.into_response();
         }
 
         let existing = match config
@@ -347,6 +347,7 @@ mod tests {
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
@@ -399,6 +400,7 @@ mod tests {
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
@@ -443,6 +445,7 @@ mod tests {
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
@@ -484,6 +487,7 @@ mod tests {
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],

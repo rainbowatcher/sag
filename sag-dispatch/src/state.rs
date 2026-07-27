@@ -333,6 +333,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
             strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             role_mappings: HashMap::new(),
             enabled_models: vec![],

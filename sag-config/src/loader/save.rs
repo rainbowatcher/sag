@@ -314,6 +314,45 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
         let body_overrides = ensure_inline_table_field(table, "body_overrides");
         sync_inline_table_in_place(body_overrides, &provider.body_overrides, json_to_toml_value);
     }
+    // strip_fields — string array; remove if empty
+    if provider.strip_fields.is_empty() {
+        table.remove("strip_fields");
+    } else {
+        let arr = ensure_array_field(table, "strip_fields");
+        sync_string_array_in_place(arr, &provider.strip_fields);
+    }
+    // model_strip_fields — inline table keyed by model name -> string array; remove if empty
+    if provider.model_strip_fields.is_empty() {
+        table.remove("model_strip_fields");
+    } else {
+        let msf_inline = ensure_inline_table_field(table, "model_strip_fields");
+        let model_set: std::collections::HashSet<&str> = provider
+            .model_strip_fields
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let stale: Vec<String> = msf_inline
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .filter(|k| !model_set.contains(k.as_str()))
+            .collect();
+        for k in stale {
+            msf_inline.remove(k.as_str());
+        }
+        for (model, fields) in &provider.model_strip_fields {
+            if fields.is_empty() {
+                msf_inline.remove(model);
+            } else {
+                let array_val = toml_edit::Value::Array(
+                    fields
+                        .iter()
+                        .map(|s| toml_edit::Value::from(s.as_str()))
+                        .collect(),
+                );
+                msf_inline.insert(model, array_val);
+            }
+        }
+    }
     // chunk_timeout_secs — skip if None (mirrors skip_serializing_if = "Option::is_none")
     if let Some(secs) = provider.chunk_timeout_secs {
         table["chunk_timeout_secs"] = toml_edit::value(secs as i64);
@@ -510,6 +549,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
             strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             role_mappings: HashMap::new(),
             enabled: true,
@@ -646,6 +686,7 @@ base_url = "https://api.anthropic.com"
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
@@ -793,6 +834,7 @@ key_strategy = "round_robin"
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
@@ -931,6 +973,7 @@ targets = [
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
@@ -996,6 +1039,7 @@ targets = [
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
@@ -1055,6 +1099,7 @@ targets = [
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled: true,
@@ -2451,6 +2496,7 @@ api_keys = ["sk-test"]
                 headers,
                 body_overrides,
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides,
                 role_mappings,
                 enabled: false,
@@ -2589,6 +2635,90 @@ api_keys = ["sk-test"]
         assert!(
             !saved2.contains("[providers.openai.model_overrides]"),
             "model_overrides should NOT become sub-table format after update, got:\n{saved2}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn model_strip_fields_round_trip() {
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+        let mut config = openai_only_config();
+        config.providers.get_mut("openai").unwrap().strip_fields = vec!["global_bad".into()];
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .model_strip_fields = HashMap::from([
+            ("glm-5.2".into(), vec!["chat_template_kwargs".into()]),
+            ("qwen-2.5".into(), vec!["extra_a".into(), "extra_b".into()]),
+        ]);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let provider = reloaded.providers.get("openai").unwrap();
+
+        assert_eq!(provider.strip_fields, vec!["global_bad"]);
+        assert_eq!(
+            provider.model_strip_fields.get("glm-5.2"),
+            Some(&vec!["chat_template_kwargs".to_string()])
+        );
+        assert_eq!(
+            provider.model_strip_fields.get("qwen-2.5"),
+            Some(&vec!["extra_a".to_string(), "extra_b".to_string()])
+        );
+
+        // Test updating: remove one model mapping and save again
+        drop(reloaded);
+        drop(reloaded_handle);
+
+        let mut config2 = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        config2
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .model_strip_fields
+            .remove("glm-5.2");
+        save_config_to_file(&config2, &path).unwrap();
+
+        let reloaded2 = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        let provider2 = reloaded2.providers.get("openai").unwrap();
+        assert!(!provider2.model_strip_fields.contains_key("glm-5.2"));
+        assert_eq!(
+            provider2.model_strip_fields.get("qwen-2.5"),
+            Some(&vec!["extra_a".to_string(), "extra_b".to_string()])
+        );
+
+        // Test clearing all model_strip_fields removes section from file
+        let config3 = provider2.clone();
+        let mut full_config = openai_only_config();
+        full_config
+            .providers
+            .insert("openai".into(), config3.clone());
+        full_config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .model_strip_fields
+            .clear();
+        save_config_to_file(&full_config, &path).unwrap();
+
+        let saved_raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved_raw.contains("model_strip_fields"),
+            "empty model_strip_fields section should be removed from saved file, got:\n{saved_raw}"
         );
 
         let _ = std::fs::remove_file(&path);

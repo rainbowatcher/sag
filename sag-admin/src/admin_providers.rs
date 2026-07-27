@@ -43,6 +43,9 @@ pub struct AddProviderRequest {
     /// Top-level fields to strip from the upstream JSON body before sending.
     #[serde(default)]
     pub strip_fields: Vec<String>,
+    /// Per-model body field strip list, keyed by real_model name.
+    #[serde(default)]
+    pub model_strip_fields: HashMap<String, Vec<String>>,
     /// Per-model body field overrides, keyed by real_model name.
     #[serde(default)]
     pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -68,6 +71,7 @@ pub struct UpdateProviderRequest {
     pub headers: Option<HashMap<String, String>>,
     pub body_overrides: Option<HashMap<String, serde_json::Value>>,
     pub strip_fields: Option<Vec<String>>,
+    pub model_strip_fields: Option<HashMap<String, Vec<String>>>,
     pub model_overrides: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
     pub role_mappings: Option<HashMap<String, String>>,
     pub enabled_models: Option<Vec<String>>,
@@ -96,6 +100,7 @@ pub struct ProviderInfo {
     pub headers: HashMap<String, String>,
     pub body_overrides: HashMap<String, serde_json::Value>,
     pub strip_fields: Vec<String>,
+    pub model_strip_fields: HashMap<String, Vec<String>>,
     pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
     pub role_mappings: HashMap<String, String>,
     pub enabled_models: Vec<String>,
@@ -148,6 +153,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         headers: cfg.headers.clone(),
         body_overrides: cfg.body_overrides.clone(),
         strip_fields: cfg.strip_fields.clone(),
+        model_strip_fields: cfg.model_strip_fields.clone(),
         model_overrides: cfg.model_overrides.clone(),
         role_mappings: cfg.role_mappings.clone(),
         enabled_models: cfg.enabled_models.clone(),
@@ -204,6 +210,7 @@ pub async fn add_provider(
         body_overrides: req.body_overrides.clone(),
         model_overrides: req.model_overrides.clone(),
         strip_fields: req.strip_fields.clone(),
+        model_strip_fields: req.model_strip_fields.clone(),
         role_mappings: req.role_mappings.clone(),
         enabled_models: req.enabled_models.clone(),
         enabled: true,
@@ -277,6 +284,9 @@ pub async fn update_provider(
         }
         if let Some(v) = req.strip_fields {
             pc.strip_fields = v;
+        }
+        if let Some(v) = req.model_strip_fields {
+            pc.model_strip_fields = v;
         }
         if let Some(v) = req.model_overrides {
             pc.model_overrides = v;
@@ -477,6 +487,7 @@ mod tests {
                     headers: HashMap::new(),
                     body_overrides: HashMap::new(),
                     strip_fields: vec![],
+                    model_strip_fields: HashMap::new(),
                     model_overrides: HashMap::new(),
                     role_mappings: HashMap::new(),
                     enabled_models: vec![],
@@ -706,6 +717,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
@@ -727,6 +739,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into()],
@@ -748,6 +761,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
@@ -788,6 +802,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec![],
@@ -809,6 +824,7 @@ targets = [
                 headers: HashMap::new(),
                 body_overrides: HashMap::new(),
                 strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
                 model_overrides: HashMap::new(),
                 role_mappings: HashMap::new(),
                 enabled_models: vec!["other-model".into()],
@@ -933,5 +949,81 @@ targets = [
         // Ensure the runtime registry was updated
         let reg = state.providers.read().await;
         assert!(reg.contains_key("openai"));
+    }
+
+    #[tokio::test]
+    async fn add_and_update_provider_with_model_strip_fields() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        // 1. Add provider with model_strip_fields
+        let add_payload = serde_json::json!({
+            "name": "new_provider",
+            "provider_type": "openai",
+            "api_keys": ["sk-new"],
+            "base_url": "https://api.example.com/v1",
+            "model_strip_fields": {
+                "glm-5.2": ["chat_template_kwargs"],
+                "qwen-2.5": ["extra_a"]
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(add_payload.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Verify config state
+        let cfg = state.config.read().await;
+        let p = cfg.providers.get("new_provider").unwrap();
+        assert_eq!(
+            p.model_strip_fields.get("glm-5.2"),
+            Some(&vec!["chat_template_kwargs".to_string()])
+        );
+        drop(cfg);
+
+        // Verify GET /api/providers returns model_strip_fields
+        let req_get = Request::builder()
+            .method("GET")
+            .uri("/api/providers")
+            .body(Body::empty())
+            .unwrap();
+        let response_get = app.clone().oneshot(req_get).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response_get.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let provider_info = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "new_provider")
+            .unwrap();
+        assert_eq!(
+            provider_info["model_strip_fields"]["glm-5.2"],
+            serde_json::json!(["chat_template_kwargs"])
+        );
+
+        // 2. Update provider to clear model_strip_fields
+        let update_payload = serde_json::json!({
+            "name": "new_provider",
+            "model_strip_fields": {}
+        });
+        let req2 = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(update_payload.to_string()))
+            .unwrap();
+        let response2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(response2.status(), StatusCode::OK);
+
+        let cfg2 = state.config.read().await;
+        let p2 = cfg2.providers.get("new_provider").unwrap();
+        assert!(p2.model_strip_fields.is_empty());
     }
 }

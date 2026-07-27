@@ -18,6 +18,7 @@ use crate::state::{AppState, DispatchRuntime};
 /// configured `api_endpoint`. Returns a fully-built error response (with
 /// analytics already logged) when the model is unknown or all targets are
 /// pointing at disabled providers.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_route(
     state: &AppState,
     runtime: &DispatchRuntime,

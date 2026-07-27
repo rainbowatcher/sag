@@ -38,6 +38,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         headers: std::collections::HashMap::new(),
         body_overrides: std::collections::HashMap::new(),
         strip_fields: vec![],
+        model_strip_fields: std::collections::HashMap::new(),
         model_overrides: std::collections::HashMap::new(),
         role_mappings: std::collections::HashMap::new(),
         enabled_models: vec![],

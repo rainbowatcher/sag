@@ -90,7 +90,7 @@ pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamC
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
         // Remove the delimiter (\n\n or \r\n\r\n)
-        let delim_len = if buffer.len() >= 4 && buffer[..4] == [b'\r', b'\n', b'\r', b'\n'] {
+        let delim_len = if buffer.len() >= 4 && buffer[..4] == *b"\r\n\r\n" {
             4
         } else {
             2
@@ -145,10 +145,49 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 .get("prompt_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
-            let ct = usage_val
+            let mut ct = usage_val
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
+
+            let total_from_upstream = usage_val
+                .get("total_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+
+            // OpenAI nests cache/reasoning tokens inside details objects.
+            let cached_tokens = usage_val
+                .get("prompt_tokens_details")
+                .and_then(|v| v.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let cache_creation_tokens = usage_val
+                .get("prompt_tokens_details")
+                .and_then(|v| v.get("cache_creation_input_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let reasoning_tokens = usage_val
+                .get("completion_tokens_details")
+                .and_then(|v| v.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+
+            // Fallback for missing/zero completion_tokens:
+            if ct == 0
+                && let Some(tot) = total_from_upstream
+                && tot > pt
+            {
+                ct = tot - pt;
+            }
+            // Strategy 2: completion_tokens must be at least reasoning_tokens.
+            // Note: If Strategy 2 intervenes due to self-contradictory upstream usage fields
+            // (e.g. prompt=100, reasoning=50, total=110), pt + ct (150) may exceed upstream total (110).
+            // We intentionally prioritize completion_tokens >= reasoning_tokens over total consistency.
+            if let Some(rt) = reasoning_tokens
+                && ct < rt
+            {
+                ct = rt;
+            }
 
             // Diagnostic for "Completion=0" in call logs. A frame that
             // credits prompt tokens but zero completion tokens is always
@@ -176,26 +215,7 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 continue;
             }
 
-            let total = usage_val
-                .get("total_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(pt as u64 + ct as u64) as u32;
-            // OpenAI nests cache/reasoning tokens inside details objects.
-            let cached_tokens = usage_val
-                .get("prompt_tokens_details")
-                .and_then(|v| v.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let cache_creation_tokens = usage_val
-                .get("prompt_tokens_details")
-                .and_then(|v| v.get("cache_creation_input_tokens"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let reasoning_tokens = usage_val
-                .get("completion_tokens_details")
-                .and_then(|v| v.get("reasoning_tokens"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
+            let total = total_from_upstream.unwrap_or(pt + ct);
             let _ = tx.send(StreamChunk::Usage(Usage {
                 prompt_tokens: pt,
                 completion_tokens: ct,
@@ -462,5 +482,56 @@ mod tests {
             Some(70),
             "must be lifted from prompt_tokens_details.cache_creation_input_tokens"
         );
+    }
+
+    /// When completion_tokens is missing/0 but total_tokens and reasoning_tokens
+    /// are present, we should fallback and derive the correct values.
+    #[test]
+    fn test_fallback_completion_tokens_when_missing_or_zero() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // Scenario 1: Deriving completion_tokens via total_tokens - prompt_tokens
+        let frame = b"data: {\"usage\":{\"completion_tokens_details\":{\"reasoning_tokens\":137},\"prompt_tokens\":53228,\"prompt_tokens_details\":{\"cached_tokens\":50008},\"total_tokens\":53365}}\n\n";
+        process_sse_frame(frame, &tx);
+
+        // Scenario 2: Deriving completion_tokens via reasoning_tokens when total_tokens is absent
+        let frame2 = b"data: {\"usage\":{\"completion_tokens_details\":{\"reasoning_tokens\":42},\"prompt_tokens\":100}}\n\n";
+        process_sse_frame(frame2, &tx);
+
+        // Scenario 3: Strategy 1 derives completion_tokens (10), but reasoning_tokens is larger (50), so Strategy 2 raises completion_tokens to 50
+        let frame3 = b"data: {\"usage\":{\"completion_tokens_details\":{\"reasoning_tokens\":50},\"prompt_tokens\":100,\"total_tokens\":110}}\n\n";
+        process_sse_frame(frame3, &tx);
+
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Usage(u) = chunk {
+                chunks.push(u);
+            }
+        }
+        assert_eq!(chunks.len(), 3);
+
+        // Verify Scenario 1 (derived from total_tokens - prompt_tokens)
+        let usage1 = &chunks[0];
+        assert_eq!(usage1.prompt_tokens, 53228);
+        assert_eq!(usage1.completion_tokens, 137);
+        assert_eq!(usage1.total_tokens, 53365);
+        assert_eq!(usage1.cached_tokens, Some(50008));
+        assert_eq!(usage1.reasoning_tokens, Some(137));
+
+        // Verify Scenario 2 (derived from reasoning_tokens)
+        let usage2 = &chunks[1];
+        assert_eq!(usage2.prompt_tokens, 100);
+        assert_eq!(usage2.completion_tokens, 42);
+        assert_eq!(usage2.total_tokens, 142);
+        assert_eq!(usage2.reasoning_tokens, Some(42));
+
+        // Verify Scenario 3 (Strategy 1 gives 10, Strategy 2 corrects to 50)
+        let usage3 = &chunks[2];
+        assert_eq!(usage3.prompt_tokens, 100);
+        assert_eq!(usage3.completion_tokens, 50);
+        assert_eq!(usage3.total_tokens, 110);
+        assert_eq!(usage3.reasoning_tokens, Some(50));
     }
 }

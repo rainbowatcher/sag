@@ -29,6 +29,8 @@ pub struct ProviderBase {
     /// Applied after all override layers, guaranteeing absence in the
     /// final body.
     strip_fields: Vec<String>,
+    /// Per-model strip fields keyed by real_model name.
+    model_strip_fields: HashMap<String, Vec<String>>,
     role_mappings: HashMap<String, String>,
     /// Whether to inject `cache_control` breakpoints for Anthropic providers.
     pub anthropic_cache_control: bool,
@@ -68,6 +70,7 @@ impl ProviderBase {
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
             strip_fields: config.strip_fields.clone(),
+            model_strip_fields: config.model_strip_fields.clone(),
             role_mappings: config.role_mappings.clone(),
             anthropic_cache_control: config.anthropic_cache_control,
             chunk_timeout_secs: config.chunk_timeout_secs,
@@ -131,7 +134,22 @@ impl ProviderBase {
         let req = apply_headers(req, &self.headers);
         let body = apply_body_overrides(body, &self.body_overrides);
         let body = apply_body_overrides(body, target_extra);
-        let body = apply_body_strip(body, &self.strip_fields);
+
+        // Union provider-level and model-level strip_fields (if real_model matches).
+        // Note: By contract, body["model"] has already been substituted to real_model by the caller.
+        let effective_strip = if let Some(model_name) = body.get("model").and_then(|v| v.as_str()) {
+            if let Some(model_strips) = self.model_strip_fields.get(model_name) {
+                let mut combined = self.strip_fields.clone();
+                combined.extend(model_strips.clone());
+                combined
+            } else {
+                self.strip_fields.clone()
+            }
+        } else {
+            self.strip_fields.clone()
+        };
+
+        let body = apply_body_strip(body, &effective_strip);
         let body_str = serde_json::to_string(&body).unwrap_or_default();
         debug!(url, "sending upstream request");
         trace!(url, body = %body_str, "upstream request body");
@@ -294,6 +312,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
             strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -325,6 +344,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
             strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -349,6 +369,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides,
             strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -714,6 +735,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides,
             strip_fields: vec!["chat_template_kwargs".to_string()],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             enabled: true,
             enabled_models: Vec::new(),
@@ -746,6 +768,76 @@ mod tests {
             "body_overrides should still be applied"
         );
         assert_eq!(body.get("model").unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn model_strip_fields_combines_with_provider_strip_fields() {
+        let mut model_strip = HashMap::new();
+        model_strip.insert(
+            "glm-5.2".to_string(),
+            vec!["chat_template_kwargs".to_string()],
+        );
+
+        let config = ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            provider_type: sag_config::ProviderType::OpenAI,
+            key_strategy: sag_config::KeyStrategy::FillFirst,
+            base_url: "https://example.com".into(),
+            models_endpoint: "models".into(),
+            timeout_secs: 30,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            strip_fields: vec!["global_bad_field".to_string()],
+            model_strip_fields: model_strip,
+            model_overrides: HashMap::new(),
+            enabled: true,
+            enabled_models: Vec::new(),
+            role_mappings: HashMap::new(),
+            anthropic_cache_control: true,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+        };
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+
+        // Request for glm-5.2 -> strips both global_bad_field and chat_template_kwargs
+        let req = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({
+                    "model": "glm-5.2",
+                    "global_bad_field": 123,
+                    "chat_template_kwargs": { "foo": "bar" },
+                    "keep_me": "yes"
+                }),
+                &HashMap::new(),
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert!(body.get("global_bad_field").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert_eq!(body.get("keep_me").unwrap(), "yes");
+
+        // Request for gpt-4o -> only strips global_bad_field
+        let req2 = base
+            .build_request(
+                "https://example.com/v1/chat/completions",
+                serde_json::json!({
+                    "model": "gpt-4o",
+                    "global_bad_field": 123,
+                    "chat_template_kwargs": { "foo": "bar" },
+                }),
+                &HashMap::new(),
+                &[],
+            )
+            .build()
+            .unwrap();
+
+        let body2 = extract_json_body(req2);
+        assert!(body2.get("global_bad_field").is_none());
+        assert!(body2.get("chat_template_kwargs").is_some());
     }
 
     #[test]

@@ -89,6 +89,7 @@ fn adapter_config_changed(old: &ProviderConfig, new: &ProviderConfig) -> bool {
         || old.headers != new.headers
         || old.body_overrides != new.body_overrides
         || old.strip_fields != new.strip_fields
+        || old.model_strip_fields != new.model_strip_fields
         || old.role_mappings != new.role_mappings
         || old.anthropic_cache_control != new.anthropic_cache_control
 }
@@ -167,24 +168,22 @@ impl ConfigMutationCoordinator {
         let sync = self.prepare_provider_sync(&old_config.providers, &candidate.providers)?;
 
         // Step 5: Persist (if requested and file-backed).
-        if persist {
-            if let Some(path) = self.config.path() {
-                let mut accepted_guard = self.accepted_file_revision.lock().unwrap();
-                // Conflict detection: file must still match our accepted revision.
-                let current_rev = FileRevision::from_path(path)?;
-                if let Some(ref accepted_rev) = *accepted_guard {
-                    if &current_rev != accepted_rev {
-                        return Err(AppError::Conflict(
-                            "config file changed outside SAG; reload and retry".into(),
-                        ));
-                    }
-                }
-                // Atomic write.
-                sag_config::save_config_to_file(&candidate, path)?;
-                // Update accepted revision.
-                *accepted_guard = Some(current_rev);
-                // accepted_guard dropped here.
+        if persist && let Some(path) = self.config.path() {
+            let mut accepted_guard = self.accepted_file_revision.lock().unwrap();
+            // Conflict detection: file must still match our accepted revision.
+            let current_rev = FileRevision::from_path(path)?;
+            if let Some(ref accepted_rev) = *accepted_guard
+                && &current_rev != accepted_rev
+            {
+                return Err(AppError::Conflict(
+                    "config file changed outside SAG; reload and retry".into(),
+                ));
             }
+            // Atomic write.
+            sag_config::save_config_to_file(&candidate, path)?;
+            // Update accepted revision.
+            *accepted_guard = Some(current_rev);
+            // accepted_guard dropped here.
         }
 
         // Pre-compute routes_changed before candidate is consumed.
@@ -523,6 +522,7 @@ mod tests {
             headers: HashMap::new(),
             body_overrides: HashMap::new(),
             strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             role_mappings: HashMap::new(),
             enabled: true,
@@ -607,6 +607,15 @@ mod tests {
         let mut a = base_provider();
         let b = base_provider();
         a.strip_fields.push("chat_template_kwargs".into());
+        assert!(adapter_config_changed(&a, &b));
+    }
+
+    #[test]
+    fn model_strip_fields_change_triggers_rebuild() {
+        let mut a = base_provider();
+        let b = base_provider();
+        a.model_strip_fields
+            .insert("glm-5.2".into(), vec!["chat_template_kwargs".into()]);
         assert!(adapter_config_changed(&a, &b));
     }
 

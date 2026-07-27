@@ -25,6 +25,7 @@ pub struct CachedOrder {
 ///
 /// `RoundRobin` rotates the list so each request starts at a different
 /// position, persisting the per-model counter across calls.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn order_targets(
     targets: Vec<RouteTarget>,
     model_name: &str,
@@ -391,6 +392,7 @@ mod tests {
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
+    #[allow(clippy::type_complexity)]
     fn active_map() -> Arc<RwLock<HashMap<String, (String, String, Instant)>>> {
         Arc::new(RwLock::new(HashMap::new()))
     }

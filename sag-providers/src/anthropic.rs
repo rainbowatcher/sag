@@ -73,7 +73,7 @@ fn drain_anthropic_sse_frames(
 ) {
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
-        let delim_len = if buffer.len() >= 4 && buffer[..4] == [b'\r', b'\n', b'\r', b'\n'] {
+        let delim_len = if buffer.len() >= 4 && buffer[..4] == *b"\r\n\r\n" {
             4
         } else {
             2
@@ -815,13 +815,15 @@ mod tests {
     #[test]
     fn to_anthropic_request_extracts_system_from_mapped_developer() {
         // Simulate what happens AFTER apply_role_mappings: developer → system
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![ChatMessage {
-            role: "system".into(), // already mapped
-            content: serde_json::Value::String("you are helpful".into()),
-            name: None,
-            extra: serde_json::Map::new(),
-        }];
+        let req = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "system".into(), // already mapped
+                content: serde_json::Value::String("you are helpful".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            ..Default::default()
+        };
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         assert_eq!(
             anthropic_req.system,
@@ -832,21 +834,23 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_deduplicates_multiple_system_messages() {
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: serde_json::Value::String("first system".into()),
-                name: None,
-                extra: serde_json::Map::new(),
-            },
-            ChatMessage {
-                role: "system".into(),
-                content: serde_json::Value::String("second system".into()),
-                name: None,
-                extra: serde_json::Map::new(),
-            },
-        ];
+        let req = ChatCompletionRequest {
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: serde_json::Value::String("first system".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                },
+                ChatMessage {
+                    role: "system".into(),
+                    content: serde_json::Value::String("second system".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                },
+            ],
+            ..Default::default()
+        };
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
         // Only the first system message is kept
         assert_eq!(
@@ -1052,21 +1056,23 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_injects_cache_control_when_enabled() {
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: serde_json::Value::String("you are helpful".into()),
-                name: None,
-                extra: serde_json::Map::new(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: serde_json::Value::String("hello".into()),
-                name: None,
-                extra: serde_json::Map::new(),
-            },
-        ];
+        let req = ChatCompletionRequest {
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: serde_json::Value::String("you are helpful".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: serde_json::Value::String("hello".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                },
+            ],
+            ..Default::default()
+        };
 
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", true);
 
@@ -1081,22 +1087,24 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_forwards_tools() {
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![ChatMessage {
-            role: "user".into(),
-            content: serde_json::Value::String("what's the weather?".into()),
-            name: None,
-            extra: serde_json::Map::new(),
-        }];
-        req.tools = Some(serde_json::json!([
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "parameters": {"type": "object", "properties": {}}
+        let req = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("what's the weather?".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            tools: Some(serde_json::json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
                 }
-            }
-        ]));
+            ])),
+            ..Default::default()
+        };
 
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", false);
 
@@ -1107,25 +1115,27 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_tools_with_cache_control() {
-        let mut req = ChatCompletionRequest::default();
-        req.messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: serde_json::Value::String("you are helpful".into()),
-                name: None,
-                extra: serde_json::Map::new(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: serde_json::Value::String("hello".into()),
-                name: None,
-                extra: serde_json::Map::new(),
-            },
-        ];
-        req.tools = Some(serde_json::json!([
-            {"type": "function", "function": {"name": "tool_a"}},
-            {"type": "function", "function": {"name": "tool_b"}},
-        ]));
+        let req = ChatCompletionRequest {
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: serde_json::Value::String("you are helpful".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: serde_json::Value::String("hello".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                },
+            ],
+            tools: Some(serde_json::json!([
+                {"type": "function", "function": {"name": "tool_a"}},
+                {"type": "function", "function": {"name": "tool_b"}},
+            ])),
+            ..Default::default()
+        };
 
         let anthropic_req = AnthropicProvider::to_anthropic_request(&req, "claude-3", true);
 
