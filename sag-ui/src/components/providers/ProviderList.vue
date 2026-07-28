@@ -325,7 +325,7 @@ const table = useVueTable({
               v-model="searchInput"
               type="text"
               placeholder="Search providers..."
-              class="h-9 pl-8"
+              class="h-8 pl-8"
             />
           </div>
         </div>
@@ -334,7 +334,7 @@ const table = useVueTable({
             :model-value="filterProviderType"
             @update:model-value="(value) => (filterProviderType = value as string)"
           >
-            <SelectTrigger class="w-[200px]">
+            <SelectTrigger class="h-8 w-[200px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -349,7 +349,7 @@ const table = useVueTable({
             :model-value="sortByName ? 'name' : 'default'"
             @update:model-value="(value) => (sortByName = value === 'name')"
           >
-            <SelectTrigger class="w-[160px]">
+            <SelectTrigger class="h-8 w-[160px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -393,7 +393,7 @@ const table = useVueTable({
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
     <div v-else class="min-h-0 flex-1">
-      <div class="max-h-full rounded-lg border [&>div]:max-h-full">
+      <div class="h-full rounded-lg border [&>div]:h-full">
         <TooltipProvider :delay-duration="200">
           <Table>
             <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">

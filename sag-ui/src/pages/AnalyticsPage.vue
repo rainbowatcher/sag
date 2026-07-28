@@ -184,13 +184,13 @@ const statsTotals = computed(() => {
             <div class="h-full rounded-lg border [&>div]:h-full">
               <div
                 v-if="store.statsLoading"
-                class="text-muted-foreground flex h-full items-center justify-center gap-2"
+                class="text-muted-foreground flex items-center justify-center gap-2 py-12"
               >
                 <Loader2 class="h-5 w-5 animate-spin" /> Loading...
               </div>
               <div
                 v-else-if="store.stats.length === 0"
-                class="text-muted-foreground flex h-full items-center justify-center text-sm"
+                class="text-muted-foreground flex items-center justify-center py-12 text-sm"
               >
                 No statistics available.
               </div>
@@ -289,13 +289,13 @@ const statsTotals = computed(() => {
             <div class="h-full rounded-lg border [&>div]:h-full">
               <div
                 v-if="store.cacheLoading"
-                class="text-muted-foreground flex h-full items-center justify-center gap-2"
+                class="text-muted-foreground flex items-center justify-center gap-2 py-12"
               >
                 <Loader2 class="h-5 w-5 animate-spin" /> Loading...
               </div>
               <div
                 v-else-if="store.cache.length === 0"
-                class="text-muted-foreground flex h-full items-center justify-center text-sm"
+                class="text-muted-foreground flex items-center justify-center py-12 text-sm"
               >
                 No cache statistics available.
               </div>
