@@ -8,6 +8,7 @@ import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import {
   Select,
   SelectContent,
@@ -314,44 +315,26 @@ const table = useVueTable({
   <div class="flex h-full flex-col space-y-4">
     <!-- ── Header ────────────────────────────────────────────────── -->
     <div class="shrink-0 space-y-4">
-      <div class="flex items-center justify-end">
-        <div class="flex items-center gap-2">
-          <RefreshButton :loading="store.providersLoading" @click="refreshAll()" />
-          <button
-            @click="showAdd = !showAdd"
-            class="bg-primary text-primary-foreground hover:bg-primary/90 inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm transition-colors"
-          >
-            <Plus class="h-3.5 w-3.5" />
-            Add Provider
-          </button>
-        </div>
-      </div>
-
-      <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
-
-      <!-- ── Filters ─────────────────────────────────────────────── -->
-      <div class="grid gap-3 md:grid-cols-[1fr_200px_160px] md:items-end">
-        <div>
-          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Name / Model</label>
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="min-w-0 flex-1">
           <div class="relative">
             <Search
-              class="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2"
+              class="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 z-10 h-4 w-4 -translate-y-1/2"
             />
-            <input
+            <Input
               v-model="searchInput"
               type="text"
               placeholder="Search providers..."
-              class="border-input bg-background ring-offset-background placeholder:text-muted-foreground focus-visible:ring-ring flex h-9 w-full rounded-md border px-3 py-2 pl-8 text-sm file:border-0 file:bg-transparent file:text-sm file:font-medium focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              class="h-9 pl-8"
             />
           </div>
         </div>
-        <div>
-          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Type</label>
+        <div class="hidden md:block">
           <Select
             :model-value="filterProviderType"
             @update:model-value="(value) => (filterProviderType = value as string)"
           >
-            <SelectTrigger>
+            <SelectTrigger class="w-[200px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -361,13 +344,12 @@ const table = useVueTable({
             </SelectContent>
           </Select>
         </div>
-        <div>
-          <label class="text-muted-foreground mb-1.5 block text-xs font-medium">Sort</label>
+        <div class="hidden md:block">
           <Select
             :model-value="sortByName ? 'name' : 'default'"
             @update:model-value="(value) => (sortByName = value === 'name')"
           >
-            <SelectTrigger>
+            <SelectTrigger class="w-[160px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -376,7 +358,16 @@ const table = useVueTable({
             </SelectContent>
           </Select>
         </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <RefreshButton :loading="store.providersLoading" @click="refreshAll()" />
+          <Button size="sm" @click="showAdd = !showAdd">
+            <Plus class="h-3.5 w-3.5" />
+            Add Provider
+          </Button>
+        </div>
       </div>
+
+      <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
     </div>
 
     <!-- ── Loading ───────────────────────────────────────────────── -->
@@ -401,37 +392,39 @@ const table = useVueTable({
     </div>
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
-    <div v-else class="min-h-0 flex-1 rounded-lg border [&>div]:h-full">
-      <TooltipProvider :delay-duration="200">
-        <Table>
-          <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
-            <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
-              <TableHead
-                v-for="header in headerGroup.headers"
-                :key="header.id"
-                :class="(header.column.columnDef.meta as any)?.class"
-              >
-                <FlexRender
-                  v-if="!header.isPlaceholder"
-                  :render="header.column.columnDef.header!"
-                  :props="header.getContext()"
-                />
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            <TableRow v-for="row in table.getRowModel().rows" :key="row.id">
-              <TableCell
-                v-for="cell in row.getVisibleCells()"
-                :key="cell.id"
-                :class="(cell.column.columnDef.meta as any)?.class"
-              >
-                <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-              </TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
-      </TooltipProvider>
+    <div v-else class="min-h-0 flex-1">
+      <div class="max-h-full rounded-lg border [&>div]:max-h-full">
+        <TooltipProvider :delay-duration="200">
+          <Table>
+            <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
+              <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+                <TableHead
+                  v-for="header in headerGroup.headers"
+                  :key="header.id"
+                  :class="(header.column.columnDef.meta as any)?.class"
+                >
+                  <FlexRender
+                    v-if="!header.isPlaceholder"
+                    :render="header.column.columnDef.header!"
+                    :props="header.getContext()"
+                  />
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              <TableRow v-for="row in table.getRowModel().rows" :key="row.id">
+                <TableCell
+                  v-for="cell in row.getVisibleCells()"
+                  :key="cell.id"
+                  :class="(cell.column.columnDef.meta as any)?.class"
+                >
+                  <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+                </TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+        </TooltipProvider>
+      </div>
     </div>
 
     <!-- ── Delete confirmation ───────────────────────────────────── -->
