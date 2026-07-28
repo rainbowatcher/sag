@@ -70,14 +70,7 @@ const statsTotals = computed(() => {
 
 <template>
   <div class="flex h-full flex-col">
-    <div class="shrink-0">
-      <div>
-        <h2 class="text-2xl font-bold tracking-tight">Analytics</h2>
-        <p class="text-muted-foreground mt-1 text-sm">调用统计 / Token 消耗 / 缓存命中</p>
-      </div>
-    </div>
-
-    <Tabs :default-value="'stats'" class="flex min-h-0 flex-1 flex-col pt-6">
+    <Tabs :default-value="'stats'" class="flex min-h-0 flex-1 flex-col pt-4">
       <TabsList class="shrink-0">
         <TabsTrigger value="stats">Stats</TabsTrigger>
         <TabsTrigger value="cache">Cache</TabsTrigger>
@@ -86,7 +79,7 @@ const statsTotals = computed(() => {
       <!-- ── Stats panel ─────────────────────────────────────────── -->
       <TabsContent value="stats" class="min-h-0 flex-1">
         <div class="flex h-full flex-col">
-          <div class="shrink-0 space-y-6">
+          <div class="shrink-0 space-y-4">
             <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
               <Card>
                 <CardContent class="flex items-center gap-3 p-4 xl:gap-4">

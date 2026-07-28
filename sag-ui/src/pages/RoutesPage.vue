@@ -35,12 +35,8 @@ onMounted(refreshPage)
 
 <template>
   <div class="flex h-full flex-col">
-    <div class="shrink-0 space-y-6">
-      <div class="flex items-center justify-between">
-        <div>
-          <h2 class="text-2xl font-bold tracking-tight">Routes</h2>
-          <p class="text-muted-foreground mt-1 text-sm">管理模型路由规则与 API 端点映射</p>
-        </div>
+    <div class="shrink-0 space-y-4">
+      <div class="flex items-center justify-end">
         <div class="flex items-center gap-2">
           <RefreshButton :loading="routeStore.routesLoading" @click="refreshPage" />
           <Button size="sm" @click="showAdd = true">
@@ -60,7 +56,7 @@ onMounted(refreshPage)
       />
     </div>
 
-    <div class="min-h-0 flex-1 pt-6 pb-6">
+    <div class="min-h-0 flex-1 pt-4 pb-4">
       <div
         v-if="routeStore.routesLoading && routeStore.routes.length === 0"
         class="text-muted-foreground py-12 text-center"

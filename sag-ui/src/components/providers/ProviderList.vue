@@ -311,14 +311,10 @@ const table = useVueTable({
 </script>
 
 <template>
-  <div class="flex h-full flex-col space-y-6">
+  <div class="flex h-full flex-col space-y-4">
     <!-- ── Header ────────────────────────────────────────────────── -->
-    <div class="shrink-0 space-y-6">
-      <div class="flex items-center justify-between">
-        <div>
-          <h2 class="text-2xl font-bold tracking-tight">Providers</h2>
-          <p class="text-muted-foreground mt-1 text-sm">管理上游 LLM 供应商配置</p>
-        </div>
+    <div class="shrink-0 space-y-4">
+      <div class="flex items-center justify-end">
         <div class="flex items-center gap-2">
           <RefreshButton :loading="store.providersLoading" @click="refreshAll()" />
           <button

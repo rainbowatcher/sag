@@ -4,7 +4,7 @@ import ProviderList from "@/components/providers/ProviderList.vue"
 
 <template>
   <div class="flex h-full flex-col">
-    <div class="min-h-0 flex-1 pb-6">
+    <div class="min-h-0 flex-1 pb-4">
       <ProviderList />
     </div>
   </div>

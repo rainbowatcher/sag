@@ -194,10 +194,7 @@ const pieChart = computed(() => ({
 
 <template>
   <div class="flex h-full flex-col">
-    <div class="shrink-0 space-y-6">
-      <h2 class="text-2xl font-bold tracking-tight">Dashboard</h2>
-      <p class="text-muted-foreground mt-1 text-sm">SAG AI Gateway 运行概览</p>
-
+    <div class="shrink-0 space-y-4">
       <!-- Stat cards -->
       <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <Card v-for="card in cards" :key="card.label" class="transition-shadow hover:shadow-md">
@@ -249,7 +246,7 @@ const pieChart = computed(() => ({
       </Alert>
     </div>
 
-    <div class="min-h-0 flex-1 pt-6">
+    <div class="min-h-0 flex-1 pt-4">
       <div class="h-full overflow-y-auto">
         <div class="grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
           <!-- Distribution pie chart -->
