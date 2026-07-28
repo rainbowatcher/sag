@@ -279,11 +279,17 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
             let intercept = is_anomalous && !has_meaningful_choice;
 
             if is_anomalous {
+                let choices_arr = val.get("choices").and_then(|c| c.as_array());
                 warn!(
                     pt = pt,
                     ct = ct,
                     usage = %usage_val,
                     intercepted = intercept,
+                    choices_count = choices_arr.map(|a| a.len()).unwrap_or(0),
+                    finish_reasons = ?choices_arr
+                        .map(|a| a.iter()
+                            .map(|ch| ch.get("finish_reason").and_then(|f| f.as_str()))
+                            .collect::<Vec<_>>()),
                     "upstream usage frame credits zero completion_tokens despite non-zero prompt; \
                      this is the source of Completion=0 in the call log",
                 );
