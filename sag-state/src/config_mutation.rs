@@ -181,8 +181,9 @@ impl ConfigMutationCoordinator {
             }
             // Atomic write.
             sag_config::save_config_to_file(&candidate, path)?;
-            // Update accepted revision.
-            *accepted_guard = Some(current_rev);
+            // Update accepted revision to the newly written file's revision.
+            let new_rev = FileRevision::from_path(path)?;
+            *accepted_guard = Some(new_rev);
             // accepted_guard dropped here.
         }
 
