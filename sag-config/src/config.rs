@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Defaults:
 /// - `server`: 127.0.0.1:3000
 /// - `gateway_auth`: `Some(GatewayAuthConfig { api_keys: ["test-key"] })`
-/// - `backoff`: `BackoffConfig::default()` (retries 2, base 100ms, max 5s, jitter)
+/// - `backoff`: `BackoffConfig::default()` (retries 2, base 100ms, max 5s, jitter, retry_on_empty_response)
 /// - `circuit_breaker`: `CircuitBreakerConfig::default()` (quota 1h, rate 10s, generic 60s)
 /// - `logging`: `LoggingConfig::default()` (info, compact)
 /// - `shuffle_cache_ttl_secs`: 7200
@@ -707,6 +707,12 @@ pub struct BackoffConfig {
     /// cap is used. Defaults to `true` (recommended for production).
     #[serde(default = "default_backoff_jitter")]
     pub jitter: bool,
+    /// Whether to retry when an upstream returns an empty response (zero
+    /// `completion_tokens` with no content in `choices`). Defaults to `true`.
+    /// Set to `false` to disable empty-response detection entirely (the raw
+    /// upstream response is forwarded as-is).
+    #[serde(default = "default_retry_on_empty_response")]
+    pub retry_on_empty_response: bool,
 }
 
 impl Default for BackoffConfig {
@@ -716,6 +722,7 @@ impl Default for BackoffConfig {
             base_ms: default_backoff_base_ms(),
             max_ms: default_backoff_max_ms(),
             jitter: default_backoff_jitter(),
+            retry_on_empty_response: default_retry_on_empty_response(),
         }
     }
 }
@@ -727,6 +734,9 @@ pub fn default_backoff_max_ms() -> u64 {
     5_000
 }
 pub fn default_backoff_jitter() -> bool {
+    true
+}
+pub fn default_retry_on_empty_response() -> bool {
     true
 }
 

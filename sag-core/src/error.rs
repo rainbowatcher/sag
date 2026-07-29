@@ -83,6 +83,15 @@ pub enum AppError {
     #[error("upstream time-to-first-byte timeout after {secs}s (provider={provider})")]
     TtfbTimeout { provider: String, secs: u64 },
 
+    /// Upstream returned a response with zero `completion_tokens` despite a
+    /// non-zero prompt. The stream (or non-stream response body) is complete
+    /// but carries no generated output -- the model effectively returned an
+    /// empty answer. Retryable so the dispatcher retries the same target with
+    /// backoff, then falls through to the next target when retries are
+    /// exhausted.
+    #[error("upstream returned empty response with no content in choices (provider={provider})")]
+    EmptyResponse { provider: String },
+
     /// Generic internal error.
     #[error("internal error: {0}")]
     Internal(String),
@@ -145,6 +154,7 @@ impl AppError {
             AppError::AllProvidersExhausted { .. } => "all_exhausted",
             AppError::Network(_) => "network_error",
             AppError::TtfbTimeout { .. } => "timeout",
+            AppError::EmptyResponse { .. } => "empty_response",
             AppError::Internal(_) => "internal_error",
             AppError::Anyhow(_) => "internal_error",
         }
@@ -179,6 +189,9 @@ impl IntoResponse for AppError {
                 "TTFB_TIMEOUT",
                 self.to_string(),
             ),
+            AppError::EmptyResponse { .. } => {
+                (StatusCode::BAD_GATEWAY, "EMPTY_RESPONSE", self.to_string())
+            }
             AppError::Internal(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -349,6 +362,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_response_returns_502() {
+        let (status, body) = extract(AppError::EmptyResponse {
+            provider: "cpa".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "EMPTY_RESPONSE");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no content in choices")
+        );
+    }
+
+    #[tokio::test]
     async fn internal_error_returns_500() {
         let (status, body) = extract(AppError::Internal("unexpected state".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -447,6 +476,17 @@ mod tests {
             }
             .error_category(),
             "timeout"
+        );
+    }
+
+    #[test]
+    fn error_category_empty_response() {
+        assert_eq!(
+            AppError::EmptyResponse {
+                provider: "cpa".into()
+            }
+            .error_category(),
+            "empty_response"
         );
     }
 

@@ -121,6 +121,8 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
             item["base_ms"] = toml_edit::value(config.backoff.base_ms as i64);
             item["max_ms"] = toml_edit::value(config.backoff.max_ms as i64);
             item["jitter"] = toml_edit::value(config.backoff.jitter);
+            item["retry_on_empty_response"] =
+                toml_edit::value(config.backoff.retry_on_empty_response);
         },
     )?;
 
@@ -1285,6 +1287,7 @@ targets = [
             base_ms: 250,
             max_ms: 30_000,
             jitter: false,
+            retry_on_empty_response: true,
         };
 
         save_config_to_file(&config, &path).unwrap();
