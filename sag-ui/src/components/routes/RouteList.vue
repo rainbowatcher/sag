@@ -40,6 +40,16 @@ const activeTargetStore = useActiveTargetStore()
 
 onMounted(() => activeTargetStore.fetchActiveTargets())
 
+// ── Search / filter ───────────────────────────────────────────────
+// Debounced query from RoutesPage; client-side filter by model name.
+const props = defineProps<{ searchQuery?: string }>()
+
+const filteredRoutes = computed(() => {
+  const kw = (props.searchQuery ?? "").trim().toLowerCase()
+  if (!kw) return routeStore.routes
+  return routeStore.routes.filter((r) => r.model_name.toLowerCase().includes(kw))
+})
+
 // ── Edit flow ─────────────────────────────────────────────────────
 const editingRoute = ref<RouteConfig | null>(null)
 
@@ -240,10 +250,7 @@ const columns = [
       const active = sticky ?? fill
 
       if (!active) {
-        return h("div", { class: "flex items-center gap-1.5 text-muted-foreground/50" }, [
-          h(PinOff, { class: "h-3 w-3 shrink-0" }),
-          h("span", { class: "text-[11px]" }, "—"),
-        ])
+        return h("span", { class: "text-muted-foreground/50" }, "-")
       }
 
       const isFillFirst = fill !== undefined && sticky === undefined
@@ -331,7 +338,7 @@ const columns = [
 
 const table = useVueTable({
   get data() {
-    return routeStore.routes
+    return filteredRoutes.value
   },
   columns,
   getCoreRowModel: getCoreRowModel(),
@@ -340,58 +347,65 @@ const table = useVueTable({
 </script>
 
 <template>
-  <!-- ── Table ─────────────────────────────────────────────────── -->
-  <div v-if="routeStore.routes.length > 0" class="h-full rounded-lg border [&>div]:h-full">
-    <Table>
-      <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
-        <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
-          <TableHead
-            v-for="header in headerGroup.headers"
-            :key="header.id"
-            :class="[
-              (header.column.columnDef.meta as any)?.class,
-              header.column.getCanSort()
-                ? 'hover:text-foreground cursor-pointer transition-colors select-none'
-                : '',
-            ]"
-            @click="header.column.getCanSort() && header.column.toggleSorting()"
+  <div v-if="routeStore.routes.length > 0" class="flex h-full flex-col gap-4">
+    <!-- ── Empty (no match) ─────────────────────────────────────── -->
+    <div v-if="filteredRoutes.length === 0" class="text-muted-foreground py-12 text-center text-sm">
+      No routes match the current filters.
+    </div>
+
+    <!-- ── Table ─────────────────────────────────────────────────── -->
+    <div v-else class="min-h-0 flex-1 rounded-lg border [&>div]:h-full">
+      <Table>
+        <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
+          <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+            <TableHead
+              v-for="header in headerGroup.headers"
+              :key="header.id"
+              :class="[
+                (header.column.columnDef.meta as any)?.class,
+                header.column.getCanSort()
+                  ? 'hover:text-foreground cursor-pointer transition-colors select-none'
+                  : '',
+              ]"
+              @click="header.column.getCanSort() && header.column.toggleSorting()"
+            >
+              <div class="flex items-center gap-1">
+                <FlexRender
+                  v-if="!header.isPlaceholder"
+                  :render="header.column.columnDef.header!"
+                  :props="header.getContext()"
+                />
+                <ArrowUpDown
+                  v-if="header.column.getCanSort()"
+                  class="h-3 w-3"
+                  :class="
+                    header.column.getIsSorted() ? 'text-foreground' : 'text-muted-foreground/40'
+                  "
+                />
+              </div>
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRow
+            v-for="row in table.getRowModel().rows"
+            :key="row.id"
+            :class="{
+              'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
+              'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
+            }"
           >
-            <div class="flex items-center gap-1">
-              <FlexRender
-                v-if="!header.isPlaceholder"
-                :render="header.column.columnDef.header!"
-                :props="header.getContext()"
-              />
-              <ArrowUpDown
-                v-if="header.column.getCanSort()"
-                class="h-3 w-3"
-                :class="
-                  header.column.getIsSorted() ? 'text-foreground' : 'text-muted-foreground/40'
-                "
-              />
-            </div>
-          </TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        <TableRow
-          v-for="row in table.getRowModel().rows"
-          :key="row.id"
-          :class="{
-            'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
-            'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
-          }"
-        >
-          <TableCell
-            v-for="cell in row.getVisibleCells()"
-            :key="cell.id"
-            :class="(cell.column.columnDef.meta as any)?.class"
-          >
-            <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-          </TableCell>
-        </TableRow>
-      </TableBody>
-    </Table>
+            <TableCell
+              v-for="cell in row.getVisibleCells()"
+              :key="cell.id"
+              :class="(cell.column.columnDef.meta as any)?.class"
+            >
+              <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+            </TableCell>
+          </TableRow>
+        </TableBody>
+      </Table>
+    </div>
   </div>
 
   <!-- ── Delete confirmation Dialog ────────────────────────────── -->

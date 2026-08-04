@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { AlertCircle, Loader2, Plus } from "@lucide/vue"
+import { AlertCircle, Loader2, Plus, Search } from "@lucide/vue"
+import { refDebounced } from "@vueuse/core"
 import { onMounted, ref } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -13,6 +15,10 @@ import { useRouteStore } from "@/stores/routes"
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
 const activeTargetStore = useActiveTargetStore()
+
+// ── Search / filter (debounced, shared with RouteList) ────────────
+const searchInput = ref("")
+const debouncedSearch = refDebounced(searchInput, 300)
 
 // ── Add form ──────────────────────────────────────────────────────
 const showAdd = ref(false)
@@ -42,8 +48,21 @@ onMounted(refreshPage)
 <template>
   <div class="flex h-full flex-col">
     <div class="shrink-0 space-y-4">
-      <div class="flex items-center justify-end">
-        <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2">
+        <div class="min-w-0 flex-1">
+          <div class="relative">
+            <Search
+              class="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 z-10 h-4 w-4 -translate-y-1/2"
+            />
+            <Input
+              v-model="searchInput"
+              type="text"
+              placeholder="Search routes by model name…"
+              class="h-8 pl-8"
+            />
+          </div>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
           <RefreshButton :loading="routeStore.routesLoading" @click="refreshPage" />
           <Button size="sm" @click="showAdd = true">
             <Plus class="h-3.5 w-3.5" />
@@ -89,7 +108,7 @@ onMounted(refreshPage)
       </div>
 
       <!-- ── Route List (table + edit + delete) ──────────────────── -->
-      <RouteList v-else />
+      <RouteList v-else :search-query="debouncedSearch" />
     </div>
   </div>
 </template>
