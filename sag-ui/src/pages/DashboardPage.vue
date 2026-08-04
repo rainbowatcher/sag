@@ -25,7 +25,6 @@ import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useHealthStore } from "@/stores/health"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-
 ChartJS.register(
   CategoryScale,
   LinearScale,

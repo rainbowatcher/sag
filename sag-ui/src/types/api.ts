@@ -185,3 +185,12 @@ export interface CircuitBreakerEntry {
   /** Whether a probe request is currently in flight (HalfOpen only). */
   probe_in_flight: boolean
 }
+
+/** Sticky-failover active target entry returned by `GET /api/sticky-targets`. */
+export interface StickyTargetEntry {
+  model: string
+  provider: string
+  real_model: string
+  age_secs: number
+  expired: boolean
+}

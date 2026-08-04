@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Trash2 } from "@lucide/vue"
+import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Pin, Trash2 } from "@lucide/vue"
 import {
   FlexRender,
   createColumnHelper,
@@ -7,7 +7,7 @@ import {
   getSortedRowModel,
   useVueTable,
 } from "@tanstack/vue-table"
-import { computed, h, ref } from "vue"
+import { computed, h, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"
 import { Badge } from "@/components/ui/badge"
@@ -28,13 +28,17 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { getErrorMessage } from "@/lib/utils"
+import { formatDuration, getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
+import { useStickyTargetStore } from "@/stores/stickyTarget"
 import type { RouteConfig } from "@/types/api"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
+const stickyTargetStore = useStickyTargetStore()
+
+onMounted(() => stickyTargetStore.fetchStickyTargets())
 
 // ── Edit flow ─────────────────────────────────────────────────────
 const editingRoute = ref<RouteConfig | null>(null)
@@ -49,7 +53,7 @@ function onEditClose() {
 
 async function onUpdated() {
   editingRoute.value = null
-  await routeStore.fetchRoutes()
+  await Promise.all([routeStore.fetchRoutes(), stickyTargetStore.fetchStickyTargets()])
 }
 
 // ── Delete flow ───────────────────────────────────────────────────
@@ -75,7 +79,7 @@ async function confirmDelete() {
     toast.success(`Route "${deleteTarget.value}" deleted`)
     deleteDialogOpen.value = false
     deleteTarget.value = null
-    await routeStore.fetchRoutes()
+    await Promise.all([routeStore.fetchRoutes(), stickyTargetStore.fetchStickyTargets()])
   } catch (e: any) {
     const msg = getErrorMessage(e)
     toast.error(msg)
@@ -153,20 +157,47 @@ const columns = [
     cell: (info) => {
       const total = info.getValue().length
       const disabled = disabledTargetCount(info.row.original)
-      if (disabled === 0) {
-        return h("span", { class: "tabular-nums font-medium" }, String(total))
-      }
-      return h("div", { class: "flex items-center justify-center gap-1.5" }, [
-        h(AlertTriangle, {
-          class: "text-amber-500 h-3.5 w-3.5 shrink-0",
-        }),
-        h("span", { class: "tabular-nums font-medium text-muted-foreground" }, [
-          String(total - disabled),
-          h("span", { class: "text-muted-foreground/60" }, `/${total}`),
-        ]),
+      const route = info.row.original
+      const sticky = stickyTargetStore.targets.find((s) => s.model === route.model_name)
+
+      const countEl =
+        disabled === 0
+          ? h("span", { class: "tabular-nums font-medium" }, String(total))
+          : h("div", { class: "flex items-center justify-center gap-1.5" }, [
+              h(AlertTriangle, {
+                class: "text-amber-500 h-3.5 w-3.5 shrink-0",
+              }),
+              h("span", { class: "tabular-nums font-medium text-muted-foreground" }, [
+                String(total - disabled),
+                h("span", { class: "text-muted-foreground/60" }, `/${total}`),
+              ]),
+            ])
+
+      if (!sticky) return countEl
+
+      return h("div", { class: "flex items-center justify-center gap-2" }, [
+        countEl,
+        h(
+          "div",
+          {
+            class:
+              "flex items-center gap-1 text-xs text-muted-foreground border-l pl-2 border-border",
+          },
+          [
+            h(Pin, { class: "h-3 w-3 text-indigo-500 shrink-0" }),
+            h(
+              "span",
+              {
+                class: "font-mono truncate max-w-[120px]",
+                title: `${sticky.provider}/${sticky.real_model} (${formatDuration(sticky.age_secs * 1000)})`,
+              },
+              `${sticky.provider}/${sticky.real_model}`,
+            ),
+          ],
+        ),
       ])
     },
-    meta: { class: "text-center xl:min-w-[100px]" },
+    meta: { class: "text-center xl:min-w-[180px]" },
   }),
   columnHelper.display({
     id: "actions",
@@ -251,6 +282,11 @@ const table = useVueTable({
             'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
             'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
           }"
+          :data-sticky="
+            stickyTargetStore.targets.some((s) => s.model === (row.original as any).model_name)
+              ? 'true'
+              : undefined
+          "
         >
           <TableCell
             v-for="cell in row.getVisibleCells()"
