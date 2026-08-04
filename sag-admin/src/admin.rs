@@ -7,6 +7,9 @@
 //! - [`admin_routes`] — `GET|POST|PUT|DELETE /api/routes`
 //! - [`admin_testing`] — `POST /api/providers/fetch-models` and
 //!   `POST /api/model/test`
+//! - [`admin_circuit_breaker`] — `GET /api/circuit-breaker` and
+//!   `POST /api/circuit-breaker/close`
+//! - [`admin_sticky`] — `GET|DELETE /api/sticky-targets`
 //!
 //! All admin routes are intended to be wrapped in the `gateway_auth`
 //! middleware by the parent router in `routes.rs`.
@@ -19,6 +22,7 @@ use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
 };
 use crate::admin_routes::{create_route, delete_route, list_routes, update_route};
+use crate::admin_sticky::{delete_sticky_target, list_sticky_targets};
 use crate::admin_testing::{fetch_models, model_test};
 use sag_state::AppState;
 
@@ -45,5 +49,9 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
         .route("/logs", get(list_logs))
         .route("/circuit-breaker", get(list_circuit_breakers))
         .route("/circuit-breaker/close", post(close_circuit_breaker))
+        .route(
+            "/sticky-targets",
+            get(list_sticky_targets).delete(delete_sticky_target),
+        )
         .with_state(state)
 }

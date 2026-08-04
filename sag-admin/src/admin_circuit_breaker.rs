@@ -73,7 +73,12 @@ pub async fn close_circuit_breaker(
     // Reset sticky-failover memory for this model so the recovered target
     // competes on priority again instead of being pinned behind the
     // failover target that absorbed traffic while the breaker was open.
-    state.active_targets.write().await.remove(&req.model);
+    // `clear` invalidates in-flight decisions that routed before the close:
+    // per-model generation bump when the model had per-model state, global
+    // epoch bump otherwise — so a stale writeback can never re-pin the
+    // failover target afterwards, without creating per-model tombstones for
+    // models that were never used.
+    state.active_targets.write().await.clear(&req.model);
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -316,9 +321,11 @@ mod tests {
         }
         state.active_targets.write().await.insert(
             "gpt-4o".to_string(),
-            (
-                "anthropic".to_string(),
-                "claude-3".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "anthropic",
+                "claude-3",
+                "gpt-4o",
+                Some("claude-3".to_string()),
                 std::time::Instant::now(),
             ),
         );
@@ -354,9 +361,11 @@ mod tests {
         let state = empty_state().await;
         state.active_targets.write().await.insert(
             "gpt-4o".to_string(),
-            (
-                "anthropic".to_string(),
-                "claude-3".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "anthropic",
+                "claude-3",
+                "gpt-4o",
+                Some("claude-3".to_string()),
                 std::time::Instant::now(),
             ),
         );
@@ -377,5 +386,61 @@ mod tests {
             state.active_targets.read().await.get("gpt-4o").is_none(),
             "close against a healthy target must still reset sticky memory (idempotent reset path)"
         );
+    }
+
+    #[tokio::test]
+    async fn force_close_rejects_stale_writeback_without_per_model_tombstone() {
+        // A close against a model with no active entry must still block a
+        // stale writeback from an in-flight request that decided its route
+        // before the close — via the global epoch instead of a per-model
+        // tombstone, so arbitrary closes never grow the generations map.
+        let state = empty_state().await;
+        assert_eq!(state.active_targets.read().await.epoch(), 0);
+        assert_eq!(state.active_targets.read().await.generation("gpt-4o"), 0);
+
+        let app = test_app(state.clone());
+        let (status, json) = close_breaker(
+            app,
+            serde_json::json!({
+                "model": "gpt-4o",
+                "provider": "openai",
+                "real_model": "gpt-4o"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+        assert_eq!(
+            state.active_targets.read().await.epoch(),
+            1,
+            "close with no entry bumps the global epoch"
+        );
+        assert_eq!(
+            state.active_targets.read().await.generation("gpt-4o"),
+            0,
+            "no per-model tombstone is created"
+        );
+
+        // A stale writeback captured before the close (old epoch) must not
+        // repin — the epoch check rejects it even though the per-model
+        // generation is unchanged.
+        let version = state.config.routes_version();
+        let mut guard = state.active_targets.write().await;
+        assert!(
+            !guard.insert_if_generation(
+                "gpt-4o".into(),
+                sag_state::ActiveTargetEntry::new(
+                    "anthropic",
+                    "claude-3",
+                    "gpt-4o",
+                    Some("claude-3".to_string()),
+                    std::time::Instant::now()
+                ),
+                &sag_state::StickyToken::new(0, 0, version),
+                version,
+            ),
+            "pre-close epoch must not repin after the close"
+        );
+        assert!(guard.get("gpt-4o").is_none());
     }
 }
