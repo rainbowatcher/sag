@@ -8,23 +8,29 @@ import { Button } from "@/components/ui/button"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
+import { useStickyTargetStore } from "@/stores/stickyTarget"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
+const stickyTargetStore = useStickyTargetStore()
 
 // ── Add form ──────────────────────────────────────────────────────
 const showAdd = ref(false)
 
 async function handleRouteCreated() {
   showAdd.value = false
-  await routeStore.fetchRoutes()
+  await Promise.all([routeStore.fetchRoutes(), stickyTargetStore.fetchStickyTargets()])
 }
 
 const pageError = ref("")
 async function refreshPage() {
   pageError.value = ""
   try {
-    await Promise.all([providerStore.fetchProviders(), routeStore.fetchRoutes()])
+    await Promise.all([
+      providerStore.fetchProviders(),
+      routeStore.fetchRoutes(),
+      stickyTargetStore.fetchStickyTargets(),
+    ])
   } catch (e: any) {
     pageError.value = getErrorMessage(e, "Failed to load data")
   }

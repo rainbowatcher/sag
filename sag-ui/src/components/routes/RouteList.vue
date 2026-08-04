@@ -32,7 +32,7 @@ import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 import { useStickyTargetStore } from "@/stores/stickyTarget"
-import type { RouteConfig } from "@/types/api"
+import type { RouteConfig, StickyTargetEntry } from "@/types/api"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
@@ -116,6 +116,23 @@ function disabledTargetCount(route: RouteConfig): number {
   return route.targets.filter((t) => disabledProviders.value.has(t.provider)).length
 }
 
+/**
+ * Best active-target entry for a route: prefer a live `pinned` pin over an
+ * `expired` one, then the most recently recorded (smallest `age_secs`).
+ * Wildcard routes (`model_name: "*"`) can pin several targets at once
+ * (one per request model), so a plain `find` would return an arbitrary
+ * first match — this helper picks the most meaningful one.
+ */
+function activeTargetFor(model: string): StickyTargetEntry | undefined {
+  const candidates = stickyTargetStore.targets.filter(
+    (s) => s.model === model && s.status !== "idle",
+  )
+  if (candidates.length === 0) return undefined
+  const pinned = candidates.filter((s) => s.status === "pinned")
+  const pool = pinned.length > 0 ? pinned : candidates
+  return [...pool].sort((a, b) => a.age_secs - b.age_secs)[0]
+}
+
 // ══════════════════════════════════════════════════════════════════
 // TanStack Table
 // ══════════════════════════════════════════════════════════════════
@@ -191,23 +208,12 @@ const columns = [
     id: "sticky",
     header: () => h("span", { class: "text-xs font-medium" }, "Active Target"),
     sortingFn: (a, b) => {
-      const sa = stickyTargetStore.targets.some(
-        (s) => s.model === a.original.model_name && s.status !== "idle",
-      )
-        ? 1
-        : 0
-      const sb = stickyTargetStore.targets.some(
-        (s) => s.model === b.original.model_name && s.status !== "idle",
-      )
-        ? 1
-        : 0
+      const sa = activeTargetFor(a.original.model_name) ? 1 : 0
+      const sb = activeTargetFor(b.original.model_name) ? 1 : 0
       return sb - sa
     },
     cell: (info) => {
-      const route = info.row.original
-      const sticky = stickyTargetStore.targets.find(
-        (s) => s.model === route.model_name && s.status !== "idle",
-      )
+      const sticky = activeTargetFor(info.row.original.model_name)
 
       if (!sticky) {
         return h("div", { class: "flex items-center gap-1.5 text-muted-foreground/50" }, [
