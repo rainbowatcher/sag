@@ -4,7 +4,7 @@ pub mod middleware;
 pub mod routes;
 
 // ── 从 sag-state 重导出（共享状态） ───────────────────────────
-pub use sag_state::{ActiveTargets, AppState, testing::test_app_state};
+pub use sag_state::{ActiveTargets, AppState, FillFirstOrders, testing::test_app_state};
 
 // ── 从 sag-dispatch 重导出（保持向后兼容） ──────────────────────
 pub use sag_dispatch::testing::test_dispatch_runtime;

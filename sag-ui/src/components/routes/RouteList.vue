@@ -29,9 +29,9 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
+import { useStickyTargetStore } from "@/stores/stickyTarget"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-import { useStickyTargetStore } from "@/stores/stickyTarget"
 import type { RouteConfig, StickyTargetEntry } from "@/types/api"
 
 const routeStore = useRouteStore()
@@ -88,14 +88,22 @@ async function confirmDelete() {
   }
 }
 
-// ── Clear sticky target ──────────────────────────────────────────
+// ── Clear sticky target / reset fill-first order ─────────────────
 const clearingModel = ref<string | null>(null)
 
-async function clearSticky(model: string) {
+async function clearStickyTarget(entry: StickyTargetEntry) {
+  const isFillFirst = entry.strategy === "fill_first"
+  // Fill-first orders are cached under the route model name (may be "*");
+  // sticky pins under the request-model key (empty for idle entries).
+  const model = isFillFirst ? entry.model : entry.key
   clearingModel.value = model
   try {
     await stickyTargetStore.clearStickyTarget(model)
-    toast.success(`Cleared sticky pin for "${model}", will revert to priority routing`)
+    toast.success(
+      isFillFirst
+        ? `Reset fill-first order for "${entry.model}", will re-shuffle on next request`
+        : `Cleared sticky pin for "${entry.model}", will revert to priority routing`,
+    )
   } catch (e: any) {
     toast.error(getErrorMessage(e, "Failed to clear sticky target"))
   } finally {
@@ -131,6 +139,19 @@ function activeTargetFor(model: string): StickyTargetEntry | undefined {
   const pinned = candidates.filter((s) => s.status === "pinned")
   const pool = pinned.length > 0 ? pinned : candidates
   return [...pool].sort((a, b) => a.age_secs - b.age_secs)[0]
+}
+
+/**
+ * Current fill-first target for a route: the target at position 0 of the
+ * cached shuffled order — the one currently absorbing all fill-first
+ * traffic. Only meaningful for `fill_first` strategy routes (their entries
+ * never carry a sticky pin, so `activeTargetFor` is always undefined);
+ * returns undefined when the route is not fill-first or no order is cached.
+ */
+function fillFirstTargetFor(model: string): StickyTargetEntry | undefined {
+  return stickyTargetStore.targets.find(
+    (s) => s.model === model && s.strategy === "fill_first" && s.fill_first_position === 0,
+  )
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -213,16 +234,23 @@ const columns = [
       return sb - sa
     },
     cell: (info) => {
-      const sticky = activeTargetFor(info.row.original.model_name)
+      const model = info.row.original.model_name
+      const sticky = activeTargetFor(model)
+      const fill = fillFirstTargetFor(model)
+      const active = sticky ?? fill
 
-      if (!sticky) {
+      if (!active) {
         return h("div", { class: "flex items-center gap-1.5 text-muted-foreground/50" }, [
           h(PinOff, { class: "h-3 w-3 shrink-0" }),
           h("span", { class: "text-[11px]" }, "—"),
         ])
       }
 
-      const isClearing = clearingModel.value === sticky.model
+      const isFillFirst = fill !== undefined && sticky === undefined
+      // Fill-first orders are cached under the route model name ("*" for a
+      // wildcard route); sticky pins under the request-model key.
+      const resetKey = isFillFirst ? active.model : active.key
+      const isClearing = clearingModel.value === resetKey
 
       return h("div", { class: "flex items-center gap-2" }, [
         h(
@@ -230,20 +258,24 @@ const columns = [
           {
             variant: "outline",
             class: `text-[10px] leading-none px-1.5 py-0 ${
-              sticky.status === "expired"
-                ? "border-amber-500/30 bg-amber-500/10 text-amber-600"
-                : "border-green-500/30 bg-green-500/10 text-green-600"
+              isFillFirst
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
+                : active.status === "expired"
+                  ? "border-amber-500/30 bg-amber-500/10 text-amber-600"
+                  : "border-green-500/30 bg-green-500/10 text-green-600"
             }`,
           },
-          () => (sticky.status === "expired" ? "Expired" : "Active"),
+          () => (isFillFirst ? "Fill" : active.status === "expired" ? "Expired" : "Active"),
         ),
         h(
           "span",
           {
             class: "font-mono text-xs truncate max-w-[110px]",
-            title: `${sticky.provider}/${sticky.real_model} (${formatDuration(sticky.age_secs * 1000)})`,
+            title: isFillFirst
+              ? `${active.provider}/${active.real_model} — fill-first target (order cached ${formatDuration((active.fill_first_cache_age_secs ?? 0) * 1000)} ago)`
+              : `${active.provider}/${active.real_model} (${formatDuration(active.age_secs * 1000)})`,
           },
-          `${sticky.provider}/${sticky.real_model}`,
+          `${active.provider}/${active.real_model}`,
         ),
         h(
           "button",
@@ -251,9 +283,11 @@ const columns = [
             type: "button",
             class: cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "cursor-pointer"),
             disabled: isClearing,
-            onClick: () => clearSticky(sticky.model),
-            title: "Clear active target, revert to priority routing",
-            "aria-label": "Clear active target",
+            onClick: () => clearStickyTarget(active),
+            title: isFillFirst
+              ? "Reset fill-first order, re-shuffle on next request"
+              : "Clear active target, revert to priority routing",
+            "aria-label": isFillFirst ? "Reset fill-first order" : "Clear active target",
           },
           () =>
             isClearing

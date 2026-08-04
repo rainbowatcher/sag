@@ -109,6 +109,10 @@ async fn main() -> anyhow::Result<()> {
     // clearing sticky routing when a breaker is manually closed — are
     // immediately visible to dispatch ordering.
     let active_targets: sag_router::ActiveTargets = Arc::default();
+    // Fill-first shuffled-order cache. Shared the same way so admin handlers
+    // can observe the current fill-first order and reset it (manual
+    // re-shuffle) through the sticky-targets endpoints.
+    let fill_first_orders: sag_router::FillFirstOrders = Arc::default();
 
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
@@ -117,13 +121,15 @@ async fn main() -> anyhow::Result<()> {
         collector,
         circuit_breaker: route_circuit_breaker.clone(),
         active_targets: active_targets.clone(),
+        fill_first_orders: fill_first_orders.clone(),
     };
     // `with_shared_state` shares the same Arcs (rather than creating
-    // defaults) so AppState and DispatchRuntime observe the same breaker and
-    // the same sticky memory.
+    // defaults) so AppState and DispatchRuntime observe the same breaker,
+    // the same sticky memory, and the same fill-first order cache.
     let dispatch_runtime = sag_router::DispatchRuntime::with_shared_state(
         route_circuit_breaker.clone(),
         active_targets,
+        fill_first_orders,
     );
 
     // 9. Start config hot-reload watcher with a coordinator-backed handler

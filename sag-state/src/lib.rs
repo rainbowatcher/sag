@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sag_analytics::CallLogCollector;
-use sag_config::ConfigHandle;
+use sag_config::{ConfigHandle, RouteTarget};
 use sag_core::RouteCircuitBreaker;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
@@ -310,6 +310,36 @@ impl ActiveTargetsInner {
 /// closed) are immediately visible to dispatch ordering.
 pub type ActiveTargets = Arc<RwLock<ActiveTargetsInner>>;
 
+/// A cached shuffled target order for the fill-first strategy, with its
+/// creation timestamp and the config `routes_version` that produced it.
+///
+/// Lived in `sag-dispatch` until the admin layer needed to observe and
+/// reset fill-first routing through the shared `AppState`; moved here (with
+/// `FillFirstOrders`) so the admin snapshot can report the current
+/// fill-first order and a manual reset can drop it without `sag-admin`
+/// depending on the dispatch crate. `routes_version` is `None` for legacy /
+/// test-constructed entries — treated as "no version", i.e. any request may
+/// reuse or overwrite them.
+#[derive(Debug, Clone)]
+pub struct CachedOrder {
+    /// The shuffled target list in decision order; index 0 absorbs all
+    /// traffic until unavailable (fill-first), or is the base order the
+    /// sticky pin is prepended to (sticky-failover).
+    pub targets: Arc<[RouteTarget]>,
+    /// When this order was (re-)shuffled, used for the `shuffle_cache_ttl_secs`
+    /// expiry.
+    pub created_at: Instant,
+    /// Config `routes_version` that produced this cache entry.
+    pub routes_version: Option<u64>,
+}
+
+/// Shared handle for the fill-first shuffled-order cache. Shared between
+/// [`AppState`] and `DispatchRuntime` via the same `Arc` so admin handlers
+/// can observe the current fill-first order and reset it (manual
+/// re-shuffle) — the fill-first analogue of clearing `active_targets` for
+/// sticky-failover.
+pub type FillFirstOrders = Arc<RwLock<HashMap<String, CachedOrder>>>;
+
 /// Shared application state for all Axum handlers.
 ///
 /// Holds only the cross-cutting resources that every handler family
@@ -339,6 +369,13 @@ pub struct AppState {
     /// and writes the active target on a successful response only while the
     /// generation captured at decision time still matches.
     pub active_targets: ActiveTargets,
+    /// Fill-first shuffled-order cache, shared with `DispatchRuntime` via
+    /// the same `Arc`. Admin handlers read it for the sticky-target
+    /// snapshot (which target currently absorbs all fill-first traffic) and
+    /// clear it on DELETE for a fill-first route — dropping the cached
+    /// order so the next request re-shuffles, the fill-first analogue of
+    /// clearing `active_targets`.
+    pub fill_first_orders: FillFirstOrders,
 }
 
 impl AppState {
@@ -412,6 +449,7 @@ pub mod testing {
             collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
+            fill_first_orders: Arc::default(),
         }
     }
 

@@ -839,6 +839,19 @@ pub enum Strategy {
     RoundRobin,
 }
 
+impl Strategy {
+    /// Stable snake_case identifier matching the serde representation
+    /// (`rename_all = "snake_case"`), used by the admin API to annotate
+    /// route-target snapshots without a serde round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Strategy::StickyFailover => "sticky_failover",
+            Strategy::FillFirst => "fill_first",
+            Strategy::RoundRobin => "round_robin",
+        }
+    }
+}
+
 /// Per-model routing configuration.
 /// Maps a requested model name to one or more provider targets.
 ///
@@ -2020,6 +2033,33 @@ targets = [
                 .find(|r| r.model_name == "claude")
                 .unwrap();
             assert_eq!(claude.targets.len(), 1);
+        }
+
+        #[test]
+        fn strategy_as_str_matches_serde_rename() {
+            // Every Strategy variant's as_str() must match its serde
+            // snake_case representation. If a new variant is added to
+            // Strategy without updating as_str(), this test will fail.
+            let cases = [
+                (Strategy::StickyFailover, "sticky_failover"),
+                (Strategy::FillFirst, "fill_first"),
+                (Strategy::RoundRobin, "round_robin"),
+            ];
+            for (variant, expected) in &cases {
+                assert_eq!(variant.as_str(), *expected, "literal mismatch");
+                // Also verify against the serde rename to catch drift.
+                let serde_name = serde_json::to_value(variant)
+                    .unwrap()
+                    .as_str()
+                    .unwrap_or("INVALID_SERDE_OUTPUT")
+                    .to_string();
+                assert_eq!(
+                    variant.as_str(),
+                    serde_name,
+                    "as_str() mismatches serde rename for {}",
+                    serde_name
+                );
+            }
         }
     }
 }

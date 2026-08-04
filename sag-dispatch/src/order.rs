@@ -3,25 +3,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sag_config::{RouteTarget, Strategy};
+use sag_state::CachedOrder;
 use tokio::sync::RwLock;
 
-/// A cached shuffled target order with its creation timestamp.
-/// Uses `Arc` so cache hits avoid a per-request deep clone of the
-/// full target vector (including per-target `HashMap` extra fields).
-#[derive(Debug, Clone)]
-pub struct CachedOrder {
-    // `pub(crate)` so sibling module tests can construct test instances.
-    pub(crate) targets: Arc<[RouteTarget]>,
-    pub(crate) created_at: Instant,
-    /// Config `routes_version` that produced this cache entry. `None` for
-    /// legacy / test-constructed entries — treated as "no version", i.e.
-    /// any request may reuse or overwrite it (the pre-versioning behavior).
-    /// A request whose `routes_version` is older than the cached entry is
-    /// stale: it may sort its own targets locally but must not overwrite
-    /// the shared order (see [`order_fill_first`]) nor clear the shared
-    /// sticky state (see [`order_targets`]).
-    pub(crate) routes_version: Option<u64>,
-}
+// The cached shuffled-order type itself lives in `sag-state` (as
+// [`sag_state::CachedOrder`]) so the admin layer can observe and reset the
+// fill-first order through the shared `AppState`; this module re-uses it.
 
 /// Order the target list according to the route's strategy.
 ///
@@ -264,6 +251,8 @@ async fn order_fill_first(
     //   at-least-as-new entry — reuse it, preserving "shuffled once";
     // - a newer entry (higher routes_version) means this request is stale —
     //   its local shuffle is returned without touching the shared cache.
+    // `CachedOrder` is constructed with public fields now that the type
+    // lives in `sag-state`.
     let mut guard = orders.write().await;
     match guard.get(model_name) {
         // Stale: the shared cache belongs to a newer config version.

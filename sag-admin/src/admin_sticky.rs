@@ -1,21 +1,25 @@
 //! Sticky-failover active-target admin endpoints.
+//! every configured route target.
 //!
 //! - `GET /api/sticky-targets` — read-only snapshot of every target in the
-//!   current config routes, annotated with the live status of the
-//!   `active_targets` memory shared with `DispatchRuntime` (`idle` /
-//!   `pinned` / `expired`).
-//! - `DELETE /api/sticky-targets` — clear the sticky active target for a
-//!   single model (idempotent) and bump its generation, so the next request
-//!   re-evaluates the route's priority-ordered target list instead of
-//!   staying pinned to the failover target — and so in-flight requests that
-//!   decided their route before the delete can never re-pin afterwards.
+//!   current config routes, annotated with the live routing state:
+//!   sticky-failover pins (`idle` / `pinned` / `expired` from the
+//!   `active_targets` memory shared with `DispatchRuntime`) and fill-first
+//!   cached-order positions (index 0 = the target absorbing all traffic).
+//! - `DELETE /api/sticky-targets` — reset routing for a model: for a
+//!   sticky-failover route clear the active target (idempotent) and bump its
+//!   generation so the next request re-evaluates the priority-ordered list
+//!   and in-flight requests can never re-pin; for a fill-first route drop
+//!   the cached shuffled order so the next request re-shuffles.
 //!
-//! Both are mounted under `/api` by [`crate::admin::build_admin_routes`],
-//! so they are auth-protected by the `gateway_auth` middleware.
+//! Both are mounted under `/api` by [`crate::admin::build_admin_routes`], so
+//! they are auth-protected by the `gateway_auth` middleware.
 
 use axum::Json;
 use axum::extract::State;
-use sag_config::RouteTarget;
+use std::time::Instant;
+
+use sag_config::{RouteTarget, Strategy};
 use sag_state::{ActiveTargetEntry, ActiveTargetsInner, AppState};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +29,12 @@ use serde::{Deserialize, Serialize};
 pub struct StickyTargetEntry {
     /// Route `model_name` (may be `"*"` for a wildcard route).
     model: String,
+    /// Actual `active_targets` map key — the **request model** the pin was
+    /// recorded under. For an exact route this equals `model`; for a
+    /// wildcard route it is the concrete request model (e.g. `"gpt-4o"`),
+    /// which is what `DELETE /api/sticky-targets` must receive to clear the
+    /// pin. Empty string when the entry is `idle` (nothing to clear).
+    key: String,
     provider: String,
     /// Resolved real model: `target.real_model`, or the route model name
     /// when omitted (passthrough). Empty for wildcard passthrough targets
@@ -37,26 +47,53 @@ pub struct StickyTargetEntry {
     status: String,
     /// Seconds since the active entry was recorded. `0` for `idle` entries.
     age_secs: u64,
+    /// Route target-selection strategy: `"sticky_failover"`, `"fill_first"`
+    /// or `"round_robin"`. The fill-first fields below are only populated
+    /// for `"fill_first"` routes.
+    strategy: String,
+    /// Position of this target in the cached fill-first shuffled order — `0`
+    /// means this target currently absorbs all fill-first traffic. `None`
+    /// when the route is not fill-first or no order is cached yet (no
+    /// request has ever exercised the route).
+    fill_first_position: Option<u32>,
+    /// Seconds since the fill-first order was last shuffled (cache age).
+    /// `None` when no order is cached.
+    fill_first_cache_age_secs: Option<u64>,
+    /// `shuffle_cache_ttl_secs` config — after this many seconds the order
+    /// is re-shuffled. `0` means never expire. `None` when no order is
+    /// cached (or the route is not fill-first).
+    fill_first_cache_ttl_secs: Option<u64>,
 }
 
 /// `GET /api/sticky-targets`
 ///
 /// Returns `{ "targets": [StickyTargetEntry, ...] }` — one flat entry per
 /// target of every configured route (including wildcard routes), regardless
-/// of whether the `active_targets` memory holds an entry for it.
+/// of whether the `active_targets` memory holds an entry for it. For
+/// fill-first routes the entries additionally carry the cached shuffled
+/// order position (index 0 = the target currently absorbing all traffic)
+/// and the cache's age / TTL.
 pub async fn list_sticky_targets(State(state): State<AppState>) -> Json<serde_json::Value> {
     // Single config read: clone the snapshot inputs and drop the guard, so
     // the snapshot (reset secs + routes) comes from one consistent config
     // and no config read guard spans the `active_targets` await below.
-    let (reset_secs, routes) = {
+    let (reset_secs, shuffle_cache_ttl_secs, routes) = {
         let cfg = state.config.read().await;
-        (cfg.sticky_failover_reset_secs, cfg.routes.clone())
+        (
+            cfg.sticky_failover_reset_secs,
+            cfg.shuffle_cache_ttl_secs,
+            cfg.routes.clone(),
+        )
     };
 
     // Single active read: clone the whole memory (entries + generations)
     // and drop the guard before computing DTOs — the snapshot is consistent
     // and the active lock is never held across the DTO loop.
     let inner = state.active_targets.read().await.clone();
+    // Single fill-first read: clone the cached orders (the `Arc` inside
+    // `CachedOrder` makes this cheap) so the DTO loop never holds the lock.
+    let fill_first_orders = state.fill_first_orders.read().await.clone();
+    let now = Instant::now();
 
     let mut targets = Vec::new();
     for route in &routes {
@@ -72,12 +109,12 @@ pub async fn list_sticky_targets(State(state): State<AppState>) -> Json<serde_js
                 Some(rm) => rm.clone(),
                 None if route.model_name != "*" => route.model_name.clone(),
                 None => matched
-                    .map(|entry| entry.real_model.clone())
+                    .map(|(_, entry)| entry.real_model.clone())
                     .unwrap_or_default(),
             };
 
             let (status, age_secs) = match matched {
-                Some(entry) => {
+                Some((_, entry)) => {
                     let age = entry.recorded_at.elapsed().as_secs();
                     let expired = reset_secs > 0 && age >= reset_secs;
                     if expired {
@@ -89,13 +126,44 @@ pub async fn list_sticky_targets(State(state): State<AppState>) -> Json<serde_js
                 None => ("idle", 0),
             };
 
+            // Fill-first observability: report the cached shuffled order for
+            // fill-first routes only. The sticky-failover strategy also uses
+            // `order_fill_first` internally, but its observable state is the
+            // active pin above; exposing the base order there would muddy
+            // the two concepts.
+            let (fill_first_position, fill_first_cache_age_secs, fill_first_cache_ttl_secs) =
+                if route.strategy == Strategy::FillFirst {
+                    match fill_first_orders.get(&route.model_name) {
+                        Some(cached) => (
+                            cached
+                                .targets
+                                .iter()
+                                .position(|t| {
+                                    t.provider == target.provider
+                                        && t.real_model == target.real_model
+                                })
+                                .map(|i| i as u32),
+                            Some(now.duration_since(cached.created_at).as_secs()),
+                            Some(shuffle_cache_ttl_secs),
+                        ),
+                        None => (None, None, None),
+                    }
+                } else {
+                    (None, None, None)
+                };
+
             targets.push(StickyTargetEntry {
                 model: route.model_name.clone(),
+                key: matched.map(|(k, _)| k.to_string()).unwrap_or_default(),
                 provider: target.provider.clone(),
                 real_model,
                 priority: target.priority,
                 status: status.to_string(),
                 age_secs,
+                strategy: route.strategy.as_str().to_string(),
+                fill_first_position,
+                fill_first_cache_age_secs,
+                fill_first_cache_ttl_secs,
             });
         }
     }
@@ -126,7 +194,7 @@ fn match_active_target<'a>(
     cfg_routes: &[sag_config::RouteConfig],
     route_model: &str,
     target: &RouteTarget,
-) -> Option<&'a ActiveTargetEntry> {
+) -> Option<(&'a str, &'a ActiveTargetEntry)> {
     guard
         .iter()
         .filter(|(key, entry)| {
@@ -148,7 +216,6 @@ fn match_active_target<'a>(
             entry.provider == target.provider && entry.target_real_model == target.real_model
         })
         .max_by_key(|(_, entry)| entry.recorded_at)
-        .map(|(_, entry)| entry)
 }
 
 /// Request body for `DELETE /api/sticky-targets`.
@@ -159,23 +226,53 @@ pub struct DeleteStickyTargetRequest {
 
 /// `DELETE /api/sticky-targets`
 ///
-/// Clear the sticky-failover active target for `req.model`. The next request
-/// for that model falls back to the route's priority-ordered target list
-/// instead of staying pinned to the failover target. This mirrors the
-/// behaviour of `sticky_failover_reset_secs` expiring — a manual delete is
-/// an explicit "routing can re-evaluate" signal.
+/// Reset routing for `req.model` so the next request re-evaluates instead of
+/// staying pinned to a previously decided state. The exact semantics depend
+/// on the route's strategy:
 ///
-/// **Idempotent**: deleting a model with no active target is a no-op and
-/// still returns `200 OK`. A model that had per-model state (an entry or a
-/// generation tombstone) gets its generation bumped; a model with none gets
-/// the global epoch bumped instead — either way an in-flight request that
-/// decided its route before the delete cannot re-pin afterwards, and
-/// arbitrary deletes never grow the `generations` map.
+/// - **StickyFailover** (and any unmatched model): clear the sticky active
+///   target for the model and bump its generation, so the next request
+///   re-evaluates the route's priority-ordered target list instead of
+///   staying pinned to the failover target — and so in-flight requests that
+///   decided their route before the delete can never re-pin afterwards.
+/// - **FillFirst**: drop the cached shuffled order for the route, so the
+///   next request re-shuffles the same-priority targets — a manual TTL
+///   expiry, the fill-first analogue of un-pinning. Note this does **not**
+///   guarantee a different target ends up first (with two same-priority
+///   targets it is a 50/50 re-draw); the fill-first order cache is never
+///   consulted by the sticky-failover writeback, and `active_targets` is
+///   untouched for fill-first routes.
+///
+/// **Idempotent**: deleting a model with no active target / no cached order
+/// is a no-op and still returns `200 OK`.
 pub async fn delete_sticky_target(
     State(state): State<AppState>,
     Json(req): Json<DeleteStickyTargetRequest>,
 ) -> Json<serde_json::Value> {
-    state.active_targets.write().await.clear(&req.model);
+    // Resolve the request model against the current route table to pick the
+    // reset semantics. The model is the route's `model_name` ("*" for a
+    // wildcard route) — the same key the fill-first order cache is stored
+    // under. Unmatched models keep the legacy sticky-failover clear.
+    //
+    // Note: the strategy decision is based on the config snapshot taken here.
+    // After releasing the config read lock, a config hot-reload could flip
+    // the route's strategy before we take the write lock on the corresponding
+    // memory (fill_first_orders vs active_targets). If that happens the
+    // DELETE applies to the old strategy's memory — the other memory is left
+    // untouched. This is best-effort consistency: the "wrongly" cleared entry
+    // is naturally re-created by the next request / TTL / generation
+    // mechanism, and there is no data corruption risk.
+    let is_fill_first = {
+        let cfg = state.config.read().await;
+        sag_config::resolve_model_route(&cfg.routes, &req.model)
+            .map(|r| r.strategy == Strategy::FillFirst)
+            .unwrap_or(false)
+    };
+    if is_fill_first {
+        state.fill_first_orders.write().await.remove(&req.model);
+    } else {
+        state.active_targets.write().await.clear(&req.model);
+    }
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -272,6 +369,21 @@ mod tests {
         }
     }
 
+    fn route_with_strategy(
+        model: &str,
+        targets: Vec<RouteTarget>,
+        strategy: sag_config::Strategy,
+    ) -> RouteConfig {
+        RouteConfig {
+            model_name: model.into(),
+            api_endpoint: "/chat/completions".into(),
+            strategy,
+            retries: None,
+            timeout_secs: None,
+            targets,
+        }
+    }
+
     #[tokio::test]
     async fn no_routes_returns_empty_array() {
         let state = state_with_routes(vec![]).await;
@@ -304,6 +416,7 @@ mod tests {
         for entry in targets {
             assert_eq!(entry["status"], "idle");
             assert_eq!(entry["age_secs"], 0);
+            assert_eq!(entry["key"], "", "idle entries have no pin key");
         }
         assert_eq!(targets[0]["model"], "gpt-4o");
         assert_eq!(targets[0]["provider"], "openai");
@@ -356,9 +469,14 @@ mod tests {
         assert_eq!(pinned["status"], "pinned");
         assert_eq!(pinned["age_secs"], 0);
         assert_eq!(pinned["real_model"], "gpt-4o");
+        assert_eq!(
+            pinned["key"], "gpt-4o",
+            "exact-route pin key equals the route model name"
+        );
 
         let expired = targets.iter().find(|t| t["model"] == "stale").unwrap();
         assert_eq!(expired["status"], "expired");
+        assert_eq!(expired["key"], "stale");
         // `elapsed()` may straddle a second boundary, so allow 8000 or 8001.
         let age = expired["age_secs"].as_u64().unwrap();
         assert!((8000..=8001).contains(&age));
@@ -468,6 +586,10 @@ mod tests {
         assert_eq!(openai["status"], "pinned");
         assert_eq!(openai["real_model"], "gpt-4.1", "newest entry wins");
         assert_eq!(openai["model"], "*");
+        assert_eq!(
+            openai["key"], "gpt-4.1",
+            "wildcard pin key is the request model, not the '*' route name"
+        );
 
         let anthropic = targets
             .iter()
@@ -475,6 +597,7 @@ mod tests {
             .unwrap();
         assert_eq!(anthropic["status"], "pinned");
         assert_eq!(anthropic["real_model"], "claude-3-5-sonnet");
+        assert_eq!(anthropic["key"], "anything");
     }
 
     #[tokio::test]
@@ -485,6 +608,7 @@ mod tests {
         let targets = json["targets"].as_array().unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0]["status"], "idle");
+        assert_eq!(targets[0]["key"], "", "idle wildcard pin has no key");
         assert_eq!(
             targets[0]["real_model"], "",
             "wildcard passthrough with no pin has no concrete model to report"
@@ -757,6 +881,254 @@ mod tests {
         assert_eq!(
             exact["status"], "idle",
             "the wildcard-route pin must not be attributed to the exact route either"
+        );
+    }
+
+    // ── fill-first observability + manual reset ────────────────────────
+
+    #[tokio::test]
+    async fn fill_first_route_reports_strategy_and_null_cache_fields_when_absent() {
+        // A fill-first route with no cached order yet: every target reports
+        // `strategy: "fill_first"` but no position / cache metadata, and
+        // `status` stays `idle` (fill-first never writes `active_targets`).
+        let state = state_with_routes(vec![route_with_strategy(
+            "gpt-4o",
+            vec![
+                target("openai", Some("gpt-4o"), 10),
+                target("anthropic", Some("claude-3"), 5),
+            ],
+            sag_config::Strategy::FillFirst,
+        )])
+        .await;
+        let app = test_app(state);
+        let (_, json) = fetch_targets(app).await;
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        for entry in targets {
+            assert_eq!(entry["strategy"], "fill_first");
+            assert_eq!(entry["status"], "idle");
+            assert_eq!(entry["key"], "");
+            assert_eq!(entry["fill_first_position"], serde_json::Value::Null);
+            assert_eq!(entry["fill_first_cache_age_secs"], serde_json::Value::Null);
+            assert_eq!(entry["fill_first_cache_ttl_secs"], serde_json::Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn fill_first_route_reports_cached_order_position_and_age() {
+        // Inject a deterministic cached order (openai at index 0, anthropic
+        // at index 1) — the snapshot must report the position of each target
+        // in that order plus the cache age and the configured TTL.
+        let state = state_with_routes(vec![route_with_strategy(
+            "gpt-4o",
+            vec![
+                target("openai", Some("gpt-4o"), 10),
+                target("anthropic", Some("claude-3"), 10),
+            ],
+            sag_config::Strategy::FillFirst,
+        )])
+        .await;
+        {
+            let mut guard = state.fill_first_orders.write().await;
+            guard.insert(
+                "gpt-4o".into(),
+                sag_state::CachedOrder {
+                    targets: std::sync::Arc::from(vec![
+                        target("openai", Some("gpt-4o"), 10),
+                        target("anthropic", Some("claude-3"), 10),
+                    ]),
+                    created_at: Instant::now() - Duration::from_secs(123),
+                    routes_version: Some(1),
+                },
+            );
+        }
+
+        let app = test_app(state);
+        let (_, json) = fetch_targets(app).await;
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+
+        let openai = targets.iter().find(|t| t["provider"] == "openai").unwrap();
+        assert_eq!(
+            openai["fill_first_position"], 0,
+            "openai is the fill-first target (index 0 of the cached order)"
+        );
+        assert_eq!(openai["strategy"], "fill_first");
+        assert_eq!(openai["status"], "idle", "fill-first never pins");
+
+        let anthropic = targets
+            .iter()
+            .find(|t| t["provider"] == "anthropic")
+            .unwrap();
+        assert_eq!(anthropic["fill_first_position"], 1);
+
+        // Cache age: recorded 123s before the snapshot; `elapsed()` may
+        // straddle a second boundary, so allow 123 or 124.
+        let age = openai["fill_first_cache_age_secs"].as_u64().unwrap();
+        assert!((123..=124).contains(&age));
+        assert_eq!(
+            openai["fill_first_cache_ttl_secs"], 7200,
+            "default shuffle_cache_ttl_secs"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_first_cache_reports_zero_ttl_as_never_expire() {
+        // `shuffle_cache_ttl_secs = 0` means the order never expires — the
+        // snapshot must report TTL 0 (not `null`).
+        let config = sag_config::GatewayConfig {
+            shuffle_cache_ttl_secs: 0,
+            routes: vec![route_with_strategy(
+                "gpt-4o",
+                vec![target("openai", Some("gpt-4o"), 10)],
+                sag_config::Strategy::FillFirst,
+            )],
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let registry = build_provider_registry(&handle, true).await;
+        let state = test_app_state(handle, registry).await;
+        state.fill_first_orders.write().await.insert(
+            "gpt-4o".into(),
+            sag_state::CachedOrder {
+                targets: std::sync::Arc::from(vec![target("openai", Some("gpt-4o"), 10)]),
+                created_at: Instant::now(),
+                routes_version: Some(1),
+            },
+        );
+
+        let app = test_app(state);
+        let (_, json) = fetch_targets(app).await;
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0]["fill_first_cache_ttl_secs"], 0,
+            "ttl 0 must be reported as 0 (never expire), not null"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_fill_first_resets_order_cache_and_is_idempotent() {
+        // A fill-first DELETE drops the cached shuffled order (next request
+        // re-shuffles) but must NOT touch the sticky-failover active pin.
+        let state = state_with_routes(vec![route_with_strategy(
+            "gpt-4o",
+            vec![target("openai", Some("gpt-4o"), 10)],
+            sag_config::Strategy::FillFirst,
+        )])
+        .await;
+        state.fill_first_orders.write().await.insert(
+            "gpt-4o".into(),
+            sag_state::CachedOrder {
+                targets: std::sync::Arc::from(vec![target("openai", Some("gpt-4o"), 10)]),
+                created_at: Instant::now(),
+                routes_version: Some(1),
+            },
+        );
+        // A pre-existing pin on the same model (stale / injected): must
+        // survive the fill-first delete — the two memories are orthogonal.
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+
+        // First delete: drops the cached order.
+        let app = test_app(state.clone());
+        let (status, json) = delete_target(app, serde_json::json!({ "model": "gpt-4o" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+        assert!(
+            state.fill_first_orders.read().await.get("gpt-4o").is_none(),
+            "fill-first DELETE must drop the cached order"
+        );
+        assert!(
+            state.active_targets.read().await.get("gpt-4o").is_some(),
+            "fill-first DELETE must not clear the sticky active pin"
+        );
+
+        // Second delete (order already gone) is a 200 no-op — idempotent.
+        let app2 = test_app(state.clone());
+        let (status2, json2) = delete_target(app2, serde_json::json!({ "model": "gpt-4o" })).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(json2["ok"], true);
+        assert!(state.fill_first_orders.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_sticky_target_does_not_touch_fill_first_cache() {
+        // A sticky-failover DELETE clears the pin only — the fill-first
+        // order cache (which StickyFailover also uses internally as its base
+        // order) must be left alone.
+        let state = state_with_routes(vec![route(
+            "gpt-4o",
+            vec![target("openai", Some("gpt-4o"), 10)],
+        )])
+        .await;
+        state.fill_first_orders.write().await.insert(
+            "gpt-4o".into(),
+            sag_state::CachedOrder {
+                targets: std::sync::Arc::from(vec![target("openai", Some("gpt-4o"), 10)]),
+                created_at: Instant::now(),
+                routes_version: Some(1),
+            },
+        );
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+
+        let app = test_app(state.clone());
+        let (status, _) = delete_target(app, serde_json::json!({ "model": "gpt-4o" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state.active_targets.read().await.get("gpt-4o").is_none(),
+            "sticky DELETE clears the pin"
+        );
+        assert!(
+            state.fill_first_orders.read().await.contains_key("gpt-4o"),
+            "sticky DELETE must not drop the fill-first order cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_fill_first_on_wildcard_route_resets_by_route_name() {
+        // A wildcard fill-first route stores its one order under "*";
+        // DELETE with the route name "*" must drop it (the fill-first
+        // analogue of the sticky wildcard case).
+        let state = state_with_routes(vec![route_with_strategy(
+            "*",
+            vec![target("openai", None, 10)],
+            sag_config::Strategy::FillFirst,
+        )])
+        .await;
+        state.fill_first_orders.write().await.insert(
+            "*".into(),
+            sag_state::CachedOrder {
+                targets: std::sync::Arc::from(vec![target("openai", None, 10)]),
+                created_at: Instant::now(),
+                routes_version: Some(1),
+            },
+        );
+
+        let app = test_app(state.clone());
+        let (status, json) = delete_target(app, serde_json::json!({ "model": "*" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+        assert!(
+            state.fill_first_orders.read().await.get("*").is_none(),
+            "wildcard fill-first DELETE must drop the '*' order cache entry"
         );
     }
 }

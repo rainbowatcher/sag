@@ -57,3 +57,4 @@ docs/.vitepress/dist
 gateway.toml
 .zcode/
 PLAN.md
+.pi-subagents/

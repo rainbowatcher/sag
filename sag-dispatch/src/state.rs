@@ -19,7 +19,6 @@ use sag_config::{GatewayConfig, default_timeout_secs, default_ttfb_timeout_secs}
 use sag_core::compute_stale_probe_threshold;
 
 use crate::circuit_breaker::RouteCircuitBreaker;
-use crate::order::CachedOrder;
 
 /// Per-request runtime state for the dispatch engine.
 ///
@@ -36,8 +35,10 @@ pub struct DispatchRuntime {
     /// Fill-first shuffled orders keyed by route model_name.
     /// Shuffled once on first access; reused across subsequent requests
     /// until the targets for that route change (config reload) or the
-    /// TTL expires (default 2 hours).
-    pub fill_first_orders: Arc<RwLock<HashMap<String, CachedOrder>>>,
+    /// TTL expires (default 2 hours). Shared with [`AppState`] via the
+    /// same `Arc` so admin handlers can observe / reset the fill-first
+    /// order.
+    pub fill_first_orders: sag_state::FillFirstOrders,
     /// Sticky-failover active targets keyed by request model name.
     /// Stores (provider, real_model, stick_start_time) of the last successful target.
     /// The third element is the `Instant` when the sticky target was recorded,
@@ -82,10 +83,12 @@ impl DispatchRuntime {
     pub fn with_shared_state(
         route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
         active_targets: sag_state::ActiveTargets,
+        fill_first_orders: sag_state::FillFirstOrders,
     ) -> Self {
         Self {
             route_circuit_breaker,
             active_targets,
+            fill_first_orders,
             ..Default::default()
         }
     }
@@ -245,6 +248,7 @@ pub fn stale_probe_threshold_from_config(config: &GatewayConfig) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sag_state::CachedOrder;
     use std::time::Instant;
 
     /// Minimal route table for prune tests: an exact route `valid-model` and

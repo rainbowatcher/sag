@@ -186,12 +186,31 @@ export interface CircuitBreakerEntry {
   probe_in_flight: boolean
 }
 
-/** Sticky-failover active target entry returned by `GET /api/sticky-targets`. */
+/** Active-target entry returned by `GET /api/sticky-targets`. */
 export interface StickyTargetEntry {
   model: string
+  /**
+   * Actual `active_targets` map key — the request model the pin was recorded
+   * under. For an exact route this equals `model`; for a wildcard route it is
+   * the concrete request model, which is what `DELETE /api/sticky-targets`
+   * must receive to clear the pin. Empty string when the entry is `idle`.
+   */
+  key: string
   provider: string
   real_model: string
   age_secs: number
   /** "idle" | "pinned" | "expired" */
   status: string
+  /** Route strategy: "sticky_failover" | "fill_first" | "round_robin". */
+  strategy: string
+  /**
+   * Position of this target in the cached fill-first shuffled order — `0`
+   * means this target currently absorbs all fill-first traffic. `null` when
+   * the route is not fill-first or no order is cached yet.
+   */
+  fill_first_position: number | null
+  /** Seconds since the fill-first order was last shuffled. `null` when none. */
+  fill_first_cache_age_secs: number | null
+  /** `shuffle_cache_ttl_secs` config; `0` = never expire. `null` when none. */
+  fill_first_cache_ttl_secs: number | null
 }

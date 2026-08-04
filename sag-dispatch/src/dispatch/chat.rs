@@ -1605,6 +1605,7 @@ mod tests {
         let rt = DispatchRuntime::with_shared_state(
             state.circuit_breaker.clone(),
             state.active_targets.clone(),
+            state.fill_first_orders.clone(),
         );
         let req = build_request("gpt-4o", false);
         let trace_id = Uuid::new_v4();
@@ -1665,6 +1666,7 @@ mod tests {
         let rt = DispatchRuntime::with_shared_state(
             state.circuit_breaker.clone(),
             state.active_targets.clone(),
+            state.fill_first_orders.clone(),
         );
         let req = build_request("gpt-4o", false);
         let trace_id = Uuid::new_v4();
@@ -1772,6 +1774,7 @@ mod tests {
         let rt = DispatchRuntime::with_shared_state(
             state.circuit_breaker.clone(),
             state.active_targets.clone(),
+            state.fill_first_orders.clone(),
         );
         let req = build_request("gpt-4o", false);
         let trace_id = Uuid::new_v4();
