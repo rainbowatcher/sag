@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Pin, Trash2 } from "@lucide/vue"
+import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Trash2, PinOff } from "@lucide/vue"
 import {
   FlexRender,
   createColumnHelper,
@@ -88,6 +88,21 @@ async function confirmDelete() {
   }
 }
 
+// ── Clear sticky target ──────────────────────────────────────────
+const clearingModel = ref<string | null>(null)
+
+async function clearSticky(model: string) {
+  clearingModel.value = model
+  try {
+    await stickyTargetStore.clearStickyTarget(model)
+    toast.success(`Cleared sticky pin for "${model}", will revert to priority routing`)
+  } catch (e: any) {
+    toast.error(getErrorMessage(e, "Failed to clear sticky target"))
+  } finally {
+    clearingModel.value = null
+  }
+}
+
 // ── Provider enabled lookup ──────────────────────────────────────
 const disabledProviders = computed(() => {
   const set = new Set<string>()
@@ -149,7 +164,7 @@ const columns = [
         () => strategyLabels[s] || s,
       )
     },
-    meta: { class: "text-center 2xl:min-w-[140px]" },
+    meta: { class: "2xl:min-w-[140px]" },
   }),
   columnHelper.accessor("targets", {
     header: "Targets",
@@ -157,51 +172,85 @@ const columns = [
     cell: (info) => {
       const total = info.getValue().length
       const disabled = disabledTargetCount(info.row.original)
+      if (disabled === 0) {
+        return h("span", { class: "tabular-nums font-medium" }, String(total))
+      }
+      return h("div", { class: "flex items-center gap-1.5" }, [
+        h(AlertTriangle, {
+          class: "text-amber-500 h-3.5 w-3.5 shrink-0",
+        }),
+        h("span", { class: "tabular-nums font-medium text-muted-foreground" }, [
+          String(total - disabled),
+          h("span", { class: "text-muted-foreground/60" }, `/${total}`),
+        ]),
+      ])
+    },
+    meta: { class: "xl:min-w-[100px]" },
+  }),
+  columnHelper.display({
+    id: "sticky",
+    header: () => h("span", { class: "text-xs font-medium" }, "Sticky Target"),
+    sortingFn: (a, b) => {
+      const sa = stickyTargetStore.targets.some((s) => s.model === a.original.model_name) ? 1 : 0
+      const sb = stickyTargetStore.targets.some((s) => s.model === b.original.model_name) ? 1 : 0
+      return sb - sa
+    },
+    cell: (info) => {
       const route = info.row.original
       const sticky = stickyTargetStore.targets.find((s) => s.model === route.model_name)
 
-      const countEl =
-        disabled === 0
-          ? h("span", { class: "tabular-nums font-medium" }, String(total))
-          : h("div", { class: "flex items-center justify-center gap-1.5" }, [
-              h(AlertTriangle, {
-                class: "text-amber-500 h-3.5 w-3.5 shrink-0",
-              }),
-              h("span", { class: "tabular-nums font-medium text-muted-foreground" }, [
-                String(total - disabled),
-                h("span", { class: "text-muted-foreground/60" }, `/${total}`),
-              ]),
-            ])
+      if (!sticky) {
+        return h("div", { class: "flex items-center gap-1.5 text-muted-foreground/50" }, [
+          h(PinOff, { class: "h-3 w-3 shrink-0" }),
+          h("span", { class: "text-[11px]" }, "—"),
+        ])
+      }
 
-      if (!sticky) return countEl
+      const isClearing = clearingModel.value === sticky.model
 
-      return h("div", { class: "flex items-center justify-center gap-2" }, [
-        countEl,
+      return h("div", { class: "flex items-center gap-2" }, [
         h(
-          "div",
+          Badge,
           {
-            class:
-              "flex items-center gap-1 text-xs text-muted-foreground border-l pl-2 border-border",
+            variant: "outline",
+            class: `text-[10px] leading-none px-1.5 py-0 ${
+              sticky.expired
+                ? "border-amber-500/30 bg-amber-500/10 text-amber-600"
+                : "border-green-500/30 bg-green-500/10 text-green-600"
+            }`,
           },
-          [
-            h(Pin, { class: "h-3 w-3 text-indigo-500 shrink-0" }),
-            h(
-              "span",
-              {
-                class: "font-mono truncate max-w-[120px]",
-                title: `${sticky.provider}/${sticky.real_model} (${formatDuration(sticky.age_secs * 1000)})`,
-              },
-              `${sticky.provider}/${sticky.real_model}`,
-            ),
-          ],
+          () => (sticky.expired ? "Expired" : "Active"),
+        ),
+        h(
+          "span",
+          {
+            class: "font-mono text-xs truncate max-w-[110px]",
+            title: `${sticky.provider}/${sticky.real_model} (${formatDuration(sticky.age_secs * 1000)})`,
+          },
+          `${sticky.provider}/${sticky.real_model}`,
+        ),
+        h(
+          Button,
+          {
+            variant: "ghost",
+            size: "icon-sm",
+            disabled: isClearing,
+            onClick: () => clearSticky(sticky.model),
+            title: "Clear sticky pin, revert to priority routing",
+            "aria-label": "Clear sticky pin",
+          },
+          () =>
+            isClearing
+              ? h(Loader2, { class: "h-3 w-3 animate-spin" })
+              : h(Trash2, { class: "h-3 w-3 text-muted-foreground hover:text-destructive" }),
         ),
       ])
     },
-    meta: { class: "text-center xl:min-w-[180px]" },
+    meta: { class: "xl:min-w-[220px]" },
   }),
   columnHelper.display({
     id: "actions",
-    header: "",
+    header: () => h("span", { class: "text-xs font-medium" }, "Actions"),
     cell: (info) =>
       h("div", { class: "flex items-center justify-end gap-1" }, [
         h(
@@ -282,11 +331,6 @@ const table = useVueTable({
             'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
             'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
           }"
-          :data-sticky="
-            stickyTargetStore.targets.some((s) => s.model === (row.original as any).model_name)
-              ? 'true'
-              : undefined
-          "
         >
           <TableCell
             v-for="cell in row.getVisibleCells()"
