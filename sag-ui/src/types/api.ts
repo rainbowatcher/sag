@@ -192,5 +192,6 @@ export interface StickyTargetEntry {
   provider: string
   real_model: string
   age_secs: number
-  expired: boolean
+  /** "idle" | "pinned" | "expired" */
+  status: string
 }

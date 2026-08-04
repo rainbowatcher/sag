@@ -11,7 +11,7 @@ import { computed, h, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
@@ -28,7 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { formatDuration, getErrorMessage } from "@/lib/utils"
+import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 import { useStickyTargetStore } from "@/stores/stickyTarget"
@@ -189,15 +189,25 @@ const columns = [
   }),
   columnHelper.display({
     id: "sticky",
-    header: () => h("span", { class: "text-xs font-medium" }, "Sticky Target"),
+    header: () => h("span", { class: "text-xs font-medium" }, "Active Target"),
     sortingFn: (a, b) => {
-      const sa = stickyTargetStore.targets.some((s) => s.model === a.original.model_name) ? 1 : 0
-      const sb = stickyTargetStore.targets.some((s) => s.model === b.original.model_name) ? 1 : 0
+      const sa = stickyTargetStore.targets.some(
+        (s) => s.model === a.original.model_name && s.status !== "idle",
+      )
+        ? 1
+        : 0
+      const sb = stickyTargetStore.targets.some(
+        (s) => s.model === b.original.model_name && s.status !== "idle",
+      )
+        ? 1
+        : 0
       return sb - sa
     },
     cell: (info) => {
       const route = info.row.original
-      const sticky = stickyTargetStore.targets.find((s) => s.model === route.model_name)
+      const sticky = stickyTargetStore.targets.find(
+        (s) => s.model === route.model_name && s.status !== "idle",
+      )
 
       if (!sticky) {
         return h("div", { class: "flex items-center gap-1.5 text-muted-foreground/50" }, [
@@ -214,12 +224,12 @@ const columns = [
           {
             variant: "outline",
             class: `text-[10px] leading-none px-1.5 py-0 ${
-              sticky.expired
+              sticky.status === "expired"
                 ? "border-amber-500/30 bg-amber-500/10 text-amber-600"
                 : "border-green-500/30 bg-green-500/10 text-green-600"
             }`,
           },
-          () => (sticky.expired ? "Expired" : "Active"),
+          () => (sticky.status === "expired" ? "Expired" : "Active"),
         ),
         h(
           "span",
@@ -230,19 +240,19 @@ const columns = [
           `${sticky.provider}/${sticky.real_model}`,
         ),
         h(
-          Button,
+          "button",
           {
-            variant: "ghost",
-            size: "icon-sm",
+            type: "button",
+            class: cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "cursor-pointer"),
             disabled: isClearing,
             onClick: () => clearSticky(sticky.model),
-            title: "Clear sticky pin, revert to priority routing",
-            "aria-label": "Clear sticky pin",
+            title: "Clear active target, revert to priority routing",
+            "aria-label": "Clear active target",
           },
           () =>
             isClearing
               ? h(Loader2, { class: "h-3 w-3 animate-spin" })
-              : h(Trash2, { class: "h-3 w-3 text-muted-foreground hover:text-destructive" }),
+              : h(PinOff, { class: "h-3 w-3 text-muted-foreground" }),
         ),
       ])
     },
