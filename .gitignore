@@ -56,3 +56,4 @@ docs/.vitepress/dist
 .plan/
 gateway.toml
 .zcode/
+PLAN.md
