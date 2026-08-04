@@ -14,11 +14,15 @@ use crate::dispatch::ResolvedTarget;
 use crate::state::DispatchRuntime;
 
 /// Shared test target constructor — avoids copy-paste across chat / image
-/// dispatch test modules.
+/// dispatch test modules. Records an exact-route entry (`route_model` =
+/// `real_model`, explicit `target_real_model`) which matches the semantics
+/// of the exact-route scenarios these tests exercise.
 pub fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget {
     ResolvedTarget {
         provider: provider.into(),
         real_model: real_model.into(),
+        route_model: real_model.into(),
+        target_real_model: Some(real_model.into()),
         extra: std::collections::HashMap::new(),
         retries,
         timeout_secs: 120,

@@ -107,11 +107,12 @@ fn compute_routes_changed(old: &GatewayConfig, new: &GatewayConfig) -> usize {
 ///
 /// ## Lock-order invariant
 ///
-/// Every mutation follows: `mutation_lock` → `config.write()` →
-/// `providers.write()` → `bump_routes_version`. Adapter construction and
-/// file I/O happen inside `mutation_lock` but **outside** all `RwLock`
-/// write guards. This order is encapsulated by the coordinator; callers
-/// must not acquire `config.write()` or `providers.write()` directly.
+/// Every mutation follows: `mutation_lock` → `config.write()` (the config
+/// commit **and** `bump_routes_version` are atomic inside this one guard) →
+/// `providers.write()`. Adapter construction and file I/O happen inside
+/// `mutation_lock` but **outside** all `RwLock` write guards. This order is
+/// encapsulated by the coordinator; callers must not acquire
+/// `config.write()` or `providers.write()` directly.
 pub struct ConfigMutationCoordinator {
     config: ConfigHandle,
     providers: ProviderRegistry,
@@ -190,10 +191,18 @@ impl ConfigMutationCoordinator {
         // Pre-compute routes_changed before candidate is consumed.
         let routes_changed = compute_routes_changed(&old_config, &candidate);
 
-        // Step 6: Commit -- config, then providers, then version.
+        // Step 6: Commit -- config, then providers. The `routes_version`
+        // bump happens *inside* the config write guard so the new config
+        // and the bumped version are atomic w.r.t. readers: a dispatch
+        // writeback holding `config.read()` across its version read +
+        // `active_targets` write can never observe the new config with the
+        // old version (or vice versa) — it either linearizes before this
+        // mutation (the mutation waits for the read guard) or is rejected
+        // on a version mismatch.
         {
             let mut config_guard = self.config.write().await;
             *config_guard = candidate;
+            self.config.bump_routes_version();
         }
         {
             let mut providers_guard = self.providers.write().await;
@@ -204,7 +213,6 @@ impl ConfigMutationCoordinator {
                 providers_guard.insert(name.clone(), provider.clone());
             }
         }
-        self.config.bump_routes_version();
 
         // Step 7: Build report.
         let no_op = sync.added.is_empty()
@@ -316,10 +324,13 @@ impl ConfigMutationCoordinator {
                 // File was stable during the operation -- commit.
                 let routes_changed = compute_routes_changed(&old_config, &candidate);
 
-                // Commit: config -> providers -> version.
+                // Commit: config (with the routes_version bump inside the
+                // write guard — see `mutate` for the linearization
+                // guarantee this ordering provides) -> providers.
                 {
                     let mut config_guard = self.config.write().await;
                     *config_guard = candidate;
+                    self.config.bump_routes_version();
                 }
                 {
                     let mut providers_guard = self.providers.write().await;
@@ -330,7 +341,6 @@ impl ConfigMutationCoordinator {
                         providers_guard.insert(name.clone(), provider.clone());
                     }
                 }
-                self.config.bump_routes_version();
 
                 // Update accepted file revision.
                 *self.accepted_file_revision.lock().unwrap() = Some(rev2);
@@ -856,5 +866,152 @@ mod tests {
 
         let err = coord.prepare_provider_sync(&old, &new).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // ── Config read-guard / routes_version atomicity ──────────────────
+    //
+    // The dispatch sticky writeback holds `config.read()` across its
+    // routes_version read + `active_targets` write (chat.rs / image.rs).
+    // Those two tests pin the coordinator-side guarantee that protocol
+    // relies on: a mutation's config commit and its version bump are atomic
+    // under `config.write()`.
+
+    fn make_arc_coordinator() -> (Arc<ConfigMutationCoordinator>, ConfigHandle) {
+        let config = ConfigHandle::from_config(GatewayConfig {
+            ..gateway_config_base!()
+        });
+        let providers: ProviderRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let coord = Arc::new(ConfigMutationCoordinator::new(config.clone(), providers));
+        (coord, config)
+    }
+
+    fn new_route() -> RouteConfig {
+        RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            strategy: Strategy::FillFirst,
+            retries: None,
+            timeout_secs: None,
+            targets: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn config_read_guard_pins_content_and_routes_version_together() {
+        // While any config read guard is held (as the sticky writeback
+        // holds one), a concurrent mutation must be completely invisible:
+        // neither the config content nor routes_version can move, and both
+        // become visible together only after the guard is released. This is
+        // the guarantee that makes the writeback's read-compare-insert
+        // atomic against config changes.
+        let (coord, config) = make_arc_coordinator();
+        let version_before = config.routes_version();
+        let routes_before = config.read().await.routes.clone();
+
+        // Hold the read guard exactly like the dispatch writeback does.
+        let guard = config.read().await;
+
+        let task_coord = coord.clone();
+        let handle = tokio::spawn(async move { task_coord.create_route(new_route()).await });
+
+        // Run the mutation task until it blocks on `config.write()`.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // While the guard is held the mutation must be fully invisible.
+        // (`routes_version` is an atomic load and `guard.routes` reads
+        // through the guard we already hold — a second `config.read()`
+        // would deadlock, because tokio's RwLock queues new readers behind
+        // the mutation's waiting `config.write()`.)
+        assert!(
+            !handle.is_finished(),
+            "a mutation must block on config.write() while a read guard is held"
+        );
+        assert_eq!(
+            config.routes_version(),
+            version_before,
+            "routes_version must not move while a config read guard is held"
+        );
+        assert_eq!(
+            guard.routes, routes_before,
+            "config content must not change while a config read guard is held"
+        );
+
+        drop(guard);
+
+        let report = handle
+            .await
+            .expect("mutation task must complete")
+            .expect("mutation must succeed");
+        assert!(report.routes_changed >= 1);
+        assert_eq!(
+            config.routes_version(),
+            version_before + 1,
+            "commit and version bump become visible together after the guard is released"
+        );
+        assert!(
+            config
+                .read()
+                .await
+                .routes
+                .iter()
+                .any(|r| r.model_name == "gpt-4o"),
+            "the route created by the mutation must be visible after release"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_version_bump_is_atomic_with_config_commit() {
+        // The writeback protocol is only sound if a mutation's commit and
+        // its routes_version bump are atomic under `config.write()` — a
+        // version that lags the config commit would reopen the stale
+        // writeback window (read old version → mutation commits → writeback
+        // succeeds against the pre-mutation version). This test pins that
+        // atomicity by parking the mutation mid-commit on `providers.write()`
+        // (the step that follows `config.write()` in the commit order): the
+        // version must ALREADY reflect the commit while the mutation is
+        // parked, i.e. the bump happened inside the config write guard.
+        //
+        // The providers registry must be the SAME Arc the coordinator was
+        // built with — the mutation's `providers.write()` parks only on
+        // that registry.
+        let config = ConfigHandle::from_config(GatewayConfig {
+            ..gateway_config_base!()
+        });
+        let providers: ProviderRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let coord = Arc::new(ConfigMutationCoordinator::new(
+            config.clone(),
+            providers.clone(),
+        ));
+        let version_before = config.routes_version();
+
+        // Hold the provider-registry write lock so the mutation parks after
+        // its config commit (config.write() → providers.write()).
+        let providers_guard = providers.write().await;
+
+        let task_coord = coord.clone();
+        let handle = tokio::spawn(async move { task_coord.create_route(new_route()).await });
+
+        // All the mutation's awaits before `providers.write()` are
+        // uncontended, so one yield parks it there.
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "mutation must park on providers.write() mid-commit"
+        );
+        assert_eq!(
+            config.routes_version(),
+            version_before + 1,
+            "routes_version must be bumped inside the config write guard, \
+             before the provider-registry sync — a lagging version would let \
+             a stale sticky writeback slip through the window"
+        );
+
+        drop(providers_guard);
+        let report = handle
+            .await
+            .expect("mutation task must complete")
+            .expect("mutation must succeed");
+        assert!(report.routes_changed >= 1);
     }
 }

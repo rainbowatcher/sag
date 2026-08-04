@@ -234,6 +234,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         start,
         errors,
         strategy,
+        sticky_token,
         user_agent,
         client_ip,
     } = ctx;
@@ -382,15 +383,39 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         };
 
         if strategy == sag_config::Strategy::StickyFailover {
+            // Write back only while the token captured at routing decision
+            // time still matches: a DELETE / breaker close / targets-changed
+            // / prune (per-model generation, or the global epoch for
+            // no-entry clears) or any config mutation (routes_version) that
+            // happened after this request decided its route must not be
+            // overwritten by a stale pin.
+            //
+            // Linearization protocol: the config read guard is held across
+            // the version read *and* the active write, so a config mutation
+            // (which commits the new config and bumps `routes_version`
+            // atomically under `config.write()`, see
+            // `ConfigMutationCoordinator`) can never interleave between the
+            // version read and the conditional insert — either this
+            // writeback linearizes before the mutation (the mutation waits
+            // for the guard) or the version mismatch rejects the pin. The
+            // read-compare-insert itself runs under the single active write
+            // lock, atomic against concurrent clears.
+            let _config_guard = state.config.read().await;
+            let current_version = state.config.routes_version();
             let mut active = runtime.active_targets.write().await;
-            active.insert(
+            active.insert_if_generation(
                 request.model.clone(),
-                (
+                sag_state::ActiveTargetEntry::new(
                     provider_name.clone(),
                     real_model.clone(),
+                    target.route_model.clone(),
+                    target.target_real_model.clone(),
                     std::time::Instant::now(),
                 ),
+                &sticky_token,
+                current_version,
             );
+            drop(active);
         }
 
         match attempt {
@@ -683,6 +708,7 @@ mod tests {
             start: Instant::now(),
             errors,
             strategy,
+            sticky_token: sag_state::StickyToken::default(),
             user_agent: None,
             client_ip: None,
         }
@@ -1454,14 +1480,18 @@ mod tests {
         let rt = crate::testing::test_dispatch_runtime();
         let req = build_request("gpt-4o", false);
 
-        // Pre-record "second" as the active target (which has priority 5, lower than "first"'s 10)
+        // Pre-record "second" as the active target (which has priority 5,
+        // lower than "first"'s 10). The route targets are passthrough
+        // (`real_model: None`), so the pin records `target_real_model: None`.
         {
             let mut active = rt.active_targets.write().await;
             active.insert(
                 "gpt-4o".to_string(),
-                (
-                    "second".to_string(),
-                    "gpt-4o".to_string(),
+                sag_state::ActiveTargetEntry::new(
+                    "second",
+                    "gpt-4o",
+                    "gpt-4o",
+                    None,
                     std::time::Instant::now(),
                 ),
             );
@@ -1471,7 +1501,7 @@ mod tests {
         let start = Instant::now();
 
         // Resolve route (should place "second" first due to sticky active target)
-        let (resolved_targets, api_endpoint, strategy) =
+        let (resolved_targets, api_endpoint, strategy, sticky_token) =
             crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
                 .await
                 .unwrap();
@@ -1491,6 +1521,7 @@ mod tests {
             start,
             errors: &mut errors,
             strategy,
+            sticky_token,
             user_agent: None,
             client_ip: None,
         };
@@ -1522,7 +1553,7 @@ mod tests {
         let start = Instant::now();
 
         // Resolve route
-        let (resolved_targets, api_endpoint, strategy) =
+        let (resolved_targets, api_endpoint, strategy, sticky_token) =
             crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
                 .await
                 .unwrap();
@@ -1540,6 +1571,7 @@ mod tests {
             start,
             errors: &mut errors,
             strategy,
+            sticky_token,
             user_agent: None,
             client_ip: None,
         };
@@ -1553,8 +1585,250 @@ mod tests {
         {
             let active = rt.active_targets.read().await;
             let active_target = active.get("gpt-4o").unwrap();
-            assert_eq!(active_target.0, "second");
+            assert_eq!(active_target.provider, "second");
         }
+    }
+
+    #[tokio::test]
+    async fn stale_writeback_after_clear_does_not_repin() {
+        // Regression for the DELETE /api/sticky-targets race: a request that
+        // resolved its route *before* the clear must not pin its target on
+        // success afterwards. The writeback is conditional on the generation
+        // captured at decision time.
+        let m1 = Arc::new(MockProvider::new("first"));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state_with_strategy(vec![m1.clone()], Strategy::StickyFailover).await;
+
+        // Share the active_targets Arc between AppState and DispatchRuntime,
+        // mirroring production wiring — this is the "shared runtime" a stale
+        // writeback would corrupt.
+        let rt = DispatchRuntime::with_shared_state(
+            state.circuit_breaker.clone(),
+            state.active_targets.clone(),
+        );
+        let req = build_request("gpt-4o", false);
+        let trace_id = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Routing decision happens now: captures the current generation (0).
+        let (resolved_targets, api_endpoint, strategy, sticky_token) =
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(sticky_token.generation, 0);
+        assert_eq!(
+            sticky_token.routes_version,
+            state.config.routes_version(),
+            "token must carry the routes_version captured at decision time"
+        );
+
+        // DELETE /api/sticky-targets lands between decision and writeback.
+        rt.active_targets.write().await.clear("gpt-4o");
+
+        // Dispatch succeeds, but the stale token must block the pin.
+        let mut errors = Vec::new();
+        let ctx = DispatchCtx {
+            state: &state,
+            runtime: &rt,
+            request: &req,
+            targets: &resolved_targets,
+            api_endpoint: &api_endpoint,
+            is_stream: false,
+            trace_id,
+            start,
+            errors: &mut errors,
+            strategy,
+            sticky_token,
+            user_agent: None,
+            client_ip: None,
+        };
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rt.active_targets.read().await.get("gpt-4o").is_none(),
+            "stale writeback after a clear must not re-pin the deleted target"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_writeback_after_config_mutation_does_not_repin() {
+        // Regression: a request whose route decision predates a config
+        // mutation (route / provider CRUD, hot-reload) must not pin its
+        // target on success afterwards — even when the model never had an
+        // entry or generation, which the per-model generation alone cannot
+        // invalidate. The `routes_version` component of the token closes
+        // that window.
+        let m1 = Arc::new(MockProvider::new("first"));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state_with_strategy(vec![m1.clone()], Strategy::StickyFailover).await;
+        let rt = DispatchRuntime::with_shared_state(
+            state.circuit_breaker.clone(),
+            state.active_targets.clone(),
+        );
+        let req = build_request("gpt-4o", false);
+        let trace_id = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Routing decision happens now: captures (generation 0, version V).
+        let (resolved_targets, api_endpoint, strategy, sticky_token) =
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(sticky_token.generation, 0, "never had an entry");
+
+        // A config mutation lands between decision and writeback: re-create
+        // the route (any route change moves routes_version).
+        {
+            let mut cfg = state.config.write().await;
+            cfg.routes.retain(|r| r.model_name != "gpt-4o");
+            cfg.routes.push(sag_config::RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                timeout_secs: None,
+                strategy: sag_config::Strategy::StickyFailover,
+                targets: vec![sag_config::RouteTarget {
+                    provider: "first".into(),
+                    real_model: Some("gpt-4o".into()),
+                    priority: 10,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                }],
+            });
+            state.config.bump_routes_version();
+        }
+        assert!(state.config.routes_version() > sticky_token.routes_version);
+
+        // Dispatch succeeds, but the stale routes_version must block the pin.
+        let mut errors = Vec::new();
+        let ctx = DispatchCtx {
+            state: &state,
+            runtime: &rt,
+            request: &req,
+            targets: &resolved_targets,
+            api_endpoint: &api_endpoint,
+            is_stream: false,
+            trace_id,
+            start,
+            errors: &mut errors,
+            strategy,
+            sticky_token,
+            user_agent: None,
+            client_ip: None,
+        };
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rt.active_targets.read().await.get("gpt-4o").is_none(),
+            "stale writeback after a config mutation must not re-pin"
+        );
+
+        // The entry recorded by the writeback path carries the route
+        // identity (route_model + target spec) used by prune / admin.
+        // Sanity: a fresh decision after the mutation captures the new
+        // version and pins normally.
+        let (resolved_targets2, api_endpoint2, strategy2, token2) =
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        let mut errors2 = Vec::new();
+        let ctx2 = DispatchCtx {
+            state: &state,
+            runtime: &rt,
+            request: &req,
+            targets: &resolved_targets2,
+            api_endpoint: &api_endpoint2,
+            is_stream: false,
+            trace_id,
+            start,
+            errors: &mut errors2,
+            strategy: strategy2,
+            sticky_token: token2,
+            user_agent: None,
+            client_ip: None,
+        };
+        let resp2 = dispatch_chat(ctx2).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let active = rt.active_targets.read().await;
+        let entry = active.get("gpt-4o").expect("fresh decision must pin");
+        assert_eq!(entry.provider, "first");
+        assert_eq!(entry.route_model, "gpt-4o");
+        assert_eq!(entry.target_real_model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
+        // Same guarantee as `stale_writeback_after_config_mutation_does_not_repin`
+        // but the config mutation goes through the production
+        // `ConfigMutationCoordinator` (config.write() with the version bump
+        // atomic inside the guard, then providers.write()) — the exact path
+        // the sticky writeback's config read guard serializes with. A
+        // mutation between decision and writeback must invalidate the pin.
+        let m1 = Arc::new(MockProvider::new("first"));
+        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state_with_strategy(vec![m1.clone()], Strategy::StickyFailover).await;
+        let rt = DispatchRuntime::with_shared_state(
+            state.circuit_breaker.clone(),
+            state.active_targets.clone(),
+        );
+        let req = build_request("gpt-4o", false);
+        let trace_id = Uuid::new_v4();
+        let start = Instant::now();
+
+        // Routing decision happens now: captures (generation 0, version V).
+        let (resolved_targets, api_endpoint, strategy, sticky_token) =
+            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(sticky_token.generation, 0, "never had an entry");
+
+        // A config mutation lands between decision and writeback, through
+        // the real coordinator (no-op route update still bumps the version).
+        {
+            let cfg = state.config.read().await;
+            let existing = cfg
+                .routes
+                .iter()
+                .find(|r| r.model_name == "gpt-4o")
+                .cloned()
+                .expect("route must exist");
+            drop(cfg);
+            state
+                .coordinator
+                .update_route("gpt-4o", existing)
+                .await
+                .expect("coordinator update must succeed");
+        }
+        assert!(
+            state.config.routes_version() > sticky_token.routes_version,
+            "the coordinator mutation must have bumped routes_version"
+        );
+
+        // Dispatch succeeds, but the stale routes_version must block the pin.
+        let mut errors = Vec::new();
+        let ctx = DispatchCtx {
+            state: &state,
+            runtime: &rt,
+            request: &req,
+            targets: &resolved_targets,
+            api_endpoint: &api_endpoint,
+            is_stream: false,
+            trace_id,
+            start,
+            errors: &mut errors,
+            strategy,
+            sticky_token,
+            user_agent: None,
+            client_ip: None,
+        };
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            rt.active_targets.read().await.get("gpt-4o").is_none(),
+            "stale writeback after a coordinator mutation must not re-pin"
+        );
     }
 
     // ── empty-response detection tests ─────────────────────────────

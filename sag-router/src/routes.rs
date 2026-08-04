@@ -113,8 +113,9 @@ async fn chat_completions(
                 .map(|s| s.to_string())
         });
 
-    // Resolve route → ordered targets + api_endpoint + strategy
-    let (targets, api_endpoint, strategy) = match resolve_route(
+    // Resolve route → ordered targets + api_endpoint + strategy + the
+    // sticky-failover token captured at decision time.
+    let (targets, api_endpoint, strategy, sticky_token) = match resolve_route(
         &state,
         &runtime,
         &request,
@@ -144,6 +145,7 @@ async fn chat_completions(
             start,
             errors: &mut errors,
             strategy,
+            sticky_token,
             user_agent,
             client_ip,
         })
@@ -161,6 +163,7 @@ async fn chat_completions(
         start,
         errors: &mut errors,
         strategy,
+        sticky_token,
         user_agent,
         client_ip,
     })

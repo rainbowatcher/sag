@@ -45,13 +45,27 @@ pub use resolve::resolve_route;
 pub struct ResolvedTarget {
     pub provider: String,
     pub real_model: String,
+    /// The config route `model_name` that resolved this target (`"*"` for a
+    /// wildcard route). Recorded on the sticky writeback so prune and the
+    /// admin snapshot can attribute the pin to the correct route.
+    pub route_model: String,
+    /// The target's `real_model` spec (`None` = passthrough, the effective
+    /// model is the request model). Recorded on the sticky writeback so the
+    /// admin snapshot can tell a passthrough pin from an explicit pin.
+    pub target_real_model: Option<String>,
     pub extra: HashMap<String, serde_json::Value>,
     pub retries: u32,
     pub timeout_secs: u64,
 }
 
-/// Resolved route data: (ordered targets, configured `api_endpoint`, strategy).
-pub type ResolvedRoute = (Vec<ResolvedTarget>, String, Strategy);
+/// Resolved route data: (ordered targets, configured `api_endpoint`,
+/// strategy, sticky-failover token captured at decision time).
+pub type ResolvedRoute = (
+    Vec<ResolvedTarget>,
+    String,
+    Strategy,
+    sag_state::StickyToken,
+);
 
 /// Bundled parameters for a single dispatch call. Replaces the 7–8
 /// argument lists on [`dispatch_chat`] / [`dispatch_image`] so the
@@ -67,6 +81,14 @@ pub struct DispatchCtx<'a> {
     pub start: Instant,
     pub errors: &'a mut Vec<String>,
     pub strategy: Strategy,
+    /// Sticky-failover token captured when the route was ordered (see
+    /// [`crate::order::order_targets`]). The success path writes back to
+    /// `active_targets` only while all components still match — the global
+    /// epoch, the per-model generation, and the config `routes_version` —
+    /// so a clear (DELETE / breaker close / targets-changed / prune) or
+    /// config mutation that happened after the routing decision can never
+    /// be overwritten by an in-flight request's stale pin.
+    pub sticky_token: sag_state::StickyToken,
     pub user_agent: Option<String>,
     pub client_ip: Option<String>,
 }

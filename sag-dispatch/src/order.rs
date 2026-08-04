@@ -13,6 +13,14 @@ pub struct CachedOrder {
     // `pub(crate)` so sibling module tests can construct test instances.
     pub(crate) targets: Arc<[RouteTarget]>,
     pub(crate) created_at: Instant,
+    /// Config `routes_version` that produced this cache entry. `None` for
+    /// legacy / test-constructed entries — treated as "no version", i.e.
+    /// any request may reuse or overwrite it (the pre-versioning behavior).
+    /// A request whose `routes_version` is older than the cached entry is
+    /// stale: it may sort its own targets locally but must not overwrite
+    /// the shared order (see [`order_fill_first`]) nor clear the shared
+    /// sticky state (see [`order_targets`]).
+    pub(crate) routes_version: Option<u64>,
 }
 
 /// Order the target list according to the route's strategy.
@@ -25,6 +33,14 @@ pub struct CachedOrder {
 ///
 /// `RoundRobin` rotates the list so each request starts at a different
 /// position, persisting the per-model counter across calls.
+///
+/// Returns the ordered targets plus the sticky-failover token captured at
+/// the decision's linearization point (the second element carries the same
+/// two-component token for every strategy; only `StickyFailover` consumes
+/// it). The dispatch success path hands that token back to `active_targets`
+/// so a clear (DELETE / breaker close / targets-changed / prune) or config
+/// mutation that happened after this decision can never be overwritten by a
+/// stale pin.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn order_targets(
     targets: Vec<RouteTarget>,
@@ -32,10 +48,11 @@ pub async fn order_targets(
     strategy: Strategy,
     counters: &Arc<RwLock<HashMap<String, u64>>>,
     fill_first_orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
-    active_targets: &Arc<RwLock<HashMap<String, (String, String, Instant)>>>,
+    active_targets: &sag_state::ActiveTargets,
     shuffle_cache_ttl_secs: u64,
     sticky_failover_reset_secs: u64,
-) -> Vec<RouteTarget> {
+    routes_version: u64,
+) -> (Vec<RouteTarget>, sag_state::StickyToken) {
     match strategy {
         Strategy::StickyFailover => {
             let targets_changed = {
@@ -48,8 +65,42 @@ pub async fn order_targets(
             };
             if targets_changed {
                 let mut active = active_targets.write().await;
-                active.remove(model_name);
+                // The version check must hold *together with* the clear
+                // decision: only a request at least as new as the cached
+                // entry may invalidate the shared order — and with it the
+                // active pin a newer config may have recorded. The cache is
+                // re-checked under the active write lock so a cache entry
+                // written (and pin recorded) between the read above and this
+                // clear can never be clobbered by a stale request. A stale
+                // request (routes_version < cache version) falls through
+                // without clearing: the shared cache/active state belongs to
+                // the newer config.
+                let clear_gate = fill_first_orders
+                    .read()
+                    .await
+                    .get(model_name)
+                    .is_some_and(|cached| routes_version >= cached.routes_version.unwrap_or(0));
+                if clear_gate {
+                    active.clear(model_name);
+                }
             }
+
+            // Capture the sticky decision state (entry + generation + epoch)
+            // at the linearization point — *before* the async shuffle
+            // below. A clear (DELETE / breaker close / targets-changed /
+            // prune) that lands during `order_fill_first` must fail the
+            // eventual writeback, so the token has to be captured here,
+            // never after the await. The snapshot doubles as the decision
+            // input, so the returned token always represents the state this
+            // order used.
+            let sticky = {
+                let active = active_targets.read().await;
+                (
+                    active.get(model_name).cloned(),
+                    active.generation(model_name),
+                    active.epoch(),
+                )
+            };
 
             let mut shuffled = order_fill_first(
                 targets,
@@ -57,13 +108,13 @@ pub async fn order_targets(
                 fill_first_orders,
                 shuffle_cache_ttl_secs,
                 Instant::now(),
+                routes_version,
             )
             .await;
 
-            let active = active_targets.read().await;
-            if let Some((active_provider, active_real_model, created_at)) = active.get(model_name) {
+            if let Some(entry) = &sticky.0 {
                 let expired = sticky_failover_reset_secs > 0
-                    && created_at.elapsed().as_secs() >= sticky_failover_reset_secs;
+                    && entry.recorded_at.elapsed().as_secs() >= sticky_failover_reset_secs;
                 if expired {
                     // 过期：不做任何事，自然 fall through 到 fill-first 顺序。
                     // 不在此处删除 entry——避免 read-then-write 竞态；
@@ -74,26 +125,44 @@ pub async fn order_targets(
                         "sticky-failover active target expired, using fill-first order"
                     );
                 } else if let Some(idx) = shuffled.iter().position(|t| {
-                    t.provider == *active_provider
-                        && t.real_model.as_deref().unwrap_or(model_name) == *active_real_model
+                    // Target identity is provider + the target's *original*
+                    // `real_model` spec, not the effective real model: a
+                    // passthrough target (`None`) and an explicit target
+                    // (`Some(rm)`) on the same provider can both resolve to
+                    // the same effective real model, and must not be
+                    // treated as the same sticky target. The effective-model
+                    // comparison stays as a cross-check.
+                    t.provider == entry.provider
+                        && t.real_model == entry.target_real_model
+                        && t.real_model.as_deref().unwrap_or(model_name) == entry.real_model
                 }) {
                     let active_target = shuffled.remove(idx);
                     shuffled.insert(0, active_target);
                 }
             }
-            shuffled
+            (
+                shuffled,
+                sag_state::StickyToken::new(sticky.2, sticky.1, routes_version),
+            )
         }
         Strategy::FillFirst => {
-            order_fill_first(
+            let ordered = order_fill_first(
                 targets,
                 model_name,
                 fill_first_orders,
                 shuffle_cache_ttl_secs,
                 Instant::now(),
+                routes_version,
             )
-            .await
+            .await;
+            // Epoch 0: fill-first never writes back to `active_targets`, so
+            // the token's epoch/generation components are inert.
+            (ordered, sag_state::StickyToken::new(0, 0, routes_version))
         }
-        Strategy::RoundRobin => order_round_robin(targets, model_name, counters).await,
+        Strategy::RoundRobin => {
+            let ordered = order_round_robin(targets, model_name, counters).await;
+            (ordered, sag_state::StickyToken::new(0, 0, routes_version))
+        }
     }
 }
 
@@ -122,11 +191,18 @@ fn targets_match(a: &[RouteTarget], b: &[RouteTarget]) -> bool {
 
 /// Shuffle same-priority targets once and cache the result.
 ///
-/// - First access: shuffle and cache with current timestamp.
-/// - Subsequent access with same targets: return cached order.
+/// - First access: shuffle and cache with current timestamp and the
+///   `routes_version` that produced this resolve.
+/// - Subsequent access with same targets and an at-least-as-new
+///   `routes_version`: return cached order.
 /// - If TTL (`shuffle_cache_ttl_secs`) has elapsed since last shuffle:
 ///   re-shuffle and update timestamp.
 /// - If targets changed (config reload): re-shuffle regardless of TTL.
+/// - If this request's `routes_version` is **older** than the cached
+///   entry's: the request is stale — it sorted against an older config. It
+///   shuffles locally and returns without touching the shared cache, so a
+///   stale request can never clobber an order established by a newer
+///   config (the cache pollution half of the stale-request bug).
 ///
 /// This gives a fair initial distribution while keeping the "fill first"
 /// stickiness: the first target in the shuffled order absorbs all traffic
@@ -138,33 +214,40 @@ async fn order_fill_first(
     orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
     ttl_secs: u64,
     now: Instant,
+    routes_version: u64,
 ) -> Vec<RouteTarget> {
     // Stable sort by priority descending so same-priority items are
     // adjacent and in TOML insertion order before shuffling.
     targets.sort_by_key(|t| std::cmp::Reverse(t.priority));
-    let mut guard = orders.write().await;
 
-    // Reuse cached order when targets haven't changed AND TTL hasn't expired.
-    if let Some(cached) = guard.get(model_name)
-        && targets_match(&targets, &cached.targets)
+    // Fast path: reuse a cached order when this request is at least as new
+    // as the cached entry (`None` = legacy entry, treated as version 0) and
+    // the targets still match and the TTL hasn't expired. Reads under a
+    // read lock so cache hits never serialize on the write lock.
     {
-        let age_secs = now.duration_since(cached.created_at).as_secs();
-        // ttl_secs == 0 → never expire (cache lasts until config change).
-        // ttl_secs > 0 → expire after that many seconds.
-        if ttl_secs == 0 || age_secs < ttl_secs {
-            return cached.targets.to_vec();
+        let guard = orders.read().await;
+        if let Some(cached) = guard.get(model_name)
+            && routes_version >= cached.routes_version.unwrap_or(0)
+            && targets_match(&targets, &cached.targets)
+        {
+            let age_secs = now.duration_since(cached.created_at).as_secs();
+            // ttl_secs == 0 → never expire (cache lasts until config change).
+            // ttl_secs > 0 → expire after that many seconds.
+            if ttl_secs == 0 || age_secs < ttl_secs {
+                return cached.targets.to_vec();
+            }
+            // TTL expired — fall through to re-shuffle.
+            tracing::info!(
+                model = %model_name,
+                age_secs,
+                ttl_secs,
+                "fill-first shuffle cache expired, re-shuffling"
+            );
         }
-        // TTL expired — fall through to re-shuffle.
-        tracing::info!(
-            model = %model_name,
-            age_secs,
-            ttl_secs,
-            "fill-first shuffle cache expired, re-shuffling"
-        );
     }
 
-    // First access, targets changed, or TTL expired: shuffle within each
-    // priority group.
+    // First access, targets changed, TTL expired, or stale request: shuffle
+    // within each priority group.
     let mut i = 0;
     while i < targets.len() {
         let prio = targets[i].priority;
@@ -176,13 +259,41 @@ async fn order_fill_first(
         i = j;
     }
 
-    guard.insert(
-        model_name.to_string(),
-        CachedOrder {
-            targets: Arc::from(targets.clone()),
-            created_at: now,
-        },
-    );
+    // Write-back path. Re-checks the cache under the write lock:
+    // - a concurrent request may have just populated a matching,
+    //   at-least-as-new entry — reuse it, preserving "shuffled once";
+    // - a newer entry (higher routes_version) means this request is stale —
+    //   its local shuffle is returned without touching the shared cache.
+    let mut guard = orders.write().await;
+    match guard.get(model_name) {
+        // Stale: the shared cache belongs to a newer config version.
+        Some(cached) if routes_version < cached.routes_version.unwrap_or(0) => {}
+        Some(cached) => {
+            if targets_match(&targets, &cached.targets)
+                && (ttl_secs == 0 || now.duration_since(cached.created_at).as_secs() < ttl_secs)
+            {
+                return cached.targets.to_vec();
+            }
+            guard.insert(
+                model_name.to_string(),
+                CachedOrder {
+                    targets: Arc::from(targets.clone()),
+                    created_at: now,
+                    routes_version: Some(routes_version),
+                },
+            );
+        }
+        None => {
+            guard.insert(
+                model_name.to_string(),
+                CachedOrder {
+                    targets: Arc::from(targets.clone()),
+                    created_at: now,
+                    routes_version: Some(routes_version),
+                },
+            );
+        }
+    }
     targets
 }
 
@@ -242,9 +353,9 @@ mod tests {
             })
             .collect();
 
-        let first = order_fill_first(targets.clone(), "m", &orders, ttl, Instant::now()).await;
-        let second = order_fill_first(targets.clone(), "m", &orders, ttl, Instant::now()).await;
-        let third = order_fill_first(targets, "m", &orders, ttl, Instant::now()).await;
+        let first = order_fill_first(targets.clone(), "m", &orders, ttl, Instant::now(), 1).await;
+        let second = order_fill_first(targets.clone(), "m", &orders, ttl, Instant::now(), 1).await;
+        let third = order_fill_first(targets, "m", &orders, ttl, Instant::now(), 1).await;
 
         assert_eq!(first, second, "cached order must be stable");
         assert_eq!(second, third, "cached order must be stable");
@@ -276,16 +387,16 @@ mod tests {
             .collect();
 
         let t0 = Instant::now();
-        let first = order_fill_first(targets.clone(), "m", &orders, ttl, t0).await;
+        let first = order_fill_first(targets.clone(), "m", &orders, ttl, t0, 1).await;
         // Cache is fresh — next call returns same order.
-        let second = order_fill_first(targets.clone(), "m", &orders, ttl, t0).await;
+        let second = order_fill_first(targets.clone(), "m", &orders, ttl, t0, 1).await;
         assert_eq!(first, second, "same order while cache is fresh");
 
         // Advance time past TTL — the first call must expire and update
         // the cache timestamp. This directly proves the TTL expiry path
         // executed, without relying on shuffle probability.
         let t1 = t0 + std::time::Duration::from_secs(2);
-        let _next = order_fill_first(targets.clone(), "m", &orders, ttl, t1).await;
+        let _next = order_fill_first(targets.clone(), "m", &orders, ttl, t1, 1).await;
         let guard = orders.read().await;
         let cached = guard.get("m").expect("cache entry must exist");
         assert!(
@@ -300,7 +411,7 @@ mod tests {
         let orders = orders_map();
         let ttl = 7200;
         let targets = vec![target("low", 1), target("high-b", 10), target("high-a", 10)];
-        let ordered = order_fill_first(targets, "m", &orders, ttl, Instant::now()).await;
+        let ordered = order_fill_first(targets, "m", &orders, ttl, Instant::now(), 1).await;
 
         let priorities: Vec<u32> = ordered.iter().map(|t| t.priority).collect();
         assert_eq!(&priorities[..2], &[10, 10], "first two must be priority 10");
@@ -314,14 +425,14 @@ mod tests {
         let targets_a: Vec<RouteTarget> = vec![target("a", 0), target("b", 0)];
         let targets_b: Vec<RouteTarget> = vec![target("a", 0), target("b", 0), target("c", 0)];
 
-        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
-        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(a1, a2, "same targets → cached");
 
         // Targets changed (added "c") → must re-shuffle
-        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now()).await;
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(b1.len(), 3, "new target list includes c");
-        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now()).await;
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
@@ -346,17 +457,17 @@ mod tests {
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
         }];
 
-        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
-        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(a1, a2, "same targets → cached");
 
         // Extra changed → must re-shuffle even though provider/real_model/priority are identical
-        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now()).await;
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(
             b1[0].extra.get("temperature").unwrap(),
             &serde_json::json!(0.9)
         );
-        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now()).await;
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
@@ -381,20 +492,20 @@ mod tests {
             extra: HashMap::new(),
         }];
 
-        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
-        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now()).await;
+        let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
+        let a2 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(a1, a2, "same targets → cached");
 
         // Retries changed → must re-shuffle even though provider/real_model/priority are identical
-        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now()).await;
+        let b1 = order_fill_first(targets_b.clone(), "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(b1[0].retries, Some(3));
-        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now()).await;
+        let b2 = order_fill_first(targets_b, "m", &orders, ttl, Instant::now(), 1).await;
         assert_eq!(b1, b2, "cached after re-shuffle");
     }
 
     #[allow(clippy::type_complexity)]
-    fn active_map() -> Arc<RwLock<HashMap<String, (String, String, Instant)>>> {
-        Arc::new(RwLock::new(HashMap::new()))
+    fn active_map() -> sag_state::ActiveTargets {
+        Arc::new(RwLock::new(sag_state::ActiveTargetsInner::new()))
     }
 
     #[tokio::test]
@@ -406,7 +517,7 @@ mod tests {
         let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
 
         // First call: starts at 0
-        let r1 = order_targets(
+        let (r1, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::RoundRobin,
@@ -415,12 +526,13 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
         assert_eq!(r1[0].provider, "a");
 
         // Second call: starts at 1
-        let r2 = order_targets(
+        let (r2, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::RoundRobin,
@@ -429,12 +541,13 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
         assert_eq!(r2[0].provider, "b");
 
         // Third call: starts at 2
-        let r3 = order_targets(
+        let (r3, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::RoundRobin,
@@ -443,12 +556,13 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
         assert_eq!(r3[0].provider, "c");
 
         // Fourth call: wraps back to 0
-        let r4 = order_targets(
+        let (r4, _) = order_targets(
             targets,
             "model",
             Strategy::RoundRobin,
@@ -457,6 +571,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
         assert_eq!(r4[0].provider, "a");
@@ -470,7 +585,7 @@ mod tests {
         let ttl = 7200;
         let targets = vec![target("a", 0), target("b", 0)];
 
-        let r1 = order_targets(
+        let (r1, _) = order_targets(
             targets.clone(),
             "model-a",
             Strategy::RoundRobin,
@@ -479,9 +594,10 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
-        let r2 = order_targets(
+        let (r2, _) = order_targets(
             targets.clone(),
             "model-b",
             Strategy::RoundRobin,
@@ -490,6 +606,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -506,16 +623,19 @@ mod tests {
         let ttl = 7200;
         let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
 
-        // Record "b" as the active target
+        // Record "b" as the active target. The route targets are passthrough
+        // (`real_model: None`, see `target()`), so the pin must record
+        // `target_real_model: None` — the identity that dispatch actually
+        // writes back for a passthrough target.
         {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                ("b".to_string(), "model".to_string(), Instant::now()),
+                sag_state::ActiveTargetEntry::new("b", "model", "model", None, Instant::now()),
             );
         }
 
-        let ordered = order_targets(
+        let (ordered, token) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
@@ -524,16 +644,230 @@ mod tests {
             &active,
             ttl,
             0,
+            5,
         )
         .await;
 
+        // Fresh memory, nothing cleared: the decision captured 0.
+        assert_eq!(token.generation, 0);
+        // The token carries the routes_version captured at decision time.
+        assert_eq!(token.routes_version, 5);
         // "b" must be prepended to the front (index 0)
         assert_eq!(ordered[0].provider, "b");
-        // Remaining targets are preserved
-        let remaining: Vec<String> = ordered[1..].iter().map(|t| t.provider.clone()).collect();
-        assert!(remaining.contains(&"a".to_string()));
-        assert!(remaining.contains(&"c".to_string()));
-        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_identity_is_provider_plus_original_real_model_spec() {
+        // A passthrough target (`real_model: None`) and an explicit target
+        // (`real_model: Some(model_name)`) on the same provider and priority
+        // resolve to the SAME effective real model ("model"). Sticky must
+        // still match only the exact target that was pinned — matching by
+        // provider + effective model alone would hoist whichever target
+        // happens to appear first in the shuffled order.
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let targets = vec![
+            RouteTarget {
+                provider: "openai".into(),
+                real_model: None, // passthrough — effective model = "model"
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            },
+            RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("model".into()), // explicit — same effective model
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            },
+        ];
+
+        // Pin the passthrough target (original spec `None`).
+        {
+            let mut guard = active.write().await;
+            guard.insert(
+                "model".to_string(),
+                sag_state::ActiveTargetEntry::new(
+                    "openai",
+                    "model", // effective real model (passthrough = request model)
+                    "model",
+                    None, // original spec: passthrough
+                    Instant::now(),
+                ),
+            );
+        }
+
+        let (ordered, _) = order_targets(
+            targets.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            7200,
+            0,
+            1,
+        )
+        .await;
+        assert_eq!(
+            ordered[0].real_model, None,
+            "sticky must prepend the pinned passthrough target, not the explicit one"
+        );
+
+        // Pin the explicit target (original spec `Some("model")`) instead.
+        {
+            let mut guard = active.write().await;
+            guard.insert(
+                "model".to_string(),
+                sag_state::ActiveTargetEntry::new(
+                    "openai",
+                    "model", // effective real model (explicit override)
+                    "model",
+                    Some("model".to_string()), // original spec: explicit
+                    Instant::now(),
+                ),
+            );
+        }
+
+        let (ordered2, _) = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            7200,
+            0,
+            1,
+        )
+        .await;
+        assert_eq!(
+            ordered2[0].real_model.as_deref(),
+            Some("model"),
+            "sticky must prepend the pinned explicit target, not the passthrough one"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_token_is_captured_before_the_async_shuffle_window() {
+        // The token must represent the decision state read *before* the
+        // async `order_fill_first` — a clear that lands after the decision
+        // (e.g. during the shuffle, or between the decision and the
+        // writeback) must invalidate the token, not be masked by it.
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let targets = vec![target("a", 0), target("b", 0)];
+
+        // Passthrough targets → the pin records `target_real_model: None`.
+        {
+            let mut guard = active.write().await;
+            guard.insert(
+                "model".to_string(),
+                sag_state::ActiveTargetEntry::new("b", "model", "model", None, Instant::now()),
+            );
+        }
+
+        // Decision happens now, with an existing entry and a fresh (never
+        // cleared) generation → token captures (0, 5). The targets are
+        // passthrough (`real_model: None`), so the pin records
+        // `target_real_model: None`.
+        let (ordered, token) = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            7200,
+            0,
+            5,
+        )
+        .await;
+        assert_eq!(ordered[0].provider, "b", "sticky entry must be prepended");
+        assert_eq!(token.generation, 0);
+        assert_eq!(token.routes_version, 5);
+
+        // A clear lands *after* the decision (the exact window the reviewer
+        // flagged: between `order_fill_first` and the writeback). The token
+        // captured at decision time must now be rejected — this is only
+        // possible if the token was captured before the clear, i.e. at the
+        // linearization point rather than after the async shuffle.
+        active.write().await.clear("model");
+        let mut guard = active.write().await;
+        assert!(
+            !guard.insert_if_generation(
+                "model".into(),
+                sag_state::ActiveTargetEntry::new(
+                    "b",
+                    "model",
+                    "model",
+                    Some("model".to_string()),
+                    Instant::now(),
+                ),
+                &token,
+                5,
+            ),
+            "a clear after the decision must reject the captured token"
+        );
+        assert!(
+            guard.get("model").is_none(),
+            "the stale writeback must not re-pin the cleared entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_failover_token_is_rejected_when_routes_version_moves() {
+        // A config mutation after the decision (route / provider CRUD,
+        // hot-reload) moves `routes_version`; even a decision that captured
+        // the *current* per-model generation (here: `None`, never cleared)
+        // must not write back — this covers models that never had an entry.
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let targets = vec![target("a", 0)];
+
+        let (_, token) = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            7200,
+            0,
+            5,
+        )
+        .await;
+        assert_eq!(token.generation, 0, "model never had an entry");
+
+        // Simulate a config mutation after the decision: writeback with the
+        // old routes_version must be rejected, even though the per-model
+        // generation is unchanged.
+        let mut guard = active.write().await;
+        assert!(
+            !guard.insert_if_generation(
+                "model".into(),
+                sag_state::ActiveTargetEntry::new(
+                    "a",
+                    "model",
+                    "model",
+                    Some("model".to_string()),
+                    Instant::now(),
+                ),
+                &token,
+                6,
+            ),
+            "a config mutation after the decision must reject the writeback"
+        );
+        assert!(
+            guard.get("model").is_none(),
+            "the stale writeback must not pin a model whose route state changed"
+        );
     }
 
     #[tokio::test]
@@ -555,6 +889,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -563,12 +898,18 @@ mod tests {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                ("b".to_string(), "model".to_string(), Instant::now()),
+                sag_state::ActiveTargetEntry::new(
+                    "b",
+                    "model",
+                    "model",
+                    Some("model".to_string()),
+                    Instant::now(),
+                ),
             );
         }
 
         // Run again with targets_b (which is different)
-        let ordered = order_targets(
+        let (ordered, generation) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
@@ -577,6 +918,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -588,6 +930,9 @@ mod tests {
                 "active target must be cleared on config change"
             );
         }
+        // The clear also bumped the generation: the decision in *this* call
+        // captured the post-clear generation.
+        assert_eq!(generation.generation, 1);
 
         // And the first element should be whatever fill_first decided, not necessarily "b"
         // (no prepending happens).
@@ -647,6 +992,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -655,12 +1001,18 @@ mod tests {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                ("b".to_string(), "model".to_string(), Instant::now()),
+                sag_state::ActiveTargetEntry::new(
+                    "b",
+                    "model",
+                    "model",
+                    Some("model".to_string()),
+                    Instant::now(),
+                ),
             );
         }
 
         // Run again with targets_b (extra changed but provider/real_model/priority identical)
-        let ordered = order_targets(
+        let (ordered, generation) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
@@ -669,6 +1021,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -680,6 +1033,10 @@ mod tests {
                 "active target must be cleared when extra changes"
             );
         }
+        assert_eq!(
+            generation.generation, 1,
+            "targets-changed clear must bump the generation"
+        );
 
         // The returned targets must carry the new extra value
         let a_target = ordered.iter().find(|t| t.provider == "a").unwrap();
@@ -742,6 +1099,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -750,12 +1108,18 @@ mod tests {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                ("b".to_string(), "model".to_string(), Instant::now()),
+                sag_state::ActiveTargetEntry::new(
+                    "b",
+                    "model",
+                    "model",
+                    Some("model".to_string()),
+                    Instant::now(),
+                ),
             );
         }
 
         // Run again with targets_b (retries changed but provider/real_model/priority identical)
-        let ordered = order_targets(
+        let (ordered, generation) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
@@ -764,6 +1128,7 @@ mod tests {
             &active,
             ttl,
             0,
+            1,
         )
         .await;
 
@@ -775,6 +1140,10 @@ mod tests {
                 "active target must be cleared when retries changes"
             );
         }
+        assert_eq!(
+            generation.generation, 1,
+            "targets-changed clear must bump the generation"
+        );
 
         // The returned targets must carry the new retries value
         let a_target = ordered.iter().find(|t| t.provider == "a").unwrap();
@@ -790,7 +1159,7 @@ mod tests {
 
         // Baseline: no active entry -> primes the fill-first cache with a
         // fixed shuffled order.
-        let baseline = order_targets(
+        let (baseline, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::StickyFailover,
@@ -799,17 +1168,22 @@ mod tests {
             &active,
             7200,
             3600, // reset window, irrelevant: no active entry exists
+            1,
         )
         .await;
 
-        // Insert an EXPIRED active entry pointing at "b".
+        // Insert an EXPIRED active entry pointing at "b". Passthrough
+        // targets → the pin records `target_real_model: None`, so the
+        // identity matches and the expiry logic decides the outcome.
         {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                (
-                    "b".to_string(),
-                    "model".to_string(),
+                sag_state::ActiveTargetEntry::new(
+                    "b",
+                    "model",
+                    "model",
+                    None,
                     Instant::now() - std::time::Duration::from_secs(7200),
                 ),
             );
@@ -817,7 +1191,7 @@ mod tests {
 
         // Re-run: cache is already primed (same shuffle), only difference
         // is the expired active entry.
-        let ordered = order_targets(
+        let (ordered, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
@@ -826,6 +1200,7 @@ mod tests {
             &active,
             7200,
             3600, // entry is 7200s old, window is 3600s -> expired
+            1,
         )
         .await;
 
@@ -845,16 +1220,17 @@ mod tests {
         let ttl = 7200;
         let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
 
-        // Record "b" as the active target, freshly created.
+        // Record "b" as the active target, freshly created. Passthrough
+        // targets → the pin records `target_real_model: None`.
         {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                ("b".to_string(), "model".to_string(), Instant::now()),
+                sag_state::ActiveTargetEntry::new("b", "model", "model", None, Instant::now()),
             );
         }
 
-        let ordered = order_targets(
+        let (ordered, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
@@ -863,6 +1239,7 @@ mod tests {
             &active,
             ttl,
             3600, // reset window: 3600s - the fresh entry is not expired
+            1,
         )
         .await;
 
@@ -887,15 +1264,17 @@ mod tests {
             let mut guard = active.write().await;
             guard.insert(
                 "model".to_string(),
-                (
-                    "b".to_string(),
-                    "model".to_string(),
+                sag_state::ActiveTargetEntry::new(
+                    "b",
+                    "model",
+                    "model",
+                    None,
                     Instant::now() - std::time::Duration::from_secs(7200),
                 ),
             );
         }
 
-        let ordered = order_targets(
+        let (ordered, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
@@ -904,11 +1283,222 @@ mod tests {
             &active,
             ttl,
             0, // reset window: 0 -> never expire
+            1,
         )
         .await;
 
         // Even though the entry is old, ttl=0 means never reset - "b" must
         // still be prepended.
         assert_eq!(ordered[0].provider, "b");
+    }
+
+    // ── stale-request regression: old config must not pollute the shared
+    //    ordering cache / sticky state of a newer config ────────────────
+
+    #[tokio::test]
+    async fn stale_request_does_not_clear_new_pin_or_overwrite_new_cache() {
+        // Reviewer trigger sequence: request A resolves old targets at
+        // routes_version V; the config becomes V+1; request B builds a new
+        // CachedOrder and successfully pins; A (stale) then enters
+        // `order_targets` and must neither clear B's pin nor overwrite B's
+        // cache with its old targets.
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets_a = vec![target("a", 0), target("b", 0)];
+        let targets_b = vec![target("a", 0), target("b", 0), target("c", 0)];
+
+        // Request B (routes_version 2) builds the new cache and pins "b".
+        let (ordered_b, token_b) = order_targets(
+            targets_b.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0,
+            2,
+        )
+        .await;
+        assert_eq!(ordered_b.len(), 3);
+        {
+            let mut guard = active.write().await;
+            assert!(
+                guard.insert_if_generation(
+                    "model".into(),
+                    sag_state::ActiveTargetEntry::new("b", "model", "model", None, Instant::now()),
+                    &token_b,
+                    2,
+                ),
+                "B's pin must record"
+            );
+        }
+        assert_eq!(
+            orders.read().await.get("model").unwrap().routes_version,
+            Some(2),
+            "B's cache must carry its routes_version"
+        );
+
+        // Request A (routes_version 1, old targets) continues into
+        // `order_targets` *after* B.
+        let (ordered_a, _) = order_targets(
+            targets_a,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0,
+            1,
+        )
+        .await;
+
+        // A must NOT clear B's active pin...
+        assert!(
+            active.read().await.get("model").is_some(),
+            "stale request must not clear the new active pin"
+        );
+        // ...must NOT overwrite B's CachedOrder...
+        let guard = orders.read().await;
+        let cached = guard.get("model").unwrap();
+        assert_eq!(cached.routes_version, Some(2), "cache version must stay 2");
+        assert_eq!(
+            cached.targets.len(),
+            3,
+            "cache must still hold B's targets, not A's stale ones"
+        );
+        // ...and A still received a local order over its own old targets.
+        assert_eq!(ordered_a.len(), 2, "A sorts its own old targets locally");
+
+        // A later request at the NEW version still uses B's cache/active.
+        let (ordered_new, token_new) = order_targets(
+            targets_b,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0,
+            2,
+        )
+        .await;
+        assert_eq!(ordered_new.len(), 3, "new-version request uses B's cache");
+        assert_eq!(
+            ordered_new[0].provider, "b",
+            "new-version request still honors B's pin"
+        );
+        assert_eq!(token_new.generation, 0, "B's pin was never cleared");
+    }
+
+    #[tokio::test]
+    async fn stale_request_with_matching_targets_does_not_overwrite_new_cache() {
+        // The config version moved but the route's targets are unchanged: a
+        // stale request must still not downgrade the newer cache entry even
+        // though its targets match the cached ones.
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        let targets = vec![target("a", 0), target("b", 0)];
+
+        // B (version 2) establishes the cache.
+        order_targets(
+            targets.clone(),
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0,
+            2,
+        )
+        .await;
+        assert_eq!(
+            orders.read().await.get("model").unwrap().routes_version,
+            Some(2)
+        );
+
+        // A (version 1) with identical targets: shuffles locally and leaves
+        // the version-2 cache intact.
+        let (ordered_a, _) = order_targets(
+            targets,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0,
+            1,
+        )
+        .await;
+        assert_eq!(ordered_a.len(), 2);
+        let guard = orders.read().await;
+        assert_eq!(
+            guard.get("model").unwrap().routes_version,
+            Some(2),
+            "stale request must not downgrade the cache version"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cache_without_version_keeps_clear_and_update_behavior() {
+        // A cache entry without a routes_version (pre-versioning era / test
+        // fixture): any request may invalidate it — the current behavior is
+        // preserved, i.e. targets change → clear the pin + replace cache.
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let ttl = 7200;
+        orders.write().await.insert(
+            "model".into(),
+            CachedOrder {
+                targets: Arc::from([target("a", 0), target("b", 0)]),
+                created_at: Instant::now(),
+                routes_version: None,
+            },
+        );
+        active.write().await.insert(
+            "model".into(),
+            sag_state::ActiveTargetEntry::new(
+                "b",
+                "model",
+                "model",
+                Some("model".into()),
+                Instant::now(),
+            ),
+        );
+
+        // New targets at version 1: must clear the pin, bump the generation,
+        // and replace the legacy cache (now versioned).
+        let targets_b = vec![target("a", 0), target("b", 0), target("c", 0)];
+        let (ordered, token) = order_targets(
+            targets_b,
+            "model",
+            Strategy::StickyFailover,
+            &counters,
+            &orders,
+            &active,
+            ttl,
+            0,
+            1,
+        )
+        .await;
+
+        assert_eq!(ordered.len(), 3);
+        assert!(
+            active.read().await.get("model").is_none(),
+            "legacy cache + changed targets must clear the pin"
+        );
+        assert_eq!(token.generation, 1, "the clear bumped the generation");
+        let guard = orders.read().await;
+        let cached = guard.get("model").unwrap();
+        assert_eq!(cached.routes_version, Some(1), "cache is now versioned");
+        assert_eq!(cached.targets.len(), 3);
     }
 }

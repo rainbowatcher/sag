@@ -132,6 +132,12 @@ impl GatewayConfig {
         })
     }
 
+    /// Resolve a request `model` to its route: an exact `model_name` match
+    /// first, falling back to the `"*"` wildcard route.
+    pub fn resolve_route<'a>(&'a self, model: &str) -> Option<&'a RouteConfig> {
+        resolve_model_route(&self.routes, model)
+    }
+
     /// Validate the configuration, returning all semantic errors found.
     /// Returns `Ok(())` if no errors, `Err(Vec<String>)` with all error messages.
     pub fn validate(&self) -> std::result::Result<(), Vec<String>> {
@@ -882,6 +888,20 @@ pub struct RouteConfig {
 
 fn default_api_endpoint() -> String {
     "/chat/completions".into()
+}
+
+/// Resolve a request `model` against a route table: an exact `model_name`
+/// match first, falling back to the `"*"` wildcard route. Returns the
+/// matching route, or `None` when the model does not belong to any route.
+///
+/// Shared by the dispatch resolver, the stale-entry prune, and the admin
+/// sticky-target snapshot so all three agree on which route a request model
+/// belongs to.
+pub fn resolve_model_route<'a>(routes: &'a [RouteConfig], model: &str) -> Option<&'a RouteConfig> {
+    routes
+        .iter()
+        .find(|r| r.model_name == model)
+        .or_else(|| routes.iter().find(|r| r.model_name == "*"))
 }
 
 impl RouteConfig {

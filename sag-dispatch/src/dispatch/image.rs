@@ -35,6 +35,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         start,
         errors,
         strategy,
+        sticky_token,
         user_agent,
         client_ip,
     } = ctx;
@@ -138,15 +139,29 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         };
 
         if strategy == sag_config::Strategy::StickyFailover {
+            // Conditional writeback — see `dispatch_chat` for the race this
+            // closes. The config read guard is held across the version read
+            // *and* the active write so a config mutation (commit + version
+            // bump are atomic under `config.write()`) can never interleave
+            // between them: either the writeback linearizes before the
+            // mutation or the version mismatch rejects the pin. The
+            // read-compare-insert runs under the single active write lock.
+            let _config_guard = state.config.read().await;
+            let current_version = state.config.routes_version();
             let mut active = runtime.active_targets.write().await;
-            active.insert(
+            active.insert_if_generation(
                 request.model.clone(),
-                (
+                sag_state::ActiveTargetEntry::new(
                     provider_name.clone(),
                     real_model.clone(),
+                    target.route_model.clone(),
+                    target.target_real_model.clone(),
                     std::time::Instant::now(),
                 ),
+                &sticky_token,
+                current_version,
             );
+            drop(active);
         }
 
         state.collector.log(success_log(
@@ -388,6 +403,7 @@ mod tests {
             start: Instant::now(),
             errors,
             strategy: sag_config::Strategy::StickyFailover,
+            sticky_token: sag_state::StickyToken::default(),
             user_agent: None,
             client_ip: None,
         }

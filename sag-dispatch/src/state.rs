@@ -8,7 +8,7 @@
 
 pub use sag_state::AppState;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
@@ -90,22 +90,41 @@ impl DispatchRuntime {
         }
     }
 
-    /// Remove cached entries for model names that no longer exist
-    /// in the current config routes. Called at the start of every
-    /// `resolve_route` to prevent unbounded growth from
-    /// create/delete route cycles.
-    pub async fn prune_stale_entries(&self, valid_model_names: &HashSet<&str>) {
+    /// Remove cached entries for request models that no longer resolve to any
+    /// route in the current config. Called at the start of every
+    /// `resolve_route` when the `routes_version` has changed, to prevent
+    /// unbounded growth from create/delete route cycles.
+    ///
+    /// All three maps are keyed by the **request** model — for a wildcard
+    /// route that is any concrete model the route has served — so validity is
+    /// judged by re-resolving the key against the current route table, never
+    /// by checking membership in the config's `model_name` set (which may
+    /// only contain `"*"`). Active entries additionally record the route that
+    /// created them (`ActiveTargetEntry::route_model`); an entry is kept only
+    /// while its key still resolves to that same route, so:
+    /// - a wildcard request key survives config changes that do not affect
+    ///   the wildcard route (it keeps resolving to `"*"`), and
+    /// - a key that no longer resolves to its recorded route — an exact route
+    ///   now shadowing a previously-wildcard key, or the route being removed
+    ///   entirely — is dropped.
+    pub async fn prune_stale_entries(&self, routes: &[sag_config::RouteConfig]) {
+        let resolves_to = |request_model: &str| -> Option<&str> {
+            sag_config::resolve_model_route(routes, request_model).map(|r| r.model_name.as_str())
+        };
         {
             let mut guard = self.fill_first_orders.write().await;
-            guard.retain(|k, _| valid_model_names.contains(k.as_str()));
+            guard.retain(|k, _| resolves_to(k).is_some());
         }
         {
             let mut guard = self.route_counters.write().await;
-            guard.retain(|k, _| valid_model_names.contains(k.as_str()));
+            guard.retain(|k, _| resolves_to(k).is_some());
         }
         {
             let mut guard = self.active_targets.write().await;
-            guard.retain(|k, _| valid_model_names.contains(k.as_str()));
+            guard.retain(|k, entry| match entry {
+                Some(e) => resolves_to(k) == Some(e.route_model.as_str()),
+                None => resolves_to(k).is_some(),
+            });
         }
     }
 }
@@ -228,6 +247,30 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// Minimal route table for prune tests: an exact route `valid-model` and
+    /// a wildcard route `*`.
+    fn test_routes() -> Vec<sag_config::RouteConfig> {
+        use sag_config::{RouteConfig, RouteTarget, Strategy};
+        fn route(model: &str) -> RouteConfig {
+            RouteConfig {
+                model_name: model.into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy: Strategy::StickyFailover,
+                retries: None,
+                timeout_secs: None,
+                targets: vec![RouteTarget {
+                    provider: "p".into(),
+                    real_model: None,
+                    priority: 0,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                }],
+            }
+        }
+        vec![route("valid-model"), route("*")]
+    }
+
     #[tokio::test]
     async fn prune_stale_entries_removes_deleted_routes() {
         let rt = DispatchRuntime::default();
@@ -238,6 +281,7 @@ mod tests {
             CachedOrder {
                 targets: Arc::from([]),
                 created_at: std::time::Instant::now(),
+                routes_version: None,
             },
         );
         rt.route_counters
@@ -246,40 +290,79 @@ mod tests {
             .insert("deleted-model".into(), 42);
         rt.active_targets.write().await.insert(
             "deleted-model".into(),
-            ("p".into(), "m".into(), Instant::now()),
+            sag_state::ActiveTargetEntry::new(
+                "p",
+                "m",
+                "deleted-model",
+                Some("m".into()),
+                Instant::now(),
+            ),
         );
 
-        // Also add a valid entry that should survive.
+        // Also add valid entries that should survive: one exact-route entry
+        // and one wildcard-route entry (the wildcard request key must NOT be
+        // pruned even though "gpt-4.1" is not a route model_name).
         rt.fill_first_orders.write().await.insert(
             "valid-model".into(),
             CachedOrder {
                 targets: Arc::from([]),
                 created_at: std::time::Instant::now(),
+                routes_version: None,
+            },
+        );
+        rt.fill_first_orders.write().await.insert(
+            "gpt-4.1".into(),
+            CachedOrder {
+                targets: Arc::from([]),
+                created_at: std::time::Instant::now(),
+                routes_version: None,
             },
         );
         rt.route_counters
             .write()
             .await
             .insert("valid-model".into(), 1);
+        rt.route_counters.write().await.insert("gpt-4.1".into(), 1);
         rt.active_targets.write().await.insert(
             "valid-model".into(),
-            ("p2".into(), "m2".into(), Instant::now()),
+            sag_state::ActiveTargetEntry::new(
+                "p2",
+                "m2",
+                "valid-model",
+                Some("m2".into()),
+                Instant::now(),
+            ),
+        );
+        rt.active_targets.write().await.insert(
+            "gpt-4.1".into(),
+            sag_state::ActiveTargetEntry::new("p3", "gpt-4.1", "*", None, Instant::now()),
         );
 
-        let valid: HashSet<&str> = ["valid-model"].into_iter().collect();
-        rt.prune_stale_entries(&valid).await;
+        let routes = test_routes();
+        rt.prune_stale_entries(&routes).await;
 
-        // Stale entries removed.
+        // "deleted-model" resolves through the wildcard (*) route, so
+        // fill_first_orders and route_counters entries (keyed by request
+        // model) survive — they will produce a correct shuffle on next use.
+        // The active_targets entry is dropped because its route_model
+        // "deleted-model" does not match the resolved route "*".
         assert!(
-            !rt.fill_first_orders
+            rt.fill_first_orders
                 .read()
                 .await
-                .contains_key("deleted-model")
+                .contains_key("deleted-model"),
+            "fill_first_orders entry for a wildcard-resolving key survives the prune"
         );
-        assert!(!rt.route_counters.read().await.contains_key("deleted-model"));
-        assert!(!rt.active_targets.read().await.contains_key("deleted-model"));
+        assert!(
+            rt.route_counters.read().await.contains_key("deleted-model"),
+            "route_counters entry for a wildcard-resolving key survives the prune"
+        );
+        assert!(
+            !rt.active_targets.read().await.contains_key("deleted-model"),
+            "active_targets entry with mismatched route_model must be dropped"
+        );
 
-        // Valid entries survive.
+        // Valid entries survive — including the wildcard request key.
         assert!(
             rt.fill_first_orders
                 .read()
@@ -288,30 +371,125 @@ mod tests {
         );
         assert!(rt.route_counters.read().await.contains_key("valid-model"));
         assert!(rt.active_targets.read().await.contains_key("valid-model"));
+        assert!(
+            rt.fill_first_orders.read().await.contains_key("gpt-4.1"),
+            "wildcard request key must survive the prune"
+        );
+        assert!(rt.route_counters.read().await.contains_key("gpt-4.1"));
+        assert!(
+            rt.active_targets.read().await.contains_key("gpt-4.1"),
+            "wildcard active entry must survive the prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_stale_entries_drops_wildcard_key_shadowed_by_exact_route() {
+        let rt = DispatchRuntime::default();
+        // A wildcard pin for "gpt-4o" (request key, route_model "*").
+        rt.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            sag_state::ActiveTargetEntry::new("p", "gpt-4o", "*", None, Instant::now()),
+        );
+        rt.fill_first_orders.write().await.insert(
+            "gpt-4o".into(),
+            CachedOrder {
+                targets: Arc::from([]),
+                created_at: std::time::Instant::now(),
+                routes_version: None,
+            },
+        );
+        rt.route_counters.write().await.insert("gpt-4o".into(), 3);
+
+        // Config now has an exact "gpt-4o" route plus the wildcard: "gpt-4o"
+        // resolves to the exact route, so the wildcard-route pin must be
+        // dropped (it no longer resolves to its recorded route).
+        let routes = vec![
+            sag_config::RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy: sag_config::Strategy::StickyFailover,
+                retries: None,
+                timeout_secs: None,
+                targets: vec![],
+            },
+            sag_config::RouteConfig {
+                model_name: "*".into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy: sag_config::Strategy::StickyFailover,
+                retries: None,
+                timeout_secs: None,
+                targets: vec![],
+            },
+        ];
+        rt.prune_stale_entries(&routes).await;
+
+        assert!(
+            !rt.active_targets.read().await.contains_key("gpt-4o"),
+            "wildcard pin must be dropped once an exact route shadows the key"
+        );
+        // Cache entries keyed by a still-resolving request model survive
+        // (they self-heal by re-shuffling on next use).
+        assert!(rt.fill_first_orders.read().await.contains_key("gpt-4o"));
+        assert!(rt.route_counters.read().await.contains_key("gpt-4o"));
     }
 
     #[tokio::test]
     async fn prune_stale_entries_noop_when_all_valid() {
         let rt = DispatchRuntime::default();
+        // An exact-route entry: key "valid-model" matches the route
+        // model_name "valid-model" in test_routes().
         rt.fill_first_orders.write().await.insert(
-            "m1".into(),
+            "valid-model".into(),
             CachedOrder {
                 targets: Arc::from([]),
                 created_at: std::time::Instant::now(),
+                routes_version: None,
             },
         );
-        rt.route_counters.write().await.insert("m1".into(), 1);
-        rt.active_targets
+        rt.route_counters
             .write()
             .await
-            .insert("m1".into(), ("p".into(), "rm".into(), Instant::now()));
+            .insert("valid-model".into(), 1);
+        rt.active_targets.write().await.insert(
+            "valid-model".into(),
+            sag_state::ActiveTargetEntry::new(
+                "p",
+                "rm",
+                "valid-model",
+                Some("rm".into()),
+                Instant::now(),
+            ),
+        );
+        // A wildcard-resolving entry: key "gpt-4.1" resolves to "*" and
+        // its route_model is "*".
+        rt.fill_first_orders.write().await.insert(
+            "gpt-4.1".into(),
+            CachedOrder {
+                targets: Arc::from([]),
+                created_at: std::time::Instant::now(),
+                routes_version: None,
+            },
+        );
+        rt.route_counters.write().await.insert("gpt-4.1".into(), 1);
+        rt.active_targets.write().await.insert(
+            "gpt-4.1".into(),
+            sag_state::ActiveTargetEntry::new("p", "gpt-4.1", "*", None, Instant::now()),
+        );
 
-        let valid: HashSet<&str> = ["m1"].into_iter().collect();
-        rt.prune_stale_entries(&valid).await;
+        let routes = test_routes();
+        rt.prune_stale_entries(&routes).await;
 
-        assert!(rt.fill_first_orders.read().await.contains_key("m1"));
-        assert!(rt.route_counters.read().await.contains_key("m1"));
-        assert!(rt.active_targets.read().await.contains_key("m1"));
+        assert!(
+            rt.fill_first_orders
+                .read()
+                .await
+                .contains_key("valid-model")
+        );
+        assert!(rt.route_counters.read().await.contains_key("valid-model"));
+        assert!(rt.active_targets.read().await.contains_key("valid-model"));
+        assert!(rt.fill_first_orders.read().await.contains_key("gpt-4.1"));
+        assert!(rt.route_counters.read().await.contains_key("gpt-4.1"));
+        assert!(rt.active_targets.read().await.contains_key("gpt-4.1"));
     }
 
     // ── stale_probe_threshold_from_config tests ────────────────────

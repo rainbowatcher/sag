@@ -1,6 +1,6 @@
 //! Route resolution: model → ordered fallback targets + `api_endpoint`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,12 +40,7 @@ pub async fn resolve_route(
         .last_prune_version
         .load(std::sync::atomic::Ordering::Acquire);
     if current_version != last {
-        let valid_names: HashSet<&str> = config_guard
-            .routes
-            .iter()
-            .map(|r| r.model_name.as_str())
-            .collect();
-        runtime.prune_stale_entries(&valid_names).await;
+        runtime.prune_stale_entries(&config_guard.routes).await;
         runtime
             .last_prune_version
             .store(current_version, std::sync::atomic::Ordering::Release);
@@ -106,6 +101,7 @@ pub async fn resolve_route(
     let api_endpoint = route.api_endpoint.clone();
     let route_retries = route.retries;
     let route_timeout = route.timeout_secs;
+    let route_model_name = route.model_name.clone();
     let global_retries = config_guard.backoff.retries;
     let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
     let sticky_failover_reset_secs = config_guard.sticky_failover_reset_secs;
@@ -116,8 +112,11 @@ pub async fn resolve_route(
         .collect();
     drop(config_guard);
 
-    // Apply target selection strategy
-    let ordered = order_targets(
+    // Apply target selection strategy. `current_version` (captured at the
+    // same linearization point as the config read above) becomes part of the
+    // sticky token, so a config mutation after this decision invalidates any
+    // in-flight writeback.
+    let (ordered, sticky_token) = order_targets(
         targets,
         &request.model,
         strategy,
@@ -126,6 +125,7 @@ pub async fn resolve_route(
         &runtime.active_targets,
         shuffle_cache_ttl_secs,
         sticky_failover_reset_secs,
+        current_version,
     )
     .await;
 
@@ -134,6 +134,7 @@ pub async fn resolve_route(
     let resolved: Vec<ResolvedTarget> = ordered
         .into_iter()
         .map(|t| {
+            let target_real_model = t.real_model.clone();
             let rm = t.real_model.unwrap_or_else(|| request.model.clone());
             let retries = t.retries.or(route_retries).unwrap_or(global_retries);
             let timeout_secs = t
@@ -144,6 +145,8 @@ pub async fn resolve_route(
             ResolvedTarget {
                 provider: t.provider,
                 real_model: rm,
+                route_model: route_model_name.clone(),
+                target_real_model,
                 extra: t.extra,
                 retries,
                 timeout_secs,
@@ -151,7 +154,7 @@ pub async fn resolve_route(
         })
         .collect();
 
-    Ok((resolved, api_endpoint, strategy))
+    Ok((resolved, api_endpoint, strategy, sticky_token))
 }
 
 /// Drop targets whose provider is marked `enabled = false` in the config.
@@ -327,7 +330,13 @@ mod tests {
             .insert("gpt-4o".into(), 42);
         runtime.active_targets.write().await.insert(
             "gpt-4o".into(),
-            ("openai".into(), "gpt-4o".into(), std::time::Instant::now()),
+            sag_state::ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                std::time::Instant::now(),
+            ),
         );
 
         // 1. First call: resolve route → populates fill_first_orders.
@@ -379,6 +388,155 @@ mod tests {
             !runtime.active_targets.read().await.contains_key("gpt-4o"),
             "stale active_targets entry must be pruned"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_captures_sticky_token_while_ordering() {
+        // A StickyFailover route so `order_targets` captures a token.
+        let (state, runtime) = build_sticky_state().await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        // Fresh memory, nothing cleared: the decision captured 0 and
+        // the current routes_version.
+        let (_, _, _, token1) =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(token1.generation, 0, "fresh map captures 0");
+        assert_eq!(
+            token1.routes_version,
+            state.config.routes_version(),
+            "token must carry the routes_version captured at decision time"
+        );
+
+        // A clear (DELETE / close / targets-changed / prune) invalidates
+        // pre-clear decisions. For a model with no per-model state (fresh
+        // map) the clear bumps the global epoch instead of creating a
+        // per-model tombstone; the *next* decision captures the new epoch so
+        // its writeback still succeeds, while pre-clear decisions (old
+        // epoch) fail.
+        runtime.active_targets.write().await.clear("gpt-4o");
+        let (_, _, _, token2) =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            token2.epoch, 1,
+            "post-clear decision captures the bumped epoch"
+        );
+        assert_eq!(
+            token2.generation, 0,
+            "no per-model tombstone is created for an untouched model"
+        );
+
+        runtime.active_targets.write().await.clear("gpt-4o");
+        let (_, _, _, token3) =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(token3.epoch, 2, "every no-entry clear bumps again");
+    }
+
+    #[tokio::test]
+    async fn resolve_route_captures_post_mutation_routes_version() {
+        // A config mutation moves `routes_version`; the next decision must
+        // capture the new version (so its writeback still succeeds) while
+        // decisions captured before the mutation fail.
+        let (state, runtime) = build_sticky_state().await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        let (_, _, _, before) =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        let version_before = before.routes_version;
+
+        // Simulate a config mutation (route CRUD / hot-reload).
+        {
+            let mut cfg = state.config.write().await;
+            cfg.routes.retain(|r| r.model_name != "gpt-4o");
+            cfg.routes.push(sag_config::RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                timeout_secs: None,
+                strategy: sag_config::Strategy::StickyFailover,
+                targets: vec![sag_config::RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("gpt-4o".into()),
+                    priority: 10,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                }],
+            });
+            state.config.bump_routes_version();
+        }
+        assert!(state.config.routes_version() > version_before);
+
+        let (_, _, _, after) =
+            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            after.routes_version,
+            state.config.routes_version(),
+            "post-mutation decision captures the new routes_version"
+        );
+        assert!(after.routes_version > version_before);
+
+        // The pre-mutation token must be rejected by a writeback.
+        let mut guard = runtime.active_targets.write().await;
+        assert!(
+            !guard.insert_if_generation(
+                "gpt-4o".into(),
+                sag_state::ActiveTargetEntry::new(
+                    "openai",
+                    "gpt-4o",
+                    "gpt-4o",
+                    Some("gpt-4o".into()),
+                    std::time::Instant::now(),
+                ),
+                &before,
+                state.config.routes_version(),
+            ),
+            "pre-mutation token must be rejected after the config mutation"
+        );
+    }
+
+    /// Build an AppState + DispatchRuntime for a single StickyFailover route.
+    async fn build_sticky_state() -> (AppState, DispatchRuntime) {
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        providers.insert("openai".into(), crate::testing::provider_config(true));
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::StickyFailover,
+            targets: vec![sag_config::RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            }],
+        }];
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+        (state, runtime)
     }
 
     // ── Sentinel value tests ─────────────────────────────────────
