@@ -9,6 +9,8 @@ updated: 2026-07-22
 
 ## 2026-08-04
 
+- **Sticky Targets**：[0002 端点重命名 /api/active-targets](sticky-targets-observability/changes/0002-rename-active-targets.md) — 端点路径与全链路标识符（handler/DTO/store/组件）从 sticky-targets 改名 active-targets，硬切换不留旧路径
+
 - **Sticky Targets**：[0001 FillFirst 手动重置与可观测性](sticky-targets-observability/changes/0001-fill-first.md) — `CachedOrder` 下沉 `sag-state` 并注入 `AppState`；GET 对 FillFirst 路由报缓存顺序位置/age/TTL，DELETE 按 strategy 分发（FillFirst 清缓存重新洗牌）
 
 ## 2026-07-22

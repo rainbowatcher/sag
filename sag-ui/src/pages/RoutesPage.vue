@@ -6,20 +6,20 @@ import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
 import { getErrorMessage } from "@/lib/utils"
+import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-import { useStickyTargetStore } from "@/stores/stickyTarget"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
-const stickyTargetStore = useStickyTargetStore()
+const activeTargetStore = useActiveTargetStore()
 
 // ── Add form ──────────────────────────────────────────────────────
 const showAdd = ref(false)
 
 async function handleRouteCreated() {
   showAdd.value = false
-  await Promise.all([routeStore.fetchRoutes(), stickyTargetStore.fetchStickyTargets()])
+  await Promise.all([routeStore.fetchRoutes(), activeTargetStore.fetchActiveTargets()])
 }
 
 const pageError = ref("")
@@ -29,7 +29,7 @@ async function refreshPage() {
     await Promise.all([
       providerStore.fetchProviders(),
       routeStore.fetchRoutes(),
-      stickyTargetStore.fetchStickyTargets(),
+      activeTargetStore.fetchActiveTargets(),
     ])
   } catch (e: any) {
     pageError.value = getErrorMessage(e, "Failed to load data")

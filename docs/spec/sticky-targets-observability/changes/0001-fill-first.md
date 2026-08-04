@@ -45,7 +45,7 @@ FillFirst 只有 TTL（`shuffle_cache_ttl_secs`，默认 7200s）自动过期一
 | [`sag-router/src/lib.rs`](../../../sag-router/src/lib.rs) | re-export `FillFirstOrders` |
 | [`sag-gateway/src/main.rs`](../../../sag-gateway/src/main.rs) | 创建 `fill_first_orders` Arc 注入 `AppState` + `DispatchRuntime::with_shared_state` |
 | [`sag-config/src/config.rs`](../../../sag-config/src/config.rs) | `Strategy` 新增 `as_str()`（snake_case 标识，供 admin API 标注 strategy） |
-| [`sag-admin/src/admin_sticky.rs`](../../../sag-admin/src/admin_sticky.rs) | `StickyTargetEntry` 新增 `strategy` / `fill_first_position` / `fill_first_cache_age_secs` / `fill_first_cache_ttl_secs`；GET 对 FillFirst 路由读 `fill_first_orders` 快照报位置与缓存元数据；DELETE 按 route strategy 分发（FillFirst → 清缓存，其余 → 清 pin） |
+| [`sag-admin/src/admin_active_targets.rs`](../../../sag-admin/src/admin_sticky.rs) | `StickyTargetEntry` 新增 `strategy` / `fill_first_position` / `fill_first_cache_age_secs` / `fill_first_cache_ttl_secs`；GET 对 FillFirst 路由读 `fill_first_orders` 快照报位置与缓存元数据；DELETE 按 route strategy 分发（FillFirst → 清缓存，其余 → 清 pin） |
 | [`sag-ui/src/types/api.ts`](../../../sag-ui/src/types/api.ts) | `StickyTargetEntry` 新增 4 个字段 |
 | [`sag-ui/src/components/routes/RouteList.vue`](../../../sag-ui/src/components/routes/RouteList.vue) | Active Target 列对 FillFirst 路由显示 position 0 target（"Fill" 徽标 + 缓存 age tooltip）；清除按钮按策略传参（FillFirst 传 route model name，sticky 传 pin key）；toast 按策略区分文案 |
 

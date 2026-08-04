@@ -186,13 +186,13 @@ export interface CircuitBreakerEntry {
   probe_in_flight: boolean
 }
 
-/** Active-target entry returned by `GET /api/sticky-targets`. */
-export interface StickyTargetEntry {
+/** Active-target entry returned by `GET /api/active-targets`. */
+export interface ActiveTargetEntry {
   model: string
   /**
    * Actual `active_targets` map key — the request model the pin was recorded
    * under. For an exact route this equals `model`; for a wildcard route it is
-   * the concrete request model, which is what `DELETE /api/sticky-targets`
+   * the concrete request model, which is what `DELETE /api/active-targets`
    * must receive to clear the pin. Empty string when the entry is `idle`.
    */
   key: string

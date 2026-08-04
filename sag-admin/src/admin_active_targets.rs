@@ -1,12 +1,12 @@
-//! Sticky-failover active-target admin endpoints.
+//! Active-target admin endpoints: the currently-effective routing state for
 //! every configured route target.
 //!
-//! - `GET /api/sticky-targets` — read-only snapshot of every target in the
+//! - `GET /api/active-targets` — read-only snapshot of every target in the
 //!   current config routes, annotated with the live routing state:
 //!   sticky-failover pins (`idle` / `pinned` / `expired` from the
 //!   `active_targets` memory shared with `DispatchRuntime`) and fill-first
 //!   cached-order positions (index 0 = the target absorbing all traffic).
-//! - `DELETE /api/sticky-targets` — reset routing for a model: for a
+//! - `DELETE /api/active-targets` — reset routing for a model: for a
 //!   sticky-failover route clear the active target (idempotent) and bump its
 //!   generation so the next request re-evaluates the priority-ordered list
 //!   and in-flight requests can never re-pin; for a fill-first route drop
@@ -26,13 +26,13 @@ use serde::{Deserialize, Serialize};
 /// One sticky-failover entry in the snapshot: a route target plus the live
 /// status of the shared active-target memory.
 #[derive(Debug, Serialize)]
-pub struct StickyTargetEntry {
+pub struct ActiveTargetDto {
     /// Route `model_name` (may be `"*"` for a wildcard route).
     model: String,
     /// Actual `active_targets` map key — the **request model** the pin was
     /// recorded under. For an exact route this equals `model`; for a
     /// wildcard route it is the concrete request model (e.g. `"gpt-4o"`),
-    /// which is what `DELETE /api/sticky-targets` must receive to clear the
+    /// which is what `DELETE /api/active-targets` must receive to clear the
     /// pin. Empty string when the entry is `idle` (nothing to clear).
     key: String,
     provider: String,
@@ -65,15 +65,15 @@ pub struct StickyTargetEntry {
     fill_first_cache_ttl_secs: Option<u64>,
 }
 
-/// `GET /api/sticky-targets`
+/// `GET /api/active-targets`
 ///
-/// Returns `{ "targets": [StickyTargetEntry, ...] }` — one flat entry per
+/// Returns `{ "targets": [ActiveTargetDto, ...] }` — one flat entry per
 /// target of every configured route (including wildcard routes), regardless
 /// of whether the `active_targets` memory holds an entry for it. For
 /// fill-first routes the entries additionally carry the cached shuffled
 /// order position (index 0 = the target currently absorbing all traffic)
 /// and the cache's age / TTL.
-pub async fn list_sticky_targets(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn list_active_targets(State(state): State<AppState>) -> Json<serde_json::Value> {
     // Single config read: clone the snapshot inputs and drop the guard, so
     // the snapshot (reset secs + routes) comes from one consistent config
     // and no config read guard spans the `active_targets` await below.
@@ -152,7 +152,7 @@ pub async fn list_sticky_targets(State(state): State<AppState>) -> Json<serde_js
                     (None, None, None)
                 };
 
-            targets.push(StickyTargetEntry {
+            targets.push(ActiveTargetDto {
                 model: route.model_name.clone(),
                 key: matched.map(|(k, _)| k.to_string()).unwrap_or_default(),
                 provider: target.provider.clone(),
@@ -218,13 +218,13 @@ fn match_active_target<'a>(
         .max_by_key(|(_, entry)| entry.recorded_at)
 }
 
-/// Request body for `DELETE /api/sticky-targets`.
+/// Request body for `DELETE /api/active-targets`.
 #[derive(Debug, Deserialize)]
-pub struct DeleteStickyTargetRequest {
+pub struct DeleteActiveTargetRequest {
     pub model: String,
 }
 
-/// `DELETE /api/sticky-targets`
+/// `DELETE /api/active-targets`
 ///
 /// Reset routing for `req.model` so the next request re-evaluates instead of
 /// staying pinned to a previously decided state. The exact semantics depend
@@ -245,9 +245,9 @@ pub struct DeleteStickyTargetRequest {
 ///
 /// **Idempotent**: deleting a model with no active target / no cached order
 /// is a no-op and still returns `200 OK`.
-pub async fn delete_sticky_target(
+pub async fn delete_active_target(
     State(state): State<AppState>,
-    Json(req): Json<DeleteStickyTargetRequest>,
+    Json(req): Json<DeleteActiveTargetRequest>,
 ) -> Json<serde_json::Value> {
     // Resolve the request model against the current route table to pick the
     // reset semantics. The model is the route's `model_name` ("*" for a
@@ -295,12 +295,12 @@ mod tests {
             .with_state(state)
     }
 
-    /// Helper: send GET /api/sticky-targets and return (status, parsed JSON).
+    /// Helper: send GET /api/active-targets and return (status, parsed JSON).
     async fn fetch_targets(app: axum::Router) -> (StatusCode, serde_json::Value) {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/sticky-targets")
+                    .uri("/api/active-targets")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -312,7 +312,7 @@ mod tests {
         (status, json)
     }
 
-    /// Helper: send DELETE /api/sticky-targets with a body and return
+    /// Helper: send DELETE /api/active-targets with a body and return
     /// (status, parsed JSON).
     async fn delete_target(
         app: axum::Router,
@@ -322,7 +322,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("DELETE")
-                    .uri("/api/sticky-targets")
+                    .uri("/api/active-targets")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_vec(&body).unwrap()))
                     .unwrap(),
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_sticky_target_does_not_touch_fill_first_cache() {
+    async fn delete_active_target_does_not_touch_fill_first_cache() {
         // A sticky-failover DELETE clears the pin only — the fill-first
         // order cache (which StickyFailover also uses internally as its base
         // order) must be left alone.

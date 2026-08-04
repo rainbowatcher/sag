@@ -11,7 +11,7 @@ FillFirst 策略不写 `active_targets`，它的粘性是 `fill_first_orders` �
 （index 0 吸收所有流量直到不可用）。
 
 本模块的端点让两种策略的生效状态可见可手动操作：
-`GET|DELETE /api/sticky-targets` 对 StickyFailover 报 pin 状态、对 FillFirst 报
+`GET|DELETE /api/active-targets` 对 StickyFailover 报 pin 状态、对 FillFirst 报
 缓存顺序位置；DELETE 对 StickyFailover 解除 pin、对 FillFirst 丢弃缓存顺序
 （下次请求重新洗牌）。不改 sticky 失败/熔断逻辑。
 
@@ -21,8 +21,8 @@ FillFirst 策略不写 `active_targets`，它的粘性是 `fill_first_orders` �
 
 ### 入口/路由注册
 
-- `sag-admin/src/admin.rs` — `build_admin_routes` 注册 `GET|DELETE /api/sticky-targets`，由 `gateway_auth` 中间件保护
-- `sag-admin/src/admin_sticky.rs` — `list_sticky_targets` / `delete_sticky_target` handler 与内联测试
+- `sag-admin/src/admin.rs` — `build_admin_routes` 注册 `GET|DELETE /api/active-targets`，由 `gateway_auth` 中间件保护
+- `sag-admin/src/admin_active_targets.rs` — `list_active_targets` / `delete_active_target` handler 与内联测试
 
 ### 共享状态
 
@@ -40,39 +40,39 @@ FillFirst 策略不写 `active_targets`，它的粘性是 `fill_first_orders` �
 
 ### 前端
 
-- `sag-ui/src/types/api.ts` — `StickyTargetEntry` 接口（snake_case，仿 `CircuitBreakerEntry`）
-- `sag-ui/src/stores/activeTarget.ts` — Pinia store：`fetchStickyTargets` / `clearStickyTarget`，401 处理
+- `sag-ui/src/types/api.ts` — `ActiveTargetDto` 接口（snake_case，仿 `CircuitBreakerEntry`）
+- `sag-ui/src/stores/activeTarget.ts` — Pinia store：`fetchActiveTargets` / `clearActiveTarget`，401 处理
 - `sag-ui/src/components/routes/RouteList.vue` — Routes 页表格内嵌「Active Target」列：StickyFailover 显示 pin（Active/Expired 徽标 + 清除）、FillFirst 显示当前 fill target（Fill 徽标 + 重置）
 
 ## 核心设计
 
 ### 数据流
 
-`GET /api/sticky-targets` 请求链路：
+`GET /api/active-targets` 请求链路：
 
 ```mermaid
 sequenceDiagram
     participant C as Client (RouteList)
-    participant H as list_sticky_targets (sag-admin/src/admin_sticky.rs)
+    participant H as list_active_targets (sag-admin/src/admin_active_targets.rs)
     participant CFG as AppState.config
     participant AT as active_targets (Arc<RwLock>)
     participant FO as fill_first_orders (Arc<RwLock>)
     participant OD as order_targets (sag-dispatch/src/order.rs)
 
-    C->>H: GET /api/sticky-targets
+    C->>H: GET /api/active-targets
     H->>CFG: read(): sticky_failover_reset_secs + shuffle_cache_ttl_secs + routes
     H->>AT: read() 克隆快照
     H->>FO: read() 克隆快照
     H->>H: 每 route × target 一行；sticky 报 status/age_secs，fill-first 报 position/cache age
-    H-->>C: { "targets": [StickyTargetEntry] }
+    H-->>C: { "targets": [ActiveTargetDto] }
     Note over OD: 快照为 point-in-time 读，与 dispatch 写互斥但不阻塞<br/>后续写入
 ```
 
-`DELETE /api/sticky-targets` 流程（按 route strategy 分发）：
+`DELETE /api/active-targets` 流程（按 route strategy 分发）：
 
 ```mermaid
 flowchart TD
-    A[Client: DELETE /api/sticky-targets<br/>body { model }] --> B[delete_sticky_target handler]
+    A[Client: DELETE /api/active-targets<br/>body { model }] --> B[delete_active_target handler]
     B --> R[resolve_model_route: 该 model 的路由 strategy?]
     R -->|FillFirst| FF[fill_first_orders.remove(model)<br/>下次请求重新洗牌 = 手动 TTL 过期]
     R -->|StickyFailover / RR / 无路由| SF[active_targets.clear(model)<br/>解除 pin + bump generation/epoch]
@@ -130,10 +130,10 @@ DELETE）的对称性。
 
 背景：GET 对 FillFirst 路由此前恒报 `idle`（误导——流量实际全灌到缓存顺序首位）。
 
-**决策**：扩展现有 `/api/sticky-targets`，新增 `strategy` / `fill_first_position` /
+**决策**：扩展现有 `/api/active-targets`，新增 `strategy` / `fill_first_position` /
 `fill_first_cache_age_secs` / `fill_first_cache_ttl_secs` 字段，只对 FillFirst 路由填充。
 
-- ✅ 复用现有 GET/DELETE 与 UI 入口；"sticky" 一词本就涵盖 fill-first 的粘性；改动集中在 `admin_sticky.rs` + `RouteList.vue` 一处
+- ✅ 复用现有 GET/DELETE 与 UI 入口；"sticky" 一词本就涵盖 fill-first 的粘性；改动集中在 `admin_active_targets.rs` + `RouteList.vue` 一处
 - ❌ 独立 `/api/fill-first` 端点：职责更正交，但 UI 需新增入口，且两处共享 `fill_first_orders` 的状态要重复解释
 - 注意：StickyFailover 内部也走 `order_fill_first`（共享同一缓存），但 GET 只对 FillFirst 路由报缓存字段——sticky 的可观测主角是 pin，混报会模糊两个概念
 
@@ -141,23 +141,23 @@ DELETE）的对称性。
 
 ### 后端 API
 
-- `DELETE /api/sticky-targets` 按 model 解析 route strategy 分发：FillFirst → `fill_first_orders.remove(model)`，其余 → `active_targets.clear(model)`；两者都不触碰 `circuit_breaker`（grep: 无 `circuit_breaker` 引用）
+- `DELETE /api/active-targets` 按 model 解析 route strategy 分发：FillFirst → `fill_first_orders.remove(model)`，其余 → `active_targets.clear(model)`；两者都不触碰 `circuit_breaker`（grep: 无 `circuit_breaker` 引用）
 - FillFirst 的 DELETE 与 sticky 的 DELETE 互不干扰：fill-first 分支不动 `active_targets`，sticky 分支不动 `fill_first_orders`（测试 `delete_fill_first_resets_order_cache_and_is_idempotent` / `delete_sticky_does_not_touch_fill_first_cache` 断言隔离）
 - `active_targets` 的 key 是 model，value 是 `(provider, real_model, Instant)`；entry 的 `age_secs = recorded_at.elapsed().as_secs()`（grep: `recorded_at.elapsed().as_secs()`）
 - `expired = sticky_failover_reset_secs > 0 && elapsed >= sticky_failover_reset_secs`；`reset_secs == 0` 时恒 false（grep: `reset_secs > 0 && elapsed >= reset_secs`）
-- `DELETE /api/sticky-targets` 幂等：`remove` / `clear` 对不存在 key 是 no-op，仍返回 200 `{ "ok": true }`
-- GET 响应格式固定为 `{ "targets": [StickyTargetEntry] }`，空记忆返回空数组（非 null）
+- `DELETE /api/active-targets` 幂等：`remove` / `clear` 对不存在 key 是 no-op，仍返回 200 `{ "ok": true }`
+- GET 响应格式固定为 `{ "targets": [ActiveTargetDto] }`，空记忆返回空数组（非 null）
 - fill-first 缓存字段只对 `Strategy::FillFirst` 路由填充：`strategy` 恒有值，`fill_first_position` / `fill_first_cache_age_secs` / `fill_first_cache_ttl_secs` 无缓存时 null，`ttl == 0` 报 0（永不过期）而非 null（grep: `route.strategy == Strategy::FillFirst` 分支）
 - fill-first 的缓存 key 是 route `model_name`（wildcard 为 `"*"`），与 DELETE 的 model 参数同源；`fill_first_position` 按 provider + `real_model` spec 匹配缓存顺序（position 0 = 当前 fill target）
 
 ### 前端
 
-- `StickyTargetEntry` 字段与后端 serde 输出一致（snake_case：`age_secs` / `expired`），仿 `CircuitBreakerEntry` 风格
+- `ActiveTargetDto` 字段与后端 serde 输出一致（snake_case：`age_secs` / `expired`），仿 `CircuitBreakerEntry` 风格
 - 401 一律走 `useConnectionStore().handle401()`（与 `circuitBreaker.ts` 一致）
 
 ## 测试策略
 
-### 后端 `sag-admin/src/admin_sticky.rs`（内联 `#[cfg(test)] mod tests`）
+### 后端 `sag-admin/src/admin_active_targets.rs`（内联 `#[cfg(test)] mod tests`）
 
 - `no_routes_returns_empty_array` / `all_route_targets_are_idle_when_active_map_empty` — 空态返回 200 与 `targets: []`、全 idle
 - `pinned_and_expired_statuses` — 手动写入 active_targets 后 GET 报 `pinned`/`expired`，`age_secs` 用范围断言防秒边界 flaky
@@ -178,5 +178,7 @@ DELETE）的对称性。
 - `oxlint` 通过（`pnpm lint`）
 
 ## 变更记录
+
+- [0002 端点重命名 /api/active-targets](changes/0002-rename-active-targets.md)
 
 - [0001 FillFirst 手动重置与可观测性](changes/0001-fill-first.md)

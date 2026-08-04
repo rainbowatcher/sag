@@ -29,16 +29,16 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
-import { useStickyTargetStore } from "@/stores/stickyTarget"
+import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-import type { RouteConfig, StickyTargetEntry } from "@/types/api"
+import type { RouteConfig, ActiveTargetEntry } from "@/types/api"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
-const stickyTargetStore = useStickyTargetStore()
+const activeTargetStore = useActiveTargetStore()
 
-onMounted(() => stickyTargetStore.fetchStickyTargets())
+onMounted(() => activeTargetStore.fetchActiveTargets())
 
 // ── Edit flow ─────────────────────────────────────────────────────
 const editingRoute = ref<RouteConfig | null>(null)
@@ -53,7 +53,7 @@ function onEditClose() {
 
 async function onUpdated() {
   editingRoute.value = null
-  await Promise.all([routeStore.fetchRoutes(), stickyTargetStore.fetchStickyTargets()])
+  await Promise.all([routeStore.fetchRoutes(), activeTargetStore.fetchActiveTargets()])
 }
 
 // ── Delete flow ───────────────────────────────────────────────────
@@ -79,7 +79,7 @@ async function confirmDelete() {
     toast.success(`Route "${deleteTarget.value}" deleted`)
     deleteDialogOpen.value = false
     deleteTarget.value = null
-    await Promise.all([routeStore.fetchRoutes(), stickyTargetStore.fetchStickyTargets()])
+    await Promise.all([routeStore.fetchRoutes(), activeTargetStore.fetchActiveTargets()])
   } catch (e: any) {
     const msg = getErrorMessage(e)
     toast.error(msg)
@@ -91,21 +91,21 @@ async function confirmDelete() {
 // ── Clear sticky target / reset fill-first order ─────────────────
 const clearingModel = ref<string | null>(null)
 
-async function clearStickyTarget(entry: StickyTargetEntry) {
+async function clearActiveTarget(entry: ActiveTargetEntry) {
   const isFillFirst = entry.strategy === "fill_first"
   // Fill-first orders are cached under the route model name (may be "*");
   // sticky pins under the request-model key (empty for idle entries).
   const model = isFillFirst ? entry.model : entry.key
   clearingModel.value = model
   try {
-    await stickyTargetStore.clearStickyTarget(model)
+    await activeTargetStore.clearActiveTarget(model)
     toast.success(
       isFillFirst
         ? `Reset fill-first order for "${entry.model}", will re-shuffle on next request`
         : `Cleared sticky pin for "${entry.model}", will revert to priority routing`,
     )
   } catch (e: any) {
-    toast.error(getErrorMessage(e, "Failed to clear sticky target"))
+    toast.error(getErrorMessage(e, "Failed to clear active target"))
   } finally {
     clearingModel.value = null
   }
@@ -131,8 +131,8 @@ function disabledTargetCount(route: RouteConfig): number {
  * (one per request model), so a plain `find` would return an arbitrary
  * first match — this helper picks the most meaningful one.
  */
-function activeTargetFor(model: string): StickyTargetEntry | undefined {
-  const candidates = stickyTargetStore.targets.filter(
+function activeTargetFor(model: string): ActiveTargetEntry | undefined {
+  const candidates = activeTargetStore.targets.filter(
     (s) => s.model === model && s.status !== "idle",
   )
   if (candidates.length === 0) return undefined
@@ -148,8 +148,8 @@ function activeTargetFor(model: string): StickyTargetEntry | undefined {
  * never carry a sticky pin, so `activeTargetFor` is always undefined);
  * returns undefined when the route is not fill-first or no order is cached.
  */
-function fillFirstTargetFor(model: string): StickyTargetEntry | undefined {
-  return stickyTargetStore.targets.find(
+function fillFirstTargetFor(model: string): ActiveTargetEntry | undefined {
+  return activeTargetStore.targets.find(
     (s) => s.model === model && s.strategy === "fill_first" && s.fill_first_position === 0,
   )
 }
@@ -226,7 +226,7 @@ const columns = [
     meta: { class: "xl:min-w-[100px]" },
   }),
   columnHelper.display({
-    id: "sticky",
+    id: "activeTarget",
     header: () => h("span", { class: "text-xs font-medium" }, "Active Target"),
     sortingFn: (a, b) => {
       const sa = activeTargetFor(a.original.model_name) ? 1 : 0
@@ -283,7 +283,7 @@ const columns = [
             type: "button",
             class: cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "cursor-pointer"),
             disabled: isClearing,
-            onClick: () => clearStickyTarget(active),
+            onClick: () => clearActiveTarget(active),
             title: isFillFirst
               ? "Reset fill-first order, re-shuffle on next request"
               : "Clear active target, revert to priority routing",
