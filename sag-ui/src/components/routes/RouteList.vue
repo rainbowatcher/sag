@@ -28,6 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -187,6 +188,17 @@ function fillFirstTargetFor(model: string): ActiveTargetEntry | undefined {
   )
 }
 
+/**
+ * Aligned label/value row for the active-target tooltip: label on the left,
+ * value right-aligned on the same baseline so columns stay aligned.
+ */
+function tooltipRow(label: string, value: string, mono = false) {
+  return h("div", { class: "flex items-baseline justify-between gap-4" }, [
+    h("span", { class: "text-background/60" }, label),
+    h("span", { class: mono ? "font-mono" : "" }, value),
+  ])
+}
+
 // ══════════════════════════════════════════════════════════════════
 // TanStack Table
 // ══════════════════════════════════════════════════════════════════
@@ -283,20 +295,38 @@ const columns = [
           ? "bg-amber-500"
           : "bg-green-500"
 
-      return h("div", { class: "flex items-center gap-1.5" }, [
-        h("span", { class: cn("h-2 w-2 shrink-0 rounded-full", dotClass) }),
-        h(
-          Button,
-          {
-            variant: "ghost",
-            size: "sm",
-            class: "px-1 font-mono text-xs truncate",
-            title: isFillFirst
-              ? `${active.provider}/${active.real_model} — fill-first target (order cached ${formatDuration((active.fill_first_cache_age_secs ?? 0) * 1000)} ago). Click to reset.`
-              : `${active.provider}/${active.real_model} (${formatDuration(active.age_secs * 1000)}). Click to clear.`,
-            onClick: () => openClearConfirm(active),
-          },
-          () => `${active.provider}/${active.real_model}`,
+      // Status dot + provider label merged into one clickable button;
+      // full details live in the aligned tooltip.
+      return h(Tooltip, null, () => [
+        h(TooltipTrigger, { asChild: true }, () =>
+          h(
+            Button,
+            {
+              variant: "ghost",
+              size: "sm",
+              class: "cursor-pointer gap-1.5 px-1 font-mono text-xs truncate max-w-[110px]",
+              onClick: () => openClearConfirm(active),
+            },
+            () => [
+              h("span", { class: cn("h-2 w-2 shrink-0 rounded-full", dotClass) }),
+              h("span", { class: "truncate" }, active.provider),
+            ],
+          ),
+        ),
+        h(TooltipContent, { side: "left", class: "max-w-xs" }, () =>
+          h("div", { class: "space-y-1" }, [
+            tooltipRow("Provider", active.provider, true),
+            tooltipRow("Model", active.real_model, true),
+            tooltipRow("Status", isFillFirst ? "Fill-first target" : active.status),
+            tooltipRow(
+              isFillFirst ? "Order age" : "Pin age",
+              formatDuration(
+                (isFillFirst ? (active.fill_first_cache_age_secs ?? 0) : active.age_secs) * 1000,
+              ),
+              true,
+            ),
+            tooltipRow("Action", isFillFirst ? "Click to reset" : "Click to clear"),
+          ]),
         ),
       ])
     },
@@ -352,56 +382,58 @@ const table = useVueTable({
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
     <div v-else class="min-h-0 flex-1 rounded-lg border [&>div]:h-full">
-      <Table>
-        <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
-          <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
-            <TableHead
-              v-for="header in headerGroup.headers"
-              :key="header.id"
-              :class="[
-                (header.column.columnDef.meta as any)?.class,
-                header.column.getCanSort()
-                  ? 'hover:text-foreground cursor-pointer transition-colors select-none'
-                  : '',
-              ]"
-              @click="header.column.getCanSort() && header.column.toggleSorting()"
+      <TooltipProvider :delay-duration="200">
+        <Table>
+          <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
+            <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+              <TableHead
+                v-for="header in headerGroup.headers"
+                :key="header.id"
+                :class="[
+                  (header.column.columnDef.meta as any)?.class,
+                  header.column.getCanSort()
+                    ? 'hover:text-foreground cursor-pointer transition-colors select-none'
+                    : '',
+                ]"
+                @click="header.column.getCanSort() && header.column.toggleSorting()"
+              >
+                <div class="flex items-center gap-1">
+                  <FlexRender
+                    v-if="!header.isPlaceholder"
+                    :render="header.column.columnDef.header!"
+                    :props="header.getContext()"
+                  />
+                  <ArrowUpDown
+                    v-if="header.column.getCanSort()"
+                    class="h-3 w-3"
+                    :class="
+                      header.column.getIsSorted() ? 'text-foreground' : 'text-muted-foreground/40'
+                    "
+                  />
+                </div>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <TableRow
+              v-for="row in table.getRowModel().rows"
+              :key="row.id"
+              :class="{
+                'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
+                'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
+              }"
             >
-              <div class="flex items-center gap-1">
-                <FlexRender
-                  v-if="!header.isPlaceholder"
-                  :render="header.column.columnDef.header!"
-                  :props="header.getContext()"
-                />
-                <ArrowUpDown
-                  v-if="header.column.getCanSort()"
-                  class="h-3 w-3"
-                  :class="
-                    header.column.getIsSorted() ? 'text-foreground' : 'text-muted-foreground/40'
-                  "
-                />
-              </div>
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          <TableRow
-            v-for="row in table.getRowModel().rows"
-            :key="row.id"
-            :class="{
-              'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
-              'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
-            }"
-          >
-            <TableCell
-              v-for="cell in row.getVisibleCells()"
-              :key="cell.id"
-              :class="(cell.column.columnDef.meta as any)?.class"
-            >
-              <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-            </TableCell>
-          </TableRow>
-        </TableBody>
-      </Table>
+              <TableCell
+                v-for="cell in row.getVisibleCells()"
+                :key="cell.id"
+                :class="(cell.column.columnDef.meta as any)?.class"
+              >
+                <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+              </TableCell>
+            </TableRow>
+          </TableBody>
+        </Table>
+      </TooltipProvider>
     </div>
   </div>
 
