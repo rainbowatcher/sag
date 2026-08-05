@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Trash2, PinOff } from "@lucide/vue"
+import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Trash2 } from "@lucide/vue"
 import {
   FlexRender,
   createColumnHelper,
@@ -11,7 +11,7 @@ import { computed, h, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"
 import { Badge } from "@/components/ui/badge"
-import { Button, buttonVariants } from "@/components/ui/button"
+import { Button } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
@@ -101,7 +101,7 @@ async function confirmDelete() {
 // ── Clear sticky target / reset fill-first order ─────────────────
 const clearingModel = ref<string | null>(null)
 
-async function clearActiveTarget(entry: ActiveTargetEntry) {
+async function clearActiveTarget(entry: ActiveTargetEntry): Promise<boolean> {
   const isFillFirst = entry.strategy === "fill_first"
   // Fill-first orders are cached under the route model name (may be "*");
   // sticky pins under the request-model key (empty for idle entries).
@@ -114,11 +114,34 @@ async function clearActiveTarget(entry: ActiveTargetEntry) {
         ? `Reset fill-first order for "${entry.model}", will re-shuffle on next request`
         : `Cleared sticky pin for "${entry.model}", will revert to priority routing`,
     )
+    return true
   } catch (e: any) {
     toast.error(getErrorMessage(e, "Failed to clear active target"))
+    return false
   } finally {
     clearingModel.value = null
   }
+}
+
+// ── Clear confirm dialog (triggered by clicking the target) ──────
+const confirmOpen = ref(false)
+const confirmEntry = ref<ActiveTargetEntry | null>(null)
+
+function openClearConfirm(entry: ActiveTargetEntry) {
+  confirmEntry.value = entry
+  confirmOpen.value = true
+}
+
+function cancelClearConfirm() {
+  confirmOpen.value = false
+  confirmEntry.value = null
+}
+
+async function confirmClear() {
+  const entry = confirmEntry.value
+  if (!entry) return
+  const ok = await clearActiveTarget(entry)
+  if (ok) cancelClearConfirm()
 }
 
 // ── Provider enabled lookup ──────────────────────────────────────
@@ -254,52 +277,26 @@ const columns = [
       }
 
       const isFillFirst = fill !== undefined && sticky === undefined
-      // Fill-first orders are cached under the route model name ("*" for a
-      // wildcard route); sticky pins under the request-model key.
-      const resetKey = isFillFirst ? active.model : active.key
-      const isClearing = clearingModel.value === resetKey
+      const dotClass = isFillFirst
+        ? "bg-emerald-500"
+        : active.status === "expired"
+          ? "bg-amber-500"
+          : "bg-green-500"
 
-      return h("div", { class: "flex items-center gap-2" }, [
+      return h("div", { class: "flex items-center gap-1.5" }, [
+        h("span", { class: cn("h-2 w-2 shrink-0 rounded-full", dotClass) }),
         h(
-          Badge,
+          Button,
           {
-            variant: "outline",
-            class: `text-[10px] leading-none px-1.5 py-0 ${
-              isFillFirst
-                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600"
-                : active.status === "expired"
-                  ? "border-amber-500/30 bg-amber-500/10 text-amber-600"
-                  : "border-green-500/30 bg-green-500/10 text-green-600"
-            }`,
-          },
-          () => (isFillFirst ? "Fill" : active.status === "expired" ? "Expired" : "Active"),
-        ),
-        h(
-          "span",
-          {
-            class: "font-mono text-xs truncate max-w-[110px]",
+            variant: "ghost",
+            size: "sm",
+            class: "cursor-pointer px-1 font-mono text-xs truncate max-w-[110px]",
             title: isFillFirst
-              ? `${active.provider}/${active.real_model} — fill-first target (order cached ${formatDuration((active.fill_first_cache_age_secs ?? 0) * 1000)} ago)`
-              : `${active.provider}/${active.real_model} (${formatDuration(active.age_secs * 1000)})`,
+              ? `${active.provider}/${active.real_model} — fill-first target (order cached ${formatDuration((active.fill_first_cache_age_secs ?? 0) * 1000)} ago). Click to reset.`
+              : `${active.provider}/${active.real_model} (${formatDuration(active.age_secs * 1000)}). Click to clear.`,
+            onClick: () => openClearConfirm(active),
           },
-          `${active.provider}/${active.real_model}`,
-        ),
-        h(
-          "button",
-          {
-            type: "button",
-            class: cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "cursor-pointer"),
-            disabled: isClearing,
-            onClick: () => clearActiveTarget(active),
-            title: isFillFirst
-              ? "Reset fill-first order, re-shuffle on next request"
-              : "Clear active target, revert to priority routing",
-            "aria-label": isFillFirst ? "Reset fill-first order" : "Clear active target",
-          },
-          () =>
-            isClearing
-              ? h(Loader2, { class: "h-3 w-3 animate-spin" })
-              : h(PinOff, { class: "h-3 w-3 text-muted-foreground" }),
+          () => `${active.provider}/${active.real_model}`,
         ),
       ])
     },
@@ -407,6 +404,66 @@ const table = useVueTable({
       </Table>
     </div>
   </div>
+
+  <!-- ── Clear active target / reset fill-first confirm Dialog ──── -->
+  <Dialog
+    :open="confirmOpen"
+    @update:open="
+      (v) => {
+        if (!v) cancelClearConfirm()
+      }
+    "
+  >
+    <DialogContent class="sm:max-w-md">
+      <DialogHeader>
+        <DialogTitle>
+          {{
+            confirmEntry?.strategy === "fill_first"
+              ? "Reset Fill-First Order"
+              : "Clear Active Target"
+          }}
+        </DialogTitle>
+        <DialogDescription>
+          <template v-if="confirmEntry?.strategy === 'fill_first'">
+            Reset the cached fill-first order for
+            <span class="font-mono font-medium">{{ confirmEntry?.model }}</span
+            >? The next request will re-shuffle and may route to a different target.
+          </template>
+          <template v-else>
+            Clear the active target
+            <span class="font-mono font-medium"
+              >{{ confirmEntry?.provider }}/{{ confirmEntry?.real_model }}</span
+            >? Traffic will revert to priority routing.
+          </template>
+        </DialogDescription>
+      </DialogHeader>
+      <DialogFooter class="flex flex-row justify-end gap-2 sm:justify-end">
+        <Button
+          variant="outline"
+          size="sm"
+          :disabled="clearingModel !== null"
+          @click="cancelClearConfirm"
+        >
+          Cancel
+        </Button>
+        <Button
+          variant="destructive"
+          size="sm"
+          :disabled="clearingModel !== null"
+          @click="confirmClear"
+        >
+          <Loader2 v-if="clearingModel !== null" class="h-3 w-3 animate-spin" />
+          {{
+            clearingModel !== null
+              ? "Clearing…"
+              : confirmEntry?.strategy === "fill_first"
+                ? "Reset"
+                : "Clear"
+          }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
 
   <!-- ── Delete confirmation Dialog ────────────────────────────── -->
   <Dialog
