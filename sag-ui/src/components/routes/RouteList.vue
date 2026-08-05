@@ -290,7 +290,7 @@ const columns = [
           {
             variant: "ghost",
             size: "sm",
-            class: "cursor-pointer px-1 font-mono text-xs truncate max-w-[110px]",
+            class: "px-1 font-mono text-xs truncate",
             title: isFillFirst
               ? `${active.provider}/${active.real_model} — fill-first target (order cached ${formatDuration((active.fill_first_cache_age_secs ?? 0) * 1000)} ago). Click to reset.`
               : `${active.provider}/${active.real_model} (${formatDuration(active.age_secs * 1000)}). Click to clear.`,
