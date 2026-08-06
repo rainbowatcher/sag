@@ -44,6 +44,7 @@ stateDiagram-v2
 **动机**：纯时间驱动无法感知"上游是否真的恢复"。LLM 供应商普遍提供 5 小时限额 / 每日限额 / RPM 瞬时限流，额度可能在冷却窗口中途被补充——原实现要傻等满冷却（默认 1h）才发现，对 fill-first / sticky-failover 首选 target 尤其伤。
 
 **Trade-off**:
+
 - ✅ 上游恢复后最多 `probe_interval_secs` 内被发现并解除跳过（提前感知）
 - ✅ 冷却期内探测带 jitter 且全局仅 1 次，额外上游流量极小
 - ❌ 冷却期内会产生低频真实探测请求（运营已确认可接受）
@@ -55,7 +56,9 @@ stateDiagram-v2
 
 ### 4xx 行为非对称（有意设计）
 
-- 健康 target 收到 4xx（NonRetryable）→ 不打开熔断，零惩罚（4xx 通常是客户端请求问题，非 target 故障）。
+非可重试 4xx 经归因后（见 [4xx Failover 归因策略](../failover-4xx-policy/spec.md)）：客户端归因（400/413/422/未知）直接返客户端、不进 failover；provider 持续性归因（401/404/403-非quota）failover 但不开闸；403-quota 已重分类为可重试，耗尽后开闸（`QuotaExhausted`）。
+
+- 健康 target 收到非可重试 4xx（客户端 / provider 持续性）→ 不打开熔断，零惩罚（前者是客户端请求问题、后者是持续性配置问题，探针自愈对两者无意义）。
 - 探测期收到 4xx → 按失败探测重排（短暂跳过），原因：探测必须回填结果，4xx 表示"此刻不可用"，避免 half-open 槽卡死。
 
 ### `CircuitHint` 的分类粒度
@@ -69,6 +72,7 @@ pub enum CircuitHint {
 ```
 
 **Trade-off**: 三种分类 vs 更多细分：
+
 - 三种覆盖了主要的故障模式
 - 更多分类（如区分 timeout 和 500）会增加配置复杂度，但效用有限
 
@@ -77,6 +81,7 @@ pub enum CircuitHint {
 熔断器状态存储在 `DispatchRuntime` 的 `HashMap<RouteTargetKey, CircuitEntry>` 中（`RouteTargetKey = (model, provider, real_model)`，避免不同逻辑路由共享同一 provider 的熔断状态）。
 
 **Trade-off**: 全局 HashMap vs 嵌入 RouteTarget：
+
 - 全局：简单，热重载时只需清除对应 key
 - 嵌入：与 target 生命周期绑定，但 target 可能在热重载时被删除
 
@@ -106,6 +111,8 @@ pub enum CircuitHint {
 - [sag-state/src/lib.rs](../../../sag-state/src/lib.rs) — `AppState` 共享 `circuit_breaker` 与 `active_targets` Arc
 
 ## 变更记录
+
+- [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：403-quota 重分类为可重试 + 开闸）
 - [0001 初始化](changes/0001-initial.md)
 - [0002 熔断半开探测与冷却期周期探测](changes/0002-half-open-periodic-probe.md)
 - [0003 探测失败隐瞒冷却下界与流式取消探测槽泄漏修复](changes/0003-probe-lifetime-fix.md)

@@ -36,17 +36,19 @@ flowchart TD
     J --> L{success?}
     K --> L
     L -->|yes| M[return response]
-    L -->|non-retryable 4xx(1)| N[stop retries → failover]
-    L -->|retryable (408/429/5xx/timeout)| O{retries left?}
+    L -->|retryable (408/429/5xx/timeout/403-quota)| O{retries left?}
     O -->|yes| P[backoff sleep]
     P --> K
     O -->|no| Q[open circuit breaker]
     Q --> D
+    L -->|client 4xx(1)| R1[return error to client]
+    L -->|provider-persistent 4xx(2)| N[stop retries → failover]
     N --> D
     D -->|all exhausted| R[502 aggregated errors]
 ```
 
-(1) 400/403/422 等上游业务性 4xx（除 408 超时、429 限流外）。non-retryable 4xx 不触发重试、不开熔断，直接 failover 到下一 target。
+(1) 400/413/422/未知 4xx（客户端归因）：直接返客户端，不 failover、不挪 pin、不开熔断。
+(2) 401/404/403-非quota（provider 持续性）：failover + 挪 pin、不开熔断。403-quota 归入可重试分支。
 
 ## 关键决策
 
@@ -55,6 +57,7 @@ flowchart TD
 重试在单个请求处理中同步执行（循环内 await），而非 spawn 新任务。
 
 **Trade-off**:
+
 - ✅ 实现简单，请求上下文天然传递（不需要为每个重试创建新的 span）
 - ✅ 自然利用 tokio 的协作调度——sleep 时让出 CPU
 - ❌ 长时间重试会占用一个 tokio task。但 LLM API 的典型延迟是秒级，task 数量本就不高
@@ -70,6 +73,7 @@ let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 ```
 
 **Trade-off**:
+
 - ✅ 解耦 provider（生产者）和 axum（消费者），任一端可以独立处理
 - ✅ unbounded channel 避免 provider 生产速度受限于消费速度——SSE chunk 通常很小
 - ❌ 错误无法通过 `?` 传播，需要通过 channel 发送错误 chunk
@@ -90,6 +94,7 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 重试逻辑在 dispatch 层（不在 provider 层），每个 target 的 retry 独立计数。
 
 **Trade-off**:
+
 - ✅ Provider 不需要关心重试，保持简单
 - ✅ Dispatch 可以看到完整的 targets 列表，做跨 target 的 fallthrough
 - ❌ Provider 内部的错误（如网络）和业务错误（如 4xx）在 dispatch 层区分，增加了判断逻辑
@@ -103,8 +108,9 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 ## 不变式
 
 - `resolve_route()` 通过对比 `ConfigHandle.routes_version` 与 `DispatchRuntime.last_prune_version` 实现惰性缓存清理；仅在版本差异时移除已不存在路由对应的 `fill_first_orders`、`route_counters`、`active_targets` 条目。路由变更方（admin API / 热重载）负责递增 `routes_version`
-- non-retryable 4xx（除 408/429 外）不触发重试、不开熔断，直接 failover 到下一 target
-- 408 Timeout 和 429 Rate Limited 属于可重试 4xx，429 走 `CircuitHint::RateLimited` 短冷却路径
+- 客户端归因 4xx（400/413/422/未知 4xx）直接返客户端，不 failover、不挪 pin、不开熔断
+- provider 持续性 4xx（401/404/403-非quota）不重试、不开熔断，failover + 挪 pin
+- 403-quota 与 408/429/5xx 同属可重试，403-quota 走 `CircuitHint::QuotaExhausted` 长冷却（3600s），429 走 `CircuitHint::RateLimited` 短冷却
 - 非流式请求使用 `timeout_secs` 做整体超时；流式请求使用 `chunk_timeout_secs` 做 chunk 间超时
 - backoff 在每次重试前 sleep（不是在失败后立即 sleep）
 - 流式请求的 response body 不等待（不缓存整个响应）
@@ -119,6 +125,8 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 - 关键场景：熔断器交互、重试耗尽、流式超时、4xx 分类判定（non-retryable vs retryable）、时间穿越（UTC 时间戳）
 
 ## 变更记录
+
+- [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）
 - [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)
 - [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)
 - [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)

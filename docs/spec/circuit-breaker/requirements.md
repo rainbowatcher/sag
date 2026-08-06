@@ -17,11 +17,11 @@ updated: 2026-07-22
 
 | 冷却类型 | 触发条件 | 默认冷却 |
 |---------|---------|---------|
-| 额度耗尽 | HTTP 429 + body 含 quota/billing 关键词 | 3600s (1h) |
+| 额度耗尽 | HTTP 429 **或 403** + body 含 quota/billing 关键词 | 3600s (1h) |
 | 速率限制 | HTTP 429（非额度相关） | 10s |
 | 通用故障 | 5xx / 网络超时 / 连接错误 / 上游超时 | 60s |
 
-分类逻辑：先精确匹配 `"rate limit"` → `RateLimited`，再匹配 quota/billing 关键词 → `QuotaExhausted`，其余 429 和 5xx/网络错误 → `Generic`。
+分类逻辑：对 `Upstream{status: 429|403}` 先精确匹配 `"rate limit"` → `RateLimited`，再匹配 quota/billing 关键词 → `QuotaExhausted`，其余 → `Generic`。403-非quota 不走熔断（归 provider 持续性，见 [4xx 归因策略](../failover-4xx-policy/spec.md)）。
 
 ### 冷却行为
 
@@ -58,6 +58,7 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 ## 功能边界
 
 ### 包含
+
 - 按错误类型分类
 - 时间驱动的冷却
 - 自动恢复
@@ -65,6 +66,7 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 - 冷却期周期探测（提前感知恢复）
 
 ### 不包含
+
 - 滑动窗口计数
 - 基于成功率的熔断（仅时间驱动）
 - 探测次数上限（真耗尽目标无限期按 interval 低频探测直到恢复）

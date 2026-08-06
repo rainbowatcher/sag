@@ -22,8 +22,9 @@ updated: 2026-07-22
    c. 调用 provider（chat / chat_stream / chat_image）
    d. 成功 → 返回响应
    e. 失败 → 根据错误类型决定重试或 fallthrough：
-      - **non-retryable 4xx**（除 408 超时、429 限流外）：不重试、不开熔断，直接 failover 到下一 target
-      - **retryable 错误**（408/429/5xx/超时/网络错误）：按退避策略重试，耗尽后开熔断（429 走 `CircuitHint::RateLimited` 短冷却路径）
+      - **客户端归因 4xx**（400/413/422/未知 4xx）：直接返客户端，不重试、不 failover、不挪 pin、不开熔断
+      - **provider 持续性 4xx**（401/404/403-非quota）：不重试、不开熔断，failover 到下一 target（StickyFailover 下成功则挪 pin）
+      - **可重试错误**（408/429/5xx/超时/网络错误/**403-quota**）：按退避策略重试，耗尽后开熔断（429 走 `CircuitHint::RateLimited` 短冷却，403-quota 走 `CircuitHint::QuotaExhausted` 长冷却）
 5. 全部 targets 耗尽 → 返回聚合错误
 
 **失败路径**在写入 `call_logs` 时携带 `request.reasoning_effort`，确保失败请求的推理意图可被审计——与成功路径一致。图片生成路径传 `None`（不适用）。
@@ -31,22 +32,25 @@ updated: 2026-07-22
 ### 重试退避
 
 每次重试前等待指数退避延迟：
+
 - 公式：`min(base_ms * 2^attempt, max_ms)`
 - `attempt` 从 0 计数（第 0 次重试前等待 `base_ms`）
 - `jitter = true` 时：`delay = random(0, computed_cap)`（防 thundering herd）
 - `jitter = false` 时：`delay = computed_cap`（确定性，便于测试）
 
-### 上游 4xx 错误分类
+### 上游 4xx 错误归因
 
-上游返回的 HTTP 4xx 状态码按以下规则分类，决定重试与熔断行为：
+上游返回的 HTTP 4xx 状态码按归因三类，决定重试、failover 与熔断行为（详见 [4xx Failover 归因策略](../failover-4xx-policy/spec.md)）：
 
-| 状态码 | 分类 | 行为 |
+| 状态码 | 归因 | 行为 |
 |--------|------|------|
-| 408 Request Timeout | 可重试 | 按退避策略重试，耗尽后开熔断 |
-| 429 Too Many Requests | 可重试（短冷却） | 走 `CircuitHint::RateLimited` 短冷却路径，不按常规退避重试 |
-| 400/403/422 等其余 4xx | 不可重试 | 不重试、不开熔断，立即 failover 到下一 target |
+| 400/413/422/未知 4xx | 客户端参数错 | 直接返客户端，不重试、不 failover、不挪 pin、不开熔断 |
+| 401/404/403-非quota | provider 持续性 | 不重试、不开熔断，failover + 挪 pin（StickyFailover） |
+| 403 + body 含 quota 关键词 | provider 瞬时（额度） | 可重试，耗尽后开熔断 `CircuitHint::QuotaExhausted`（3600s） |
+| 408 Request Timeout | provider 瞬时（超时） | 可重试，耗尽后开熔断（60s） |
+| 429 Too Many Requests | provider 瞬时（限流） | 可重试，走 `CircuitHint::RateLimited` 短冷却（10s） |
 
-**原则**：上游返回的业务性 4xx（请求被拒）意味着请求体本身有问题，重试相同请求体不会改变结果；而 408 表示上游可能还活着但暂时忙不过来，429 表示上游限流——这两类值得重试或冷却等待。
+**原则**：客户端归因的 4xx（请求被拒）换一家 provider 同样会被拒，且改全员共享状态会有爆炸半径——故直接返客户端、诚实透传。provider 持续性故障（key 坏、model 下架）不会自愈，挪 pin 切走且待着、等人修。provider 瞬时故障（限流、超时、额度、5xx）会自愈，走熔断 + 周期探针等其恢复。
 
 ### 流式处理
 
@@ -84,6 +88,7 @@ updated: 2026-07-22
 ## 功能边界
 
 ### 包含
+
 - 请求分发（chat / stream / image）
 - 指数退避重试
 - 流式 SSE 透传
@@ -92,6 +97,7 @@ updated: 2026-07-22
 - 流式 chunk 超时的 SSE error 通知
 
 ### 不包含
+
 - 请求排队 / 优先级队列
 - 并发控制 / 信号量限制
 - 请求缓存（由上游 Anthropic cache_control 处理）
@@ -107,6 +113,7 @@ updated: 2026-07-22
 
 ## 变更记录
 
+- [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）
 - [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)
 - [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)
 - [0002 路由删除后缓存泄漏修复](changes/0002-cache-leak-fix.md)
