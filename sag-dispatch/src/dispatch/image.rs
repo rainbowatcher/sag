@@ -6,10 +6,11 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sag_core::{ChatCompletionRequest, ImageGenerationRequest, ImageGenerationResponse};
+use sag_core::{AppError, ChatCompletionRequest, ImageGenerationRequest, ImageGenerationResponse};
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
+use crate::dispatch::retry::is_client_caused_4xx;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
     DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
@@ -106,14 +107,29 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         // `apply_circuit_outcome` consumes it.
         let category = match &outcome {
             RetryOutcome::Exhausted(e) => e.error_category(),
-            RetryOutcome::NonRetryable => "bad_request",
+            RetryOutcome::NonRetryable(_) => "bad_request",
             RetryOutcome::Success(_) => "", // never logged
+        };
+
+        // Client-attributed 4xx (400/413/422/unknown 4xx): return straight
+        // to the client — no failover, no pin movement, no circuit change.
+        // `AppError` is not `Clone`, so peel the error out of the outcome by
+        // value and hand the breaker a placeholder `NonRetryable` (its
+        // payload is ignored — the breaker only needs the verdict to release
+        // a half-open probe slot). The peel happens *before*
+        // `apply_circuit_outcome` consumes the outcome.
+        let (client_error, cb_outcome) = match outcome {
+            RetryOutcome::NonRetryable(e) if is_client_caused_4xx(&e) => (
+                Some(e),
+                RetryOutcome::NonRetryable(AppError::Internal("client 4xx".into())),
+            ),
+            other => (None, other),
         };
 
         let Some(resp) = apply_circuit_outcome(
             runtime,
             circuit_key,
-            outcome,
+            cb_outcome,
             &circuit_breaker_cfg,
             is_probe,
         )
@@ -135,7 +151,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 user_agent.as_deref(),
                 client_ip.as_deref(),
             );
-            continue;
+            if let Some(err) = client_error {
+                // Client-attributed 4xx: return to the client directly — no
+                // failover to the next target, no pin movement, no circuit
+                // change. `into_response` transparently forwards the upstream
+                // status code + body.
+                return err.into_response();
+            }
+            continue; // provider-persistent 4xx: failover as before
         };
 
         if strategy == sag_config::Strategy::StickyFailover {

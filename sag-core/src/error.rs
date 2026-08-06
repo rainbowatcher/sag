@@ -104,13 +104,16 @@ pub enum AppError {
 impl AppError {
     /// Classify the error for circuit-breaker open-duration selection.
     ///
-    /// - HTTP 429 with a body hinting at quota/billing → [`CircuitHint::QuotaExhausted`]
+    /// - HTTP 429/403 with a body hinting at quota/billing → [`CircuitHint::QuotaExhausted`]
     /// - HTTP 429 without quota language → [`CircuitHint::RateLimited`]
+    /// - HTTP 403 without quota language → [`CircuitHint::Generic`]
     /// - Everything else → [`CircuitHint::Generic`]
     pub fn circuit_hint(&self) -> CircuitHint {
         match self {
             AppError::Upstream {
-                status: 429, body, ..
+                status: 429 | 403,
+                body,
+                ..
             } => {
                 let lower = body.to_lowercase();
                 // Check "rate limit" first: it is a narrow, high-precision
@@ -531,6 +534,101 @@ mod tests {
         assert_eq!(
             AppError::Anyhow(anyhow::anyhow!("oops")).error_category(),
             "internal_error"
+        );
+    }
+
+    // ── circuit_hint tests ───────────────────────────────────────
+
+    #[test]
+    fn circuit_hint_429_quota_body_is_quota_exhausted() {
+        assert_eq!(
+            AppError::Upstream {
+                provider: "openai".into(),
+                status: 429,
+                body: "quota exceeded".into(),
+            }
+            .circuit_hint(),
+            CircuitHint::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn circuit_hint_429_plain_rate_limit_is_rate_limited() {
+        // Narrow "rate limit" match wins over the broader quota keywords.
+        assert_eq!(
+            AppError::Upstream {
+                provider: "openai".into(),
+                status: 429,
+                body: "rate limit reached".into(),
+            }
+            .circuit_hint(),
+            CircuitHint::RateLimited
+        );
+        // Unknown 429 (no recognizable keyword) defaults to Generic (60s),
+        // not the short 10s cooldown — an unrecognised quota 429 must not
+        // hammer the upstream for an hour.
+        assert_eq!(
+            AppError::Upstream {
+                provider: "openai".into(),
+                status: 429,
+                body: "too many requests".into(),
+            }
+            .circuit_hint(),
+            CircuitHint::Generic
+        );
+    }
+
+    #[test]
+    fn circuit_hint_403_quota_body_is_quota_exhausted() {
+        // 403 sharing the 429 quota/billing keyword set → QuotaExhausted
+        // (self-healing, long cooldown).
+        for body in [
+            "quota exceeded",
+            "billing limit",
+            "insufficient quota",
+            "usage limit",
+            "current quota",
+        ] {
+            assert_eq!(
+                AppError::Upstream {
+                    provider: "openai".into(),
+                    status: 403,
+                    body: body.into(),
+                }
+                .circuit_hint(),
+                CircuitHint::QuotaExhausted,
+                "403 body {body:?} should classify as QuotaExhausted"
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_hint_403_non_quota_body_is_generic() {
+        assert_eq!(
+            AppError::Upstream {
+                provider: "openai".into(),
+                status: 403,
+                body: "permission denied".into(),
+            }
+            .circuit_hint(),
+            CircuitHint::Generic
+        );
+    }
+
+    #[test]
+    fn circuit_hint_other_statuses_are_generic() {
+        assert_eq!(
+            AppError::Upstream {
+                provider: "openai".into(),
+                status: 400,
+                body: "bad request".into(),
+            }
+            .circuit_hint(),
+            CircuitHint::Generic
+        );
+        assert_eq!(
+            AppError::Internal("boom".into()).circuit_hint(),
+            CircuitHint::Generic
         );
     }
 }

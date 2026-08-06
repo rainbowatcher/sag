@@ -11,6 +11,7 @@ use sag_core::{AppError, ChatCompletionResponse, StreamChunk};
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
+use crate::dispatch::retry::is_client_caused_4xx;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
@@ -219,9 +220,12 @@ async fn validate_stream_first_chunk(
 }
 
 /// Try each target in order. On a retryable error, retry the same target with
-/// exponential backoff. On a non-retryable 4xx error (client-side request
-/// problem), do **not** retry the same target and do **not** open the circuit
-/// breaker — instead, failover to the next target in the list.
+/// exponential backoff. On a non-retryable 4xx error, do **not** retry the
+/// same target and do **not** open the circuit breaker:
+/// - client-caused 4xx (400/413/422/unknown) return straight to the client,
+///   no failover and no shared-state mutation;
+/// - provider-persistent 4xx (401/404/non-quota 403) failover to the next
+///   target, which may move the sticky pin on success.
 pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     let DispatchCtx {
         state,
@@ -350,14 +354,29 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         // generic "provider_error".
         let category = match &outcome {
             RetryOutcome::Exhausted(e) => e.error_category(),
-            RetryOutcome::NonRetryable => "bad_request",
+            RetryOutcome::NonRetryable(_) => "bad_request",
             RetryOutcome::Success(_) => "", // never logged — Success never reaches the else block
+        };
+
+        // Client-attributed 4xx (400/413/422/unknown 4xx): return straight
+        // to the client — no failover, no pin movement, no circuit change.
+        // `AppError` is not `Clone`, so peel the error out of the outcome by
+        // value and hand the breaker a placeholder `NonRetryable` (its
+        // payload is ignored — the breaker only needs the verdict to release
+        // a half-open probe slot). The peel happens *before*
+        // `apply_circuit_outcome` consumes the outcome.
+        let (client_error, cb_outcome) = match outcome {
+            RetryOutcome::NonRetryable(e) if is_client_caused_4xx(&e) => (
+                Some(e),
+                RetryOutcome::NonRetryable(AppError::Internal("client 4xx".into())),
+            ),
+            other => (None, other),
         };
 
         let Some(attempt) = apply_circuit_outcome(
             runtime,
             circuit_key,
-            outcome,
+            cb_outcome,
             &circuit_breaker_cfg,
             is_probe,
         )
@@ -379,7 +398,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 user_agent.as_deref(),
                 client_ip.as_deref(),
             );
-            continue;
+            if let Some(err) = client_error {
+                // Client-attributed 4xx: return to the client directly — no
+                // failover to the next target, no pin movement, no circuit
+                // change. `into_response` transparently forwards the upstream
+                // status code + body.
+                return err.into_response();
+            }
+            continue; // provider-persistent 4xx: failover as before
         };
 
         if strategy == sag_config::Strategy::StickyFailover {
@@ -709,6 +735,35 @@ mod tests {
             errors,
             strategy,
             sticky_token: sag_state::StickyToken::default(),
+            user_agent: None,
+            client_ip: None,
+        }
+    }
+
+    /// Like [`make_ctx`] (StickyFailover) but with an explicit sticky token.
+    /// [`StickyToken::default`] carries `routes_version = 0`, while a fresh
+    /// `ConfigHandle` starts at `routes_version = 1`, so tests that assert a
+    /// sticky writeback must pass a token captured from the live config.
+    fn make_ctx_with_token<'a>(
+        state: &'a AppState,
+        runtime: &'a DispatchRuntime,
+        request: &'a ChatCompletionRequest,
+        targets: &'a [ResolvedTarget],
+        errors: &'a mut Vec<String>,
+        sticky_token: sag_state::StickyToken,
+    ) -> DispatchCtx<'a> {
+        DispatchCtx {
+            state,
+            runtime,
+            request,
+            targets,
+            api_endpoint: "/chat/completions",
+            is_stream: false,
+            trace_id: Uuid::new_v4(),
+            start: Instant::now(),
+            errors,
+            strategy: sag_config::Strategy::StickyFailover,
+            sticky_token,
             user_agent: None,
             client_ip: None,
         }
@@ -1331,18 +1386,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_chat_upstream_4xx_does_not_retry_or_open_circuit() {
-        // Regression test: AppError::Upstream { status: 400 } is a
-        // client-side error and must be treated as non-retryable:
-        //   (1) no retries on the failing provider,
-        //   (2) circuit breaker stays closed (no cooldown),
-        //   (3) immediately failover to the next target.
+    async fn client_error_4xx_returns_to_client_without_failover() {
+        // A 400 (client-caused 4xx) must be returned straight to the client:
+        // no retry on the failing provider, no failover to the next target,
+        // no pin movement, no circuit change. (Pre-policy this failed over
+        // and B's success would have repinned every user onto B.)
         let m1 = Arc::new(MockProvider::new("first"));
         let m2 = Arc::new(MockProvider::new("second"));
         m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
             provider: "first".into(),
             status: 400,
-            body: "bad request from upstream".into(),
+            body: "unsupported parameter".into(),
+        }));
+        // m2 would succeed if ever called — it must not be.
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // Pre-pin A so "pin unchanged" is observable.
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+
+        // 400 straight to the client — not B's 200, not a 502.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(m1.chat_calls(), 1, "client 4xx should not retry A");
+        assert_eq!(m2.chat_calls(), 0, "client 4xx must not failover to B");
+
+        // Pin unchanged (still A).
+        let active = rt.active_targets.read().await;
+        assert_eq!(
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("first"),
+            "client-caused 4xx must not move the pin"
+        );
+
+        // Circuit stays closed.
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        assert!(
+            rt.route_circuit_breaker.read().await.is_closed(&key),
+            "client-caused 4xx must not open the circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_param_422_does_not_move_pin() {
+        // Regression: a provider rejecting an unsupported parameter (422)
+        // must not move the shared sticky pin — pre-policy every non-
+        // retryable 4xx failed over and B's success would have repinned
+        // all users from A to B for one client's bad parameter.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 422,
+            body: "unsupported parameter 'foo'".into(),
         }));
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
@@ -1350,57 +1460,308 @@ mod tests {
         let req = build_request("gpt-4o", false);
         let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
 
-        // First request: first fails with 4xx, should not retry or open circuit.
-        let mut first_errors = Vec::new();
-        let first = dispatch_chat(make_ctx(
+        // pin = A
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(
+            m2.chat_calls(),
+            0,
+            "B would have succeeded — must not be tried"
+        );
+
+        let active = rt.active_targets.read().await;
+        assert_eq!(
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("first"),
+            "pin must stay on A — B must not become the shared active target"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_401_failovers_and_moves_pin() {
+        // Regression: a 401 (invalid provider key — provider-persistent,
+        // not the client's fault) must still failover and move the pin to
+        // the working backup, without opening A's circuit.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 401,
+            body: "invalid api key".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // pin = A
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx_with_token(
             &state,
             &rt,
             &req,
             &targets,
-            false,
-            &mut first_errors,
+            &mut errors,
+            sag_state::StickyToken::new(0, 0, state.config.routes_version()),
         ))
         .await;
-        assert_eq!(first.status(), StatusCode::OK);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        // Pin moved to B (B succeeded → sticky writeback).
+        let active = rt.active_targets.read().await;
         assert_eq!(
-            m1.chat_calls(),
-            1,
-            "4xx upstream should not retry the same provider"
-        );
-        assert_eq!(
-            m2.chat_calls(),
-            1,
-            "should failover to the next target after non-retryable"
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("second"),
+            "provider-persistent 401 should move the pin to the working backup"
         );
 
-        // Circuit must still be closed — a 4xx on a healthy target should
-        // not open the breaker (mod.rs:167 design intent).
+        // A's circuit stays closed (no open on non-retryable 4xx).
         let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
         assert!(
             rt.route_circuit_breaker.read().await.is_closed(&key),
-            "non-retryable 4xx upstream error must not open the circuit"
+            "401 must not open the circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_404_failovers_and_moves_pin() {
+        // Regression: a 404 (model removed upstream — provider-persistent)
+        // must still failover and move the pin, without opening the circuit.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 404,
+            body: "model not found".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // pin = A
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
         );
 
-        // Second request: first should still be callable (not circuit-open).
-        let mut second_errors = Vec::new();
-        m1.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
-        let second = dispatch_chat(make_ctx(
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx_with_token(
             &state,
             &rt,
             &req,
             &targets,
-            false,
-            &mut second_errors,
+            &mut errors,
+            sag_state::StickyToken::new(0, 0, state.config.routes_version()),
         ))
         .await;
-        assert_eq!(second.status(), StatusCode::OK);
-        assert_eq!(
-            m1.chat_calls(),
-            2,
-            "first should be callable again — circuit was not opened"
-        );
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
         assert_eq!(m2.chat_calls(), 1);
-        assert!(second_errors.is_empty());
+
+        let active = rt.active_targets.read().await;
+        assert_eq!(
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("second"),
+            "provider-persistent 404 should move the pin to the working backup"
+        );
+
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        assert!(
+            rt.route_circuit_breaker.read().await.is_closed(&key),
+            "404 must not open the circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_403_opens_circuit() {
+        // A 403 whose body signals quota exhaustion is retryable: with the
+        // retry budget spent, A's circuit opens with the quota cooldown
+        // (default 3600s) and the request fails over to B.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 403,
+            body: "quota exceeded".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        // Default circuit_breaker config: quota_exhausted_secs = 3600.
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "fails over to B");
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        // A's circuit opened with the quota cooldown (~3600s).
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        let breaker = rt.route_circuit_breaker.read().await;
+        assert!(!breaker.is_closed(&key), "quota 403 must open the circuit");
+        let snap = breaker.snapshot();
+        let entry = snap
+            .iter()
+            .find(|e| e.provider == "first")
+            .expect("first must have a circuit entry");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let remaining = entry.cooldown_until_secs.saturating_sub(now_secs);
+        assert!(
+            (3500..=3600).contains(&remaining),
+            "quota cooldown should be ~3600s, got {remaining}s remaining"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_quota_403_failovers_and_moves_pin() {
+        // A 403 without quota keywords (perms / region / content policy) is
+        // a provider-persistent failure: failover + move pin + no circuit.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 403,
+            body: "permission denied".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // pin = A
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx_with_token(
+            &state,
+            &rt,
+            &req,
+            &targets,
+            &mut errors,
+            sag_state::StickyToken::new(0, 0, state.config.routes_version()),
+        ))
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        let active = rt.active_targets.read().await;
+        assert_eq!(
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("second"),
+            "non-quota 403 should move the pin to the working backup"
+        );
+
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        assert!(
+            rt.route_circuit_breaker.read().await.is_closed(&key),
+            "non-quota 403 must not open the circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_4xx_returns_to_client() {
+        // Unknown 4xx (418) defaults to client-caused: return to the client,
+        // no failover, no pin movement, no circuit change.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 418,
+            body: "i'm a teapot".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let state = build_state(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // pin = A
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let mut errors = Vec::new();
+        let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+
+        assert_eq!(resp.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 0, "unknown 4xx must not failover");
+
+        let active = rt.active_targets.read().await;
+        assert_eq!(
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("first"),
+            "unknown 4xx must not move the pin"
+        );
+
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        assert!(
+            rt.route_circuit_breaker.read().await.is_closed(&key),
+            "unknown 4xx must not open the circuit"
+        );
     }
 
     #[tokio::test]

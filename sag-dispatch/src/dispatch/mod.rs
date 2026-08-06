@@ -262,7 +262,7 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
             }
             None
         }
-        RetryOutcome::NonRetryable => {
+        RetryOutcome::NonRetryable(_) => {
             if is_probe {
                 // A non-retryable (4xx) probe means the target is not usable
                 // right now — reschedule the next probe one interval later

@@ -2,6 +2,7 @@
 
 use sag_config::BackoffConfig;
 use sag_core::AppError;
+use sag_core::error::CircuitHint;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
@@ -31,11 +32,14 @@ pub fn compute_backoff(attempt: u32, base_ms: u64, max_ms: u64, jitter: bool) ->
 /// state only when a target has actually spent its retry budget.
 ///
 /// [`Exhausted`](RetryOutcome::Exhausted) carries the last error so the
-/// caller can select an appropriate circuit-breaker open-duration.
+/// caller can select an appropriate circuit-breaker open-duration, and
+/// [`NonRetryable`](RetryOutcome::NonRetryable) carries the error so the
+/// caller can attribute a non-retryable 4xx to the client (return straight
+/// to the client) vs provider persistence (failover).
 #[derive(Debug)]
 pub enum RetryOutcome<T> {
     Success(T),
-    NonRetryable,
+    NonRetryable(AppError),
     Exhausted(AppError),
 }
 
@@ -43,7 +47,7 @@ impl<T> RetryOutcome<T> {
     pub fn into_option(self) -> Option<T> {
         match self {
             Self::Success(value) => Some(value),
-            Self::NonRetryable | Self::Exhausted(_) => None,
+            Self::NonRetryable(_) | Self::Exhausted(_) => None,
         }
     }
 }
@@ -76,8 +80,8 @@ where
 /// … capped at `backoff.max_ms`. See [`compute_backoff`].
 ///
 /// Behavior:
-/// - Non-retryable errors (client-side 4xx except 408/429) abort the loop
-///   immediately and push a `{label}: {err}` entry to `errors`.
+/// - Non-retryable errors (4xx except 408/429 and non-quota 403) abort the
+///   loop immediately and push a `{label}: {err}` entry to `errors`.
 /// - Retryable errors at the final attempt push a `{label}: {err}
 ///   (retries exhausted)` entry and stop.
 pub async fn run_with_retries_outcome<T, F, Fut>(
@@ -122,7 +126,7 @@ where
                 );
                 if !retryable {
                     errors.push(format!("{label}: {err}"));
-                    return RetryOutcome::NonRetryable;
+                    return RetryOutcome::NonRetryable(err);
                 }
                 if attempt == max_retries {
                     errors.push(format!("{label}: {err} (retries exhausted)"));
@@ -139,18 +143,46 @@ where
 ///
 /// The following errors are **not** retryable:
 /// - `BadRequest`, `ModelNotFound`, `Unauthorized`
-/// - `Upstream` with a 4xx status code **except** 408 (timeout) and 429 (rate
-///   limited), which are treated as transient and retryable — 429 already has
-///   its own short-circuit-breaker cooldown path via [`CircuitHint::RateLimited`].
+/// - `Upstream` with a 4xx status code **except** 408 (timeout), 429 (rate
+///   limited) and quota-403 (quota/billing exhausted) — 408/429/403-quota
+///   are treated as transient and retryable (429/403-quota already have
+///   their own circuit-breaker cooldown path via [`CircuitHint`]).
 ///
 /// Everything else (5xx, network, timeout, internal) is retryable.
 pub fn is_retryable_error(err: &AppError) -> bool {
     match err {
         AppError::BadRequest(_) | AppError::ModelNotFound(_) | AppError::Unauthorized(_) => false,
-        AppError::Upstream { status, .. } => {
-            matches!(status, 429 | 408 | 500..=599)
-        }
+        AppError::Upstream { status, .. } => match status {
+            // A 403 is retryable only when it signals quota exhaustion
+            // (self-healing — the provider tops up or the billing cycle
+            // resets). A non-quota 403 (perms / region / content policy) is
+            // a provider-persistent failure: not retryable, failover instead.
+            403 => err.circuit_hint() == CircuitHint::QuotaExhausted,
+            429 | 408 | 500..=599 => true,
+            _ => false,
+        },
         _ => true,
+    }
+}
+
+/// Whether a non-retryable upstream 4xx is attributable to the client
+/// (request shape) rather than provider persistence. Only meaningful for
+/// non-retryable 4xx: 401/403/404 are attributed to provider persistence
+/// (failover + move pin), every other 4xx is client-caused (return the
+/// error to the client, no failover, no pin movement, no circuit change).
+///
+/// A 403 reaching this predicate is always a non-quota 403 - quota-403 is
+/// retryable and never lands in [`RetryOutcome::NonRetryable`]. 408/429 are
+/// likewise retryable (transient provider failures, not client-caused) and
+/// excluded for defense-in-depth, even though they never reach this
+/// predicate via the `NonRetryable` path.
+pub fn is_client_caused_4xx(err: &AppError) -> bool {
+    match err {
+        AppError::Upstream { status, .. } => {
+            let s = *status;
+            (400..500).contains(&s) && !matches!(s, 401 | 403 | 404 | 408 | 429)
+        }
+        _ => false,
     }
 }
 
@@ -174,7 +206,8 @@ mod tests {
             reason: "r".into(),
         }));
 
-        // Upstream 4xx (except 408/429) are not retryable — client-side error.
+        // Upstream 4xx (except 408/429 and quota-403) are not retryable —
+        // client-side / provider-persistent error.
         assert!(!is_retryable_error(&AppError::Upstream {
             provider: "p".into(),
             status: 400,
@@ -183,12 +216,25 @@ mod tests {
         assert!(!is_retryable_error(&AppError::Upstream {
             provider: "p".into(),
             status: 403,
-            body: "forbidden".into()
+            body: "permission denied".into()
         }));
         assert!(!is_retryable_error(&AppError::Upstream {
             provider: "p".into(),
             status: 422,
             body: "unprocessable".into()
+        }));
+
+        // A 403 whose body signals quota/billing exhaustion is retryable
+        // (self-healing) — goes through the circuit-breaker cooldown path.
+        assert!(is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 403,
+            body: "quota exceeded".into()
+        }));
+        assert!(!is_retryable_error(&AppError::Upstream {
+            provider: "p".into(),
+            status: 403,
+            body: "rate limit reached".into()
         }));
 
         // 429 (rate limited) is retryable — short-circuit-breaker cooldown.
@@ -216,6 +262,66 @@ mod tests {
             status: 503,
             body: "unavailable".into()
         }));
+    }
+
+    #[test]
+    fn is_client_caused_4xx_attributes_status_codes() {
+        let upstream = |status: u16| AppError::Upstream {
+            provider: "p".into(),
+            status,
+            body: "body".into(),
+        };
+
+        // Client-caused: request-shape / unknown 4xx.
+        for status in [400, 402, 413, 418, 422, 451] {
+            assert!(
+                is_client_caused_4xx(&upstream(status)),
+                "status {status} should be client-caused"
+            );
+        }
+
+        // Provider-persistent: auth / missing-model / non-quota 403.
+        for status in [401, 403, 404] {
+            assert!(
+                !is_client_caused_4xx(&upstream(status)),
+                "status {status} should be provider-persistent"
+            );
+        }
+
+        // Non-4xx and non-Upstream errors are never client-caused.
+        assert!(!is_client_caused_4xx(&upstream(500)));
+        assert!(!is_client_caused_4xx(&AppError::BadRequest("bad".into())));
+        assert!(!is_client_caused_4xx(&AppError::Internal("i".into())));
+        // 408/429 (retryable) are transient provider failures, not
+        // client-caused; they also never reach this predicate via NonRetryable
+        // (filtered earlier by `is_retryable_error` -> Exhausted path), but
+        // the predicate is kept self-consistent for defense-in-depth.
+        assert!(!is_client_caused_4xx(&upstream(408)));
+        assert!(!is_client_caused_4xx(&upstream(429)));
+    }
+
+    #[tokio::test]
+    async fn non_retryable_outcome_carries_the_error() {
+        // The dispatch loop needs the status code from the non-retryable
+        // error to attribute a 4xx to the client vs provider persistence.
+        let mut errors = Vec::new();
+        let backoff = BackoffConfig::default();
+        let outcome: RetryOutcome<()> =
+            run_with_retries_outcome("test", 0, &backoff, &mut errors, |_attempt| async move {
+                Err::<(), _>(AppError::Upstream {
+                    provider: "p".into(),
+                    status: 400,
+                    body: "bad param".into(),
+                })
+            })
+            .await;
+        match outcome {
+            RetryOutcome::NonRetryable(err) => {
+                assert!(matches!(err, AppError::Upstream { status: 400, .. }));
+            }
+            other => panic!("expected NonRetryable, got {other:?}"),
+        }
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]
