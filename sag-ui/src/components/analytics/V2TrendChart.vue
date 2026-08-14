@@ -204,7 +204,7 @@ const chartData = computed(() => {
 })
 
 /** Y-axis title follows the metric; the requests metric keeps the
- *  scope-aware population wording (attempts are never mislabelled). */
+ *  scope-aware population wording (target-scope lowercase "requests"). */
 const yTitle = computed(() =>
   metric.value === "requests" ? population.value : metricOption.value.label,
 )

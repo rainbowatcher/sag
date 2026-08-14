@@ -36,10 +36,11 @@ export function populationOf(m: MetricSummary, scope: AnalyticsScope): number {
   return scope === "target" ? m.attempts : m.requests
 }
 
-/** Wording for the population metric of a scope — target attempts are
- *  never mislabelled as requests. */
+/** Wording for the population metric of a scope. Target-scope population
+ *  is shown as lowercase "requests" to distinguish it from route-scope
+ *  "Requests". */
 export function populationLabel(scope: AnalyticsScope): string {
-  return scope === "target" ? "尝试次数" : "Requests"
+  return scope === "target" ? "requests" : "Requests"
 }
 
 /** Per-second unit of the overall throughput metric — the backend's
