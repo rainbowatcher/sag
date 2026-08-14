@@ -9,10 +9,22 @@ import {
   Tooltip,
   Legend,
 } from "chart.js"
-import { computed } from "vue"
+import { computed, ref } from "vue"
 import { Line } from "vue-chartjs"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { useChartTheme } from "@/composables/useChartTheme"
-import type { AnalyticsScope, AnalyticsTrendResponse } from "@/types/api"
+import type {
+  AnalyticsScope,
+  AnalyticsTrendPoint,
+  AnalyticsTrendResponse,
+  MetricSummary,
+} from "@/types/api"
 import { groupKeyLabel, populationLabel } from "./v2"
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip, Legend)
@@ -27,10 +39,64 @@ const { chartColors } = useChartTheme()
 /**
  * Series drawn as explicit lines. The backend trims to Top-20 + others;
  * drawing all of them would make the legend unreadable, so the chart keeps
- * the overall area + the top few series + the `others` dashed line. The
- * full Top-20 + others list stays available in the trend table.
+ * the overall area + the top few series + the `others` dashed line.
  */
 const CHART_SERIES_LIMIT = 8
+
+// ── Switchable metric ──────────────────────────────────────────────
+// Per-point metrics are computable for EVERY line (Overall + series +
+// others). Overall-only metrics exist only on the overall bucket
+// (MetricSummary) — the per-series `AnalyticsTrendPoint` carries no
+// cache / latency data — so selecting one hides the series/others lines.
+const METRIC_KEYS = [
+  "requests",
+  "success",
+  "success_rate",
+  "prompt_tokens",
+  "completion_tokens",
+  "total_tokens",
+  "cache_hit_rate",
+  "e2e_avg",
+  "e2e_p95",
+] as const
+
+type MetricKey = (typeof METRIC_KEYS)[number]
+
+interface MetricOption {
+  label: string
+  /** 0..100 percentage scale → y-axis `max: 100`. */
+  rate?: boolean
+  /** Only the overall bucket has data → hide per-series lines. */
+  overallOnly?: boolean
+}
+
+const METRICS: Record<MetricKey, MetricOption> = {
+  requests: { label: "Requests" },
+  success: { label: "Success" },
+  success_rate: { label: "Success Rate (%)", rate: true },
+  prompt_tokens: { label: "Prompt Tokens" },
+  completion_tokens: { label: "Completion Tokens" },
+  total_tokens: { label: "Total Tokens" },
+  cache_hit_rate: { label: "Cache Hit Rate (%)", rate: true, overallOnly: true },
+  e2e_avg: { label: "Avg E2E (ms)", overallOnly: true },
+  e2e_p95: { label: "P95 E2E (ms)", overallOnly: true },
+}
+
+const metric = ref<MetricKey>("requests")
+const metricOption = computed(() => METRICS[metric.value])
+const overallOnly = computed(() => metricOption.value.overallOnly === true)
+
+/**
+ * Dropdown entries. The "requests" entry is scope-aware (attempts in
+ * target scope are never mislabelled as requests — same wording as the
+ * y-axis population label).
+ */
+const metricOptions = computed(() =>
+  METRIC_KEYS.map((key) => ({
+    key,
+    label: key === "requests" ? populationLabel(props.scope) : METRICS[key].label,
+  })),
+)
 
 const labels = computed(() =>
   props.trend.buckets.map((b) =>
@@ -43,47 +109,104 @@ const labels = computed(() =>
 
 const population = computed(() => populationLabel(props.scope))
 
+/** Value of a per-series point for the selected metric; `null` breaks the
+ *  line (no fabricated 0). Overall-only metrics return `null` (unreachable
+ *  for series lines — guarded by `overallOnly`). */
+function pointValue(p: AnalyticsTrendPoint, key: MetricKey): number | null {
+  switch (key) {
+    case "requests":
+      return p.requests
+    case "success":
+      return p.success
+    case "success_rate":
+      return p.requests > 0 ? (p.success / p.requests) * 100 : null
+    case "prompt_tokens":
+      return p.prompt_tokens
+    case "completion_tokens":
+      return p.completion_tokens
+    case "total_tokens":
+      return p.total_tokens
+    default:
+      return null
+  }
+}
+
+/** Value of the overall bucket for the selected metric. Nullable rates /
+ *  latencies map to `null` (line gap) instead of a fabricated 0. */
+function overallValue(m: MetricSummary, key: MetricKey, scope: AnalyticsScope): number | null {
+  switch (key) {
+    case "requests":
+      return scope === "target" ? m.attempts : m.requests
+    case "success":
+      return m.success
+    case "success_rate":
+      return m.success_rate === null ? null : m.success_rate * 100
+    case "prompt_tokens":
+      return m.prompt_tokens
+    case "completion_tokens":
+      return m.completion_tokens
+    case "total_tokens":
+      return m.total_tokens
+    case "cache_hit_rate":
+      return m.request_cache_hit_rate === null ? null : m.request_cache_hit_rate * 100
+    case "e2e_avg":
+      return m.e2e.avg_ms
+    case "e2e_p95":
+      return m.e2e.p95_ms
+  }
+}
+
 const chartData = computed(() => {
-  const scope = props.scope
+  const key = metric.value
   const datasets: any[] = [
     {
       label: `Overall ${population.value}`,
-      data: props.trend.buckets.map((b) =>
-        scope === "target" ? b.overall.attempts : b.overall.requests,
-      ),
+      data: props.trend.buckets.map((b) => overallValue(b.overall, key, props.scope)),
       borderColor: chartColors.value[0],
       backgroundColor: chartColors.value[0].replace("rgb(", "rgba(").replace(")", ",0.12)"),
       fill: true,
       tension: 0.3,
       pointRadius: 0,
       borderWidth: 2,
+      spanGaps: false,
     },
   ]
-  props.trend.series.slice(0, CHART_SERIES_LIMIT).forEach((s, i) => {
-    datasets.push({
-      label: groupKeyLabel(s.key),
-      data: s.points.map((p) => p.requests),
-      borderColor: chartColors.value[(i % (chartColors.value.length - 1)) + 1],
-      backgroundColor: "transparent",
-      tension: 0.3,
-      pointRadius: 0,
-      borderWidth: 1.5,
+  // Overall-only metrics have no per-series data — draw just the overall line.
+  if (!overallOnly.value) {
+    props.trend.series.slice(0, CHART_SERIES_LIMIT).forEach((s, i) => {
+      datasets.push({
+        label: groupKeyLabel(s.key),
+        data: s.points.map((p) => pointValue(p, key)),
+        borderColor: chartColors.value[(i % (chartColors.value.length - 1)) + 1],
+        backgroundColor: "transparent",
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 1.5,
+        spanGaps: false,
+      })
     })
-  })
-  if (props.trend.others) {
-    datasets.push({
-      label: `others (${props.trend.others.total_requests.toLocaleString()} ${population.value})`,
-      data: props.trend.others.points.map((p) => p.requests),
-      borderColor: "rgb(148 163 184)",
-      backgroundColor: "transparent",
-      borderDash: [4, 4],
-      tension: 0.3,
-      pointRadius: 0,
-      borderWidth: 1.5,
-    })
+    if (props.trend.others) {
+      datasets.push({
+        label: `others (${props.trend.others.total_requests.toLocaleString()} ${population.value})`,
+        data: props.trend.others.points.map((p) => pointValue(p, key)),
+        borderColor: "rgb(148 163 184)",
+        backgroundColor: "transparent",
+        borderDash: [4, 4],
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 1.5,
+        spanGaps: false,
+      })
+    }
   }
   return { labels: labels.value, datasets }
 })
+
+/** Y-axis title follows the metric; the requests metric keeps the
+ *  scope-aware population wording (attempts are never mislabelled). */
+const yTitle = computed(() =>
+  metric.value === "requests" ? population.value : metricOption.value.label,
+)
 
 const chartOptions = computed(() => ({
   responsive: true,
@@ -92,7 +215,8 @@ const chartOptions = computed(() => ({
   scales: {
     y: {
       beginAtZero: true,
-      title: { display: true, text: population.value },
+      max: metricOption.value.rate ? 100 : undefined,
+      title: { display: true, text: yTitle.value },
     },
     x: {
       ticks: { maxTicksLimit: 8 },
@@ -108,7 +232,23 @@ const chartOptions = computed(() => ({
 </script>
 
 <template>
-  <div class="h-64 xl:h-72">
-    <Line :data="chartData" :options="chartOptions" />
+  <div>
+    <div class="mb-2 flex items-center gap-2">
+      <span class="text-muted-foreground text-xs">Metric</span>
+      <Select :model-value="metric" @update:model-value="(v) => (metric = v as MetricKey)">
+        <SelectTrigger class="h-7 w-44 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent class="w-(--reka-select-trigger-width)">
+          <SelectItem v-for="m in metricOptions" :key="m.key" :value="m.key">
+            {{ m.label }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+      <p v-if="overallOnly" class="text-muted-foreground text-xs">该指标仅整体线可用，无逐组明细</p>
+    </div>
+    <div class="h-64 xl:h-72">
+      <Line :data="chartData" :options="chartOptions" />
+    </div>
   </div>
 </template>

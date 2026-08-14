@@ -12,13 +12,20 @@ import {
   TrendingUp,
   Zap,
 } from "@lucide/vue"
-import { computed, ref, watch } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
+import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import {
   Table,
   TableBody,
@@ -29,6 +36,8 @@ import {
 } from "@/components/ui/table"
 import { formatCompactNumber, successRateColor } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
+import { useProviderStore } from "@/stores/providers"
+import { useRouteStore } from "@/stores/routes"
 import type {
   AnalyticsGroupKey,
   AnalyticsGroupSummary,
@@ -36,6 +45,8 @@ import type {
   AnalyticsV2Query,
   LatencyMetric,
 } from "@/types/api"
+import DateRangePicker from "./DateRangePicker.vue"
+import type { DateRangeMs } from "./DateRangePicker.vue"
 import {
   formatCount,
   formatLatency,
@@ -48,11 +59,26 @@ import {
 } from "./v2"
 import V2TrendChart from "./V2TrendChart.vue"
 const store = useAnalyticsStore()
+const providerStore = useProviderStore()
+const routeStore = useRouteStore()
+
+// ── Filter option sources (mirror LogsPage) ──────────────────────
+const routeOptions = computed(() => routeStore.routes.map((r) => ({ value: r.model_name })))
+const providerOptions = computed(() =>
+  providerStore.providers.map((p) => ({ value: p.name, label: p.name })),
+)
+const modelOptions = computed(() => providerStore.allProviderModels.map((m) => ({ value: m })))
+
+onMounted(() => {
+  // Load option sources for the SearchSelect filters if not already loaded.
+  if (providerStore.providers.length === 0) providerStore.fetchProviders()
+  if (providerStore.allProviderModels.length === 0) providerStore.fetchAllProviderModels()
+  if (routeStore.routes.length === 0) routeStore.fetchRoutes()
+})
 
 // ── Query state ────────────────────────────────────────────────────
-type TimeRange = "1h" | "24h" | "7d"
-const RANGE_OPTIONS: TimeRange[] = ["1h", "24h", "7d"]
-const RANGE_MS: Record<TimeRange, number> = {
+type TimeRange = "1h" | "24h" | "7d" | "custom"
+const RANGE_MS: Record<Exclude<TimeRange, "custom">, number> = {
   "1h": 3_600_000,
   "24h": 86_400_000,
   "7d": 604_800_000,
@@ -60,6 +86,8 @@ const RANGE_MS: Record<TimeRange, number> = {
 const SCOPE_OPTIONS: AnalyticsScope[] = ["route", "target"]
 
 const range = ref<TimeRange>("24h")
+/** Custom range (UTC ms bounds) picked via the calendar range picker. */
+const customRange = ref<DateRangeMs | null>(null)
 const scope = ref<AnalyticsScope>("route")
 const routeFilter = ref("")
 const providerFilter = ref("")
@@ -107,15 +135,32 @@ const trend = computed(() => {
   if (dataStale.value || trendError.value) return null
   return matchesLastQuery(store.v2Trend) ? store.v2Trend : null
 })
-const series = computed(() => trend.value?.series ?? [])
-const others = computed(() => trend.value?.others ?? null)
 
-function buildQuery(): AnalyticsV2Query {
+/** True when a custom range is selected but from/to are missing or
+ *  invalid; the Query button is disabled and `refresh()` no-ops then. */
+const customRangeInvalid = computed(() => {
+  if (range.value !== "custom") return false
+  const r = customRange.value
+  return r === null || r.fromMs >= r.toMs
+})
+
+function buildQuery(): AnalyticsV2Query | null {
   const now = Date.now()
   const isTarget = scope.value === "target"
+  let from: number
+  let to: number
+  if (range.value === "custom") {
+    const r = customRange.value
+    if (r === null || r.fromMs >= r.toMs) return null
+    from = r.fromMs
+    to = r.toMs
+  } else {
+    from = now - RANGE_MS[range.value]
+    to = now
+  }
   return {
-    from: now - RANGE_MS[range.value],
-    to: now,
+    from,
+    to,
     scope: scope.value,
     route: routeFilter.value.trim() || undefined,
     // provider / real_model are target-scope-only filters; a route-scope
@@ -127,6 +172,7 @@ function buildQuery(): AnalyticsV2Query {
 
 async function refresh() {
   const query = buildQuery()
+  if (!query) return
   lastQuery.value = query
   inFlight.value++
   try {
@@ -136,8 +182,13 @@ async function refresh() {
   }
 }
 
-// Auto-refresh on time-range / scope changes (filters apply via Query).
-watch([range, scope], () => refresh(), { immediate: true })
+// Auto-refresh on scope changes and on preset range switches; the custom
+// range only takes effect via Query after the user picks from/to (picking
+// in the calendar must not fire requests).
+watch(scope, () => refresh(), { immediate: true })
+watch(range, (r) => {
+  if (r !== "custom") refresh()
+})
 
 // ── Summary cards ──────────────────────────────────────────────────
 const latencyCards = computed<
@@ -264,78 +315,14 @@ const groupRows = computed<GroupRow[]>(() =>
     return { key: groupKeyLabel(g.key), cells }
   }),
 )
-
-// ── Trend series table ─────────────────────────────────────────────
-interface SeriesRow {
-  label: string
-  total: number
-  success: number
-  successRate: number | null
-  tokensIn: number
-  tokensOut: number
-  others: boolean
-}
-
-function sumPoints(
-  points: { success: number; prompt_tokens: number; completion_tokens: number }[],
-) {
-  return points.reduce(
-    (acc, p) => ({
-      success: acc.success + p.success,
-      tokensIn: acc.tokensIn + p.prompt_tokens,
-      tokensOut: acc.tokensOut + p.completion_tokens,
-    }),
-    { success: 0, tokensIn: 0, tokensOut: 0 },
-  )
-}
-
-const seriesRows = computed<SeriesRow[]>(() => {
-  const rows: SeriesRow[] = series.value.map((s) => {
-    const totals = sumPoints(s.points)
-    return {
-      label: groupKeyLabel(s.key),
-      total: s.total_requests,
-      success: totals.success,
-      successRate: s.total_requests > 0 ? totals.success / s.total_requests : null,
-      tokensIn: totals.tokensIn,
-      tokensOut: totals.tokensOut,
-      others: false,
-    }
-  })
-  const o = others.value
-  if (o) {
-    const totals = sumPoints(o.points)
-    rows.push({
-      label: "others",
-      total: o.total_requests,
-      success: totals.success,
-      successRate: o.total_requests > 0 ? totals.success / o.total_requests : null,
-      tokensIn: totals.tokensIn,
-      tokensOut: totals.tokensOut,
-      others: true,
-    })
-  }
-  return rows
-})
 </script>
 
 <template>
   <div class="flex h-full flex-col">
     <!-- ── Toolbar ─────────────────────────────────────────────── -->
     <div class="shrink-0">
-      <div class="flex flex-wrap items-center gap-3">
-        <div class="bg-muted inline-flex rounded-md p-0.5">
-          <button
-            v-for="r in RANGE_OPTIONS"
-            :key="r"
-            @click="range = r"
-            class="rounded-sm px-3 py-1 text-sm transition-colors"
-            :class="range === r ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground'"
-          >
-            {{ r }}
-          </button>
-        </div>
-        <div class="bg-muted inline-flex rounded-md p-0.5">
+      <div class="flex flex-nowrap items-center gap-2 overflow-x-auto">
+        <div class="bg-muted inline-flex shrink-0 rounded-md p-0.5 whitespace-nowrap">
           <button
             v-for="s in SCOPE_OPTIONS"
             :key="s"
@@ -346,31 +333,67 @@ const seriesRows = computed<SeriesRow[]>(() => {
             {{ s === "route" ? "Route" : "Target" }}
           </button>
         </div>
-        <Input
-          v-model="routeFilter"
-          class="w-40 xl:w-52"
-          placeholder="Filter route..."
-          @keyup.enter="refresh()"
+        <Select
+          :model-value="range"
+          @update:model-value="(v) => (range = v as TimeRange)"
+          class="shrink-0 whitespace-nowrap"
+        >
+          <SelectTrigger class="w-28">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="1h">1h</SelectItem>
+            <SelectItem value="24h">24h</SelectItem>
+            <SelectItem value="7d">7d</SelectItem>
+            <SelectItem value="custom">Custom</SelectItem>
+          </SelectContent>
+        </Select>
+        <DateRangePicker
+          v-if="range === 'custom'"
+          v-model="customRange"
+          class="shrink-0"
+          placeholder="Pick a range"
         />
-        <Input
-          v-if="scope === 'target'"
-          v-model="providerFilter"
-          class="w-40 xl:w-52"
-          placeholder="Filter provider..."
-          @keyup.enter="refresh()"
-        />
-        <Input
-          v-if="scope === 'target'"
-          v-model="modelFilter"
-          class="w-40 xl:w-52"
-          placeholder="Filter actual model..."
-          @keyup.enter="refresh()"
-        />
-        <Button @click="refresh()">
+        <div class="flex shrink-0 items-center gap-2">
+          <SearchSelect
+            v-model="routeFilter"
+            :options="routeOptions"
+            placeholder="route"
+            search-placeholder="Search route..."
+            class="w-40 shrink-0"
+          />
+          <SearchSelect
+            v-if="scope === 'target'"
+            v-model="providerFilter"
+            :options="providerOptions"
+            placeholder="provider"
+            search-placeholder="Search provider..."
+            class="w-40 shrink-0"
+          />
+          <SearchSelect
+            v-if="scope === 'target'"
+            v-model="modelFilter"
+            :options="modelOptions"
+            placeholder="actual model"
+            search-placeholder="Search actual model..."
+            class="w-40 shrink-0"
+          />
+        </div>
+        <Button
+          size="sm"
+          class="shrink-0 whitespace-nowrap"
+          :disabled="customRangeInvalid"
+          @click="refresh()"
+        >
           <Search class="h-3.5 w-3.5" />
           Query
         </Button>
-        <RefreshButton :loading="loading" size="default" class="ml-auto" @click="refresh()" />
+        <RefreshButton
+          :loading="loading"
+          size="default"
+          class="ml-auto shrink-0 whitespace-nowrap"
+          @click="refresh()"
+        />
       </div>
     </div>
 
@@ -640,57 +663,8 @@ const seriesRows = computed<SeriesRow[]>(() => {
             >
               <Loader2 class="h-4 w-4 animate-spin" /> Loading trend...
             </div>
-            <div v-else-if="trend" class="space-y-4">
+            <div v-else-if="trend">
               <V2TrendChart :trend="trend" :scope="scope" />
-              <div class="overflow-x-auto">
-                <Table class="min-w-max">
-                  <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
-                    <TableRow>
-                      <TableHead class="text-left">Group</TableHead>
-                      <TableHead class="text-right">{{ populationLabel(scope) }}</TableHead>
-                      <TableHead class="text-right">Success</TableHead>
-                      <TableHead class="text-right">Success Rate</TableHead>
-                      <TableHead class="text-right">Tokens In</TableHead>
-                      <TableHead class="text-right">Tokens Out</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    <TableRow v-for="row in seriesRows" :key="row.label">
-                      <TableCell
-                        :class="row.others ? 'text-muted-foreground italic' : 'font-medium'"
-                      >
-                        {{ row.label }}
-                      </TableCell>
-                      <TableCell class="text-right tabular-nums">
-                        {{ row.total.toLocaleString() }}
-                      </TableCell>
-                      <TableCell class="text-right tabular-nums">
-                        {{ row.success.toLocaleString() }}
-                      </TableCell>
-                      <TableCell class="text-right font-mono text-xs tabular-nums">
-                        <span
-                          v-if="row.successRate != null"
-                          :style="{ color: successRateColor(row.successRate * 100) }"
-                        >
-                          {{ (row.successRate * 100).toFixed(1) }}%
-                        </span>
-                        <span v-else class="text-muted-foreground">—</span>
-                      </TableCell>
-                      <TableCell class="text-right tabular-nums">
-                        {{ formatCompactNumber(row.tokensIn) }}
-                      </TableCell>
-                      <TableCell class="text-right tabular-nums">
-                        {{ formatCompactNumber(row.tokensOut) }}
-                      </TableCell>
-                    </TableRow>
-                    <TableRow v-if="seriesRows.length === 0">
-                      <TableCell colspan="6" class="text-muted-foreground py-6 text-center">
-                        No trend series in this range.
-                      </TableCell>
-                    </TableRow>
-                  </TableBody>
-                </Table>
-              </div>
             </div>
             <div
               v-else
