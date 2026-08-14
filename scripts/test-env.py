@@ -7,8 +7,10 @@ start
     Spawn `./target/release/sag gateway.test.toml` detached, write
     `.test-env/{pid, build-info.json}`. The sag binary writes its own
     logs to daily-rotating files under `logs/` via tracing-appender
-    (e.g. `logs/sag.2026-06-26.log`). stdout/stderr are redirected to
-    `os.devnull`; this launcher does NOT capture them.
+    (e.g. `logs/sag.log.2026-06-26`). stdout is redirected to
+    `os.devnull` (the binary does file-based logging), while stderr is
+    captured to `.test-env/stderr.log` so panics and non-tracing
+    `Error:` output leave a trace instead of vanishing silently.
     Locks are acquired atomically (O_EXCL) so two concurrent `start`
     calls cannot both proceed past the lock check. On any failure during
     start, lock + pid + build-info are removed.
@@ -37,7 +39,9 @@ State under `.test-env/`:
     build-info.json — machine-readable summary of the launch
 
 Logs:
-    logs/sag.YYYY-MM-DD.log — daily-rotating, managed by tracing-appender
+    logs/sag.log.YYYY-MM-DD — daily-rotating, managed by tracing-appender
+    .test-env/stderr.log — captured stderr of the sag process (overwritten
+        on every start), for panics / non-tracing errors
 """
 
 import argparse
@@ -57,7 +61,10 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 PID_FILE = TEST_ENV_DIR / "pid"
 LOCK_FILE = TEST_ENV_DIR / "lock"
 BUILD_INFO = TEST_ENV_DIR / "build-info.json"
-LOG_GLOB = "logs/sag.*.log"
+STDERR_LOG = TEST_ENV_DIR / "stderr.log"
+# Daily-rotated log files are named `sag.log.YYYY-MM-DD` (tracing-appender
+# prefixes the file with "sag.log" and appends the date).
+LOG_GLOB = "logs/sag.log.*"
 
 DEFAULT_BINARY = PROJECT_ROOT / "target" / "release" / "sag"
 DEFAULT_CONFIG = PROJECT_ROOT / "gateway.test.toml"
@@ -175,15 +182,18 @@ def cmd_start(args: argparse.Namespace) -> None:
     try:
         # 4. Spawn detached. The sag binary writes its own logs to
         #    daily-rotating files under `logs/` via tracing-appender;
-        #    we redirect stdout/stderr to DEVNULL so the launcher does
-        #    not interfere with file-based logging.
+        #    we redirect stdout to DEVNULL so the launcher does
+        #    not interfere with file-based logging. stderr is captured
+        #    to `.test-env/stderr.log` (truncated on each start) so
+        #    panics / non-tracing errors are never silently lost.
         #    start_new_session=True puts sag in its own process group
         #    so SIGTERM targets only sag.
+        stderr_handle = open(STDERR_LOG, "w")
         proc = subprocess.Popen(
             [str(binary), str(config)],
             cwd=PROJECT_ROOT,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_handle,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -193,6 +203,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         #    metadata; partial-write here would still leave pid_file pointing
         #    at the live process.
         PID_FILE.write_text(str(proc.pid))
+        # Close the parent's copy of the stderr fd; the child keeps its own,
+        #    so the file remains writable by the sag process.
+        stderr_handle.close()
 
         # 6. Now write build-info.json with the pid resolved.
         info = {
@@ -209,7 +222,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         log("OK", f"test-env launched: PID {proc.pid}")
         log("SYS", f"binary: {binary}")
         log("SYS", f"config: {config}")
-        log("SYS", f"logs:   logs/sag.DATE.log (daily rotating)")
+        log("SYS", f"logs:   logs/sag.log.DATE (daily rotating)")
+        log("SYS", f"stderr: {STDERR_LOG}")
         log("SYS", f"info:   {BUILD_INFO}")
     except Exception:
         log("ERR", "start failed; cleaning up lock / pid / build-info")
@@ -341,7 +355,7 @@ def cmd_status(_args: Optional[argparse.Namespace] = None) -> None:
         if "config_mtime" in info:
             print(f"  mtime:    {info['config_mtime']}")
 
-    # 3. Find the latest rolling log file (logs/sag.*.log).
+    # 3. Find the latest rolling log file (logs/sag.log.*).
     log_files = sorted(
         PROJECT_ROOT.glob(LOG_GLOB),
         key=lambda p: p.stat().st_mtime,
@@ -350,6 +364,21 @@ def cmd_status(_args: Optional[argparse.Namespace] = None) -> None:
     latest_log = log_files[0] if log_files else None
 
     print()
+    # stderr capture: surface it if present (e.g. a startup panic).
+    if STDERR_LOG.exists():
+        stderr_size = STDERR_LOG.stat().st_size
+        if stderr_size:
+            print(f"== stderr ({STDERR_LOG}, {stderr_size} bytes) ==")
+            try:
+                with open(STDERR_LOG, "rb") as err_f:
+                    err_f.seek(0, os.SEEK_END)
+                    err_f.seek(max(0, err_f.tell() - 4096))
+                    tail = err_f.read().decode("utf-8", errors="replace").splitlines()[-20:]
+                for line in tail:
+                    print(f"  {line}")
+            except OSError as exc:
+                print(f"  (could not read: {exc})")
+        print()
     if latest_log:
         print(f"== log tail (last 20 of {latest_log}) ==")
         try:

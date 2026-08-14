@@ -82,13 +82,14 @@ State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analyti
 
 ### 日志轮转与清理
 
-SAG 在非 TTY 环境（生产部署、test-env）下自动将日志写入 `logs/` 目录的**每日轮转文件**（如 `logs/sag.2026-06-26.log`），启动器不再重定向 stdout/stderr。
+SAG 在非 TTY 环境（生产部署、test-env）下自动将日志写入 `logs/` 目录的**每日轮转文件**（如 `logs/sag.log.2026-06-26`）。test-env 启动器不再重定向 stdout，但会**捕获 stderr 到 `.test-env/stderr.log`**（每次 start 覆盖），panics 与非 tracing 的 `Error:` 输出不会静默丢失。
 
 - **轮转**：每日自动切换新文件（`tracing-appender` `Rotation::DAILY`）
 - **清理**：每次启动时自动删除 **7 天前**的旧日志文件，保留最近一周
 - **格式**：配置文件 `[logging].format` 控制（`compact` / `json`），TTY 环境默认 `compact` 输出到终端
+- **启动失败可见性**：启动任一步骤失败时，`main` 会通过 tracing 写入 `startup failed error=...` 到日志文件，并同时打印到 stderr（test-env 下落在 `.test-env/stderr.log`），避免仅剩一行 `starting SAG gateway` 的静默退出
 
-`just test-env status` 会从最新的轮转日志文件中读取末尾 20 行，而非固定路径文件。
+`just test-env status` 会从最新的轮转日志文件中读取末尾 20 行，并在存在时展示 `.test-env/stderr.log` 的末尾内容。
 
 ## 优雅关闭
 

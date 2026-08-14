@@ -13,10 +13,10 @@ updated: 2026-06-26
 
 ### 输出目标
 
-| 环境 | stdout | 日志文件 |
-|------|--------|---------|
-| TTY（开发） | ✅ 输出 | ❌ 不写文件 |
-| 非 TTY（生产/test-env） | ❌ DEVNULL | ✅ `logs/sag.YYYY-MM-DD.log` 每日轮转 |
+| 环境 | stdout | stderr | 日志文件 |
+|------|--------|--------|---------|
+| TTY（开发） | ✅ 输出 | ✅ 输出 | ❌ 不写文件 |
+| 非 TTY（生产/test-env） | ❌ DEVNULL | test-env 捕获到 `.test-env/stderr.log` | ✅ `logs/sag.log.YYYY-MM-DD` 每日轮转 |
 
 ### 日志格式
 

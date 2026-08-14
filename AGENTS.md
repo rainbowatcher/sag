@@ -81,8 +81,8 @@
 | Rust 二进制 | `cargo run` 的 debug 实例 | `./target/release/sag`（事先 `just build-test`） |
 | 前端 | Vite dev server 独立 HMR | emit 后的产物通过 `rust-embed` 嵌入二进制（`--features embed-ui`） |
 | 默认端口 | 37210（读 `gateway.toml`） | 37211（读 `gateway.test.toml`） |
-| 状态目录 | n/a | `.test-env/{pid,lock,build-info.json}` |
-| 日志 | `logs/sag.YYYY-MM-DD.log`（每日滚动，tracing-appender 写入；dev.py 将子进程 stdout 以 `[BE]` 标签回显到终端） | `logs/sag.YYYY-MM-DD.log`（每日滚动，grep 友好；stdout/stderr 重定向到 DEVNULL） |
+| 状态目录 | n/a | `.test-env/{pid,lock,build-info.json,stderr.log}` |
+| 日志 | `logs/sag.log.YYYY-MM-DD`（每日滚动，tracing-appender 写入；dev.py 将子进程 stdout 以 `[BE]` 标签回显到终端） | `logs/sag.log.YYYY-MM-DD`（每日滚动，grep 友好；stdout 重定向到 DEVNULL，**stderr 捕获到 `.test-env/stderr.log`**） |
 | 配置 | `gateway.toml` | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
 | SQLite | `analytics.db` | `analytics-test.db` |
 
@@ -116,7 +116,7 @@ State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analyti
 - **start 的 fail-fast 路径**：缺 `./target/release/sag` → exit 1 + `[ERR] binary not found ... did you run \`just build-test\`?` ；缺 `gateway.test.toml` → exit 1 + `[ERR] config not found`。Agent 拿到 exit code 后追查即可，无须自己预先验证。
 - **`_acquire_lock()`** 走 `O_CREAT | O_EXCL` 原子获取，并发 `start` 互斥；agent 调 `restart` 时无须自己加锁。
 - **PID 文件是 canonical pointer**：status 路径先看 `.test-env/pid`，再 best-effort 读 `build-info.json`（缺失时打 `(build-info.json unavailable — partial state)` 而不是硬退）。无状态目录 → exit 1 + `[ERR] no test-env state`，agent 可作为运行探针使用。
-- **日志路径**：`logs/sag.YYYY-MM-DD.log` 每日滚动（tracing-appender 管理）；SAG 进程不会自己重开该文件，reader agent 可放心 `tail -f` 或 `grep`。
+- **日志路径**：`logs/sag.log.YYYY-MM-DD` 每日滚动（tracing-appender 管理）；SAG 进程不会自己重开该文件，reader agent 可放心 `tail -f` 或 `grep`。非 tracing 的 stderr（panic、`Error:`）落到 `.test-env/stderr.log`，排查静默失败时优先看它。
 - **隐式前置依赖**：改 `sag-ui/**.{ts,vue}` 之后必须重跑 `just build-test`，不然 `./target/release/sag` 仍是上一版 UI；改 `gateway.test.toml` 不需重建二进制（文件级 notify 热重载）。
 
 ## 开发环境与测试环境的边界

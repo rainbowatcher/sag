@@ -22,9 +22,15 @@ mod tracing_init;
 mod ui_routes;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     // 1. Resolve config path: --config <path> > positional <path> > "gateway.toml"
-    let config_path = resolve_config_path()?;
+    let config_path = match resolve_config_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // 2. Peek at the config file for logging.level and logging.format, then
     //    initialize tracing. The peek is done before full config load so the
@@ -32,17 +38,34 @@ async fn main() -> anyhow::Result<()> {
     //    If the file can't be read or the keys are missing, defaults apply.
     let (log_level, log_format) = sag_config::peek_logging_config(&config_path);
     // Declared first in main() → dropped last by Rust's reverse drop order,
-    // keeping the non-blocking writer alive through `info!("all subsystems shut down")`.
+    // keeping the non-blocking writer alive through `info!("all subsystems shut down")`
+    // and through the `tracing::error!` emitted when startup fails.
     let _log_guard = tracing_init::init(Some(&log_level), log_format);
 
     // Remove log files older than the retention period before any new
     // log entries are written for this process.
     cleanup_old_logs();
 
+    // 3. Run the gateway. Any startup failure is surfaced BOTH to the
+    //    tracing log file (so test-env / log readers can see it) and to
+    //    stderr (visible when run in the foreground). Without this, a failed
+    //    startup would exit silently — e.g. when test-env redirects stderr to
+    //    DEVNULL — leaving only a bare "starting SAG gateway" in the logs.
+    if let Err(e) = run(&config_path).await {
+        tracing::error!(error = %e, "startup failed");
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Full gateway startup and serve loop. Returns `Err` on any startup failure
+/// (config load, analytics init, provider registration, bind, ...) so `main`
+/// can report it via tracing + stderr instead of failing silently.
+async fn run(config_path: &str) -> anyhow::Result<()> {
     info!(%config_path, "starting SAG gateway");
 
     // 3. Load configuration with hot-reload support
-    let config_handle = sag_config::load_config(&config_path)?;
+    let config_handle = sag_config::load_config(config_path)?;
 
     // 4. Determine analytics storage DSN from config
     let config = config_handle.read().await;
