@@ -1,15 +1,245 @@
 //! SSE response builder for streaming chat completions.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use axum::{body::Body, http::StatusCode, response::Response};
 use futures_util::{Stream, StreamExt, stream::unfold};
-use sag_analytics::CallLogCollector;
-use sag_core::{CallLog, StreamChunk, Usage};
+use sag_analytics::{CallLogCollector, EventCollector, EventQueueError};
+use sag_core::{
+    CallLog, FailureReason, FinalStatus, RequestResultFact, StreamChunk, TargetAttemptFact,
+    TargetStatus, Usage,
+};
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::state::AppState;
+
+/// Terminal analytics facts shared between the stream loop and its drop
+/// guard ([`TerminalGuard`]).
+struct StreamAnalytics {
+    event_collector: Arc<EventCollector>,
+    request_id: uuid::Uuid,
+    route_name: String,
+    /// The model the client requested (route-level identity).
+    requested_model: String,
+    provider: String,
+    real_model: String,
+    /// Wall-clock route start captured at dispatch time (fact timestamp).
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Wall-clock start of this target's first actual provider call.
+    target_started_at: chrono::DateTime<chrono::Utc>,
+    /// Failure facts of targets that fell through before this stream
+    /// committed (retries / fallbacks). Included once in the single
+    /// terminal event of this request.
+    prior_target_facts: Vec<TargetAttemptFact>,
+    /// Set when the normal `Done`/`None` terminal ran (its event is
+    /// authoritative); the drop guard must not emit a second event.
+    done: AtomicBool,
+    /// Set when a mid-stream `Error` chunk was observed — distinguishes
+    /// `stream_error_after_commit` from `client_cancelled` on drop.
+    error: AtomicBool,
+}
+
+/// Build the single terminal [`sag_analytics::AnalyticsEvent`] for a
+/// streamed request: one request-level fact plus the current target's
+/// terminal fact, preceded by the failure facts of targets that fell
+/// through before commit.
+///
+/// `usage` / `ttft_ms` / `upstream_duration_ms` are the success-only
+/// payload (mid-stream partial usage never enters a fact); failure and
+/// cancel terminals pass `None` so every token / timing column stays NULL.
+#[allow(clippy::too_many_arguments)]
+fn terminal_event(
+    analytics: &StreamAnalytics,
+    result_status: FinalStatus,
+    result_reason: Option<FailureReason>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+    usage: Option<Usage>,
+    ttft_ms: Option<u64>,
+    upstream_duration_ms: Option<u64>,
+    target_status: TargetStatus,
+    target_reason: Option<FailureReason>,
+) -> sag_analytics::AnalyticsEvent {
+    sag_analytics::AnalyticsEvent {
+        result: RequestResultFact {
+            request_id: analytics.request_id,
+            route_name: Some(analytics.route_name.clone()),
+            requested_model: analytics.requested_model.clone(),
+            final_status: result_status,
+            failure_reason: result_reason,
+            stream: true,
+            started_at: analytics.started_at,
+            completed_at,
+            usage: usage.clone(),
+            cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
+            cache_creation_tokens: usage.as_ref().and_then(|u| u.cache_creation_tokens),
+            ttft_ms,
+            upstream_duration_ms,
+        },
+        targets: {
+            let mut targets = analytics.prior_target_facts.clone();
+            targets.push(TargetAttemptFact {
+                provider: analytics.provider.clone(),
+                real_model: analytics.real_model.clone(),
+                status: target_status,
+                failure_reason: target_reason,
+                started_at: analytics.target_started_at,
+                completed_at,
+                usage: usage.clone(),
+                cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
+                ttft_ms,
+                upstream_duration_ms,
+            });
+            targets
+        },
+    }
+}
+
+/// Deliver a claimed terminal event so the enqueue survives the response
+/// body's cancellation lifecycle *and* normal shutdown:
+///
+/// 1. Fast path — [`EventCollector::try_emit`]: the event is enqueued
+///    synchronously before this function returns. There is no task to
+///    cancel and nothing to drain later — the collector's writer, awaited
+///    by [`EventCollector::shutdown`] on graceful shutdown, persists the
+///    event from the channel. This is the normal-operation path and it is
+///    immune to both body-future cancellation and runtime scheduling.
+/// 2. Queue full — spawn a detached task that awaits backpressure via
+///    [`EventCollector::emit`]. The task is independent of the body
+///    future: dropping the body (client disconnect) can never cancel it.
+///    Graceful shutdown cannot lose it either: the in-flight `emit` holds
+///    its own sender clone, the writer drains the queue (the gateway
+///    awaits the drain before the runtime drops), and the `send` resolves
+///    once capacity frees — the event is written before the process
+///    exits. The only remaining loss window is the runtime-shutdown race
+///    on a task that never gets its first poll, and that now additionally
+///    requires the queue to be genuinely full at terminal time (the
+///    accepted abnormal case, not normal operation).
+/// 3. Queue full with no Tokio runtime context (a `Drop` guard dropped
+///    off-runtime) — warn and retry `try_emit` once; the writer may have
+///    freed a slot in the meantime.
+///
+/// Returns the spawned task's join handle when one was spawned, so the
+/// body-future terminal can await it: a *normal* completion then also
+/// guarantees the event is enqueued before the response body ends (fully
+/// drained by shutdown), while cancelling that await (body drop) cannot
+/// cancel the task itself. The drop guard — `Drop` cannot await — ignores
+/// the returned handle and the task runs detached.
+///
+/// `pub(crate)`: also used by the dispatch-level `DispatchCancelGuard`
+/// (the client-disconnect terminal of the dispatch loop) to deliver the
+/// `client_cancelled` event of a request cancelled before any terminal was
+/// reached.
+pub(crate) fn deliver_terminal_event(
+    collector: Arc<EventCollector>,
+    event: sag_analytics::AnalyticsEvent,
+) -> Option<JoinHandle<()>> {
+    let request_id = event.result.request_id;
+    let status = event.result.final_status;
+    match collector.try_emit(event.clone()) {
+        Ok(()) => None,
+        Err(EventQueueError::Closed) => {
+            warn!(
+                request_id = %request_id,
+                status = ?status,
+                "analytics terminal event not enqueued (event collector shut down)"
+            );
+            None
+        }
+        Err(EventQueueError::Full) => match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Some(handle.spawn(async move {
+                if let Err(e) = collector.emit(event).await {
+                    warn!(
+                        request_id = %request_id,
+                        status = ?status,
+                        error = %e,
+                        "analytics terminal event not enqueued from detached task (collector shut down)"
+                    );
+                }
+            })),
+            Err(_) => {
+                warn!(
+                    request_id = %request_id,
+                    status = ?status,
+                    "no tokio runtime context and analytics queue full; retrying try_emit once"
+                );
+                if let Err(e) = collector.try_emit(event) {
+                    warn!(
+                        request_id = %request_id,
+                        status = ?status,
+                        error = %e,
+                        "analytics terminal event not enqueued via try_emit retry"
+                    );
+                }
+                None
+            }
+        },
+    }
+}
+
+/// Drop guard on the stream state: emits the terminal analytics event when
+/// the response body is abandoned before a normal `Done`/`None` terminal —
+/// the axum/hyper client-disconnect detection point (dropping the response
+/// body drops this stream, which drops the guard).
+///
+/// Classifies by whether a mid-stream `Error` chunk was observed:
+/// - error observed → `model_failure` / `stream_error_after_commit` (the
+///   upstream failed after the first committed byte; no fallback);
+/// - no error → `client_cancelled` (client disconnected).
+///
+/// The guard fires at most once: the normal terminal sets the shared
+/// `done` flag *before* delivering its event, so a state dropped during or
+/// after the terminal delivery is a no-op and can never produce a second
+/// request result. Delivery runs through [`deliver_terminal_event`], which
+/// decouples the enqueue from the body future's cancellation lifecycle.
+struct TerminalGuard {
+    analytics: Arc<StreamAnalytics>,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Claim the terminal. The normal Done/None path already set `done`;
+        // only an abandoned stream reaches this swap with `false`.
+        if self.analytics.done.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let had_error = self.analytics.error.load(Ordering::SeqCst);
+        let (result_status, result_reason, target_status, target_reason) = if had_error {
+            (
+                FinalStatus::ModelFailure,
+                Some(FailureReason::StreamErrorAfterCommit),
+                TargetStatus::Failure,
+                Some(FailureReason::StreamErrorAfterCommit),
+            )
+        } else {
+            (
+                FinalStatus::ClientCancelled,
+                Some(FailureReason::ClientCancelled),
+                TargetStatus::Cancelled,
+                None,
+            )
+        };
+        let event = terminal_event(
+            &self.analytics,
+            result_status,
+            result_reason,
+            chrono::Utc::now(),
+            None, // failure / cancel: tokens must stay NULL
+            None,
+            None,
+            target_status,
+            target_reason,
+        );
+        // Same decoupled delivery as the normal terminal. `Drop` cannot
+        // await, so the queue-full path runs its backpressured `emit` in a
+        // detached task (the join handle is ignored — the task is
+        // independent); the common fast path enqueues synchronously and is
+        // fully drained by shutdown.
+        let _ = deliver_terminal_event(self.analytics.event_collector.clone(), event);
+    }
+}
 
 /// Wrap a `StreamChunk` stream in an SSE `Response`, forwarding data chunks
 /// to the client verbatim and accumulating `Usage` / `Error` chunks into
@@ -20,16 +250,53 @@ use crate::state::AppState;
 /// - `upstream_duration_ms` — wall-clock from start to stream end.
 /// - `ttft_ms` — wall-clock to the first `StreamChunk::Data`, or `None`
 ///   if the stream emitted only metadata.
+///
+/// ## Formal analytics terminal event
+///
+/// Every streamed request emits exactly one [`sag_analytics::AnalyticsEvent`]
+/// (the EventWriter's `request_id` idempotency is the backstop against
+/// duplicates):
+///
+/// - normal `Done`/`None` without a mid-stream error → `Success` with the
+///   final accumulated usage / cache / TTFT / upstream timing, plus a
+///   `Success` target fact for this streamed target;
+/// - normal `Done`/`None` after a mid-stream `Error` → `ModelFailure` /
+///   `stream_error_after_commit` (no fallback after commit; the HTTP 200 /
+///   truncated-SSE legacy protocol behavior is unchanged), with a
+///   `Failure` target fact; tokens stay NULL;
+/// - the response body dropped before a normal terminal — the axum/hyper
+///   client-disconnect signal — → `ClientCancelled` / `client_cancelled`
+///   with a `Cancelled` target fact (or `ModelFailure` /
+///   `stream_error_after_commit` if a mid-stream error was already
+///   observed); tokens stay NULL; no fallback.
+///
+/// The terminal event is delivered by [`deliver_terminal_event`], which
+/// decouples the enqueue from the body future's cancellation lifecycle:
+/// the common path enqueues synchronously (`try_emit` — nothing to cancel,
+/// nothing to drain later), and only when the queue is genuinely full does
+/// a detached task own the backpressured `emit`, surviving a body drop
+/// (client disconnect) mid-delivery and completing before graceful
+/// shutdown drains the collector.
+///
+/// The terminal event also carries the failure facts of targets that fell
+/// through before this stream committed (see `target_facts`). Route latency
+/// spans `started_at` → the terminal wall-clock instant; the target fact's
+/// `started_at` is the wall-clock start of this target's first provider
+/// call, and both facts share the same terminal `completed_at`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_streaming_response<S>(
     state: &AppState,
     chunk_stream: S,
+    route_name: &str,
     provider_name: &str,
     model: &str,
     real_model: &str,
     trace_id: uuid::Uuid,
     start: Instant,
     upstream_start: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
+    target_started_at: chrono::DateTime<chrono::Utc>,
+    target_facts: Vec<TargetAttemptFact>,
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
@@ -47,36 +314,51 @@ where
         usage: Usage,
         error: Option<String>,
         done: bool,
+        first_byte_at: Option<Instant>,
         collector: Arc<CallLogCollector>,
-        request_id: uuid::Uuid,
-        provider: String,
-        model: String,
-        real_model: String,
         start: Instant,
         upstream_start: Instant,
-        first_byte_at: Option<Instant>,
         reasoning_effort: Option<String>,
         user_agent: Option<String>,
         client_ip: Option<String>,
+        // Declared before the guard so it drops first; the guard's own
+        // `Arc` clone keeps the shared data alive regardless. The guard
+        // field is never read — it exists solely for its `Drop` (client
+        // disconnect terminal), hence the underscore name.
+        analytics: Arc<StreamAnalytics>,
+        _guard: TerminalGuard,
     }
 
     let collector = state.collector.clone();
+    let analytics = Arc::new(StreamAnalytics {
+        event_collector: state.event_collector.clone(),
+        request_id: trace_id,
+        route_name: route_name.to_string(),
+        requested_model: model.to_string(),
+        provider: provider_name.to_string(),
+        real_model: real_model.to_string(),
+        started_at,
+        target_started_at,
+        prior_target_facts: target_facts,
+        done: AtomicBool::new(false),
+        error: AtomicBool::new(false),
+    });
     let state = StreamState {
         stream: chunk_stream,
         usage: Usage::default(),
         error: None,
         done: false,
+        first_byte_at: None,
         collector,
-        request_id: trace_id,
-        provider: provider_name.to_string(),
-        model: model.to_string(),
-        real_model: real_model.to_string(),
         start,
         upstream_start,
-        first_byte_at: None,
         reasoning_effort,
         user_agent,
         client_ip,
+        analytics: analytics.clone(),
+        _guard: TerminalGuard {
+            analytics: analytics.clone(),
+        },
     };
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -133,13 +415,18 @@ where
                     }
                 }
                 Some(StreamChunk::Error(msg)) => {
-                    warn!(provider = %state.provider, error = %msg, "mid-stream error");
+                    warn!(provider = %state.analytics.provider, error = %msg, "mid-stream error");
                     state.error = Some(msg);
+                    // Shared with the drop guard: an abandoned stream after
+                    // an upstream error classifies as `stream_error_after_commit`,
+                    // not `client_cancelled`.
+                    state.analytics.error.store(true, Ordering::SeqCst);
                 }
                 Some(StreamChunk::Done) | None => {
                     state.done = true;
                     let error = state.error.take();
-                    let status_code = if error.is_some() { 502 } else { 200 };
+                    let had_error = error.is_some();
+                    let status_code = if had_error { 502 } else { 200 };
                     // `upstream_duration_ms` is always populated; `ttft_ms`
                     // is only set if at least one `Data` chunk arrived.
                     let upstream_duration_ms = Instant::now()
@@ -157,11 +444,15 @@ where
                     let cached_tokens = state.usage.cached_tokens;
                     let cache_creation_tokens = state.usage.cache_creation_tokens;
                     let reasoning_tokens = state.usage.reasoning_tokens;
+                    // Also shared by the analytics success fact below — the
+                    // fact's usage must be the *final* accumulated usage,
+                    // not a mid-stream partial frame.
+                    let usage = state.usage.clone();
                     state.collector.log(CallLog {
-                        request_id: state.request_id,
-                        provider: state.provider.clone(),
-                        model: state.model.clone(),
-                        real_model: state.real_model.clone(),
+                        request_id: state.analytics.request_id,
+                        provider: state.analytics.provider.clone(),
+                        model: state.analytics.requested_model.clone(),
+                        real_model: state.analytics.real_model.clone(),
                         stream: true,
                         status_code,
                         duration_ms: state.start.elapsed().as_millis() as u64,
@@ -173,7 +464,7 @@ where
                         cached_tokens,
                         cache_creation_tokens,
                         reasoning_tokens,
-                        usage: Some(state.usage),
+                        usage: Some(usage.clone()),
                         user_agent: state.user_agent.clone(),
                         client_ip: state.client_ip.clone(),
                         error_category: if status_code == 200 {
@@ -181,7 +472,73 @@ where
                         } else {
                             Some("stream_error".to_string())
                         },
+                        // Legacy call_logs keep its diagnostic role: the
+                        // formal identity columns stay NULL here; the
+                        // request_results / target_attempts facts resolve
+                        // identity via route_name / provider / real_model.
+                        route_id: None,
+                        target_id: None,
                     });
+
+                    // ── Formal analytics terminal event ──
+                    // Claim the terminal *before* delivering: if this body
+                    // future is dropped mid-delivery (client-disconnect
+                    // race at the very end), the drop guard sees `done`
+                    // and must not emit a second, conflicting request
+                    // result.
+                    state.analytics.done.store(true, Ordering::SeqCst);
+                    let (result_status, result_reason) = if had_error {
+                        (
+                            FinalStatus::ModelFailure,
+                            Some(FailureReason::StreamErrorAfterCommit),
+                        )
+                    } else {
+                        (FinalStatus::Success, None)
+                    };
+                    let (target_status, target_reason) = if had_error {
+                        (
+                            TargetStatus::Failure,
+                            Some(FailureReason::StreamErrorAfterCommit),
+                        )
+                    } else {
+                        (TargetStatus::Success, None)
+                    };
+                    let completed_at = chrono::Utc::now();
+                    let event = terminal_event(
+                        &state.analytics,
+                        result_status,
+                        result_reason,
+                        completed_at,
+                        // Success-only payload: usage / cache / TTFT /
+                        // upstream timing come from StreamState; failure
+                        // keeps every token / timing field NULL.
+                        if had_error { None } else { Some(usage) },
+                        if had_error { None } else { ttft_ms },
+                        if had_error {
+                            None
+                        } else {
+                            Some(upstream_duration_ms)
+                        },
+                        target_status,
+                        target_reason,
+                    );
+                    // Deliver the terminal outside this body future's
+                    // cancellation scope: dropping the body while the
+                    // queue is full must not cancel the enqueue — the
+                    // drop guard skips (the claim above), so this is the
+                    // only delivery for the normal terminal. The fast
+                    // path enqueues synchronously; under backpressure a
+                    // detached task owns the backpressured `emit`.
+                    // Awaiting the task here only binds a *normal*
+                    // completion to the enqueue — the event is in the
+                    // channel before the body ends, hence drained by
+                    // shutdown; cancelling this await (body drop) cannot
+                    // cancel the task.
+                    if let Some(task) =
+                        deliver_terminal_event(state.analytics.event_collector.clone(), event)
+                    {
+                        let _ = task.await;
+                    }
                     return None;
                 }
             }
@@ -212,6 +569,9 @@ mod tests {
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
+    use super::super::tests::{build_state_with_event_pool, build_state_with_event_queue_capacity};
+    use http_body_util::BodyExt;
+
     async fn build_state() -> AppState {
         let config = GatewayConfig {
             gateway_auth: Some(GatewayAuthConfig {
@@ -226,6 +586,36 @@ mod tests {
 
     fn chunk_stream(chunks: Vec<StreamChunk>) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         Box::pin(stream::iter(chunks))
+    }
+
+    /// Build a streaming response with default identity / timing args
+    /// (route `"test-route"`, `real_model` = model, fresh `trace_id`,
+    /// current instants, no prior target facts). Tests that need specific
+    /// identity / timing / reasoning args call `build_streaming_response`
+    /// directly.
+    fn stream_response(
+        state: &AppState,
+        chunks: Vec<StreamChunk>,
+        provider: &str,
+        model: &str,
+    ) -> axum::response::Response<axum::body::Body> {
+        build_streaming_response(
+            state,
+            chunk_stream(chunks),
+            "test-route",
+            provider,
+            model,
+            model,
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
     }
 
     /// Drain the collector and return the most recently inserted CallLog.
@@ -243,6 +633,60 @@ mod tests {
         logs.pop().expect("at least one log row")
     }
 
+    /// A valid filler event (success + a successful attempt) used to
+    /// occupy the collector queue in backpressure tests. It passes the
+    /// writer's validation so the drain stays fast; its `request_id` is
+    /// unique and never queried.
+    fn filler_event() -> sag_analytics::AnalyticsEvent {
+        let now = chrono::Utc::now();
+        sag_analytics::AnalyticsEvent {
+            result: RequestResultFact {
+                request_id: Uuid::new_v4(),
+                route_name: Some("fill-route".into()),
+                requested_model: "fill-model".into(),
+                final_status: FinalStatus::Success,
+                failure_reason: None,
+                stream: false,
+                started_at: now,
+                completed_at: now,
+                usage: None,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            },
+            targets: vec![TargetAttemptFact {
+                provider: "openai".into(),
+                real_model: "fill-model".into(),
+                status: TargetStatus::Success,
+                failure_reason: None,
+                started_at: now,
+                completed_at: now,
+                usage: None,
+                cached_tokens: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            }],
+        }
+    }
+
+    /// Fill the collector's queue until `try_emit` refuses. The caller
+    /// holds the pool's only connection (blocking the writer), so the
+    /// queue cannot drain between iterations: a refused `try_emit` means
+    /// the queue is genuinely full, and every later terminal delivery
+    /// must take the backpressure (spawned-task) path.
+    fn fill_tiny_queue(state: &AppState) {
+        let mut fills = 0;
+        while state.event_collector.try_emit(filler_event()).is_ok() {
+            fills += 1;
+            assert!(fills < 64, "queue must fill while the writer is blocked");
+        }
+        assert!(
+            fills >= 1,
+            "at least one filler event must occupy the queue"
+        );
+    }
+
     #[tokio::test]
     async fn data_chunks_are_forwarded_to_body() {
         let state = build_state().await;
@@ -251,19 +695,7 @@ mod tests {
             StreamChunk::Data(b"data: chunk-2\n\n".to_vec()),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get("Content-Type").unwrap(),
@@ -297,19 +729,7 @@ mod tests {
             }),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         // CallLog should record the max cumulative usage across chunks: max(10,5)=10 prompt, 20 completion, 30 total
@@ -350,19 +770,7 @@ mod tests {
             }),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "anthropic",
-            "claude",
-            "claude-sonnet-4",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "anthropic", "claude");
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         let log = latest_call_log(&state).await;
@@ -379,19 +787,7 @@ mod tests {
             StreamChunk::Error("upstream died".into()),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         state.collector.flush().await;
@@ -416,19 +812,7 @@ mod tests {
             StreamChunk::Data(b"data: ok\n\n".to_vec()),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         state.collector.flush().await;
@@ -446,19 +830,7 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_terminates_immediately() {
         let state = build_state().await;
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(vec![]),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, vec![], "openai", "gpt-4o");
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert!(body.is_empty(), "empty stream should yield empty body");
 
@@ -482,19 +854,7 @@ mod tests {
         // then just ends (no explicit `Done`).
         let state = build_state().await;
         let chunks = vec![StreamChunk::Data(b"data: partial\n\n".to_vec())];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"data: partial\n\n");
 
@@ -525,6 +885,7 @@ mod tests {
         let resp = build_streaming_response(
             &state,
             chunk_stream(chunks),
+            "test-route",
             "openai",
             "gpt-4o",
             "gpt-4o",
@@ -533,6 +894,9 @@ mod tests {
             // upstream_start recorded significantly before the stream
             // completes — guarantees a positive upstream_duration_ms.
             Instant::now() - std::time::Duration::from_millis(50),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
             Some("medium".into()),
             None,
             None,
@@ -579,19 +943,7 @@ mod tests {
             }),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         let log = latest_call_log(&state).await;
@@ -629,19 +981,7 @@ mod tests {
             }),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "openai",
-            "gpt-4o",
-            "gpt-4o",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "openai", "gpt-4o");
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
         let log = latest_call_log(&state).await;
@@ -677,19 +1017,7 @@ mod tests {
             }),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "anthropic",
-            "claude-3-5-sonnet",
-            "claude-3-5-sonnet",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "anthropic", "claude-3-5-sonnet");
 
         let _body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -724,19 +1052,7 @@ mod tests {
             }),
             StreamChunk::Done,
         ];
-        let resp = build_streaming_response(
-            &state,
-            chunk_stream(chunks),
-            "anthropic",
-            "claude-3-5-sonnet",
-            "claude-3-5-sonnet",
-            Uuid::new_v4(),
-            Instant::now(),
-            Instant::now(),
-            None,
-            None,
-            None,
-        );
+        let resp = stream_response(&state, chunks, "anthropic", "claude-3-5-sonnet");
 
         let _body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -745,5 +1061,724 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10682);
         assert_eq!(usage.completion_tokens, 510);
         assert_eq!(usage.total_tokens, 11192);
+    }
+
+    // ─── Formal analytics terminal event ──────────────────────────
+
+    /// Streaming success must emit exactly one `request_results` row
+    /// (`success`, `stream=1`, final accumulated usage / cache, route
+    /// identity resolved from `route_name`) plus one success target fact,
+    /// and the terminal event must also carry the failure fact of a target
+    /// that fell through before commit.
+    #[tokio::test]
+    async fn stream_success_emits_single_success_event_with_target_fact() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let prior_failure = TargetAttemptFact {
+            provider: "first".into(),
+            real_model: "gpt-4o".into(),
+            status: TargetStatus::Failure,
+            failure_reason: Some(FailureReason::ProviderError),
+            started_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            completed_at: chrono::Utc::now(),
+            usage: None,
+            cached_tokens: None,
+            ttft_ms: None,
+            upstream_duration_ms: None,
+        };
+        let chunks = vec![
+            StreamChunk::Data(b"data: hello\n\n".to_vec()),
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+                cached_tokens: Some(3),
+                cache_creation_tokens: None,
+                reasoning_tokens: Some(1),
+            }),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o-real",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            vec![prior_failure],
+            None,
+            None,
+            None,
+        );
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        state.event_collector.shutdown().await;
+
+        // Exactly one request result — no duplicate from the drop guard.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "exactly one request result per streamed request");
+
+        let (final_status, failure_reason, stream, pt, ct, cached): (
+            String,
+            Option<String>,
+            i32,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, stream, prompt_tokens, completion_tokens, \
+             cached_tokens \
+             FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("success fact must be persisted");
+        assert_eq!(final_status, "success");
+        assert!(failure_reason.is_none());
+        assert_eq!(stream, 1, "streamed request must record stream=1");
+        assert_eq!(pt, Some(5), "final accumulated usage enters the fact");
+        assert_eq!(ct, Some(7));
+        assert_eq!(cached, Some(3));
+        let actual_model: Option<String> =
+            sqlx::query_scalar("SELECT actual_model FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            actual_model.as_deref(),
+            Some("gpt-4o-real"),
+            "actual_model comes from the successful target's real_model"
+        );
+
+        // Route identity resolved by the writer from route_name.
+        let route_name: String = sqlx::query_scalar(
+            "SELECT r.route_name FROM analytics_routes r \
+             JOIN request_results rr ON rr.route_id = r.route_id \
+             WHERE rr.request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(route_name, "test-route");
+
+        // Two attempts: the prior failure (fallback) + the stream success.
+        // `attempt_id` order = the event's targets-vec order (insertion
+        // order is deterministic; `started_at` has millisecond ties).
+        let rows: Vec<(String, String, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT rt.provider, t.status, t.failure_reason, t.prompt_tokens \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.attempt_id",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "fallback failure + stream success");
+        assert_eq!(rows[0].0, "first");
+        assert_eq!(rows[0].1, "failure");
+        assert_eq!(rows[0].2.as_deref(), Some("provider_error"));
+        assert!(rows[0].3.is_none(), "failed attempt tokens stay NULL");
+        assert_eq!(rows[1].0, "openai");
+        assert_eq!(rows[1].1, "success");
+        assert!(rows[1].2.is_none());
+        assert_eq!(rows[1].3, Some(5), "success attempt carries the usage");
+    }
+
+    /// Mid-stream `Error` after a committed `Data` chunk: no fallback, the
+    /// terminal event is `model_failure` / `stream_error_after_commit`, the
+    /// target attempt is `failure`, and tokens stay NULL — mid-stream
+    /// partial usage must never enter a non-success fact.
+    #[tokio::test]
+    async fn stream_error_after_commit_emits_model_failure_with_null_tokens() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let chunks = vec![
+            StreamChunk::Data(b"data: partial\n\n".to_vec()),
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            StreamChunk::Error("upstream died".into()),
+            StreamChunk::Done,
+        ];
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(chunks),
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, pt, ct, ttft): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, prompt_tokens, completion_tokens, ttft_ms \
+             FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("model_failure fact must be persisted");
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(failure_reason.as_deref(), Some("stream_error_after_commit"));
+        assert!(
+            pt.is_none() && ct.is_none(),
+            "partial usage must not enter a failed request fact"
+        );
+        assert!(
+            ttft.is_none(),
+            "failed request fact keeps timing NULL (success-only payload)"
+        );
+
+        let (status, t_fr, t_pt): (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT status, failure_reason, prompt_tokens \
+             FROM target_attempts WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failure");
+        assert_eq!(t_fr.as_deref(), Some("stream_error_after_commit"));
+        assert!(t_pt.is_none(), "failed attempt tokens stay NULL");
+    }
+
+    /// Client-disconnect simulation at the axum/hyper body boundary:
+    /// dropping the response (and thus the body stream) without reaching a
+    /// normal `Done`/`None` terminal must emit exactly one
+    /// `client_cancelled` request result plus a `cancelled` target attempt
+    /// — even though partial usage was already observed, the cancel fact
+    /// keeps tokens NULL.
+    #[tokio::test]
+    async fn response_drop_emits_client_cancelled_with_cancelled_attempt() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        // One committed byte, partial usage, then the stream would keep
+        // streaming forever — the client disconnects before any terminal.
+        let stream = stream::iter(vec![
+            StreamChunk::Data(b"data: partial\n\n".to_vec()),
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+        ])
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        // The disconnect: drop the response without polling the body. The
+        // stream state (and its drop guard) is dropped with it.
+        drop(resp);
+        // The guard spawns the emit task on the current runtime; yield once
+        // so it enqueues before the collector drains (Drop cannot await).
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "drop guard must emit exactly one request result");
+
+        let (final_status, failure_reason, stream_flag, pt): (
+            String,
+            Option<String>,
+            i32,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, stream, prompt_tokens \
+             FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("client_cancelled fact must be persisted");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(failure_reason.as_deref(), Some("client_cancelled"));
+        assert_eq!(stream_flag, 1);
+        assert!(
+            pt.is_none(),
+            "cancelled request must not carry partial usage tokens"
+        );
+
+        let (status, t_pt): (String, Option<i64>) = sqlx::query_as(
+            "SELECT status, prompt_tokens FROM target_attempts WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "cancelled", "in-flight attempt is cancelled");
+        assert!(t_pt.is_none(), "cancelled attempt tokens stay NULL");
+    }
+
+    /// A client disconnect after a mid-stream upstream error classifies as
+    /// `model_failure` / `stream_error_after_commit` (the error takes
+    /// precedence over the cancel), with a `failure` attempt.
+    #[tokio::test]
+    async fn response_drop_after_upstream_error_emits_stream_error_after_commit() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let stream = stream::iter(vec![
+            StreamChunk::Data(b"data: partial\n\n".to_vec()),
+            StreamChunk::Error("upstream died".into()),
+        ])
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        // Drive the body one frame at a time with a noop waker: the first
+        // poll forwards the committed `Data` byte, the second consumes the
+        // `Error` chunk and suspends on `pending` — the client disconnects
+        // in that suspended state, so the drop guard must classify by the
+        // error flag it saw, not as a plain cancel.
+        let mut body = resp.into_body();
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let frame = body.frame();
+        futures_util::pin_mut!(frame);
+        assert!(
+            frame.as_mut().poll(&mut cx).is_ready(),
+            "first body frame (the committed Data byte) must be ready"
+        );
+        assert!(
+            frame.poll(&mut cx).is_pending(),
+            "Error chunk consumed; the stream must be suspended on pending"
+        );
+        drop(body);
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT final_status, failure_reason FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("model_failure fact must be persisted");
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(
+            failure_reason.as_deref(),
+            Some("stream_error_after_commit"),
+            "an upstream error seen before the drop wins over client_cancelled"
+        );
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failure");
+    }
+
+    // ─── Round-1 rework: terminal emit survives body drop under
+    // ─── backpressure ─────────────────────────────────────────────
+
+    /// The round-1 bug: the Done/None terminal claimed `done` and then ran
+    /// `emit().await` inside the body future — with the queue full
+    /// (backpressure), dropping the body cancelled the pending emit, and
+    /// the drop guard skipped (`done` already set), so the success fact
+    /// was lost. Regression: with the queue full and the body dropped
+    /// *while the terminal delivery is pending*, exactly one `success`
+    /// request result must still be persisted, with the final accumulated
+    /// usage.
+    #[tokio::test]
+    async fn backpressure_pending_body_drop_success_terminal_still_lands_once() {
+        let (state, pool) = build_state_with_event_queue_capacity(vec![], 1).await;
+        // Hold the pool's only connection: `open_analytics_pool(":memory:")`
+        // uses `max_connections = 1`, so the writer blocks on its first
+        // write and the queue cannot drain.
+        let conn = pool.acquire().await.unwrap();
+        fill_tiny_queue(&state);
+
+        let trace_id = Uuid::new_v4();
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(vec![
+                StreamChunk::Data(b"data: partial\n\n".to_vec()),
+                StreamChunk::Usage(Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: 7,
+                    total_tokens: 12,
+                    cached_tokens: None,
+                    cache_creation_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                StreamChunk::Done,
+            ]),
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        // Drive the body one frame at a time with a noop waker: the first
+        // poll forwards the committed byte; the second reaches the Done
+        // terminal, whose delivery must block on the full queue
+        // (backpressure Pending).
+        let mut body = resp.into_body();
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let frame = body.frame();
+        futures_util::pin_mut!(frame);
+        assert!(
+            frame.as_mut().poll(&mut cx).is_ready(),
+            "first body frame (the committed Data byte) must be ready"
+        );
+        assert!(
+            frame.poll(&mut cx).is_pending(),
+            "terminal delivery must pend on the full queue"
+        );
+
+        // The disconnect: drop the body while the terminal enqueue is
+        // pending. The detached emit task must survive and still enqueue.
+        drop(body);
+        // Let the detached task start and clone its sender before shutdown
+        // closes the slot, so its backpressured send can complete once the
+        // queue drains.
+        tokio::task::yield_now().await;
+
+        // Unblock the writer: the queue drains, the task's send completes,
+        // and shutdown awaits the writer until every event is persisted.
+        drop(conn);
+        state.event_collector.shutdown().await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly one terminal fact despite body drop under backpressure"
+        );
+
+        let (final_status, stream_flag, pt, ct): (String, i32, Option<i64>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, stream, prompt_tokens, completion_tokens \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(final_status, "success");
+        assert_eq!(stream_flag, 1);
+        assert_eq!(pt, Some(5), "final accumulated usage must reach the fact");
+        assert_eq!(ct, Some(7));
+    }
+
+    /// The error-after-commit variant of the backpressure body-drop
+    /// regression: with the queue full and the body dropped while the
+    /// `model_failure` / `stream_error_after_commit` delivery is pending,
+    /// exactly one request result must still be persisted, and partial
+    /// usage must stay NULL.
+    #[tokio::test]
+    async fn backpressure_pending_body_drop_error_terminal_still_lands_once() {
+        let (state, pool) = build_state_with_event_queue_capacity(vec![], 1).await;
+        let conn = pool.acquire().await.unwrap();
+        fill_tiny_queue(&state);
+
+        let trace_id = Uuid::new_v4();
+        let resp = build_streaming_response(
+            &state,
+            chunk_stream(vec![
+                StreamChunk::Data(b"data: partial\n\n".to_vec()),
+                StreamChunk::Usage(Usage {
+                    prompt_tokens: 5,
+                    completion_tokens: 7,
+                    total_tokens: 12,
+                    cached_tokens: None,
+                    cache_creation_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                StreamChunk::Error("upstream died".into()),
+                StreamChunk::Done,
+            ]),
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        let mut body = resp.into_body();
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let frame = body.frame();
+        futures_util::pin_mut!(frame);
+        assert!(
+            frame.as_mut().poll(&mut cx).is_ready(),
+            "first body frame (the committed Data byte) must be ready"
+        );
+        assert!(
+            frame.poll(&mut cx).is_pending(),
+            "Error consumed; the terminal delivery must pend on the full queue"
+        );
+
+        drop(body);
+        tokio::task::yield_now().await;
+        drop(conn);
+        state.event_collector.shutdown().await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly one terminal fact despite body drop under backpressure"
+        );
+
+        let (final_status, failure_reason, pt): (String, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, prompt_tokens \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(failure_reason.as_deref(), Some("stream_error_after_commit"));
+        assert!(
+            pt.is_none(),
+            "partial usage must stay NULL on the failed terminal"
+        );
+    }
+
+    /// The client-disconnect variant of the backpressure regression: the
+    /// stream never ends, the queue is full, and the response is dropped —
+    /// the drop guard's terminal delivery must take the backpressure path
+    /// and still persist exactly one `client_cancelled` request result
+    /// (tokens NULL).
+    #[tokio::test]
+    async fn backpressure_response_drop_guard_delivery_still_lands_once() {
+        let (state, pool) = build_state_with_event_queue_capacity(vec![], 1).await;
+        let conn = pool.acquire().await.unwrap();
+        fill_tiny_queue(&state);
+
+        let trace_id = Uuid::new_v4();
+        let stream = stream::iter(vec![StreamChunk::Data(b"data: partial\n\n".to_vec())])
+            .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        let mut body = resp.into_body();
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let frame = body.frame();
+        futures_util::pin_mut!(frame);
+        assert!(
+            frame.as_mut().poll(&mut cx).is_ready(),
+            "first body frame (the committed Data byte) must be ready"
+        );
+        assert!(
+            frame.poll(&mut cx).is_pending(),
+            "stream must be suspended waiting on the upstream"
+        );
+
+        // The disconnect: dropping the body runs the guard, whose delivery
+        // must take the backpressure path (the queue is full) and spawn
+        // the detached emit.
+        drop(body);
+        // Let the detached task start and clone its sender before shutdown
+        // closes the slot.
+        tokio::task::yield_now().await;
+
+        drop(conn);
+        state.event_collector.shutdown().await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "drop guard under backpressure must still persist exactly one fact"
+        );
+
+        let (final_status, failure_reason, pt): (String, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, prompt_tokens \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(failure_reason.as_deref(), Some("client_cancelled"));
+        assert!(
+            pt.is_none(),
+            "cancelled terminal must keep tokens NULL even under backpressure"
+        );
+    }
+
+    /// Controlled wrapper test for the drop guard outside any Tokio
+    /// runtime context (Drop cannot await): the synchronous `try_emit`
+    /// fast path must enqueue the event without a runtime.
+    #[test]
+    fn drop_guard_falls_back_to_try_emit_outside_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = rt.block_on(async {
+            sag_analytics::open_analytics_pool(":memory:")
+                .await
+                .unwrap()
+        });
+        // The collector must be created inside the runtime — its writer
+        // task is spawned via `tokio::spawn`.
+        let collector = rt.block_on(async {
+            Arc::new(sag_analytics::EventCollector::new(
+                sag_analytics::EventWriter::new(pool.clone()),
+            ))
+        });
+        let trace_id = Uuid::new_v4();
+        let guard = rt.block_on(async {
+            TerminalGuard {
+                analytics: Arc::new(StreamAnalytics {
+                    event_collector: collector.clone(),
+                    request_id: trace_id,
+                    route_name: "test-route".to_string(),
+                    requested_model: "gpt-4o".to_string(),
+                    provider: "openai".to_string(),
+                    real_model: "gpt-4o".to_string(),
+                    started_at: chrono::Utc::now(),
+                    target_started_at: chrono::Utc::now(),
+                    prior_target_facts: Vec::new(),
+                    done: AtomicBool::new(false),
+                    error: AtomicBool::new(false),
+                }),
+            }
+        });
+        // Dropped on the test thread, outside any runtime context: the
+        // synchronous `try_emit` fast path still enqueues the event — no
+        // task and no runtime are needed while the queue has room.
+        drop(guard);
+
+        rt.block_on(async {
+            collector.shutdown().await;
+            let (final_status, stream): (String, i32) = sqlx::query_as(
+                "SELECT final_status, stream FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("try_emit fallback must enqueue the event");
+            assert_eq!(final_status, "client_cancelled");
+            assert_eq!(stream, 1);
+        });
     }
 }

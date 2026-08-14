@@ -4,6 +4,7 @@ use sag_core::{AppError, CallLog, Usage};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::warn;
 
 use crate::store::{
@@ -71,13 +72,22 @@ pub struct SqliteLogStore {
 impl SqliteLogStore {
     /// Create a new SQLite store. `dsn` may be a file path, `:memory:`, or a
     /// `sqlite://...` URI. The schema is created/updated via `sqlx::migrate!`.
+    ///
+    /// Connections pin an explicit 5s `busy_timeout` so writes to the same
+    /// physical file as the formal analytics pool (rollup background
+    /// transactions, fact writes) wait for the lock instead of failing
+    /// immediately with SQLITE_BUSY.
     pub async fn new(dsn: &str) -> Result<Self, sqlx::Error> {
         let options = if dsn.starts_with("sqlite:") || dsn == ":memory:" {
             SqliteConnectOptions::from_str(dsn)?
+                .foreign_keys(true)
+                .busy_timeout(Duration::from_secs(5))
         } else {
             SqliteConnectOptions::new()
                 .filename(dsn)
                 .create_if_missing(true)
+                .foreign_keys(true)
+                .busy_timeout(Duration::from_secs(5))
         };
 
         let pool = SqlitePoolOptions::new()
@@ -560,6 +570,10 @@ impl LogRow {
             user_agent: self.user_agent,
             client_ip: self.client_ip,
             error_category: self.error_category,
+            // Identity columns are not persisted yet; legacy rows stay NULL
+            // (no retroactive backfill, per the analytics spec).
+            route_id: None,
+            target_id: None,
         }
     }
 }
@@ -598,6 +612,9 @@ mod tests {
             user_agent: None,
             client_ip: None,
             error_category: None,
+            // Internal analytics identity fields: not populated in tests.
+            route_id: None,
+            target_id: None,
         }
     }
 
@@ -761,6 +778,9 @@ mod tests {
             user_agent: Some("curl/8.0.1".into()),
             client_ip: Some("203.0.113.7".into()),
             error_category: None,
+            // Internal analytics identity fields: not populated in tests.
+            route_id: None,
+            target_id: None,
         };
         store
             .insert_batch(std::slice::from_ref(&log))
@@ -1001,5 +1021,259 @@ mod tests {
         assert_eq!(rows[0].total_prompt_tokens, 110);
         assert_eq!(rows[0].total_cached_tokens, 30);
         assert_eq!(rows[0].total_cache_creation_tokens, 15);
+    }
+
+    // ─── M1 migration: FK enforcement + rollup CHECK constraints ─────
+
+    fn assert_database_error(err: sqlx::Error, needle: &str) {
+        let msg = match &err {
+            sqlx::Error::Database(db) => db.message(),
+            other => panic!("expected database error, got: {other:?}"),
+        };
+        assert!(
+            msg.contains(needle),
+            "expected error containing {needle:?}, got: {msg}",
+        );
+    }
+
+    /// Blocker regression: every pool connection must run with
+    /// `foreign_keys(true)`, otherwise the migration's REFERENCES /
+    /// ON DELETE RESTRICT constraints are inert. A dangling
+    /// `target_attempts.request_id` must be rejected and deleting a
+    /// `request_results` row that still has attempts must be RESTRICTed.
+    #[tokio::test]
+    async fn migration_foreign_keys_are_enforced_on_pool_connections() {
+        let store = SqliteLogStore::new_memory().await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+
+        let route_id = Uuid::new_v4().to_string();
+        let target_id = Uuid::new_v4().to_string();
+        let request_id = Uuid::new_v4().to_string();
+
+        // Seed the referenced identity rows.
+        sqlx::query(
+            "INSERT INTO analytics_routes (route_id, route_name, first_seen, last_seen)
+             VALUES (?, 'test-route', 1000, 1000)",
+        )
+        .bind(&route_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO analytics_route_targets
+                 (target_id, route_id, provider, real_model, first_seen, last_seen)
+             VALUES (?, ?, 'provider', 'model', 1000, 1000)",
+        )
+        .bind(&target_id)
+        .bind(&route_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO request_results
+                 (request_id, final_status, started_at, completed_at, duration_ms)
+             VALUES (?, 'success', 1000, 2000, 1000)",
+        )
+        .bind(&request_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        // Dangling reference: request_id not in request_results must fail.
+        let dangling = Uuid::new_v4().to_string();
+        let err = sqlx::query(
+            "INSERT INTO target_attempts
+                 (request_id, target_id, route_id, actual_model, status,
+                  started_at, completed_at, duration_ms)
+             VALUES (?, ?, ?, 'model', 'success', 1000, 2000, 1000)",
+        )
+        .bind(&dangling)
+        .bind(&target_id)
+        .bind(&route_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+        assert_database_error(err, "FOREIGN KEY constraint failed");
+
+        // Valid attempt referencing the seeded request must succeed.
+        sqlx::query(
+            "INSERT INTO target_attempts
+                 (request_id, target_id, route_id, actual_model, status,
+                  started_at, completed_at, duration_ms)
+             VALUES (?, ?, ?, 'model', 'success', 1000, 2000, 1000)",
+        )
+        .bind(&request_id)
+        .bind(&target_id)
+        .bind(&route_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        // Facts are permanent: deleting a request with attempts is RESTRICTed.
+        let err = sqlx::query("DELETE FROM request_results WHERE request_id = ?")
+            .bind(&request_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap_err();
+        assert_database_error(err, "FOREIGN KEY constraint failed");
+    }
+
+    /// Major regression: the rollup tables must carry the status-count
+    /// equality CHECK constraints from the spec. Global counts every
+    /// final status; route excludes client_error / no_route.
+    #[tokio::test]
+    async fn migration_rollup_requests_equality_checks_are_enforced() {
+        let store = SqliteLogStore::new_memory().await.unwrap();
+        let mut conn = store.pool.acquire().await.unwrap();
+
+        let hour = 3_600_000_i64;
+
+        // Global: requests = success + client_error + no_route + all_disabled
+        //                + model_failure + client_cancelled.
+        // 8 != 2 + 1 + 1 + 1 + 1 + 1 = 7 → rejected.
+        let err = sqlx::query(
+            "INSERT INTO rollup_global_hourly
+                 (hour, requests, success, client_error, no_route, all_disabled,
+                  model_failure, client_cancelled, prompt_tokens, completion_tokens,
+                  total_tokens, cached_tokens, cache_creation_tokens,
+                  cached_known_count, cached_hit_count, prompt_tokens_cached_known,
+                  e2e_count, e2e_sum_ms, ttft_count, ttft_sum_ms,
+                  upstream_count, upstream_sum_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(hour)
+        .bind(8_i64)
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+        assert_database_error(err, "CHECK constraint failed");
+
+        // Balanced global row (7 = 2 + 1 + 1 + 1 + 1 + 1) must succeed.
+        sqlx::query(
+            "INSERT INTO rollup_global_hourly
+                 (hour, requests, success, client_error, no_route, all_disabled,
+                  model_failure, client_cancelled, prompt_tokens, completion_tokens,
+                  total_tokens, cached_tokens, cache_creation_tokens,
+                  cached_known_count, cached_hit_count, prompt_tokens_cached_known,
+                  e2e_count, e2e_sum_ms, ttft_count, ttft_sum_ms,
+                  upstream_count, upstream_sum_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(hour)
+        .bind(7_i64)
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        // Route view excludes client_error / no_route:
+        // requests = success + all_disabled + model_failure + client_cancelled.
+        // 9 != 5 + 1 + 1 + 1 = 8 → rejected.
+        let err = sqlx::query(
+            "INSERT INTO rollup_route_hourly
+                 (hour, route_id, requests, success, model_failure, all_disabled,
+                  client_cancelled, prompt_tokens, completion_tokens, total_tokens,
+                  cached_tokens, cached_known_count, cached_hit_count,
+                  prompt_tokens_cached_known, e2e_count, e2e_sum_ms, ttft_count,
+                  ttft_sum_ms, upstream_count, upstream_sum_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(hour)
+        .bind("route-1")
+        .bind(9_i64)
+        .bind(5_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+        assert_database_error(err, "CHECK constraint failed");
+
+        // Balanced route row (8 = 5 + 1 + 1 + 1) must succeed.
+        sqlx::query(
+            "INSERT INTO rollup_route_hourly
+                 (hour, route_id, requests, success, model_failure, all_disabled,
+                  client_cancelled, prompt_tokens, completion_tokens, total_tokens,
+                  cached_tokens, cached_known_count, cached_hit_count,
+                  prompt_tokens_cached_known, e2e_count, e2e_sum_ms, ttft_count,
+                  ttft_sum_ms, upstream_count, upstream_sum_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(hour)
+        .bind("route-1")
+        .bind(8_i64)
+        .bind(5_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
     }
 }

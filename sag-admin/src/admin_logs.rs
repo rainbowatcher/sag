@@ -141,6 +141,9 @@ mod tests {
             } else {
                 None
             },
+            // Internal analytics identity fields: not populated in tests.
+            route_id: None,
+            target_id: None,
         }
     }
 

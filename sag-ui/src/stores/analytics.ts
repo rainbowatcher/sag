@@ -3,6 +3,9 @@ import { ref, computed } from "vue"
 import { api } from "@/lib/client"
 import { getErrorMessage } from "@/lib/utils"
 import type {
+  AnalyticsSummaryResponse,
+  AnalyticsTrendResponse,
+  AnalyticsV2Query,
   CacheStatsRow,
   CallLog,
   DistributionRow,
@@ -16,6 +19,30 @@ import { useProviderStore } from "./providers"
 import { useRouteStore } from "./routes"
 
 const DEFAULT_LOG_LIMIT = 50
+
+/**
+ * Monotonic generation guard for async queries. `next()` starts a new
+ * generation and returns its token; `isCurrent(token)` is true only for the
+ * latest generation. An async flow captures the token before awaiting and
+ * re-checks it after the response/error lands — a stale result (token no
+ * longer current) must not touch state. This is the store-level fix for the
+ * out-of-order-response race: a slow response from a superseded scope/range
+ * query can no longer overwrite newer data or errors.
+ */
+function createQueryGuard() {
+  let current = 0
+  return {
+    /** Bump the generation and return the token of the new (current) one. */
+    next() {
+      current += 1
+      return current
+    },
+    /** True iff `token` still belongs to the latest generation. */
+    isCurrent(token: number) {
+      return token === current
+    },
+  }
+}
 
 export const useAnalyticsStore = defineStore("analytics", () => {
   // ── Stats (aggregated) ────────────────────────────────────────────
@@ -219,6 +246,86 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     }
   })
 
+  // ── V2 unified query API (summary / trend) ──────────────────────
+  const v2Summary = ref<AnalyticsSummaryResponse | null>(null)
+  const v2SummaryLoading = ref(false)
+  const v2SummaryError = ref<string | null>(null)
+  const v2Trend = ref<AnalyticsTrendResponse | null>(null)
+  const v2TrendLoading = ref(false)
+  const v2TrendError = ref<string | null>(null)
+  /** Summary and trend have independent generations: a stale response of
+   *  one kind never affects the other kind's state. */
+  const v2SummaryGuard = createQueryGuard()
+  const v2TrendGuard = createQueryGuard()
+
+  /** Serialize the shared v2 query parameters (from/to are always set). */
+  function buildV2Params(query: AnalyticsV2Query): URLSearchParams {
+    const params = new URLSearchParams()
+    params.set("from", String(query.from))
+    params.set("to", String(query.to))
+    if (query.scope) params.set("scope", query.scope)
+    if (query.route) params.set("route", query.route)
+    if (query.provider) params.set("provider", query.provider)
+    if (query.real_model) params.set("real_model", query.real_model)
+    if (query.top != null) params.set("top", String(query.top))
+    return params
+  }
+
+  /**
+   * Fetch the v2 summary (overall + groups + unassigned failures). Only the
+   * request holding the current generation token may write summary state:
+   * a late response/error from a superseded query is dropped, so rapid
+   * scope/range/filter switches can never let stale results or stale errors
+   * clobber the newest query's state. The current-token success path clears
+   * the error when writing new data, so a surviving stale error can never
+   * coexist with freshly written data (the error ref is owned by whichever
+   * request is current at write time, not by who started the request).
+   */
+  async function fetchV2Summary(query: AnalyticsV2Query) {
+    const token = v2SummaryGuard.next()
+    v2SummaryLoading.value = true
+    v2SummaryError.value = null
+    try {
+      const { data } = await api.get<AnalyticsSummaryResponse>(
+        `/v1/analytics/v2/summary?${buildV2Params(query)}`,
+      )
+      if (!v2SummaryGuard.isCurrent(token)) return
+      v2SummaryError.value = null
+      v2Summary.value = data
+    } catch (e: any) {
+      if (e?.response?.status === 401) useConnectionStore().handle401()
+      if (!v2SummaryGuard.isCurrent(token)) return
+      v2SummaryError.value = getErrorMessage(e, "Failed to load analytics summary")
+    } finally {
+      if (v2SummaryGuard.isCurrent(token)) v2SummaryLoading.value = false
+    }
+  }
+
+  /**
+   * Fetch the v2 trend (per-hour buckets + Top-N series + others). Guarded
+   * by its own generation token, independent of the summary's. Like the
+   * summary, the current-token success path clears the error when writing.
+   */
+  async function fetchV2Trend(query: AnalyticsV2Query) {
+    const token = v2TrendGuard.next()
+    v2TrendLoading.value = true
+    v2TrendError.value = null
+    try {
+      const { data } = await api.get<AnalyticsTrendResponse>(
+        `/v1/analytics/v2/trend?${buildV2Params(query)}`,
+      )
+      if (!v2TrendGuard.isCurrent(token)) return
+      v2TrendError.value = null
+      v2Trend.value = data
+    } catch (e: any) {
+      if (e?.response?.status === 401) useConnectionStore().handle401()
+      if (!v2TrendGuard.isCurrent(token)) return
+      v2TrendError.value = getErrorMessage(e, "Failed to load analytics trend")
+    } finally {
+      if (v2TrendGuard.isCurrent(token)) v2TrendLoading.value = false
+    }
+  }
+
   return {
     // stats
     stats,
@@ -240,6 +347,15 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     distLoading,
     distError,
     fetchDistribution,
+    // v2 unified query API
+    v2Summary,
+    v2SummaryLoading,
+    v2SummaryError,
+    fetchV2Summary,
+    v2Trend,
+    v2TrendLoading,
+    v2TrendError,
+    fetchV2Trend,
     // logs
     logs,
     logsTotal,

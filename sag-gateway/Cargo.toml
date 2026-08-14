@@ -29,6 +29,12 @@ async-trait = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Test-only: construct AnalyticsEvent fixtures (timestamps / ids) through
+# the formal public API instead of raw SQL.
+chrono = { workspace = true }
+uuid = { workspace = true }
+
 [features]
 # When on, sag-ui/dist/ is rolled into the binary at compile time.
 # Default is OFF: keeps the binary lean for users who deploy the SPA

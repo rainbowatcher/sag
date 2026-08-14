@@ -7,7 +7,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use sag_core::{AppError, ChatCompletionResponse, StreamChunk};
+use sag_analytics::AnalyticsEvent;
+use sag_core::{
+    AppError, ChatCompletionResponse, FailureReason, FinalStatus, RequestResultFact, StreamChunk,
+    TargetAttemptFact, TargetStatus,
+};
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
@@ -15,7 +19,8 @@ use crate::dispatch::retry::is_client_caused_4xx;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
-    DispatchCtx, apply_circuit_outcome, circuit_allows_target, fallback_exhausted_response,
+    DispatchCancelGuard, DispatchCtx, apply_circuit_outcome, circuit_allows_target,
+    client_error_failure_reason, emit_analytics_event, fallback_exhausted_response,
     log_per_target_failure, merge_model_overrides, release_probe_slot, success_log,
 };
 
@@ -236,12 +241,34 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         is_stream,
         trace_id,
         start,
+        // Route-level identity facts for the analytics request event:
+        // the matched route's `model_name` and the wall-clock timestamp
+        // captured at route scheduling time.
+        route_name,
+        started_at,
         errors,
         strategy,
         sticky_token,
         user_agent,
         client_ip,
     } = ctx;
+
+    // Client-disconnect terminal: if the handler future is dropped before
+    // any normal terminal (non-streaming request, or a streaming request
+    // cancelled before `build_streaming_response` commits), this guard
+    // emits the `client_cancelled` fact — with a `cancelled` attempt if a
+    // provider call was in flight, and 0 attempts otherwise (spec scenario
+    // 11). Created first so even a cancel during the config snapshot below
+    // is covered. Every terminal calls `mark_done()` before emitting its
+    // own event.
+    let cancel_guard = DispatchCancelGuard::new(
+        state.event_collector.clone(),
+        trace_id,
+        route_name,
+        &request.model,
+        is_stream,
+        started_at,
+    );
 
     // Snapshot the backoff config once so the per-target retry loop doesn't
     // hold the config read lock and so all targets within one request share
@@ -252,6 +279,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     let retry_on_empty = backoff.retry_on_empty_response;
     let circuit_breaker_cfg = config.circuit_breaker.clone();
     let api_endpoint = api_endpoint.to_string();
+
+    // One `TargetAttemptFact` per actually-issued target, emitted once in a
+    // single atomic request event at the end of the dispatch (non-stream
+    // slice only). Skipped targets (circuit open / provider disabled) never
+    // reach the provider and produce no fact.
+    let mut target_facts: Vec<TargetAttemptFact> = Vec::new();
 
     for target in targets {
         let provider_name = &target.provider;
@@ -289,60 +322,84 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         let retries = target.retries;
         let timeout_secs = target.timeout_secs;
 
+        // Wall-clock start of this target's first actual provider call,
+        // captured inside the retry closure on attempt 0. Retries of the
+        // same target extend the single fact's duration; the legacy
+        // `upstream_start` `Instant` remains untouched.
+        let mut target_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
+
         let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
             provider_name,
             retries,
             &backoff,
             errors,
-            |_attempt| {
+            |attempt| {
+                if attempt == 0 {
+                    target_started_at = Some(chrono::Utc::now());
+                }
                 let provider = provider.clone();
                 let real_model = real_model.clone();
                 let target_extra = target_extra.clone();
                 let api_endpoint = api_endpoint.clone();
                 let provider_name = provider_name.to_string();
+                let cancel = cancel_guard.analytics();
                 async move {
-                    // Capture the upstream start time immediately before the
-                    // provider call so retry/circuit overhead is excluded.
-                    let upstream_start = std::time::Instant::now();
-                    if is_stream {
-                        let s = provider
-                            .chat_stream(
-                                request,
-                                &real_model,
-                                &api_endpoint,
-                                &target_extra,
-                                timeout_secs,
-                            )
-                            .await?;
-                        if retry_on_empty {
-                            // Peek at the first chunk before committing the HTTP
-                            // 200 response.  If the upstream returned an empty
-                            // response (ct=0, no content), surface an
-                            // `EmptyResponse` error so the retry loop retries the
-                            // same target with backoff.
-                            let s =
-                                validate_stream_first_chunk(Box::pin(s), &provider_name).await?;
-                            Ok(ChatAttempt::Stream(s, upstream_start))
+                    // An actual provider call is in flight from here until
+                    // the attempt's future resolves. A client disconnect
+                    // during this window drops the future with the marker
+                    // still set, so the dispatch cancel guard persists the
+                    // attempt as `cancelled` (spec: 在途调用 → cancelled).
+                    // Cancels during backoff sleeps or between targets have
+                    // no marker → 0 target attempts (spec: 退避/fallback
+                    // 间隙 → 0 条).
+                    cancel.begin_attempt(&provider_name, &real_model);
+                    let result = async {
+                        // Capture the upstream start time immediately before the
+                        // provider call so retry/circuit overhead is excluded.
+                        let upstream_start = std::time::Instant::now();
+                        if is_stream {
+                            let s = provider
+                                .chat_stream(
+                                    request,
+                                    &real_model,
+                                    &api_endpoint,
+                                    &target_extra,
+                                    timeout_secs,
+                                )
+                                .await?;
+                            if retry_on_empty {
+                                // Peek at the first chunk before committing the HTTP
+                                // 200 response.  If the upstream returned an empty
+                                // response (ct=0, no content), surface an
+                                // `EmptyResponse` error so the retry loop retries the
+                                // same target with backoff.
+                                let s = validate_stream_first_chunk(Box::pin(s), &provider_name)
+                                    .await?;
+                                Ok(ChatAttempt::Stream(s, upstream_start))
+                            } else {
+                                Ok(ChatAttempt::Stream(Box::pin(s), upstream_start))
+                            }
                         } else {
-                            Ok(ChatAttempt::Stream(Box::pin(s), upstream_start))
+                            let r = provider
+                                .chat(
+                                    request,
+                                    &real_model,
+                                    &api_endpoint,
+                                    &target_extra,
+                                    timeout_secs,
+                                )
+                                .await?;
+                            if retry_on_empty && is_empty_non_stream_response(&r) {
+                                return Err(AppError::EmptyResponse {
+                                    provider: provider_name.clone(),
+                                });
+                            }
+                            Ok(ChatAttempt::NonStream(r, upstream_start))
                         }
-                    } else {
-                        let r = provider
-                            .chat(
-                                request,
-                                &real_model,
-                                &api_endpoint,
-                                &target_extra,
-                                timeout_secs,
-                            )
-                            .await?;
-                        if retry_on_empty && is_empty_non_stream_response(&r) {
-                            return Err(AppError::EmptyResponse {
-                                provider: provider_name.clone(),
-                            });
-                        }
-                        Ok(ChatAttempt::NonStream(r, upstream_start))
                     }
+                    .await;
+                    cancel.end_attempt();
+                    result
                 }
             },
         )
@@ -351,12 +408,40 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         // Extract the error_category from the outcome before
         // `apply_circuit_outcome` consumes it, so per-target
         // failure logs carry the real failure type instead of a
-        // generic "provider_error".
+        // generic "provider_error". Non-retryable errors use the real
+        // `error_category()` too: a client-caused `BadRequest` maps to
+        // "bad_request" exactly as before, while provider-persistent 4xx
+        // (401/403/404 upstream) correctly classify as "provider_error"
+        // instead of the historical hardcoded "bad_request".
         let category = match &outcome {
             RetryOutcome::Exhausted(e) => e.error_category(),
-            RetryOutcome::NonRetryable(_) => "bad_request",
+            RetryOutcome::NonRetryable(e) => e.error_category(),
             RetryOutcome::Success(_) => "", // never logged — Success never reaches the else block
         };
+
+        // Collapse this target's whole retry sequence into exactly one
+        // `TargetAttemptFact` (final outcome only — no retry counts). For
+        // streaming requests only pre-commit failures land here: a stream
+        // success fact is built at terminal time inside
+        // `build_streaming_response`, which also receives the failure
+        // facts accumulated so far (retry success collapses into the single
+        // success fact either way). The client-caused 4xx path is excluded:
+        // per the writer's validation contract a `client_error` event can
+        // carry no target attempts, so that attempt is recorded only in
+        // call_logs.
+        let is_client_error_path =
+            matches!(&outcome, RetryOutcome::NonRetryable(e) if is_client_caused_4xx(e));
+        if !is_client_error_path
+            && let Some(fact) = build_target_attempt_fact(
+                provider_name,
+                &real_model,
+                &outcome,
+                target_started_at,
+                chrono::Utc::now(),
+            )
+        {
+            target_facts.push(fact);
+        }
 
         // Client-attributed 4xx (400/413/422/unknown 4xx): return straight
         // to the client — no failover, no pin movement, no circuit change.
@@ -403,6 +488,39 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 // failover to the next target, no pin movement, no circuit
                 // change. `into_response` transparently forwards the upstream
                 // status code + body.
+                // Formal analytics event: the request failed with a
+                // client-caused 4xx → `client_error`. Per the writer's
+                // validation contract a `client_error` event carries no
+                // route identity (`route_id` NULL) and no target
+                // attempts — the attempt above is still visible in the
+                // legacy call_logs row. The reason maps per the spec
+                // table (`invalid_request` / `payload_too_large`).
+                // Emitted for **both** streaming and non-streaming
+                // requests: a streaming request whose first provider call
+                // returns a client-caused 4xx never reaches
+                // `build_streaming_response` (no bytes were committed), so
+                // this is the only terminal it gets — skipping it would
+                // violate the "one request, one fact" invariant.
+                cancel_guard.mark_done();
+                emit_analytics_event(
+                    state,
+                    AnalyticsEvent::new(RequestResultFact {
+                        request_id: trace_id,
+                        route_name: None,
+                        requested_model: request.model.clone(),
+                        final_status: FinalStatus::ClientError,
+                        failure_reason: Some(client_error_failure_reason(&err)),
+                        stream: is_stream,
+                        started_at,
+                        completed_at: chrono::Utc::now(),
+                        usage: None,
+                        cached_tokens: None,
+                        cache_creation_tokens: None,
+                        ttft_ms: None,
+                        upstream_duration_ms: None,
+                    }),
+                )
+                .await;
                 return err.into_response();
             }
             continue; // provider-persistent 4xx: failover as before
@@ -446,15 +564,29 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
 
         match attempt {
             ChatAttempt::Stream(stream, upstream_start) => {
+                // The stream's single terminal analytics event (success /
+                // stream-error-after-commit / client-cancelled) is emitted
+                // from inside `build_streaming_response`, which receives the
+                // route identity facts, the wall-clock start of this
+                // target's first provider call, and the failure facts of
+                // targets that fell through before commit. Hand the
+                // post-commit cancellation lifecycle to the stream's own
+                // drop guard; the dispatch guard must not fire on the
+                // normal return.
+                cancel_guard.mark_done();
                 return build_streaming_response(
                     state,
                     stream,
+                    route_name,
                     provider_name,
                     &request.model,
                     &real_model,
                     trace_id,
                     start,
                     upstream_start,
+                    started_at,
+                    target_started_at.unwrap_or(chrono::Utc::now()),
+                    target_facts,
                     request.reasoning_effort.clone(),
                     user_agent.clone(),
                     client_ip.clone(),
@@ -479,12 +611,43 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     user_agent.clone(),
                     client_ip.clone(),
                 ));
+                // Formal analytics event: the request completed successfully.
+                // The writer derives `actual_model` from the final
+                // successful target attempt; usage / cache come from the
+                // final response; route latency spans the whole dispatch
+                // (fallback + retry) via `started_at` → `completed_at`.
+                cancel_guard.mark_done();
+                emit_analytics_event(
+                    state,
+                    AnalyticsEvent {
+                        result: RequestResultFact {
+                            request_id: trace_id,
+                            route_name: Some(route_name.to_string()),
+                            requested_model: request.model.clone(),
+                            final_status: FinalStatus::Success,
+                            failure_reason: None,
+                            stream: false,
+                            started_at,
+                            completed_at: chrono::Utc::now(),
+                            usage: resp.usage.clone(),
+                            cached_tokens: resp.usage.as_ref().and_then(|u| u.cached_tokens),
+                            cache_creation_tokens: resp
+                                .usage
+                                .as_ref()
+                                .and_then(|u| u.cache_creation_tokens),
+                            ttft_ms: timing,
+                            upstream_duration_ms: timing,
+                        },
+                        targets: target_facts,
+                    },
+                )
+                .await;
                 return (StatusCode::OK, Json(resp)).into_response();
             }
         }
     }
 
-    fallback_exhausted_response(
+    let response = fallback_exhausted_response(
         state,
         &request.model,
         is_stream,
@@ -494,13 +657,97 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         request.reasoning_effort.as_deref(),
         user_agent.as_deref(),
         client_ip.as_deref(),
+    );
+    // Formal analytics event: every target exhausted → `model_failure`
+    // with `all_exhausted` and one failure fact per actually-issued
+    // target (circuit-open / disabled skips never produce facts). Applies
+    // to streaming requests too — a pre-commit failure is the only
+    // terminal a stream can reach without committing bytes, so its
+    // failure facts are exactly the ones accumulated above.
+    cancel_guard.mark_done();
+    emit_analytics_event(
+        state,
+        AnalyticsEvent {
+            result: RequestResultFact {
+                request_id: trace_id,
+                route_name: Some(route_name.to_string()),
+                requested_model: request.model.clone(),
+                final_status: FinalStatus::ModelFailure,
+                failure_reason: Some(FailureReason::AllExhausted),
+                stream: is_stream,
+                started_at,
+                completed_at: chrono::Utc::now(),
+                usage: None,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            },
+            targets: target_facts,
+        },
     )
+    .await;
+    response
+}
+
+/// Build the single [`TargetAttemptFact`] for an actually-issued target
+/// from its final retry outcome.
+///
+/// - retry success → one `Success` row (all attempts of the retry
+///   sequence collapse into it, no retry count);
+/// - retry exhaustion / non-retryable → one `Failure` row; the failure
+///   tokens stay NULL (unknown — never fabricated as 0);
+/// - streaming success → `None`: the stream target's success fact is
+///   built at terminal time inside `build_streaming_response`, which also
+///   receives the failure facts accumulated here so the request's single
+///   event carries them all.
+fn build_target_attempt_fact(
+    provider: &str,
+    real_model: &str,
+    outcome: &RetryOutcome<ChatAttempt>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+) -> Option<TargetAttemptFact> {
+    // `started_at` is captured at the first actual provider call; fall back
+    // to `completed_at` only if the closure never ran (cannot happen in
+    // practice — the retry loop always issues attempt 0).
+    let started_at = started_at.unwrap_or(completed_at);
+    match outcome {
+        RetryOutcome::Success(ChatAttempt::NonStream(resp, upstream_start)) => {
+            let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
+            Some(TargetAttemptFact {
+                provider: provider.to_string(),
+                real_model: real_model.to_string(),
+                status: TargetStatus::Success,
+                failure_reason: None,
+                started_at,
+                completed_at,
+                usage: resp.usage.clone(),
+                cached_tokens: resp.usage.as_ref().and_then(|u| u.cached_tokens),
+                ttft_ms: Some(upstream_duration_ms),
+                upstream_duration_ms: Some(upstream_duration_ms),
+            })
+        }
+        RetryOutcome::Success(ChatAttempt::Stream(_, _)) => None,
+        RetryOutcome::Exhausted(err) | RetryOutcome::NonRetryable(err) => Some(TargetAttemptFact {
+            provider: provider.to_string(),
+            real_model: real_model.to_string(),
+            status: TargetStatus::Failure,
+            failure_reason: err.failure_reason(),
+            started_at,
+            completed_at,
+            usage: None,
+            cached_tokens: None,
+            ttft_ms: None,
+            upstream_duration_ms: None,
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::ResolvedTarget;
+    use crate::dispatch::{ResolvedRoute, ResolvedTarget};
     use crate::state::{AppState, DispatchRuntime};
     use crate::testing::target;
     use async_trait::async_trait;
@@ -518,7 +765,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
@@ -533,6 +780,9 @@ mod tests {
 
     enum StreamBehavior {
         Ok(Vec<StreamChunk>),
+        /// `chat_stream` fails immediately with this error (e.g. an
+        /// upstream client-caused 4xx on a streaming request).
+        Err(AppError),
     }
 
     struct MockProvider {
@@ -609,8 +859,58 @@ mod tests {
                 Some(StreamBehavior::Ok(chunks)) => {
                     Ok(Box::pin(futures_util::stream::iter(chunks)))
                 }
+                Some(StreamBehavior::Err(e)) => Err(e),
                 None => Ok(Box::pin(futures_util::stream::empty())),
             }
+        }
+    }
+
+    /// Provider whose `chat` / `chat_stream` never resolve. Used to hold a
+    /// dispatch in an in-flight provider call so the test can cancel the
+    /// handler future mid-call (client-disconnect simulation) and assert
+    /// the `client_cancelled` terminal.
+    struct BlockingProvider {
+        name: String,
+        chat_started: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlockingProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                chat_started: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for BlockingProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn chat(
+            &self,
+            _request: &ChatCompletionRequest,
+            _real_model: &str,
+            _api_endpoint: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
+        ) -> sag_core::Result<ChatCompletionResponse> {
+            self.chat_started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatCompletionRequest,
+            _real_model: &str,
+            _api_endpoint: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
+        ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            self.chat_started.notify_one();
+            std::future::pending().await
         }
     }
 
@@ -732,6 +1032,8 @@ mod tests {
             is_stream,
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
+            route_name: "test-route",
+            started_at: chrono::Utc::now(),
             errors,
             strategy,
             sticky_token: sag_state::StickyToken::default(),
@@ -761,6 +1063,8 @@ mod tests {
             is_stream: false,
             trace_id: Uuid::new_v4(),
             start: Instant::now(),
+            route_name: "test-route",
+            started_at: chrono::Utc::now(),
             errors,
             strategy: sag_config::Strategy::StickyFailover,
             sticky_token,
@@ -769,7 +1073,725 @@ mod tests {
         }
     }
 
+    // Shared `AppState` builder whose formal event collector writes into a
+    // pool the test keeps a handle on (see `dispatch::tests`).
+    use super::super::tests::{
+        build_state_with_event_pool, build_state_with_event_pool_and_backoff,
+    };
+
     // ─── Tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[allow(clippy::type_complexity)]
+    async fn dispatch_chat_non_streaming_success_emits_success_analytics_event() {
+        let mock = Arc::new(MockProvider::new("openai"));
+        mock.push_chat(ChatBehavior::Ok(build_response_with_content(
+            "gpt-4o",
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+                cached_tokens: Some(3),
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            "hello",
+        )));
+        let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("openai", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+        let started_at = ctx.started_at;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the event queue so the writer commits before we read.
+        state.event_collector.shutdown().await;
+
+        let (
+            final_status,
+            failure_reason,
+            route_id,
+            actual_model,
+            prompt_tokens,
+            cached_tokens,
+            started_ms,
+            completed_ms,
+            stream,
+        ): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i64,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, route_id, actual_model, prompt_tokens, \
+             cached_tokens, started_at, completed_at, stream \
+             FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("success fact must be persisted");
+
+        assert_eq!(final_status, "success");
+        assert!(
+            failure_reason.is_none(),
+            "success must not carry a failure reason"
+        );
+        let route_id = route_id.expect("success must resolve a route_id");
+        assert_eq!(actual_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(prompt_tokens, Some(5), "usage must be persisted on success");
+        assert_eq!(cached_tokens, Some(3), "cached tokens must be persisted");
+        assert_eq!(
+            started_ms,
+            started_at.timestamp_millis(),
+            "started_at must come from the caller-supplied route start"
+        );
+        assert!(
+            completed_ms >= started_ms,
+            "completed_at (UTC completion time) must not precede started_at"
+        );
+        assert_eq!(stream, 0, "non-stream request must record stream=0");
+
+        // The resolved identity must be the route the ctx carried.
+        let resolved_name: String =
+            sqlx::query_scalar("SELECT route_name FROM analytics_routes WHERE route_id = ?")
+                .bind(&route_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(resolved_name, "test-route");
+
+        // Exactly one target attempt, success, with the response usage/cache.
+        let (status, t_actual_model, t_pt, t_ct, t_cached, t_stream): (
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT status, actual_model, prompt_tokens, completion_tokens, cached_tokens, stream \
+             FROM target_attempts WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one success attempt must be persisted");
+
+        assert_eq!(status, "success");
+        assert_eq!(t_actual_model, "gpt-4o");
+        assert_eq!(t_pt, Some(5));
+        assert_eq!(t_ct, Some(7));
+        assert_eq!(t_cached, Some(3));
+        assert_eq!(t_stream, 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_retry_success_emits_single_success_attempt() {
+        // A retry sequence (fail → retry → success) must collapse into
+        // exactly one target row with the final success — no retry counts,
+        // no intermediate failure rows.
+        let mock = Arc::new(MockProvider::new("openai"));
+        mock.push_chat(ChatBehavior::Retryable(AppError::Internal("oops".into())));
+        mock.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("openai", "gpt-4o", 1)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(mock.chat_calls(), 2, "provider must have been retried");
+
+        state.event_collector.shutdown().await;
+
+        let final_status: String =
+            sqlx::query_scalar("SELECT final_status FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("success fact must be persisted");
+        assert_eq!(final_status, "success");
+
+        let (count, status): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(status) FROM target_attempts WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "retry sequence must produce exactly one target attempt row"
+        );
+        assert_eq!(
+            status, "success",
+            "the single row must record the final success"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_fallback_emits_failure_and_success_attempts() {
+        // A fails → fallback to B (success): route-level success, one
+        // failure attempt for A and one success attempt for B.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 500,
+            body: "boom".into(),
+        }));
+        m2.push_chat(ChatBehavior::Ok(build_response_with_content(
+            "gpt-4o", None, "ok",
+        )));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m1.chat_calls(), 1);
+        assert_eq!(m2.chat_calls(), 1);
+
+        state.event_collector.shutdown().await;
+
+        let final_status: String =
+            sqlx::query_scalar("SELECT final_status FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("success fact must be persisted");
+        assert_eq!(final_status, "success", "fallback success is route success");
+
+        // A failure first, then B success — attempt order follows the
+        // dispatch order (provider attribution via the target registry).
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT rt.provider, t.status, t.failure_reason \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.started_at",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "two actual attempts → two fact rows");
+        assert_eq!(rows[0].0, "first");
+        assert_eq!(rows[0].1, "failure");
+        assert!(
+            rows[0].2.is_some(),
+            "failed attempt carries a failure reason"
+        );
+        assert_eq!(rows[1].0, "second");
+        assert_eq!(rows[1].1, "success");
+        assert!(
+            rows[1].2.is_none(),
+            "successful attempt carries no failure reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_all_exhausted_emits_model_failure_with_all_attempts() {
+        // Every target fails → route-level model_failure with
+        // failure_reason all_exhausted plus one failure fact per
+        // actually-issued target; failure tokens stay NULL.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::Retryable(AppError::Internal("fail1".into())));
+        m2.push_chat(ChatBehavior::Retryable(AppError::Internal("fail2".into())));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, prompt_tokens): (String, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, prompt_tokens \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("model_failure fact must be persisted");
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(failure_reason.as_deref(), Some("all_exhausted"));
+        assert!(
+            prompt_tokens.is_none(),
+            "failed request tokens must stay NULL (unknown), never 0"
+        );
+
+        let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT rt.provider, t.status, t.prompt_tokens \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.started_at",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both actually-issued targets get a failure row"
+        );
+        assert_eq!(rows[0].0, "first");
+        assert_eq!(rows[0].1, "failure");
+        assert_eq!(rows[1].0, "second");
+        assert_eq!(rows[1].1, "failure");
+        assert!(
+            rows.iter().all(|(_, _, pt)| pt.is_none()),
+            "failed attempts must keep token fields NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_streaming_success_emits_success_analytics_event() {
+        // Streaming success now emits the formal analytics event: one
+        // `success` request result (stream=1, final usage / cache) plus one
+        // success target attempt.
+        let mock = Arc::new(MockProvider::new("openai"));
+        mock.push_stream(StreamBehavior::Ok(vec![
+            StreamChunk::Data(b"data: hello\n\n".to_vec()),
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+                cached_tokens: Some(3),
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
+            }),
+            StreamChunk::Done,
+        ]));
+        let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", true);
+        let targets = vec![target("openai", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(mock.stream_calls(), 1);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"data: hello\n\n");
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, stream, pt, cached, actual_model): (
+            String,
+            i32,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT final_status, stream, prompt_tokens, cached_tokens, actual_model \
+             FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("stream success fact must be persisted");
+        assert_eq!(final_status, "success");
+        assert_eq!(stream, 1, "streaming request must record stream=1");
+        assert_eq!(pt, Some(5), "final usage must be persisted on success");
+        assert_eq!(cached, Some(3), "cached tokens must be persisted");
+        assert_eq!(actual_model.as_deref(), Some("gpt-4o"));
+
+        let (count, status, t_pt): (i64, String, Option<i64>) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(status), MAX(prompt_tokens) \
+             FROM target_attempts WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "exactly one success attempt");
+        assert_eq!(status, "success");
+        assert_eq!(t_pt, Some(5));
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_streaming_fallback_emits_route_success_with_both_attempts() {
+        // A fails pre-commit (first chunk is an upstream Error → retryable,
+        // exhausted), B streams success: the route succeeds and the single
+        // terminal event carries both attempts — A's failure fact (built by
+        // the dispatch loop) and B's stream success fact (built at stream
+        // terminal inside `build_streaming_response`).
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_stream(StreamBehavior::Ok(vec![StreamChunk::Error(
+            "first died".into(),
+        )]));
+        m2.push_stream(StreamBehavior::Ok(vec![
+            StreamChunk::Data(b"data: hello\n\n".to_vec()),
+            StreamChunk::Done,
+        ]));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", true);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(m1.stream_calls(), 1);
+        assert_eq!(m2.stream_calls(), 1);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, stream): (String, Option<String>, i32) = sqlx::query_as(
+            "SELECT final_status, failure_reason, stream \
+                 FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("route success fact must be persisted");
+        assert_eq!(final_status, "success");
+        assert!(failure_reason.is_none());
+        assert_eq!(stream, 1);
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rt.provider, t.status \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.attempt_id",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "pre-commit fallback failure + stream success = two attempts"
+        );
+        assert_eq!(rows[0].0, "first");
+        assert_eq!(rows[0].1, "failure");
+        assert_eq!(rows[1].0, "second");
+        assert_eq!(rows[1].1, "success");
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_streaming_error_after_commit_does_not_fallback() {
+        // The stream commits its first byte, then the upstream errors: no
+        // fallback to the next target, and the terminal event is
+        // model_failure / stream_error_after_commit with a failure attempt.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_stream(StreamBehavior::Ok(vec![
+            StreamChunk::Data(b"data: partial\n\n".to_vec()),
+            StreamChunk::Error("upstream died".into()),
+            StreamChunk::Done,
+        ]));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", true);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        // Headers are already committed once the stream starts — the HTTP
+        // status stays 200 (legacy truncated-SSE protocol behavior).
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(m1.stream_calls(), 1);
+        assert_eq!(
+            m2.stream_calls(),
+            0,
+            "error after commit must not fall back to the next target"
+        );
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT final_status, failure_reason FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("model_failure fact must be persisted");
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(failure_reason.as_deref(), Some("stream_error_after_commit"));
+
+        let (status, t_fr): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, failure_reason FROM target_attempts WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failure");
+        assert_eq!(t_fr.as_deref(), Some("stream_error_after_commit"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_chat_streaming_all_exhausted_emits_model_failure_with_attempts() {
+        // Every stream target fails pre-commit: 502 response plus a
+        // `model_failure` / `all_exhausted` event (stream=1) with one
+        // failure fact per actually-issued target.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_stream(StreamBehavior::Ok(vec![StreamChunk::Error("fail1".into())]));
+        m2.push_stream(StreamBehavior::Ok(vec![StreamChunk::Error("fail2".into())]));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", true);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, stream, pt): (String, Option<String>, i32, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, stream, prompt_tokens \
+             FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("model_failure fact must be persisted");
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(failure_reason.as_deref(), Some("all_exhausted"));
+        assert_eq!(stream, 1);
+        assert!(pt.is_none(), "failed request tokens stay NULL");
+
+        // `attempt_id` order = insertion order (deterministic; `started_at`
+        // has millisecond ties).
+        let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT rt.provider, t.status, t.prompt_tokens \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.attempt_id",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both actually-issued targets get a failure row"
+        );
+        assert_eq!(rows[0].0, "first");
+        assert_eq!(rows[0].1, "failure");
+        assert_eq!(rows[1].0, "second");
+        assert_eq!(rows[1].1, "failure");
+        assert!(
+            rows.iter().all(|(_, _, pt)| pt.is_none()),
+            "failed attempts keep token fields NULL"
+        );
+    }
+
+    /// Blocker regression: a streaming request whose first provider call
+    /// returns a client-caused 4xx must still emit a `client_error` fact.
+    /// Previously the emit was guarded by `if !is_stream`, so the request
+    /// produced **zero** analytics rows (violating "一请求恰一条") — the
+    /// stream never committed, so `build_streaming_response`'s terminal
+    /// could not fire either.
+    #[tokio::test]
+    async fn dispatch_chat_streaming_client_error_emits_client_error_fact() {
+        let mock = Arc::new(MockProvider::new("openai"));
+        mock.push_stream(StreamBehavior::Err(AppError::Upstream {
+            provider: "openai".into(),
+            status: 400,
+            body: "bad request".into(),
+        }));
+        let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", true);
+        let targets = vec![target("openai", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, stream): (String, Option<String>, i32) = sqlx::query_as(
+            "SELECT final_status, failure_reason, stream \
+                 FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("streaming client_error fact must be persisted");
+        assert_eq!(final_status, "client_error");
+        assert_eq!(failure_reason.as_deref(), Some("invalid_request"));
+        assert_eq!(stream, 1, "streaming client_error must record stream=1");
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0, "client_error carries no target attempts");
+    }
+
+    /// Major-1 e2e: a non-streaming request cancelled (handler future
+    /// dropped) while a provider call is in flight emits one
+    /// `client_cancelled` fact with the in-flight attempt recorded as
+    /// `cancelled` (spec scenario 11).
+    #[tokio::test]
+    async fn dispatch_chat_cancelled_mid_call_emits_client_cancelled_with_cancelled_attempt() {
+        let mock = Arc::new(BlockingProvider::new("openai"));
+        let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("openai", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+
+        // The provider call never resolves; the timeout drops the handler
+        // future mid-call — the axum/hyper client-disconnect signal.
+        let result = tokio::time::timeout(Duration::from_millis(100), dispatch_chat(ctx)).await;
+        assert!(result.is_err(), "dispatch must be cancelled by the timeout");
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, stream): (String, i32) =
+            sqlx::query_as("SELECT final_status, stream FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("client_cancelled fact must be persisted");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(stream, 0, "non-streaming cancel records stream=0");
+
+        let (status, actual_model, pt): (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT t.status, t.actual_model, t.prompt_tokens \
+             FROM target_attempts t WHERE t.request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("in-flight attempt must be recorded as cancelled");
+        assert_eq!(status, "cancelled");
+        assert_eq!(actual_model, "gpt-4o");
+        assert!(pt.is_none(), "cancelled attempt tokens stay NULL");
+    }
+
+    /// Major-1 e2e: a streaming request cancelled **before** commit (the
+    /// dispatch loop, not the response body) emits `client_cancelled` with
+    /// `stream=1` and the in-flight attempt recorded as `cancelled`.
+    #[tokio::test]
+    async fn dispatch_chat_streaming_cancelled_before_commit_emits_client_cancelled() {
+        let mock = Arc::new(BlockingProvider::new("openai"));
+        let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", true);
+        let targets = vec![target("openai", "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        let trace_id = ctx.trace_id;
+
+        let result = tokio::time::timeout(Duration::from_millis(100), dispatch_chat(ctx)).await;
+        assert!(result.is_err(), "dispatch must be cancelled by the timeout");
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, stream): (String, i32) =
+            sqlx::query_as("SELECT final_status, stream FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("pre-commit streaming cancel must persist a client_cancelled fact");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(stream, 1, "streaming cancel records stream=1");
+
+        let (status, actual_model): (String, String) = sqlx::query_as(
+            "SELECT t.status, t.actual_model FROM target_attempts t WHERE t.request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("in-flight stream attempt must be recorded as cancelled");
+        assert_eq!(status, "cancelled");
+        assert_eq!(actual_model, "gpt-4o");
+    }
+
+    /// Major-1 e2e: a cancel during the retry/backoff gap (no in-flight
+    /// provider call) emits `client_cancelled` with **zero** target
+    /// attempts (spec scenario 11: 退避/fallback 间隙 → 0 条).
+    #[tokio::test]
+    async fn dispatch_chat_cancelled_during_backoff_emits_client_cancelled_without_attempts() {
+        let mock = Arc::new(MockProvider::new("openai"));
+        // Retryable error: attempt 0 fails fast, then the loop sleeps the
+        // (jitter-free, 10 s) backoff — the timeout lands inside the sleep.
+        mock.push_chat(ChatBehavior::Retryable(AppError::Internal("boom".into())));
+        let backoff = sag_config::BackoffConfig {
+            retries: 1,
+            base_ms: 10_000,
+            max_ms: 10_000,
+            jitter: false,
+            retry_on_empty_response: false,
+        };
+        let (state, pool) =
+            build_state_with_event_pool_and_backoff(vec![mock.clone()], backoff).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("openai", "gpt-4o", 1)];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+
+        let result = tokio::time::timeout(Duration::from_millis(100), dispatch_chat(ctx)).await;
+        assert!(result.is_err(), "dispatch must be cancelled by the timeout");
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, stream): (String, i32) =
+            sqlx::query_as("SELECT final_status, stream FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("backoff-gap cancel must persist a client_cancelled fact");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(stream, 0);
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts, 0,
+            "cancel during a backoff gap must not fabricate an attempt"
+        );
+    }
 
     #[tokio::test]
     async fn dispatch_chat_non_streaming_success() {
@@ -1340,11 +2362,18 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_chat_non_retryable_failure_does_not_open_circuit() {
+        // A provider-persistent non-retryable error (non-quota 403) must
+        // fail over without opening the circuit. BadRequest is deliberately
+        // NOT used here: since it is classified client-caused, it returns
+        // straight to the client and never reaches this path — see
+        // `client_error_bad_request_returns_to_client_without_failover`.
         let m1 = Arc::new(MockProvider::new("first"));
         let m2 = Arc::new(MockProvider::new("second"));
-        m1.push_chat(ChatBehavior::NonRetryable(AppError::BadRequest(
-            "bad".into(),
-        )));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::Upstream {
+            provider: "first".into(),
+            status: 403,
+            body: "permission denied".into(),
+        }));
         m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
         let state = build_state(vec![m1.clone(), m2.clone()]).await;
         let rt = crate::testing::test_dispatch_runtime();
@@ -1488,6 +2517,101 @@ mod tests {
             active.get("gpt-4o").map(|e| e.provider.as_str()),
             Some("first"),
             "pin must stay on A — B must not become the shared active target"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_error_bad_request_returns_to_client_without_failover() {
+        // Regression: a locally-raised `AppError::BadRequest` (request
+        // input / parameter error) must be classified as client-caused —
+        // returned straight to the client, no retry, no failover, no pin
+        // movement, no circuit change. The formal event must be
+        // `client_error` with reason `invalid_request` (no route identity,
+        // no target attempts), NOT model_failure. Pre-policy BadRequest
+        // fell through the client-caused predicate, failed over, and —
+        // if every target failed — inflated the model-failure rate.
+        let m1 = Arc::new(MockProvider::new("first"));
+        let m2 = Arc::new(MockProvider::new("second"));
+        m1.push_chat(ChatBehavior::NonRetryable(AppError::BadRequest(
+            "unsupported parameter: temperature=-1".into(),
+        )));
+        // m2 would succeed if ever called — it must not be.
+        m2.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("gpt-4o", false);
+        let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+
+        // Pre-pin A so "pin unchanged" is observable.
+        rt.active_targets.write().await.insert(
+            "gpt-4o".to_string(),
+            sag_state::ActiveTargetEntry::new(
+                "first",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".to_string()),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+        let trace_id = ctx.trace_id;
+        let resp = dispatch_chat(ctx).await;
+
+        // 400 straight to the client — not B's 200, not a 502.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(m1.chat_calls(), 1, "BadRequest should not retry A");
+        assert_eq!(m2.chat_calls(), 0, "BadRequest must not failover to B");
+
+        // Pin unchanged (still A).
+        let active = rt.active_targets.read().await;
+        assert_eq!(
+            active.get("gpt-4o").map(|e| e.provider.as_str()),
+            Some("first"),
+            "client-caused BadRequest must not move the pin"
+        );
+
+        // Circuit stays closed.
+        let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+        assert!(
+            rt.route_circuit_breaker.read().await.is_closed(&key),
+            "client-caused BadRequest must not open the circuit"
+        );
+
+        // Formal event: `client_error` / `invalid_request`, no route
+        // identity, no target attempts — and definitely not model_failure.
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, route_id): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, route_id \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("client_error fact must be persisted");
+        assert_eq!(final_status, "client_error");
+        assert_eq!(
+            failure_reason.as_deref(),
+            Some("invalid_request"),
+            "BadRequest carries no payload-too-large signal — reason must be invalid_request"
+        );
+        assert!(
+            route_id.is_none(),
+            "client_error event must carry no route identity"
+        );
+
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempt_count, 0,
+            "client_error event must carry no target attempts"
         );
     }
 
@@ -1862,12 +2986,32 @@ mod tests {
         let start = Instant::now();
 
         // Resolve route (should place "second" first due to sticky active target)
-        let (resolved_targets, api_endpoint, strategy, sticky_token) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            targets: resolved_targets,
+            api_endpoint,
+            strategy,
+            sticky_token,
+            route_name,
+            started_at,
+        } = crate::dispatch::resolve_route(
+            &state,
+            &rt,
+            &req,
+            trace_id,
+            start,
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(resolved_targets[0].provider, "second");
+        assert_eq!(
+            route_name, "gpt-4o",
+            "route carrier must record the matched route model_name"
+        );
 
         // Dispatch
         let mut errors = Vec::new();
@@ -1880,6 +3024,8 @@ mod tests {
             is_stream: false,
             trace_id,
             start,
+            route_name: &route_name,
+            started_at,
             errors: &mut errors,
             strategy,
             sticky_token,
@@ -1914,10 +3060,26 @@ mod tests {
         let start = Instant::now();
 
         // Resolve route
-        let (resolved_targets, api_endpoint, strategy, sticky_token) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            targets: resolved_targets,
+            api_endpoint,
+            strategy,
+            sticky_token,
+            route_name,
+            started_at,
+        } = crate::dispatch::resolve_route(
+            &state,
+            &rt,
+            &req,
+            trace_id,
+            start,
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Dispatch
         let mut errors = Vec::new();
@@ -1930,6 +3092,8 @@ mod tests {
             is_stream: false,
             trace_id,
             start,
+            route_name: &route_name,
+            started_at,
             errors: &mut errors,
             strategy,
             sticky_token,
@@ -1973,10 +3137,26 @@ mod tests {
         let start = Instant::now();
 
         // Routing decision happens now: captures the current generation (0).
-        let (resolved_targets, api_endpoint, strategy, sticky_token) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            targets: resolved_targets,
+            api_endpoint,
+            strategy,
+            sticky_token,
+            route_name,
+            started_at,
+        } = crate::dispatch::resolve_route(
+            &state,
+            &rt,
+            &req,
+            trace_id,
+            start,
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(sticky_token.generation, 0);
         assert_eq!(
             sticky_token.routes_version,
@@ -1998,6 +3178,8 @@ mod tests {
             is_stream: false,
             trace_id,
             start,
+            route_name: &route_name,
+            started_at,
             errors: &mut errors,
             strategy,
             sticky_token,
@@ -2034,10 +3216,26 @@ mod tests {
         let start = Instant::now();
 
         // Routing decision happens now: captures (generation 0, version V).
-        let (resolved_targets, api_endpoint, strategy, sticky_token) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            targets: resolved_targets,
+            api_endpoint,
+            strategy,
+            sticky_token,
+            route_name,
+            started_at,
+        } = crate::dispatch::resolve_route(
+            &state,
+            &rt,
+            &req,
+            trace_id,
+            start,
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(sticky_token.generation, 0, "never had an entry");
 
         // A config mutation lands between decision and writeback: re-create
@@ -2075,6 +3273,8 @@ mod tests {
             is_stream: false,
             trace_id,
             start,
+            route_name: &route_name,
+            started_at,
             errors: &mut errors,
             strategy,
             sticky_token,
@@ -2092,10 +3292,26 @@ mod tests {
         // identity (route_model + target spec) used by prune / admin.
         // Sanity: a fresh decision after the mutation captures the new
         // version and pins normally.
-        let (resolved_targets2, api_endpoint2, strategy2, token2) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            targets: resolved_targets2,
+            api_endpoint: api_endpoint2,
+            strategy: strategy2,
+            sticky_token: token2,
+            route_name,
+            started_at,
+        } = crate::dispatch::resolve_route(
+            &state,
+            &rt,
+            &req,
+            trace_id,
+            start,
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let mut errors2 = Vec::new();
         let ctx2 = DispatchCtx {
             state: &state,
@@ -2104,6 +3320,8 @@ mod tests {
             targets: &resolved_targets2,
             api_endpoint: &api_endpoint2,
             is_stream: false,
+            route_name: &route_name,
+            started_at,
             trace_id,
             start,
             errors: &mut errors2,
@@ -2142,10 +3360,26 @@ mod tests {
         let start = Instant::now();
 
         // Routing decision happens now: captures (generation 0, version V).
-        let (resolved_targets, api_endpoint, strategy, sticky_token) =
-            crate::dispatch::resolve_route(&state, &rt, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            targets: resolved_targets,
+            api_endpoint,
+            strategy,
+            sticky_token,
+            route_name,
+            started_at,
+        } = crate::dispatch::resolve_route(
+            &state,
+            &rt,
+            &req,
+            trace_id,
+            start,
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(sticky_token.generation, 0, "never had an entry");
 
         // A config mutation lands between decision and writeback, through
@@ -2177,6 +3411,8 @@ mod tests {
             runtime: &rt,
             request: &req,
             targets: &resolved_targets,
+            route_name: &route_name,
+            started_at,
             api_endpoint: &api_endpoint,
             is_stream: false,
             trace_id,

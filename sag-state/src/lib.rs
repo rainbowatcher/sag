@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use sag_analytics::CallLogCollector;
+use sag_analytics::{AnalyticsQueryEngine, CallLogCollector, EventCollector};
 use sag_config::{ConfigHandle, RouteTarget};
 use sag_core::RouteCircuitBreaker;
 use sag_providers::LlmProvider;
@@ -359,6 +359,23 @@ pub struct AppState {
     pub coordinator: Arc<ConfigMutationCoordinator>,
     /// Async call log collector for analytics.
     pub collector: Arc<CallLogCollector>,
+    /// Formal analytics event collector: bounded queue + background
+    /// transactional writer with backpressure, drained on graceful
+    /// shutdown via [`EventCollector::shutdown`]. Kept alongside the
+    /// legacy [`Self::collector`]: this is the future emission path for
+    /// [`sag_analytics::AnalyticsEvent`]s (dispatch is not wired to it
+    /// yet), while the legacy collector remains the droppable diagnostic
+    /// path for `/v1/analytics/*` and `/api/logs`.
+    pub event_collector: Arc<EventCollector>,
+    /// Exact-detail analytics query engine (≤ 24h spans) built over the
+    /// **same** pool the event writer / identity registry use — never a
+    /// private, split-brain pool. Serves the `/v1/analytics/v2/*`
+    /// handlers. `None` when the assembly did not wire the query kernel
+    /// (e.g. legacy test states): the v2 handlers then answer with an
+    /// internal error instead of fabricating data. `Arc`-wrapped so
+    /// [`AppState`] stays `Clone` without coupling to the kernel's
+    /// (intentionally absent) `Clone` impl.
+    pub analytics_query: Option<Arc<AnalyticsQueryEngine>>,
     /// Shared route-target circuit breaker. The same `Arc` is injected into
     /// `DispatchRuntime` at startup, so this handle observes live state.
     pub circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
@@ -433,7 +450,9 @@ pub mod testing {
     use super::ConfigMutationCoordinator;
 
     /// Build an [`AppState`] with the given config and provider registry,
-    /// backed by an in-memory analytics collector.
+    /// backed by in-memory analytics collectors (legacy call-log collector
+    /// plus the formal event collector over a shared in-memory pool — the
+    /// same writer + registry pool wiring the production assembly uses).
     pub async fn test_app_state(
         config: ConfigHandle,
         providers: Arc<RwLock<HashMap<String, Arc<dyn sag_providers::LlmProvider>>>>,
@@ -442,11 +461,21 @@ pub mod testing {
             config.clone(),
             providers.clone(),
         ));
+        // Shared in-memory pool with migrations applied, shared between
+        // the event writer, the identity registry and the query engine.
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let analytics_query = sag_analytics::AnalyticsQueryEngine::new(pool.clone());
         AppState {
             config,
             providers,
             coordinator,
             collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
+            event_collector: Arc::new(sag_analytics::EventCollector::new(
+                sag_analytics::EventWriter::new(pool),
+            )),
+            analytics_query: Some(Arc::new(analytics_query)),
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),

@@ -23,12 +23,18 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sag_config::{ProviderConfig, Strategy};
-use sag_core::{AppError, CallLog, ChatCompletionRequest, Usage};
-use tracing::{error, info};
+use sag_core::{
+    AppError, CallLog, ChatCompletionRequest, FailureReason, FinalStatus, RequestResultFact,
+    TargetAttemptFact, TargetStatus, Usage,
+};
+use tracing::{error, info, warn};
 
 use crate::circuit_breaker::RouteTargetKey;
 use crate::dispatch::retry::RetryOutcome;
 use crate::state::{AppState, DispatchRuntime};
+use sag_analytics::EventCollector;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub mod chat;
 pub mod image;
@@ -58,14 +64,24 @@ pub struct ResolvedTarget {
     pub timeout_secs: u64,
 }
 
-/// Resolved route data: (ordered targets, configured `api_endpoint`,
-/// strategy, sticky-failover token captured at decision time).
-pub type ResolvedRoute = (
-    Vec<ResolvedTarget>,
-    String,
-    Strategy,
-    sag_state::StickyToken,
-);
+/// Resolved route data: ordered targets, configured `api_endpoint`,
+/// strategy, sticky-failover token captured at decision time, plus the
+/// route-identity facts (`route_name`, wall-clock `started_at`) that the
+/// upcoming analytics route-start event consumes.
+pub struct ResolvedRoute {
+    pub targets: Vec<ResolvedTarget>,
+    pub api_endpoint: String,
+    pub strategy: Strategy,
+    pub sticky_token: sag_state::StickyToken,
+    /// The config route `model_name` matched for this request (`"*"` for a
+    /// wildcard match). Route-level identity for analytics facts; distinct
+    /// from [`ResolvedTarget::route_model`], which attributes individual
+    /// targets (sticky writeback / admin snapshot).
+    pub route_name: String,
+    /// Wall-clock timestamp captured at route scheduling time, next to the
+    /// `Instant` used for legacy duration timing.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
 
 /// Bundled parameters for a single dispatch call. Replaces the 7–8
 /// argument lists on [`dispatch_chat`] / [`dispatch_image`] so the
@@ -79,6 +95,13 @@ pub struct DispatchCtx<'a> {
     pub is_stream: bool,
     pub trace_id: uuid::Uuid,
     pub start: Instant,
+    /// The matched route's `model_name` (`"*"` for a wildcard route) —
+    /// route-level identity for the analytics route-start event.
+    pub route_name: &'a str,
+    /// Wall-clock timestamp of route scheduling, captured in `routes.rs`
+    /// alongside `start`. Fact timestamp for the analytics route-start
+    /// event.
+    pub started_at: chrono::DateTime<chrono::Utc>,
     pub errors: &'a mut Vec<String>,
     pub strategy: Strategy,
     /// Sticky-failover token captured when the route was ordered (see
@@ -333,6 +356,238 @@ pub(in crate::dispatch) fn merge_model_overrides(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Analytics event helpers — shared across the dispatch submodules.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Map a client-caused 4xx (see [`retry::is_client_caused_4xx`]) to the
+/// registered [`FailureReason`] for the `client_error` final status.
+///
+/// The spec table registers exactly two reasons for `client_error`:
+/// `invalid_request` / `payload_too_large`. A 413 (payload too large)
+/// maps to `payload_too_large`; every other client-caused 4xx (400 / 422 /
+/// unknown) maps to `invalid_request`.
+pub(in crate::dispatch) fn client_error_failure_reason(err: &AppError) -> FailureReason {
+    match err {
+        AppError::Upstream { status: 413, .. } => FailureReason::PayloadTooLarge,
+        _ => FailureReason::InvalidRequest,
+    }
+}
+
+/// Enqueue a request-level analytics event with formal backpressure
+/// ([`EventCollector::emit`](sag_analytics::EventCollector::emit), never
+/// `try_emit` — the fact must not be dropped). A collector failure is only
+/// possible once the collector is shut down; it is logged and swallowed so
+/// the client-facing response already built by the caller keeps its exact
+/// semantics.
+pub(in crate::dispatch) async fn emit_analytics_event(
+    state: &AppState,
+    event: sag_analytics::AnalyticsEvent,
+) {
+    if let Err(e) = state.event_collector.emit(event.clone()).await {
+        warn!(
+            request_id = %event.result.request_id,
+            status = ?event.result.final_status,
+            error = %e,
+            "analytics event not enqueued (event collector shut down)"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Dispatch cancellation guard — client-disconnect terminal.
+// ═══════════════════════════════════════════════════════════════════
+
+/// An in-flight (actually-issued) target attempt, recorded so a client
+/// disconnect can persist it as a `cancelled` target fact.
+pub(crate) struct InFlightAttempt {
+    provider: String,
+    real_model: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Shared state of one dispatch: the request-identity facts needed to
+/// build the `client_cancelled` terminal plus the in-flight attempt
+/// marker.
+pub(crate) struct DispatchAnalytics {
+    event_collector: Arc<EventCollector>,
+    request_id: uuid::Uuid,
+    route_name: String,
+    /// The model the client requested (route-level identity).
+    requested_model: String,
+    is_stream: bool,
+    /// Wall-clock route start captured at dispatch time (fact timestamp).
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Set by every normal terminal **before** it emits; the drop guard
+    /// claims this flag so it can never emit a second request result.
+    done: std::sync::atomic::AtomicBool,
+    /// The currently in-flight provider call, if any. Updated around the
+    /// retry closure's actual provider call; `None` during backoff sleeps
+    /// and between targets. On drop (client disconnect), a `Some` value
+    /// becomes a `cancelled` target attempt; `None` means the request had
+    /// no in-flight attempt (retry/fallback gap) and the event carries 0
+    /// target attempts.
+    ///
+    /// `std::sync::Mutex`: the guard's `Drop` cannot await, and the
+    /// critical sections are a single set/clear with no await inside.
+    in_flight: std::sync::Mutex<Option<InFlightAttempt>>,
+}
+
+/// Drop guard on the dispatch loop: emits the `client_cancelled` terminal
+/// when the handler future is dropped before any normal terminal ran — the
+/// axum/hyper client-disconnect signal for **non-streaming** requests and
+/// for **streaming** requests cancelled before `build_streaming_response`
+/// commits (the stream body's own `TerminalGuard` only covers post-commit
+/// drops).
+///
+/// Fires at most once: every normal terminal (success / client_error /
+/// all-exhausted / stream handoff) calls [`mark_done`](Self::mark_done)
+/// **before** emitting, so a guard dropped on a normal return is a no-op.
+/// Delivery runs through the stream module's `deliver_terminal_event`,
+/// which decouples the enqueue from the future's cancellation lifecycle.
+///
+/// ## Trade-off (documented per spec)
+///
+/// `Drop` cannot await, so the queue-full path spawns a detached task that
+/// awaits backpressure. The detached task can be lost in the runtime
+/// shutdown race (a task that never gets its first poll while the runtime
+/// is tearing down) — the same accepted loss window as the stream
+/// `TerminalGuard`. The spec allows "异常崩溃允许少量未提交的分析事件丢失";
+/// the common path (`try_emit` fast path) enqueues synchronously inside
+/// `Drop` and is fully drained by graceful shutdown.
+pub(crate) struct DispatchCancelGuard {
+    analytics: Arc<DispatchAnalytics>,
+}
+
+impl DispatchAnalytics {
+    /// Mark an actual provider call as in-flight. Called immediately
+    /// before the upstream call inside the retry closure; cleared by
+    /// [`end_attempt`](Self::end_attempt) when the call completes.
+    ///
+    /// Poisoned-lock recovery: a panic while holding the lock would only
+    /// happen on a fatal bug; `into_inner` keeps the guard functional
+    /// instead of dropping the event.
+    fn begin_attempt(&self, provider: &str, real_model: &str) {
+        let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(InFlightAttempt {
+            provider: provider.to_string(),
+            real_model: real_model.to_string(),
+            started_at: chrono::Utc::now(),
+        });
+    }
+
+    /// Clear the in-flight marker after a provider call completed (or the
+    /// retry sequence gave up). A client disconnect during the call never
+    /// reaches this line — the future is dropped with the marker still
+    /// set, so the guard persists a `cancelled` attempt.
+    fn end_attempt(&self) {
+        let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = None;
+    }
+}
+
+impl DispatchCancelGuard {
+    /// Create the guard for one dispatch. Must be kept alive until the
+    /// dispatch returns; every terminal path calls [`mark_done`](Self::mark_done)
+    /// before emitting its own event.
+    pub(crate) fn new(
+        event_collector: Arc<EventCollector>,
+        request_id: uuid::Uuid,
+        route_name: &str,
+        requested_model: &str,
+        is_stream: bool,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            analytics: Arc::new(DispatchAnalytics {
+                event_collector,
+                request_id,
+                route_name: route_name.to_string(),
+                requested_model: requested_model.to_string(),
+                is_stream,
+                started_at,
+                done: std::sync::atomic::AtomicBool::new(false),
+                in_flight: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Claim the terminal: the normal path is about to emit its own
+    /// event, so the drop guard must not fire.
+    pub(crate) fn mark_done(&self) {
+        self.analytics.done.store(true, Ordering::SeqCst);
+    }
+
+    /// Shared state handle for the retry closure (cloned per attempt).
+    pub(crate) fn analytics(&self) -> Arc<DispatchAnalytics> {
+        self.analytics.clone()
+    }
+}
+
+impl Drop for DispatchCancelGuard {
+    fn drop(&mut self) {
+        // Claim the terminal. A normal path already set `done`; only a
+        // cancelled dispatch reaches this swap with `false`.
+        if self.analytics.done.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let analytics = &*self.analytics;
+        let completed_at = chrono::Utc::now();
+        // Take the in-flight attempt, if any. A `Some` becomes one
+        // `cancelled` target fact; `None` (cancel during a retry/backoff
+        // gap or between targets) leaves the event without target
+        // attempts — spec scenario 11.
+        let in_flight = self
+            .analytics
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let targets = match in_flight {
+            Some(att) => vec![TargetAttemptFact {
+                provider: att.provider,
+                real_model: att.real_model,
+                status: TargetStatus::Cancelled,
+                failure_reason: None,
+                started_at: att.started_at,
+                completed_at,
+                usage: None,
+                cached_tokens: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            }],
+            None => Vec::new(),
+        };
+        let event = sag_analytics::AnalyticsEvent {
+            result: RequestResultFact {
+                request_id: analytics.request_id,
+                route_name: Some(analytics.route_name.clone()),
+                requested_model: analytics.requested_model.clone(),
+                final_status: FinalStatus::ClientCancelled,
+                failure_reason: Some(FailureReason::ClientCancelled),
+                stream: analytics.is_stream,
+                started_at: analytics.started_at,
+                completed_at,
+                usage: None,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            },
+            targets,
+        };
+        let request_id = event.result.request_id;
+        let _ = crate::dispatch::stream::deliver_terminal_event(
+            analytics.event_collector.clone(),
+            event,
+        );
+        warn!(
+            request_id = %request_id,
+            "dispatch cancelled by client disconnect; client_cancelled fact enqueued"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Logging / response helpers — shared across the dispatch submodules.
 
 /// Build a `CallLog` for a successful response.
@@ -372,6 +627,10 @@ pub(in crate::dispatch) fn success_log(
         user_agent,
         client_ip,
         error_category: None,
+        // Internal analytics identity fields: not populated yet (dispatch
+        // wiring is a later phase); kept None for now.
+        route_id: None,
+        target_id: None,
     }
 }
 
@@ -410,6 +669,10 @@ pub(in crate::dispatch) fn failure_log(
         user_agent: user_agent.map(|s| s.to_string()),
         client_ip: client_ip.map(|s| s.to_string()),
         error_category: Some(err.error_category().to_string()),
+        // Internal analytics identity fields: not populated yet (dispatch
+        // wiring is a later phase); kept None for now.
+        route_id: None,
+        target_id: None,
     }
 }
 
@@ -540,8 +803,114 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sag_config::ProviderConfig;
+    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig};
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// Build an [`AppState`] whose formal event collector writes into a
+    /// shared in-memory pool the test keeps a handle on — same wiring as
+    /// `sag_state::testing::test_app_state`, minus the hidden pool. Draining
+    /// the queue via `state.event_collector.shutdown().await` commits all
+    /// pending events before the pool is read.
+    ///
+    /// Shared by the `chat` / `stream` dispatch test modules.
+    pub(crate) async fn build_state_with_event_pool(
+        providers: Vec<Arc<dyn sag_providers::LlmProvider>>,
+    ) -> (AppState, sqlx::SqlitePool) {
+        build_state_with_event_queue_capacity(
+            providers,
+            sag_analytics::DEFAULT_EVENT_QUEUE_CAPACITY,
+        )
+        .await
+    }
+
+    /// Same wiring as [`build_state_with_event_pool`] but with a
+    /// configurable collector queue capacity: backpressure tests fill a
+    /// tiny queue deterministically while the writer is blocked on the
+    /// pool's single connection (`open_analytics_pool(":memory:")` uses
+    /// `max_connections = 1`).
+    pub(crate) async fn build_state_with_event_queue_capacity(
+        providers: Vec<Arc<dyn sag_providers::LlmProvider>>,
+        capacity: usize,
+    ) -> (AppState, sqlx::SqlitePool) {
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+        for p in providers {
+            registry.insert(p.name().to_string(), p);
+        }
+        let registry = Arc::new(RwLock::new(registry));
+        let config = GatewayConfig {
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["k".into()],
+            }),
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = ConfigHandle::from_config(config);
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let state = AppState {
+            config: handle.clone(),
+            providers: registry.clone(),
+            coordinator: Arc::new(sag_state::ConfigMutationCoordinator::new(handle, registry)),
+            collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
+            event_collector: Arc::new(sag_analytics::EventCollector::with_capacity(
+                sag_analytics::EventWriter::new(pool.clone()),
+                capacity,
+            )),
+            analytics_query: Some(Arc::new(sag_analytics::AnalyticsQueryEngine::new(
+                pool.clone(),
+            ))),
+            circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
+            active_targets: Arc::default(),
+            fill_first_orders: Arc::default(),
+        };
+        (state, pool)
+    }
+
+    /// Same wiring as [`build_state_with_event_queue_capacity`] but with a
+    /// custom backoff config: the cancellation tests need a long,
+    /// jitter-free backoff so a timeout lands deterministically inside the
+    /// backoff sleep (no in-flight attempt) rather than inside a provider
+    /// call.
+    pub(crate) async fn build_state_with_event_pool_and_backoff(
+        providers: Vec<Arc<dyn sag_providers::LlmProvider>>,
+        backoff: sag_config::BackoffConfig,
+    ) -> (AppState, sqlx::SqlitePool) {
+        let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+        for p in providers {
+            registry.insert(p.name().to_string(), p);
+        }
+        let registry = Arc::new(RwLock::new(registry));
+        let config = GatewayConfig {
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["k".into()],
+            }),
+            backoff,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = ConfigHandle::from_config(config);
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let state = AppState {
+            config: handle.clone(),
+            providers: registry.clone(),
+            coordinator: Arc::new(sag_state::ConfigMutationCoordinator::new(handle, registry)),
+            collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
+            event_collector: Arc::new(sag_analytics::EventCollector::with_capacity(
+                sag_analytics::EventWriter::new(pool.clone()),
+                sag_analytics::DEFAULT_EVENT_QUEUE_CAPACITY,
+            )),
+            analytics_query: Some(Arc::new(sag_analytics::AnalyticsQueryEngine::new(
+                pool.clone(),
+            ))),
+            circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
+            active_targets: Arc::default(),
+            fill_first_orders: Arc::default(),
+        };
+        (state, pool)
+    }
 
     fn make_provider(
         model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -769,5 +1138,132 @@ mod tests {
             Some("medium"),
             "reasoning_effort must round-trip through log_per_target_failure"
         );
+    }
+
+    // ── DispatchCancelGuard unit contract ────────────────────────
+
+    /// The guard dropped with no in-flight attempt (retry/fallback gap)
+    /// emits exactly one `client_cancelled` fact with **zero** target
+    /// attempts (spec scenario 11: 退避/fallback 间隙 → 0 条).
+    #[tokio::test]
+    async fn dispatch_cancel_guard_no_in_flight_emits_client_cancelled_without_attempts() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let started_at = chrono::Utc::now();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            false,
+            started_at,
+        );
+        drop(guard);
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, route_name, stream, started_ms): (
+            String,
+            Option<String>,
+            String,
+            i32,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT rr.final_status, rr.failure_reason, ar.route_name, rr.stream, rr.started_at \
+             FROM request_results rr \
+             LEFT JOIN analytics_routes ar ON ar.route_id = rr.route_id \
+             WHERE rr.request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("cancel guard must persist a client_cancelled fact");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(failure_reason.as_deref(), Some("client_cancelled"));
+        assert_eq!(route_name, "test-route");
+        assert_eq!(stream, 0);
+        assert_eq!(started_ms, started_at.timestamp_millis());
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0, "no in-flight attempt → 0 target attempts");
+    }
+
+    /// The guard dropped with an in-flight attempt (client disconnect
+    /// during an actual provider call) emits one `client_cancelled` fact
+    /// plus one `cancelled` target attempt (spec: 在途调用 → cancelled).
+    #[tokio::test]
+    async fn dispatch_cancel_guard_in_flight_emits_client_cancelled_with_cancelled_attempt() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            true, // streaming
+            chrono::Utc::now(),
+        );
+        guard.analytics().begin_attempt("openai", "gpt-4o");
+        drop(guard);
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, stream): (String, i32) =
+            sqlx::query_as("SELECT final_status, stream FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(
+            stream, 1,
+            "streaming flag must round-trip through the guard"
+        );
+
+        let (status, actual_model, pt): (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT t.status, t.actual_model, t.prompt_tokens \
+             FROM target_attempts t WHERE t.request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("in-flight attempt must be recorded as cancelled");
+        assert_eq!(status, "cancelled");
+        assert_eq!(actual_model, "gpt-4o");
+        assert!(pt.is_none(), "cancelled attempt tokens stay NULL");
+    }
+
+    /// A guard marked done (normal terminal already emitted) must be a
+    /// strict no-op on drop — no second request result, ever.
+    #[tokio::test]
+    async fn dispatch_cancel_guard_marked_done_emits_nothing() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            false,
+            chrono::Utc::now(),
+        );
+        guard.mark_done();
+        guard.analytics().begin_attempt("openai", "gpt-4o");
+        drop(guard);
+
+        state.event_collector.shutdown().await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "mark_done must suppress the drop terminal");
     }
 }

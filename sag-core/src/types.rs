@@ -375,6 +375,193 @@ pub struct CallLog {
     /// (e.g. `"model_not_found"`, `"provider_error"`, `"timeout"`). `None`
     /// for successful calls.    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,
+    /// Internal analytics identity of the route this call was dispatched
+    /// through. Populated by the dispatch layer for new logs so the log can
+    /// be correlated with the `request_results` / `target_attempts` facts.
+    ///
+    /// System-generated, database-only — never serialized to the legacy log
+    /// API/UI, and ignored when deserializing (legacy records have no value).
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub route_id: Option<uuid::Uuid>,
+    /// Internal analytics identity of the target actually attempted for this
+    /// call. Same visibility rules as [`CallLog::route_id`].
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub target_id: Option<uuid::Uuid>,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Analytics fact types (route / target level)
+// ═══════════════════════════════════════════════════════════════════
+//
+// Shared contracts for the phase-1 analytics facts. They are consumed by
+// `sag-dispatch` (which builds them at request time) and `sag-analytics`
+// (which persists them). They intentionally stay independent of `CallLog`:
+// `CallLog` keeps its legacy diagnostic semantics while these types carry
+// the formal per-request / per-attempt facts.
+
+/// Final status of a request at the route level.
+///
+/// One request produces exactly one route-level result. Mirrors the
+/// `request_results.final_status` column values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalStatus {
+    /// Request completed successfully (including normal stream end).
+    Success,
+    /// Authenticated but the request input/parameters were invalid.
+    ClientError,
+    /// No matching route (including no `*` fallback).
+    NoRoute,
+    /// Matched a route but all targets were statically unavailable.
+    AllDisabled,
+    /// All targets exhausted / upstream error / timeout / breaker all open /
+    /// error after stream commit.
+    ModelFailure,
+    /// Client disconnected before completion.
+    ClientCancelled,
+}
+
+/// Status of a single target attempt (one actual upstream call).
+///
+/// Mirrors the `target_attempts.status` column values. `Cancelled` counts as
+/// an actual attempt (denominator) but neither success nor failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetStatus {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+/// Machine-readable failure reason attached to an analytics fact.
+///
+/// Orthogonal to the final status (a status may carry multiple reason
+/// details), but every reason has exactly one legal final status, given by
+/// [`FailureReason::final_status`]. The table there is the authoritative
+/// classification — unregistered `(reason, status)` combinations must not
+/// occur. Extend the enum and the table together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    /// Authenticated request with invalid input/parameters.
+    InvalidRequest,
+    /// Authenticated request rejected because the payload is too large.
+    PayloadTooLarge,
+    /// Model not found in the routing table.
+    ModelNotFound,
+    /// Matched route with all targets statically unavailable.
+    AllDisabled,
+    /// Upstream time-to-first-byte / overall timeout.
+    Timeout,
+    /// Network / transport error.
+    NetworkError,
+    /// Upstream provider returned an error response.
+    ProviderError,
+    /// Upstream returned a response with no generated content.
+    EmptyResponse,
+    /// Upstream rate-limited the request (HTTP 429).
+    RateLimited,
+    /// Stream error after the first data chunk was already committed.
+    StreamErrorAfterCommit,
+    /// All targets exhausted (retries / fallbacks failed).
+    AllExhausted,
+    /// Client disconnected before completion.
+    ClientCancelled,
+}
+
+impl FailureReason {
+    /// Stable snake_case string used for the DB `failure_reason` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureReason::InvalidRequest => "invalid_request",
+            FailureReason::PayloadTooLarge => "payload_too_large",
+            FailureReason::ModelNotFound => "model_not_found",
+            FailureReason::AllDisabled => "all_disabled",
+            FailureReason::Timeout => "timeout",
+            FailureReason::NetworkError => "network_error",
+            FailureReason::ProviderError => "provider_error",
+            FailureReason::EmptyResponse => "empty_response",
+            FailureReason::RateLimited => "rate_limited",
+            FailureReason::StreamErrorAfterCommit => "stream_error_after_commit",
+            FailureReason::AllExhausted => "all_exhausted",
+            FailureReason::ClientCancelled => "client_cancelled",
+        }
+    }
+
+    /// Authoritative mapping from failure reason to final status.
+    ///
+    /// This is the single classification table for the analytics contract:
+    /// every registered reason maps to exactly one legal
+    /// [`FinalStatus`], and no unregistered combination may be emitted.
+    pub fn final_status(self) -> FinalStatus {
+        match self {
+            FailureReason::InvalidRequest | FailureReason::PayloadTooLarge => {
+                FinalStatus::ClientError
+            }
+            FailureReason::ModelNotFound => FinalStatus::NoRoute,
+            FailureReason::AllDisabled => FinalStatus::AllDisabled,
+            FailureReason::Timeout
+            | FailureReason::NetworkError
+            | FailureReason::ProviderError
+            | FailureReason::EmptyResponse
+            | FailureReason::RateLimited
+            | FailureReason::StreamErrorAfterCommit
+            | FailureReason::AllExhausted => FinalStatus::ModelFailure,
+            FailureReason::ClientCancelled => FinalStatus::ClientCancelled,
+        }
+    }
+}
+
+/// Route-level final fact for one analyzed request.
+///
+/// Exactly one per request that entered analytics. Persisted as a
+/// `request_results` row by `sag-analytics`; built by `sag-dispatch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestResultFact {
+    pub request_id: uuid::Uuid,
+    /// `None` for `no_route` / `client_error` (never matched or resolved).
+    pub route_name: Option<String>,
+    pub requested_model: String,
+    pub final_status: FinalStatus,
+    pub failure_reason: Option<FailureReason>,
+    pub stream: bool,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    /// Only set on final success.
+    pub usage: Option<Usage>,
+    pub cached_tokens: Option<u32>,
+    pub cache_creation_tokens: Option<u32>,
+    pub ttft_ms: Option<u64>,
+    pub upstream_duration_ms: Option<u64>,
+}
+
+/// Target-level fact for one actual upstream attempt.
+///
+/// One per actually-issued target call; a request has 0..n of these.
+/// Persisted as a `target_attempts` row by `sag-analytics`; built by
+/// `sag-dispatch`. `real_model` is the model actually invoked at runtime
+/// (passthrough = requested model).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetAttemptFact {
+    pub provider: String,
+    pub real_model: String,
+    pub status: TargetStatus,
+    pub failure_reason: Option<FailureReason>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    pub usage: Option<Usage>,
+    pub cached_tokens: Option<u32>,
+    pub ttft_ms: Option<u64>,
+    pub upstream_duration_ms: Option<u64>,
+}
+
+/// Generate a new UUID v7 (time-ordered, millisecond precision).
+///
+/// Used for analytics identity fields (`route_id` / `target_id`) which are
+/// system-generated and exist only in the database — never written to TOML
+/// and never exposed to the API/UI.
+pub fn new_uuid_v7() -> uuid::Uuid {
+    uuid::Uuid::now_v7()
 }
 
 #[cfg(test)]
@@ -437,5 +624,194 @@ mod tests {
                 .unwrap();
         req.normalize_reasoning_effort();
         assert_eq!(req.reasoning_effort.as_deref(), Some("ultra"));
+    }
+
+    // ── CallLog internal identity fields tests ──────────────────
+
+    fn sample_call_log() -> CallLog {
+        CallLog {
+            request_id: uuid::Uuid::new_v4(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            real_model: "gpt-4o".into(),
+            stream: false,
+            status_code: 200,
+            duration_ms: 100,
+            usage: None,
+            error: None,
+            timestamp: chrono::Utc::now(),
+            reasoning_effort: None,
+            upstream_duration_ms: None,
+            ttft_ms: None,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            user_agent: None,
+            client_ip: None,
+            error_category: None,
+            route_id: None,
+            target_id: None,
+        }
+    }
+
+    #[test]
+    fn call_log_serialization_omits_internal_identity_fields() {
+        // Even when populated, the internal analytics identity fields must
+        // never leak into the legacy log API/UI JSON.
+        let mut log = sample_call_log();
+        log.route_id = Some(uuid::Uuid::now_v7());
+        log.target_id = Some(uuid::Uuid::now_v7());
+
+        let value: serde_json::Value = serde_json::to_value(&log).unwrap();
+        assert!(
+            value.get("route_id").is_none(),
+            "route_id must not be serialized"
+        );
+        assert!(
+            value.get("target_id").is_none(),
+            "target_id must not be serialized"
+        );
+    }
+
+    #[test]
+    fn call_log_deserialization_accepts_legacy_json() {
+        // Legacy records (no internal identity fields) deserialize fine, and
+        // the fields default to None.
+        let legacy_json = json!({
+            "request_id": uuid::Uuid::new_v4(),
+            "provider": "openai",
+            "model": "gpt-4o",
+            "real_model": "gpt-4o",
+            "stream": false,
+            "status_code": 200,
+            "duration_ms": 100,
+            "usage": null,
+            "error": null,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let log: CallLog = serde_json::from_value(legacy_json).unwrap();
+        assert!(log.route_id.is_none());
+        assert!(log.target_id.is_none());
+    }
+
+    #[test]
+    fn call_log_deserialization_ignores_injected_identity_fields() {
+        // Even if a JSON payload contains the identity fields, they are
+        // ignored on deserialization (internal-only, not part of the wire
+        // contract).
+        let mut json = serde_json::to_value(sample_call_log()).unwrap();
+        json["route_id"] = serde_json::json!(uuid::Uuid::now_v7());
+        json["target_id"] = serde_json::json!(uuid::Uuid::now_v7());
+
+        let log: CallLog = serde_json::from_value(json).unwrap();
+        assert!(log.route_id.is_none());
+        assert!(log.target_id.is_none());
+    }
+
+    // ── UUID v7 generation tests ────────────────────────────────
+
+    #[test]
+    fn new_uuid_v7_returns_version_7_uuid() {
+        let id = new_uuid_v7();
+        assert_eq!(id.get_version_num(), 7, "must be a v7 (time-ordered) uuid");
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn new_uuid_v7_are_unique() {
+        let a = new_uuid_v7();
+        let b = new_uuid_v7();
+        assert_ne!(a, b);
+    }
+
+    // ── Analytics fact type tests ───────────────────────────────
+
+    #[test]
+    fn failure_reason_final_status_table_is_authoritative() {
+        // The documented classification table: every reason maps to exactly
+        // one legal final status.
+        assert_eq!(
+            FailureReason::InvalidRequest.final_status(),
+            FinalStatus::ClientError
+        );
+        assert_eq!(
+            FailureReason::PayloadTooLarge.final_status(),
+            FinalStatus::ClientError
+        );
+        assert_eq!(
+            FailureReason::ModelNotFound.final_status(),
+            FinalStatus::NoRoute
+        );
+        assert_eq!(
+            FailureReason::AllDisabled.final_status(),
+            FinalStatus::AllDisabled
+        );
+        for reason in [
+            FailureReason::Timeout,
+            FailureReason::NetworkError,
+            FailureReason::ProviderError,
+            FailureReason::EmptyResponse,
+            FailureReason::RateLimited,
+            FailureReason::StreamErrorAfterCommit,
+            FailureReason::AllExhausted,
+        ] {
+            assert_eq!(reason.final_status(), FinalStatus::ModelFailure);
+        }
+        assert_eq!(
+            FailureReason::ClientCancelled.final_status(),
+            FinalStatus::ClientCancelled
+        );
+    }
+
+    #[test]
+    fn failure_reason_as_str_roundtrip_via_serde() {
+        for reason in [
+            FailureReason::InvalidRequest,
+            FailureReason::PayloadTooLarge,
+            FailureReason::ModelNotFound,
+            FailureReason::AllDisabled,
+            FailureReason::Timeout,
+            FailureReason::NetworkError,
+            FailureReason::ProviderError,
+            FailureReason::EmptyResponse,
+            FailureReason::RateLimited,
+            FailureReason::StreamErrorAfterCommit,
+            FailureReason::AllExhausted,
+            FailureReason::ClientCancelled,
+        ] {
+            // `as_str()` must agree with the serde snake_case name and be
+            // round-trippable, so both stay usable for the DB TEXT column.
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{}\"", reason.as_str())
+            );
+            let restored: FailureReason =
+                serde_json::from_str(&format!("\"{}\"", reason.as_str())).unwrap();
+            assert_eq!(restored, reason);
+        }
+    }
+
+    #[test]
+    fn final_status_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&FinalStatus::ClientCancelled).unwrap(),
+            "\"client_cancelled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FinalStatus::ModelFailure).unwrap(),
+            "\"model_failure\""
+        );
+        let status: FinalStatus = serde_json::from_str("\"all_disabled\"").unwrap();
+        assert_eq!(status, FinalStatus::AllDisabled);
+    }
+
+    #[test]
+    fn target_status_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TargetStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
+        let status: TargetStatus = serde_json::from_str("\"success\"").unwrap();
+        assert_eq!(status, TargetStatus::Success);
     }
 }

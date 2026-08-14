@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use sag_analytics::{IdentityRegistry, RouteIdentity, TargetIdentity};
 use sag_config::{ConfigHandle, GatewayConfig, ProviderConfig, RouteConfig};
 use sag_core::AppError;
 use sag_providers::LlmProvider;
@@ -121,6 +123,23 @@ pub struct ConfigMutationCoordinator {
     /// Guarded by `mutation_lock` -- accessed only within its scope,
     /// so a `std::sync::Mutex` suffices for interior mutability.
     accepted_file_revision: std::sync::Mutex<Option<FileRevision>>,
+    /// Optional analytics identity registry. When attached, every committed
+    /// mutation that actually changes the routes list (route
+    /// create/update/delete, provider-delete cascade, hot reload) reconciles
+    /// the DB identities with the committed routes; a failed sync leaves a
+    /// pending retry (see [`Self::pending_identity_sync`]) so the next
+    /// mutation or reload retries even without a route change.
+    /// Provider-only mutations (add/update) and registry-free coordinators
+    /// never sync unless a retry is pending.
+    identity_registry: Option<Arc<IdentityRegistry>>,
+    /// Set when a committed config's identity sync failed: the config is
+    /// live but the DB identities may be stale. While set, every subsequent
+    /// mutation/reload commit retries the sync even when routes are
+    /// unchanged (otherwise the stale identities could persist forever if
+    /// no route change ever happens again). Cleared on the first successful
+    /// sync. Only touched inside `mutation_lock`; an atomic suffices for
+    /// interior mutability.
+    pending_identity_sync: AtomicBool,
 }
 
 impl ConfigMutationCoordinator {
@@ -137,7 +156,23 @@ impl ConfigMutationCoordinator {
             providers,
             mutation_lock: tokio::sync::Mutex::new(()),
             accepted_file_revision: std::sync::Mutex::new(accepted),
+            identity_registry: None,
+            pending_identity_sync: AtomicBool::new(false),
         }
+    }
+
+    /// Attach an analytics [`IdentityRegistry`] (optional).
+    ///
+    /// When attached, each committed mutation that changes the routes list
+    /// reconciles the registry with the live routes (see
+    /// [`Self::sync_identity_if_routes_changed`]). A failed sync surfaces as
+    /// an explicit half-commit error and leaves a pending retry: the next
+    /// mutation or reload — even a provider-only one — retries the sync.
+    /// Existing `new` call sites stay registry-free and behave exactly as
+    /// before.
+    pub fn with_identity_registry(mut self, registry: Arc<IdentityRegistry>) -> Self {
+        self.identity_registry = Some(registry);
+        self
     }
 
     /// Unified mutation protocol entry point.
@@ -214,6 +249,18 @@ impl ConfigMutationCoordinator {
             }
         }
 
+        // Step 6b: Reconcile analytics identities with the committed routes
+        // when the routes list actually changed (route create/update/delete,
+        // provider-delete cascade) — or when a previous sync failed and left
+        // a pending retry (a provider-only mutation then retries it). Runs
+        // inside `mutation_lock` but outside all RwLock guards, snapshotting
+        // the committed config (see `sync_identity_if_routes_changed` for the
+        // lock-order rationale and the explicit half-commit error contract).
+        let committed = self.config.read().await;
+        self.sync_identity_if_routes_changed("mutation", &old_config, &committed)
+            .await?;
+        drop(committed);
+
         // Step 7: Build report.
         let no_op = sync.added.is_empty()
             && sync.rebuilt.is_empty()
@@ -284,6 +331,104 @@ impl ConfigMutationCoordinator {
         })
     }
 
+    /// Snapshot the committed routes as analytics route identities, exactly
+    /// as the identity registry expects them: `route_name` is the immutable
+    /// `model_name`; passthrough targets (`real_model = None`) are carried
+    /// through and skipped by the registry's static registration.
+    fn snapshot_routes_identity(config: &GatewayConfig) -> Vec<RouteIdentity> {
+        config
+            .routes
+            .iter()
+            .map(|route| RouteIdentity {
+                route_name: route.model_name.clone(),
+                targets: route
+                    .targets
+                    .iter()
+                    .map(|t| TargetIdentity {
+                        provider: t.provider.clone(),
+                        real_model: t.real_model.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Reconcile the analytics identity registry with the committed routes.
+    ///
+    /// **Call discipline**: invoked only *after* the config commit (persist +
+    /// in-memory commit + `routes_version` bump), while still holding
+    /// `mutation_lock` and outside all `RwLock` guards. The snapshot is
+    /// taken from the committed handle, so it always reflects exactly the
+    /// config that is now live. `what` labels the caller ("mutation" /
+    /// "reload") in the error message.
+    ///
+    /// On success the pending flag is cleared; on failure it is set and an
+    /// explicit half-commit error is returned (the config stays applied, the
+    /// error is never silently swallowed). The pending flag makes the very
+    /// next mutation or reload retry the sync even when routes did not
+    /// change in that event — see
+    /// [`Self::sync_identity_if_routes_changed`].
+    ///
+    /// **Lock trade-off** (deliberate): the DB sync runs inside
+    /// `mutation_lock`, serialising concurrent config mutations for the
+    /// duration of the reconciliation (a local-SQLite transaction,
+    /// millisecond-scale; config mutations are rare admin/hot-reload
+    /// events). Syncing *outside* the lock would let a later mutation
+    /// commit between our commit and our sync, and its own sync could then
+    /// finish first — leaving the DB reconciled against a stale config
+    /// with no guaranteed convergence. Serialising is therefore the minimal
+    /// safe scheme.
+    async fn sync_identity(&self, what: &str, committed: &GatewayConfig) -> Result<(), AppError> {
+        let Some(registry) = &self.identity_registry else {
+            return Ok(());
+        };
+        let snapshot = Self::snapshot_routes_identity(committed);
+        match registry.sync(&snapshot).await {
+            Ok(()) => {
+                self.pending_identity_sync.store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                self.pending_identity_sync.store(true, Ordering::Release);
+                Err(AppError::Internal(format!(
+                    "config {what} applied, but analytics identity sync failed: {e}"
+                )))
+            }
+        }
+    }
+
+    /// Reconcile the analytics identity registry with the committed routes,
+    /// but only when the routes list actually changed **or** a previous
+    /// sync is pending. Route create/update/delete, the provider-delete
+    /// cascade (which rewrites route targets), and hot reloads that change
+    /// routes always trigger it; provider-only mutations trigger it only to
+    /// retry a pending sync — with no pending and unchanged routes they
+    /// skip it entirely, so healthy provider-only mutations never cause
+    /// wasteful syncs.
+    ///
+    /// **Call discipline**: invoked only *after* the config commit (persist +
+    /// in-memory commit + `routes_version` bump), while still holding
+    /// `mutation_lock` and outside all `RwLock` guards (see
+    /// [`Self::sync_identity`] for the lock rationale and the explicit
+    /// half-commit error contract). A pending retry always syncs the
+    /// *current* committed snapshot, so a pending sync retried after
+    /// further commits converges on the latest config.
+    async fn sync_identity_if_routes_changed(
+        &self,
+        what: &str,
+        old: &GatewayConfig,
+        committed: &GatewayConfig,
+    ) -> Result<(), AppError> {
+        if self.identity_registry.is_none() {
+            return Ok(());
+        }
+        let pending = self.pending_identity_sync.load(Ordering::Acquire);
+        if old.routes == committed.routes && !pending {
+            return Ok(());
+        }
+        self.sync_identity(what, committed).await
+    }
+
     // ── Public API ────────────────────────────────────────────────────
 
     /// Hot-reload: re-read, validate, and atomically publish the config at
@@ -344,6 +489,17 @@ impl ConfigMutationCoordinator {
 
                 // Update accepted file revision.
                 *self.accepted_file_revision.lock().unwrap() = Some(rev2);
+
+                // Reconcile analytics identities with the committed routes
+                // when the routes list actually changed (same gate and lock
+                // discipline as `mutate`; a failed sync returns an explicit
+                // half-commit error and leaves a pending retry, so the next
+                // mutation or reload — even one with unchanged routes —
+                // re-syncs and heals).
+                let committed = self.config.read().await;
+                self.sync_identity_if_routes_changed("reload", &old_config, &committed)
+                    .await?;
+                drop(committed);
 
                 let no_op = sync.added.is_empty()
                     && sync.rebuilt.is_empty()

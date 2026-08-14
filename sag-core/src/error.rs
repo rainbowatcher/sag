@@ -3,6 +3,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::types::{FailureReason, FinalStatus};
+
 /// Circuit breaker open-duration hint extracted from an upstream error.
 ///
 /// [`AppError::circuit_open_duration_secs`] returns one of these
@@ -161,6 +163,44 @@ impl AppError {
             AppError::Internal(_) => "internal_error",
             AppError::Anyhow(_) => "internal_error",
         }
+    }
+
+    /// Map the error to the analytics [`FailureReason`] for facts.
+    ///
+    /// `None` means this error carries no registered failure reason:
+    /// - `Unauthorized` — requests failing authentication are **excluded**
+    ///   from analytics entirely (no facts are emitted, per spec);
+    /// - config / admin / internal variants have no registered reason.
+    ///
+    /// The resulting reason always has a legal [`FinalStatus`] via
+    /// [`FailureReason::final_status`] — see `final_status()`.
+    pub fn failure_reason(&self) -> Option<FailureReason> {
+        match self {
+            AppError::BadRequest(_) => Some(FailureReason::InvalidRequest),
+            AppError::ModelNotFound(_) => Some(FailureReason::ModelNotFound),
+            // HTTP 429 upstream → rate-limited; everything else upstream
+            // (including 403 quota language) → provider error.
+            AppError::Upstream { status: 429, .. } => Some(FailureReason::RateLimited),
+            AppError::Upstream { .. } => Some(FailureReason::ProviderError),
+            AppError::AllProvidersExhausted { .. } => Some(FailureReason::AllExhausted),
+            AppError::Network(_) => Some(FailureReason::NetworkError),
+            AppError::TtfbTimeout { .. } => Some(FailureReason::Timeout),
+            AppError::EmptyResponse { .. } => Some(FailureReason::EmptyResponse),
+            // Unauthorized is excluded from analytics; config/admin/internal
+            // variants are not part of the dispatch-path classification.
+            _ => None,
+        }
+    }
+
+    /// Map the error to the analytics [`FinalStatus`] for the request-level
+    /// fact. `None` = excluded from analytics (authentication failure) or no
+    /// registered status (config/admin/internal errors).
+    ///
+    /// Implemented via [`AppError::failure_reason`] + the authoritative
+    /// [`FailureReason::final_status`] table, so the `(failure_reason,
+    /// final_status)` combination is always legal.
+    pub fn final_status(&self) -> Option<FinalStatus> {
+        self.failure_reason().map(FailureReason::final_status)
     }
 }
 
@@ -630,5 +670,160 @@ mod tests {
             AppError::Internal("boom".into()).circuit_hint(),
             CircuitHint::Generic
         );
+    }
+
+    // ── analytics failure_reason / final_status mapping tests ─────
+
+    #[test]
+    fn failure_reason_bad_request_is_invalid_request_client_error() {
+        let err = AppError::BadRequest("unsupported param".into());
+        assert_eq!(err.failure_reason(), Some(FailureReason::InvalidRequest));
+        assert_eq!(err.final_status(), Some(FinalStatus::ClientError));
+    }
+
+    #[test]
+    fn failure_reason_model_not_found_is_no_route() {
+        let err = AppError::ModelNotFound("gpt-99".into());
+        assert_eq!(err.failure_reason(), Some(FailureReason::ModelNotFound));
+        assert_eq!(err.final_status(), Some(FinalStatus::NoRoute));
+    }
+
+    #[test]
+    fn failure_reason_upstream_429_is_rate_limited() {
+        let err = AppError::Upstream {
+            provider: "openai".into(),
+            status: 429,
+            body: "rate limit reached".into(),
+        };
+        assert_eq!(err.failure_reason(), Some(FailureReason::RateLimited));
+        assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
+    }
+
+    #[test]
+    fn failure_reason_upstream_other_is_provider_error() {
+        for status in [400, 403, 500, 502, 503] {
+            let err = AppError::Upstream {
+                provider: "openai".into(),
+                status,
+                body: "boom".into(),
+            };
+            assert_eq!(
+                err.failure_reason(),
+                Some(FailureReason::ProviderError),
+                "status {status} should map to provider_error"
+            );
+            assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
+        }
+    }
+
+    #[test]
+    fn failure_reason_all_exhausted_is_model_failure() {
+        let err = AppError::AllProvidersExhausted {
+            model: "gpt-4o".into(),
+            reason: "all timed out".into(),
+        };
+        assert_eq!(err.failure_reason(), Some(FailureReason::AllExhausted));
+        assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
+    }
+
+    #[tokio::test]
+    async fn failure_reason_network_is_model_failure() {
+        // Build a minimal reqwest::Error via an unreachable localhost port.
+        let req_err = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(5))
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        let err = AppError::from(req_err);
+        assert_eq!(err.failure_reason(), Some(FailureReason::NetworkError));
+        assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
+    }
+
+    #[test]
+    fn failure_reason_ttfb_timeout_is_model_failure() {
+        let err = AppError::TtfbTimeout {
+            provider: "openai".into(),
+            secs: 60,
+        };
+        assert_eq!(err.failure_reason(), Some(FailureReason::Timeout));
+        assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
+    }
+
+    #[test]
+    fn failure_reason_empty_response_is_model_failure() {
+        let err = AppError::EmptyResponse {
+            provider: "cpa".into(),
+        };
+        assert_eq!(err.failure_reason(), Some(FailureReason::EmptyResponse));
+        assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
+    }
+
+    #[test]
+    fn failure_reason_unauthorized_is_excluded_from_analytics() {
+        // Authentication failures are completely excluded: no facts, so no
+        // reason or status.
+        let err = AppError::Unauthorized("bad key".into());
+        assert_eq!(err.failure_reason(), None);
+        assert_eq!(err.final_status(), None);
+    }
+
+    #[test]
+    fn failure_reason_internal_variants_have_no_registered_reason() {
+        // Config / admin / internal errors are not part of the dispatch-path
+        // classification table; they must not produce an illegal combination.
+        for err in [
+            AppError::Config("bad".into()),
+            AppError::NotFound("gone".into()),
+            AppError::Conflict("dup".into()),
+            AppError::Internal("boom".into()),
+            AppError::Anyhow(anyhow::anyhow!("oops")),
+        ] {
+            assert_eq!(err.failure_reason(), None, "{err:?}");
+            assert_eq!(err.final_status(), None, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn failure_reason_and_status_combinations_are_legal() {
+        // Every mapped reason must agree with the authoritative
+        // FailureReason::final_status table. (Network is covered separately
+        // in `failure_reason_network_is_model_failure` because it needs a
+        // real reqwest error.)
+        for err in [
+            AppError::BadRequest("x".into()),
+            AppError::ModelNotFound("x".into()),
+            AppError::Upstream {
+                provider: "o".into(),
+                status: 429,
+                body: "rate limit".into(),
+            },
+            AppError::Upstream {
+                provider: "o".into(),
+                status: 500,
+                body: "boom".into(),
+            },
+            AppError::AllProvidersExhausted {
+                model: "m".into(),
+                reason: "r".into(),
+            },
+            AppError::TtfbTimeout {
+                provider: "o".into(),
+                secs: 60,
+            },
+            AppError::EmptyResponse {
+                provider: "o".into(),
+            },
+        ] {
+            let reason = err.failure_reason().expect("mapped reason");
+            assert_eq!(
+                err.final_status(),
+                Some(reason.final_status()),
+                "final_status must follow the authoritative reason table"
+            );
+        }
     }
 }

@@ -25,3 +25,4 @@ sag-admin = { path = "../sag-admin" }
 [dev-dependencies]
 async-trait = "0.1"
 http-body-util = "0.1"
+sqlx = { workspace = true }

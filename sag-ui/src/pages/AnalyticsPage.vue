@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { AlertCircle, Search, Loader2, TrendingUp, Zap, Clock } from "@lucide/vue"
 import { ref, onMounted, computed } from "vue"
+import AnalyticsV2Panel from "@/components/analytics/AnalyticsV2Panel.vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -74,7 +75,13 @@ const statsTotals = computed(() => {
       <TabsList class="shrink-0">
         <TabsTrigger value="stats">Stats</TabsTrigger>
         <TabsTrigger value="cache">Cache</TabsTrigger>
+        <TabsTrigger value="insights">Insights</TabsTrigger>
       </TabsList>
+
+      <!-- ── Insights panel (analytics v2 summary / trend) ─────── -->
+      <TabsContent value="insights" class="min-h-0 flex-1">
+        <AnalyticsV2Panel />
+      </TabsContent>
 
       <!-- ── Stats panel ─────────────────────────────────────────── -->
       <TabsContent value="stats" class="min-h-0 flex-1">

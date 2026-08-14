@@ -17,3 +17,6 @@ sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
+
+[dev-dependencies]
+sqlx = { workspace = true }

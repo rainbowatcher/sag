@@ -1,6 +1,8 @@
 //! Handlers for routes that are not part of the chat/image dispatch:
 //! `/health`, `/v1/models`, `/v1/analytics/stats`.
 
+pub mod analytics_v2;
+
 use axum::{
     Json,
     body::Body,

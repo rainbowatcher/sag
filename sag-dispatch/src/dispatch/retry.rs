@@ -165,11 +165,18 @@ pub fn is_retryable_error(err: &AppError) -> bool {
     }
 }
 
-/// Whether a non-retryable upstream 4xx is attributable to the client
-/// (request shape) rather than provider persistence. Only meaningful for
-/// non-retryable 4xx: 401/403/404 are attributed to provider persistence
-/// (failover + move pin), every other 4xx is client-caused (return the
-/// error to the client, no failover, no pin movement, no circuit change).
+/// Whether a non-retryable error is attributable to the client (request
+/// shape) rather than provider persistence.
+///
+/// Two families qualify:
+/// - [`AppError::BadRequest`] — locally-detected request input / parameter
+///   errors (validation raised before or around the provider call). Always
+///   client-caused: return the error to the client, no failover, no pin
+///   movement, no circuit change.
+/// - Non-retryable upstream 4xx: 401/403/404 are attributed to provider
+///   persistence (failover + move pin), every other 4xx is client-caused
+///   (return the error to the client, no failover, no pin movement, no
+///   circuit change).
 ///
 /// A 403 reaching this predicate is always a non-quota 403 - quota-403 is
 /// retryable and never lands in [`RetryOutcome::NonRetryable`]. 408/429 are
@@ -178,6 +185,7 @@ pub fn is_retryable_error(err: &AppError) -> bool {
 /// predicate via the `NonRetryable` path.
 pub fn is_client_caused_4xx(err: &AppError) -> bool {
     match err {
+        AppError::BadRequest(_) => true,
         AppError::Upstream { status, .. } => {
             let s = *status;
             (400..500).contains(&s) && !matches!(s, 401 | 403 | 404 | 408 | 429)
@@ -280,6 +288,12 @@ mod tests {
             );
         }
 
+        // Locally-detected request input / parameter errors are always
+        // client-caused.
+        assert!(is_client_caused_4xx(&AppError::BadRequest(
+            "bad param".into()
+        )));
+
         // Provider-persistent: auth / missing-model / non-quota 403.
         for status in [401, 403, 404] {
             assert!(
@@ -288,9 +302,8 @@ mod tests {
             );
         }
 
-        // Non-4xx and non-Upstream errors are never client-caused.
+        // Non-4xx and other non-Upstream errors are never client-caused.
         assert!(!is_client_caused_4xx(&upstream(500)));
-        assert!(!is_client_caused_4xx(&AppError::BadRequest("bad".into())));
         assert!(!is_client_caused_4xx(&AppError::Internal("i".into())));
         // 408/429 (retryable) are transient provider failures, not
         // client-caused; they also never reach this predicate via NonRetryable

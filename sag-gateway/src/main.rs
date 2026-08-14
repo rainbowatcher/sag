@@ -67,16 +67,63 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     // 3. Load configuration with hot-reload support
     let config_handle = sag_config::load_config(config_path)?;
 
-    // 4. Determine analytics storage DSN from config
+    // 4. Determine analytics storage DSN from config, and snapshot the
+    //    configured route identities (route_name → static targets) from
+    //    the same read lock.
     let config = config_handle.read().await;
     let analytics_dsn = config
         .analytics
         .as_ref()
         .map(|a| a.storage_dsn.clone())
         .unwrap_or_else(|| "sqlite://analytics.db".into());
+    let routes_identity: Vec<sag_analytics::RouteIdentity> = config
+        .routes
+        .iter()
+        .map(|route| sag_analytics::RouteIdentity {
+            route_name: route.model_name.clone(),
+            targets: route
+                .targets
+                .iter()
+                .map(|t| sag_analytics::TargetIdentity {
+                    provider: t.provider.clone(),
+                    real_model: t.real_model.clone(),
+                })
+                .collect(),
+        })
+        .collect();
     drop(config);
 
-    // 5. Initialize analytics collector with SQLite persistence
+    // 5. Initialize analytics. The formal path (EventCollector →
+    //    EventWriter + IdentityRegistry) opens ONE shared, migrated pool
+    //    on the analytics DSN — the same SQLite file the legacy
+    //    call_logs store writes to; the writer is built over that shared
+    //    pool (`EventWriter::new`), never over a private one. The
+    //    identity registry is synced against the configured routes
+    //    *before* startup proceeds (config-sync-first); a failed sync
+    //    aborts startup. The exact-detail query engine (`/v1/analytics/v2/*`)
+    //    is assembled over the same shared pool, so it observes exactly
+    //    what the writer commits. The legacy CallLogCollector is kept for
+    //    the `/v1/analytics/*` and `/api/logs` paths.
+    let analytics_pool = sag_analytics::open_analytics_pool(&analytics_dsn).await?;
+    let identity_registry = Arc::new(sag_analytics::IdentityRegistry::new(analytics_pool.clone()));
+    identity_registry.sync(&routes_identity).await?;
+    let analytics_query = sag_analytics::AnalyticsQueryEngine::new(analytics_pool.clone());
+    // 5a. 1h rollup engine over the SAME shared pool (one pool for writer /
+    //     registry / query / rollup — a failed sync aborts startup above,
+    //     so the rollup can only ever see a migrated, consistent DB). The
+    //     single-worker scheduler is spawned immediately but only
+    //     *registers* missing hours at startup (scan → `pending`, never
+    //     compute) in the background while the rest of the gateway comes
+    //     up — registration cannot block service startup, and a failed
+    //     scan is warned and retried by every hourly cycle.
+    let rollup_scheduler_handle = spawn_rollup_scheduler(
+        Arc::new(sag_analytics::RollupEngine::new(analytics_pool.clone())),
+        ROLLUP_INTERVAL,
+    );
+    let event_collector = Arc::new(sag_analytics::EventCollector::new(
+        sag_analytics::EventWriter::new(analytics_pool),
+    ));
+
     let collector = Arc::new(sag_analytics::CallLogCollector::new(&analytics_dsn).await?);
 
     // 6. Initialize provider registry from config and compute the
@@ -114,11 +161,16 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     let provider_registry = Arc::new(RwLock::new(providers));
 
     // 7. Create config mutation coordinator (serialises all production
-    //    config writes: hot-reload + Admin CRUD).
-    let coordinator = Arc::new(ConfigMutationCoordinator::new(
-        config_handle.clone(),
-        provider_registry.clone(),
-    ));
+    //    config writes: hot-reload + Admin CRUD). The startup-created
+    //    identity registry is injected so that every committed route
+    //    mutation (admin CRUD via the coordinator, hot reload via the
+    //    coordinator-backed handler below) reconciles the analytics
+    //    identities with the live routes. Provider-only mutations never
+    //    touch identities.
+    let coordinator = Arc::new(
+        ConfigMutationCoordinator::new(config_handle.clone(), provider_registry.clone())
+            .with_identity_registry(identity_registry.clone()),
+    );
 
     // 8. Build AppState (shared resources) + DispatchRuntime (dispatch-only state).
     //    The circuit breaker Arc is created first and injected into both
@@ -142,6 +194,8 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         providers: provider_registry,
         coordinator: coordinator.clone(),
         collector,
+        event_collector: event_collector.clone(),
+        analytics_query: Some(Arc::new(analytics_query)),
         circuit_breaker: route_circuit_breaker.clone(),
         active_targets: active_targets.clone(),
         fill_first_orders: fill_first_orders.clone(),
@@ -223,6 +277,26 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     //     the SQLite background task exit.
     hot_reload_handle.shutdown().await;
     threshold_watcher_handle.shutdown().await;
+
+    // 14a. Stop the rollup scheduler BEFORE draining the event queue. The
+    //      signal + join guarantees the scheduler's in-flight bucket
+    //      compute transaction has ended (a bucket is all-or-nothing: one
+    //      transaction across every rollup table) and the task has
+    //      stopped, so the drain below is the last writer to touch the
+    //      analytics DB and no background task can outlive the shared
+    //      pool / process. A timeout or panicked task is logged as an
+    //      error — never silently ignored. Any bucket left `processing`
+    //      by a hard kill is reclaimed via the lease at next startup.
+    rollup_scheduler_handle.shutdown().await;
+
+    // 15. Drain the formal analytics event queue: close the sender, wait
+    //     for the writer to persist every pending event before exiting.
+    //     `EventCollector::shutdown` runs on a shared handle (`&self`)
+    //     and is idempotent, so the drain does not depend on this `Arc`
+    //     being the last strong reference — extra clones (e.g. the
+    //     `AppState` handle) can never cause the drain to be skipped.
+    event_collector.shutdown().await;
+    info!("analytics event collector drained");
 
     info!("all subsystems shut down");
 
@@ -353,6 +427,136 @@ impl ThresholdWatcherHandle {
     }
 }
 
+/// Interval between rollup scheduler cycles: one compute run per hour
+/// (spec: 每小时执行一轮). Combined with [`MissedTickBehavior::Skip`], a
+/// cycle that overruns its hour delays the next run instead of bursting
+/// into catch-up runs — the engine's lease-based claim is safe only for a
+/// single worker, and one run per hour is the contract.
+const ROLLUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Registration lookback for [`RollupEngine::register_missing_hours`]: each
+/// cycle scans facts in `[now - window, now)` and registers the hours that
+/// need rollup as `pending` (missing / dirty / failed / expired-lease). The
+/// window bounds the scan cost (index-backed distinct on `completed_at`);
+/// buckets outside it are still answered correctly by the query engine's
+/// exact-detail fallback, so it only bounds how much history gets
+/// accelerated — never correctness.
+const ROLLUP_REGISTRATION_LOOKBACK: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// Spawn the single-worker 1h rollup scheduler over the shared analytics
+/// pool.
+///
+/// Startup contract (spec): registration only — scan the registration
+/// window and mark candidate hours `pending`, never compute. The task is
+/// spawned at analytics init and registers in the background while the
+/// rest of the gateway comes up, so a slow scan (or a transient DB error)
+/// cannot delay serving: failures are warned and retried by every hourly
+/// cycle. The first *compute* run happens a full `interval` later (the
+/// immediate first tick of a tokio interval is consumed, never executed).
+///
+/// Compute contract: one run per `interval` (production: 1h), single
+/// worker only. Each cycle re-registers first (retries a failed startup
+/// registration; picks up new / dirty / late-fact hours that appeared
+/// since), then runs one batch of up to
+/// [`sag_analytics::rollup::MAX_BUCKETS_PER_RUN`] buckets. `run_once` and
+/// `register_missing_hours` never panic on DB errors — they return
+/// `Err`, which is logged here and retried next cycle.
+fn spawn_rollup_scheduler(
+    engine: Arc<sag_analytics::RollupEngine>,
+    interval: Duration,
+) -> RollupSchedulerHandle {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        // Startup: registration only (never compute).
+        register_rollup_hours(&engine).await;
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A tokio interval's first tick fires immediately. Consume it so
+        // the first compute run happens a full interval after startup —
+        // startup is registration-only by spec.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("rollup scheduler stopped");
+                    return;
+                }
+                _ = ticker.tick() => {}
+            }
+            register_rollup_hours(&engine).await;
+            match engine.run_once().await {
+                Ok(report) => info!(
+                    claimed = report.claimed,
+                    completed = report.completed,
+                    failed = report.failed,
+                    "rollup cycle done"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "rollup cycle failed; retrying next cycle");
+                }
+            }
+        }
+    });
+    RollupSchedulerHandle { task, shutdown_tx }
+}
+
+/// One registration pass of the rollup scheduler: scan the registration
+/// window and register every hour that needs rollup as `pending`.
+///
+/// Best-effort by design: a failure is warned and retried on the next
+/// cycle — the query engine answers missing buckets from exact-detail
+/// aggregation, so the service stays correct even while rollup lags. The
+/// engine logs the registered hours itself; this helper only surfaces
+/// failures.
+async fn register_rollup_hours(engine: &sag_analytics::RollupEngine) {
+    let now_ms = unix_now_ms();
+    let from_ms = now_ms - ROLLUP_REGISTRATION_LOOKBACK.as_millis() as i64;
+    match engine.register_missing_hours(from_ms, now_ms).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "rollup registration failed; retrying next cycle");
+        }
+    }
+}
+
+/// Current unix time in milliseconds. A system clock before the UNIX epoch
+/// clamps to 0 — the registration window then degenerates to a no-op scan
+/// instead of panicking.
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Handle for the rollup scheduler background task.
+struct RollupSchedulerHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl RollupSchedulerHandle {
+    /// Signal the scheduler to stop and wait up to 5s for it to exit.
+    ///
+    /// The join is the only way to know the scheduler's current bucket
+    /// compute transaction has ended and the task has stopped — dropping
+    /// or aborting the handle would leak the task or silently skip the
+    /// stop, so a timeout or a panicked task is logged as an error. SQLite
+    /// transactions stay atomic either way (a hard kill rolls back), but
+    /// the shutdown-order guarantee (drain happens last, no background
+    /// writer after it) requires the join to succeed.
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+        match tokio::time::timeout(Duration::from_secs(5), self.task).await {
+            Ok(Ok(())) => info!("rollup scheduler shut down"),
+            Ok(Err(e)) => tracing::error!(error = %e, "rollup scheduler task panicked"),
+            Err(_) => tracing::error!("rollup scheduler did not stop within 5s"),
+        }
+    }
+}
+
 /// Resolves the configuration file path from CLI arguments.
 ///
 /// Precedence:
@@ -478,5 +682,149 @@ async fn shutdown_signal() {
     {
         let _ = ctrl_c.await;
         info!("received SIGINT, shutting down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sag_analytics::BucketState;
+    use sag_core::{FinalStatus, RequestResultFact};
+
+    /// Build one `client_error` fact (no route, no attempts — the simplest
+    /// fact that still exercises the full write → register → compute
+    /// path) at `completed_at` (unix ms) through the formal public API.
+    fn client_error_event(completed_at: i64) -> sag_analytics::AnalyticsEvent {
+        use chrono::{TimeZone, Utc};
+        let completed_at = Utc.timestamp_millis_opt(completed_at).unwrap();
+        let started_at = completed_at - chrono::Duration::milliseconds(250);
+        sag_analytics::AnalyticsEvent::new(RequestResultFact {
+            request_id: uuid::Uuid::new_v4(),
+            route_name: None,
+            requested_model: "test-model".to_string(),
+            final_status: FinalStatus::ClientError,
+            failure_reason: None,
+            stream: false,
+            started_at,
+            completed_at,
+            usage: None,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            ttft_ms: None,
+            upstream_duration_ms: None,
+        })
+    }
+
+    /// Startup contract against a real (in-memory) analytics DB: the
+    /// scheduler's background registration marks the fact's hour `pending`
+    /// — and never computes it (the first cycle is a full hour away).
+    /// Shutdown stops the task with no leak, and the bucket stays `pending`.
+    #[tokio::test]
+    async fn rollup_scheduler_startup_registers_never_computes() {
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let engine = Arc::new(sag_analytics::RollupEngine::new(pool));
+
+        // One fact in the current hour bucket (via the formal writer).
+        // `completed_at` is deliberately 1 ms in the past: the scheduler's
+        // registration scan bounds its hour query by the *current* time
+        // (right-open: `completed_at < to_ms`), so a fact stamped with the
+        // exact same millisecond as the scan would fall outside the window
+        // and never be registered (flaky). One millisecond of skew makes
+        // `completed_at < to_ms` hold unconditionally.
+        let fact_completed_at = unix_now_ms() - 1;
+        let hour =
+            fact_completed_at / sag_analytics::rollup::HOUR_MS * sag_analytics::rollup::HOUR_MS;
+        sag_analytics::EventWriter::new(engine.pool().clone())
+            .write(client_error_event(fact_completed_at))
+            .await
+            .unwrap();
+
+        // Production-like interval: a full hour — only registration may run.
+        let handle = spawn_rollup_scheduler(engine.clone(), Duration::from_secs(3600));
+
+        // Registration is async in the background task; poll for it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match engine.bucket_status(hour).await.unwrap() {
+                Some(status) => {
+                    assert_eq!(
+                        status.state,
+                        BucketState::Pending,
+                        "startup registration must never compute"
+                    );
+                    assert_eq!(status.attempt, 0, "no claim may happen at startup");
+                    break;
+                }
+                None => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "startup registration never landed"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        // Shutdown stops the task promptly and the join reports no panic.
+        handle.shutdown().await;
+
+        let status = engine.bucket_status(hour).await.unwrap().unwrap();
+        assert_eq!(status.state, BucketState::Pending);
+    }
+
+    /// Compute contract: the first run happens after one interval, claims
+    /// the pending bucket once, materializes the rollup rows, and
+    /// `shutdown` stops the task.
+    #[tokio::test]
+    async fn rollup_scheduler_first_cycle_computes_bucket() {
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let engine = Arc::new(sag_analytics::RollupEngine::new(pool));
+
+        // One fact in the current hour bucket (via the formal writer).
+        // 1 ms skew — see `rollup_scheduler_startup_registers_never_computes`
+        // for why the fact must strictly precede the scan's `to_ms`.
+        let fact_completed_at = unix_now_ms() - 1;
+        let hour =
+            fact_completed_at / sag_analytics::rollup::HOUR_MS * sag_analytics::rollup::HOUR_MS;
+        sag_analytics::EventWriter::new(engine.pool().clone())
+            .write(client_error_event(fact_completed_at))
+            .await
+            .unwrap();
+
+        let handle = spawn_rollup_scheduler(engine.clone(), Duration::from_millis(100));
+
+        // First compute run happens after the interval — poll for it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match engine.bucket_status(hour).await.unwrap() {
+                Some(status) if status.state == BucketState::Completed => {
+                    // `attempt` counts failures (spec state machine), and
+                    // this bucket never failed — first claim + compute
+                    // leave it at 0.
+                    assert_eq!(status.attempt, 0, "one claim per run, single worker");
+                    break;
+                }
+                _ => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "rollup never completed the bucket"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        // Rollup rows materialized for the hour.
+        let rows = engine.global_rows(&[hour]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 1);
+        assert_eq!(rows[0].client_error, 1);
+
+        // Shutdown: task stops promptly and the join reports no panic.
+        handle.shutdown().await;
     }
 }

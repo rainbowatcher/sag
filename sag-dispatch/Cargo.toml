@@ -27,3 +27,4 @@ sag-state = { path = "../sag-state" }
 [dev-dependencies]
 async-trait = "0.1"
 http-body-util = "0.1"
+sqlx = { workspace = true }

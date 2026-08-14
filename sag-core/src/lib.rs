@@ -19,8 +19,9 @@ pub use circuit_breaker::{
 };
 pub use error::AppError;
 pub use types::{
-    CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ImageData,
-    ImageGenerationRequest, ImageGenerationResponse, StopSequence, StreamChunk, Usage,
+    CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FailureReason,
+    FinalStatus, ImageData, ImageGenerationRequest, ImageGenerationResponse, RequestResultFact,
+    StopSequence, StreamChunk, TargetAttemptFact, TargetStatus, Usage, new_uuid_v7,
 };
 
 /// Convenient alias for `Result<T, error::AppError>`.

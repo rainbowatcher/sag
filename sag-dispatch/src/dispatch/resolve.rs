@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{body::Body, http::StatusCode, response::Response};
+use sag_analytics::AnalyticsEvent;
 use sag_config::{ProviderConfig, RouteTarget};
-use sag_core::{AppError, ChatCompletionRequest};
+use sag_core::{AppError, ChatCompletionRequest, FailureReason, FinalStatus, RequestResultFact};
 use sag_providers::LlmProvider;
 use tracing::{info, warn};
 
@@ -15,9 +16,12 @@ use crate::order::order_targets;
 use crate::state::{AppState, DispatchRuntime};
 
 /// Resolve a chat request to an ordered list of fallback targets and the
-/// configured `api_endpoint`. Returns a fully-built error response (with
-/// analytics already logged) when the model is unknown or all targets are
-/// pointing at disabled providers.
+/// configured `api_endpoint`, carrying the matched `route_name` and the
+/// wall-clock `started_at` (captured by the caller alongside `start`) for
+/// the analytics route-start event. Returns a fully-built error response
+/// (with the legacy call log and the formal analytics event already emitted)
+/// when the model is unknown or all targets are pointing at disabled
+/// providers.
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_route(
     state: &AppState,
@@ -25,6 +29,7 @@ pub async fn resolve_route(
     request: &ChatCompletionRequest,
     trace_id: uuid::Uuid,
     start: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
     is_stream: bool,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
@@ -53,7 +58,7 @@ pub async fn resolve_route(
         .or_else(|| config_guard.routes.iter().find(|r| r.model_name == "*"));
 
     let Some(route) = route else {
-        return Err(failure_response(
+        let response = failure_response(
             state,
             trace_id,
             "__no_route__",
@@ -66,7 +71,24 @@ pub async fn resolve_route(
             request.reasoning_effort.as_deref(),
             user_agent,
             client_ip,
-        ));
+        );
+        // Formal analytics fact: no route matched → no route identity, no
+        // target attempts. The sentinel `__no_route__` CallLog row above is
+        // left untouched and must never leak into this fact.
+        emit_route_failure_event(
+            state,
+            route_failure_event(
+                trace_id,
+                &request.model,
+                None,
+                FinalStatus::NoRoute,
+                FailureReason::ModelNotFound,
+                is_stream,
+                started_at,
+            ),
+        )
+        .await;
+        return Err(response);
     };
 
     // Drop targets pointing at disabled providers.
@@ -81,7 +103,7 @@ pub async fn resolve_route(
                 route.model_name
             ),
         };
-        return Err(failure_response(
+        let response = failure_response(
             state,
             trace_id,
             "__all_disabled__",
@@ -94,7 +116,26 @@ pub async fn resolve_route(
             request.reasoning_effort.as_deref(),
             user_agent,
             client_ip,
-        ));
+        );
+        // Formal analytics fact: the route matched but every target is
+        // disabled → carry the real matched route name (never the
+        // `__all_disabled__` sentinel); the writer resolves `route_id` from
+        // it. No target attempts, and the sentinel CallLog row above is
+        // left untouched.
+        emit_route_failure_event(
+            state,
+            route_failure_event(
+                trace_id,
+                &request.model,
+                Some(route.model_name.clone()),
+                FinalStatus::AllDisabled,
+                FailureReason::AllDisabled,
+                is_stream,
+                started_at,
+            ),
+        )
+        .await;
+        return Err(response);
     }
 
     let strategy = route.strategy;
@@ -154,7 +195,68 @@ pub async fn resolve_route(
         })
         .collect();
 
-    Ok((resolved, api_endpoint, strategy, sticky_token))
+    Ok(ResolvedRoute {
+        targets: resolved,
+        api_endpoint,
+        strategy,
+        sticky_token,
+        route_name: route_model_name,
+        started_at,
+    })
+}
+
+/// Build the formal analytics event for a request that failed during route
+/// resolution, before any target attempt:
+///
+/// - `no_route`: no route matched → `route_name = None` (the writer keeps
+///   `route_id` NULL); the sentinel `__no_route__` identity used in the
+///   legacy CallLog must never leak into the formal fact.
+/// - `all_disabled`: a route matched but every target is disabled →
+///   `route_name = Some(matched route)`; the writer resolves `route_id`
+///   from that name.
+///
+/// Both cases carry zero target attempts. `completed_at` is captured at
+/// completion time (UTC); `request_id` is the caller's `trace_id`.
+fn route_failure_event(
+    trace_id: uuid::Uuid,
+    requested_model: &str,
+    route_name: Option<String>,
+    final_status: FinalStatus,
+    failure_reason: FailureReason,
+    stream: bool,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> AnalyticsEvent {
+    AnalyticsEvent::new(RequestResultFact {
+        request_id: trace_id,
+        route_name,
+        requested_model: requested_model.to_string(),
+        final_status,
+        failure_reason: Some(failure_reason),
+        stream,
+        started_at,
+        completed_at: chrono::Utc::now(),
+        usage: None,
+        cached_tokens: None,
+        cache_creation_tokens: None,
+        ttft_ms: None,
+        upstream_duration_ms: None,
+    })
+}
+
+/// Enqueue a route-level failure event with formal backpressure
+/// ([`EventCollector::emit`], never `try_emit` — the fact must not be
+/// dropped). A collector failure is only possible once the collector is
+/// shut down; it is logged and swallowed so the client-facing response
+/// already built by the caller keeps its exact semantics.
+async fn emit_route_failure_event(state: &AppState, event: AnalyticsEvent) {
+    if let Err(e) = state.event_collector.emit(event.clone()).await {
+        warn!(
+            request_id = %event.result.request_id,
+            status = ?event.result.final_status,
+            error = %e,
+            "analytics event not enqueued (event collector shut down)"
+        );
+    }
 }
 
 /// Drop targets whose provider is marked `enabled = false` in the config.
@@ -320,6 +422,7 @@ mod tests {
         let req = test_request("gpt-4o");
         let trace_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
 
         // Pre-populate all three caches so we can verify prune clears
         // every map, not just fill_first_orders.
@@ -340,8 +443,10 @@ mod tests {
         );
 
         // 1. First call: resolve route → populates fill_first_orders.
-        let result =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
         assert!(result.is_ok(), "route should resolve successfully");
 
         // All three caches are populated.
@@ -364,8 +469,10 @@ mod tests {
         }
 
         // 3. Second call: route gone → ModelNotFound, but prune ran first.
-        let result2 =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        let result2 = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
         assert!(
             result2.is_err(),
             "second resolve should fail with ModelNotFound"
@@ -397,13 +504,18 @@ mod tests {
         let req = test_request("gpt-4o");
         let trace_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
 
         // Fresh memory, nothing cleared: the decision captured 0 and
         // the current routes_version.
-        let (_, _, _, token1) =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            sticky_token: token1,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
         assert_eq!(token1.generation, 0, "fresh map captures 0");
         assert_eq!(
             token1.routes_version,
@@ -418,10 +530,14 @@ mod tests {
         // its writeback still succeeds, while pre-clear decisions (old
         // epoch) fail.
         runtime.active_targets.write().await.clear("gpt-4o");
-        let (_, _, _, token2) =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            sticky_token: token2,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             token2.epoch, 1,
             "post-clear decision captures the bumped epoch"
@@ -432,10 +548,14 @@ mod tests {
         );
 
         runtime.active_targets.write().await.clear("gpt-4o");
-        let (_, _, _, token3) =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            sticky_token: token3,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
         assert_eq!(token3.epoch, 2, "every no-entry clear bumps again");
     }
 
@@ -448,11 +568,16 @@ mod tests {
         let req = test_request("gpt-4o");
         let trace_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
 
-        let (_, _, _, before) =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            sticky_token: before,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
         let version_before = before.routes_version;
 
         // Simulate a config mutation (route CRUD / hot-reload).
@@ -478,10 +603,14 @@ mod tests {
         }
         assert!(state.config.routes_version() > version_before);
 
-        let (_, _, _, after) =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None)
-                .await
-                .unwrap();
+        let ResolvedRoute {
+            sticky_token: after,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             after.routes_version,
             state.config.routes_version(),
@@ -505,6 +634,75 @@ mod tests {
                 state.config.routes_version(),
             ),
             "pre-mutation token must be rejected after the config mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_carries_route_name_and_started_at() {
+        // Exact-match route: the resolved carrier must expose the matched
+        // route's `model_name` and pass through the caller-supplied
+        // wall-clock `started_at` unchanged (captured in `routes.rs` next
+        // to the `Instant` used for legacy duration timing).
+        let (state, runtime) = build_sticky_state().await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
+
+        let ResolvedRoute {
+            route_name,
+            started_at: carried_started_at,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            route_name, "gpt-4o",
+            "exact match must carry the route model_name"
+        );
+        assert_eq!(
+            carried_started_at, started_at,
+            "started_at must pass through unchanged"
+        );
+
+        // Wildcard route: a model with no exact route falls back to `*`;
+        // the carrier must record the wildcard `model_name`.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.routes.push(sag_config::RouteConfig {
+                model_name: "*".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                timeout_secs: None,
+                strategy: sag_config::Strategy::FillFirst,
+                targets: vec![sag_config::RouteTarget {
+                    provider: "openai".into(),
+                    real_model: None,
+                    priority: 1,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                }],
+            });
+            state.config.bump_routes_version();
+        }
+
+        let req = test_request("some-unknown-model");
+        let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
+        let ResolvedRoute {
+            route_name: wildcard_name,
+            ..
+        } = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wildcard_name, "*",
+            "wildcard match must carry the `*` route name"
         );
     }
 
@@ -597,9 +795,12 @@ mod tests {
         let req = test_request("gpt-4o");
         let trace_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
 
-        let result =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
         assert!(result.is_err(), "expected ModelNotFound error");
 
         state.collector.flush().await;
@@ -627,9 +828,12 @@ mod tests {
         let req = test_request("gpt-4o");
         let trace_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
 
-        let result =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
         assert!(result.is_err(), "expected AllProvidersExhausted error");
 
         state.collector.flush().await;
@@ -668,9 +872,12 @@ mod tests {
         let req = test_request_with_reasoning("gpt-4o", "low");
         let trace_id = uuid::Uuid::new_v4();
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
 
-        let result =
-            resolve_route(&state, &runtime, &req, trace_id, start, false, None, None).await;
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
         assert!(result.is_err(), "expected ModelNotFound error");
 
         state.collector.flush().await;
@@ -689,5 +896,201 @@ mod tests {
             Some("low"),
             "reasoning_effort must round-trip through resolve failure path"
         );
+    }
+
+    // ── formal analytics event tests ────────────────────────────
+
+    /// Build an [`AppState`] whose formal event collector writes into a
+    /// shared in-memory pool the test keeps a handle on — same wiring as
+    /// `sag_state::testing::test_app_state`, minus the hidden pool.
+    async fn build_state_with_event_pool(
+        config: sag_config::GatewayConfig,
+    ) -> (AppState, DispatchRuntime, sqlx::SqlitePool) {
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let state = AppState {
+            config: handle.clone(),
+            providers: provider_registry.clone(),
+            coordinator: Arc::new(sag_state::ConfigMutationCoordinator::new(
+                handle,
+                provider_registry,
+            )),
+            collector: Arc::new(sag_analytics::CallLogCollector::new_memory().await.unwrap()),
+            event_collector: Arc::new(sag_analytics::EventCollector::new(
+                sag_analytics::EventWriter::new(pool.clone()),
+            )),
+            analytics_query: Some(Arc::new(sag_analytics::AnalyticsQueryEngine::new(
+                pool.clone(),
+            ))),
+            circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
+            active_targets: Arc::default(),
+            fill_first_orders: Arc::default(),
+        };
+        let runtime = DispatchRuntime::default();
+        (state, runtime, pool)
+    }
+
+    #[tokio::test]
+    async fn resolve_route_no_route_persists_no_route_analytics_event() {
+        let (state, runtime, pool) = build_state_with_event_pool(sag_config::GatewayConfig {
+            providers: HashMap::new(),
+            routes: vec![],
+            ..sag_config::gateway_config_base!()
+        })
+        .await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
+
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
+        assert!(result.is_err(), "expected ModelNotFound error");
+
+        // Drain the event queue so the writer commits before we read.
+        state.event_collector.shutdown().await;
+
+        let (
+            final_status,
+            failure_reason,
+            route_id,
+            requested_model,
+            stream,
+            started_ms,
+            completed_ms,
+        ): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            i32,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, route_id, requested_model, stream, \
+             started_at, completed_at FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("no_route fact must be persisted");
+
+        assert_eq!(final_status, "no_route");
+        assert_eq!(failure_reason.as_deref(), Some("model_not_found"));
+        assert!(route_id.is_none(), "no_route must keep route_id NULL");
+        assert_eq!(requested_model, "gpt-4o");
+        assert_eq!(stream, 0, "non-stream request must record stream=0");
+        assert_eq!(
+            started_ms,
+            started_at.timestamp_millis(),
+            "started_at must come from the caller-supplied capture"
+        );
+        assert!(
+            completed_ms >= started_ms,
+            "completed_at (completion time, UTC) must not precede started_at"
+        );
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0, "no_route must not produce target attempts");
+    }
+
+    #[tokio::test]
+    async fn resolve_route_all_disabled_persists_all_disabled_analytics_event() {
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        providers.insert("off".into(), provider_config(false));
+
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![sag_config::RouteTarget {
+                provider: "off".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            }],
+        }];
+
+        let (state, runtime, pool) = build_state_with_event_pool(sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        })
+        .await;
+        let req = test_request("gpt-4o");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
+
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
+        assert!(result.is_err(), "expected AllProvidersExhausted error");
+
+        // Drain the event queue so the writer commits before we read.
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, route_id, requested_model, started_ms, completed_ms): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, route_id, requested_model, started_at, \
+             completed_at FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("all_disabled fact must be persisted");
+
+        assert_eq!(final_status, "all_disabled");
+        assert_eq!(failure_reason.as_deref(), Some("all_disabled"));
+        let route_id = route_id.expect("all_disabled must resolve a route_id");
+        assert_eq!(requested_model, "gpt-4o");
+        assert_eq!(
+            started_ms,
+            started_at.timestamp_millis(),
+            "started_at must come from the caller-supplied capture"
+        );
+        assert!(
+            completed_ms >= started_ms,
+            "completed_at (completion time, UTC) must not precede started_at"
+        );
+
+        // The resolved identity must be the route the request actually
+        // matched — the real route name, never the __all_disabled__ sentinel.
+        let resolved_name: String =
+            sqlx::query_scalar("SELECT route_name FROM analytics_routes WHERE route_id = ?")
+                .bind(&route_id)
+                .fetch_one(&pool)
+                .await
+                .expect("resolved route identity must exist");
+        assert_eq!(resolved_name, "gpt-4o");
+
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0, "all_disabled must not produce target attempts");
     }
 }
