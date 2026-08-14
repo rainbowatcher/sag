@@ -109,17 +109,20 @@ const labels = computed(() =>
 
 const population = computed(() => populationLabel(props.scope))
 
-/** Value of a per-series point for the selected metric; `null` breaks the
- *  line (no fabricated 0). Overall-only metrics return `null` (unreachable
- *  for series lines — guarded by `overallOnly`). */
-function pointValue(p: AnalyticsTrendPoint, key: MetricKey): number | null {
+/** Value of a per-series point for the selected metric. When the metric
+ *  cannot be computed (e.g. success_rate with zero requests) or there is
+ *  no data, it returns `0` as a visual placeholder so the line stays
+ *  continuous — a 0 is NOT a real measurement, just a gap filler.
+ *  Overall-only metrics return `0` (unreachable for series lines —
+ *  guarded by `overallOnly`). */
+function pointValue(p: AnalyticsTrendPoint, key: MetricKey): number {
   switch (key) {
     case "requests":
       return p.requests
     case "success":
       return p.success
     case "success_rate":
-      return p.requests > 0 ? (p.success / p.requests) * 100 : null
+      return p.requests > 0 ? (p.success / p.requests) * 100 : 0
     case "prompt_tokens":
       return p.prompt_tokens
     case "completion_tokens":
@@ -127,20 +130,21 @@ function pointValue(p: AnalyticsTrendPoint, key: MetricKey): number | null {
     case "total_tokens":
       return p.total_tokens
     default:
-      return null
+      return 0
   }
 }
 
 /** Value of the overall bucket for the selected metric. Nullable rates /
- *  latencies map to `null` (line gap) instead of a fabricated 0. */
-function overallValue(m: MetricSummary, key: MetricKey, scope: AnalyticsScope): number | null {
+ *  latencies map to `0` (visual placeholder, not a fabricated real
+ *  measurement) so the line never breaks. */
+function overallValue(m: MetricSummary, key: MetricKey, scope: AnalyticsScope): number {
   switch (key) {
     case "requests":
       return scope === "target" ? m.attempts : m.requests
     case "success":
       return m.success
     case "success_rate":
-      return m.success_rate === null ? null : m.success_rate * 100
+      return m.success_rate === null ? 0 : m.success_rate * 100
     case "prompt_tokens":
       return m.prompt_tokens
     case "completion_tokens":
@@ -148,11 +152,11 @@ function overallValue(m: MetricSummary, key: MetricKey, scope: AnalyticsScope): 
     case "total_tokens":
       return m.total_tokens
     case "cache_hit_rate":
-      return m.request_cache_hit_rate === null ? null : m.request_cache_hit_rate * 100
+      return m.request_cache_hit_rate === null ? 0 : m.request_cache_hit_rate * 100
     case "e2e_avg":
-      return m.e2e.avg_ms
+      return m.e2e.avg_ms ?? 0
     case "e2e_p95":
-      return m.e2e.p95_ms
+      return m.e2e.p95_ms ?? 0
   }
 }
 
@@ -168,7 +172,6 @@ const chartData = computed(() => {
       tension: 0.3,
       pointRadius: 0,
       borderWidth: 2,
-      spanGaps: false,
     },
   ]
   // Overall-only metrics have no per-series data — draw just the overall line.
@@ -182,7 +185,6 @@ const chartData = computed(() => {
         tension: 0.3,
         pointRadius: 0,
         borderWidth: 1.5,
-        spanGaps: false,
       })
     })
     if (props.trend.others) {
@@ -195,7 +197,6 @@ const chartData = computed(() => {
         tension: 0.3,
         pointRadius: 0,
         borderWidth: 1.5,
-        spanGaps: false,
       })
     }
   }

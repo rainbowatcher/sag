@@ -6,6 +6,7 @@ import {
   Clock,
   Database,
   Gauge,
+  Info,
   Loader2,
   Search,
   Timer,
@@ -34,6 +35,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { formatCompactNumber, successRateColor } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useProviderStore } from "@/stores/providers"
@@ -44,6 +46,7 @@ import type {
   AnalyticsScope,
   AnalyticsV2Query,
   LatencyMetric,
+  MetricSummary,
 } from "@/types/api"
 import DateRangePicker from "./DateRangePicker.vue"
 import type { DateRangeMs } from "./DateRangePicker.vue"
@@ -219,6 +222,8 @@ interface GroupCell {
 interface GroupRow {
   key: string
   cells: GroupCell[]
+  /** True for the synthetic `others` aggregation row (muted/italic). */
+  others?: boolean
 }
 
 const groupColumns = computed<GroupColumn[]>(() => {
@@ -237,7 +242,7 @@ const groupColumns = computed<GroupColumn[]>(() => {
       { key: "tokens_in", label: "Tokens In", align: right },
       { key: "tokens_out", label: "Tokens Out", align: right },
       { key: "cache_hit", label: "Cache Hit", align: right },
-      { key: "cache_unknown", label: "Unknown", align: right },
+      { key: "cache_unknown", label: "Cache Unknown", align: right },
     ]
   }
   return [
@@ -251,7 +256,7 @@ const groupColumns = computed<GroupColumn[]>(() => {
     { key: "tokens_in", label: "Tokens In", align: right },
     { key: "tokens_out", label: "Tokens Out", align: right },
     { key: "cache_hit", label: "Cache Hit", align: right },
-    { key: "cache_unknown", label: "Unknown", align: right },
+    { key: "cache_unknown", label: "Cache Unknown", align: right },
   ]
 })
 
@@ -259,62 +264,142 @@ function isRouteKey(key: AnalyticsGroupKey): key is { route_name: string } {
   return "route_name" in key
 }
 
-const groupRows = computed<GroupRow[]>(() =>
-  groups.value.map((g: AnalyticsGroupSummary) => {
-    const m = g.metrics
-    const cells: GroupCell[] = []
-    for (const col of groupColumns.value) {
-      switch (col.key) {
-        case "route_name":
-          cells.push({ value: groupKeyLabel(g.key) })
-          break
-        case "provider":
-          cells.push({ value: isRouteKey(g.key) ? "—" : g.key.provider })
-          break
-        case "real_model":
-          cells.push({ value: isRouteKey(g.key) ? "—" : g.key.real_model })
-          break
-        case "requests":
-          cells.push({ value: m.requests.toLocaleString() })
-          break
-        case "attempts":
-          cells.push({ value: m.attempts.toLocaleString() })
-          break
-        case "success":
-          cells.push({ value: m.success.toLocaleString() })
-          break
-        case "failure":
-          cells.push({ value: m.failure.toLocaleString() })
-          break
-        case "success_rate":
-          cells.push({ value: formatRate(m.success_rate), rate: m.success_rate })
-          break
-        case "model_failure_rate":
-          cells.push({ value: formatRate(m.model_failure_rate) })
-          break
-        case "avg_e2e":
-          cells.push({ value: formatLatency(m.e2e.avg_ms) })
-          break
-        case "p95_e2e":
-          cells.push({ value: formatLatency(m.e2e.p95_ms) })
-          break
-        case "tokens_in":
-          cells.push({ value: formatCompactNumber(m.prompt_tokens) })
-          break
-        case "tokens_out":
-          cells.push({ value: formatCompactNumber(m.completion_tokens) })
-          break
-        case "cache_hit":
-          cells.push({ value: formatRate(m.request_cache_hit_rate) })
-          break
-        case "cache_unknown":
-          cells.push({ value: m.cache_unknown.toLocaleString() })
-          break
-      }
+/** 组表最多展示的具名行数；超出部分聚合成一个 `others` 行（spec Top20 约定）。 */
+const GROUPS_TOP_N = 20
+
+function buildGroupRow(g: AnalyticsGroupSummary): GroupRow {
+  const m = g.metrics
+  const cells: GroupCell[] = []
+  for (const col of groupColumns.value) {
+    switch (col.key) {
+      case "route_name":
+        cells.push({ value: groupKeyLabel(g.key) })
+        break
+      case "provider":
+        cells.push({ value: isRouteKey(g.key) ? "—" : g.key.provider })
+        break
+      case "real_model":
+        cells.push({ value: isRouteKey(g.key) ? "—" : g.key.real_model })
+        break
+      case "requests":
+        cells.push({ value: m.requests.toLocaleString() })
+        break
+      case "attempts":
+        cells.push({ value: m.attempts.toLocaleString() })
+        break
+      case "success":
+        cells.push({ value: m.success.toLocaleString() })
+        break
+      case "failure":
+        cells.push({ value: m.failure.toLocaleString() })
+        break
+      case "success_rate":
+        cells.push({ value: formatRate(m.success_rate), rate: m.success_rate })
+        break
+      case "model_failure_rate":
+        cells.push({ value: formatRate(m.model_failure_rate) })
+        break
+      case "avg_e2e":
+        cells.push({ value: formatLatency(m.e2e.avg_ms) })
+        break
+      case "p95_e2e":
+        cells.push({ value: formatLatency(m.e2e.p95_ms) })
+        break
+      case "tokens_in":
+        cells.push({ value: formatCompactNumber(m.prompt_tokens) })
+        break
+      case "tokens_out":
+        cells.push({ value: formatCompactNumber(m.completion_tokens) })
+        break
+      case "cache_hit":
+        cells.push({ value: formatRate(m.request_cache_hit_rate) })
+        break
+      case "cache_unknown":
+        cells.push({ value: m.cache_unknown.toLocaleString() })
+        break
     }
-    return { key: groupKeyLabel(g.key), cells }
-  }),
-)
+  }
+  return { key: groupKeyLabel(g.key), cells }
+}
+
+/** 把超出 Top-N 的组聚合成一个 `others` 行：可加性字段求和，率按原口径重算，
+ *  分位数延迟不聚合（置 —）。仅在前端聚合，不改后端/store/types。 */
+function buildOthersRow(overflow: AnalyticsGroupSummary[]): GroupRow {
+  const sum = (pick: (m: MetricSummary) => number) =>
+    overflow.reduce((acc, g) => acc + pick(g.metrics), 0)
+  const requests = sum((m) => m.requests)
+  const attempts = sum((m) => m.attempts)
+  const success = sum((m) => m.success)
+  const failure = sum((m) => m.failure)
+  const model_failure = sum((m) => m.model_failure)
+  const prompt_tokens = sum((m) => m.prompt_tokens)
+  const completion_tokens = sum((m) => m.completion_tokens)
+  const cache_known = sum((m) => m.cache_known)
+  const cache_hit = sum((m) => m.cache_hit)
+  const cache_unknown = sum((m) => m.cache_unknown)
+  const isTarget = scope.value === "target"
+  const cells: GroupCell[] = []
+  for (const col of groupColumns.value) {
+    switch (col.key) {
+      case "route_name":
+      case "provider":
+      case "real_model":
+        cells.push({ value: "others" })
+        break
+      case "requests":
+        cells.push({ value: requests.toLocaleString() })
+        break
+      case "attempts":
+        cells.push({ value: attempts.toLocaleString() })
+        break
+      case "success":
+        cells.push({ value: success.toLocaleString() })
+        break
+      case "failure":
+        cells.push({ value: failure.toLocaleString() })
+        break
+      case "success_rate": {
+        const denom = isTarget ? attempts : requests
+        const rate = denom > 0 ? success / denom : null
+        cells.push({ value: rate === null ? "—" : formatRate(rate), rate })
+        break
+      }
+      case "model_failure_rate": {
+        const denom = success + model_failure
+        const rate = denom > 0 ? model_failure / denom : null
+        cells.push({ value: rate === null ? "—" : formatRate(rate) })
+        break
+      }
+      case "avg_e2e":
+      case "p95_e2e":
+        cells.push({ value: "—" })
+        break
+      case "tokens_in":
+        cells.push({ value: formatCompactNumber(prompt_tokens) })
+        break
+      case "tokens_out":
+        cells.push({ value: formatCompactNumber(completion_tokens) })
+        break
+      case "cache_hit": {
+        const rate = cache_known > 0 ? cache_hit / cache_known : null
+        cells.push({ value: rate === null ? "—" : formatRate(rate) })
+        break
+      }
+      case "cache_unknown":
+        cells.push({ value: cache_unknown.toLocaleString() })
+        break
+    }
+  }
+  return { key: "others", cells, others: true }
+}
+
+const groupRows = computed<GroupRow[]>(() => {
+  const rows = groups.value.slice(0, GROUPS_TOP_N).map(buildGroupRow)
+  if (groups.value.length > GROUPS_TOP_N) {
+    rows.push(buildOthersRow(groups.value.slice(GROUPS_TOP_N)))
+  }
+  return rows
+})
 </script>
 
 <template>
@@ -595,7 +680,7 @@ const groupRows = computed<GroupRow[]>(() =>
           </div>
 
           <!-- ── Groups table ────────────────────────────────────── -->
-          <div class="overflow-x-auto rounded-lg border">
+          <div class="max-h-[32rem] overflow-auto rounded-lg border">
             <Table class="min-w-max">
               <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
                 <TableRow>
@@ -604,12 +689,30 @@ const groupRows = computed<GroupRow[]>(() =>
                     :key="col.key"
                     :class="col.align === 'right' ? 'text-right' : 'text-left'"
                   >
-                    {{ col.label }}
+                    <template v-if="col.key === 'cache_unknown'">
+                      <span class="inline-flex items-center gap-1">
+                        {{ col.label }}
+                        <Tooltip>
+                          <TooltipTrigger as-child>
+                            <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                          </TooltipTrigger>
+                          <TooltipContent side="top" class="max-w-xs">
+                            成功样本中未上报 cached_tokens 的数量（unknown ≠
+                            miss，不计入命中率分母）
+                          </TooltipContent>
+                        </Tooltip>
+                      </span>
+                    </template>
+                    <template v-else>{{ col.label }}</template>
                   </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                <TableRow v-for="row in groupRows" :key="row.key">
+                <TableRow
+                  v-for="row in groupRows"
+                  :key="row.key"
+                  :class="row.others ? 'text-muted-foreground italic' : ''"
+                >
                   <TableCell
                     v-for="(cell, i) in row.cells"
                     :key="i"
