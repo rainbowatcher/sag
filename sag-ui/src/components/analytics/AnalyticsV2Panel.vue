@@ -233,7 +233,7 @@ const groupColumns = computed<GroupColumn[]>(() => {
     return [
       { key: "provider", label: "Provider", align: left },
       { key: "real_model", label: "Actual Model", align: left },
-      { key: "attempts", label: "requests", align: right },
+      { key: "attempts", label: "attempts", align: right },
       { key: "success", label: "Success", align: right },
       { key: "failure", label: "Failure", align: right },
       { key: "success_rate", label: "Success Rate", align: right },
