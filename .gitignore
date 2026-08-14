@@ -58,3 +58,4 @@ gateway.toml
 .zcode/
 PLAN.md
 .pi-subagents/
+.pi/
