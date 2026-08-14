@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-07-22
+updated: 2026-08-11
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-08-11
+
+- **分析**：[0002 双层事实与 Rollup](analytics/changes/0002-two-level-facts.md) — 缓存命中率 Rollup 可合并计数（known/hit/prompt_known）、actual_model 语义、failure_reason 映射表、target 三值枚举（+cancelled）、flowchart 补 emit 边、FK RESTRICT 等设计修订
 
 ## 2026-08-04
 
