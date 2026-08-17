@@ -226,7 +226,7 @@ onUnmounted(() => {
         :aria-disabled="disabled"
         :class="
           cn(
-            'border-input bg-background flex min-h-[2.25rem] w-full cursor-text flex-nowrap items-center gap-1 rounded-md border px-3 py-1 outline-offset-0 outline-none focus-within:outline-[3px]',
+            'border-input ring-offset-background bg-background focus-within:ring-ring flex min-h-[2.25rem] w-full cursor-text flex-nowrap items-center gap-1 rounded-md border px-3 py-1 shadow-sm focus-within:ring-2 focus-within:outline-none',
             props.class,
           )
         "
@@ -303,7 +303,7 @@ onUnmounted(() => {
       </div>
     </PopoverTrigger>
     <PopoverContent
-      class="border-input w-full min-w-[var(--reka-popper-anchor-width)] p-0"
+      class="border-input w-(--reka-popper-anchor-width) min-w-[var(--reka-popper-anchor-width)] p-0"
       align="start"
     >
       <Command>

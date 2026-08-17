@@ -406,7 +406,7 @@ const groupRows = computed<GroupRow[]>(() => {
   <div class="flex h-full flex-col">
     <!-- ── Toolbar ─────────────────────────────────────────────── -->
     <div class="shrink-0">
-      <div class="flex flex-nowrap items-center gap-2 overflow-x-auto">
+      <div class="-mx-1 flex flex-nowrap items-center gap-2 overflow-x-auto px-1 py-1">
         <div class="bg-muted inline-flex shrink-0 rounded-md p-0.5 whitespace-nowrap">
           <button
             v-for="s in SCOPE_OPTIONS"
