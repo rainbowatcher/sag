@@ -28,6 +28,10 @@ updated: 2026-08-11
   - provider 或 real_model 变化，形成**新**的 target 身份；
   - target 被移除后重新出现相同的 `(route_name, provider, real_model)`，必须复用原身份。
 - 旧历史不做猜测性身份回填：旧记录的身份字段保持为空。
+- `request_id` 与 `route_id` / `target_id` 使用不同 UUID 版本分工（详见 spec.md「request_id 用 v4、身份 ID 用 v7 的分层」）：
+  - `request_id`（UUID v4）：每请求一个的临时追踪 token，纯随机不泄露时间，作为 `request_results` 主键与幂等去重依据；不进 API 响应。
+  - `route_id` / `target_id`（UUID v7）：持久身份，时间有序、DB 插入友好、可调试可读；不进 API 响应。
+  - 两者共存是「临时追踪 vs 持久身份」的语义分层，不统一为单一版本。
 
 ### 数据事实
 
@@ -169,5 +173,6 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 变更记录
 
+- [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)
 - [0002 双层事实与 Rollup](changes/0002-two-level-facts.md)
 - [0001 初始化](changes/0001-initial.md)

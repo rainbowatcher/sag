@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-08-11
+updated: 2026-08-17
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-08-17
+
+- **分析**：[0003 UUID v4/v7 版本分层决策](analytics/changes/0003-uuid-version-layering.md) — 记录 request_id(v4) 与身份 ID(v7) 的版本分工理据，明确共存是有意分层非技术债
 
 ## 2026-08-11
 

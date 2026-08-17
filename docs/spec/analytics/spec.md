@@ -523,6 +523,24 @@ stateDiagram-v2
 - ✅ `route_id` / `target_id` 由 DB 注册层生成（UUID v7），TOML 与 API 零感知：配置 diff 无噪声、旧配置无需迁移、身份不会被用户误改。
 - ❌ 放弃「把 id 写进 TOML / 用 `model_name` 直接当主键」：TOML 手写 id 破坏可编辑语义且与既有配置不兼容；`model_name` 是匹配键，一旦未来允许改名会断裂全部历史事实关联。
 
+### request_id 用 v4、身份 ID 用 v7 的分层
+
+**背景**：仓库同时使用 UUID v4（`request_id` / `trace_id`）与 v7（`route_id` / `target_id`），需要明确这是有意分工还是历史遗留。
+
+**两层 ID 的业务角色**：
+- `request_id`（v4）：每请求一个的临时追踪 token，由 `sag-router/src/middleware/trace.rs` 生成，经 dispatch 链传到 analytics event，作为 `request_results` 主键 + `ON CONFLICT(request_id) DO NOTHING` 幂等去重依据。不进 API 响应。
+- `route_id` / `target_id`（v7）：`IdentityRegistry` 给每条 route / 每个 `(provider, real_model)` target 分配的持久身份，存 `analytics_routes` / `analytics_route_targets` 主键，被事实表外键引用。不进 API 响应。
+
+**Trade-off**（v4 + v7 共存 vs 统一为单一版本）：
+- ✅ **v4 给 request_id**：纯随机 122 位，高并发无冲突；不含时间戳，不泄露请求发生时间（防御性属性，即便当前不外泄 trace_id 也保留）；幂等去重走哈希/点查而非范围扫，随机主键的 B-tree 页分裂缺点不成立。
+- ✅ **v7 给身份 ID**：前 48 位毫秒时间戳，B-tree 插入单调递增、页分裂少、写放大低；运维查库可从 id 解出创建时间辅助排查；与 `registry.rs`「System-generated UUID v7 identities live only in the database」一致。
+- ❌ 放弃「全用 v4」：身份 ID 失去时间有序，DB 插入代价上升、调试可读性降。
+- ❌ 放弃「全用 v7」：request_id 失去不泄露时间属性，幂等去重无业务变化但安全属性降。
+
+**共存代价评估**（产物大小）：uuid crate 是单 crate 多 feature 架构，v4 与 v7 共存只多编译两组 `new_v4` / `now_v7` 方法体（几十行纯算术），LTO 后 inline 进调用方。实测 release binary 20 MB，v4/v7 共存的代码体积增量 < 10 KB（千分之零点几），不可测量。v4 拉入的 `getrandom` 是 Rust 生态近乎必然存在的依赖，即便去掉 v4 大概率仍被其它 crate 拉进。**为省产物大小而砍任一方无意义。**
+
+**结论**：v4 + v7 共存是「临时追踪 token vs 持久身份」的语义分层，不是待清理技术债。保持现状，不为了版本统一而合并。
+
 ### 不直接从 call_logs 推导两级事实
 
 **背景**：旧 `call_logs` 一请求多行、可丢弃、无最终状态与 target 尝试语义。
