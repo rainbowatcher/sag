@@ -224,7 +224,7 @@ onUnmounted(() => {
         role="combobox"
         :aria-expanded="open"
         :disabled="disabled || loading"
-        class="bg-background hover:bg-background border-input min-h-[2.25rem] w-full justify-between overflow-hidden px-3 font-normal outline-offset-0 outline-none focus-visible:outline-[3px]"
+        class="bg-background hover:bg-background border-input min-h-[2.25rem] w-full justify-between overflow-hidden px-3 font-normal"
       >
         <!-- Multi-select badge display -->
         <div
