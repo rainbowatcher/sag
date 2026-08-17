@@ -209,6 +209,21 @@ const yTitle = computed(() =>
   metric.value === "requests" ? population.value : metricOption.value.label,
 )
 
+/** Format a chart tick / tooltip value per the metric family: rates to
+ *  1 decimal (+%), latency in rounded ms, counts localized - never raw
+ *  floats like 438.4794662427439. */
+function formatTick(
+  value: string | number | null | undefined,
+  rate: boolean | undefined,
+  key?: MetricKey,
+): string {
+  if (value == null || Number.isNaN(Number(value))) return "-"
+  const v = Number(value)
+  if (rate) return `${v.toFixed(1)}%`
+  if (key === "e2e_avg" || key === "e2e_p95") return `${Math.round(v)} ms`
+  return v.toLocaleString()
+}
+
 const chartOptions = computed(() => ({
   responsive: true,
   maintainAspectRatio: false,
@@ -218,6 +233,10 @@ const chartOptions = computed(() => ({
       beginAtZero: true,
       max: metricOption.value.rate ? 100 : undefined,
       title: { display: true, text: yTitle.value },
+      ticks: {
+        // Keep tick labels free of float artifacts (e.g. 33.333333333).
+        callback: (value: string | number) => formatTick(value, metricOption.value.rate),
+      },
     },
     x: {
       ticks: { maxTicksLimit: 8 },
@@ -227,6 +246,14 @@ const chartOptions = computed(() => ({
     legend: {
       position: "bottom" as const,
       labels: { boxWidth: 8, boxHeight: 8, font: { size: 10 } },
+    },
+    tooltip: {
+      callbacks: {
+        // Format series values per metric (rates to 1 decimal + %, latency
+        // in rounded ms, counts localized) instead of raw floats.
+        label: (item: any) =>
+          ` ${item.dataset.label}: ${formatTick(item.parsed.y, metricOption.value.rate, metric.value)}`,
+      },
     },
   },
 }))
