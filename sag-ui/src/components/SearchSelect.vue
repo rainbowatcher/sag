@@ -226,7 +226,7 @@ onUnmounted(() => {
         :aria-disabled="disabled"
         :class="
           cn(
-            'border-input ring-offset-background bg-background focus-within:ring-ring flex min-h-[2.25rem] w-full cursor-text flex-nowrap items-center gap-1 rounded-md border px-3 py-1 shadow-sm focus-within:ring-2 focus-within:outline-none',
+            'border-input ring-offset-background bg-background focus-within:border-ring focus-within:ring-ring/50 flex min-h-[2.25rem] w-full cursor-text flex-nowrap items-center gap-1 rounded-md border px-3 py-1 shadow-sm focus-within:ring-3 focus-within:outline-none',
             props.class,
           )
         "
