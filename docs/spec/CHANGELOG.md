@@ -9,6 +9,7 @@ updated: 2026-08-17
 
 ## 2026-08-17
 
+- **调度**：[0005 聊天分发单文件复杂度解耦与模块化](dispatch/changes/0005-chat-dispatch-modularization.md) — 将 3900+ 行 `chat.rs` 解耦拆分为 `chat/` 模块目录（`mod.rs` 主调度、`attempt.rs` 事实构造、`empty.rs` 空响应校验、`tests.rs` 集成测试）
 - **分析**：[0003 UUID v4/v7 版本分层决策](analytics/changes/0003-uuid-version-layering.md) — 记录 request_id(v4) 与身份 ID(v7) 的版本分工理据，明确共存是有意分层非技术债
 
 ## 2026-08-11
