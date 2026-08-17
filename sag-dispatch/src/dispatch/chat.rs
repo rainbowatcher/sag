@@ -419,6 +419,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             RetryOutcome::Success(_) => "", // never logged — Success never reaches the else block
         };
 
+        // Extract the real HTTP status from the outcome error so the
+        // per-target `call_logs` row carries the actual upstream status
+        // (429/500/503/…) instead of a hardcoded 502.
+        let attempt_status = match &outcome {
+            RetryOutcome::Exhausted(e) | RetryOutcome::NonRetryable(e) => e.status_code().as_u16(),
+            RetryOutcome::Success(_) => 200, // never logged — Success never reaches the else block
+        };
+
         // Collapse this target's whole retry sequence into exactly one
         // `TargetAttemptFact` (final outcome only — no retry counts). For
         // streaming requests only pre-commit failures land here: a stream
@@ -479,6 +487,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 start,
                 errors,
                 category,
+                attempt_status,
                 request.reasoning_effort.as_deref(),
                 user_agent.as_deref(),
                 client_ip.as_deref(),

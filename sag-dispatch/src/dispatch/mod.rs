@@ -700,6 +700,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
     start: Instant,
     errors: &[String],
     error_category: &str,
+    status_code: u16,
     reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
@@ -715,7 +716,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
         real_model,
         is_stream,
         start,
-        502,
+        status_code,
         &AppError::Internal(last_err),
         reasoning_effort,
         user_agent,
@@ -1117,6 +1118,7 @@ mod tests {
             start,
             &["upstream 500".into()],
             "provider_error",
+            502,
             Some("medium"),
             None,
             None,
@@ -1137,6 +1139,48 @@ mod tests {
             logs[0].reasoning_effort.as_deref(),
             Some("medium"),
             "reasoning_effort must round-trip through log_per_target_failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_per_target_failure_preserves_status_code() {
+        let state = build_test_state().await;
+
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+
+        log_per_target_failure(
+            &state,
+            trace_id,
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            false,
+            start,
+            &["upstream 429".into()],
+            "provider_error",
+            429,
+            None,
+            None,
+            None,
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        // Regression guard: if log_per_target_failure is changed to hardcode
+        // 502 again, this assertion fails (429 != 502).
+        assert_eq!(
+            logs[0].status_code, 429,
+            "status_code must round-trip through log_per_target_failure (not hardcoded 502)"
         );
     }
 

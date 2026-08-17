@@ -162,6 +162,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             RetryOutcome::Success(_) => "", // never logged
         };
 
+        // Extract the real HTTP status from the outcome error so the
+        // per-target `call_logs` row carries the actual upstream status
+        // (429/500/503/…) instead of a hardcoded 502.
+        let attempt_status = match &outcome {
+            RetryOutcome::Exhausted(e) | RetryOutcome::NonRetryable(e) => e.status_code().as_u16(),
+            RetryOutcome::Success(_) => 200, // never logged
+        };
+
         // Collapse this target's whole retry sequence into exactly one
         // `TargetAttemptFact` (final outcome only — no retry counts). The
         // client-caused 4xx path is excluded: per the writer's validation
@@ -217,6 +225,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 start,
                 errors,
                 category,
+                attempt_status,
                 None, // reasoning_effort — not applicable for image generation
                 user_agent.as_deref(),
                 client_ip.as_deref(),

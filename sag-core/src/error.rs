@@ -202,49 +202,53 @@ impl AppError {
     pub fn final_status(&self) -> Option<FinalStatus> {
         self.failure_reason().map(FailureReason::final_status)
     }
+
+    /// Map this error to its HTTP status code (same mapping used by
+    /// `into_response`).
+    ///
+    /// Extracted as a public method so dispatch-layer helpers (e.g.
+    /// `log_per_target_failure`) can record the real upstream status in
+    /// `call_logs` instead of a hardcoded 502.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            AppError::Upstream { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::AllProvidersExhausted { .. } => StatusCode::BAD_GATEWAY,
+            AppError::Network(_) => StatusCode::BAD_GATEWAY,
+            AppError::TtfbTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            AppError::EmptyResponse { .. } => StatusCode::BAD_GATEWAY,
+            AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, code, message) = match &self {
-            AppError::Config(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "CONFIG_ERROR",
-                msg.clone(),
-            ),
-            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.clone()),
-            AppError::Upstream { status, body, .. } => {
-                let s = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-                (s, "UPSTREAM_ERROR", body.clone())
+        let status = self.status_code();
+        let (code, message) = match &self {
+            AppError::Config(msg) => ("CONFIG_ERROR", msg.clone()),
+            AppError::Unauthorized(msg) => ("UNAUTHORIZED", msg.clone()),
+            AppError::Upstream { body, .. } => ("UPSTREAM_ERROR", body.clone()),
+            AppError::BadRequest(msg) => ("BAD_REQUEST", msg.clone()),
+            AppError::ModelNotFound(msg) => ("MODEL_NOT_FOUND", msg.clone()),
+            AppError::NotFound(msg) => ("NOT_FOUND", msg.clone()),
+            AppError::Conflict(msg) => ("CONFLICT", msg.clone()),
+            AppError::AllProvidersExhausted { reason, .. } => {
+                ("ALL_PROVIDERS_EXHAUSTED", reason.clone())
             }
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg.clone()),
-            AppError::ModelNotFound(msg) => (StatusCode::NOT_FOUND, "MODEL_NOT_FOUND", msg.clone()),
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg.clone()),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg.clone()),
-            AppError::AllProvidersExhausted { reason, .. } => (
-                StatusCode::BAD_GATEWAY,
-                "ALL_PROVIDERS_EXHAUSTED",
-                reason.clone(),
-            ),
-            AppError::Network(e) => (StatusCode::BAD_GATEWAY, "NETWORK_ERROR", e.to_string()),
-            AppError::TtfbTimeout { .. } => (
-                StatusCode::GATEWAY_TIMEOUT,
-                "TTFB_TIMEOUT",
-                self.to_string(),
-            ),
-            AppError::EmptyResponse { .. } => {
-                (StatusCode::BAD_GATEWAY, "EMPTY_RESPONSE", self.to_string())
-            }
-            AppError::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                msg.clone(),
-            ),
-            AppError::Anyhow(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                e.to_string(),
-            ),
+            AppError::Network(e) => ("NETWORK_ERROR", e.to_string()),
+            AppError::TtfbTimeout { .. } => ("TTFB_TIMEOUT", self.to_string()),
+            AppError::EmptyResponse { .. } => ("EMPTY_RESPONSE", self.to_string()),
+            AppError::Internal(msg) => ("INTERNAL_ERROR", msg.clone()),
+            AppError::Anyhow(e) => ("INTERNAL_ERROR", e.to_string()),
         };
 
         let body = json!({
