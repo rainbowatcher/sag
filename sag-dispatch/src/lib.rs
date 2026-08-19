@@ -3,7 +3,6 @@
 //! This crate owns the core dispatch logic that was previously part of
 //! `sag-router`:
 //!
-//! - [`circuit_breaker`] — in-memory per-target circuit breaker state.
 //! - [`order`] — target ordering strategies (FillFirst / RoundRobin).
 //! - [`dispatch`] — route resolution, per-target retry loop, chat & image
 //!   dispatch fallback, and SSE streaming response builder.
@@ -14,8 +13,11 @@
 //!   (not gated by `#[cfg(test)]` so integration tests can reach them).
 //!   The `test_app_state` / `build_provider_registry` helpers have also
 //!   moved to `sag-state` and are re-exported here.
+//!
+//! Circuit-breaker primitives (`RouteCircuitBreaker`, `RouteTargetKey`,
+//! `CircuitBreakerEntry`, `CircuitStateKind`) live in `sag-core` and are
+//! re-exported there — import them from `sag_core` directly.
 
-pub mod circuit_breaker;
 pub mod dispatch;
 pub mod order;
 pub mod state;
@@ -23,9 +25,6 @@ pub mod testing;
 
 // ── Re-exports ──────────────────────────────────────────────────────
 
-pub use circuit_breaker::{
-    CircuitBreakerEntry, CircuitStateKind, RouteCircuitBreaker, RouteTargetKey,
-};
 pub use dispatch::{
     DispatchCtx, ResolvedRoute, ResolvedTarget, dispatch_chat, dispatch_image, resolve_route,
 };

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use sag_analytics::{AnalyticsQueryEngine, CallLogCollector, EventCollector};
 use sag_config::{ConfigHandle, RouteTarget};
-use sag_core::RouteCircuitBreaker;
+use sag_core::{RouteCircuitBreaker, RouteTargetKey};
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
 
@@ -433,6 +433,36 @@ impl AppState {
     pub async fn remove_provider_runtime(&self, name: &str) {
         let mut providers = self.providers.write().await;
         providers.remove(name);
+    }
+
+    /// Force-close the circuit breaker for a single route target and clear
+    /// the associated model's sticky-failover memory.
+    ///
+    /// # Consistency note (sequential locks, eventually consistent)
+    ///
+    /// The two `tokio::sync::RwLock` writes run **sequentially** — there is
+    /// no cross-lock atomicity and no "atomic clear / strong consistency"
+    /// guarantee is implied. Correctness comes from the existing versioning
+    /// machinery:
+    /// 1. `active_targets.write().await.clear(model)` bumps the model's
+    ///    generation (when it has per-model state) or the global epoch (when
+    ///    it has none) — see [`StickyToken`]. Any in-flight request that made
+    ///    its routing decision before this close has its writeback rejected
+    ///    by the `insert_if_generation` epoch/generation comparison, so a
+    ///    cleared failover target can never be re-pinned afterwards;
+    /// 2. if a half-open probe is in flight at close time, its
+    ///    `record_probe_result` is silently discarded (the entry no longer
+    ///    exists) — the same documented concurrency semantics the previous
+    ///    admin-handler implementation had. If the upstream is still down,
+    ///    the next failed request re-opens the breaker with a fresh cooldown.
+    ///
+    /// Idempotent: closing an already-`Closed` target is a no-op, and
+    /// clearing a non-existent sticky entry is a no-op — so calling this
+    /// against a healthy target is a safe way to reset sticky routing.
+    pub async fn force_close_circuit(&self, model: &str, provider: &str, real_model: &str) {
+        let key = RouteTargetKey::new(model, provider, real_model);
+        self.circuit_breaker.write().await.close(&key);
+        self.active_targets.write().await.clear(model);
     }
 }
 

@@ -84,3 +84,4 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 - [0003 探测失败隐瞒冷却下界与流式取消探测槽泄漏修复](changes/0003-probe-lifetime-fix.md)
 - [0004 熔断状态可观测化](changes/0004-observability.md)
 - [0005 手动关闭熔断时清除 StickyFailover 粘性记忆](changes/0005-manual-close-clears-sticky.md)
+- [0006 熔断器逻辑概念内聚与探测槽生命周期治理（RAII）](changes/0006-concept-consolidation-and-probe-guard-lifecycle.md)（无行为变更：探测槽归还收敛为消费式 `ProbeGuard` / `apply_circuit_outcome`，`force_close_circuit` 下沉 `sag-state`）

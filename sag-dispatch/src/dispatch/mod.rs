@@ -29,10 +29,10 @@ use sag_core::{
 };
 use tracing::{error, info, warn};
 
-use crate::circuit_breaker::RouteTargetKey;
 use crate::dispatch::retry::RetryOutcome;
 use crate::state::{AppState, DispatchRuntime};
 use sag_analytics::EventCollector;
+use sag_core::RouteTargetKey;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -120,37 +120,140 @@ pub struct DispatchCtx<'a> {
 // Circuit breaker helpers — shared across the dispatch submodules.
 // ═══════════════════════════════════════════════════════════════════
 
-/// Verdict returned by [`circuit_allows_target`].
+/// Circuit-gate permit (RAII guard). `'a` only borrows the
+/// [`DispatchRuntime`] snapshot fields — it never carries a
+/// `RwLockReadGuard` (the release timing is spelled out under
+/// [`ProbeGuard`]).
+pub(in crate::dispatch) enum CircuitPermit<'a> {
+    /// Target healthy (`Closed`): holds no probe slot, nothing to release;
+    /// only carries the identity for outcome application.
+    Allowed { key: RouteTargetKey },
+    /// A half-open probe slot was claimed: the slot is exclusively held by
+    /// this guard until it is consumed. Release is done synchronously by the
+    /// consuming [`apply_circuit_outcome`] on the normal path; abnormal
+    /// paths are caught by `ProbeGuard`'s `Drop`.
+    Probe(ProbeGuard<'a>),
+}
+
+/// RAII guard over a claimed half-open probe slot.
 ///
-/// `key` is the resolved target identity; `is_probe` is `true` when the
-/// target's circuit is `HalfOpen` and this request was granted the single
-/// probe slot — meaning the attempt that follows should be treated as a
-/// recovery probe (its outcome re-opens the circuit on failure rather than
-/// just opening it for the first time).
-pub(in crate::dispatch) struct CircuitVerdict {
+/// Holds a read-only borrow of the [`DispatchRuntime`] — used only to reach
+/// the shared breaker `Arc` and call the release method. The
+/// `Arc<RwLock<RouteCircuitBreaker>>` itself survives across `await` (the
+/// guard borrows the `Arc`, not the lock guard); detaching clones it once so
+/// the release task is decoupled from the caller's lifetime.
+pub(in crate::dispatch) struct ProbeGuard<'a> {
+    runtime: &'a DispatchRuntime,
     pub key: RouteTargetKey,
-    pub is_probe: bool,
+    /// Snapshot of `probe_interval_secs` taken at guard creation, shared by
+    /// [`apply_circuit_outcome`] and the abnormal-path release so the
+    /// judgement and the release can never drift apart.
+    pub interval_secs: u64,
+    /// Single-completion marker: set by the two consuming release paths
+    /// ([`apply_circuit_outcome`] and [`Self::release_probe_slot`]) before
+    /// their first release; once set, `Drop` short-circuits and never
+    /// releases twice.
+    completed: bool,
+}
+
+impl<'a> ProbeGuard<'a> {
+    pub fn new(runtime: &'a DispatchRuntime, key: RouteTargetKey, interval_secs: u64) -> Self {
+        Self {
+            runtime,
+            key,
+            interval_secs,
+            completed: false,
+        }
+    }
+
+    /// Mark the slot as consumed. Must be called by any consuming release
+    /// path *before* its first await — dropping the guard after a cancelled
+    /// future then short-circuits instead of releasing a second time.
+    fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+
+    /// Synchronous release entry for normal early-skip paths (provider
+    /// unresolved / request skipped before the retry loop), keeping the
+    /// "dispatch returns ⇒ slot released" semantics.
+    ///
+    /// Consuming `mut self`: `mark_completed()` runs **before** any await,
+    /// so if the future is cancelled while waiting for the write lock the
+    /// guard's `Drop` sees `completed = true` and does not release again.
+    pub async fn release_probe_slot(mut self) {
+        self.mark_completed(); // must precede any await
+        // `self` implements `Drop`, so `self.key` cannot be moved out; clone
+        // it (same cost as the plan's original by-value transfer).
+        self.runtime
+            .circuit_breaker
+            .write()
+            .await
+            .record_probe_result(self.key.clone(), false, self.interval_secs);
+    }
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        // Only abnormal paths reach here: the two consuming release paths
+        // ([`apply_circuit_outcome`] / [`Self::release_probe_slot`]) both
+        // call `mark_completed` first, so a dropped guard here means the
+        // future was dropped before any release point (panic unwind / client
+        // disconnect). Best-effort release keeps `probe_in_flight` from
+        // leaking; a reclamation window is the last-resort safety net (see
+        // `sag_core::circuit_breaker::try_acquire_probe`).
+        if self.completed {
+            return;
+        }
+        let breaker = self.runtime.circuit_breaker.clone();
+        let key = self.key.clone();
+        let interval = self.interval_secs;
+
+        // Best-effort, never unconditionally `tokio::spawn` — spawning
+        // without a current runtime (or while one is shutting down) would
+        // panic. Same pattern as
+        // `sag-dispatch/src/dispatch/stream.rs::deliver_terminal_event`:
+        // without a runtime we warn and leave the slot to the stale-probe
+        // reclamation.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    breaker
+                        .write()
+                        .await
+                        .record_probe_result(key, false, interval);
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    ?key,
+                    "dropping un-consumed probe guard with no tokio runtime; slot left for stale reclamation"
+                );
+            }
+        }
+    }
 }
 
 /// Check whether a target's circuit allows a try.
 ///
 /// Returns `None` if the target is `Open` (cooling down) or is `HalfOpen`
 /// with a probe already in flight — in both cases the caller should skip to
-/// the next target. Returns `Some(CircuitVerdict)` when the target may be
-/// tried: `is_probe` is `true` iff this request was handed the half-open
-/// probe slot.
-pub(in crate::dispatch) async fn circuit_allows_target(
-    runtime: &DispatchRuntime,
+/// the next target. Returns `Some(CircuitPermit)` when the target may be
+/// tried: `Allowed` for a healthy (`Closed`) target, `Probe(guard)` when
+/// this request was handed the half-open probe slot (the guard's drop
+/// releases the slot).
+pub(in crate::dispatch) async fn circuit_allows_target<'a>(
+    runtime: &'a DispatchRuntime,
     model: &str,
     provider_name: &str,
     real_model: &str,
-) -> Option<CircuitVerdict> {
+    circuit_breaker_cfg: &sag_config::CircuitBreakerConfig,
+) -> Option<CircuitPermit<'a>> {
     let circuit_key = RouteTargetKey::new(model, provider_name, real_model);
 
     // Single read pass. `can_probe_now` returns true for a healthy (Closed)
     // target as well as a due `Open`/`HalfOpen` one.
     {
-        let breaker = runtime.route_circuit_breaker.read().await;
+        let breaker = runtime.circuit_breaker.read().await;
         if !breaker.can_probe_now(&circuit_key) {
             let next_ms = breaker
                 .next_probe_in(&circuit_key)
@@ -167,28 +270,29 @@ pub(in crate::dispatch) async fn circuit_allows_target(
         // Healthy (Closed) target: allow as a normal attempt without taking a
         // write lock or claiming a probe slot.
         if breaker.is_closed(&circuit_key) {
-            return Some(CircuitVerdict {
-                key: circuit_key,
-                is_probe: false,
-            });
+            return Some(CircuitPermit::Allowed { key: circuit_key });
         }
     }
 
     // Upgrade to a write pass to transition a due `Open` to `HalfOpen`
     // and claim the single probe slot.
-    let mut breaker = runtime.route_circuit_breaker.write().await;
+    let mut breaker = runtime.circuit_breaker.write().await;
     if !breaker.to_half_open_if_due(&circuit_key) {
         // Not due after the transition check (race) — treat as skipped.
         return None;
     }
 
-    let is_probe = breaker.try_acquire_probe(&circuit_key);
-    if is_probe {
+    if breaker.try_acquire_probe(&circuit_key) {
         info!(
             provider = %provider_name,
             real_model = %real_model,
             "half-open circuit probe allowed"
         );
+        Some(CircuitPermit::Probe(ProbeGuard::new(
+            runtime,
+            circuit_key,
+            circuit_breaker_cfg.probe_interval_secs,
+        )))
     } else {
         // Half-open but a probe is already in flight: skip this request.
         info!(
@@ -196,48 +300,55 @@ pub(in crate::dispatch) async fn circuit_allows_target(
             real_model = %real_model,
             "skipping route target: half-open probe already in flight"
         );
-        return None;
+        None
     }
-
-    Some(CircuitVerdict {
-        key: circuit_key,
-        is_probe,
-    })
 }
 
 /// Apply the outcome of a single target attempt to the circuit breaker.
+///
+/// Consuming: `permit` enters by value; `key` / `is_probe` are extracted in
+/// the `match`, and a `Probe` guard is marked completed so its `Drop`
+/// short-circuits — the release is owned by exactly this call, never by a
+/// later `Drop`.
 ///
 /// # Asymmetry note (intentional)
 ///
 /// A non-retryable (4xx) error on a *healthy* target does **not** open the
 /// circuit — the target stays usable, because a 4xx is usually a client-side
 /// request problem, not a target fault. The same 4xx arriving during a
-/// *probe* (`is_probe = true`) instead re-schedules the next probe one
-/// interval later (effectively a short cooldown). This asymmetry is
-/// deliberate: a probe must always report an outcome, and a 4xx during a probe
-/// means "not usable right now", so it is treated as a failed probe rather
-/// than left half-open forever. The practical effect — a target that returns
-/// 4xx to probe requests is briefly skipped — is acceptable and self-heals on
-/// the next interval.
-pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
-    runtime: &DispatchRuntime,
-    circuit_key: RouteTargetKey,
+/// *probe* instead re-schedules the next probe one interval later
+/// (effectively a short cooldown). This asymmetry is deliberate: a probe
+/// must always report an outcome, and a 4xx during a probe means "not usable
+/// right now", so it is treated as a failed probe rather than left half-open
+/// forever. The practical effect — a target that returns 4xx to probe
+/// requests is briefly skipped — is acceptable and self-heals on the next
+/// interval.
+pub(in crate::dispatch) async fn apply_circuit_outcome<'a, T>(
+    runtime: &'a DispatchRuntime,
+    permit: CircuitPermit<'a>,
     outcome: RetryOutcome<T>,
     circuit_breaker_cfg: &sag_config::CircuitBreakerConfig,
-    is_probe: bool,
 ) -> Option<T> {
     let interval = circuit_breaker_cfg.probe_interval_secs;
+    // Extract `key` and `is_probe`. The `Probe` guard is moved out and
+    // dropped at the end of the match arm — `mark_completed()` runs first,
+    // so the drop is a strict no-op.
+    let (breaker, key, is_probe) = match permit {
+        CircuitPermit::Allowed { key } => (runtime.circuit_breaker.clone(), key, false),
+        CircuitPermit::Probe(mut guard) => {
+            let breaker = guard.runtime.circuit_breaker.clone();
+            let key = guard.key.clone();
+            guard.mark_completed();
+            (breaker, key, true)
+        }
+    };
     match outcome {
         RetryOutcome::Success(value) => {
-            runtime
-                .route_circuit_breaker
-                .write()
-                .await
-                .close(&circuit_key);
+            breaker.write().await.close(&key);
             if is_probe {
                 info!(
-                    provider = %circuit_key.provider,
-                    real_model = %circuit_key.real_model,
+                    provider = %key.provider,
+                    real_model = %key.real_model,
                     "half-open circuit probe succeeded, circuit closed"
                 );
             }
@@ -256,17 +367,16 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
                 // re-opening the full cooldown — otherwise early recovery
                 // would again be invisible until the whole window elapsed.
                 info!(
-                    provider = %circuit_key.provider,
-                    real_model = %circuit_key.real_model,
+                    provider = %key.provider,
+                    real_model = %key.real_model,
                     hint = ?hint,
                     interval_secs = interval,
                     "half-open circuit probe failed, rescheduling next probe"
                 );
-                runtime
-                    .route_circuit_breaker
+                breaker
                     .write()
                     .await
-                    .record_probe_result(circuit_key, false, interval);
+                    .record_probe_result(key, false, interval);
             } else {
                 // First failure (target was Closed/healthy): open the circuit
                 // with the error-derived cooldown as the hard lower bound and
@@ -277,11 +387,7 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
                     interval_secs = interval,
                     "opening circuit with error-based duration"
                 );
-                runtime.route_circuit_breaker.write().await.open(
-                    circuit_key,
-                    duration_secs,
-                    interval,
-                );
+                breaker.write().await.open(key, duration_secs, interval);
             }
             None
         }
@@ -290,40 +396,14 @@ pub(in crate::dispatch) async fn apply_circuit_outcome<T>(
                 // A non-retryable (4xx) probe means the target is not usable
                 // right now — reschedule the next probe one interval later
                 // rather than leaving it half-open forever.
-                runtime
-                    .route_circuit_breaker
+                breaker
                     .write()
                     .await
-                    .record_probe_result(circuit_key, false, interval);
+                    .record_probe_result(key, false, interval);
             }
             None
         }
     }
-}
-
-/// Release a half-open probe slot without having actually attempted the
-/// upstream.
-///
-/// Claiming a probe slot (via [`circuit_allows_target`]) creates an obligation
-/// to report the probe outcome through [`apply_circuit_outcome`]. Some early
-/// exits between claiming the slot and the retry loop — notably when
-/// [`resolve_provider`](crate::dispatch::resolve::resolve_provider) returns
-/// `None` because the provider is disabled or no longer registered — skip that
-/// call. Without this release the `HalfOpen` + `probe_in_flight = true` entry
-/// would never be cleared (`try_acquire_probe` would reject every later
-/// request), permanently skipping the target. Treating the un-attempted probe
-/// as a failure reschedules the next probe one interval later, matching the
-/// normal failed-probe path.
-pub(in crate::dispatch) async fn release_probe_slot(
-    runtime: &DispatchRuntime,
-    circuit_key: RouteTargetKey,
-    probe_interval_secs: u64,
-) {
-    runtime
-        .route_circuit_breaker
-        .write()
-        .await
-        .record_probe_result(circuit_key, false, probe_interval_secs);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1309,5 +1389,303 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0, "mark_done must suppress the drop terminal");
+    }
+
+    // ── CircuitPermit / ProbeGuard RAII contract ───────────────────
+
+    fn cb_config(probe_interval_secs: u64) -> sag_config::CircuitBreakerConfig {
+        sag_config::CircuitBreakerConfig {
+            quota_exhausted_secs: 3600,
+            rate_limited_secs: 10,
+            generic_secs: 60,
+            probe_interval_secs,
+        }
+    }
+
+    /// An un-consumed `ProbeGuard` dropped outside any tokio runtime must
+    /// take the best-effort warn path — never panic (a naive unconditional
+    /// `tokio::spawn` in `Drop` would panic with "there is no reactor
+    /// running"). The slot is left for the stale-probe reclamation.
+    #[test]
+    fn probe_guard_drop_without_runtime_does_not_panic() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let guard = ProbeGuard::new(&rt, RouteTargetKey::new("m", "p", "rm"), 60);
+        drop(guard); // must not panic
+    }
+
+    /// A `ProbeGuard` whose single-completion marker is set drops as a strict
+    /// no-op — it must not touch the runtime at all (`Drop` short-circuits
+    /// before `Handle::try_current`, so this also holds without a runtime).
+    #[test]
+    fn probe_guard_marked_completed_drop_is_noop() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let mut guard = ProbeGuard::new(&rt, RouteTargetKey::new("m", "p", "rm"), 60);
+        guard.mark_completed();
+        drop(guard); // no-op — must not panic even without a runtime
+    }
+
+    /// An un-consumed `ProbeGuard` dropped inside a tokio runtime releases
+    /// the claimed slot through a detached task: after the drop the slot
+    /// must become claimable again (`probe_in_flight` cleared), so the
+    /// best-effort `Drop` path really does release.
+    #[tokio::test]
+    async fn probe_guard_drop_with_runtime_releases_slot_detached() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(0); // interval 0 → the detached release lands immediately
+        rt.circuit_breaker
+            .write()
+            .await
+            .open(RouteTargetKey::new("m", "p", "rm"), 3600, 0);
+
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+            .await
+            .expect("half-open probe should be granted");
+        let CircuitPermit::Probe(guard) = permit else {
+            panic!("expected a probe permit");
+        };
+        // Drop un-consumed: the guard's Drop must detach a release.
+        drop(guard);
+
+        // Poll until the detached release lands (interval 0 → the reschedule
+        // is due immediately, so the slot is claimable again after the write).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut breaker = rt.circuit_breaker.write().await;
+            if breaker.to_half_open_if_due(&RouteTargetKey::new("m", "p", "rm"))
+                && breaker.try_acquire_probe(&RouteTargetKey::new("m", "p", "rm"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached drop release never landed"
+            );
+            drop(breaker);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A consumed probe failure records exactly one `record_probe_result`:
+    /// the guard's `Drop` after `apply_circuit_outcome` is a strict no-op
+    /// (already `mark_completed`), so the entry ends up `Open` with
+    /// `probe_in_flight` cleared and a single rescheduled `next_probe_at`.
+    #[tokio::test]
+    async fn apply_circuit_outcome_consumed_probe_failure_reschedules_once() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(5);
+        let key = RouteTargetKey::new("m", "p", "rm");
+        rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
+
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+            .await
+            .expect("probe should be granted");
+        assert!(
+            matches!(&permit, CircuitPermit::Probe(_)),
+            "expected a probe permit"
+        );
+
+        let result = apply_circuit_outcome(
+            &rt,
+            permit,
+            RetryOutcome::<u32>::Exhausted(AppError::Upstream {
+                provider: "p".into(),
+                status: 503,
+                body: "boom".into(),
+            }),
+            &cfg,
+        )
+        .await;
+        assert!(result.is_none());
+
+        let breaker = rt.circuit_breaker.read().await;
+        assert!(
+            !breaker.can_probe_now(&key),
+            "failed probe must reschedule, not leave the slot probeable"
+        );
+        let next_in = breaker
+            .next_probe_in(&key)
+            .expect("Open entry must have a next probe");
+        assert!(
+            next_in.as_millis() >= 4900 && next_in.as_millis() <= 8000,
+            "failed probe reschedules ~interval (5s), got {next_in:?}"
+        );
+        let entry = breaker
+            .snapshot()
+            .into_iter()
+            .find(|e| e.model == "m")
+            .expect("entry must still exist after probe failure");
+        assert_eq!(entry.state, sag_core::CircuitStateKind::Open);
+        assert!(
+            !entry.probe_in_flight,
+            "consumed guard must release the slot exactly once"
+        );
+    }
+
+    /// `Success` on both an `Allowed` (healthy) and a `Probe` target closes
+    /// the circuit (a no-op for the healthy one, a recovery for the probe).
+    #[tokio::test]
+    async fn apply_circuit_outcome_success_closes_healthy_and_probe() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(5);
+        let key = RouteTargetKey::new("m", "p", "rm");
+
+        // Healthy (Allowed) + Success: no entry is created, stays closed.
+        let out = apply_circuit_outcome(
+            &rt,
+            CircuitPermit::Allowed { key: key.clone() },
+            RetryOutcome::Success(42u32),
+            &cfg,
+        )
+        .await;
+        assert_eq!(out, Some(42));
+        assert!(
+            rt.circuit_breaker.read().await.is_closed(&key),
+            "healthy success must stay closed"
+        );
+
+        // Probe + Success: the half-open entry is closed (recovery).
+        rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+            .await
+            .expect("probe should be granted");
+        let out = apply_circuit_outcome(&rt, permit, RetryOutcome::Success(7u32), &cfg).await;
+        assert_eq!(out, Some(7));
+        assert!(
+            rt.circuit_breaker.read().await.is_closed(&key),
+            "successful probe must close the circuit"
+        );
+    }
+
+    /// `Exhausted` on a healthy (`Allowed`) target opens the circuit with the
+    /// error-derived cooldown as the hard lower bound.
+    #[tokio::test]
+    async fn apply_circuit_outcome_exhausted_opens_healthy_with_duration() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(5);
+        let key = RouteTargetKey::new("m", "p", "rm");
+
+        let out = apply_circuit_outcome(
+            &rt,
+            CircuitPermit::Allowed { key: key.clone() },
+            RetryOutcome::<u32>::Exhausted(AppError::Upstream {
+                provider: "p".into(),
+                status: 503,
+                body: "boom".into(),
+            }),
+            &cfg,
+        )
+        .await;
+        assert!(out.is_none());
+
+        let breaker = rt.circuit_breaker.read().await;
+        let entry = breaker
+            .snapshot()
+            .into_iter()
+            .find(|e| e.model == "m")
+            .expect("exhausted healthy target must open");
+        assert_eq!(entry.state, sag_core::CircuitStateKind::Open);
+        assert!(
+            !entry.probe_in_flight,
+            "healthy open does not hold a probe slot"
+        );
+    }
+
+    /// A non-retryable (client-caused) 4xx on a healthy target must **not**
+    /// open the circuit — the asymmetry invariant that keeps client errors
+    /// from poisoning a healthy target.
+    #[tokio::test]
+    async fn apply_circuit_outcome_non_retryable_healthy_does_not_open() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(5);
+        let key = RouteTargetKey::new("m", "p", "rm");
+
+        let out = apply_circuit_outcome(
+            &rt,
+            CircuitPermit::Allowed { key: key.clone() },
+            RetryOutcome::<u32>::NonRetryable(AppError::BadRequest("client 4xx".into())),
+            &cfg,
+        )
+        .await;
+        assert!(out.is_none());
+        assert!(
+            rt.circuit_breaker.read().await.is_closed(&key),
+            "client 4xx on a healthy target must not open the circuit"
+        );
+    }
+
+    /// A non-retryable (4xx) during a probe is treated as a failed probe:
+    /// the next probe is pushed one interval later and the slot is released
+    /// — never left half-open forever, and never a full cooldown.
+    #[tokio::test]
+    async fn apply_circuit_outcome_non_retryable_probe_reschedules_not_cooldown() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(5);
+        let key = RouteTargetKey::new("m", "p", "rm");
+        rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
+
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+            .await
+            .expect("probe should be granted");
+        let out = apply_circuit_outcome(
+            &rt,
+            permit,
+            RetryOutcome::<u32>::NonRetryable(AppError::BadRequest("client 4xx".into())),
+            &cfg,
+        )
+        .await;
+        assert!(out.is_none());
+
+        let breaker = rt.circuit_breaker.read().await;
+        let next_in = breaker
+            .next_probe_in(&key)
+            .expect("4xx probe must reschedule the next probe");
+        assert!(
+            next_in.as_millis() >= 4900 && next_in.as_millis() <= 8000,
+            "4xx probe must reschedule ~interval (5s), not open a full cooldown, got {next_in:?}"
+        );
+        let entry = breaker
+            .snapshot()
+            .into_iter()
+            .find(|e| e.model == "m")
+            .expect("entry must still exist after the failed 4xx probe");
+        assert!(!entry.probe_in_flight, "4xx probe must release the slot");
+    }
+
+    /// `release_probe_slot` (the provider-unresolved early-skip path) is a
+    /// consuming release: it marks the guard completed before awaiting, so
+    /// the guard's drop after the call can never record a second time. The
+    /// slot is synchronously claimable once the future resolves.
+    #[tokio::test]
+    async fn probe_guard_release_probe_slot_releases_once() {
+        let rt = crate::testing::test_dispatch_runtime();
+        let cfg = cb_config(5);
+        let key = RouteTargetKey::new("m", "p", "rm");
+        rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
+
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+            .await
+            .expect("probe should be granted");
+        let CircuitPermit::Probe(guard) = permit else {
+            panic!("expected a probe permit");
+        };
+        guard.release_probe_slot().await;
+
+        let breaker = rt.circuit_breaker.read().await;
+        let next_in = breaker
+            .next_probe_in(&key)
+            .expect("released probe must reschedule the next probe");
+        assert!(
+            next_in.as_millis() >= 4900 && next_in.as_millis() <= 8000,
+            "released probe reschedules ~interval (5s), got {next_in:?}"
+        );
+        let entry = breaker
+            .snapshot()
+            .into_iter()
+            .find(|e| e.model == "m")
+            .expect("entry must still exist after the release");
+        assert!(
+            !entry.probe_in_flight,
+            "release_probe_slot must release the slot exactly once"
+        );
     }
 }

@@ -1440,8 +1440,8 @@ async fn dispatch_chat_releases_probe_slot_when_provider_unresolved() {
 
     // Pre-open `first`'s circuit so the next request finds it probe-due
     // and claims the slot before `resolve_provider` fails.
-    rt.route_circuit_breaker.write().await.open(
-        crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
+    rt.circuit_breaker.write().await.open(
+        sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
         0,
         0,
     );
@@ -1453,17 +1453,13 @@ async fn dispatch_chat_releases_probe_slot_when_provider_unresolved() {
 
     // The slot must have been released: the target is probeable again and
     // the single probe slot can be claimed once more.
-    let mut b = rt.route_circuit_breaker.write().await;
+    let mut b = rt.circuit_breaker.write().await;
     assert!(
-        b.to_half_open_if_due(&crate::circuit_breaker::RouteTargetKey::new(
-            "gpt-4o", "first", "gpt-4o"
-        )),
+        b.to_half_open_if_due(&sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o")),
         "after release, target should be probeable again (not stuck half-open)"
     );
     assert!(
-        b.try_acquire_probe(&crate::circuit_breaker::RouteTargetKey::new(
-            "gpt-4o", "first", "gpt-4o"
-        )),
+        b.try_acquire_probe(&sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o")),
         "released probe slot should be claimable again"
     );
 }
@@ -1529,8 +1525,8 @@ async fn dispatch_chat_half_open_probe_in_flight_skips_others() {
 
     // Pre-open the circuit for `first` so the next concurrent requests
     // find it half-open and race for the single probe slot.
-    rt.route_circuit_breaker.write().await.open(
-        crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
+    rt.circuit_breaker.write().await.open(
+        sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
         0,
         0,
     );
@@ -1706,9 +1702,9 @@ async fn client_error_4xx_returns_to_client_without_failover() {
     );
 
     // Circuit stays closed.
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
     assert!(
-        rt.route_circuit_breaker.read().await.is_closed(&key),
+        rt.circuit_breaker.read().await.is_closed(&key),
         "client-caused 4xx must not open the circuit"
     );
 }
@@ -1816,9 +1812,9 @@ async fn client_error_bad_request_returns_to_client_without_failover() {
     );
 
     // Circuit stays closed.
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
     assert!(
-        rt.route_circuit_breaker.read().await.is_closed(&key),
+        rt.circuit_breaker.read().await.is_closed(&key),
         "client-caused BadRequest must not open the circuit"
     );
 
@@ -1912,9 +1908,9 @@ async fn auth_401_failovers_and_moves_pin() {
     );
 
     // A's circuit stays closed (no open on non-retryable 4xx).
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
     assert!(
-        rt.route_circuit_breaker.read().await.is_closed(&key),
+        rt.circuit_breaker.read().await.is_closed(&key),
         "401 must not open the circuit"
     );
 }
@@ -1970,9 +1966,9 @@ async fn model_404_failovers_and_moves_pin() {
         "provider-persistent 404 should move the pin to the working backup"
     );
 
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
     assert!(
-        rt.route_circuit_breaker.read().await.is_closed(&key),
+        rt.circuit_breaker.read().await.is_closed(&key),
         "404 must not open the circuit"
     );
 }
@@ -2004,8 +2000,8 @@ async fn quota_403_opens_circuit() {
     assert_eq!(m2.chat_calls(), 1);
 
     // A's circuit opened with the quota cooldown (~3600s).
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
-    let breaker = rt.route_circuit_breaker.read().await;
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let breaker = rt.circuit_breaker.read().await;
     assert!(!breaker.is_closed(&key), "quota 403 must open the circuit");
     let snap = breaker.snapshot();
     let entry = snap
@@ -2074,9 +2070,9 @@ async fn non_quota_403_failovers_and_moves_pin() {
         "non-quota 403 should move the pin to the working backup"
     );
 
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
     assert!(
-        rt.route_circuit_breaker.read().await.is_closed(&key),
+        rt.circuit_breaker.read().await.is_closed(&key),
         "non-quota 403 must not open the circuit"
     );
 }
@@ -2124,9 +2120,9 @@ async fn unknown_4xx_returns_to_client() {
         "unknown 4xx must not move the pin"
     );
 
-    let key = crate::circuit_breaker::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
     assert!(
-        rt.route_circuit_breaker.read().await.is_closed(&key),
+        rt.circuit_breaker.read().await.is_closed(&key),
         "unknown 4xx must not open the circuit"
     );
 }

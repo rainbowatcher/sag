@@ -7,7 +7,7 @@ updated: 2026-07-22
 
 ## 关键文件
 
-- [sag-dispatch/src/circuit_breaker.rs](../../../sag-dispatch/src/circuit_breaker.rs) — 熔断器状态管理
+- [sag-core/src/circuit_breaker.rs](../../../sag-core/src/circuit_breaker.rs) — 熔断器状态管理
 - [sag-core/src/types.rs](../../../sag-core/src/types.rs) — `CircuitHint` 枚举（错误分类）
 - [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `CircuitBreakerConfig` 配置段
 
@@ -101,8 +101,9 @@ pub enum CircuitHint {
 
 ## 测试策略
 
-- `sag-dispatch/src/circuit_breaker.rs` — 单元测试：状态转换、周期探测到期、失败重排 interval（非整段冷却）、并发仅 1 次探测
-- `sag-dispatch/src/dispatch/chat.rs` 与 `image.rs` — 集成测试：冷却期内提前恢复、探测失败重排、并发 in-flight skip、探测槽泄漏回归（`resolve_provider` 失败路径）
+- `sag-core/src/circuit_breaker.rs` — 单元测试：状态转换、周期探测到期、失败重排 interval（非整段冷却）、并发仅 1 次探测
+- `sag-dispatch/src/dispatch/chat/tests.rs` 与 `image.rs` — 集成测试：冷却期内提前恢复、探测失败重排、并发 in-flight skip、探测槽泄漏回归（`resolve_provider` 失败路径）
+- `sag-dispatch/src/dispatch/mod.rs` — RAII 专项单元测试：`ProbeGuard` Drop 不 panic / detach 归还、消费式 `apply_circuit_outcome` 单次完成、非对称 4xx 开闸语义
 - `sag-config/src/config.rs` — `probe_interval_secs` 校验
 
 ## 关键文件
@@ -118,3 +119,4 @@ pub enum CircuitHint {
 - [0003 探测失败隐瞒冷却下界与流式取消探测槽泄漏修复](changes/0003-probe-lifetime-fix.md)
 - [0004 熔断状态可观测化](changes/0004-observability.md)
 - [0005 手动关闭熔断时清除 StickyFailover 粘性记忆](changes/0005-manual-close-clears-sticky.md)
+- [0006 熔断器逻辑概念内聚与探测槽生命周期治理（RAII）](changes/0006-concept-consolidation-and-probe-guard-lifecycle.md)（`CircuitPermit`/`ProbeGuard` RAII 守卫、`force_close_circuit` 下沉 `sag-state`、移除 shim、`DispatchRuntime.circuit_breaker` 命名统一）

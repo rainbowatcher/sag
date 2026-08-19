@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-08-17
+updated: 2026-08-18
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-08-18
+
+- **熔断器**：[0006 熔断器逻辑概念内聚与探测槽生命周期治理（RAII）](circuit-breaker/changes/0006-concept-consolidation-and-probe-guard-lifecycle.md) — `CircuitPermit`/`ProbeGuard` RAII 守卫收敛探测槽归还（`is_probe` 布尔与手工释放分支消失），`force_close_circuit` 下沉 `sag-state`，移除 shim 并统一 `DispatchRuntime.circuit_breaker` 命名；行为零回归
 
 ## 2026-08-17
 

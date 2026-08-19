@@ -9,9 +9,12 @@ pub use sag_state::{ActiveTargets, AppState, FillFirstOrders, testing::test_app_
 // ── 从 sag-dispatch 重导出（保持向后兼容） ──────────────────────
 pub use sag_dispatch::testing::test_dispatch_runtime;
 pub use sag_dispatch::{
-    CachedOrder, DispatchCtx, DispatchRuntime, RouteCircuitBreaker, RouteTargetKey, dispatch_chat,
-    dispatch_image, order_targets, resolve_route, stale_probe_threshold_from_config,
+    CachedOrder, DispatchCtx, DispatchRuntime, dispatch_chat, dispatch_image, order_targets,
+    resolve_route, stale_probe_threshold_from_config,
 };
+
+// ── 从 sag-core 重导出（熔断器原语直供） ────────────────────────
+pub use sag_core::{RouteCircuitBreaker, RouteTargetKey};
 
 // ── 从 sag-admin 重导出（保持向后兼容） ──────────────────────────
 pub use sag_admin::build_admin_routes;

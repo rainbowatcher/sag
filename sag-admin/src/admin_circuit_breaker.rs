@@ -11,7 +11,6 @@
 
 use axum::Json;
 use axum::extract::State;
-use sag_core::RouteTargetKey;
 use sag_state::AppState;
 use serde::Deserialize;
 
@@ -43,13 +42,14 @@ pub struct CloseCircuitBreakerRequest {
 /// entry so the target immediately becomes `Closed` (healthy). The next
 /// request will hit the upstream directly.
 ///
-/// Also clears the [`StickyFailover`](sag_config::Strategy::StickyFailover)
-/// active-target memory for `req.model`, so the next request falls back to
-/// the route's priority-ordered target list instead of staying pinned to the
-/// failover target. This mirrors the behaviour of
-/// `sticky_failover_reset_secs` expiring — a manual close is an explicit
-/// "this target is healthy again, let routing re-evaluate" signal, so the
-/// sticky memory that pinned traffic to a failover target must be reset.
+/// Delegates to [`AppState::force_close_circuit`], which also clears the
+/// [`StickyFailover`](sag_config::Strategy::StickyFailover) active-target
+/// memory for `req.model`, so the next request falls back to the route's
+/// priority-ordered target list instead of staying pinned to the failover
+/// target. This mirrors the behaviour of `sticky_failover_reset_secs`
+/// expiring — a manual close is an explicit "this target is healthy again,
+/// let routing re-evaluate" signal, so the sticky memory that pinned traffic
+/// to a failover target must be reset.
 ///
 /// **Idempotent**: if the target is already `Closed` (no entry), the
 /// operation is a no-op and still returns `200 OK`. Clearing a sticky entry
@@ -65,20 +65,9 @@ pub async fn close_circuit_breaker(
     State(state): State<AppState>,
     Json(req): Json<CloseCircuitBreakerRequest>,
 ) -> Json<serde_json::Value> {
-    let key = RouteTargetKey::new(&req.model, &req.provider, &req.real_model);
-    {
-        let mut guard = state.circuit_breaker.write().await;
-        guard.close(&key);
-    }
-    // Reset sticky-failover memory for this model so the recovered target
-    // competes on priority again instead of being pinned behind the
-    // failover target that absorbed traffic while the breaker was open.
-    // `clear` invalidates in-flight decisions that routed before the close:
-    // per-model generation bump when the model had per-model state, global
-    // epoch bump otherwise — so a stale writeback can never re-pin the
-    // failover target afterwards, without creating per-model tombstones for
-    // models that were never used.
-    state.active_targets.write().await.clear(&req.model);
+    state
+        .force_close_circuit(&req.model, &req.provider, &req.real_model)
+        .await;
     Json(serde_json::json!({ "ok": true }))
 }
 

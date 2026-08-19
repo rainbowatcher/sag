@@ -15,9 +15,9 @@ use crate::dispatch::retry::is_client_caused_4xx;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
-    DispatchCancelGuard, DispatchCtx, apply_circuit_outcome, circuit_allows_target,
+    CircuitPermit, DispatchCancelGuard, DispatchCtx, apply_circuit_outcome, circuit_allows_target,
     client_error_failure_reason, emit_analytics_event, fallback_exhausted_response,
-    log_per_target_failure, merge_model_overrides, release_probe_slot, success_log,
+    log_per_target_failure, merge_model_overrides, success_log,
 };
 
 mod attempt;
@@ -96,26 +96,27 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         let provider_name = &target.provider;
         let real_model = &target.real_model;
 
-        let Some(verdict) =
-            circuit_allows_target(runtime, &request.model, provider_name, real_model).await
+        let Some(permit) = circuit_allows_target(
+            runtime,
+            &request.model,
+            provider_name,
+            real_model,
+            &circuit_breaker_cfg,
+        )
+        .await
         else {
             errors.push(format!("{provider_name}/{real_model}: circuit open"));
             continue;
         };
-        let circuit_key = verdict.key;
-        let is_probe = verdict.is_probe;
 
         let Some(provider) = resolve_provider(state, provider_name, errors).await else {
             // Provider is disabled / unregistered. If this request claimed the
-            // half-open probe slot we must release it, otherwise the target
-            // would be skipped forever (probe_in_flight stuck true).
-            if is_probe {
-                release_probe_slot(
-                    runtime,
-                    circuit_key.clone(),
-                    circuit_breaker_cfg.probe_interval_secs,
-                )
-                .await;
+            // half-open probe slot we must release it synchronously, otherwise
+            // the target would be skipped forever (probe_in_flight stuck
+            // true). `release_probe_slot` consumes the guard (mark_completed
+            // first), so the drop after this branch can never release twice.
+            if let CircuitPermit::Probe(guard) = permit {
+                guard.release_probe_slot().await;
             }
             continue;
         };
@@ -272,14 +273,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             other => (None, other),
         };
 
-        let Some(attempt) = apply_circuit_outcome(
-            runtime,
-            circuit_key,
-            cb_outcome,
-            &circuit_breaker_cfg,
-            is_probe,
-        )
-        .await
+        let Some(attempt) =
+            apply_circuit_outcome(runtime, permit, cb_outcome, &circuit_breaker_cfg).await
         else {
             // Per-provider failure: log a failure entry with the actual provider/real_model
             // so the analytics table knows which provider was attempted.

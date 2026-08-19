@@ -176,7 +176,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     //    The circuit breaker Arc is created first and injected into both
     //    objects so they share the *same* live breaker instance. The breaker
     //    is constructed with the config-derived stale-probe threshold.
-    let route_circuit_breaker: Arc<RwLock<sag_core::RouteCircuitBreaker>> = Arc::new(RwLock::new(
+    let circuit_breaker: Arc<RwLock<sag_core::RouteCircuitBreaker>> = Arc::new(RwLock::new(
         sag_core::RouteCircuitBreaker::new(stale_probe_threshold),
     ));
     // Sticky-failover active-target memory. Shared between `AppState` and
@@ -196,7 +196,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         collector,
         event_collector: event_collector.clone(),
         analytics_query: Some(Arc::new(analytics_query)),
-        circuit_breaker: route_circuit_breaker.clone(),
+        circuit_breaker: circuit_breaker.clone(),
         active_targets: active_targets.clone(),
         fill_first_orders: fill_first_orders.clone(),
     };
@@ -204,7 +204,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     // defaults) so AppState and DispatchRuntime observe the same breaker,
     // the same sticky memory, and the same fill-first order cache.
     let dispatch_runtime = sag_router::DispatchRuntime::with_shared_state(
-        route_circuit_breaker.clone(),
+        circuit_breaker.clone(),
         active_targets,
         fill_first_orders,
     );
@@ -230,7 +230,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     let initial_routes_version = config_handle.routes_version();
     let threshold_watcher_handle = spawn_threshold_watcher(
         config_handle.clone(),
-        route_circuit_breaker,
+        circuit_breaker,
         initial_routes_version,
     );
 
@@ -377,7 +377,7 @@ const THRESHOLD_WATCHER_POLL_INTERVAL: std::time::Duration = std::time::Duration
 
 fn spawn_threshold_watcher(
     config_handle: sag_config::ConfigHandle,
-    route_circuit_breaker: Arc<RwLock<sag_core::RouteCircuitBreaker>>,
+    circuit_breaker: Arc<RwLock<sag_core::RouteCircuitBreaker>>,
     initial_routes_version: u64,
 ) -> ThresholdWatcherHandle {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -399,7 +399,7 @@ fn spawn_threshold_watcher(
             let config = config_handle.read().await;
             let new_threshold = sag_router::stale_probe_threshold_from_config(&config);
             drop(config);
-            let mut breaker = route_circuit_breaker.write().await;
+            let mut breaker = circuit_breaker.write().await;
             breaker.set_stale_probe_threshold(new_threshold);
             info!(
                 ?new_threshold,

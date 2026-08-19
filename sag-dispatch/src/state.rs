@@ -16,9 +16,7 @@ use tokio::sync::RwLock;
 use std::time::Duration;
 
 use sag_config::{GatewayConfig, default_timeout_secs, default_ttfb_timeout_secs};
-use sag_core::compute_stale_probe_threshold;
-
-use crate::circuit_breaker::RouteCircuitBreaker;
+use sag_core::{RouteCircuitBreaker, compute_stale_probe_threshold};
 
 /// Per-request runtime state for the dispatch engine.
 ///
@@ -49,8 +47,11 @@ pub struct DispatchRuntime {
     /// clearing sticky memory when a breaker is manually closed — are
     /// immediately visible to dispatch ordering.
     pub active_targets: sag_state::ActiveTargets,
-    /// Runtime availability memory for route targets.
-    pub route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
+    /// Runtime availability memory for route targets. Shared with
+    /// [`AppState`](sag_state::AppState) via the same `Arc` (injected through
+    /// [`DispatchRuntime::with_shared_state`]) so admin mutations — e.g. a
+    /// manual breaker close — are immediately visible to dispatch ordering.
+    pub circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
     /// Last routes version seen by the prune guard. When this matches
     /// [`ConfigHandle::routes_version`] the prune is skipped entirely,
     /// avoiding three write-lock acquisitions on every request.
@@ -63,7 +64,7 @@ impl Default for DispatchRuntime {
             route_counters: Arc::default(),
             fill_first_orders: Arc::default(),
             active_targets: Arc::default(),
-            route_circuit_breaker: Arc::default(),
+            circuit_breaker: Arc::default(),
             last_prune_version: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -81,12 +82,12 @@ impl DispatchRuntime {
     /// All other fields (counters, ordering cache, prune version) are
     /// initialized to their defaults.
     pub fn with_shared_state(
-        route_circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
+        circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
         active_targets: sag_state::ActiveTargets,
         fill_first_orders: sag_state::FillFirstOrders,
     ) -> Self {
         Self {
-            route_circuit_breaker,
+            circuit_breaker,
             active_targets,
             fill_first_orders,
             ..Default::default()
