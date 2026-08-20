@@ -92,23 +92,26 @@ flowchart TD
     I --> J
     E --> J
     J --> K{目标可用?}
-    K -->|熔断器开| J
+    K -->|熔断中且未到探测时机| J
     K -->|provider disabled| J
-    K -->|是| L[调用上游 API]
+    K -->|是 / 获得半开探测槽| L[调用上游 API]
     L --> M{响应结果}
-    M -->|成功| N[记录为 sticky active target<br/>返回 200]
-    M -->|4xx 错误| O[停止重试]
-    M -->|5xx/网络超时| P{该目标重试耗尽?}
-    P -->|否| L
-    P -->|是| J
-    J -->|全部失败| Q[返回 502]
+    M -->|成功| N[记录为 sticky active target<br/>关闭熔断器<br/>返回 200]
+    M -->|客户端 4xx: 400/413/422| O[透传返回客户端<br/>不重试 / 不 Failover]
+    M -->|供应商 4xx: 401/404/403非quota| P[Failover 尝试下一目标<br/>不开熔断]
+    P --> J
+    M -->|5xx/网络超时/403-quota| Q{该目标重试耗尽?}
+    Q -->|否| L
+    Q -->|是| R[按错误类型打开熔断<br/>尝试下一目标]
+    R --> J
+    J -->|全部目标失败/不可用| S[返回 502 All Providers Exhausted]
 ```
 
 **关键特性**：
 
 1. **继承 FillFirst 的 shuffle 特性** — 首次随机、顺序缓存、TTL 过期；路由 target 列表发生变更时 shuffle 缓存自动失效
 2. **粘滞复用** — 一旦某个 target 成功响应，同模型的后续请求会将它置顶优先尝试，最大化上游缓存命中率
-3. **失败自动切换** — 当 sticky target 因熔断、禁用或重试耗尽而失败时，自动 fallthrough 到下一个 target；成功后新的 target 成为 sticky active
+3. **失败自动切换** — 当 sticky target 因熔断、禁用、供应商 4xx 或重试耗尽而失败时，自动 fallthrough 到下一个 target；成功后新的 target 成为 sticky active
 4. **配置变更清理** — 当路由 target 列表发生变更（增删、provider/real_model/priority 修改）时，自动清除该模型的 sticky active target，防止指向已不存在的 target
 
 **适用场景**：
@@ -132,15 +135,18 @@ flowchart TD
     D --> F[尝试下一个目标]
     E --> F
     F --> G{目标可用?}
-    G -->|熔断器开| F
+    G -->|熔断中且未到探测时机| F
     G -->|provider disabled| F
-    G -->|是| H[调用上游 API]
+    G -->|是 / 获得半开探测槽| H[调用上游 API]
     H --> I{响应结果}
-    I -->|成功| J[返回 200]
-    I -->|4xx 错误| K[停止重试]
-    I -->|5xx/网络超时| L{该目标重试耗尽?}
-    L -->|否| H
-    L -->|是| F
+    I -->|成功| J[关闭熔断器<br/>返回 200]
+    I -->|客户端 4xx: 400/413/422| K[透传返回客户端<br/>不重试 / 不 Failover]
+    I -->|供应商 4xx: 401/404/403非quota| L[Failover 尝试下一目标<br/>不开熔断]
+    L --> F
+    I -->|5xx/网络超时/403-quota| M{该目标重试耗尽?}
+    M -->|否| H
+    M -->|是| N[按错误类型打开熔断<br/>尝试下一目标]
+    N --> F
     F -->|全部失败| O[返回 502]
 ```
 
@@ -149,7 +155,7 @@ flowchart TD
 1. **首次随机** — 首次访问时同优先级 target 随机打乱，避免所有 SAG 实例启动后都打同一个 provider
 2. **顺序缓存 + TTL** — 打乱结果通过 `model_name` 缓存，后续请求严格按同一顺序尝试。缓存有效期由 `shuffle_cache_ttl_secs` 控制（默认 7200 秒 = 2 小时），到期后自动重新打乱
 3. **缓存失效** — 当路由配置变更（target 增删、provider/real_model/priority 修改）时自动重新打乱，忽略 TTL
-4. **熔断器** — 如果目标重试耗尽，熔断器按错误类型打开对应冷却时长。冷却期内该目标被跳过；冷却结束后自动重新加入，按优先级正常参与竞争
+4. **熔断器与自愈** — 如果目标重试耗尽，熔断器按错误类型打开对应冷却时长。冷却期内该目标被跳过，但在冷却期内按 `probe_interval_secs` 周期性探测，上游恢复后自动重新加入
 
 **示例**：
 
@@ -176,7 +182,7 @@ priority = 0
 
 - 请求 1-1000：所有请求都发给 anthropic，只要它健康
 - 如果 anthropic 熔断：自动跳到 openai
-- 冷却结束后：重新尝试 anthropic（FillFirst 自然语义——优先用首选 target）
+- 冷却结束后或探测成功：重新尝试 anthropic（FillFirst 自然语义——优先用首选 target）
 
 ### RoundRobin — 轮询
 
@@ -191,14 +197,17 @@ flowchart TD
     E --> F{尝试当前 target}
     F --> G{目标可用?}
     G -->|否| F
-    G -->|是| H[调用上游 API]
+    G -->|是 / 获得半开探测槽| H[调用上游 API]
     H --> I{响应结果}
-    I -->|成功| J[返回 200]
-    I -->|4xx 错误| K[停止重试]
-    I -->|5xx/网络超时| L{该 target 重试耗尽?}
-    L -->|否| H
-    L -->|是| F
-    F -->|全部失败| M[返回 502]
+    I -->|成功| J[关闭熔断器<br/>返回 200]
+    I -->|客户端 4xx: 400/413/422| K[透传返回客户端<br/>不重试 / 不 Failover]
+    I -->|供应商 4xx: 401/404/403非quota| L[Failover 尝试下一目标<br/>不开熔断]
+    L --> F
+    I -->|5xx/网络超时/403-quota| M{该 target 重试耗尽?}
+    M -->|否| H
+    M -->|是| N[按错误类型打开熔断<br/>尝试下一目标]
+    N --> F
+    F -->|全部失败| O[返回 502]
 ```
 
 **关键特性**：
@@ -207,7 +216,7 @@ flowchart TD
 2. **计数器独立** — 每个 `model_name` 有自己的计数器，互不干扰
 3. **按优先级分组** — 和 FillFirst 一样按 priority 降序排列，但同一优先级内按轮询顺序
 4. **不跨界** — 高优先级失败尝试完所有同级 target 后，才会进入下一个优先级（与 FillFirst 相同）
-5. **熔断器生效** — 熔断器打开时自动跳过该 target，冷却结束后重新加入轮转
+5. **熔断器生效** — 熔断器打开时自动跳过该 target，冷却结束后或探测成功后重新加入轮转
 
 **示例**：
 
@@ -243,22 +252,33 @@ priority = 10
 
 ## 熔断器策略
 
-SAG 的熔断器根据**错误类型**自动选择冷却时长，三个 duration 均可通过 `[circuit_breaker]` 配置段覆盖：
+SAG 内置基于**三态机（Closed / Open / Half-Open）**的熔断器，根据上游**错误类型**自动选择冷却时长，并支持**冷却期内的周期性半开探测（提前感知恢复）**与 **RAII 安全生命周期管理**：
 
 | 错误类型 | 默认冷却 | 触发条件 |
 |---------|---------|----|
-| 额度耗尽 | 1 小时 | 上游返回 `429` + quota/billing 相关错误 body |
-| 请求过频 | 10 秒 | 上游返回 `429`（速率限制），非额度相关 |
-| 通用故障 | 60 秒 | 5xx、网络超时、连接错误等 |
+| 额度耗尽 (`QuotaExhausted`) | 3600 秒 (1 小时) | 上游返回 `429` 或 `403`，且 body 包含 quota/billing 关键词 |
+| 速率限制 (`RateLimited`) | 10 秒 | 上游返回 `429`（非额度相关的瞬时限流） |
+| 通用故障 (`Generic`) | 60 秒 | 5xx、网络超时、连接错误、上游超时等 |
 
-冷却结束后，目标自然重新加入路由——StickyFailover 继续优先使用上一次成功的 sticky target，FillFirst 按优先级尝试首选 target，RoundRobin 回到轮转顺序。
+### 半开探测与提前自愈机制
+
+1. **冷却期内周期探测（提前感知）**：
+   - 目标熔断后（`Open` 态），冷却时长（如 1 小时）仅作为硬下限。在冷却窗口内，SAG 会按 `probe_interval_secs`（默认 60 秒，带 jitter 错峰）周期性放行 **1 个并发请求**进入 `Half-Open` 半开状态进行探测。
+   - **探测成功**：熔断器立即关闭（`Closed`），目标瞬间恢复健康并重新接收正常流量，无需等满整个冷却期。
+   - **探测失败**：仅将下一次探测时间推后一个 `probe_interval_secs`（带 jitter），不会重开整段冷却。
+2. **并发控制与防卡槽（RAII Guard）**：
+   - 半开状态下全局**独占 1 个探测槽位**，其余并发请求仍视为熔断跳过。
+   - 探测生命周期由 RAII `ProbeGuard` 守卫：正常路径同步归还，异常路径（如客户端提前断开连接导致请求被取消）自动由 `Drop` 兜底释放，彻底杜绝探测槽位泄漏与死锁。
+3. **手动关闭与粘性记忆重置**：
+   - 在管理控制台「Circuit Breaker」面板点击「恢复」，或调用 `POST /api/circuit-breaker/close` 时，SAG 不仅会将目标强制置为健康状态（`Closed`），还会**同步清除该模型的 StickyFailover 粘性路由记忆**，使下一个请求立即回归首选优先级顺序。
 
 ```toml
-# 熔断器冷却时长（秒），省略则使用默认值。
+# 熔断器配置（秒），省略则使用默认值。
 [circuit_breaker]
-quota_exhausted_secs = 3600   # 默认 1 小时
-rate_limited_secs = 10        # 默认 10 秒
-generic_secs = 60             # 默认 60 秒
+quota_exhausted_secs = 3600   # 额度耗尽冷却时长（默认 1 小时）
+rate_limited_secs = 10        # 速率限制冷却时长（默认 10 秒）
+generic_secs = 60             # 通用故障冷却时长（默认 60 秒）
+probe_interval_secs = 60      # 冷却期内半开探测间隔（默认 60 秒，带 jitter 错峰）
 ```
 
 ## shuffle_cache_ttl_secs
@@ -287,26 +307,37 @@ sticky_failover_reset_secs = 7200
 
 路由内的目标按 `priority` **降序**排列（值越大越优先）。这里的 `priority` 是 `RouteTarget` 级别字段，不是 `ProviderConfig` 级别字段。
 
-处理逻辑（三种策略共用）：
+### 请求处理与 4xx/5xx 归因策略
 
 ```mermaid
 flowchart TD
-    A[请求到达] --> B[匹配路由]
-    B --> C[按策略排序目标]
-    C --> D{尝试下一个目标}
-    D --> E{目标可用?}
-    E -->|否| D
-    E -->|是| F[调用上游 API]
-    F --> G{响应结果}
-    G -->|成功| H[返回 200]
-    G -->|4xx 错误| I[停止重试]
-    G -->|5xx/网络超时| D
-    D -->|全部失败| J[返回 502]
+    A[请求到达] --> B[匹配路由并按策略排序]
+    B --> C[尝试下一个可用目标]
+    C --> D{调用上游响应}
+    D -->|成功 200| E[返回客户端]
+    D -->|客户端 4xx<br/>400/413/422/未知 4xx| F[立即终止重试<br/>直接透传返回客户端<br/>不 Failover / 不开熔断]
+    D -->|供应商 4xx<br/>401/404/403非quota| G[Failover 切换至下一目标<br/>不开熔断器]
+    G --> C
+    D -->|可重试故障<br/>5xx/网络超时/403-quota| H{当前目标重试耗尽?}
+    H -->|否| D
+    H -->|是| I[按错误类型打开熔断器<br/>Failover 切换至下一目标]
+    I --> C
+    C -->|所有目标均不可用/失败| J[返回 502 All Providers Exhausted]
 ```
 
-- **4xx 错误**（BadRequest、Unauthorized、ModelNotFound）— **立即停止**，不尝试下一个目标。因为这是客户端的问题，换其他供应商也会失败
-- **5xx/网络超时/其他** — 收集错误信息，继续尝试下一个目标
-- **全部目标失败** — 返回 `502 All Providers Exhausted`，附带上所有失败原因
+SAG 实行精细化的错误归因机制，确保不会因客户端输入问题切走主用供应商，也不会因单一供应商配置问题导致整条请求失败：
+
+1. **客户端归因（400 BadRequest、413 PayloadTooLarge、422 UnprocessableEntity、未知 4xx）**：
+   - **立即停止**，不进行目标间 Failover，也不触碰熔断器与 Sticky 粘性记忆。
+   - 直接透传错误响应给客户端（因为请求体或参数本身非法，换任何其他供应商也会失败）。
+2. **Provider 持续性归因（401 Unauthorized、404 ModelNotFound、403-非quota）**：
+   - 判定为该供应商的凭证失效或模型不支持，SAG 会**自动 Failover 到下一个目标**。
+   - 如果后续目标调用成功且策略为 StickyFailover，会更新粘性钉住目标；但**不开熔断器**（避免配置型错误过度惩罚目标）。
+3. **可重试故障（5xx 服务端错误、网络超时、连接异常、403-quota 额度耗尽）**：
+   - 在当前目标上按退避策略重试（由 `retries` 与 `[backoff]` 配置决定）。
+   - 若重试耗尽，则按错误类型**打开熔断器**，并 **Failover 继续尝试下一个目标**。
+4. **全部目标失败**：
+   - 返回 `502 All Providers Exhausted`，并在响应中汇总所有尝试过目标的失败原因。
 
 ## 使用场景
 

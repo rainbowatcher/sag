@@ -1,6 +1,6 @@
 ---
 created: 2026-06-14
-updated: 2026-07-22
+updated: 2026-08-20
 ---
 
 # 熔断器
@@ -74,8 +74,8 @@ probe_interval_secs = 60      # 默认 60s，冷却期内探测间隔（带 jitt
 ## 与其它模块的交互
 
 - **路由**：检查目标的熔断器状态
-- **调度**：重试耗尽后打开熔断器；`resolve_provider` 失败时若已占用探测槽须释放
-- **StickyFailover 粘性记忆**：手动关闭熔断器（`POST /api/circuit-breaker/close`）时同步清除该 model 的 sticky active target 记忆，使下一次请求回退到 fill-first 优先级顺序。语义与 `sticky_failover_reset_secs` 自然过期一致。
+- **调度**：重试耗尽后打开熔断器；通过 RAII `ProbeGuard` 守卫探测槽（`resolve_provider` 失败时同步释放）
+- **StickyFailover 粘性记忆**：手动关闭熔断器（`POST /api/circuit-breaker/close`，下沉为 `AppState::force_close_circuit`）时同步清除该 model 的 sticky active target 记忆，使下一次请求回退到 fill-first 优先级顺序。语义与 `sticky_failover_reset_secs` 自然过期一致。
 
 ## 变更记录
 

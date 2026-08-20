@@ -146,7 +146,7 @@ flowchart TD
 ### 客户端归因 4xx 不改共享状态
 
 - 400 / 413 / 422 / 未知 4xx 命中时，dispatch 循环**不 `continue` 到下一 target**，直接构造错误响应返客户端。
-- 该路径不调用 `active_targets.write().insert_if_generation`、不调用 `route_circuit_breaker.write().open`。（grep `insert_if_generation` / `.open(` 确认无新调用点）
+- 该路径不调用 `active_targets.write().insert_if_generation`、不调用 `circuit_breaker.write().open`。（grep `insert_if_generation` / `.open(` 确认无新调用点）
 
 ### provider 持续性 4xx failover 但不开闸
 
