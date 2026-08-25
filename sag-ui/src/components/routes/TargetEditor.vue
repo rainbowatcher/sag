@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowDown, ArrowUp, EllipsisVertical, Plus, Trash2 } from "@lucide/vue"
+import { AlertTriangle, ArrowDown, ArrowUp, EllipsisVertical, Plus, Trash2 } from "@lucide/vue"
 import { computed, ref } from "vue"
 import Combobox from "@/components/Combobox.vue"
 import { Badge } from "@/components/ui/badge"
@@ -89,6 +89,51 @@ function toggleExpand(id: number) {
   }
 }
 
+// --- Provider & Model Options Helpers ---
+function getProviderOptions(target: TargetItem) {
+  const list = props.providers.map((p) => ({
+    value: p.name,
+    label: `${p.name} (${p.provider_type})${!p.enabled ? " — Disabled" : ""}`,
+  }))
+  if (target.provider && !props.providers.some((p) => p.name === target.provider)) {
+    list.unshift({
+      value: target.provider,
+      label: `${target.provider} (Not Found)`,
+    })
+  }
+  return list
+}
+
+function getModelOptions(target: TargetItem) {
+  const models = props.providerModels[target.provider] ?? []
+  const options = models.map((m) => ({ value: m, label: m }))
+  if (target.real_model && !models.includes(target.real_model)) {
+    const p = props.providers.find((prov) => prov.name === target.provider)
+    const isInvalid =
+      p && p.enabled_models.length > 0 && !p.enabled_models.includes(target.real_model)
+    options.unshift({
+      value: target.real_model,
+      label: isInvalid ? `${target.real_model} (Unavailable / Not in provider)` : target.real_model,
+    })
+  }
+  return options
+}
+
+function getTargetWarning(target: TargetItem): string | null {
+  if (!target.provider) return null
+  const p = props.providers.find((prov) => prov.name === target.provider)
+  if (!p) return `Provider "${target.provider}" not found`
+  if (!p.enabled) return `Provider "${target.provider}" is disabled`
+  if (
+    target.real_model &&
+    p.enabled_models.length > 0 &&
+    !p.enabled_models.includes(target.real_model)
+  ) {
+    return `Model "${target.real_model}" is not enabled for provider "${target.provider}"`
+  }
+  return null
+}
+
 // --- Mutations ---
 
 function updateTargets(val: TargetItem[]) {
@@ -167,12 +212,7 @@ function onProviderChange(index: number, value: string) {
               <TableCell>
                 <Combobox
                   :model-value="t.provider"
-                  :options="
-                    providers.map((p) => ({
-                      value: p.name,
-                      label: `${p.name} (${p.provider_type})`,
-                    }))
-                  "
+                  :options="getProviderOptions(t)"
                   placeholder="Select provider..."
                   search-placeholder="Search provider..."
                   empty-text="No providers found"
@@ -182,7 +222,7 @@ function onProviderChange(index: number, value: string) {
               <TableCell>
                 <Combobox
                   :model-value="t.real_model"
-                  :options="(providerModels[t.provider] ?? []).map((m) => ({ value: m }))"
+                  :options="getModelOptions(t)"
                   placeholder="Select model"
                   search-placeholder="Search model..."
                   empty-text="No models found"
@@ -191,6 +231,13 @@ function onProviderChange(index: number, value: string) {
                     (v) => updateTarget(modelValue.indexOf(t), { real_model: v as string })
                   "
                 />
+                <p
+                  v-if="getTargetWarning(t)"
+                  class="mt-1 flex items-center gap-1 text-[11px] leading-tight text-amber-600 dark:text-amber-400"
+                >
+                  <AlertTriangle class="h-3 w-3 shrink-0" />
+                  {{ getTargetWarning(t) }}
+                </p>
               </TableCell>
               <TableCell class="text-right">
                 <div class="flex items-center justify-end gap-0.5">

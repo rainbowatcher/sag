@@ -145,17 +145,69 @@ async function confirmClear() {
   if (ok) cancelClearConfirm()
 }
 
-// ── Provider enabled lookup ──────────────────────────────────────
-const disabledProviders = computed(() => {
-  const set = new Set<string>()
-  for (const p of providerStore.providers) {
-    if (!p.enabled) set.add(p.name)
-  }
-  return set
-})
+// ── Target validity diagnosis ────────────────────────────────────
+interface TargetIssue {
+  targetIndex: number
+  provider: string
+  real_model?: string | null
+  reason: "missing_provider" | "disabled_provider" | "invalid_model"
+  message: string
+}
 
-function disabledTargetCount(route: RouteConfig): number {
-  return route.targets.filter((t) => disabledProviders.value.has(t.provider)).length
+interface RouteTargetStatus {
+  total: number
+  validCount: number
+  invalidCount: number
+  issues: TargetIssue[]
+}
+
+function getRouteTargetStatus(route: RouteConfig): RouteTargetStatus {
+  const issues: TargetIssue[] = []
+  let validCount = 0
+
+  for (let i = 0; i < route.targets.length; i++) {
+    const t = route.targets[i]
+    const p = providerStore.providers.find((prov) => prov.name === t.provider)
+    if (!p) {
+      issues.push({
+        targetIndex: i + 1,
+        provider: t.provider,
+        real_model: t.real_model,
+        reason: "missing_provider",
+        message: `Target #${i + 1}: Provider "${t.provider}" not found`,
+      })
+    } else if (!p.enabled) {
+      issues.push({
+        targetIndex: i + 1,
+        provider: t.provider,
+        real_model: t.real_model,
+        reason: "disabled_provider",
+        message: `Target #${i + 1}: Provider "${t.provider}" is disabled`,
+      })
+    } else if (p.enabled_models.length > 0) {
+      const modelToCheck = t.real_model || route.model_name
+      if (modelToCheck !== "*" && !p.enabled_models.includes(modelToCheck)) {
+        issues.push({
+          targetIndex: i + 1,
+          provider: t.provider,
+          real_model: t.real_model,
+          reason: "invalid_model",
+          message: `Target #${i + 1}: Model "${modelToCheck}" is not enabled for provider "${t.provider}"`,
+        })
+      } else {
+        validCount++
+      }
+    } else {
+      validCount++
+    }
+  }
+
+  return {
+    total: route.targets.length,
+    validCount,
+    invalidCount: issues.length,
+    issues,
+  }
 }
 
 /**
@@ -251,20 +303,49 @@ const columns = [
   }),
   columnHelper.accessor("targets", {
     header: "Targets",
-    sortingFn: (a, b) => a.original.targets.length - b.original.targets.length,
+    sortingFn: (a, b) => {
+      const sa = getRouteTargetStatus(a.original).validCount
+      const sb = getRouteTargetStatus(b.original).validCount
+      return sa - sb
+    },
     cell: (info) => {
-      const total = info.getValue().length
-      const disabled = disabledTargetCount(info.row.original)
-      if (disabled === 0) {
-        return h("span", { class: "tabular-nums font-medium" }, String(total))
+      const status = getRouteTargetStatus(info.row.original)
+      if (status.invalidCount === 0) {
+        return h("span", { class: "tabular-nums font-medium" }, String(status.total))
       }
-      return h("div", { class: "flex items-center gap-1.5" }, [
-        h(AlertTriangle, {
-          class: "text-amber-500 h-3.5 w-3.5 shrink-0",
-        }),
-        h("span", { class: "tabular-nums font-medium text-muted-foreground" }, [
-          String(total - disabled),
-          h("span", { class: "text-muted-foreground/60" }, `/${total}`),
+      const allInvalid = status.validCount === 0
+      return h(Tooltip, null, () => [
+        h(TooltipTrigger, { asChild: true }, () =>
+          h("div", { class: "inline-flex items-center gap-1.5 cursor-help" }, [
+            h(AlertTriangle, {
+              class: cn("h-3.5 w-3.5 shrink-0", allInvalid ? "text-destructive" : "text-amber-500"),
+            }),
+            h(
+              "span",
+              {
+                class: cn(
+                  "tabular-nums font-medium",
+                  allInvalid ? "text-destructive" : "text-muted-foreground",
+                ),
+              },
+              [
+                String(status.validCount),
+                h("span", { class: "text-muted-foreground/60" }, `/${status.total}`),
+              ],
+            ),
+          ]),
+        ),
+        h(TooltipContent, { side: "top", class: "max-w-xs space-y-1 text-xs" }, () => [
+          h(
+            "div",
+            { class: "border-border/50 border-b pb-0.5 font-semibold" },
+            allInvalid
+              ? "All targets are unavailable"
+              : `${status.validCount}/${status.total} targets valid`,
+          ),
+          ...status.issues.map((issue) =>
+            h("div", { class: "text-muted-foreground" }, issue.message),
+          ),
         ]),
       ])
     },
@@ -419,7 +500,11 @@ const table = useVueTable({
               v-for="row in table.getRowModel().rows"
               :key="row.id"
               :class="{
-                'bg-muted/20 text-muted-foreground': disabledTargetCount(row.original) > 0,
+                'bg-destructive/10 text-muted-foreground':
+                  getRouteTargetStatus(row.original).validCount === 0,
+                'bg-muted/20 text-muted-foreground':
+                  getRouteTargetStatus(row.original).validCount > 0 &&
+                  getRouteTargetStatus(row.original).invalidCount > 0,
                 'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
               }"
             >

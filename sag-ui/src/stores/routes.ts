@@ -37,6 +37,14 @@ export const useRouteStore = defineStore("routes", () => {
     }
   }
 
+  function clearProviderModelsCache(providerName?: string) {
+    if (providerName) {
+      delete providerModels.value[providerName]
+    } else {
+      providerModels.value = {}
+    }
+  }
+
   function loadProviderModels(providerName: string, providers: Provider[]) {
     const p = providers.find((p) => p.name === providerName)
     if (p && p.enabled_models.length > 0) {
@@ -83,6 +91,7 @@ export const useRouteStore = defineStore("routes", () => {
     fetchRoutes,
     loadProviderModels,
     fetchProviderModels,
+    clearProviderModelsCache,
     createRoute,
     updateRoute,
     deleteRoute,

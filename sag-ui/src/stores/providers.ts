@@ -138,6 +138,7 @@ export const useProviderStore = defineStore("providers", () => {
   }) {
     try {
       await api.post("/api/providers", payload)
+      await fetchProviders()
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       throw e
@@ -152,7 +153,9 @@ export const useProviderStore = defineStore("providers", () => {
         data: { name },
       })
       const { useRouteStore } = await import("./routes")
-      await useRouteStore().fetchRoutes()
+      const routeStore = useRouteStore()
+      routeStore.clearProviderModelsCache(name)
+      await routeStore.fetchRoutes()
     } catch (e: any) {
       providers.value = oldProviders
       if (e.response?.status === 401) useConnectionStore().handle401()
@@ -181,6 +184,10 @@ export const useProviderStore = defineStore("providers", () => {
   ) {
     try {
       await api.put("/api/providers", { name, ...payload })
+      await fetchProviders()
+      const { useRouteStore } = await import("./routes")
+      const routeStore = useRouteStore()
+      routeStore.clearProviderModelsCache(name)
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       console.error("[updateProvider] error:", e.code, e.message, e.response?.data)

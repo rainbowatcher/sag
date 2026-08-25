@@ -80,7 +80,11 @@ function isSelected(value: string): boolean {
 const triggerLabel = computed(() => {
   if (!props.modelValue) return null
   const opt = props.options.find((o) => o.value === props.modelValue)
-  return opt?.label ?? opt?.value ?? null
+  return (
+    opt?.label ??
+    opt?.value ??
+    (typeof props.modelValue === "string" && props.modelValue !== "" ? props.modelValue : null)
+  )
 })
 
 // ── Selection handler ────────────────────────────────────────────
