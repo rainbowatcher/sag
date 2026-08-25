@@ -73,20 +73,34 @@ const routeStore = useRouteStore()
 
 // ── Quick Create Route Dialog ──────────────────────
 const routeToCreate = ref<string | null>(null)
+const customRouteName = ref("")
 const creatingRoute = ref(false)
 
-const targetRouteName = computed(() => {
-  if (!props.providerName || !routeToCreate.value) return ""
-  return `${props.providerName}/${routeToCreate.value}`
+const isRouteNameEmpty = computed(() => !customRouteName.value.trim())
+
+const isRouteExisting = computed(() => {
+  const name = customRouteName.value.trim()
+  if (!name) return false
+  return routeStore.routes.some((r) => r.model_name === name)
+})
+
+const canConfirmRoute = computed(() => {
+  return !isRouteNameEmpty.value && !isRouteExisting.value && !creatingRoute.value
 })
 
 function openCreateRoute(model: string) {
   routeToCreate.value = model
+  customRouteName.value = props.providerName ? `${props.providerName}/${model}` : model
+  if (routeStore.routes.length === 0) {
+    routeStore.fetchRoutes()
+  }
 }
 
 async function confirmCreateRoute() {
   if (!props.providerName || !routeToCreate.value) return
-  const routeName = targetRouteName.value
+  const routeName = customRouteName.value.trim()
+  if (!routeName || isRouteExisting.value) return
+
   creatingRoute.value = true
   try {
     const payload: CreateRoutePayload = {
@@ -415,11 +429,28 @@ function onModelsEndpointChange(value: string | number) {
         <DialogHeader>
           <DialogTitle>Create Route</DialogTitle>
           <DialogDescription>
-            Create route
-            <span class="text-foreground font-mono font-semibold">{{ targetRouteName }}</span
-            >?
+            Create a single-target route for
+            <span class="text-foreground font-mono font-medium"
+              >{{ providerName }}/{{ routeToCreate }}</span
+            >.
           </DialogDescription>
         </DialogHeader>
+
+        <div class="space-y-2 py-2">
+          <FieldLabel for="quick-route-name">Route Name</FieldLabel>
+          <Input
+            id="quick-route-name"
+            :model-value="customRouteName"
+            placeholder="e.g. volc/deepseek-v4-flash"
+            class="font-mono text-sm"
+            @input="customRouteName = ($event.target as HTMLInputElement).value"
+            @keydown.enter.prevent="canConfirmRoute && confirmCreateRoute()"
+          />
+          <p v-if="isRouteExisting" class="text-destructive text-xs">
+            Route "{{ customRouteName.trim() }}" already exists.
+          </p>
+        </div>
+
         <DialogFooter class="flex flex-row justify-end gap-2 sm:justify-end">
           <Button
             variant="outline"
@@ -429,7 +460,7 @@ function onModelsEndpointChange(value: string | number) {
           >
             Cancel
           </Button>
-          <Button size="sm" :disabled="creatingRoute" @click="confirmCreateRoute">
+          <Button size="sm" :disabled="!canConfirmRoute" @click="confirmCreateRoute">
             <Loader2 v-if="creatingRoute" class="h-3 w-3 animate-spin" />
             {{ creatingRoute ? "Creating…" : "Confirm" }}
           </Button>
