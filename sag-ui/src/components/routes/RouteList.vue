@@ -462,63 +462,65 @@ const table = useVueTable({
     </div>
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
-    <div v-else class="min-h-0 flex-1 rounded-lg border [&>div]:h-full">
-      <TooltipProvider :delay-duration="200">
-        <Table>
-          <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
-            <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
-              <TableHead
-                v-for="header in headerGroup.headers"
-                :key="header.id"
-                :class="[
-                  (header.column.columnDef.meta as any)?.class,
-                  header.column.getCanSort()
-                    ? 'hover:text-foreground cursor-pointer transition-colors select-none'
-                    : '',
-                ]"
-                @click="header.column.getCanSort() && header.column.toggleSorting()"
+    <div v-else class="min-h-0 flex-1">
+      <div class="max-h-full overflow-auto rounded-lg border [&>div]:overflow-visible">
+        <TooltipProvider :delay-duration="200">
+          <Table>
+            <TableHeader class="bg-background/95 sticky top-0 z-10 backdrop-blur-xs">
+              <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
+                <TableHead
+                  v-for="header in headerGroup.headers"
+                  :key="header.id"
+                  :class="[
+                    (header.column.columnDef.meta as any)?.class,
+                    header.column.getCanSort()
+                      ? 'hover:text-foreground cursor-pointer transition-colors select-none'
+                      : '',
+                  ]"
+                  @click="header.column.getCanSort() && header.column.toggleSorting()"
+                >
+                  <div class="flex items-center gap-1">
+                    <FlexRender
+                      v-if="!header.isPlaceholder"
+                      :render="header.column.columnDef.header!"
+                      :props="header.getContext()"
+                    />
+                    <ArrowUpDown
+                      v-if="header.column.getCanSort()"
+                      class="h-3 w-3"
+                      :class="
+                        header.column.getIsSorted() ? 'text-foreground' : 'text-muted-foreground/40'
+                      "
+                    />
+                  </div>
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              <TableRow
+                v-for="row in table.getRowModel().rows"
+                :key="row.id"
+                :class="{
+                  'bg-destructive/10 text-muted-foreground':
+                    getRouteTargetStatus(row.original).validCount === 0,
+                  'bg-muted/20 text-muted-foreground':
+                    getRouteTargetStatus(row.original).validCount > 0 &&
+                    getRouteTargetStatus(row.original).invalidCount > 0,
+                  'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
+                }"
               >
-                <div class="flex items-center gap-1">
-                  <FlexRender
-                    v-if="!header.isPlaceholder"
-                    :render="header.column.columnDef.header!"
-                    :props="header.getContext()"
-                  />
-                  <ArrowUpDown
-                    v-if="header.column.getCanSort()"
-                    class="h-3 w-3"
-                    :class="
-                      header.column.getIsSorted() ? 'text-foreground' : 'text-muted-foreground/40'
-                    "
-                  />
-                </div>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            <TableRow
-              v-for="row in table.getRowModel().rows"
-              :key="row.id"
-              :class="{
-                'bg-destructive/10 text-muted-foreground':
-                  getRouteTargetStatus(row.original).validCount === 0,
-                'bg-muted/20 text-muted-foreground':
-                  getRouteTargetStatus(row.original).validCount > 0 &&
-                  getRouteTargetStatus(row.original).invalidCount > 0,
-                'bg-destructive/5': deleteDialogOpen && deleteTarget === row.original.model_name,
-              }"
-            >
-              <TableCell
-                v-for="cell in row.getVisibleCells()"
-                :key="cell.id"
-                :class="(cell.column.columnDef.meta as any)?.class"
-              >
-                <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
-              </TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
-      </TooltipProvider>
+                <TableCell
+                  v-for="cell in row.getVisibleCells()"
+                  :key="cell.id"
+                  :class="(cell.column.columnDef.meta as any)?.class"
+                >
+                  <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
+                </TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+        </TooltipProvider>
+      </div>
     </div>
   </div>
 

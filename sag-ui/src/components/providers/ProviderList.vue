@@ -393,10 +393,10 @@ const table = useVueTable({
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
     <div v-else class="min-h-0 flex-1">
-      <div class="h-full rounded-lg border [&>div]:h-full">
+      <div class="max-h-full overflow-auto rounded-lg border [&>div]:overflow-visible">
         <TooltipProvider :delay-duration="200">
           <Table>
-            <TableHeader class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs">
+            <TableHeader class="bg-background/95 sticky top-0 z-10 backdrop-blur-xs">
               <TableRow v-for="headerGroup in table.getHeaderGroups()" :key="headerGroup.id">
                 <TableHead
                   v-for="header in headerGroup.headers"
@@ -430,7 +430,7 @@ const table = useVueTable({
     <!-- ── Delete confirmation ───────────────────────────────────── -->
     <div
       v-if="confirmingDelete"
-      class="bg-destructive/5 border-destructive/20 fixed inset-x-0 bottom-0 z-50 border-t p-4 shadow-lg md:relative md:inset-auto md:rounded-lg md:border md:shadow-none"
+      class="bg-destructive/5 border-destructive/20 fixed inset-x-0 bottom-0 z-50 shrink-0 border-t p-4 shadow-lg md:relative md:inset-auto md:rounded-lg md:border md:shadow-none"
     >
       <div class="flex items-center justify-between gap-4">
         <p class="text-sm">
