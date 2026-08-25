@@ -1,9 +1,16 @@
 <script setup lang="ts">
-import { Check, ChevronDown, Loader2, Search } from "@lucide/vue"
-import { computed, ref, watch, nextTick, onMounted, onUnmounted } from "vue"
+import { Check, ChevronDown, Loader2 } from "@lucide/vue"
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Command, CommandGroup, CommandItem, CommandList } from "@/components/ui/command"
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { cn } from "@/lib/utils"
 
@@ -31,6 +38,8 @@ const props = withDefaults(
     loading?: boolean
     /** Enable multi-select mode */
     multiple?: boolean
+    /** Allow deselecting the current value in single-select mode */
+    allowDeselect?: boolean
   }>(),
   {
     placeholder: "Select...",
@@ -39,6 +48,7 @@ const props = withDefaults(
     disabled: false,
     loading: false,
     multiple: false,
+    allowDeselect: false,
   },
 )
 
@@ -49,19 +59,8 @@ const emit = defineEmits<{
 }>()
 
 const open = ref(false)
-const searchQuery = ref("")
-const searchInputRef = ref<HTMLInputElement>()
 const badgeContainer = ref<HTMLDivElement>()
 const visibleCount = ref(0)
-
-const filteredOptions = computed(() => {
-  if (!searchQuery.value.trim()) return props.options
-  const q = searchQuery.value.trim().toLowerCase()
-  return props.options.filter((opt) => {
-    const label = opt.label ?? opt.value
-    return label.toLowerCase().includes(q) || opt.value.toLowerCase().includes(q)
-  })
-})
 
 const selectedValues = computed(() => selectedArray())
 
@@ -104,7 +103,7 @@ function handleSelect(currentValue: string) {
     }
     // Keep popover open in multiple mode
   } else {
-    const newValue = currentValue === props.modelValue ? "" : currentValue
+    const newValue = props.allowDeselect && currentValue === props.modelValue ? "" : currentValue
     emit("update:modelValue", newValue)
     open.value = false
   }
@@ -206,11 +205,6 @@ watch(open, (isOpen) => {
   emit("update:open", isOpen)
   if (isOpen) {
     emit("open")
-    nextTick(() => {
-      searchInputRef.value?.focus()
-    })
-  } else {
-    searchQuery.value = ""
   }
 })
 
@@ -313,15 +307,7 @@ onUnmounted(() => {
       align="start"
     >
       <Command>
-        <div class="flex h-9 items-center gap-2 border-b px-3">
-          <Search class="size-4 shrink-0 opacity-50" />
-          <input
-            ref="searchInputRef"
-            v-model="searchQuery"
-            :placeholder="searchPlaceholder"
-            class="placeholder:text-muted-foreground flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
-          />
-        </div>
+        <CommandInput :placeholder="searchPlaceholder" />
         <CommandList>
           <div
             v-if="loading"
@@ -330,17 +316,12 @@ onUnmounted(() => {
             <Loader2 class="size-4 animate-spin" />
             <span>Loading models...</span>
           </div>
-          <div
-            v-else-if="filteredOptions.length === 0"
-            class="text-muted-foreground py-6 text-center text-sm"
-          >
-            {{ emptyText }}
-          </div>
-          <CommandGroup v-else>
+          <CommandEmpty v-else>{{ emptyText }}</CommandEmpty>
+          <CommandGroup v-if="!loading">
             <CommandItem
-              v-for="opt in filteredOptions"
+              v-for="opt in options"
               :key="opt.value"
-              :value="opt.value"
+              :value="opt.label ?? opt.value"
               @select="handleSelect(opt.value)"
               :class="opt.warning ? 'text-amber-600 dark:text-amber-400' : ''"
             >
