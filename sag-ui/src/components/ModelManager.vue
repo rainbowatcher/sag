@@ -93,7 +93,7 @@ const comboboxOptions = computed(() => {
       if (!existingSet.has(m)) {
         missingList.push({
           value: m,
-          label: `${m} (Not in upstream)`,
+          label: m,
           warning: true,
         })
       }
@@ -174,18 +174,27 @@ function onModelsEndpointChange(value: string | number) {
       v-model="expandedOverride"
       class="rounded-md border"
     >
-      <AccordionItem v-for="model in enabledModels" :key="model" :value="model">
+      <AccordionItem
+        v-for="model in enabledModels"
+        :key="model"
+        :value="model"
+        :class="{
+          'text-muted-foreground bg-amber-500/10 dark:bg-amber-500/15':
+            isModelMissingFromUpstream(model),
+        }"
+      >
         <div class="hover:bg-muted/50 flex items-center [&>:first-child]:flex-1">
           <AccordionTrigger class="px-3 py-0.5 hover:no-underline">
             <span class="flex items-center gap-2">
-              <span class="font-mono text-sm">{{ model }}</span>
-              <Badge
-                v-if="isModelMissingFromUpstream(model)"
-                variant="outline"
-                class="border-amber-500/40 bg-amber-500/10 px-1.5 py-0 text-[10px] font-normal text-amber-700 dark:text-amber-300"
+              <span
+                class="font-mono text-sm"
+                :class="{
+                  'font-medium text-amber-700 dark:text-amber-300':
+                    isModelMissingFromUpstream(model),
+                }"
               >
-                Not in upstream
-              </Badge>
+                {{ model }}
+              </span>
               <Badge
                 v-if="overrideCount(model) > 0"
                 variant="secondary"
