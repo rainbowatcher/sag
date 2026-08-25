@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { ref, watch } from "vue"
+import { onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
@@ -32,6 +32,11 @@ const emit = defineEmits<{
 
 const adding = ref(false)
 const apiError = ref("")
+
+onMounted(() => {
+  store.upstreamModels = []
+  store.upstreamModelsError = ""
+})
 
 // ── API keys management ──────────────────────────────────────
 const apiKeys = ref<string[]>([""])

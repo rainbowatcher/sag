@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils"
 export interface ComboboxOption {
   value: string
   label?: string
+  warning?: boolean
 }
 
 const props = withDefaults(
@@ -43,6 +44,8 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   "update:modelValue": [value: string | string[]]
+  "update:open": [value: boolean]
+  open: []
 }>()
 
 const open = ref(false)
@@ -200,7 +203,9 @@ onMounted(() => {
 })
 
 watch(open, (isOpen) => {
+  emit("update:open", isOpen)
   if (isOpen) {
+    emit("open")
     nextTick(() => {
       searchInputRef.value?.focus()
     })
@@ -241,7 +246,7 @@ onUnmounted(() => {
         variant="outline"
         role="combobox"
         :aria-expanded="open"
-        :disabled="disabled || loading"
+        :disabled="disabled"
         class="bg-background hover:bg-background border-input min-h-[2.25rem] w-full justify-between overflow-hidden px-3 font-normal"
       >
         <!-- Multi-select badge display -->
@@ -254,8 +259,14 @@ onUnmounted(() => {
             v-for="(value, idx) in selectedValues"
             :key="value"
             v-show="idx < visibleCount"
-            variant="secondary"
-            class="max-w-[150px] shrink-0 overflow-hidden text-ellipsis whitespace-nowrap"
+            :variant="options.find((o) => o.value === value)?.warning ? 'outline' : 'secondary'"
+            :class="
+              cn(
+                'max-w-[150px] shrink-0 overflow-hidden text-ellipsis whitespace-nowrap',
+                options.find((o) => o.value === value)?.warning &&
+                  'border-amber-500/40 bg-amber-500/10 font-normal text-amber-700 dark:text-amber-300',
+              )
+            "
           >
             {{ options.find((o) => o.value === value)?.label ?? value }}
             <button
@@ -313,10 +324,17 @@ onUnmounted(() => {
         </div>
         <CommandList>
           <div
-            v-if="loading || filteredOptions.length === 0"
+            v-if="loading"
+            class="text-muted-foreground flex items-center justify-center gap-2 py-6 text-sm"
+          >
+            <Loader2 class="size-4 animate-spin" />
+            <span>Loading models...</span>
+          </div>
+          <div
+            v-else-if="filteredOptions.length === 0"
             class="text-muted-foreground py-6 text-center text-sm"
           >
-            {{ loading ? "Loading..." : emptyText }}
+            {{ emptyText }}
           </div>
           <CommandGroup v-else>
             <CommandItem
@@ -324,6 +342,7 @@ onUnmounted(() => {
               :key="opt.value"
               :value="opt.value"
               @select="handleSelect(opt.value)"
+              :class="opt.warning ? 'text-amber-600 dark:text-amber-400' : ''"
             >
               {{ opt.label ?? opt.value }}
               <Check v-if="isSelected(opt.value)" :size="16" class="ml-auto" />

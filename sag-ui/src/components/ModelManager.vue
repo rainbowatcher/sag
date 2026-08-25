@@ -60,6 +60,42 @@ const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
 const expandedOverride = ref<string | undefined>(undefined)
 const customModel = ref("")
 
+const upstreamModelNames = computed(() => new Set(props.upstreamModels.map((m) => modelLabel(m))))
+const hasFetchedUpstream = computed(() => props.upstreamModels.length > 0)
+
+function isModelMissingFromUpstream(model: string): boolean {
+  return hasFetchedUpstream.value && !upstreamModelNames.value.has(model)
+}
+
+const comboboxOptions = computed(() => {
+  const upstreamList = props.upstreamModels.map((m) => {
+    const val = modelLabel(m)
+    return { value: val, label: val }
+  })
+  const existingSet = new Set(upstreamList.map((o) => o.value))
+
+  const missingList: { value: string; label: string; warning?: boolean }[] = []
+  if (hasFetchedUpstream.value) {
+    for (const m of props.enabledModels) {
+      if (!existingSet.has(m)) {
+        missingList.push({
+          value: m,
+          label: `${m} (Not in upstream)`,
+          warning: true,
+        })
+      }
+    }
+  }
+
+  return [...missingList, ...upstreamList]
+})
+
+function onComboboxOpen() {
+  if (!props.upstreamModelsLoading) {
+    emit("fetchModels", modelsEndpoint.value)
+  }
+}
+
 function addCustomModel() {
   const trimmed = customModel.value.trim()
   if (trimmed && !props.enabledModels.includes(trimmed)) {
@@ -124,6 +160,13 @@ function onModelsEndpointChange(value: string | number) {
           <AccordionTrigger class="px-3 py-0.5 hover:no-underline">
             <span class="flex items-center gap-2">
               <span class="font-mono text-sm">{{ model }}</span>
+              <Badge
+                v-if="isModelMissingFromUpstream(model)"
+                variant="outline"
+                class="border-amber-500/40 bg-amber-500/10 px-1.5 py-0 text-[10px] font-normal text-amber-700 dark:text-amber-300"
+              >
+                Not in upstream
+              </Badge>
               <Badge
                 v-if="overrideCount(model) > 0"
                 variant="secondary"
@@ -196,12 +239,13 @@ function onModelsEndpointChange(value: string | number) {
     <div class="min-w-0">
       <Combobox
         :model-value="enabledModels"
-        :options="upstreamModels.map((m) => ({ value: modelLabel(m) }))"
+        :options="comboboxOptions"
         placeholder="Select models..."
         search-placeholder="Search models..."
         empty-text="No models found. Click Refresh Models."
         :loading="upstreamModelsLoading"
         multiple
+        @open="onComboboxOpen"
         @update:model-value="(v) => emit('update:enabledModels', v as string[])"
       />
     </div>

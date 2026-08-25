@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
-import { computed, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
@@ -68,6 +68,11 @@ const emit = defineEmits<{
 const open = ref(true)
 const saving = ref(false)
 const apiError = ref("")
+
+onMounted(() => {
+  store.upstreamModels = []
+  store.upstreamModelsError = ""
+})
 
 function onOpenChange(v: boolean) {
   if (!v) emit("close")

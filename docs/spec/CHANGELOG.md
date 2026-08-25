@@ -9,6 +9,7 @@ updated: 2026-08-25
 
 ## 2026-08-25
 
+- **供应商**：[0003 供应商模型下拉自动拉取与缺失标记](providers/changes/0003-combobox-auto-fetch-and-missing-indicator.md) — Combobox 点击展开自动请求 models 接口并在下拉内展示 loading；比对已启用模型并在已选列表和下拉项中标记上游不存在的模型
 - **路由**：[0002 目标模型有效性校验与 Provider 变更联动感知](routing/changes/0002-target-model-validity-and-provider-sync.md) — 运行时 `filter_enabled_targets` 与 `/v1/models` 增加 `enabled_models` 白名单过滤；前端 Provider 变更联动清理模型缓存，Route 列表与 Target 编辑器增强失效目标诊断与高亮提示
 
 ## 2026-08-18
