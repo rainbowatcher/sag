@@ -67,6 +67,19 @@ function isModelMissingFromUpstream(model: string): boolean {
   return hasFetchedUpstream.value && !upstreamModelNames.value.has(model)
 }
 
+const hasFetched = ref(false)
+
+watch(modelsEndpoint, () => {
+  hasFetched.value = false
+})
+
+watch(
+  () => props.upstreamModels,
+  (models) => {
+    if (models.length > 0) hasFetched.value = true
+  },
+)
+
 const comboboxOptions = computed(() => {
   const upstreamList = props.upstreamModels.map((m) => {
     const val = modelLabel(m)
@@ -91,9 +104,15 @@ const comboboxOptions = computed(() => {
 })
 
 function onComboboxOpen() {
-  if (!props.upstreamModelsLoading) {
+  if (!hasFetched.value && !props.upstreamModelsLoading && props.upstreamModels.length === 0) {
+    hasFetched.value = true
     emit("fetchModels", modelsEndpoint.value)
   }
+}
+
+function handleManualRefresh() {
+  hasFetched.value = true
+  emit("fetchModels", modelsEndpoint.value)
 }
 
 function addCustomModel() {
@@ -277,10 +296,11 @@ function onModelsEndpointChange(value: string | number) {
         type="button"
         variant="outline"
         size="sm"
-        :disabled="disabled"
-        @click="emit('fetchModels', modelsEndpoint)"
+        :disabled="disabled || upstreamModelsLoading"
+        @click="handleManualRefresh"
       >
-        <RefreshCw class="h-3.5 w-3.5" />
+        <Loader2 v-if="upstreamModelsLoading" class="h-3.5 w-3.5 animate-spin" />
+        <RefreshCw v-else class="h-3.5 w-3.5" />
         Refresh Models
       </Button>
       <div v-if="upstreamModelsLoading" class="text-muted-foreground text-xs">
