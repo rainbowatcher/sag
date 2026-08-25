@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { AlertTriangle, ArrowDown, ArrowUp, EllipsisVertical, Plus, Trash2 } from "@lucide/vue"
+import { ArrowDown, ArrowUp, EllipsisVertical, Plus, Trash2 } from "@lucide/vue"
 import { computed, ref } from "vue"
-import Combobox from "@/components/Combobox.vue"
+import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -90,23 +90,25 @@ function toggleExpand(id: number) {
 }
 
 // --- Provider & Model Options Helpers ---
-function getProviderOptions(target: TargetItem) {
-  const list = props.providers.map((p) => ({
+function getProviderOptions(target: TargetItem): ComboboxOption[] {
+  const list: ComboboxOption[] = props.providers.map((p) => ({
     value: p.name,
     label: `${p.name} (${p.provider_type})${!p.enabled ? " — Disabled" : ""}`,
+    warning: !p.enabled,
   }))
   if (target.provider && !props.providers.some((p) => p.name === target.provider)) {
     list.unshift({
       value: target.provider,
       label: `${target.provider} (Not Found)`,
+      warning: true,
     })
   }
   return list
 }
 
-function getModelOptions(target: TargetItem) {
+function getModelOptions(target: TargetItem): ComboboxOption[] {
   const models = props.providerModels[target.provider] ?? []
-  const options = models.map((m) => ({ value: m, label: m }))
+  const options: ComboboxOption[] = models.map((m) => ({ value: m, label: m }))
   if (target.real_model && !models.includes(target.real_model)) {
     const p = props.providers.find((prov) => prov.name === target.provider)
     const isInvalid =
@@ -114,24 +116,24 @@ function getModelOptions(target: TargetItem) {
     options.unshift({
       value: target.real_model,
       label: isInvalid ? `${target.real_model} (Unavailable / Not in provider)` : target.real_model,
+      warning: isInvalid,
     })
   }
   return options
 }
 
-function getTargetWarning(target: TargetItem): string | null {
-  if (!target.provider) return null
+function isTargetWarning(target: TargetItem): boolean {
+  if (!target.provider) return false
   const p = props.providers.find((prov) => prov.name === target.provider)
-  if (!p) return `Provider "${target.provider}" not found`
-  if (!p.enabled) return `Provider "${target.provider}" is disabled`
+  if (!p || !p.enabled) return true
   if (
     target.real_model &&
     p.enabled_models.length > 0 &&
     !p.enabled_models.includes(target.real_model)
   ) {
-    return `Model "${target.real_model}" is not enabled for provider "${target.provider}"`
+    return true
   }
-  return null
+  return false
 }
 
 // --- Mutations ---
@@ -200,7 +202,11 @@ function onProviderChange(index: number, value: string) {
         </TableHeader>
         <TableBody>
           <template v-for="(t, displayIndex) in displayTargets" :key="t.id">
-            <TableRow>
+            <TableRow
+              :class="{
+                'text-muted-foreground bg-amber-500/10 dark:bg-amber-500/15': isTargetWarning(t),
+              }"
+            >
               <TableCell class="text-muted-foreground text-center text-xs font-medium">
                 {{ displayIndex + 1 }}
               </TableCell>
@@ -231,13 +237,6 @@ function onProviderChange(index: number, value: string) {
                     (v) => updateTarget(modelValue.indexOf(t), { real_model: v as string })
                   "
                 />
-                <p
-                  v-if="getTargetWarning(t)"
-                  class="mt-1 flex items-center gap-1 text-[11px] leading-tight text-amber-600 dark:text-amber-400"
-                >
-                  <AlertTriangle class="h-3 w-3 shrink-0" />
-                  {{ getTargetWarning(t) }}
-                </p>
               </TableCell>
               <TableCell class="text-right">
                 <div class="flex items-center justify-end gap-0.5">
