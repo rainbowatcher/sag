@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
+import { GitBranch, Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
+import { toast } from "vue-sonner"
 import Combobox from "@/components/Combobox.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import {
@@ -11,9 +12,20 @@ import {
 } from "@/components/ui/accordion"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { getErrorMessage } from "@/lib/utils"
+import { useRouteStore } from "@/stores/routes"
+import type { CreateRoutePayload } from "@/types/api"
 
 interface KvPair {
   key: string
@@ -32,6 +44,7 @@ export interface ModelTestState {
 
 const props = withDefaults(
   defineProps<{
+    providerName?: string
     enabledModels: string[]
     modelOverrides: Record<string, KvPair[]>
     upstreamModels: Record<string, unknown>[]
@@ -42,6 +55,7 @@ const props = withDefaults(
     disabled?: boolean
   }>(),
   {
+    providerName: "",
     modelTestStates: undefined,
     disabled: false,
   },
@@ -54,6 +68,49 @@ const emit = defineEmits<{
   fetchModels: [modelsEndpoint: string]
   testModel: [model: string]
 }>()
+
+const routeStore = useRouteStore()
+
+// ── Quick Create Route Dialog ──────────────────────
+const routeToCreate = ref<string | null>(null)
+const creatingRoute = ref(false)
+
+const targetRouteName = computed(() => {
+  if (!props.providerName || !routeToCreate.value) return ""
+  return `${props.providerName}/${routeToCreate.value}`
+})
+
+function openCreateRoute(model: string) {
+  routeToCreate.value = model
+}
+
+async function confirmCreateRoute() {
+  if (!props.providerName || !routeToCreate.value) return
+  const routeName = targetRouteName.value
+  creatingRoute.value = true
+  try {
+    const payload: CreateRoutePayload = {
+      model_name: routeName,
+      api_endpoint: "/chat/completions",
+      strategy: "sticky_failover",
+      targets: [
+        {
+          provider: props.providerName,
+          real_model: routeToCreate.value,
+          priority: 0,
+        },
+      ],
+    }
+    await routeStore.createRoute(payload)
+    toast.success(`Route "${routeName}" created`)
+    routeToCreate.value = null
+    await routeStore.fetchRoutes()
+  } catch (e: any) {
+    toast.error(getErrorMessage(e, "Failed to create route"))
+  } finally {
+    creatingRoute.value = false
+  }
+}
 
 // ── Internal state ─────────────────────────────────
 const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
@@ -185,6 +242,7 @@ function onModelsEndpointChange(value: string | number) {
       >
         <div class="hover:bg-muted/50 flex items-center [&>:first-child]:flex-1">
           <AccordionTrigger class="px-3 py-0.5 hover:no-underline">
+            <template #icon><span class="hidden" /></template>
             <span class="flex items-center gap-2">
               <span
                 class="font-mono text-sm"
@@ -243,6 +301,23 @@ function onModelsEndpointChange(value: string | number) {
                   </div>
                 </template>
                 <template v-else> Click to test </template>
+              </TooltipContent>
+            </Tooltip>
+
+            <Tooltip v-if="providerName">
+              <TooltipTrigger as-child>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Create route"
+                  aria-label="Create route"
+                  @click.stop="openCreateRoute(model)"
+                >
+                  <GitBranch class="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" align="end" class="text-xs">
+                Create route {{ providerName }}/{{ model }}
               </TooltipContent>
             </Tooltip>
 
@@ -333,5 +408,33 @@ function onModelsEndpointChange(value: string | number) {
         @update:model-value="onModelsEndpointChange"
       />
     </div>
+
+    <!-- ── Quick Create Route Confirmation Dialog ──────────── -->
+    <Dialog :open="routeToCreate !== null" @update:open="(v) => !v && (routeToCreate = null)">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Create Route</DialogTitle>
+          <DialogDescription>
+            Create route
+            <span class="text-foreground font-mono font-semibold">{{ targetRouteName }}</span
+            >?
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter class="flex flex-row justify-end gap-2 sm:justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            :disabled="creatingRoute"
+            @click="routeToCreate = null"
+          >
+            Cancel
+          </Button>
+          <Button size="sm" :disabled="creatingRoute" @click="confirmCreateRoute">
+            <Loader2 v-if="creatingRoute" class="h-3 w-3 animate-spin" />
+            {{ creatingRoute ? "Creating…" : "Confirm" }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>

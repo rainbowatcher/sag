@@ -331,6 +331,7 @@ async function handleSubmit() {
           <!-- ─── Tab: Models ─────────────────────────────────── -->
           <TabsContent value="models" class="space-y-3">
             <ModelManager
+              :provider-name="provider.name"
               :enabled-models="enabledModels"
               :upstream-models="store.upstreamModels"
               :upstream-models-loading="store.upstreamModelsLoading"

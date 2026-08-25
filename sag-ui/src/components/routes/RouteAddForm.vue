@@ -14,8 +14,6 @@ import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, Strategy, CreateRoutePayload, TargetItem } from "@/types/api"
 
-const routeStore = useRouteStore()
-
 const props = defineProps<{
   providers: Provider[]
   providerModelsLoading: boolean
@@ -26,6 +24,8 @@ const emit = defineEmits<{
   close: []
   created: []
 }>()
+
+const routeStore = useRouteStore()
 
 const adding = ref(false)
 const apiError = ref("")
@@ -99,6 +99,8 @@ const form = useForm({
       }
 
       await routeStore.createRoute(payload)
+      toast.success(`Route "${routeName}" created`)
+      emit("created")
     } catch (e: any) {
       apiError.value = getErrorMessage(e)
       throw e
@@ -106,20 +108,12 @@ const form = useForm({
   },
 })
 
-function onCreated() {
-  const name = form.state.values.model_name || targets.value[0].real_model || ""
-  toast.success(`Route "${name}" created`)
-}
-
 async function handleSubmit(event: Event) {
   event.preventDefault()
   apiError.value = ""
   adding.value = true
   try {
     await form.handleSubmit()
-    if (apiError.value) return
-    onCreated()
-    emit("created")
   } catch (e: any) {
     if (!apiError.value) toast.error(getErrorMessage(e))
   } finally {
@@ -205,6 +199,7 @@ async function handleSubmit(event: Event) {
         />
       </form>
     </CardContent>
+
     <CardFooter class="flex justify-end">
       <Button type="submit" form="route-add-form" :disabled="adding">
         <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
