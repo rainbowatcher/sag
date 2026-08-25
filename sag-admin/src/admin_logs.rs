@@ -29,7 +29,7 @@ pub struct LogsQuery {
     #[serde(default)]
     pub real_model: Option<String>,
     #[serde(default)]
-    pub status_code: Option<u16>,
+    pub status_code: Option<String>,
     #[serde(default)]
     pub offset: u64,
     #[serde(default = "default_log_limit")]
@@ -53,7 +53,10 @@ fn build_filter(query: LogsQuery) -> LogFilter {
         provider: query.provider.filter(|s| !s.is_empty()),
         model: query.model.filter(|s| !s.is_empty()),
         real_model: query.real_model.filter(|s| !s.is_empty()),
-        status_code: query.status_code,
+        status_code: query
+            .status_code
+            .as_deref()
+            .and_then(sag_analytics::StatusCodeFilter::parse),
         offset: query.offset,
         limit: query.limit.min(MAX_LOG_LIMIT),
     }
@@ -246,6 +249,42 @@ mod tests {
             .clone();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["status_code"], 502);
+    }
+
+    #[tokio::test]
+    async fn list_logs_filters_by_non_2xx() {
+        let state = build_state(HashMap::new(), vec![]).await;
+        insert_logs(
+            &state,
+            vec![
+                make_log("openai", "gpt-4o", "gpt-4o", 200),
+                make_log("openai", "gpt-4o", "gpt-4o", 400),
+                make_log("openai", "gpt-4o", "gpt-4o", 502),
+            ],
+        )
+        .await;
+
+        let app = test_app(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/logs?status_code=non_2xx")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let data = json_body(response).await["data"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(data.len(), 2);
+        let codes: Vec<u64> = data
+            .iter()
+            .map(|r| r["status_code"].as_u64().unwrap())
+            .collect();
+        assert!(codes.contains(&400));
+        assert!(codes.contains(&502));
+        assert!(!codes.contains(&200));
     }
 
     /// Combination filter: `model` + `real_model` together. The Vue

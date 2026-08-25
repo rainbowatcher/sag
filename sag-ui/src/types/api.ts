@@ -160,7 +160,7 @@ export interface LogFilter {
   provider?: string
   model?: string
   real_model?: string
-  status_code?: number
+  status_code?: number | string
   offset?: number
   limit?: number
 }

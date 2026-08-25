@@ -8,8 +8,8 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::store::{
-    CacheStatsRow, DistributionRow, LogFilter, LogStore, StatsFilter, StatsRow, TrendFilter,
-    TrendRow,
+    CacheStatsRow, DistributionRow, LogFilter, LogStore, StatsFilter, StatsRow, StatusCodeFilter,
+    TrendFilter, TrendRow,
 };
 
 /// Stage-0.4 extension columns added to `call_logs` beyond the original
@@ -272,8 +272,17 @@ impl LogStore for SqliteLogStore {
         if filter.real_model.as_deref().is_some_and(|m| !m.is_empty()) {
             conditions.push("real_model = ?");
         }
-        if filter.status_code.is_some() {
-            conditions.push("status_code = ?");
+        if let Some(sc) = &filter.status_code {
+            match sc {
+                StatusCodeFilter::Exact(_) => conditions.push("status_code = ?"),
+                StatusCodeFilter::Named(name) => match name.as_str() {
+                    "non_2xx" => conditions.push("(status_code < 200 OR status_code >= 300)"),
+                    "2xx" => conditions.push("(status_code >= 200 AND status_code < 300)"),
+                    "4xx" => conditions.push("(status_code >= 400 AND status_code < 500)"),
+                    "5xx" => conditions.push("(status_code >= 500 AND status_code < 600)"),
+                    _ => {}
+                },
+            }
         }
         if !conditions.is_empty() {
             sql.push_str("WHERE ");
@@ -292,7 +301,7 @@ impl LogStore for SqliteLogStore {
         if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
             query = query.bind(rm);
         }
-        if let Some(sc) = filter.status_code {
+        if let Some(StatusCodeFilter::Exact(sc)) = filter.status_code {
             query = query.bind(sc as i32);
         }
         let limit = filter.limit.min(MAX_LOG_LIMIT);
@@ -319,8 +328,17 @@ impl LogStore for SqliteLogStore {
         if filter.real_model.as_deref().is_some_and(|m| !m.is_empty()) {
             conditions.push("real_model = ?");
         }
-        if filter.status_code.is_some() {
-            conditions.push("status_code = ?");
+        if let Some(sc) = &filter.status_code {
+            match sc {
+                StatusCodeFilter::Exact(_) => conditions.push("status_code = ?"),
+                StatusCodeFilter::Named(name) => match name.as_str() {
+                    "non_2xx" => conditions.push("(status_code < 200 OR status_code >= 300)"),
+                    "2xx" => conditions.push("(status_code >= 200 AND status_code < 300)"),
+                    "4xx" => conditions.push("(status_code >= 400 AND status_code < 500)"),
+                    "5xx" => conditions.push("(status_code >= 500 AND status_code < 600)"),
+                    _ => {}
+                },
+            }
         }
         if !conditions.is_empty() {
             sql.push_str(" WHERE ");
@@ -337,7 +355,7 @@ impl LogStore for SqliteLogStore {
         if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
             query = query.bind(rm);
         }
-        if let Some(sc) = filter.status_code {
+        if let Some(StatusCodeFilter::Exact(sc)) = filter.status_code {
             query = query.bind(sc as i32);
         }
 
@@ -746,6 +764,61 @@ mod tests {
         assert_eq!(page2.len(), 2);
     }
 
+    #[tokio::test]
+    async fn query_logs_with_status_code_filters() {
+        let store = SqliteLogStore::new_memory().await.unwrap();
+
+        let mut log200 = make_log("openai", "gpt-4o", "gpt-4o");
+        log200.status_code = 200;
+        let mut log400 = make_log("openai", "gpt-4o", "gpt-4o");
+        log400.status_code = 400;
+        let mut log502 = make_log("openai", "gpt-4o", "gpt-4o");
+        log502.status_code = 502;
+
+        store.insert_batch(&[log200, log400, log502]).await.unwrap();
+
+        // non_2xx should return 400 and 502 (2 items)
+        let non_2xx_filter = LogFilter {
+            status_code: Some(StatusCodeFilter::Named("non_2xx".into())),
+            limit: 10,
+            ..Default::default()
+        };
+        let non_2xx_rows = store.query_logs(non_2xx_filter.clone()).await.unwrap();
+        assert_eq!(non_2xx_rows.len(), 2);
+        let non_2xx_count = store.count_logs(non_2xx_filter).await.unwrap();
+        assert_eq!(non_2xx_count, 2);
+
+        // exact 200 should return 1 item
+        let exact_filter = LogFilter {
+            status_code: Some(StatusCodeFilter::Exact(200)),
+            limit: 10,
+            ..Default::default()
+        };
+        let exact_rows = store.query_logs(exact_filter.clone()).await.unwrap();
+        assert_eq!(exact_rows.len(), 1);
+        assert_eq!(exact_rows[0].status_code, 200);
+
+        // 4xx should return 1 item
+        let f4xx = LogFilter {
+            status_code: Some(StatusCodeFilter::Named("4xx".into())),
+            limit: 10,
+            ..Default::default()
+        };
+        let f4xx_rows = store.query_logs(f4xx).await.unwrap();
+        assert_eq!(f4xx_rows.len(), 1);
+        assert_eq!(f4xx_rows[0].status_code, 400);
+
+        // 5xx should return 1 item
+        let f5xx = LogFilter {
+            status_code: Some(StatusCodeFilter::Named("5xx".into())),
+            limit: 10,
+            ..Default::default()
+        };
+        let f5xx_rows = store.query_logs(f5xx).await.unwrap();
+        assert_eq!(f5xx_rows.len(), 1);
+        assert_eq!(f5xx_rows[0].status_code, 502);
+    }
+
     /// Every CallLog extension field must round-trip through insert/query.
     #[tokio::test]
     async fn insert_and_query_logs_round_trip_stage04_fields() {
@@ -828,7 +901,7 @@ mod tests {
 
         let logs = store
             .query_logs(LogFilter {
-                status_code: Some(502),
+                status_code: Some(502.into()),
                 limit: 10,
                 ..Default::default()
             })

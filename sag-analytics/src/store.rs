@@ -49,13 +49,47 @@ pub struct StatsFilter {
     pub to: Option<DateTime<Utc>>,
 }
 
+/// Status code filter for paginated call log queries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum StatusCodeFilter {
+    /// Exact HTTP status code (e.g. 200, 404, 502).
+    Exact(u16),
+    /// Named filter category such as "non_2xx", "2xx", "4xx", "5xx".
+    Named(String),
+}
+
+impl StatusCodeFilter {
+    pub fn parse(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        match trimmed.to_lowercase().as_str() {
+            "non_2xx" | "non-2xx" | "non2xx" | "error" | "errors" => {
+                Some(Self::Named("non_2xx".into()))
+            }
+            "2xx" => Some(Self::Named("2xx".into())),
+            "4xx" => Some(Self::Named("4xx".into())),
+            "5xx" => Some(Self::Named("5xx".into())),
+            other => other.parse::<u16>().ok().map(Self::Exact),
+        }
+    }
+}
+
+impl From<u16> for StatusCodeFilter {
+    fn from(code: u16) -> Self {
+        Self::Exact(code)
+    }
+}
+
 /// Filter for paginated call log queries.
 #[derive(Debug, Clone, Default)]
 pub struct LogFilter {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub real_model: Option<String>,
-    pub status_code: Option<u16>,
+    pub status_code: Option<StatusCodeFilter>,
     pub offset: u64,
     pub limit: u64,
 }

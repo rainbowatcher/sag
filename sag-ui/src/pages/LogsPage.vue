@@ -41,6 +41,9 @@ const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
 
 const statusCodeOptions = [
+  { value: "non_2xx", label: "Non-2xx (All Errors)" },
+  { value: "4xx", label: "4xx (Client Errors)" },
+  { value: "5xx", label: "5xx (Server Errors)" },
   { value: "200", label: "200 OK" },
   { value: "400", label: "400 Bad Request" },
   { value: "401", label: "401 Unauthorized" },
@@ -63,7 +66,7 @@ const modelOptions = computed(() => providerStore.allProviderModels.map((m) => (
 const routeModelOptions = computed(() => routeStore.routes.map((r) => ({ value: r.model_name })))
 
 async function refreshLogs() {
-  const status_code = logsFilterStatusCode.value ? Number(logsFilterStatusCode.value) : undefined
+  const status_code = logsFilterStatusCode.value ? logsFilterStatusCode.value : undefined
   await store.applyLogsFilter({
     provider: logsFilterProvider.value || undefined,
     model: logsFilterModel.value || undefined,
