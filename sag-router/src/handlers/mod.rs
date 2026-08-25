@@ -67,7 +67,21 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
                 config
                     .providers
                     .get(&t.provider)
-                    .map(|pc| pc.enabled)
+                    .map(|pc| {
+                        if !pc.enabled {
+                            return false;
+                        }
+                        if !pc.enabled_models.is_empty() {
+                            let model_to_check =
+                                t.real_model.as_deref().unwrap_or(&route.model_name);
+                            if model_to_check != "*"
+                                && !pc.enabled_models.iter().any(|m| m == model_to_check)
+                            {
+                                return false;
+                            }
+                        }
+                        true
+                    })
                     .unwrap_or(true)
             })
         })
@@ -281,5 +295,61 @@ mod tests {
             !model_ids.contains(&"claude-opus"),
             "claude-opus should NOT be in models list (all targets disabled)"
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_excludes_routes_with_models_not_in_enabled_models() {
+        let mut providers = HashMap::new();
+        let mut pc = provider_config(true);
+        pc.enabled_models = vec!["gpt-4o".into()];
+        providers.insert("openai".into(), pc);
+
+        let routes = vec![
+            RouteConfig {
+                model_name: "gpt-4o".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                timeout_secs: None,
+                strategy: Strategy::FillFirst,
+                targets: vec![RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("gpt-4o".into()),
+                    priority: 1,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                }],
+            },
+            RouteConfig {
+                model_name: "deleted-model".into(),
+                api_endpoint: "/chat/completions".into(),
+                retries: None,
+                timeout_secs: None,
+                strategy: Strategy::FillFirst,
+                targets: vec![RouteTarget {
+                    provider: "openai".into(),
+                    real_model: Some("deleted-model".into()),
+                    priority: 1,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                }],
+            },
+        ];
+
+        let config = GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = ConfigHandle::from_config(config);
+        let provider_registry = build_provider_registry(&handle, true).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let Json(response) = list_models(State(state)).await;
+        let data = response["data"].as_array().unwrap();
+        let model_ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(model_ids.contains(&"gpt-4o"));
+        assert!(!model_ids.contains(&"deleted-model"));
     }
 }

@@ -91,15 +91,14 @@ pub async fn resolve_route(
         return Err(response);
     };
 
-    // Drop targets pointing at disabled providers.
-    let targets =
-        filter_enabled_targets(&config_guard.providers, &route.targets, &route.model_name);
+    // Drop targets pointing at disabled providers or models not in enabled_models.
+    let targets = filter_enabled_targets(&config_guard.providers, &route.targets, &request.model);
 
     if targets.is_empty() {
         let err = AppError::AllProvidersExhausted {
             model: request.model.clone(),
             reason: format!(
-                "all targets for route '{}' point to disabled providers",
+                "all targets for route '{}' point to disabled or unavailable providers/models",
                 route.model_name
             ),
         };
@@ -259,27 +258,40 @@ async fn emit_route_failure_event(state: &AppState, event: AnalyticsEvent) {
     }
 }
 
-/// Drop targets whose provider is marked `enabled = false` in the config.
+/// Drop targets whose provider is marked `enabled = false` in the config
+/// or whose model is not in the provider's non-empty `enabled_models` list.
 pub fn filter_enabled_targets(
     providers: &HashMap<String, ProviderConfig>,
     targets: &[RouteTarget],
-    route_name: &str,
+    requested_model: &str,
 ) -> Vec<RouteTarget> {
     targets
         .iter()
         .filter(|t| {
-            let enabled = providers
-                .get(&t.provider)
-                .map(|pc| pc.enabled)
-                .unwrap_or(true);
-            if !enabled {
+            let Some(pc) = providers.get(&t.provider) else {
+                return true;
+            };
+            if !pc.enabled {
                 info!(
                     provider = %t.provider,
-                    route = %route_name,
+                    requested_model = %requested_model,
                     "skipping disabled provider in route target"
                 );
+                return false;
             }
-            enabled
+            if !pc.enabled_models.is_empty() {
+                let model_to_check = t.real_model.as_deref().unwrap_or(requested_model);
+                if model_to_check != "*" && !pc.enabled_models.iter().any(|m| m == model_to_check) {
+                    info!(
+                        provider = %t.provider,
+                        model = %model_to_check,
+                        requested_model = %requested_model,
+                        "skipping target because model is not in provider enabled_models"
+                    );
+                    return false;
+                }
+            }
+            true
         })
         .cloned()
         .collect()
@@ -352,6 +364,57 @@ mod tests {
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].provider, "on");
+    }
+
+    #[test]
+    fn filter_enabled_targets_drops_targets_not_in_enabled_models() {
+        let mut providers = HashMap::new();
+        let mut pc_restricted = provider_config(true);
+        pc_restricted.enabled_models = vec!["gpt-4o".into(), "gpt-4o-mini".into()];
+        providers.insert("openai".into(), pc_restricted);
+
+        // target 1: real_model "gpt-4o" is allowed
+        // target 2: real_model "claude-3-opus" is not in enabled_models
+        // target 3: real_model None with requested_model "gpt-4o" is allowed
+        // target 4: real_model None with requested_model "unknown-model" is not allowed
+        let targets = vec![
+            RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 1,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            },
+            RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("claude-3-opus".into()),
+                priority: 2,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            },
+        ];
+
+        let filtered = filter_enabled_targets(&providers, &targets, "any-route");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].real_model.as_deref(), Some("gpt-4o"));
+
+        // When requested_model is "gpt-4o-mini" and target has real_model = None
+        let passthrough_targets = vec![RouteTarget {
+            provider: "openai".into(),
+            real_model: None,
+            priority: 1,
+            retries: None,
+            timeout_secs: None,
+            extra: HashMap::new(),
+        }];
+        let filtered_pass = filter_enabled_targets(&providers, &passthrough_targets, "gpt-4o-mini");
+        assert_eq!(filtered_pass.len(), 1);
+
+        let filtered_blocked =
+            filter_enabled_targets(&providers, &passthrough_targets, "non-existent-model");
+        assert_eq!(filtered_blocked.len(), 0);
     }
 
     #[test]

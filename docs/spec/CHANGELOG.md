@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-08-18
+updated: 2026-08-25
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-08-25
+
+- **路由**：[0002 目标模型有效性校验与 Provider 变更联动感知](routing/changes/0002-target-model-validity-and-provider-sync.md) — 运行时 `filter_enabled_targets` 与 `/v1/models` 增加 `enabled_models` 白名单过滤；前端 Provider 变更联动清理模型缓存，Route 列表与 Target 编辑器增强失效目标诊断与高亮提示
 
 ## 2026-08-18
 

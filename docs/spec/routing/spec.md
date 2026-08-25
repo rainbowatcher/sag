@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-08-25
 ---
 
 # 路由 — 规格
@@ -99,3 +99,4 @@ sequenceDiagram
 
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
+- [0002 目标模型有效性校验与 Provider 变更联动感知](changes/0002-target-model-validity-and-provider-sync.md)
