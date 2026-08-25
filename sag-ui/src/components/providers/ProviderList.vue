@@ -8,6 +8,13 @@ import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -360,15 +367,24 @@ const table = useVueTable({
         </div>
         <div class="flex shrink-0 items-center gap-2">
           <RefreshButton :loading="store.providersLoading" @click="refreshAll()" />
-          <Button size="sm" @click="showAdd = !showAdd">
+          <Button size="sm" @click="showAdd = true">
             <Plus class="h-3.5 w-3.5" />
             Add Provider
           </Button>
         </div>
       </div>
-
-      <ProviderAddForm v-if="showAdd" @close="showAdd = false" @created="onCreated" />
     </div>
+
+    <!-- ── Add Provider Dialog ───────────────────────────────────── -->
+    <Dialog :open="showAdd" @update:open="(v) => !v && (showAdd = false)">
+      <DialogContent class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
+        <DialogHeader class="shrink-0">
+          <DialogTitle>New Provider</DialogTitle>
+          <DialogDescription> Configure a new upstream provider connection </DialogDescription>
+        </DialogHeader>
+        <ProviderAddForm @close="showAdd = false" @created="onCreated" />
+      </DialogContent>
+    </Dialog>
 
     <!-- ── Loading ───────────────────────────────────────────────── -->
     <div

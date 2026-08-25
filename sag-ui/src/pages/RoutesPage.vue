@@ -6,6 +6,13 @@ import RefreshButton from "@/components/RefreshButton.vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
@@ -70,16 +77,26 @@ onMounted(refreshPage)
           </Button>
         </div>
       </div>
-
-      <RouteAddForm
-        v-if="showAdd"
-        :providers="providerStore.providers"
-        :provider-models="routeStore.providerModels"
-        :provider-models-loading="routeStore.providerModelsLoading"
-        @close="showAdd = false"
-        @created="handleRouteCreated"
-      />
     </div>
+
+    <!-- ── Add Route Dialog ─────────────────────────────────────────── -->
+    <Dialog :open="showAdd" @update:open="(v) => !v && (showAdd = false)">
+      <DialogContent class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-3xl">
+        <DialogHeader class="shrink-0">
+          <DialogTitle>New Route</DialogTitle>
+          <DialogDescription>
+            Configure a new routing rule and its target providers
+          </DialogDescription>
+        </DialogHeader>
+        <RouteAddForm
+          :providers="providerStore.providers"
+          :provider-models="routeStore.providerModels"
+          :provider-models-loading="routeStore.providerModelsLoading"
+          @close="showAdd = false"
+          @created="handleRouteCreated"
+        />
+      </DialogContent>
+    </Dialog>
 
     <div class="min-h-0 flex-1 pt-4 pb-4">
       <div

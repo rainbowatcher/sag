@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { X, Loader2 } from "@lucide/vue"
+import { Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { ref } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
@@ -123,17 +122,12 @@ async function handleSubmit(event: Event) {
 </script>
 
 <template>
-  <Card class="space-y-4">
-    <CardHeader class="flex flex-row items-center justify-between space-y-0">
-      <CardTitle>New Route</CardTitle>
-      <Button variant="ghost" size="icon-sm" @click="emit('close')">
-        <X class="h-4 w-4" />
-      </Button>
-    </CardHeader>
-    <CardContent>
-      <div v-if="apiError" class="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-        {{ apiError }}
-      </div>
+  <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div v-if="apiError" class="mb-4 shrink-0 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
+      {{ apiError }}
+    </div>
+
+    <div class="min-h-0 flex-1 overflow-y-auto px-1 py-1 sm:px-2">
       <form id="route-add-form" @submit.prevent="handleSubmit">
         <div class="grid grid-cols-2 gap-4">
           <form.Field name="model_name" #default="{ field }">
@@ -143,6 +137,7 @@ async function handleSubmit(event: Event) {
                 :id="field.name"
                 :model-value="field.state.value"
                 placeholder="gpt-4o"
+                class="font-mono text-sm"
                 @blur="field.handleBlur"
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
@@ -198,13 +193,16 @@ async function handleSubmit(event: Event) {
           :provider-models-loading="providerModelsLoading"
         />
       </form>
-    </CardContent>
+    </div>
 
-    <CardFooter class="flex justify-end">
-      <Button type="submit" form="route-add-form" :disabled="adding">
+    <div class="mt-4 flex shrink-0 justify-end gap-2 border-t pt-4">
+      <Button variant="outline" size="sm" type="button" :disabled="adding" @click="emit('close')">
+        Cancel
+      </Button>
+      <Button type="submit" form="route-add-form" size="sm" :disabled="adding">
         <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
         {{ adding ? "Adding..." : "Create Route" }}
       </Button>
-    </CardFooter>
-  </Card>
+    </div>
+  </div>
 </template>

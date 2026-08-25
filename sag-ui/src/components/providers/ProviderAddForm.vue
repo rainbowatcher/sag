@@ -8,7 +8,6 @@ import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import ModelManager from "@/components/ModelManager.vue"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
@@ -102,92 +101,103 @@ const form = useForm({
   },
   onSubmit: async ({ value }) => {
     apiError.value = ""
-    try {
-      // Parse body overrides
-      const parsedBodyOverrides: Record<string, any> = {}
-      for (const { key, value: val } of bodyOverrides.value) {
-        if (!key.trim()) continue
-        try {
-          parsedBodyOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
-        } catch {
-          apiError.value = `Body override "${key}": invalid JSON value`
-          throw new Error("invalid body override JSON")
-        }
-      }
 
-      // Parse model_overrides
-      const parsedModelOverrides: Record<string, Record<string, any>> = {}
-      for (const [model, pairs] of Object.entries(modelOverridesMap.value)) {
-        const overrides: Record<string, any> = {}
-        for (const { key, value: val } of pairs) {
-          if (!key.trim()) continue
+    const validKeys = apiKeys.value.filter((k) => k.trim().length > 0)
+    if (validKeys.length === 0) {
+      apiError.value = "At least one API key is required"
+      return
+    }
+
+    const parsedHeaders = headers.value.reduce(
+      (acc, h) => {
+        if (h.key.trim() && h.value.trim()) {
+          acc[h.key.trim()] = h.value.trim()
+        }
+        return acc
+      },
+      {} as Record<string, string>,
+    )
+
+    const parsedOverrides = bodyOverrides.value.reduce(
+      (acc, h) => {
+        if (h.key.trim() && h.value.trim()) {
           try {
-            overrides[key.trim()] = val.trim() ? JSON.parse(val) : val
+            acc[h.key.trim()] = JSON.parse(h.value.trim())
           } catch {
-            apiError.value = `Model override "${model}.${key}": invalid JSON value`
-            throw new Error("invalid model override JSON")
+            acc[h.key.trim()] = h.value.trim()
           }
         }
+        return acc
+      },
+      {} as Record<string, any>,
+    )
+
+    const parsedModelOverrides = Object.entries(modelOverridesMap.value).reduce(
+      (acc, [model, pairs]) => {
+        const overrides = pairs.reduce(
+          (mAcc, h) => {
+            if (h.key.trim() && h.value.trim()) {
+              try {
+                mAcc[h.key.trim()] = JSON.parse(h.value.trim())
+              } catch {
+                mAcc[h.key.trim()] = h.value.trim()
+              }
+            }
+            return mAcc
+          },
+          {} as Record<string, any>,
+        )
         if (Object.keys(overrides).length > 0) {
-          parsedModelOverrides[model] = overrides
+          acc[model] = overrides
         }
-      }
+        return acc
+      },
+      {} as Record<string, Record<string, any>>,
+    )
 
-      // Build headers map
-      const parsedHeaders: Record<string, string> = {}
-      for (const { key, value: val } of headers.value) {
-        if (key.trim() && val.trim()) {
-          parsedHeaders[key.trim()] = val.trim()
-        }
-      }
+    const filteredStrip = stripFields.value.filter((f) => f.trim().length > 0)
 
-      const validKeys = apiKeys.value.filter((k) => k.trim())
-
-      // Omit timeout_secs when left blank so the backend applies its
-      // default (600s) — single source of truth, no frontend/backend drift.
-      const payload: Parameters<typeof store.addProvider>[0] = {
+    try {
+      await store.addProvider({
         name: value.name,
+        provider_type: value.provider_type,
+        base_url: value.base_url,
         api_keys: validKeys,
         key_strategy: keyStrategy.value,
-        provider_type: value.provider_type,
-        base_url: value.base_url || undefined,
-        headers: parsedHeaders,
-        body_overrides: parsedBodyOverrides,
-        strip_fields: stripFields.value.filter((s) => s.trim()).map((s) => s.trim()),
-        model_overrides: parsedModelOverrides,
         enabled_models: enabledModels.value,
-        models_endpoint: modelsEndpoint.value.trim() || undefined,
-      }
-      await store.addProvider(payload)
-      toast.success(`Provider "${value.name}" created`)
+        headers: Object.keys(parsedHeaders).length > 0 ? parsedHeaders : undefined,
+        body_overrides: Object.keys(parsedOverrides).length > 0 ? parsedOverrides : undefined,
+        model_overrides:
+          Object.keys(parsedModelOverrides).length > 0 ? parsedModelOverrides : undefined,
+        strip_fields: filteredStrip.length > 0 ? filteredStrip : undefined,
+        timeout_secs: value.timeout_secs,
+        models_endpoint:
+          modelsEndpoint.value &&
+          modelsEndpoint.value !== defaultModelsEndpoint(value.provider_type)
+            ? modelsEndpoint.value
+            : undefined,
+      })
+
       emit("created")
     } catch (e: any) {
-      const msg = getErrorMessage(e)
-      apiError.value = msg
-      toast.error(msg)
+      apiError.value = getErrorMessage(e)
       throw e
     }
   },
 })
 
-// Watch provider_type: if base_url still matches a known default,
-// auto-switch to the new type's default.
+// Auto-fill base_url when provider_type changes
 watch(
   () => form.state.values.provider_type,
-  (newType, oldType) => {
-    const currentUrl = form.state.values.base_url
-    const isDefault = Object.values(DEFAULT_BASE_URLS).includes(currentUrl)
-    if (isDefault && DEFAULT_BASE_URLS[newType]) {
+  (newType) => {
+    if (newType && DEFAULT_BASE_URLS[newType]) {
       form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
-    }
-    if (modelsEndpoint.value === defaultModelsEndpoint(oldType)) {
-      modelsEndpoint.value = defaultModelsEndpoint(newType)
     }
   },
 )
 
-function isInvalid(field: any) {
-  return field.state.meta.isTouched && !field.state.meta.isValid
+function isInvalid(field: any): boolean {
+  return field.state.meta.isTouched && field.state.meta.errors.length > 0
 }
 
 async function handleSubmit(event: Event) {
@@ -196,6 +206,8 @@ async function handleSubmit(event: Event) {
   adding.value = true
   try {
     await form.handleSubmit()
+  } catch (e: any) {
+    if (!apiError.value) toast.error(getErrorMessage(e))
   } finally {
     adding.value = false
   }
@@ -203,17 +215,12 @@ async function handleSubmit(event: Event) {
 </script>
 
 <template>
-  <Card class="animate-in slide-in-from-top-2">
-    <CardHeader class="flex flex-row items-center justify-between space-y-0 py-4">
-      <CardTitle>New Provider</CardTitle>
-      <Button variant="ghost" size="icon-sm" @click="emit('close')">
-        <X class="h-4 w-4" />
-      </Button>
-    </CardHeader>
-    <CardContent>
-      <div v-if="apiError" class="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-        {{ apiError }}
-      </div>
+  <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div v-if="apiError" class="mb-2 shrink-0 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
+      {{ apiError }}
+    </div>
+
+    <div class="min-h-0 flex-1 overflow-y-auto px-1 pb-4 sm:px-2">
       <form id="provider-add-form" @submit.prevent="handleSubmit">
         <Tabs default-value="basic">
           <TabsList class="mb-4">
@@ -367,12 +374,16 @@ async function handleSubmit(event: Event) {
           </TabsContent>
         </Tabs>
       </form>
-    </CardContent>
-    <CardFooter class="flex justify-end">
-      <Button type="submit" form="provider-add-form" :disabled="adding">
+    </div>
+
+    <div class="mt-auto flex shrink-0 justify-end gap-2 border-t pt-4">
+      <Button variant="outline" size="sm" type="button" :disabled="adding" @click="emit('close')">
+        Cancel
+      </Button>
+      <Button type="submit" form="provider-add-form" size="sm" :disabled="adding">
         <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
         {{ adding ? "Adding..." : "Create Provider" }}
       </Button>
-    </CardFooter>
-  </Card>
+    </div>
+  </div>
 </template>
