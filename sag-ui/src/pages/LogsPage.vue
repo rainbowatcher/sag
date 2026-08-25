@@ -85,10 +85,14 @@ function onPageChange(page: number) {
   store.setLogsPage(page)
 }
 
-function statusVariant(code: number) {
-  if (code >= 500) return "destructive" as const
-  if (code >= 400) return "secondary" as const
-  return "outline" as const
+function statusBadgeClass(code: number): string {
+  if (code >= 500) {
+    return "border-destructive/30 bg-destructive/10 text-destructive dark:text-red-400"
+  }
+  if (code >= 400) {
+    return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+  }
+  return "border-border text-foreground bg-transparent"
 }
 
 onMounted(() => {
@@ -363,7 +367,8 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                   <Tooltip>
                     <TooltipTrigger>
                       <Badge
-                        :variant="statusVariant(row.status_code)"
+                        variant="outline"
+                        :class="statusBadgeClass(row.status_code)"
                         class="font-mono text-xs tabular-nums"
                       >
                         {{ row.status_code }}
