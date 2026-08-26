@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-08-25
+updated: 2026-08-26
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-08-26
+
+- **调度**：[0006 流式请求超时边界修复](dispatch/changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 reqwest client 总 timeout 截断，非流式、TTFB 和 chunk idle timeout 分阶段生效
 
 ## 2026-08-25
 

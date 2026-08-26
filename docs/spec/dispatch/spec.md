@@ -85,9 +85,11 @@ let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 ```
 
-每次等待下一个 chunk 时加上 timeout。超时后断开连接并返回错误。
+每次等待下一个 chunk 时加上 timeout。超时后发送 `StreamChunk::Error`（不发送 `Done`）并停止读取。该 error chunk 经 `StreamChunk::to_sse_bytes` 序列化为**通用** SSE error 事件（`STREAM_ERROR`，见 `sag-core/src/types.rs`），CallLog 记为 `502` / `error_category = stream_error`；专用 `STREAM_CHUNK_TIMEOUT` 错误码 / 504 状态尚未实现，属后续独立任务。
 
 **Trade-off**: timeout 作用于单个 chunk 的等待，不是整个请求的总时长。这意味着即使单个 chunk 都很快，长时间的静默期（silence）也会触发。这正是想要的行为——LLM 推理中长时间无输出通常意味着卡住了。
+
+**成功流无总 deadline**：共享 reqwest client 不设置 `Client::timeout`，`timeout_secs` 对成功流式请求是 no-op（只覆盖非流式完整往返）。流式响应头到达由 `tokio::time::timeout` 按 `ttfb_timeout_secs` 约束（TTFB），之后 body 只受 chunk 空闲超时约束——长寿命健康流不会被总时长截断。非 2xx 流式响应的 error body 读取同样用 `ttfb_timeout_secs` 的局部 timeout 兜底，避免上游挂着不送 body 导致无界等待。
 
 ### Retry 和 Backoff 的实现位置
 
@@ -111,7 +113,7 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 - 客户端归因 4xx（400/413/422/未知 4xx）直接返客户端，不 failover、不挪 pin、不开熔断
 - provider 持续性 4xx（401/404/403-非quota）不重试、不开熔断，failover + 挪 pin
 - 403-quota 与 408/429/5xx 同属可重试，403-quota 走 `CircuitHint::QuotaExhausted` 长冷却（3600s），429 走 `CircuitHint::RateLimited` 短冷却
-- 非流式请求使用 `timeout_secs` 做整体超时；流式请求使用 `chunk_timeout_secs` 做 chunk 间超时
+- 非流式请求使用 `timeout_secs` 做整体超时（request 级 `timeout()`）；流式请求的响应头到达由 `ttfb_timeout_secs` 约束，body 由 `chunk_timeout_secs` 做 chunk 间超时。成功流式请求的总时长不受 `timeout_secs` 限制（共享 client 不设总超时）
 - backoff 在每次重试前 sleep（不是在失败后立即 sleep）
 - 流式请求的 response body 不等待（不缓存整个响应）
 
@@ -126,6 +128,7 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 
 ## 变更记录
 
+- [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，按 TTFB、chunk idle 和错误 body 阶段分别设定边界
 - [0005 聊天分发单文件复杂度解耦与模块化](changes/0005-chat-dispatch-modularization.md)
 - [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）
 - [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)

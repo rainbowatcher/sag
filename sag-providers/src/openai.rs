@@ -245,3 +245,177 @@ impl LlmProvider for OpenAiProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{chat_request, spawn_server, test_config};
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    fn openai_provider(
+        base_url: &str,
+        timeout_secs: u64,
+        chunk_timeout_secs: Option<u64>,
+    ) -> OpenAiProvider {
+        OpenAiProvider::new(
+            "test".into(),
+            &test_config(base_url, timeout_secs, Some(60), chunk_timeout_secs),
+        )
+        .unwrap()
+    }
+
+    /// Server streams 4 chunks at 400ms intervals (~1.6s total), far longer
+    /// than `timeout_secs` = 1s, followed by an explicit upstream `[DONE]`
+    /// frame and connection close. Continuous chunks must never trip the chunk
+    /// idle timeout and the removed client-level total deadline must not
+    /// truncate the stream.
+    #[tokio::test]
+    async fn chat_stream_continuous_chunks_survive_past_timeout_secs() {
+        let base_url = spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            for i in 0..4 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let frame = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk {i}\"}}}}]}}\n\n"
+                );
+                stream.write_all(frame.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            // Explicit upstream [DONE] frame (OpenAI wire protocol), then a
+            // graceful FIN so the client reliably reads the [DONE] bytes
+            // before observing EOF.
+            stream.write_all(b"data: [DONE]\n\n").await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = stream.shutdown().await;
+            drop(stream);
+        })
+        .await;
+
+        let provider = openai_provider(&base_url, 1, Some(2));
+        let mut stream = provider
+            .chat_stream(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                1,
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut data_frames: Vec<Vec<u8>> = Vec::new();
+        let mut saw_done = false;
+        let mut saw_error = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(d) => data_frames.push(d),
+                StreamChunk::Error(_) => saw_error = true,
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+
+        assert!(
+            !saw_error,
+            "continuous chunks must not trip the chunk idle timeout"
+        );
+        assert!(
+            saw_done,
+            "stream must end with Done — emitted by EOF after the [DONE] frame"
+        );
+        assert_eq!(
+            data_frames.len(),
+            5,
+            "expected 4 content frames + 1 explicit [DONE] frame, got {}",
+            data_frames.len()
+        );
+        for (i, frame) in data_frames[..4].iter().enumerate() {
+            let text = String::from_utf8(frame.clone()).unwrap();
+            let json: serde_json::Value = text
+                .strip_prefix("data: ")
+                .and_then(|s| s.strip_suffix("\n\n"))
+                .map(|s| serde_json::from_str(s).unwrap())
+                .expect("content frame must be a `data: <json>` SSE frame");
+            assert_eq!(
+                json["choices"][0]["delta"]["content"],
+                format!("chunk {i}"),
+                "content frame {i} must carry the upstream delta verbatim"
+            );
+        }
+        assert_eq!(
+            data_frames[4],
+            b"data: [DONE]\n\n".to_vec(),
+            "the explicit upstream [DONE] frame must be forwarded as its own Data chunk"
+        );
+    }
+
+    /// A single chunk followed by a 4s silence — well beyond
+    /// `chunk_timeout_secs` (1s). The idle timeout must emit an Error chunk
+    /// and never a Done.
+    #[tokio::test]
+    async fn chat_stream_chunk_idle_timeout_emits_error_not_done() {
+        let base_url = spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        })
+        .await;
+
+        let provider = openai_provider(&base_url, 30, Some(1));
+        let start = std::time::Instant::now();
+        let mut stream = provider
+            .chat_stream(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut saw_error = false;
+        let mut saw_done = false;
+        let mut saw_data = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(_) => saw_data = true,
+                StreamChunk::Error(_) => saw_error = true,
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+        let elapsed = start.elapsed();
+
+        assert!(saw_data, "expected the first chunk before the silence");
+        assert!(saw_error, "chunk idle timeout must emit an Error chunk");
+        assert!(!saw_done, "a timed-out stream must not emit Done");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "idle timeout should fire at ~1s, not wait for the connection close: {elapsed:?}"
+        );
+    }
+}

@@ -72,14 +72,15 @@ updated: 2026-07-22
 
 | 超时类型 | 发生层 | 触发机制 | HTTP 状态码 | 错误码 |
 |---------|--------|---------|------------|--------|
-| 请求总超时（非流式） | `ProviderBase::send_json` | reqwest `Client::timeout` 或 request 级 `timeout()` | **504** | `UPSTREAM_TIMEOUT` |
-| 流式初始超时 | `ProviderBase::send_json_stream` | 同上 | **504** | `UPSTREAM_TIMEOUT` |
-| chunk 空闲超时 | provider `chat_stream` spawned task | `tokio::time::timeout` 包裹 `byte_stream.next()` | **504**（CallLog） | `STREAM_CHUNK_TIMEOUT` |
+| 请求总超时（非流式） | `ProviderBase::send_json` | request 级 `timeout()`（`RequestBuilder::timeout`），覆盖建连+响应头+body 完整往返 | **502** | `NETWORK_ERROR`（reqwest 超时经 `AppError::Network` 映射，`is_timeout()` 可判定） |
+| 流式 TTFB 超时 | `ProviderBase::send_json_stream` | `tokio::time::timeout` 包裹 `request.send()`，仅覆盖到响应头到达 | **504** | `TTFB_TIMEOUT` |
+| chunk 空闲超时 | provider `chat_stream` spawned task | `tokio::time::timeout` 包裹 `byte_stream.next()` | **502**（CallLog，`error_category = stream_error`） | `STREAM_ERROR`（通用 SSE error 事件；专用 `STREAM_CHUNK_TIMEOUT` 未实现，属后续独立任务） |
 
-- **检测方式**：`ProviderBase::send_json` / `send_json_stream` 中利用 reqwest 的 `is_timeout()` 方法区分超时与连接拒绝/DNS 失败/TLS 错误
-- **重试行为**：`UpstreamTimeout` 是 retryable 错误——超时后重试同一 provider 是合理的（可能只是那次请求排队太久）
-- **CallLog 记录**：超时错误在 `call_logs` 中记录 `status_code = 504`（非流式）或 `504`（流式 chunk 超时，HTTP 响应头已发送后记录到 analytics）。`error` 字段包含超时类型和阈值
-- **流式 chunk 超时特殊处理**：HTTP 响应头（200 + `text/event-stream`）已发送给客户端后无法再改状态码，通过 SSE error 事件（`STREAM_CHUNK_TIMEOUT` 错误码）通知客户端
+- **成功流不受 `timeout_secs` 约束**：共享 reqwest client 不设置总超时（无 `Client::timeout`），`timeout_secs` 只作为非流式请求的 request 级 deadline；成功流式响应头到达后，body 总时长只受 `chunk_timeout_secs`（chunk 空闲）约束
+- **检测方式**：非流式 `send_json` 的 request 级超时产生 reqwest `is_timeout()` 错误（映射为 `AppError::Network`）；流式 TTFB 超时由 `tokio::time::timeout` 判定并返回 `AppError::TtfbTimeout`，不依赖 reqwest `is_timeout()`
+- **重试行为**：`AppError::TtfbTimeout` 与超时导致的 `AppError::Network` 均属 retryable（见 `retry.rs::is_retryable_error`）——超时后重试同一 provider 是合理的（可能只是那次请求排队太久）
+- **CallLog 记录**：超时错误在 `call_logs` 中记录 `status_code`（非流式超时 502，流式 TTFB 超时 504，chunk 超时在响应头已发送后记录到 analytics）。`error` 字段包含超时类型和阈值
+- **流式 chunk 超时特殊处理**：HTTP 响应头（200 + `text/event-stream`）已发送给客户端后无法再改状态码，通过**通用 SSE error 事件**通知客户端——provider 发出 `StreamChunk::Error("stream chunk idle timeout after Ns")`，经 `sag-core::types::StreamChunk::to_sse_bytes` 固定序列化为 `data: {"error":{"code":"STREAM_ERROR","message":"..."}}`，且不发送 `Done`；CallLog 记录 `status_code = 502`、`error_category = stream_error`。**当前并未实现**专用 `STREAM_CHUNK_TIMEOUT` 错误码 / 504 状态——让 SSE error 事件携带专用错误码属于后续独立任务（不改变外部错误协议、不做 taxonomy 重构）
 
 ## 配置 Schema
 
@@ -113,6 +114,7 @@ updated: 2026-07-22
 
 ## 变更记录
 
+- [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，保留非流式 request-level、流式 TTFB 和 chunk idle timeout
 - [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）
 - [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)
 - [0003 失败路径补全 reasoning_effort 记录](changes/0003-reasoning-effort-failure-paths.md)

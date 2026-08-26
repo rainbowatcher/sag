@@ -28,6 +28,13 @@ pub trait LlmProvider: Send + Sync {
     /// Send a streaming chat completion request. Returns a stream of
     /// parsed SSE chunks that the router layer can forward to the client
     /// while extracting usage for analytics.
+    ///
+    /// `timeout_secs` is a **no-op for a successful stream**: the total
+    /// wall-clock duration of a healthy stream is intentionally unbounded
+    /// by it (it only covers the non-streaming `chat` round-trip). The
+    /// streaming path bounds the time-to-first-byte via
+    /// `ProviderBase::ttfb_timeout_secs` and per-chunk idle time via
+    /// `chunk_timeout_secs`.
     async fn chat_stream(
         &self,
         request: &ChatCompletionRequest,

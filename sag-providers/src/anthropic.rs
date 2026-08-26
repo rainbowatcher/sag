@@ -1322,4 +1322,184 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].completion_tokens, 42);
     }
+
+    // ── chunk idle timeout (local HTTP mock) ─────────────────────
+
+    fn anthropic_provider(
+        base_url: &str,
+        timeout_secs: u64,
+        chunk_timeout_secs: Option<u64>,
+    ) -> AnthropicProvider {
+        AnthropicProvider::new(
+            "test".into(),
+            &crate::test_support::test_config(base_url, timeout_secs, Some(60), chunk_timeout_secs),
+        )
+        .unwrap()
+    }
+
+    /// Server streams 4 text deltas at 400ms intervals (~1.6s total), far
+    /// longer than `timeout_secs` = 1s, followed by `message_stop` and
+    /// connection close. Continuous chunks must never trip the chunk idle
+    /// timeout and the removed client-level total deadline must not truncate
+    /// the stream.
+    #[tokio::test]
+    async fn chat_stream_continuous_chunks_survive_past_timeout_secs() {
+        use tokio::io::AsyncWriteExt;
+        let base_url = crate::test_support::spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            for i in 0..4 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let frame = format!(
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"chunk {i}\"}}}}\n\n"
+                );
+                stream.write_all(frame.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            // message_stop → normalized [DONE], then a graceful FIN so the
+            // client reliably reads the [DONE] bytes before observing EOF.
+            stream
+                .write_all(b"data: {\"type\":\"message_stop\"}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let _ = stream.shutdown().await;
+            drop(stream);
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 1, Some(2));
+        let mut stream = provider
+            .chat_stream(
+                &crate::test_support::chat_request(),
+                "claude-3",
+                "/messages",
+                &HashMap::new(),
+                1,
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut data_frames: Vec<Vec<u8>> = Vec::new();
+        let mut saw_done = false;
+        let mut saw_error = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(d) => data_frames.push(d),
+                StreamChunk::Error(_) => saw_error = true,
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+
+        assert!(
+            !saw_error,
+            "continuous chunks must not trip the chunk idle timeout"
+        );
+        assert!(
+            saw_done,
+            "stream must end with Done — emitted by EOF after message_stop"
+        );
+        assert_eq!(
+            data_frames.len(),
+            5,
+            "expected 4 normalized text frames + 1 [DONE] frame, got {}",
+            data_frames.len()
+        );
+        for (i, frame) in data_frames[..4].iter().enumerate() {
+            let text = String::from_utf8(frame.clone()).unwrap();
+            let json: serde_json::Value = text
+                .strip_prefix("data: ")
+                .and_then(|s| s.strip_suffix("\n\n"))
+                .map(|s| serde_json::from_str(s).unwrap())
+                .expect("normalized frame must be a `data: <json>` SSE frame");
+            assert_eq!(
+                json["object"], "chat.completion.chunk",
+                "frame {i} must be normalized to OpenAI chunk format"
+            );
+            assert_eq!(
+                json["choices"][0]["delta"]["content"],
+                format!("chunk {i}"),
+                "normalized frame {i} must carry the upstream text delta"
+            );
+        }
+        assert_eq!(
+            data_frames[4],
+            b"data: [DONE]\n\n".to_vec(),
+            "message_stop must be normalized to the [DONE] Data chunk"
+        );
+    }
+
+    /// A single text delta followed by a 4s silence — well beyond
+    /// `chunk_timeout_secs` (1s). The idle timeout must emit an Error chunk
+    /// and never a Done.
+    #[tokio::test]
+    async fn chat_stream_chunk_idle_timeout_emits_error_not_done() {
+        use tokio::io::AsyncWriteExt;
+        let base_url = crate::test_support::spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+                .write_all(
+                    b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            stream
+                .write_all(
+                    b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"b\"}}\n\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, Some(1));
+        let start = std::time::Instant::now();
+        let mut stream = provider
+            .chat_stream(
+                &crate::test_support::chat_request(),
+                "claude-3",
+                "/messages",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut saw_error = false;
+        let mut saw_done = false;
+        let mut saw_data = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(_) => saw_data = true,
+                StreamChunk::Error(_) => saw_error = true,
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+        let elapsed = start.elapsed();
+
+        assert!(saw_data, "expected the first chunk before the silence");
+        assert!(saw_error, "chunk idle timeout must emit an Error chunk");
+        assert!(!saw_done, "a timed-out stream must not emit Done");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "idle timeout should fire at ~1s, not wait for the connection close: {elapsed:?}"
+        );
+    }
 }

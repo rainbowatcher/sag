@@ -563,7 +563,12 @@ pub struct ProviderConfig {
     /// without also updating the update path to mirror the skip rule.
     #[serde(default = "default_models_endpoint")]
     pub models_endpoint: String,
-    /// Timeout in seconds for requests to this provider.
+    /// Timeout in seconds for the full round-trip of **non-streaming**
+    /// requests to this provider (applied as a per-request
+    /// `RequestBuilder::timeout`). Streaming requests are **not** bounded
+    /// by this total: they use `ttfb_timeout_secs` for header arrival and
+    /// `chunk_timeout_secs` for inter-chunk idle time, so a healthy
+    /// long-lived stream can outlive `timeout_secs`.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Maximum idle time in seconds between stream chunks before the

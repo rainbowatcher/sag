@@ -4,6 +4,9 @@ pub mod openai;
 pub mod traits;
 pub mod util;
 
+#[cfg(test)]
+mod test_support;
+
 pub use anthropic::*;
 pub use base::*;
 pub use openai::*;
