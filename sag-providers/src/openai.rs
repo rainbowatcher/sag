@@ -89,19 +89,23 @@ impl LlmProvider for OpenAiProvider {
             && let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
             && let Some(raw_usage) = raw.get("usage")
         {
-            usage.cached_tokens = raw_usage
-                .get("prompt_tokens_details")
+            let pt_details = raw_usage.get("prompt_tokens_details");
+            usage.cached_tokens = pt_details
                 .and_then(|v| v.get("cached_tokens"))
+                .or_else(|| raw_usage.get("prompt_cache_hit_tokens"))
+                .or_else(|| raw_usage.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            usage.cache_creation_tokens = raw_usage
-                .get("prompt_tokens_details")
+                .map(|v| v as u32)
+                .or(pt_details.is_some().then_some(0));
+            usage.cache_creation_tokens = pt_details
                 .and_then(|v| v.get("cache_creation_input_tokens"))
+                .or_else(|| raw_usage.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             usage.reasoning_tokens = raw_usage
                 .get("completion_tokens_details")
                 .and_then(|v| v.get("reasoning_tokens"))
+                .or_else(|| raw_usage.get("reasoning_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
         }
@@ -417,5 +421,74 @@ mod tests {
             elapsed < std::time::Duration::from_secs(3),
             "idle timeout should fire at ~1s, not wait for the connection close: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_sync_extracts_cache_fields_and_aliases() {
+        let test_cases = vec![
+            (
+                r#"{"id":"1","object":"chat.completion","created":1700000000,"model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":30,"cache_creation_input_tokens":70},"completion_tokens_details":{"reasoning_tokens":15}}}"#,
+                Some(30),
+                Some(70),
+                Some(15),
+            ),
+            (
+                r#"{"id":"2","object":"chat.completion","created":1700000000,"model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_cache_hit_tokens":40,"cache_creation_input_tokens":60,"reasoning_tokens":20}}"#,
+                Some(40),
+                Some(60),
+                Some(20),
+            ),
+            (
+                r#"{"id":"3","object":"chat.completion","created":1700000000,"model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"cached_tokens":50}}"#,
+                Some(50),
+                None,
+                None,
+            ),
+            (
+                r#"{"id":"4","object":"chat.completion","created":1700000000,"model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_tokens_details":{}}}"#,
+                Some(0),
+                None,
+                None,
+            ),
+            (
+                r#"{"id":"5","object":"chat.completion","created":1700000000,"model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#,
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        for (body, exp_cached, exp_creation, exp_reasoning) in test_cases {
+            let body_owned = body.to_string();
+            let base_url = spawn_server(move |mut stream| {
+                let body = body_owned.clone();
+                async move {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+            })
+            .await;
+
+            let provider = openai_provider(&base_url, 30, None);
+            let resp = provider
+                .chat(
+                    &chat_request(),
+                    "test-model",
+                    "/chat/completions",
+                    &HashMap::new(),
+                    30,
+                )
+                .await
+                .unwrap();
+            let usage = resp.usage.unwrap();
+            assert_eq!(usage.cached_tokens, exp_cached);
+            assert_eq!(usage.cache_creation_tokens, exp_creation);
+            assert_eq!(usage.reasoning_tokens, exp_reasoning);
+        }
     }
 }

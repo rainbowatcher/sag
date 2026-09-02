@@ -23,6 +23,9 @@ use crate::state::{AppState, DispatchRuntime};
 /// when the model is unknown or all targets are pointing at disabled
 /// providers.
 #[allow(clippy::too_many_arguments)]
+// Resolution failures return the fully-built HTTP response so logging,
+// analytics emission, and client-facing error semantics stay in one path.
+#[allow(clippy::result_large_err)]
 pub async fn resolve_route(
     state: &AppState,
     runtime: &DispatchRuntime,

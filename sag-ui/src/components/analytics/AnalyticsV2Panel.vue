@@ -2,6 +2,9 @@
 import {
   Activity,
   AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ArrowUpRight,
   Clock,
   Database,
@@ -233,7 +236,7 @@ const groupColumns = computed<GroupColumn[]>(() => {
     return [
       { key: "provider", label: "Provider", align: left },
       { key: "real_model", label: "Actual Model", align: left },
-      { key: "attempts", label: "attempts", align: right },
+      { key: "attempts", label: "Attempts", align: right },
       { key: "success", label: "Success", align: right },
       { key: "failure", label: "Failure", align: right },
       { key: "success_rate", label: "Success Rate", align: right },
@@ -264,8 +267,101 @@ function isRouteKey(key: AnalyticsGroupKey): key is { route_name: string } {
   return "route_name" in key
 }
 
-/** 组表最多展示的具名行数；超出部分聚合成一个 `others` 行（spec Top20 约定）。 */
+/** Stable row identity, kept separate from the labels shown in the table. */
+function groupRowKey(key: AnalyticsGroupKey): string {
+  if (isRouteKey(key)) return `route:${JSON.stringify(key.route_name)}`
+  return `target:${JSON.stringify([key.provider, key.real_model])}`
+}
+
+const OTHERS_ROW_KEY = "__analytics_v2_others__"
+
+/** 按当前排序从全量 groups 取最多 20 个具名行；其余聚合成 `others` 行。 */
 const GROUPS_TOP_N = 20
+
+// ── Sorting state ──────────────────────────────────────────────────
+const sortKey = ref<string | null>(null)
+const sortOrder = ref<"asc" | "desc">("desc")
+
+function toggleSort(key: string) {
+  if (sortKey.value === key) {
+    if (sortOrder.value === "desc") {
+      sortOrder.value = "asc"
+    } else {
+      sortKey.value = null
+      sortOrder.value = "desc"
+    }
+  } else {
+    sortKey.value = key
+    const col = groupColumns.value.find((c) => c.key === key)
+    sortOrder.value = col?.align === "left" ? "asc" : "desc"
+  }
+}
+
+watch(scope, () => {
+  sortKey.value = null
+  sortOrder.value = "desc"
+})
+
+function getSortValue(g: AnalyticsGroupSummary, key: string): string | number | null {
+  const m = g.metrics
+  switch (key) {
+    case "route_name":
+      return groupKeyLabel(g.key)
+    case "provider":
+      return isRouteKey(g.key) ? "" : g.key.provider
+    case "real_model":
+      return isRouteKey(g.key) ? "" : g.key.real_model
+    case "requests":
+      return m.requests
+    case "attempts":
+      return m.attempts
+    case "success":
+      return m.success
+    case "failure":
+      return m.failure
+    case "success_rate":
+      return m.success_rate
+    case "model_failure_rate":
+      return m.model_failure_rate
+    case "avg_e2e":
+      return m.e2e.avg_ms
+    case "p95_e2e":
+      return m.e2e.p95_ms
+    case "tokens_in":
+      return m.prompt_tokens
+    case "tokens_out":
+      return m.completion_tokens
+    case "cache_hit":
+      return m.request_cache_hit_rate
+    case "cache_unknown":
+      return m.cache_unknown
+    default:
+      return 0
+  }
+}
+
+const sortedGroups = computed<AnalyticsGroupSummary[]>(() => {
+  const list = [...groups.value]
+  if (!sortKey.value) return list
+
+  const key = sortKey.value
+  const order = sortOrder.value === "asc" ? 1 : -1
+
+  return list.sort((a, b) => {
+    const valA = getSortValue(a, key)
+    const valB = getSortValue(b, key)
+
+    // Missing metrics always sort after valid values, regardless of direction.
+    if (valA === null && valB === null) return 0
+    if (valA === null) return 1
+    if (valB === null) return -1
+
+    if (typeof valA === "string" && typeof valB === "string") {
+      return valA.localeCompare(valB) * order
+    }
+    return (Number(valA) - Number(valB)) * order
+  })
+})
 
 function buildGroupRow(g: AnalyticsGroupSummary): GroupRow {
   const m = g.metrics
@@ -319,7 +415,7 @@ function buildGroupRow(g: AnalyticsGroupSummary): GroupRow {
         break
     }
   }
-  return { key: groupKeyLabel(g.key), cells }
+  return { key: groupRowKey(g.key), cells }
 }
 
 /** 把超出 Top-N 的组聚合成一个 `others` 行：可加性字段求和，率按原口径重算，
@@ -390,13 +486,14 @@ function buildOthersRow(overflow: AnalyticsGroupSummary[]): GroupRow {
         break
     }
   }
-  return { key: "others", cells, others: true }
+  return { key: OTHERS_ROW_KEY, cells, others: true }
 }
 
 const groupRows = computed<GroupRow[]>(() => {
-  const rows = groups.value.slice(0, GROUPS_TOP_N).map(buildGroupRow)
-  if (groups.value.length > GROUPS_TOP_N) {
-    rows.push(buildOthersRow(groups.value.slice(GROUPS_TOP_N)))
+  const list = sortedGroups.value
+  const rows = list.slice(0, GROUPS_TOP_N).map(buildGroupRow)
+  if (list.length > GROUPS_TOP_N) {
+    rows.push(buildOthersRow(list.slice(GROUPS_TOP_N)))
   }
   return rows
 })
@@ -687,23 +784,50 @@ const groupRows = computed<GroupRow[]>(() => {
                   <TableHead
                     v-for="col in groupColumns"
                     :key="col.key"
-                    :class="col.align === 'right' ? 'text-right' : 'text-left'"
+                    :class="[
+                      col.align === 'right' ? 'text-right' : 'text-left',
+                      'hover:text-foreground cursor-pointer transition-colors select-none',
+                    ]"
+                    @click="toggleSort(col.key)"
                   >
-                    <template v-if="col.key === 'cache_unknown'">
-                      <span class="inline-flex items-center gap-1">
-                        {{ col.label }}
+                    <div
+                      class="inline-flex items-center gap-1.5"
+                      :class="col.align === 'right' ? 'justify-end' : ''"
+                    >
+                      <template v-if="col.key === 'cache_unknown'">
+                        <span>{{ col.label }}</span>
                         <Tooltip>
                           <TooltipTrigger as-child>
-                            <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                            <Info
+                              class="text-muted-foreground h-3.5 w-3.5 cursor-help"
+                              @click.stop
+                            />
                           </TooltipTrigger>
-                          <TooltipContent side="top" class="max-w-xs">
+                          <TooltipContent side="top" class="max-w-xs font-normal">
                             成功样本中未上报 cached_tokens 的数量（unknown ≠
                             miss，不计入命中率分母）
                           </TooltipContent>
                         </Tooltip>
+                      </template>
+                      <template v-else>
+                        <span>{{ col.label }}</span>
+                      </template>
+
+                      <span class="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+                        <ArrowUp
+                          v-if="sortKey === col.key && sortOrder === 'asc'"
+                          class="text-foreground h-3.5 w-3.5"
+                        />
+                        <ArrowDown
+                          v-else-if="sortKey === col.key && sortOrder === 'desc'"
+                          class="text-foreground h-3.5 w-3.5"
+                        />
+                        <ArrowUpDown
+                          v-else
+                          class="text-muted-foreground/30 hover:text-foreground h-3 w-3"
+                        />
                       </span>
-                    </template>
-                    <template v-else>{{ col.label }}</template>
+                    </div>
                   </TableHead>
                 </TableRow>
               </TableHeader>

@@ -41,11 +41,13 @@ fn extract_anthropic_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender
         let cached_tokens = usage
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
+            .map(|v| v as u32)
+            .or((input > 0).then_some(0));
         let cache_creation_tokens = usage
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
+            .map(|v| v as u32)
+            .or((input > 0).then_some(0));
         let reasoning_tokens = usage
             .get("thinking_tokens")
             .and_then(|v| v.as_u64())
@@ -560,8 +562,8 @@ impl AnthropicProvider {
             prompt_tokens: u.input_tokens,
             completion_tokens: u.output_tokens,
             total_tokens: u.input_tokens + u.output_tokens,
-            cached_tokens: u.cache_read_input_tokens,
-            cache_creation_tokens: u.cache_creation_input_tokens,
+            cached_tokens: Some(u.cache_read_input_tokens.unwrap_or(0)),
+            cache_creation_tokens: Some(u.cache_creation_input_tokens.unwrap_or(0)),
             reasoning_tokens: u.thinking_tokens,
         });
 
@@ -796,6 +798,56 @@ mod tests {
         }"#;
         let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
         assert_eq!(usage.thinking_tokens, Some(2048));
+    }
+
+    #[test]
+    fn extract_anthropic_usage_defaults_cache_fields_to_zero_when_input_present() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // message_start: input_tokens present, no cache fields
+        let val1 = serde_json::json!({
+            "input_tokens": 500
+        });
+        extract_anthropic_usage(&val1, &tx);
+
+        // message_delta: output_tokens present, no input tokens
+        let val2 = serde_json::json!({
+            "output_tokens": 100
+        });
+        extract_anthropic_usage(&val2, &tx);
+
+        // message_start with cache fields
+        let val3 = serde_json::json!({
+            "input_tokens": 500,
+            "cache_read_input_tokens": 200,
+            "cache_creation_input_tokens": 100
+        });
+        extract_anthropic_usage(&val3, &tx);
+
+        drop(tx);
+
+        let mut usages = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Usage(u) = chunk {
+                usages.push(u);
+            }
+        }
+        assert_eq!(usages.len(), 3);
+
+        // val1: input > 0, defaults to Some(0)
+        assert_eq!(usages[0].prompt_tokens, 500);
+        assert_eq!(usages[0].cached_tokens, Some(0));
+        assert_eq!(usages[0].cache_creation_tokens, Some(0));
+
+        // val2: output only, does NOT fabricate cache fields (leaves None so it doesn't overwrite)
+        assert_eq!(usages[1].completion_tokens, 100);
+        assert_eq!(usages[1].cached_tokens, None);
+        assert_eq!(usages[1].cache_creation_tokens, None);
+
+        // val3: explicit cache fields
+        assert_eq!(usages[2].prompt_tokens, 500);
+        assert_eq!(usages[2].cached_tokens, Some(200));
+        assert_eq!(usages[2].cache_creation_tokens, Some(100));
     }
 
     #[test]

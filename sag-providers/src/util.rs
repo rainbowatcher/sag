@@ -192,13 +192,15 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
                 .map(|v| v as u32);
 
             // OpenAI nests cache/reasoning tokens inside details objects.
-            let cached_tokens = usage_val
-                .get("prompt_tokens_details")
+            let pt_details = usage_val.get("prompt_tokens_details");
+            let cached_tokens = pt_details
                 .and_then(|v| v.get("cached_tokens"))
+                .or_else(|| usage_val.get("prompt_cache_hit_tokens"))
+                .or_else(|| usage_val.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let cache_creation_tokens = usage_val
-                .get("prompt_tokens_details")
+                .map(|v| v as u32)
+                .or(pt_details.is_some().then_some(0));
+            let cache_creation_tokens = pt_details
                 .and_then(|v| v.get("cache_creation_input_tokens"))
                 .or_else(|| usage_val.get("cache_creation_input_tokens"))
                 .and_then(|v| v.as_u64())
@@ -206,6 +208,7 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
             let reasoning_tokens = usage_val
                 .get("completion_tokens_details")
                 .and_then(|v| v.get("reasoning_tokens"))
+                .or_else(|| usage_val.get("reasoning_tokens"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
 
@@ -579,6 +582,46 @@ mod tests {
             Some(70),
             "must be lifted from prompt_tokens_details.cache_creation_input_tokens"
         );
+    }
+
+    #[test]
+    fn stream_usage_extracts_cache_aliases_and_fallback() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // Scenario 1: prompt_cache_hit_tokens and top-level reasoning_tokens
+        let frame1 = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150,\"prompt_cache_hit_tokens\":40,\"reasoning_tokens\":20}}\n\n";
+        process_sse_frame(frame1, &tx);
+
+        // Scenario 2: cached_tokens top-level
+        let frame2 = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150,\"cached_tokens\":50}}\n\n";
+        process_sse_frame(frame2, &tx);
+
+        // Scenario 3: prompt_tokens_details: {}
+        let frame3 = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150,\"prompt_tokens_details\":{}}}\n\n";
+        process_sse_frame(frame3, &tx);
+
+        // Scenario 4: no details, no cache fields
+        let frame4 = b"data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}\n\n";
+        process_sse_frame(frame4, &tx);
+
+        drop(tx);
+
+        let mut usages = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Usage(u) = chunk {
+                usages.push(u);
+            }
+        }
+        assert_eq!(usages.len(), 4);
+
+        assert_eq!(usages[0].cached_tokens, Some(40));
+        assert_eq!(usages[0].reasoning_tokens, Some(20));
+
+        assert_eq!(usages[1].cached_tokens, Some(50));
+
+        assert_eq!(usages[2].cached_tokens, Some(0));
+
+        assert_eq!(usages[3].cached_tokens, None);
     }
 
     /// When completion_tokens is missing/0 but total_tokens and reasoning_tokens
