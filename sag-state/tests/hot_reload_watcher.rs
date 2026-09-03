@@ -36,7 +36,10 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_temp_path(prefix: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("{prefix}_{}_{n}.toml", std::process::id()))
+    let dir = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    dir.join(format!("{prefix}_{}_{n}.toml", std::process::id()))
 }
 
 fn base_provider() -> ProviderConfig {

@@ -113,23 +113,6 @@ fn event_targets_config(event: &Event, config_path: &Path) -> bool {
         .any(|p| p == config_path || (file_name.is_some() && p.file_name() == file_name))
 }
 
-/// Re-establish the direct watch on the config file itself.
-///
-/// An atomic temp-file + rename save (what
-/// [`crate::loader::save::save_config_to_file`] and most editors do)
-/// replaces the file's inode, leaving an existing file-level watch bound to
-/// the dead inode. Re-binding is idempotent and cheap, so we call it
-/// whenever any event targets the config path — including `Create`/`Remove`/
-/// `Rename` events drained during the settle window — so subsequent in-place
-/// edits are still caught (on macOS kqueue a directory watch alone does not
-/// report in-place content edits of files inside it).
-fn rewatch_config_file(watcher: &mut RecommendedWatcher, path: &Path) {
-    let _ = watcher.unwatch(path);
-    if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
-        warn!("failed to re-watch config file {}: {e}", path.display());
-    }
-}
-
 /// Perform a single reload of the config at `path`, delegating to the
 /// handler when present (coordinated reload: re-read + validate + atomic
 /// publication of config, provider registry, and version bump) or falling
@@ -184,16 +167,9 @@ async fn reload_once(
 ///
 /// # Watch semantics
 ///
-/// - The parent **directory** is watched (not only the file), so atomic
-///   temp-file + rename saves are detected — a file-level inotify/kqueue
-///   watch alone is bound to the inode and silently dies when the file is
-///   replaced.
-/// - The config **file itself** is also watched: on macOS kqueue a
-///   parent-directory watch does not report in-place content edits of files
-///   inside it (only create/remove/rename), so the direct file watch is
-///   required to catch those. Whenever any event targets the config path the
-///   file watch is re-established (the file may have been atomically
-///   replaced, leaving the old watch bound to a dead inode).
+/// - The parent **directory** is watched, so atomic temp-file + rename saves
+///   are detected (a file-level watch is bound to the inode and silently dies
+///   when the file is replaced).
 /// - Events are filtered to the config file and `Access` reads are ignored.
 /// - A **trailing** debounce merges bursts of events: reload fires only after
 ///   the file has been quiet for [`DEBOUNCE`], so the final version is always
@@ -250,20 +226,8 @@ pub fn spawn_hot_reload(
             return;
         }
 
-        // Also watch the config file itself. On macOS kqueue a directory
-        // watch does not report in-place content edits of files inside it, so
-        // the direct file watch is what catches those. It is re-established
-        // on every config-path event below (an atomic replace leaves the old
-        // watch bound to a dead inode).
-        if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-            warn!(
-                "failed to watch config file {} directly: {e}",
-                path.display()
-            );
-        }
-
         info!(
-            "hot-reload watcher started for {} (watching {} and the file)",
+            "hot-reload watcher started for {} (watching directory {})",
             path.display(),
             watch_dir.display()
         );
@@ -284,13 +248,6 @@ pub fn spawn_hot_reload(
                     match event_res {
                         Some(Ok(event)) => {
                             if event_targets_config(&event, &path) {
-                                // Re-establish the direct file watch (see
-                                // `rewatch_config_file`): an atomic
-                                // temp-file + rename save replaces the inode,
-                                // so the watch must be re-bound to the new
-                                // file or later in-place edits are missed.
-                                rewatch_config_file(&mut watcher, &path);
-
                                 // Trailing debounce: every relevant event
                                 // pushes the reload deadline out so we never
                                 // read an intermediate version of the file.
@@ -339,13 +296,6 @@ pub fn spawn_hot_reload(
                         }
                     }
                     if rearm {
-                        // A drained `Create`/`Remove`/`Rename` (e.g. an
-                        // atomic replace arriving right at the settle
-                        // boundary) must also re-establish the direct file
-                        // watch — otherwise the kqueue file watch stays
-                        // pinned to the replaced inode and later in-place
-                        // edits are never seen.
-                        rewatch_config_file(&mut watcher, &path);
                         last_event = Some(tokio::time::Instant::now());
                         continue;
                     }

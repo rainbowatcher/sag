@@ -91,7 +91,7 @@ flowchart TD
 - `GatewayConfig::validate()` 在每次加载和保存时都运行
 - 热重载始终读取并发布**最终版本**（尾部防抖），绝不发布编辑器分段保存的中间态
 - 原子 temp-file + rename 保存不中断监听（目录监听不受 inode 替换影响）
-- 热重载用 `notify` 的 `macos_kqueue` 特性（macOS 上）
+- 热重载在 macOS 上使用原生 FSEvents（`macos_fsevent`，避免 kqueue 占用文件句柄）
 - `toml_edit` 编辑以 `(provider, real_model)` 为 key 定位 route target inline table
 
 ## 测试策略
@@ -101,5 +101,6 @@ flowchart TD
 - `sag-state/tests/hot_reload_watcher.rs` tests — watcher ↔ `ConfigMutationCoordinator` 集成测试（外部编辑重载、原子替换突发写入只加载最终版本、未重载外部编辑仍冲突、SAG 自身持久化不误报）
 
 ## 变更记录
+- [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)
 - [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)
 - [0001 初始化](changes/0001-initial.md)

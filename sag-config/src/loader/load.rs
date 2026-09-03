@@ -115,7 +115,13 @@ fn warn_unknown_fields(doc: &toml::Value) {
     if let Some(backoff) = top.get("backoff").and_then(|v| v.as_table()) {
         check_unknown_keys(
             backoff,
-            &["retries", "base_ms", "max_ms", "jitter"],
+            &[
+                "retries",
+                "base_ms",
+                "max_ms",
+                "jitter",
+                "retry_on_empty_response",
+            ],
             "[backoff]",
         );
     }
@@ -402,6 +408,26 @@ targets = [
     #[test]
     fn warn_unknown_fields_ignores_known_keys() {
         let doc = toml::from_str::<toml::Value>(valid_toml()).unwrap();
+        warn_unknown_fields(&doc);
+    }
+
+    #[test]
+    fn warn_unknown_fields_ignores_known_backoff_keys() {
+        let doc = toml::from_str::<toml::Value>(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[backoff]
+retries = 3
+base_ms = 100
+max_ms = 5000
+jitter = true
+retry_on_empty_response = false
+"#,
+        )
+        .unwrap();
         warn_unknown_fields(&doc);
     }
 

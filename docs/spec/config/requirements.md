@@ -81,5 +81,6 @@ updated: 2026-09-03
 
 ## 变更记录
 
+- [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)
 - [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)
 - [0001 初始化](changes/0001-initial.md)

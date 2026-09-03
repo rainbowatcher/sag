@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = [
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "auth"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
-notify = { version = "8", features = ["macos_kqueue"] }
+notify = { version = "8" }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"

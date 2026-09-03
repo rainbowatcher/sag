@@ -9,7 +9,8 @@ updated: 2026-09-03
 
 ## 2026-09-03
 
-- **配置**：[0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](config/changes/0002-hot-reload-trailing-debounce.md) — 热重载改为尾部防抖（只加载突发写入的最终版本），同时监听父目录与文件以在原子 temp-file + rename 后不失效，并增加 settle 边界排空与瞬时失败有界重试
+- **配置**：[0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](config/changes/0003-use-native-fsevent-and-backoff-whitelist.md) — 移除 `macos_kqueue` 切换回原生 FSEvents，杜绝全项目 WalkDir 导致的句柄爆炸，并将 `retry_on_empty_response` 纳入配置白名单消除虚警
+- **配置**：[0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](config/changes/0002-hot-reload-trailing-debounce.md) — 热重载改为尾部防抖（只加载突发写入的最终版本），同时监听父目录以在原子 temp-file + rename 后不失效，并增加 settle 边界排空与瞬时失败有界重试
 
 ## 2026-08-26
 
