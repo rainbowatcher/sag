@@ -1,11 +1,38 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use crate::config::GatewayConfig;
 use crate::loader::handle::ConfigHandle;
 use crate::loader::load::reload_config;
+
+/// Trailing-debounce window: a reload is triggered only after the config file
+/// has been quiet for this long. Trailing (not leading) — every relevant
+/// event resets the window, so we always read the *final* version of a burst
+/// of writes (e.g. an editor's staged atomic save) instead of a transient
+/// intermediate state that the old leading-edge debounce could have applied
+/// and then never revisited.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Extra settle time granted after the debounce window before the reload, so
+/// an in-progress write has a moment to finish and so we can drain any
+/// straggler events that arrive right at the boundary.
+const SETTLE: Duration = Duration::from_millis(100);
+
+/// Poll interval for the trailing-debounce ticker while an event is pending.
+const DEBOUNCE_TICK: Duration = Duration::from_millis(100);
+
+/// Bounded retries for a reload that fails transiently (a read landing on a
+/// truncated/invalid intermediate state, or a temporarily-missing file during
+/// an atomic replace). After `MAX_RELOAD_RETRIES` further attempts the
+/// watcher gives up and waits for the next file event to try again.
+const MAX_RELOAD_RETRIES: usize = 2;
+const RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Handler invoked by the hot-reload watcher after a debounced file event.
 ///
@@ -48,6 +75,103 @@ impl HotReloadHandle {
     }
 }
 
+/// Return the directory to watch for `config_path` — its parent, defaulting
+/// to `.` when the path is a bare filename with no directory component.
+///
+/// The watcher watches the parent **directory** rather than the file itself:
+/// a file-level watch is bound to the inode, so an atomic temp-file + rename
+/// save (what [`crate::loader::save::save_config_to_file`] and most editors
+/// do) replaces the inode and silently kills the watch, so later external
+/// edits are never seen. Directory watches survive renames and report them
+/// as `Create`/`Remove` events for the path, which we filter by file name.
+fn watch_dir_for(config_path: &Path) -> Option<&Path> {
+    let parent = config_path.parent()?;
+    if parent.as_os_str().is_empty() {
+        Some(Path::new("."))
+    } else {
+        Some(parent)
+    }
+}
+
+/// Returns `true` if `event` concerns a content change to `config_path`.
+///
+/// We watch the parent directory, so events arrive with paths relative to it;
+/// match either the full path or the file name (robust to normalization
+/// differences between how the config path was stored at load time and how
+/// the OS reports the event). Read-only `Access` events are ignored — they
+/// never change file content — while `Create`/`Modify`/`Remove`/`Rename`
+/// (and unknown `Any`/`Other` kinds) are all treated as relevant so no
+/// genuine edit is missed.
+fn event_targets_config(event: &Event, config_path: &Path) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    let file_name = config_path.file_name();
+    event
+        .paths
+        .iter()
+        .any(|p| p == config_path || (file_name.is_some() && p.file_name() == file_name))
+}
+
+/// Re-establish the direct watch on the config file itself.
+///
+/// An atomic temp-file + rename save (what
+/// [`crate::loader::save::save_config_to_file`] and most editors do)
+/// replaces the file's inode, leaving an existing file-level watch bound to
+/// the dead inode. Re-binding is idempotent and cheap, so we call it
+/// whenever any event targets the config path — including `Create`/`Remove`/
+/// `Rename` events drained during the settle window — so subsequent in-place
+/// edits are still caught (on macOS kqueue a directory watch alone does not
+/// report in-place content edits of files inside it).
+fn rewatch_config_file(watcher: &mut RecommendedWatcher, path: &Path) {
+    let _ = watcher.unwatch(path);
+    if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+        warn!("failed to re-watch config file {}: {e}", path.display());
+    }
+}
+
+/// Perform a single reload of the config at `path`, delegating to the
+/// handler when present (coordinated reload: re-read + validate + atomic
+/// publication of config, provider registry, and version bump) or falling
+/// back to the legacy in-place config swap. Returns `true` on success.
+async fn reload_once(
+    handler: &Option<Arc<dyn ConfigReloadHandler>>,
+    inner: &Arc<RwLock<GatewayConfig>>,
+    routes_version: &Arc<AtomicU64>,
+    path: &Path,
+) -> bool {
+    if let Some(handler) = handler {
+        // Delegated reload: handler owns re-read, validation, and atomic
+        // publication of config + provider registry + version.
+        match handler.reload_from_path(path).await {
+            Ok(()) => {
+                info!("configuration hot-reloaded");
+                true
+            }
+            Err(e) => {
+                warn!("failed to reload config: {e}");
+                false
+            }
+        }
+    } else {
+        // Legacy config-only reload (backward compat, tests, and in-memory
+        // scenarios that still have a file path).
+        match reload_config(path).await {
+            Ok(new_config) => {
+                let mut guard = inner.write().await;
+                *guard = new_config;
+                routes_version.fetch_add(1, Ordering::Release);
+                info!("configuration hot-reloaded");
+                true
+            }
+            Err(e) => {
+                warn!("failed to reload config: {e}");
+                false
+            }
+        }
+    }
+}
+
 /// Spawn a background task that watches the config file for changes and reloads it.
 ///
 /// If `handler` is `Some`, file events are delegated to the handler which
@@ -57,6 +181,26 @@ impl HotReloadHandle {
 ///
 /// The returned handle will reflect the latest config. If `handle` is in-memory
 /// (no associated file path), the watcher task exits immediately.
+///
+/// # Watch semantics
+///
+/// - The parent **directory** is watched (not only the file), so atomic
+///   temp-file + rename saves are detected — a file-level inotify/kqueue
+///   watch alone is bound to the inode and silently dies when the file is
+///   replaced.
+/// - The config **file itself** is also watched: on macOS kqueue a
+///   parent-directory watch does not report in-place content edits of files
+///   inside it (only create/remove/rename), so the direct file watch is
+///   required to catch those. Whenever any event targets the config path the
+///   file watch is re-established (the file may have been atomically
+///   replaced, leaving the old watch bound to a dead inode).
+/// - Events are filtered to the config file and `Access` reads are ignored.
+/// - A **trailing** debounce merges bursts of events: reload fires only after
+///   the file has been quiet for [`DEBOUNCE`], so the final version is always
+///   what gets read.
+/// - A reload that fails transiently (invalid intermediate content, file
+///   briefly missing mid-replace) is retried up to [`MAX_RELOAD_RETRIES`]
+///   times before the watcher waits for the next file event.
 pub fn spawn_hot_reload(
     handle: ConfigHandle,
     handler: Option<Arc<dyn ConfigReloadHandler>>,
@@ -88,15 +232,45 @@ pub fn spawn_hot_reload(
             }
         };
 
-        if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-            error!("failed to watch config file {}: {e}", path.display());
+        // Watch the parent directory (see `watch_dir_for` for the rationale
+        // — atomic renames must not silently kill the watch).
+        let Some(watch_dir) = watch_dir_for(&path) else {
+            error!(
+                "config path {} has no parent directory to watch",
+                path.display()
+            );
+            return;
+        };
+        if let Err(e) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
+            error!(
+                "failed to watch config directory {} for {}: {e}",
+                watch_dir.display(),
+                path.display()
+            );
             return;
         }
 
-        info!("hot-reload watcher started for {}", path.display());
+        // Also watch the config file itself. On macOS kqueue a directory
+        // watch does not report in-place content edits of files inside it, so
+        // the direct file watch is what catches those. It is re-established
+        // on every config-path event below (an atomic replace leaves the old
+        // watch bound to a dead inode).
+        if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+            warn!(
+                "failed to watch config file {} directly: {e}",
+                path.display()
+            );
+        }
 
-        // Debounce: wait 500ms after last event before reloading
-        let mut debounce = tokio::time::Instant::now();
+        info!(
+            "hot-reload watcher started for {} (watching {} and the file)",
+            path.display(),
+            watch_dir.display()
+        );
+
+        // Trailing-debounce state: instant of the most recent relevant event,
+        // or `None` when no reload is pending.
+        let mut last_event: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -109,44 +283,18 @@ pub fn spawn_hot_reload(
                 event_res = rx.recv() => {
                     match event_res {
                         Some(Ok(event)) => {
-                            if is_modify_event(&event) {
-                                let now = tokio::time::Instant::now();
-                                if now.duration_since(debounce).as_millis() < 500 {
-                                    continue; // debounce
-                                }
-                                debounce = now;
+                            if event_targets_config(&event, &path) {
+                                // Re-establish the direct file watch (see
+                                // `rewatch_config_file`): an atomic
+                                // temp-file + rename save replaces the inode,
+                                // so the watch must be re-bound to the new
+                                // file or later in-place edits are missed.
+                                rewatch_config_file(&mut watcher, &path);
 
-                                // Small delay to let the file system settle
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                                if let Some(ref handler) = handler {
-                                    // Delegated reload: handler owns re-read,
-                                    // validation, and atomic publication of
-                                    // config + provider registry + version.
-                                    match handler.reload_from_path(&path).await {
-                                        Ok(()) => {
-                                            info!("configuration hot-reloaded");
-                                        }
-                                        Err(e) => {
-                                            warn!("failed to reload config: {e}");
-                                        }
-                                    }
-                                } else {
-                                    // Legacy config-only reload (backward compat,
-                                    // tests, and in-memory scenarios that still
-                                    // have a file path).
-                                    match reload_config(&path).await {
-                                        Ok(new_config) => {
-                                            let mut guard = inner.write().await;
-                                            *guard = new_config;
-                                            routes_version.fetch_add(1, std::sync::atomic::Ordering::Release);
-                                            info!("configuration hot-reloaded");
-                                        }
-                                        Err(e) => {
-                                            warn!("failed to reload config: {e}");
-                                        }
-                                    }
-                                }
+                                // Trailing debounce: every relevant event
+                                // pushes the reload deadline out so we never
+                                // read an intermediate version of the file.
+                                last_event = Some(tokio::time::Instant::now());
                             }
                         }
                         Some(Err(e)) => {
@@ -159,6 +307,67 @@ pub fn spawn_hot_reload(
                         }
                     }
                 }
+                _ = tokio::time::sleep(DEBOUNCE_TICK), if last_event.is_some() => {
+                    // A relevant event is pending; check whether the file has
+                    // been quiet long enough to reload.
+                    let since = last_event.expect("guard ensures Some").elapsed();
+                    if since < DEBOUNCE {
+                        continue;
+                    }
+                    last_event = None;
+
+                    // Let the filesystem settle, then drain any events that
+                    // arrived right at the boundary. If a new relevant event
+                    // showed up during the settle window the file is still
+                    // being written — re-arm the debounce instead of
+                    // reloading a possibly-intermediate state.
+                    tokio::time::sleep(SETTLE).await;
+                    let mut rearm = false;
+                    while let Ok(event_res) = rx.try_recv() {
+                        match event_res {
+                            Ok(event) if event_targets_config(&event, &path) => {
+                                rearm = true;
+                            }
+                            Err(e) => {
+                                // Same as the main loop: a watcher error must
+                                // not be silently dropped, but it also must
+                                // not re-arm the debounce (nothing new was
+                                // written).
+                                error!("file watcher error: {e}");
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                    if rearm {
+                        // A drained `Create`/`Remove`/`Rename` (e.g. an
+                        // atomic replace arriving right at the settle
+                        // boundary) must also re-establish the direct file
+                        // watch — otherwise the kqueue file watch stays
+                        // pinned to the replaced inode and later in-place
+                        // edits are never seen.
+                        rewatch_config_file(&mut watcher, &path);
+                        last_event = Some(tokio::time::Instant::now());
+                        continue;
+                    }
+
+                    // Reload, with a bounded retry for transient failures.
+                    // A single reload can fail if the read lands on a
+                    // truncated/invalid intermediate state (in-place editor
+                    // writes) or while the file is briefly absent during an
+                    // atomic replace; a couple of quick retries cover that.
+                    let mut attempts = 1;
+                    let mut ok = reload_once(&handler, &inner, &routes_version, &path).await;
+                    while !ok && attempts <= MAX_RELOAD_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        ok = reload_once(&handler, &inner, &routes_version, &path).await;
+                        attempts += 1;
+                    }
+                    if !ok {
+                        warn!(
+                            "config reload failed after {attempts} attempts; will retry on next file event"
+                        );
+                    }
+                }
             }
         }
     });
@@ -166,39 +375,134 @@ pub fn spawn_hot_reload(
     HotReloadHandle { task, shutdown_tx }
 }
 
-fn is_modify_event(event: &Event) -> bool {
-    matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn is_modify_event_detects_modify() {
-        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
-            notify::event::DataChange::Any,
-        )));
-        assert!(is_modify_event(&event));
+    fn event(kind: EventKind, path: &str) -> Event {
+        Event::new(kind).add_path(PathBuf::from(path))
     }
 
     #[test]
-    fn is_modify_event_detects_create() {
-        let event = Event::new(EventKind::Create(notify::event::CreateKind::File));
-        assert!(is_modify_event(&event));
+    fn event_targets_config_matches_exact_path() {
+        let e = event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            "/etc/sag/gateway.toml",
+        );
+        assert!(event_targets_config(&e, Path::new("/etc/sag/gateway.toml")));
     }
 
     #[test]
-    fn is_modify_event_ignores_access() {
-        let event = Event::new(EventKind::Access(notify::event::AccessKind::Close(
-            notify::event::AccessMode::Write,
-        )));
-        assert!(!is_modify_event(&event));
+    fn event_targets_config_matches_create() {
+        // An atomic temp-file + rename save surfaces as a Create event for
+        // the config path in the watched parent directory.
+        let e = event(
+            EventKind::Create(notify::event::CreateKind::File),
+            "/etc/sag/gateway.toml",
+        );
+        assert!(event_targets_config(&e, Path::new("/etc/sag/gateway.toml")));
     }
 
     #[test]
-    fn is_modify_event_ignores_remove() {
-        let event = Event::new(EventKind::Remove(notify::event::RemoveKind::File));
-        assert!(!is_modify_event(&event));
+    fn event_targets_config_matches_remove() {
+        let e = event(
+            EventKind::Remove(notify::event::RemoveKind::File),
+            "/etc/sag/gateway.toml",
+        );
+        assert!(event_targets_config(&e, Path::new("/etc/sag/gateway.toml")));
+    }
+
+    #[test]
+    fn event_targets_config_matches_rename() {
+        let e = event(
+            EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            "/etc/sag/gateway.toml",
+        );
+        assert!(event_targets_config(&e, Path::new("/etc/sag/gateway.toml")));
+    }
+
+    #[test]
+    fn event_targets_config_matches_by_file_name() {
+        // Events reported relative to the watched directory may not exactly
+        // equal the stored config path; the file name must still match.
+        let e = event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            "gateway.toml",
+        );
+        assert!(event_targets_config(&e, Path::new("/etc/sag/gateway.toml")));
+    }
+
+    #[test]
+    fn event_targets_config_ignores_access() {
+        let e = event(
+            EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Write,
+            )),
+            "/etc/sag/gateway.toml",
+        );
+        assert!(!event_targets_config(
+            &e,
+            Path::new("/etc/sag/gateway.toml")
+        ));
+    }
+
+    #[test]
+    fn event_targets_config_ignores_unrelated_paths() {
+        let e = event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            "/etc/sag/other.toml",
+        );
+        assert!(!event_targets_config(
+            &e,
+            Path::new("/etc/sag/gateway.toml")
+        ));
+    }
+
+    #[test]
+    fn event_targets_config_ignores_temp_file_of_other_process() {
+        // SAG's own atomic save writes a `.gateway.toml.tmp.<pid>` sibling
+        // first; those events must not be mistaken for a change to the
+        // config file itself.
+        let e = event(
+            EventKind::Create(notify::event::CreateKind::File),
+            "/etc/sag/.gateway.toml.tmp.1234",
+        );
+        assert!(!event_targets_config(
+            &e,
+            Path::new("/etc/sag/gateway.toml")
+        ));
+    }
+
+    #[test]
+    fn watch_dir_for_returns_parent() {
+        assert_eq!(
+            watch_dir_for(Path::new("/etc/sag/gateway.toml")),
+            Some(Path::new("/etc/sag"))
+        );
+    }
+
+    #[test]
+    fn watch_dir_for_bare_filename_defaults_to_dot() {
+        assert_eq!(
+            watch_dir_for(Path::new("gateway.toml")),
+            Some(Path::new("."))
+        );
+    }
+
+    #[test]
+    fn watch_dir_for_relative_path() {
+        assert_eq!(
+            watch_dir_for(Path::new("config/gateway.toml")),
+            Some(Path::new("config"))
+        );
     }
 }

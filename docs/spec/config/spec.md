@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-09-03
 ---
 
 # 配置 — 规格
@@ -8,7 +8,9 @@ updated: 2026-06-03
 ## 关键文件
 
 - [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `GatewayConfig`、所有子结构体、`validate()`、序列化辅助函数
-- [sag-config/src/loader.rs](../../../sag-config/src/loader.rs) — `load_config()`、`peek_logging_config()`、`spawn_hot_reload()`、`save_config_to_file()`
+- [sag-config/src/loader/load.rs](../../../sag-config/src/loader/load.rs) — `load_config()`、`peek_logging_config()`
+- [sag-config/src/loader/reload.rs](../../../sag-config/src/loader/reload.rs) — `spawn_hot_reload()` 热重载 watcher（尾部防抖、目录+文件双监听、有界重试）
+- [sag-config/src/loader/save.rs](../../../sag-config/src/loader/save.rs) — `save_config_to_file()` 原子保存
 - [sag-config/src/toml_edit_util.rs](../../../sag-config/src/toml_edit_util.rs) — `toml_edit` 原地编辑工具函数
 - [sag-config/src/lib.rs](../../../sag-config/src/lib.rs) — `ConfigHandle` 类型别名
 
@@ -31,6 +33,8 @@ flowchart TD
     J --> K[write to file]
 ```
 
+热重载 watcher（`loader/reload.rs`）在 [0002](changes/0002-hot-reload-trailing-debounce.md) 起同时监听**父目录**与**配置文件本身**：目录监听保证原子 temp-file + rename 保存（inode 替换）后监听不失效，直接文件监听覆盖 macOS kqueue 目录监听不报告文件内就地编辑的情况。事件按配置路径/文件名过滤，`Access` 只读事件忽略。触发采用**尾部防抖**（`DEBOUNCE`=300ms，`DEBOUNCE_TICK`=100ms 轮询）+ settle 窗口（`SETTLE`=100ms）边界排空：突发写入期间不断重置窗口，保证读取的是最终版本；防抖窗口后若排空到新相关事件则重新武装。加载失败最多重试 `MAX_RELOAD_RETRIES`（2）次后等待下一个文件事件。
+
 ## 关键决策
 
 ### Peek vs 完整加载
@@ -50,6 +54,12 @@ flowchart TD
 - ❌ `toml_edit` API 比 `toml` 的 serde 序列化复杂得多
 
 这个 trade-off 是值得的——配置文件是用户手写的，保留注释和格式是基本体验要求。
+
+### 尾部防抖 vs 前缘防抖
+
+热重载 watcher 使用尾部防抖（仅当文件静默超过 300ms 后才加载），而非旧的前缘防抖（首个事件后立即加载、随后 500ms 内忽略）。
+
+**Trade-off**: 尾部防抖会引入一点加载延迟（突发写入停止后最多 300ms+100ms 才生效），但保证永远读取突发写入的**最终版本**；前缘防抖可能在编辑器分段原子保存时把中间态当作最终配置加载且不再重新读取，造成永久错误的运行态。这个 trade-off 是值得的——热重载的首要正确性是「加载最终版本」，而不是「尽快加载」。
 
 ### 验证 fail-all vs fail-fast
 
@@ -79,13 +89,17 @@ flowchart TD
 
 - `ConfigHandle` = `Arc<RwLock<GatewayConfig>>`（唯一的配置访问路径）
 - `GatewayConfig::validate()` 在每次加载和保存时都运行
+- 热重载始终读取并发布**最终版本**（尾部防抖），绝不发布编辑器分段保存的中间态
+- 原子 temp-file + rename 保存不中断监听（目录监听不受 inode 替换影响）
 - 热重载用 `notify` 的 `macos_kqueue` 特性（macOS 上）
 - `toml_edit` 编辑以 `(provider, real_model)` 为 key 定位 route target inline table
 
 ## 测试策略
 
 - `sag-config/src/config.rs` tests — 大量单元测试（解析、验证、边界情况）
-- `sag-config/src/loader.rs` tests — 热重载和保存测试
+- `sag-config/src/loader/reload.rs` tests — watcher 事件过滤（`event_targets_config`）与监听目录解析单元测试
+- `sag-state/tests/hot_reload_watcher.rs` tests — watcher ↔ `ConfigMutationCoordinator` 集成测试（外部编辑重载、原子替换突发写入只加载最终版本、未重载外部编辑仍冲突、SAG 自身持久化不误报）
 
 ## 变更记录
+- [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)
 - [0001 初始化](changes/0001-initial.md)

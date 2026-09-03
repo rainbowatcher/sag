@@ -19,4 +19,5 @@ sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 sqlx = { workspace = true }

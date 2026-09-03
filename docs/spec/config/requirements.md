@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-09-03
 ---
 
 # 配置
@@ -35,6 +35,12 @@ updated: 2026-06-03
 4. 清除路由的 shuffle 缓存和 sticky active targets（因为 targets 可能变了）
 
 **热重载边界**：`[server].host` 和 `[server].port` 修改不触发 listen socket 重新 bind——需要重启生效。`[gateway_auth]` 同样需要重启。
+
+**监听与防抖**（[0002](changes/0002-hot-reload-trailing-debounce.md) 起）：
+- 同时监听配置文件**父目录**与文件本身；原子 temp-file + rename 保存不会中断监听（目录监听不受 inode 替换影响），事件按配置路径/文件名过滤，`Access` 类只读事件忽略。
+- 使用**尾部防抖**（trailing debounce）：仅当文件静默超过 300ms 后才加载，突发写入期间不断重置窗口，保证读取的是**最终版本**而非中间态。
+- 防抖窗口后增加 100ms settle 窗口并排空边界事件，若有新相关事件则重新武装防抖；排空时同步重建直接文件监听。
+- 加载失败（读到截断/无效中间态、文件短暂缺失）最多重试 2 次，之后等待下一个文件事件。
 
 ### 验证规则
 
@@ -75,4 +81,5 @@ updated: 2026-06-03
 
 ## 变更记录
 
+- [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)
 - [0001 初始化](changes/0001-initial.md)
