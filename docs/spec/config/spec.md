@@ -8,7 +8,7 @@ updated: 2026-09-03
 ## 关键文件
 
 - [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `GatewayConfig`、所有子结构体、`validate()`、序列化辅助函数
-- [sag-config/src/loader/load.rs](../../../sag-config/src/loader/load.rs) — `load_config()`、`peek_logging_config()`
+- [sag-config/src/loader/load.rs](../../../sag-config/src/loader/load.rs) — `load_config()`、`peek_logging_config()`、统一 typed 反序列化（`deserialize_config` / `deserialize_config_collecting`，基于 `serde_ignored`）
 - [sag-config/src/loader/reload.rs](../../../sag-config/src/loader/reload.rs) — `spawn_hot_reload()` 热重载 watcher（尾部防抖、目录+文件双监听、有界重试）
 - [sag-config/src/loader/save.rs](../../../sag-config/src/loader/save.rs) — `save_config_to_file()` 原子保存
 - [sag-config/src/toml_edit_util.rs](../../../sag-config/src/toml_edit_util.rs) — `toml_edit` 原地编辑工具函数
@@ -36,6 +36,12 @@ flowchart TD
 热重载 watcher（`loader/reload.rs`）在 [0002](changes/0002-hot-reload-trailing-debounce.md) 起同时监听**父目录**与**配置文件本身**：目录监听保证原子 temp-file + rename 保存（inode 替换）后监听不失效，直接文件监听覆盖 macOS kqueue 目录监听不报告文件内就地编辑的情况。事件按配置路径/文件名过滤，`Access` 只读事件忽略。触发采用**尾部防抖**（`DEBOUNCE`=300ms，`DEBOUNCE_TICK`=100ms 轮询）+ settle 窗口（`SETTLE`=100ms）边界排空：突发写入期间不断重置窗口，保证读取的是最终版本；防抖窗口后若排空到新相关事件则重新武装。加载失败最多重试 `MAX_RELOAD_RETRIES`（2）次后等待下一个文件事件。
 
 ## 关键决策
+
+### serde_ignored vs 手写白名单
+
+未知字段告警使用 `serde_ignored` 在 typed 反序列化过程中收集不识别的字段路径（`toml::Deserializer`），而非旧方案的 raw TOML + 手工枚举白名单（`warn_unknown_fields`）。
+
+**Trade-off**: 白名单方案每次新增 Schema 字段都要同步维护 `load.rs` 的键名数组，遗漏即产生误报警告（如 0003 的 `retry_on_empty_response` 虚警）；`serde_ignored` 与 `GatewayConfig` 结构体自动同步，结构体加字段即自动识别，且 load / reload 共用同一路径、行为一致。代价是告警路径变为点分路径格式（如 `providers.openai.max_tokens`），与结构体字段一一对应，调试时同样可读。
 
 ### Peek vs 完整加载
 
@@ -87,6 +93,8 @@ flowchart TD
 
 ## 不变式
 
+- 未知配置字段**只告警、绝不拒绝**（`serde_ignored` 收集 + `warn!`），向前兼容；load / reload 共用统一反序列化路径
+- 动态 HashMap key（provider 名、header 名、body override key、`RouteTarget.extra` key 等）不视为未知字段
 - `ConfigHandle` = `Arc<RwLock<GatewayConfig>>`（唯一的配置访问路径）
 - `GatewayConfig::validate()` 在每次加载和保存时都运行
 - 热重载始终读取并发布**最终版本**（尾部防抖），绝不发布编辑器分段保存的中间态
@@ -97,10 +105,12 @@ flowchart TD
 ## 测试策略
 
 - `sag-config/src/config.rs` tests — 大量单元测试（解析、验证、边界情况）
+- `sag-config/src/loader/load.rs` tests — 基于 `serde_ignored` 的未知字段检测 / 忽略 / 告警 / 不拒绝系列单元测试（load 与 reload 双路径）
 - `sag-config/src/loader/reload.rs` tests — watcher 事件过滤（`event_targets_config`）与监听目录解析单元测试
 - `sag-state/tests/hot_reload_watcher.rs` tests — watcher ↔ `ConfigMutationCoordinator` 集成测试（外部编辑重载、原子替换突发写入只加载最终版本、未重载外部编辑仍冲突、SAG 自身持久化不误报）
 
 ## 变更记录
+- [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)
 - [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)
 - [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)
 - [0001 初始化](changes/0001-initial.md)

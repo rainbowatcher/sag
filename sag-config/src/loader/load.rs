@@ -63,135 +63,36 @@ pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
     (level, format)
 }
 
-/// Log a warning for each unknown key in a TOML table.
-fn check_unknown_keys(table: &toml::Table, known: &[&str], context: &str) {
-    for key in table.keys() {
-        if !known.contains(&key.as_str()) {
-            warn!("unknown config key '{key}' in {context}");
-        }
-    }
+/// Parse a TOML document into `T`, returning the typed value plus the dotted
+/// paths of any fields the type does not recognise (via `serde_ignored`).
+///
+/// Unknown fields are never rejected — the gateway's contract is to warn and
+/// continue. The returned `Vec` holds paths like `providers.openai.max_tokens`
+/// or `routes.0.targets.0.model`. Keys of dynamic maps (e.g. `providers.<name>`,
+/// `headers.<name>`, `body_overrides.<key>`, `RouteTarget.extra.<key>`) are
+/// legitimately consumed by the map types and are therefore **not** reported.
+fn deserialize_config_collecting<T: serde::de::DeserializeOwned>(
+    content: &str,
+) -> Result<(T, Vec<String>), toml::de::Error> {
+    let deserializer = toml::Deserializer::parse(content)?;
+    let mut unknown = Vec::new();
+    let config: T = serde_ignored::deserialize(deserializer, |path| {
+        unknown.push(path.to_string());
+    })?;
+    Ok((config, unknown))
 }
 
-/// Scan the raw TOML document for keys that are not recognised by
-/// `GatewayConfig` and emit a `warn!` for each one. This catches
-/// typos, obsolete keys, and misplaced fields that serde would
-/// otherwise silently discard.
-///
-/// Covers: top level, [server], [analytics], [gateway_auth], [backoff],
-/// [circuit_breaker], [logging], [providers.*], [[routes]], and route
-/// target inline tables.
-fn warn_unknown_fields(doc: &toml::Value) {
-    let Some(top) = doc.as_table() else { return };
-
-    check_unknown_keys(
-        top,
-        &[
-            "server",
-            "analytics",
-            "gateway_auth",
-            "providers",
-            "backoff",
-            "circuit_breaker",
-            "shuffle_cache_ttl_secs",
-            "sticky_failover_reset_secs",
-            "routes",
-            "logging",
-        ],
-        "top level",
-    );
-
-    if let Some(server) = top.get("server").and_then(|v| v.as_table()) {
-        check_unknown_keys(server, &["host", "port"], "[server]");
+/// Parse a TOML document into `T`, emitting a `warn!` for every field the
+/// typed struct does not recognise. Unknown fields are tolerated (warn, never
+/// deny), matching the gateway's forward-compatibility contract. Dynamic map
+/// keys (provider names, header names, body-override keys, …) are valid and
+/// produce no warning.
+fn deserialize_config<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, toml::de::Error> {
+    let (config, unknown) = deserialize_config_collecting(content)?;
+    for path in &unknown {
+        warn!("unknown config field '{path}'");
     }
-
-    if let Some(analytics) = top.get("analytics").and_then(|v| v.as_table()) {
-        check_unknown_keys(analytics, &["enabled", "storage_dsn"], "[analytics]");
-    }
-
-    if let Some(auth) = top.get("gateway_auth").and_then(|v| v.as_table()) {
-        check_unknown_keys(auth, &["api_keys"], "[gateway_auth]");
-    }
-
-    if let Some(backoff) = top.get("backoff").and_then(|v| v.as_table()) {
-        check_unknown_keys(
-            backoff,
-            &[
-                "retries",
-                "base_ms",
-                "max_ms",
-                "jitter",
-                "retry_on_empty_response",
-            ],
-            "[backoff]",
-        );
-    }
-
-    if let Some(cb) = top.get("circuit_breaker").and_then(|v| v.as_table()) {
-        check_unknown_keys(
-            cb,
-            &["quota_exhausted_secs", "rate_limited_secs", "generic_secs"],
-            "[circuit_breaker]",
-        );
-    }
-
-    if let Some(logging) = top.get("logging").and_then(|v| v.as_table()) {
-        check_unknown_keys(logging, &["level", "format"], "[logging]");
-    }
-
-    if let Some(providers) = top.get("providers").and_then(|v| v.as_table()) {
-        let known_provider = &[
-            "provider_type",
-            "api_keys",
-            "key_strategy",
-            "base_url",
-            "models_endpoint",
-            "timeout_secs",
-            "chunk_timeout_secs",
-            "ttfb_timeout_secs",
-            "headers",
-            "body_overrides",
-            "strip_fields",
-            "model_strip_fields",
-            "model_overrides",
-            "role_mappings",
-            "enabled",
-            "enabled_models",
-            "anthropic_cache_control",
-        ];
-        for (name, pv) in providers {
-            let Some(pt) = pv.as_table() else { continue };
-            check_unknown_keys(pt, known_provider, &format!("[providers.{name}]"));
-        }
-    }
-
-    if let Some(routes) = top.get("routes").and_then(|v| v.as_array()) {
-        let known_route = &[
-            "model_name",
-            "api_endpoint",
-            "strategy",
-            "retries",
-            "timeout_secs",
-            "targets",
-        ];
-        let known_target = &[
-            "provider",
-            "real_model",
-            "priority",
-            "retries",
-            "timeout_secs",
-            "extra",
-        ];
-        for (i, rv) in routes.iter().enumerate() {
-            let Some(rt) = rv.as_table() else { continue };
-            check_unknown_keys(rt, known_route, &format!("routes[{i}]"));
-            if let Some(targets) = rt.get("targets").and_then(|v| v.as_array()) {
-                for (j, tv) in targets.iter().enumerate() {
-                    let Some(tt) = tv.as_table() else { continue };
-                    check_unknown_keys(tt, known_target, &format!("routes[{i}].targets[{j}]"));
-                }
-            }
-        }
-    }
+    Ok(config)
 }
 
 /// Load the initial configuration from a TOML file and return a `ConfigHandle`.
@@ -201,12 +102,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
         sag_core::AppError::Config(format!("failed to read config {}: {e}", path.display()))
     })?;
 
-    // Parse raw TOML to detect unknown keys before discarding them via serde.
-    if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
-        warn_unknown_fields(&raw);
-    }
-
-    let config: GatewayConfig = toml::from_str(&content)
+    let config: GatewayConfig = deserialize_config(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
     config
@@ -226,11 +122,8 @@ pub async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_
     let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
     })?;
-    if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
-        warn_unknown_fields(&raw);
-    }
 
-    let config: GatewayConfig = toml::from_str(&content)
+    let config: GatewayConfig = deserialize_config(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
     config
@@ -244,6 +137,7 @@ pub async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
 
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -313,11 +207,23 @@ api_keys = ["sk-test"]
         );
     }
 
-    // ── unknown key warning tests ──
+    // ── unknown-field warning tests (serde_ignored based) ──
+    //
+    // `deserialize_config_collecting` returns the typed config plus the dotted
+    // paths of every unrecognised field. Unknown fields are warned, never
+    // rejected; dynamic map keys are consumed by the map types and never
+    // reported. Paths follow `serde_ignored`'s format: `server.bind`,
+    // `providers.openai.max_tokens`, `routes.0.endpoint`, `routes.0.targets.0.model`.
+
+    /// Parse `content` as `GatewayConfig` and return the collected unknown paths.
+    fn collect_unknown(content: &str) -> Vec<String> {
+        let (_config, unknown) = deserialize_config_collecting::<GatewayConfig>(content).unwrap();
+        unknown
+    }
 
     #[test]
-    fn warn_unknown_fields_detects_top_level_typos() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_detects_top_level_typos() {
+        let unknown = collect_unknown(
             r#"
 host = "127.0.0.1"
 serverr = "oops"
@@ -325,14 +231,14 @@ serverr = "oops"
 port = 8080
 [providers]
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert!(unknown.contains(&"serverr".to_string()), "got: {unknown:?}");
+        assert!(unknown.contains(&"host".to_string()), "got: {unknown:?}");
     }
 
     #[test]
-    fn warn_unknown_fields_detects_unknown_server_keys() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_detects_unknown_server_keys() {
+        let unknown = collect_unknown(
             r#"
 [server]
 host = "127.0.0.1"
@@ -340,14 +246,16 @@ port = 8080
 bind = "0.0.0.0"
 [providers]
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert!(
+            unknown.contains(&"server.bind".to_string()),
+            "got: {unknown:?}"
+        );
     }
 
     #[test]
-    fn warn_unknown_fields_detects_unknown_provider_keys() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_detects_unknown_provider_keys() {
+        let unknown = collect_unknown(
             r#"
 [server]
 host = "127.0.0.1"
@@ -357,14 +265,16 @@ port = 8080
 api_keys = ["sk-test"]
 max_tokens = 4096
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert!(
+            unknown.contains(&"providers.openai.max_tokens".to_string()),
+            "got: {unknown:?}"
+        );
     }
 
     #[test]
-    fn warn_unknown_fields_detects_unknown_route_keys() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_detects_unknown_route_keys() {
+        let unknown = collect_unknown(
             r#"
 [server]
 host = "127.0.0.1"
@@ -379,14 +289,16 @@ targets = [
     { provider = "openai" },
 ]
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert!(
+            unknown.contains(&"routes.0.endpoint".to_string()),
+            "got: {unknown:?}"
+        );
     }
 
     #[test]
-    fn warn_unknown_fields_detects_unknown_target_keys() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_detects_unknown_target_keys() {
+        let unknown = collect_unknown(
             r#"
 [server]
 host = "127.0.0.1"
@@ -400,24 +312,27 @@ targets = [
     { provider = "openai", model = "gpt-4" },
 ]
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert!(
+            unknown.contains(&"routes.0.targets.0.model".to_string()),
+            "got: {unknown:?}"
+        );
     }
 
     #[test]
-    fn warn_unknown_fields_ignores_known_keys() {
-        let doc = toml::from_str::<toml::Value>(valid_toml()).unwrap();
-        warn_unknown_fields(&doc);
+    fn unknown_field_ignores_known_keys() {
+        assert_eq!(collect_unknown(valid_toml()), Vec::<String>::new());
     }
 
     #[test]
-    fn warn_unknown_fields_ignores_known_backoff_keys() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_ignores_known_backoff_keys() {
+        let unknown = collect_unknown(
             r#"
 [server]
 host = "127.0.0.1"
 port = 8080
+
+[providers]
 
 [backoff]
 retries = 3
@@ -426,23 +341,226 @@ max_ms = 5000
 jitter = true
 retry_on_empty_response = false
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert_eq!(unknown, Vec::<String>::new());
     }
 
     #[test]
-    fn warn_unknown_fields_flags_top_level_retries() {
-        let doc = toml::from_str::<toml::Value>(
+    fn unknown_field_flags_top_level_retries() {
+        // `retries` was moved under [backoff]; a stray top-level `retries`
+        // (before any [table] header) must be flagged.
+        let unknown = collect_unknown(
+            r#"
+retries = 5
+[server]
+host = "127.0.0.1"
+port = 8080
+[providers]
+"#,
+        );
+        assert!(unknown.contains(&"retries".to_string()), "got: {unknown:?}");
+    }
+
+    /// Dynamic maps must never be flagged: provider names, header names,
+    /// body/model override keys, role mappings and per-target `extra` keys
+    /// are all legitimately arbitrary.
+    #[test]
+    fn unknown_field_ignores_dynamic_map_keys() {
+        let unknown = collect_unknown(
             r#"
 [server]
 host = "127.0.0.1"
 port = 8080
-retries = 5
-[providers]
+
+[providers.my-custom-provider-1]
+api_keys = ["sk-1"]
+
+[providers.anthropic]
+api_keys = ["sk-ant"]
+
+[providers.anthropic.headers]
+X-Arbitrary-Header = "value"
+Authorization = "Bearer x"
+
+[providers.anthropic.body_overrides]
+max_tokens = 4096
+some_custom_field = { nested = true }
+
+[providers.anthropic.model_overrides."gpt-4o"]
+temperature = 0.8
+any_weird_key = 42
+
+[providers.anthropic.role_mappings]
+developer = "system"
+
+[providers.anthropic.model_strip_fields]
+"gpt-4o" = ["chat_template_kwargs"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "anthropic", extra = { temperature = 0.7, any_custom_flag = true } },
+]
 "#,
-        )
-        .unwrap();
-        warn_unknown_fields(&doc);
+        );
+        assert_eq!(
+            unknown,
+            Vec::<String>::new(),
+            "dynamic map keys must not be flagged, got: {unknown:?}"
+        );
+    }
+
+    /// `load_config` must succeed (warn, not deny) when the file contains
+    /// unknown fields, and unknown fields must be ignored by serde while
+    /// known ones still parse.
+    #[test]
+    fn load_config_does_not_deny_unknown_fields() {
+        let path = temp_toml(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+bind = "0.0.0.0"
+
+[gateway_auth]
+api_keys = ["test-key"]
+
+[providers.openai]
+api_keys = ["sk-test"]
+max_tokens = 4096
+"#,
+        );
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap();
+        assert_eq!(config.server.port, 9090);
+        assert_eq!(config.providers.len(), 1);
+    }
+
+    // ── warning emission ──
+
+    /// A minimal `tracing::Subscriber` that records the `message` of every
+    /// event. Used to assert that unknown fields emit a `warn!` (warn, never
+    /// deny). A hand-rolled subscriber is deterministic under the parallel
+    /// test harness (the fmt-subscriber writer path is not), and it needs no
+    /// extra dev-dependency.
+    #[derive(Clone, Default)]
+    struct RecordingSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for RecordingSubscriber {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(0xDEAD_BEEF)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.events.lock().unwrap().push(message.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// `deserialize_config` / `load_config` must emit a `warn!` for every
+    /// unknown field and still succeed (warn, never deny). The subscriber is
+    /// installed with `set_global_default` (once per process) rather than
+    /// `with_default`: `with_default` bumps a process-global scoped-dispatch
+    /// counter that races across threads in the parallel test harness,
+    /// intermittently dropping events; the global fast-path is deterministic.
+    #[test]
+    fn unknown_fields_emit_warn() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = RecordingSubscriber {
+            events: events.clone(),
+        };
+        // Err only if a global default was already installed; that is fine.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+        events.lock().unwrap().clear();
+
+        // `deserialize_config` path (shared by load_config and reload_config).
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+bind = "0.0.0.0"
+
+[providers.openai]
+api_keys = ["sk-test"]
+max_tokens = 4096
+"#;
+        deserialize_config::<GatewayConfig>(content).expect("parse should succeed");
+
+        // `load_config` (initial-load) path.
+        let path = temp_toml(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+bind = "0.0.0.0"
+
+[providers.openai]
+api_keys = ["sk-test"]
+max_tokens = 4096
+"#,
+        );
+        load_config(&path).expect("unknown fields must not deny loading");
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|e| e.contains("unknown config field 'server.bind'")),
+            "expected server.bind warning, got: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|e| e.contains("unknown config field 'providers.openai.max_tokens'")),
+            "expected provider warning, got: {recorded:?}"
+        );
+    }
+
+    /// `reload_config` (hot-reload path) shares `deserialize_config`, so it
+    /// must also tolerate unknown fields (warn, never deny — no panic, load
+    /// succeeds), keeping initial-load and reload behavior consistent.
+    #[tokio::test]
+    async fn reload_config_handles_unknown_fields() {
+        let path = temp_toml(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+bind = "0.0.0.0"
+
+[providers.openai]
+api_keys = ["sk-test"]
+max_tokens = 4096
+"#,
+        );
+        let config = reload_config(&path).await.expect("reload should succeed");
+        assert_eq!(config.server.port, 9090);
+        assert_eq!(config.providers.len(), 1);
     }
 }

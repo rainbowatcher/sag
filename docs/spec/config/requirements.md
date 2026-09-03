@@ -15,9 +15,16 @@ updated: 2026-09-03
 
 1. 解析命令行参数，确定配置文件路径（`--config <path>` > 位置参数 > `gateway.toml`）
 2. Peek 配置文件中的 `[logging]` 段（在完整加载前初始化 tracing）
-3. 完整反序列化 TOML → `GatewayConfig` 结构体
+3. 统一 typed 反序列化 TOML → `GatewayConfig` 结构体（`toml::Deserializer` + `serde_ignored`，与结构体 Schema 自动同步）
 4. 运行 `validate()` → 收集所有错误（不 fail-fast）
 5. 通过 `notify` crate 监听文件变化
+
+### 未知字段处理
+
+反序列化时用 `serde_ignored` 收集类型不识别的字段点分路径（如 `server.bind`、`providers.openai.max_tokens`、`routes.0.targets.0.model`），逐条 `tracing::warn!`：
+- 未知字段仅告警、**绝不拒绝**（向前兼容契约），含未知字段的配置仍正常加载；
+- 初始加载（`load_config`）与热重载（`reload_config`）共用同一告警路径，行为一致；
+- 动态 HashMap key（provider 名、`headers.*`、`body_overrides.*`、`model_overrides.*`、`role_mappings`、`RouteTarget.extra.*` 等）被 map 类型正常消费，**不**视为未知字段。
 
 ### 环境变量插值
 
@@ -81,6 +88,7 @@ updated: 2026-09-03
 
 ## 变更记录
 
+- [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)
 - [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)
 - [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)
 - [0001 初始化](changes/0001-initial.md)
