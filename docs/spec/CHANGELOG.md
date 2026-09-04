@@ -7,6 +7,10 @@ updated: 2026-09-03
 
 按时间倒序列出所有模块的变更记录。
 
+## 2026-09-04
+
+- **分析**：[0004 Token 命中率分母改为全部成功样本](analytics/changes/0004-token-cache-hit-rate-all-success.md) — `token_cache_hit_rate` 改为全部成功样本的 ΣCOALESCE(cached_tokens,0)/Σprompt_tokens，明细与 Rollup 混合路径口径一致
+
 ## 2026-09-03
 
 - **配置**：[0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](config/changes/0004-warn-unknown-config-fields.md) — 移除 raw TOML + 手写白名单，改用 `serde_ignored` 配合 `toml::Deserializer` 统一 typed 反序列化，未知字段仅 warn 不拒绝，load/reload 共用，动态 HashMap key 不误报

@@ -349,8 +349,8 @@ flowchart TD
 - target 视角只取 `target_attempts` 实际尝试；circuit-open 跳过不产生尝试，不进分母。
 - route 级 e2e 延迟样本 = `final_status ∈ {success, model_failure, all_disabled, client_cancelled}`（进入实际调度的请求；`no_route` / `client_error` 排除，见关键决策）。target 级延迟样本 = 全部实际尝试（含失败/取消尝试）。
 - Token 只统计最终成功（两级各自）；失败 Token NULL，统计中不得当作 0。
-- 缓存（route/target 两级通用）：样本集 S = 该层级最终成功样本（route：`final_status=success` 请求；target：`status=success` 尝试）中 `cached_tokens` 非 NULL 者；请求命中率 = S 中 `cached_tokens > 0` 的样本数 / |S|；Token 命中率 = Σ_S `cached_tokens` / Σ_S `prompt_tokens`；unknown 单列计数，不并入命中或未命中，**不得当作 0**。
-- 缓存命中率只依赖可合并计数（`cached_known_count` / `cached_hit_count` / `prompt_tokens_cached_known` 与 `cached_tokens` 之和），>24h 历史部分可由 Rollup 跨桶正确合并（见「查询与 Rollup」）。
+- 缓存（route/target 两级通用）：请求命中率样本集 S = 该层级最终成功样本（route：`final_status=success` 请求；target：`status=success` 尝试）中 `cached_tokens` 非 NULL 者；请求命中率 = S 中 `cached_tokens > 0` 的样本数 / |S|。Token 命中率样本集 = 全部最终成功样本：Token 命中率 = Σ `COALESCE(cached_tokens, 0)` / Σ `prompt_tokens`（token 加权 SUM/SUM，非每请求比例的算术平均）；NULL / 0 的 `cached_tokens` 分子贡献 0，其 `prompt_tokens` 仍计入分母；分母为 0（无成功样本）时为 null。unknown 单列计数，不并入命中或未命中，**不得当作 0**。
+- 缓存命中率只依赖可合并计数（请求命中率：`cached_known_count` / `cached_hit_count`；Token 命中率：`cached_tokens` 之和 / `prompt_tokens` 之和），>24h 历史部分可由 Rollup 跨桶正确合并（见「查询与 Rollup」）；`prompt_tokens_cached_known` 保留为参考计数，不再是 Token 命中率分母。
 - 延迟每维度独立：有效样本（非 NULL）→ 平均 / P50 / P95 / P99；coverage = 有值样本 / 全部样本；有效样本 < 100 → `low_sample=true`。span ≤ 24h 明细模式下分位精确计算；Rollup 模式按直方图近似（约 1% 值误差）。
 
 ### 查询与 Rollup（目标实现，阶段 2-3）
@@ -381,7 +381,7 @@ CREATE TABLE IF NOT EXISTS rollup_global_hourly (
     cache_creation_tokens INTEGER NOT NULL,
     cached_known_count     INTEGER NOT NULL,  -- 缓存信息已知的成功请求数（命中率分母）
     cached_hit_count       INTEGER NOT NULL,  -- 其中 cached_tokens > 0 的请求数
-    prompt_tokens_cached_known INTEGER NOT NULL, -- 已知样本集 prompt_tokens 之和（Token 命中率分母）
+    prompt_tokens_cached_known INTEGER NOT NULL, -- 已知样本集 prompt_tokens 之和（参考计数；Token 命中率分母 = 全部成功样本的 prompt_tokens）
     e2e_count  INTEGER NOT NULL,          -- 延迟样本数（coverage 分母）
     e2e_sum_ms INTEGER NOT NULL,
     ttft_count INTEGER NOT NULL,
@@ -404,7 +404,7 @@ CREATE TABLE IF NOT EXISTS rollup_route_hourly (
     cached_tokens     INTEGER NOT NULL,
     cached_known_count     INTEGER NOT NULL,  -- 缓存信息已知的成功请求数（命中率分母）
     cached_hit_count       INTEGER NOT NULL,  -- 其中 cached_tokens > 0 的请求数
-    prompt_tokens_cached_known INTEGER NOT NULL, -- 已知样本集 prompt_tokens 之和（Token 命中率分母）
+    prompt_tokens_cached_known INTEGER NOT NULL, -- 已知样本集 prompt_tokens 之和（参考计数；Token 命中率分母 = 全部成功样本的 prompt_tokens）
     e2e_count  INTEGER NOT NULL,
     e2e_sum_ms INTEGER NOT NULL,
     ttft_count INTEGER NOT NULL,
@@ -427,7 +427,7 @@ CREATE TABLE IF NOT EXISTS rollup_target_hourly (
     cached_tokens     INTEGER NOT NULL,
     cached_known_count     INTEGER NOT NULL,  -- 缓存信息已知的成功尝试数（命中率分母）
     cached_hit_count       INTEGER NOT NULL,  -- 其中 cached_tokens > 0 的尝试数
-    prompt_tokens_cached_known INTEGER NOT NULL, -- 已知样本集 prompt_tokens 之和（Token 命中率分母）
+    prompt_tokens_cached_known INTEGER NOT NULL, -- 已知样本集 prompt_tokens 之和（参考计数；Token 命中率分母 = 全部成功样本的 prompt_tokens）
     e2e_count  INTEGER NOT NULL,
     e2e_sum_ms INTEGER NOT NULL,
     ttft_count INTEGER NOT NULL,
@@ -459,7 +459,7 @@ CREATE TABLE IF NOT EXISTS rollup_bucket_state (
 
 稀疏对数延迟桶：0ms 单独成桶（`bucket_idx=0`）；v ≥ 1ms 时 `bucket_idx = floor(log(v) / log(1.01)) + 1`（1ms 起、约 1.01 倍递增，桶内最大相对误差约 1%，对应「约 1% 值误差」目标）；超过固定容量上限进 overflow 桶；NULL 不入桶（只计入 coverage 分母）。P50/P95/P99 由累计计数反查桶下界得到。
 
-缓存列口径：三张 Rollup 表的 `cached_tokens` / `cache_creation_tokens` 只累计已知样本（非 NULL）的值；命中率一律由 `cached_known_count` / `cached_hit_count` / `prompt_tokens_cached_known` 与 `cached_tokens` 之和计算，unknown 不计分母、不作为 0。
+缓存列口径：三张 Rollup 表的 `cached_tokens` / `cache_creation_tokens` 只累计已知样本（非 NULL）的值（`cached_tokens` 即 Token 命中率分子，NULL 贡献 0）；请求命中率由 `cached_known_count` / `cached_hit_count` 计算；Token 命中率由 `cached_tokens` 之和 / `prompt_tokens` 之和计算（分母为全部成功样本的 prompt_tokens，`prompt_tokens_cached_known` 仅为参考计数）；unknown 不计请求命中率分母、不作为 0。
 
 历史延迟分位（Rollup 模式）：global overall 合并选定时间范围内同一 `dim`（e2e/ttft/upstream）的全部 route 直方图行，按 `bucket_idx` 求和（跨 route_id），再按累计计数反查桶下界估算 P50/P95/P99；route / target 分组同理，先按 `owner_id`（route_id / target_id）筛选该对象的行再合并。明细模式（≤24h）直接按样本精确计算。
 
@@ -652,7 +652,7 @@ stateDiagram-v2
 - 同小时桶的 global/route/target/hist 行同一事务提交
 - `bucket_idx`：`0` = 0ms 桶；`overflow` 桶存在；NULL 不入桶
 - `rollup_target_hourly.attempts = success + failure + cancelled`
-- 三张 Rollup 表均含 `cached_known_count` / `cached_hit_count` / `prompt_tokens_cached_known` 列；`cached_known_count >= cached_hit_count`
+- 三张 Rollup 表均含 `cached_known_count` / `cached_hit_count` / `prompt_tokens_cached_known` 列；`cached_known_count >= cached_hit_count`；Token 命中率分子分母 = `cached_tokens` 之和 / `prompt_tokens` 之和（全部成功样本）
 - Rollup 表只被批处理 upsert，`request_results` / `target_attempts` 只增不删（Rollup 不删事实）
 
 ### API
@@ -690,10 +690,12 @@ stateDiagram-v2
 9. **迟到/缺失桶、幂等、恢复**：已完成桶收到迟写事实 → `dirty=1` → 下一轮重算；启动扫描只登记缺失/脏桶不计算；processing 超时回 pending 可恢复；同桶事务失败整体回滚后重试幂等。
 10. **缓存/缺失延迟/low_sample**：`cached_tokens` NULL 与 0 区分（unknown vs 未命中）；延迟 NULL 样本排除且 coverage 正确；有效样本 < 100 → `low_sample=true`。
 11. **client_cancelled 边界**：取消发生在无在途 target 尝试时（重试/退避/fallback 间隙）→ `request_results` 一条 `client_cancelled`、`target_attempts` 0 条；取消发生在在途调用 → 该尝试记 `cancelled`（不计 success/failure）。
-12. **缓存命中率 Rollup 对照**：`cached_known_count` / `cached_hit_count` / `prompt_tokens_cached_known` 与明细口径一致；unknown 样本不计分母；跨桶合并（>24h 混合查询）命中率 == 明细计算值。
+12. **缓存命中率 Rollup 对照**：`cached_known_count` / `cached_hit_count` 与明细口径一致（请求命中率，unknown 不计分母）；Token 命中率 = `cached_tokens` 之和 / `prompt_tokens` 之和（全部成功样本），跨桶合并（>24h 混合查询）与明细计算值一致；覆盖 成功 + cached>0 / cached=0 / cached=NULL 与失败请求被排除四种组合。
 13. **失败原因映射合法组合**：`failure_reason` 与 `final_status` 的组合符合「状态判定」映射表；未登记的非法组合不得产生。
 
 ## 变更记录
 
+- [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
+- [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)
 - [0002 双层事实与 Rollup](changes/0002-two-level-facts.md)
 - [0001 初始化](changes/0001-initial.md)

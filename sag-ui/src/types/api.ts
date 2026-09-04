@@ -312,11 +312,11 @@ export interface MetricSummary {
   cache_unknown: number
   /** 请求命中率 = cache_hit / cache_known; unknown samples are not counted. */
   request_cache_hit_rate: number | null
-  /** Token 命中率 = Σ cached_tokens / Σ prompt_tokens over known samples. */
+  /** Token 命中率 = Σ COALESCE(cached_tokens, 0) / Σ prompt_tokens over ALL success samples. */
   token_cache_hit_rate: number | null
-  /** Σ prompt_tokens over cache-known success samples. */
+  /** Σ prompt_tokens over all success samples (token hit-rate denominator). */
   cache_prompt_tokens: number
-  /** Σ cached_tokens over cache-known success samples. */
+  /** Σ COALESCE(cached_tokens, 0) over all success samples (token hit-rate numerator). */
   cache_tokens: number
   /** 端到端 / 上游 / TTFT 延迟 (各自独立 coverage). */
   e2e: LatencyMetric

@@ -89,8 +89,9 @@ updated: 2026-08-11
 - 必须提供：请求吞吐、输入 Token 吞吐、输出 Token 吞吐。
 - 必须提供缓存命中指标：缓存请求命中率与缓存 Token 命中率。
 - 缓存字段为 NULL 表示**未知**，不等于未命中；UI 必须将"未知"与"未命中"区分显示。
-- 缓存命中率样本集 = 缓存信息已知（非 NULL）的最终成功样本（route 级 = success 请求，target 级 = success 尝试）；**未知样本不计分母**，不得当作 0。
-- 请求命中率 = 命中样本数 / 已知样本数；Token 命中率 = 已知样本的 Σcached_tokens / Σprompt_tokens。
+- 请求命中率样本集 = 缓存信息已知（非 NULL）的最终成功样本（route 级 = success 请求，target 级 = success 尝试）；**未知样本不计请求命中率分母**，不得当作 0。
+- Token 命中率样本集 = 全部最终成功样本（route 级 = success 请求，target 级 = success 尝试）；Token 命中率 = Σ COALESCE(cached_tokens, 0) / Σ prompt_tokens（token 加权 SUM/SUM，非每请求比例的算术平均）；cached_tokens 为 NULL 或 0 时分子贡献 0，其 prompt_tokens 仍计入分母；分母为 0（无成功样本）时返回 null。
+- 请求命中率 = 命中样本数 / 已知样本数。
 - 命中率统计必须可由 1h Rollup 跨桶正确合并（只依赖可合并计数，不得依赖明细推导）。
 
 ### 延迟指标
@@ -173,6 +174,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 变更记录
 
+- [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
 - [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)
 - [0002 双层事实与 Rollup](changes/0002-two-level-facts.md)
 - [0001 初始化](changes/0001-initial.md)

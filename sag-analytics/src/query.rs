@@ -28,8 +28,11 @@
 //!   the average stays exact (`*_sum_ms` + detail sums).
 //! - token / cached-token columns only aggregate over final-success
 //!   samples; `cached_tokens = NULL` means **unknown** (distinct from
-//!   miss) and NULL latency values are excluded from their own coverage
-//!   denominators — none of them are ever treated as 0.
+//!   miss); the Token 命中率 = Σ `COALESCE(cached_tokens, 0)` / Σ
+//!   `prompt_tokens` over **all** success samples (NULL cached_tokens
+//!   contributes 0 to the numerator while its prompt_tokens stays in the
+//!   denominator), and NULL latency values are excluded from their own
+//!   coverage denominators — nothing is ever treated as 0.
 //! - outputs never expose `route_id` / `target_id` UUIDs: groups are keyed
 //!   by `route_name` (route scope) or `(provider, real_model)` (target
 //!   scope).
@@ -291,13 +294,16 @@ pub struct MetricSummary {
     /// 请求命中率 = `cache_hit` / `cache_known`; unknown samples are not in
     /// the denominator.
     pub request_cache_hit_rate: Option<f64>,
-    /// Token 命中率 = Σ `cached_tokens` / Σ `prompt_tokens` over known
-    /// samples; `None` when no known samples.
+    /// Token 命中率 = Σ `COALESCE(cached_tokens, 0)` / Σ `prompt_tokens`
+    /// over **all** success samples; a NULL / 0 `cached_tokens` contributes
+    /// 0 to the numerator while its `prompt_tokens` stays in the
+    /// denominator; `None` when the total success prompt_tokens is 0.
     pub token_cache_hit_rate: Option<f64>,
-    /// Σ `prompt_tokens` over cache-known success samples (token hit-rate
-    /// denominator).
+    /// Σ `prompt_tokens` over **all** success samples (the token hit-rate
+    /// denominator; equals `prompt_tokens`).
     pub cache_prompt_tokens: u64,
-    /// Σ `cached_tokens` over cache-known success samples.
+    /// Σ `COALESCE(cached_tokens, 0)` over all success samples (token
+    /// hit-rate numerator; NULL cached_tokens contribute 0).
     pub cache_tokens: u64,
 
     /// 端到端 / 上游 / TTFT 延迟（平均 + P50/P95/P99，各自独立 coverage）。
@@ -911,7 +917,7 @@ SELECT
     SUM(CASE WHEN rr.final_status = 'success' THEN rr.total_tokens END)      AS total_tokens,
     SUM(CASE WHEN rr.final_status = 'success' AND rr.cached_tokens IS NOT NULL
              THEN rr.cached_tokens END)                                       AS cache_tokens_sum,
-    SUM(CASE WHEN rr.final_status = 'success' AND rr.cached_tokens IS NOT NULL
+    SUM(CASE WHEN rr.final_status = 'success'
              THEN rr.prompt_tokens END)                                       AS cache_prompt_tokens,
     SUM(CASE WHEN rr.final_status = 'success' AND rr.cached_tokens IS NOT NULL
              THEN 1 ELSE 0 END)                                               AS cache_known,
@@ -949,7 +955,7 @@ SELECT
     SUM(CASE WHEN ta.status = 'success' THEN ta.total_tokens END)      AS total_tokens,
     SUM(CASE WHEN ta.status = 'success' AND ta.cached_tokens IS NOT NULL
              THEN ta.cached_tokens END)                                 AS cache_tokens_sum,
-    SUM(CASE WHEN ta.status = 'success' AND ta.cached_tokens IS NOT NULL
+    SUM(CASE WHEN ta.status = 'success'
              THEN ta.prompt_tokens END)                                 AS cache_prompt_tokens,
     SUM(CASE WHEN ta.status = 'success' AND ta.cached_tokens IS NOT NULL
              THEN 1 ELSE 0 END)                                         AS cache_known,
@@ -1540,7 +1546,6 @@ struct RollupRouteRow {
     cached_tokens: i64,
     cached_known_count: i64,
     cached_hit_count: i64,
-    prompt_tokens_cached_known: i64,
     e2e_sum_ms: i64,
     ttft_sum_ms: i64,
     upstream_sum_ms: i64,
@@ -1562,7 +1567,6 @@ struct RollupTargetRow {
     cached_tokens: i64,
     cached_known_count: i64,
     cached_hit_count: i64,
-    prompt_tokens_cached_known: i64,
     e2e_sum_ms: i64,
     ttft_sum_ms: i64,
     upstream_sum_ms: i64,
@@ -1572,7 +1576,7 @@ const ROLLUP_ROUTE_SQL_BASE: &str = r#"
 SELECT rr.hour, rr.route_id, ar.route_name, rr.success, rr.model_failure,
        rr.all_disabled, rr.client_cancelled, rr.prompt_tokens, rr.completion_tokens,
        rr.total_tokens, rr.cached_tokens, rr.cached_known_count, rr.cached_hit_count,
-       rr.prompt_tokens_cached_known, rr.e2e_sum_ms, rr.ttft_sum_ms, rr.upstream_sum_ms
+       rr.e2e_sum_ms, rr.ttft_sum_ms, rr.upstream_sum_ms
 FROM rollup_route_hourly rr
 LEFT JOIN analytics_routes ar ON ar.route_id = rr.route_id
 "#;
@@ -1581,7 +1585,7 @@ const ROLLUP_TARGET_SQL_BASE: &str = r#"
 SELECT rt.hour, rt.target_id, art.provider, art.real_model AS actual_model, rt.success,
        rt.failure, rt.cancelled, rt.prompt_tokens, rt.completion_tokens, rt.total_tokens,
        rt.cached_tokens, rt.cached_known_count, rt.cached_hit_count,
-       rt.prompt_tokens_cached_known, rt.e2e_sum_ms, rt.ttft_sum_ms, rt.upstream_sum_ms
+       rt.e2e_sum_ms, rt.ttft_sum_ms, rt.upstream_sum_ms
 FROM rollup_target_hourly rt
 JOIN analytics_route_targets art ON art.target_id = rt.target_id
 "#;
@@ -1657,7 +1661,7 @@ fn feed_global_counts(acc: &mut MetricAccumulator, g: &GlobalRollupRow) {
             completion_tokens: g.completion_tokens.max(0) as u64,
             total_tokens: g.total_tokens.max(0) as u64,
             cache_tokens_sum: g.cached_tokens.max(0) as u64,
-            cache_prompt_tokens: g.prompt_tokens_cached_known.max(0) as u64,
+            cache_prompt_tokens: g.prompt_tokens.max(0) as u64,
             cache_known: known,
             cache_hit: g.cached_hit_count.max(0) as u64,
             cache_unknown: success.saturating_sub(known),
@@ -1695,7 +1699,7 @@ fn feed_route_counts(acc: &mut MetricAccumulator, r: &RollupRouteRow) {
             completion_tokens: r.completion_tokens.max(0) as u64,
             total_tokens: r.total_tokens.max(0) as u64,
             cache_tokens_sum: r.cached_tokens.max(0) as u64,
-            cache_prompt_tokens: r.prompt_tokens_cached_known.max(0) as u64,
+            cache_prompt_tokens: r.prompt_tokens.max(0) as u64,
             cache_known: known,
             cache_hit: r.cached_hit_count.max(0) as u64,
             cache_unknown: success.saturating_sub(known),
@@ -1730,7 +1734,7 @@ fn feed_target_counts(acc: &mut MetricAccumulator, t: &RollupTargetRow) {
             completion_tokens: t.completion_tokens.max(0) as u64,
             total_tokens: t.total_tokens.max(0) as u64,
             cache_tokens_sum: t.cached_tokens.max(0) as u64,
-            cache_prompt_tokens: t.prompt_tokens_cached_known.max(0) as u64,
+            cache_prompt_tokens: t.prompt_tokens.max(0) as u64,
             cache_known: known,
             cache_hit: t.cached_hit_count.max(0) as u64,
             cache_unknown: success.saturating_sub(known),
@@ -3116,6 +3120,12 @@ mod tests {
         assert_eq!(summary.overall.cache_known, 0);
         assert_eq!(summary.overall.cache_unknown, 2);
         assert_eq!(summary.overall.request_cache_hit_rate, None);
+        // Token hit rate: Σ COALESCE(cached_tokens,0) / Σ prompt_tokens over
+        // ALL success — both cached_tokens are NULL (numerator 0) but the one
+        // success with usage keeps its 10 prompt_tokens in the denominator.
+        assert_close(summary.overall.token_cache_hit_rate.unwrap(), 0.0);
+        assert_eq!(summary.overall.cache_prompt_tokens, 10);
+        assert_eq!(summary.overall.cache_tokens, 0);
     }
 
     #[tokio::test]
@@ -3161,10 +3171,129 @@ mod tests {
         assert_eq!(summary.overall.cache_miss, 1);
         assert_eq!(summary.overall.cache_unknown, 1);
         assert_close(summary.overall.request_cache_hit_rate.unwrap(), 0.5);
-        // token hit rate = 5 / (10 + 10) over the known samples only.
-        assert_close(summary.overall.token_cache_hit_rate.unwrap(), 0.25);
-        assert_eq!(summary.overall.cache_prompt_tokens, 20);
+        // Token hit rate = Σ COALESCE(cached_tokens, 0) / Σ prompt_tokens
+        // over ALL success samples: 5 / (10 + 10 + 10). The unknown success
+        // keeps its prompt_tokens in the denominator (only its cached
+        // contribution is 0).
+        assert_close(summary.overall.token_cache_hit_rate.unwrap(), 5.0 / 30.0);
+        assert_eq!(summary.overall.cache_prompt_tokens, 30);
         assert_eq!(summary.overall.cache_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn token_cache_hit_rate_all_success_and_detail_rollup_consistent() {
+        let pool = test_pool().await;
+        let h0 = hour_start(T0);
+        // Four route-level facts in h0: three successes (hit > 0, known
+        // miss = 0, unknown = NULL) plus one model_failure that carries
+        // (would-be) usage + cached_tokens — it must be excluded from the
+        // token statistics entirely.
+        let mk_success = |cached: Option<u32>, prompt: u32, off_ms: i64| {
+            event(
+                fact(
+                    Uuid::new_v4(),
+                    FinalStatus::Success,
+                    Some("chat"),
+                    h0 + off_ms,
+                    100,
+                    Some(usage(prompt, 5, prompt + 5)),
+                    cached,
+                    None,
+                    None,
+                ),
+                vec![attempt(
+                    "openai",
+                    "gpt-4o",
+                    TargetStatus::Success,
+                    h0 + off_ms,
+                    90,
+                    Some(usage(prompt, 5, prompt + 5)),
+                    cached,
+                    None,
+                    None,
+                )],
+            )
+        };
+        seed(
+            &pool,
+            &[
+                mk_success(Some(30), 100, 1), // hit (> 0)
+                mk_success(Some(0), 50, 2),   // known miss (0)
+                mk_success(None, 25, 3),      // unknown (NULL)
+                event(
+                    fact(
+                        Uuid::new_v4(),
+                        FinalStatus::ModelFailure,
+                        Some("chat"),
+                        h0 + 4,
+                        200,
+                        Some(usage(999, 999, 1998)),
+                        Some(999),
+                        None,
+                        None,
+                    ),
+                    vec![attempt(
+                        "openai",
+                        "gpt-4o",
+                        TargetStatus::Failure,
+                        h0 + 4,
+                        200,
+                        Some(usage(999, 999, 1998)),
+                        Some(999),
+                        None,
+                        None,
+                    )],
+                ),
+            ],
+        )
+        .await;
+        let engine = AnalyticsQueryEngine::new(pool.clone());
+
+        // Exact path (span < 24h): token rate = (30 + 0) / (100 + 50 + 25);
+        // the failed request's 999 tokens / 999 cached_tokens never enter.
+        let exact = engine
+            .query_summary(&params(QueryScope::Route, h0, h0 + HOUR))
+            .await
+            .unwrap();
+        assert_eq!(exact.overall.success, 3);
+        assert_eq!(exact.overall.model_failure, 1);
+        assert_eq!(exact.overall.prompt_tokens, 175);
+        assert_eq!(exact.overall.cache_known, 2);
+        assert_eq!(exact.overall.cache_hit, 1);
+        assert_eq!(exact.overall.cache_unknown, 1);
+        assert_close(exact.overall.request_cache_hit_rate.unwrap(), 0.5);
+        assert_close(exact.overall.token_cache_hit_rate.unwrap(), 30.0 / 175.0);
+        assert_eq!(exact.overall.cache_prompt_tokens, 175);
+        assert_eq!(exact.overall.cache_tokens, 30);
+
+        // Mixed path (span > 24h) with h0 rolled up must agree with the
+        // exact path: rollup `prompt_tokens` is the token-hit-rate
+        // denominator and `cached_tokens` the numerator.
+        rollup_hours(&pool, h0, h0 + HOUR + 1).await;
+        let mixed = engine
+            .query_summary(&params(QueryScope::Route, h0, h0 + 25 * HOUR))
+            .await
+            .unwrap();
+        assert_eq!(mixed.overall.prompt_tokens, 175);
+        assert_close(mixed.overall.token_cache_hit_rate.unwrap(), 30.0 / 175.0);
+        assert_eq!(mixed.overall.cache_prompt_tokens, 175);
+        assert_eq!(mixed.overall.cache_tokens, 30);
+
+        // Target scope: the same three success attempts plus the failed one
+        // (excluded). Both exact and mixed agree.
+        let exact_t = engine
+            .query_summary(&params(QueryScope::Target, h0, h0 + HOUR))
+            .await
+            .unwrap();
+        assert_eq!(exact_t.overall.attempts, 4);
+        assert_eq!(exact_t.overall.success, 3);
+        assert_close(exact_t.overall.token_cache_hit_rate.unwrap(), 30.0 / 175.0);
+        let mixed_t = engine
+            .query_summary(&params(QueryScope::Target, h0, h0 + 25 * HOUR))
+            .await
+            .unwrap();
+        assert_eq!(mixed_t.overall.attempts, 4);
+        assert_close(mixed_t.overall.token_cache_hit_rate.unwrap(), 30.0 / 175.0);
     }
 
     #[tokio::test]
@@ -3927,11 +4056,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_rates_none_when_denominator_zero_all_unknown() {
+    async fn cache_rates_unknown_in_token_denominator_not_in_request_denominator() {
         let pool = test_pool().await;
-        // Two successes with usage but cached_tokens = NULL: the cache
-        // denominators are 0, so both hit rates are None — unknown samples
-        // are never treated as misses nor as 0 prompt tokens.
+        // Two successes with usage but cached_tokens = NULL: the request
+        // hit-rate denominator (cache-known samples) is 0, so
+        // `request_cache_hit_rate` is None; the token hit-rate denominator
+        // is **all** success prompt_tokens, so the unknown samples DO enter
+        // it (their cached contribution is 0 → rate 0.0, not None).
         let mk = |completed_ms: i64, cached: Option<u32>| {
             event(
                 fact(
@@ -3967,13 +4098,16 @@ mod tests {
             .unwrap();
         assert_eq!(summary.overall.cache_known, 0);
         assert_eq!(summary.overall.cache_unknown, 2);
-        assert_eq!(summary.overall.cache_prompt_tokens, 0);
+        // All-success prompt_tokens (20) is the token denominator; the NULL
+        // cached_tokens contribute 0 → 0.0 (not None).
+        assert_eq!(summary.overall.cache_prompt_tokens, 20);
         assert_eq!(summary.overall.cache_tokens, 0);
         assert_eq!(summary.overall.request_cache_hit_rate, None);
-        assert_eq!(summary.overall.token_cache_hit_rate, None);
+        assert_close(summary.overall.token_cache_hit_rate.unwrap(), 0.0);
 
         // Contrast: a known miss (cached_tokens = 0, prompt = 10) gives a
-        // real denominator and explicit rates — 0 is a miss, not unknown.
+        // real request denominator and explicit rates — 0 is a miss, not
+        // unknown; the token denominator grows to all 30 prompt_tokens.
         seed(&pool, &[mk(T0 + 2000, Some(0))]).await;
         let summary = engine
             .query_summary(&params(QueryScope::Route, T0, T0 + HOUR))
@@ -3981,7 +4115,7 @@ mod tests {
             .unwrap();
         assert_eq!(summary.overall.cache_known, 1);
         assert_eq!(summary.overall.cache_unknown, 2);
-        assert_eq!(summary.overall.cache_prompt_tokens, 10);
+        assert_eq!(summary.overall.cache_prompt_tokens, 30);
         assert_close(summary.overall.request_cache_hit_rate.unwrap(), 0.0);
         assert_close(summary.overall.token_cache_hit_rate.unwrap(), 0.0);
     }
@@ -4043,6 +4177,9 @@ mod tests {
         assert_eq!(summary.overall.total_tokens, 4 * 30);
         assert_eq!(summary.overall.cache_known, 4); // all 4 successes report cached_tokens
         assert_eq!(summary.overall.cache_unknown, 0);
+        // Token hit rate across the rollup + detail merge: all 4 successes
+        // carry cached_tokens = 3 / prompt = 10 → 12 / 40.
+        assert_close(summary.overall.token_cache_hit_rate.unwrap(), 12.0 / 40.0);
         assert_eq!(summary.overall.e2e.samples, 4);
         assert_eq!(summary.overall.e2e.population, 4);
         assert_close(summary.overall.e2e.coverage.unwrap(), 1.0);
