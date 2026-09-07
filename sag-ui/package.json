@@ -12,6 +12,8 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check",
     "typecheck": "vue-tsc --noEmit",
+    "test": "npm run test:active-target",
+    "test:active-target": "node --experimental-strip-types src/lib/activeTarget.test.ts",
     "story:dev": "histoire dev",
     "story:build": "histoire build",
     "story:preview": "histoire preview"

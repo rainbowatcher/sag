@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-09-03
+updated: 2026-09-07
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-09-07
+
+- **Sticky Targets**：[0003 Routes 页 Active Target 状态圆点颜色](sticky-targets-observability/changes/0003-routes-active-target-status-colors.md) — 圆点改四态语义：fill_first 保持 emerald、sticky expired 改灰、pinned 命中 route.targets 原顺序首项改绿、非首项/无法确认改橙；helper 抽出到 `sag-ui/src/lib/activeTarget.ts` 并新增边界测试
 
 ## 2026-09-04
 

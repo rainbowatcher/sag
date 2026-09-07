@@ -29,6 +29,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { activeTargetDotColor, selectActiveTarget, selectFillFirstTarget } from "@/lib/activeTarget"
 import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -211,36 +212,6 @@ function getRouteTargetStatus(route: RouteConfig): RouteTargetStatus {
 }
 
 /**
- * Best active-target entry for a route: prefer a live `pinned` pin over an
- * `expired` one, then the most recently recorded (smallest `age_secs`).
- * Wildcard routes (`model_name: "*"`) can pin several targets at once
- * (one per request model), so a plain `find` would return an arbitrary
- * first match — this helper picks the most meaningful one.
- */
-function activeTargetFor(model: string): ActiveTargetEntry | undefined {
-  const candidates = activeTargetStore.targets.filter(
-    (s) => s.model === model && s.status !== "idle",
-  )
-  if (candidates.length === 0) return undefined
-  const pinned = candidates.filter((s) => s.status === "pinned")
-  const pool = pinned.length > 0 ? pinned : candidates
-  return [...pool].sort((a, b) => a.age_secs - b.age_secs)[0]
-}
-
-/**
- * Current fill-first target for a route: the target at position 0 of the
- * cached shuffled order — the one currently absorbing all fill-first
- * traffic. Only meaningful for `fill_first` strategy routes (their entries
- * never carry a sticky pin, so `activeTargetFor` is always undefined);
- * returns undefined when the route is not fill-first or no order is cached.
- */
-function fillFirstTargetFor(model: string): ActiveTargetEntry | undefined {
-  return activeTargetStore.targets.find(
-    (s) => s.model === model && s.strategy === "fill_first" && s.fill_first_position === 0,
-  )
-}
-
-/**
  * Aligned label/value row for the active-target tooltip: label on the left,
  * value right-aligned on the same baseline so columns stay aligned.
  */
@@ -355,14 +326,15 @@ const columns = [
     id: "activeTarget",
     header: () => h("span", { class: "text-xs font-medium" }, "Active Target"),
     sortingFn: (a, b) => {
-      const sa = activeTargetFor(a.original.model_name) ? 1 : 0
-      const sb = activeTargetFor(b.original.model_name) ? 1 : 0
+      const sa = selectActiveTarget(activeTargetStore.targets, a.original.model_name) ? 1 : 0
+      const sb = selectActiveTarget(activeTargetStore.targets, b.original.model_name) ? 1 : 0
       return sb - sa
     },
     cell: (info) => {
       const model = info.row.original.model_name
-      const sticky = activeTargetFor(model)
-      const fill = fillFirstTargetFor(model)
+      const entries = activeTargetStore.targets
+      const sticky = selectActiveTarget(entries, model)
+      const fill = selectFillFirstTarget(entries, model)
       const active = sticky ?? fill
 
       if (!active) {
@@ -370,11 +342,7 @@ const columns = [
       }
 
       const isFillFirst = fill !== undefined && sticky === undefined
-      const dotClass = isFillFirst
-        ? "bg-emerald-500"
-        : active.status === "expired"
-          ? "bg-amber-500"
-          : "bg-green-500"
+      const dotClass = activeTargetDotColor(info.row.original, sticky, fill, entries)
 
       // Status dot + provider label merged into one clickable button;
       // full details live in the aligned tooltip.

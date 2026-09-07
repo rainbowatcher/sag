@@ -1,6 +1,6 @@
 ---
 created: 2026-08-02
-updated: 2026-08-02
+updated: 2026-09-07
 ---
 
 # Sticky Targets 可观测性 — 规格
@@ -40,9 +40,11 @@ FillFirst 策略不写 `active_targets`，它的粘性是 `fill_first_orders` �
 
 ### 前端
 
-- `sag-ui/src/types/api.ts` — `ActiveTargetDto` 接口（snake_case，仿 `CircuitBreakerEntry`）
+- `sag-ui/src/types/api.ts` — `ActiveTargetEntry` 接口（snake_case，仿 `CircuitBreakerEntry` 风格）
 - `sag-ui/src/stores/activeTarget.ts` — Pinia store：`fetchActiveTargets` / `clearActiveTarget`，401 处理
-- `sag-ui/src/components/routes/RouteList.vue` — Routes 页表格内嵌「Active Target」列：StickyFailover 显示 pin（Active/Expired 徽标 + 清除）、FillFirst 显示当前 fill target（Fill 徽标 + 重置）
+- `sag-ui/src/components/routes/RouteList.vue` — Routes 页表格内嵌「Active Target」列：StickyFailover 显示 pin（Active/Expired 徽标 + 清除）、FillFirst 显示当前 fill target（Fill 徽标 + 重置）；状态圆点颜色调 `activeTargetDotColor`
+- `sag-ui/src/lib/activeTarget.ts` — active-target 纯函数：`selectActiveTarget` / `selectFillFirstTarget`（自 RouteList 内联迁移）、`isActiveFirstTarget`（对象身份保守判定首 target）、`activeTargetDotColor`（统一圆点着色）
+- `sag-ui/src/lib/activeTarget.test.ts` — 前端边界测试（`node --experimental-strip-types` 直接运行）
 
 ## 核心设计
 
@@ -137,6 +139,32 @@ DELETE）的对称性。
 - ❌ 独立 `/api/fill-first` 端点：职责更正交，但 UI 需新增入口，且两处共享 `fill_first_orders` 的状态要重复解释
 - 注意：StickyFailover 内部也走 `order_fill_first`（共享同一缓存），但 GET 只对 FillFirst 路由报缓存字段——sticky 的可观测主角是 pin，混报会模糊两个概念
 
+#### 状态圆点颜色语义
+
+背景：此前圆点只有三态——FillFirst 恒 emerald、sticky `expired` 用 amber、sticky `pinned` 恒
+green。`expired` 的 amber 与 `pinned` 的 green 视觉区分度低，且颜色无法反映 pin 落在 route 的
+哪个 target（首项 vs fallback）。
+
+**决策**（`activeTargetDotColor`，按此顺序短路）：
+
+1. `fill_first`（`fill` 存在且无 sticky）→ `bg-emerald-500`（保持）
+2. sticky `expired` → `bg-gray-500`（灰 = 无效态，优先于绿/橙）
+3. sticky `pinned` 命中 route.targets 原顺序首项 → `bg-green-500`
+4. 其余 pinned（非首项 / 无法确认）→ `bg-orange-500`
+
+首项判定 `isActiveFirstTarget` 用**对象身份**：后端按 `route.targets` 原顺序每 target 一个 DTO，
+pin 记在其来源 target 的 DTO 上（provider + real_model spec 匹配，passthrough pin 不会归属到显式
+target，反之亦然）；store 保持响应顺序，故 `entries` 中首个 `model` 匹配的 DTO 即首 target 的
+DTO，`active === routeEntry` 成立即命中首项。
+
+- ✅ 语义清晰：绿 = 首选目标在吸收流量、橙 = 已落到 fallback、灰 = pin 已过期、emerald = fill-first
+- ✅ 为什么不比 `real_model` 字段：passthrough 与显式 target 可能解析出相同 `real_model`（如 exact
+  route passthrough 解析为 route 名），字段比较无法区分；对象身份天然精确
+- ✅ 保守方向：无法确认（空 targets / 找不到 route entry）时返回 `false` → 渲染橙色而非绿色，绝不
+  误报绿
+- ❌ 备选「按 real_model 字符串比较」被否：会在 passthrough 解析与显式 target 同名时误报首项绿
+- ❌ 备选「后端 DTO 新增 target_index 字段」被否：无谓改后端契约，前端按响应顺序 + 对象身份即可判定
+
 ## 不变式
 
 ### 后端 API
@@ -152,8 +180,10 @@ DELETE）的对称性。
 
 ### 前端
 
-- `ActiveTargetDto` 字段与后端 serde 输出一致（snake_case：`age_secs` / `expired`），仿 `CircuitBreakerEntry` 风格
+- `ActiveTargetEntry` 字段与后端 serde 输出一致（snake_case：`age_secs` / `expired`），仿 `CircuitBreakerEntry` 风格
 - 401 一律走 `useConnectionStore().handle401()`（与 `circuitBreaker.ts` 一致）
+- 状态圆点着色（`activeTargetDotColor`）：fill_first 恒 emerald；sticky `expired` 恒 gray（优先于绿/橙）；sticky `pinned` 命中首项 green、非首项/无法确认 orange；无 active 时返回 `null` 不渲染圆点
+- `isActiveFirstTarget` 用对象身份（`active === entries` 中首个 `model` 匹配的 DTO）而非 `real_model` 字段相等作首项判别；无法确认（空 targets / 无 route entry）时返回 `false`，渲染橙色而非绿色
 
 ## 测试策略
 
@@ -174,10 +204,16 @@ DELETE）的对称性。
 
 ### 前端
 
+- `sag-ui/src/lib/activeTarget.test.ts`（`node --experimental-strip-types` 直接运行）— 边界测试：
+  exact/wildcard passthrough 首项 vs 同 resolved model 的 fallback 判定（对象身份）、空 targets
+  恒非首项、expired 优先于绿/橙、fill 保持 emerald 且与 sticky 共存时 sticky 优先、字节相同 DTO
+  仅首个算首项、多 route entries 按 `model` 作用域不串扰、wildcard 多 pin 按 `age_secs` 取最新
 - `vue-tsc` typecheck 通过（`pnpm typecheck`）
 - `oxlint` 通过（`pnpm lint`）
 
 ## 变更记录
+
+- [0003 Routes 页 Active Target 状态圆点颜色](changes/0003-routes-active-target-status-colors.md)
 
 - [0002 端点重命名 /api/active-targets](changes/0002-rename-active-targets.md)
 
