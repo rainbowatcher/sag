@@ -1,4 +1,4 @@
-import type { ActiveTargetEntry, RouteConfig } from "@/types/api"
+import type { ActiveTargetEntry, Strategy } from "@/types/api"
 
 /**
  * Best sticky-failover active entry for a route: prefer a live `pinned` pin
@@ -6,11 +6,24 @@ import type { ActiveTargetEntry, RouteConfig } from "@/types/api"
  * `age_secs`). Wildcard routes (`model_name: "*"`) can pin several targets
  * at once (one per request model), so a plain `find` would return an
  * arbitrary first match — this picks the most meaningful one.
+ *
+ * `strategy` is the route's *current* strategy (from the route config, not
+ * from any entry's `strategy` field). Only `sticky_failover` routes have a
+ * meaningful pin: `fill_first` and `round_robin` never write
+ * `active_targets`, so a leftover pin on such a route is stale — it does not
+ * reflect where traffic currently goes and must never be treated as the
+ * active target (e.g. after a route switches from sticky_failover to
+ * fill_first, the stale pin must not override the fill-first display).
+ * Filtering by route strategy — not entry strategy — keeps this correct both
+ * immediately after a strategy switch (entries still carry the old DTO) and
+ * after a refresh (entries carry the new one).
  */
 export function selectActiveTarget(
   entries: ActiveTargetEntry[],
   model: string,
+  strategy: Strategy,
 ): ActiveTargetEntry | undefined {
+  if (strategy !== "sticky_failover") return undefined
   const candidates = entries.filter((s) => s.model === model && s.status !== "idle")
   if (candidates.length === 0) return undefined
   const pinned = candidates.filter((s) => s.status === "pinned")
@@ -39,52 +52,49 @@ export function selectFillFirstTarget(
  * Whether a sticky-failover `active` entry (pinned) corresponds to the
  * route's first target in its original (config) order — the green dot case.
  *
- * The `/api/active-targets` DTO does not carry a target index, but the
- * backend emits exactly one entry per config target, in config order, and
- * reports each pin on the DTO of the target it was pinned through (provider +
- * real-model-spec matching — a passthrough pin is never attributed to an
- * explicit target or vice versa). The store preserves that response order and
- * `model` is the unique route `model_name`, so the first `entries` item for
- * this route is the first config target's DTO — and the active pin is the
- * first target iff it is that exact object. Comparing object identity is more
- * precise than comparing the resolved `real_model`: it cannot confuse a
- * passthrough pin with a later explicit target that shares the same resolved
- * model (e.g. an exact route whose passthrough resolves to the route name).
- *
- * Returns `false` for empty target lists and whenever the DTO cannot confirm
- * the pin landed on the first target — the conservative choice: an
+ * The `/api/active-targets` DTO carries each target's 0-based `target_index`
+ * within `route.targets`, so the pin's config position is known directly:
+ * index 0 is the first target. A missing or non-zero `target_index` (older
+ * backend, malformed payload) returns `false` — the conservative choice: an
  * unverifiable pin renders orange, never green.
  */
-export function isActiveFirstTarget(
-  route: RouteConfig,
-  active: ActiveTargetEntry,
-  entries: ActiveTargetEntry[],
-): boolean {
-  const first = route.targets[0]
-  if (!first) return false
-  // Defensive: the first target's DTO always carries its provider, so this
-  // is redundant with the identity check below but an explicit cheap guard.
-  if (active.provider !== first.provider) return false
-  const routeEntry = entries.find((e) => e.model === route.model_name)
-  return routeEntry !== undefined && active === routeEntry
+export function isActiveFirstTarget(active: ActiveTargetEntry): boolean {
+  return active.target_index === 0
+}
+
+/**
+ * The model key to send to `DELETE /api/active-targets` for a displayed
+ * active entry. Fill-first order caches live under the route model name;
+ * sticky pins under the request-model key (`entry.key`, the concrete request
+ * model the pin was recorded under).
+ *
+ * Defensive fallback: an entry whose `key` is empty (older backend shape,
+ * malformed payload) falls back to the route model name — for a wildcard
+ * route that is `"*"`, which the backend resolves to "clear all concrete
+ * pins of the wildcard route", so the clear still works even when the
+ * concrete key is unknown. Normal (non-empty-key) semantics are unchanged.
+ */
+export function clearActiveTargetModel(entry: ActiveTargetEntry, isFillFirst: boolean): string {
+  return isFillFirst ? entry.model : entry.key || entry.model
 }
 
 /**
  * Status-dot CSS class for a route's active target, mirroring the cell in
  * RouteList.vue: fill-first traffic is always emerald; an expired sticky pin
- * is always gray (taking priority over green/orange); otherwise a pin on the
- * route's first config target is green and any fallback is orange. Returns
- * `null` when there is no active target to display.
+ * is muted — gray-green when it hit the route's first config target,
+ * gray-orange otherwise (muted hue = expired, color family = config
+ * position); a live pin on the route's first config target is green and any
+ * fallback is orange. Returns `null` when there is no active target to
+ * display.
  */
 export function activeTargetDotColor(
-  route: RouteConfig,
   sticky: ActiveTargetEntry | undefined,
   fill: ActiveTargetEntry | undefined,
-  entries: ActiveTargetEntry[],
 ): string | null {
   const active = sticky ?? fill
   if (!active) return null
   if (fill !== undefined && sticky === undefined) return "bg-emerald-500"
-  if (active.status === "expired") return "bg-gray-500"
-  return isActiveFirstTarget(route, active, entries) ? "bg-green-500" : "bg-orange-500"
+  const isFirst = isActiveFirstTarget(active)
+  if (active.status === "expired") return isFirst ? "bg-green-500/40" : "bg-orange-500/40"
+  return isFirst ? "bg-green-500" : "bg-orange-500"
 }

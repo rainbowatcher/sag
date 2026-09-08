@@ -439,7 +439,11 @@ mod tests {
     // ── resolve_route prune-stale-entries tests ───────────────────
 
     /// Build a minimal [`AppState`] with a single route for testing
-    /// resolve_route + prune behaviour.
+    /// resolve_route + prune behaviour. The route is StickyFailover so a
+    /// pre-inserted `active_targets` pin is a *valid* entry that survives
+    /// the first prune — the deletion test below then verifies prune clears
+    /// all three maps (a FillFirst route would never legitimately hold a
+    /// pin, so it would be pruned on the very first resolve).
     async fn build_state_for_prune_test() -> (AppState, DispatchRuntime) {
         use std::collections::HashMap;
 
@@ -451,7 +455,7 @@ mod tests {
             api_endpoint: "/chat/completions".into(),
             retries: None,
             timeout_secs: None,
-            strategy: sag_config::Strategy::FillFirst,
+            strategy: sag_config::Strategy::StickyFailover,
             targets: vec![sag_config::RouteTarget {
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),

@@ -214,6 +214,8 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     //    config + provider registry + routes_version.
     let handler: Arc<dyn ConfigReloadHandler> = Arc::new(GatewayReloadHandler {
         coordinator: coordinator.clone(),
+        runtime: dispatch_runtime.clone(),
+        config: config_handle.clone(),
     });
     let hot_reload_handle = sag_config::spawn_hot_reload(config_handle.clone(), Some(handler));
 
@@ -306,8 +308,15 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
 /// Handler that wraps the [`ConfigMutationCoordinator`] for the hot-reload
 /// watcher. Each file event triggers a coordinated re-read, validation, and
 /// atomic publication of config + provider registry + routes_version.
+///
+/// After a successful reload the shared dispatch runtime is pruned so stale
+/// per-model caches (notably sticky-failover pins for routes that switched
+/// strategy or were removed) are dropped immediately, without waiting for the
+/// next dispatch to notice the `routes_version` bump.
 struct GatewayReloadHandler {
     coordinator: Arc<ConfigMutationCoordinator>,
+    runtime: sag_router::DispatchRuntime,
+    config: sag_config::ConfigHandle,
 }
 
 #[async_trait]
@@ -315,6 +324,12 @@ impl ConfigReloadHandler for GatewayReloadHandler {
     async fn reload_from_path(&self, path: &Path) -> sag_core::Result<()> {
         match self.coordinator.reload_from_path(path).await {
             Ok(report) => {
+                // The coordinator released every lock (mutation lock, config
+                // RwLock) before returning; clone the routes under a short
+                // config read and prune with no config guard held, so no
+                // lock-ordering interaction with dispatch is possible.
+                let routes = self.config.read().await.routes.clone();
+                self.runtime.prune_stale_entries(&routes).await;
                 tracing::info!(
                     added = report.providers_added.len(),
                     rebuilt = report.providers_rebuilt.len(),
@@ -331,16 +346,31 @@ impl ConfigReloadHandler for GatewayReloadHandler {
                     // the editor has time to finish writing.
                     tracing::warn!("config file unstable, scheduling fallback reload in 2s");
                     let coord = self.coordinator.clone();
+                    let runtime = self.runtime.clone();
+                    let config = self.config.clone();
                     let path = path.to_path_buf();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         match coord.reload_from_path(&path).await {
-                            Ok(r) => tracing::info!(
-                                added = r.providers_added.len(),
-                                rebuilt = r.providers_rebuilt.len(),
-                                removed = r.providers_removed.len(),
-                                "fallback reload succeeded"
-                            ),
+                            Ok(r) => {
+                                // Same strategy-switch cleanup as the main
+                                // reload path: the coordinator only commits
+                                // (it has released every lock before
+                                // returning), pruning stale per-model caches
+                                // is the handler's job. Clone the routes
+                                // under a short config read and prune with no
+                                // guard held — identical to the main path,
+                                // so no lock-ordering interaction with
+                                // dispatch is possible here either.
+                                let routes = config.read().await.routes.clone();
+                                runtime.prune_stale_entries(&routes).await;
+                                tracing::info!(
+                                    added = r.providers_added.len(),
+                                    rebuilt = r.providers_rebuilt.len(),
+                                    removed = r.providers_removed.len(),
+                                    "fallback reload succeeded"
+                                )
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, "fallback reload also failed, waiting for next file event")
                             }

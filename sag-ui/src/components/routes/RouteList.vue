@@ -29,7 +29,12 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
-import { activeTargetDotColor, selectActiveTarget, selectFillFirstTarget } from "@/lib/activeTarget"
+import {
+  activeTargetDotColor,
+  clearActiveTargetModel,
+  selectActiveTarget,
+  selectFillFirstTarget,
+} from "@/lib/activeTarget"
 import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -103,11 +108,13 @@ async function confirmDelete() {
 // ── Clear sticky target / reset fill-first order ─────────────────
 const clearingModel = ref<string | null>(null)
 
-async function clearActiveTarget(entry: ActiveTargetEntry): Promise<boolean> {
-  const isFillFirst = entry.strategy === "fill_first"
-  // Fill-first orders are cached under the route model name (may be "*");
-  // sticky pins under the request-model key (empty for idle entries).
-  const model = isFillFirst ? entry.model : entry.key
+async function clearActiveTarget(entry: ActiveTargetEntry, isFillFirst: boolean): Promise<boolean> {
+  // Fill-first order caches live under the route model name; sticky pins
+  // under the request-model key. Which one to clear mirrors what the cell
+  // displayed (`isFillFirst` from the display context) — not
+  // `entry.strategy`, which reflects the route's *current* config and would
+  // mislabel a leftover pin on a route that switched to fill_first.
+  const model = clearActiveTargetModel(entry, isFillFirst)
   clearingModel.value = model
   try {
     await activeTargetStore.clearActiveTarget(model)
@@ -128,9 +135,11 @@ async function clearActiveTarget(entry: ActiveTargetEntry): Promise<boolean> {
 // ── Clear confirm dialog (triggered by clicking the target) ──────
 const confirmOpen = ref(false)
 const confirmEntry = ref<ActiveTargetEntry | null>(null)
+const confirmFillFirst = ref(false)
 
-function openClearConfirm(entry: ActiveTargetEntry) {
+function openClearConfirm(entry: ActiveTargetEntry, isFillFirst: boolean) {
   confirmEntry.value = entry
+  confirmFillFirst.value = isFillFirst
   confirmOpen.value = true
 }
 
@@ -142,7 +151,7 @@ function cancelClearConfirm() {
 async function confirmClear() {
   const entry = confirmEntry.value
   if (!entry) return
-  const ok = await clearActiveTarget(entry)
+  const ok = await clearActiveTarget(entry, confirmFillFirst.value)
   if (ok) cancelClearConfirm()
 }
 
@@ -326,14 +335,25 @@ const columns = [
     id: "activeTarget",
     header: () => h("span", { class: "text-xs font-medium" }, "Active Target"),
     sortingFn: (a, b) => {
-      const sa = selectActiveTarget(activeTargetStore.targets, a.original.model_name) ? 1 : 0
-      const sb = selectActiveTarget(activeTargetStore.targets, b.original.model_name) ? 1 : 0
-      return sb - sa
+      // "Has an active target" sort, mirroring the cell: a sticky pin on a
+      // sticky_failover route OR the current fill-first target (position 0
+      // of the cached shuffled order). `selectFillFirstTarget` already
+      // checks both strategy and position, so a fill_first route with no
+      // cached order (every `fill_first_position` is null) is never
+      // misjudged as active.
+      const hasActive = (route: RouteConfig) => {
+        const entries = activeTargetStore.targets
+        return (
+          selectActiveTarget(entries, route.model_name, route.strategy) !== undefined ||
+          selectFillFirstTarget(entries, route.model_name) !== undefined
+        )
+      }
+      return Number(hasActive(b.original)) - Number(hasActive(a.original))
     },
     cell: (info) => {
       const model = info.row.original.model_name
       const entries = activeTargetStore.targets
-      const sticky = selectActiveTarget(entries, model)
+      const sticky = selectActiveTarget(entries, model, info.row.original.strategy)
       const fill = selectFillFirstTarget(entries, model)
       const active = sticky ?? fill
 
@@ -342,7 +362,7 @@ const columns = [
       }
 
       const isFillFirst = fill !== undefined && sticky === undefined
-      const dotClass = activeTargetDotColor(info.row.original, sticky, fill, entries)
+      const dotClass = activeTargetDotColor(sticky, fill)
 
       // Status dot + provider label merged into one clickable button;
       // full details live in the aligned tooltip.
@@ -354,7 +374,7 @@ const columns = [
               variant: "ghost",
               size: "sm",
               class: "cursor-pointer gap-1.5 px-1 font-mono text-xs truncate max-w-[110px]",
-              onClick: () => openClearConfirm(active),
+              onClick: () => openClearConfirm(active, isFillFirst),
             },
             () => [
               h("span", { class: cn("h-2 w-2 shrink-0 rounded-full", dotClass) }),
@@ -504,14 +524,10 @@ const table = useVueTable({
     <DialogContent class="sm:max-w-md">
       <DialogHeader>
         <DialogTitle>
-          {{
-            confirmEntry?.strategy === "fill_first"
-              ? "Reset Fill-First Order"
-              : "Clear Active Target"
-          }}
+          {{ confirmFillFirst ? "Reset Fill-First Order" : "Clear Active Target" }}
         </DialogTitle>
         <DialogDescription>
-          <template v-if="confirmEntry?.strategy === 'fill_first'">
+          <template v-if="confirmFillFirst">
             Reset the cached fill-first order for
             <span class="font-mono font-medium">{{ confirmEntry?.model }}</span
             >? The next request will re-shuffle and may route to a different target.
@@ -540,13 +556,7 @@ const table = useVueTable({
           @click="confirmClear"
         >
           <Loader2 v-if="clearingModel !== null" class="h-3 w-3 animate-spin" />
-          {{
-            clearingModel !== null
-              ? "Clearing…"
-              : confirmEntry?.strategy === "fill_first"
-                ? "Reset"
-                : "Clear"
-          }}
+          {{ clearingModel !== null ? "Clearing…" : confirmFillFirst ? "Reset" : "Clear" }}
         </Button>
       </DialogFooter>
     </DialogContent>

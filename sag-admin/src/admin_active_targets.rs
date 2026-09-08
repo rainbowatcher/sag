@@ -6,11 +6,17 @@
 //!   sticky-failover pins (`idle` / `pinned` / `expired` from the
 //!   `active_targets` memory shared with `DispatchRuntime`) and fill-first
 //!   cached-order positions (index 0 = the target absorbing all traffic).
-//! - `DELETE /api/active-targets` — reset routing for a model: for a
-//!   sticky-failover route clear the active target (idempotent) and bump its
+//! - `DELETE /api/active-targets` — reset routing for a model: for every
+//!   strategy, clear the sticky active target (idempotent) and bump its
 //!   generation so the next request re-evaluates the priority-ordered list
-//!   and in-flight requests can never re-pin; for a fill-first route drop
-//!   the cached shuffled order so the next request re-shuffles.
+//!   and in-flight requests can never re-pin; for a fill-first route
+//!   additionally drop the cached shuffled order so the next request
+//!   re-shuffles. Clearing the sticky pin for *every* strategy is what makes
+//!   DELETE able to clear a stale pin left behind by a route that switched
+//!   from StickyFailover to FillFirst. When the request names the wildcard
+//!   route itself (`model = "*"`), every concrete pin belonging to that
+//!   wildcard route is cleared (its `active_targets` keys are the concrete
+//!   request models), never other routes' pins.
 //!
 //! Both are mounted under `/api` by [`crate::admin::build_admin_routes`], so
 //! they are auth-protected by the `gateway_auth` middleware.
@@ -42,6 +48,11 @@ pub struct ActiveTargetDto {
     real_model: String,
     /// Target priority within the route.
     priority: u32,
+    /// 0-based index of this target inside the route's original
+    /// `route.targets` config array. The frontend uses it (instead of object
+    /// identity) to confirm which config target a pin landed on:
+    /// `target_index == 0` means the route's first configured target.
+    target_index: u32,
     /// `idle` (no active entry), `pinned` (active entry, not expired) or
     /// `expired` (active entry past `sticky_failover_reset_secs`).
     status: String,
@@ -97,8 +108,17 @@ pub async fn list_active_targets(State(state): State<AppState>) -> Json<serde_js
 
     let mut targets = Vec::new();
     for route in &routes {
-        for target in &route.targets {
-            let matched = match_active_target(&inner, &routes, &route.model_name, target);
+        for (target_index, target) in route.targets.iter().enumerate() {
+            // Sticky pins are only meaningful for StickyFailover routes. A
+            // route that switched to FillFirst / RoundRobin writes no pin
+            // anymore, but a stale `active_targets` entry from its previous
+            // StickyFailover config may survive in memory until the next
+            // prune — it must not be reported as `pinned`/`expired` here.
+            let matched = if route.strategy == Strategy::StickyFailover {
+                match_active_target(&inner, &routes, &route.model_name, target)
+            } else {
+                None
+            };
 
             // Resolved real model: explicit override, else passthrough — for
             // an exact route the client sent `route.model_name`; for a
@@ -158,6 +178,7 @@ pub async fn list_active_targets(State(state): State<AppState>) -> Json<serde_js
                 provider: target.provider.clone(),
                 real_model,
                 priority: target.priority,
+                target_index: target_index as u32,
                 status: status.to_string(),
                 age_secs,
                 strategy: route.strategy.as_str().to_string(),
@@ -227,21 +248,29 @@ pub struct DeleteActiveTargetRequest {
 /// `DELETE /api/active-targets`
 ///
 /// Reset routing for `req.model` so the next request re-evaluates instead of
-/// staying pinned to a previously decided state. The exact semantics depend
-/// on the route's strategy:
+/// staying pinned to a previously decided state:
 ///
-/// - **StickyFailover** (and any unmatched model): clear the sticky active
-///   target for the model and bump its generation, so the next request
-///   re-evaluates the route's priority-ordered target list instead of
-///   staying pinned to the failover target — and so in-flight requests that
-///   decided their route before the delete can never re-pin afterwards.
-/// - **FillFirst**: drop the cached shuffled order for the route, so the
-///   next request re-shuffles the same-priority targets — a manual TTL
-///   expiry, the fill-first analogue of un-pinning. Note this does **not**
-///   guarantee a different target ends up first (with two same-priority
-///   targets it is a 50/50 re-draw); the fill-first order cache is never
-///   consulted by the sticky-failover writeback, and `active_targets` is
-///   untouched for fill-first routes.
+/// - **Every strategy**: clear the sticky active target for the model and
+///   bump its generation / epoch, so the next request re-evaluates the
+///   route's priority-ordered target list instead of staying pinned to the
+///   failover target — and so in-flight requests that decided their route
+///   before the delete can never re-pin afterwards. This also clears a
+///   *stale* pin left behind by a route that switched from StickyFailover
+///   to FillFirst: the pin is no longer written by the current strategy but
+///   survives in memory until pruned, and DELETE must be able to remove it.
+/// - **FillFirst**: additionally drop the cached shuffled order for the
+///   route, so the next request re-shuffles the same-priority targets — a
+///   manual TTL expiry, the fill-first analogue of un-pinning. Note this
+///   does **not** guarantee a different target ends up first (with two
+///   same-priority targets it is a 50/50 re-draw); the fill-first order
+///   cache is never consulted by the sticky-failover writeback.
+/// - **Wildcard route** (`req.model == "*"` with a `"*"` route present):
+///   clear every concrete pin belonging to that wildcard route — its
+///   `active_targets` keys are the concrete request models (e.g. `"gpt-4o"`)
+///   the frontend cannot name individually — while leaving other routes'
+///   pins (and wildcard pins now shadowed by an exact route) untouched. For
+///   a fill-first wildcard route the same precise rule drops the cached
+///   orders of exactly the keys that still belong to it.
 ///
 /// **Idempotent**: deleting a model with no active target / no cached order
 /// is a no-op and still returns `200 OK`.
@@ -249,10 +278,15 @@ pub async fn delete_active_target(
     State(state): State<AppState>,
     Json(req): Json<DeleteActiveTargetRequest>,
 ) -> Json<serde_json::Value> {
-    // Resolve the request model against the current route table to pick the
-    // reset semantics. The model is the route's `model_name` ("*" for a
-    // wildcard route) — the same key the fill-first order cache is stored
-    // under. Unmatched models keep the legacy sticky-failover clear.
+    // Snapshot the config once: resolve the request model to decide the
+    // strategy (whether the fill-first order cache must also be dropped) and
+    // detect the wildcard-route case. The model is the route's `model_name`
+    // ("*" for a wildcard route) — the same key the fill-first order cache is
+    // stored under. Unmatched models keep the legacy sticky-failover clear.
+    //
+    // The sticky `active_targets` clear always runs, for every strategy: it
+    // is what removes a stale pin after a StickyFailover → FillFirst switch
+    // (and, for currently-sticky routes, the live pin).
     //
     // Note: the strategy decision is based on the config snapshot taken here.
     // After releasing the config read lock, a config hot-reload could flip
@@ -262,16 +296,49 @@ pub async fn delete_active_target(
     // untouched. This is best-effort consistency: the "wrongly" cleared entry
     // is naturally re-created by the next request / TTL / generation
     // mechanism, and there is no data corruption risk.
-    let is_fill_first = {
+    let (resolved, routes) = {
         let cfg = state.config.read().await;
-        sag_config::resolve_model_route(&cfg.routes, &req.model)
-            .map(|r| r.strategy == Strategy::FillFirst)
-            .unwrap_or(false)
+        (
+            sag_config::resolve_model_route(&cfg.routes, &req.model).cloned(),
+            cfg.routes.clone(),
+        )
     };
-    if is_fill_first {
-        state.fill_first_orders.write().await.remove(&req.model);
+    let is_fill_first = resolved
+        .as_ref()
+        .is_some_and(|r| r.strategy == Strategy::FillFirst);
+    // The wildcard case: the request names the wildcard route itself
+    // (`model == "*"`) and that route exists. The frontend cannot know every
+    // concrete request model the wildcard route pinned (its `active_targets`
+    // keys are the concrete request models, e.g. "gpt-4o"), so "clear this
+    // route" clears every concrete pin belonging to it — precisely, never
+    // other routes' pins — instead of the literal "*" key (which is never a
+    // real pin).
+    let is_wildcard_clear =
+        req.model == "*" && resolved.as_ref().is_some_and(|r| r.model_name == "*");
+
+    if is_wildcard_clear {
+        state
+            .active_targets
+            .write()
+            .await
+            .clear_wildcard_route(&routes);
+        if is_fill_first {
+            // The wildcard fill-first order cache lives under concrete request
+            // models too; drop exactly the keys that still belong to the
+            // wildcard route (an exact route sharing a key keeps its cache).
+            let mut orders = state.fill_first_orders.write().await;
+            orders.retain(|k, _| {
+                !matches!(
+                    sag_config::resolve_model_route(&routes, k),
+                    Some(r) if r.model_name == "*"
+                )
+            });
+        }
     } else {
         state.active_targets.write().await.clear(&req.model);
+        if is_fill_first {
+            state.fill_first_orders.write().await.remove(&req.model);
+        }
     }
     Json(serde_json::json!({ "ok": true }))
 }
@@ -426,6 +493,60 @@ mod tests {
         assert_eq!(targets[1]["provider"], "anthropic");
         assert_eq!(targets[2]["model"], "dall-e");
         assert_eq!(targets[2]["priority"], 0);
+        // `target_index` mirrors the original `route.targets` array order.
+        assert_eq!(targets[0]["target_index"], 0, "first target of the route");
+        assert_eq!(targets[1]["target_index"], 1, "second target of the route");
+        assert_eq!(
+            targets[2]["target_index"], 0,
+            "single-target route starts at 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn target_index_mirrors_route_targets_array_order() {
+        // The frontend keys off `target_index == 0` to identify the first
+        // configured target; priorities need not be unique or sorted, so the
+        // index must come from the array position, never from `priority`.
+        let state = state_with_routes(vec![route(
+            "gpt-4o",
+            vec![
+                target("anthropic", Some("claude-3"), 5),
+                target("openai", Some("gpt-4o"), 10),
+                target("openai", Some("gpt-4o-mini"), 1),
+            ],
+        )])
+        .await;
+        let app = test_app(state.clone());
+        let (_, json) = fetch_targets(app).await;
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0]["provider"], "anthropic");
+        assert_eq!(targets[0]["target_index"], 0);
+        assert_eq!(targets[1]["provider"], "openai");
+        assert_eq!(targets[1]["target_index"], 1);
+        assert_eq!(targets[2]["provider"], "openai");
+        assert_eq!(targets[2]["target_index"], 2);
+        // The pinned target keeps its own index: pin `gpt-4o` (array index
+        // 1, priority 10) and the DTO must still report index 1 on it.
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+        let app2 = test_app(state);
+        let (_, json2) = fetch_targets(app2).await;
+        let targets2 = json2["targets"].as_array().unwrap();
+        let pinned = targets2.iter().find(|t| t["status"] == "pinned").unwrap();
+        assert_eq!(pinned["provider"], "openai");
+        assert_eq!(
+            pinned["target_index"], 1,
+            "index is the config array position"
+        );
     }
 
     #[tokio::test]
@@ -887,6 +1008,58 @@ mod tests {
     // ── fill-first observability + manual reset ────────────────────────
 
     #[tokio::test]
+    async fn fill_first_route_ignores_stale_active_targets_entry() {
+        // Regression for the sticky→fill_first switch: a route that used to
+        // be StickyFailover may still carry a pin in `active_targets` until
+        // the next prune. GET must NOT report it as `pinned`/`expired` for a
+        // route whose current strategy is FillFirst — the entry reports
+        // `idle` with no sticky key, and only the fill-first fields carry
+        // state.
+        let state = state_with_routes(vec![route_with_strategy(
+            "gpt-4o",
+            vec![target("openai", Some("gpt-4o"), 10)],
+            sag_config::Strategy::FillFirst,
+        )])
+        .await;
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+        // Same for a stale *expired* pin (recorded long ago).
+        state.active_targets.write().await.insert(
+            "stale".into(),
+            ActiveTargetEntry::new(
+                "openai",
+                "stale",
+                "gpt-4o",
+                Some("stale".into()),
+                Instant::now() - Duration::from_secs(8000),
+            ),
+        );
+
+        let app = test_app(state);
+        let (_, json) = fetch_targets(app).await;
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["strategy"], "fill_first");
+        assert_eq!(
+            targets[0]["status"], "idle",
+            "a stale sticky pin must not be reported on a fill-first route"
+        );
+        assert_eq!(
+            targets[0]["key"], "",
+            "no sticky key for a fill-first route"
+        );
+        assert_eq!(targets[0]["age_secs"], 0);
+    }
+
+    #[tokio::test]
     async fn fill_first_route_reports_strategy_and_null_cache_fields_when_absent() {
         // A fill-first route with no cached order yet: every target reports
         // `strategy: "fill_first"` but no position / cache metadata, and
@@ -1008,9 +1181,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_fill_first_resets_order_cache_and_is_idempotent() {
+    async fn delete_fill_first_resets_order_cache_and_clears_stale_pin() {
         // A fill-first DELETE drops the cached shuffled order (next request
-        // re-shuffles) but must NOT touch the sticky-failover active pin.
+        // re-shuffles) AND clears a stale sticky-failover pin left behind by
+        // a previous StickyFailover config — the user-visible way to get rid
+        // of the residual after switching strategies.
         let state = state_with_routes(vec![route_with_strategy(
             "gpt-4o",
             vec![target("openai", Some("gpt-4o"), 10)],
@@ -1025,8 +1200,9 @@ mod tests {
                 routes_version: Some(1),
             },
         );
-        // A pre-existing pin on the same model (stale / injected): must
-        // survive the fill-first delete — the two memories are orthogonal.
+        // A pre-existing pin on the same model (stale, from the route's
+        // earlier StickyFailover config): must be cleared by the fill-first
+        // delete — that is the residual-state fix.
         state.active_targets.write().await.insert(
             "gpt-4o".into(),
             ActiveTargetEntry::new(
@@ -1038,7 +1214,7 @@ mod tests {
             ),
         );
 
-        // First delete: drops the cached order.
+        // First delete: drops the cached order and clears the stale pin.
         let app = test_app(state.clone());
         let (status, json) = delete_target(app, serde_json::json!({ "model": "gpt-4o" })).await;
         assert_eq!(status, StatusCode::OK);
@@ -1048,16 +1224,18 @@ mod tests {
             "fill-first DELETE must drop the cached order"
         );
         assert!(
-            state.active_targets.read().await.get("gpt-4o").is_some(),
-            "fill-first DELETE must not clear the sticky active pin"
+            state.active_targets.read().await.get("gpt-4o").is_none(),
+            "fill-first DELETE must clear the stale sticky active pin"
         );
 
-        // Second delete (order already gone) is a 200 no-op — idempotent.
+        // Second delete (order and pin already gone) is a 200 no-op —
+        // idempotent.
         let app2 = test_app(state.clone());
         let (status2, json2) = delete_target(app2, serde_json::json!({ "model": "gpt-4o" })).await;
         assert_eq!(status2, StatusCode::OK);
         assert_eq!(json2["ok"], true);
         assert!(state.fill_first_orders.read().await.is_empty());
+        assert!(state.active_targets.read().await.get("gpt-4o").is_none());
     }
 
     #[tokio::test]
@@ -1129,6 +1307,204 @@ mod tests {
         assert!(
             state.fill_first_orders.read().await.get("*").is_none(),
             "wildcard fill-first DELETE must drop the '*' order cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_wildcard_clears_all_concrete_pins_not_other_routes() {
+        // The user-facing fix: on a wildcard route the active pins are keyed
+        // by concrete request models (e.g. "gpt-4.1"), and the frontend only
+        // knows the route name "*". DELETE with model="*" must clear every
+        // concrete pin belonging to the wildcard route — and nothing else:
+        // an exact route's pin on the same provider must survive, and a
+        // wildcard pin shadowed by an exact route must survive too.
+        let state = state_with_routes(vec![
+            route("gpt-4o", vec![target("openai", Some("gpt-4o"), 10)]),
+            route("*", vec![target("openai", None, 5)]),
+        ])
+        .await;
+        {
+            let mut guard = state.active_targets.write().await;
+            // Concrete wildcard pins (the ones the UI cannot name).
+            guard.insert(
+                "gpt-4.1".into(),
+                ActiveTargetEntry::new("openai", "gpt-4.1", "*", None, Instant::now()),
+            );
+            guard.insert(
+                "claude-3-opus".into(),
+                ActiveTargetEntry::new("openai", "claude-3-opus", "*", None, Instant::now()),
+            );
+            // Exact-route pin on the same provider — must survive.
+            guard.insert(
+                "gpt-4o".into(),
+                ActiveTargetEntry::new(
+                    "openai",
+                    "gpt-4o",
+                    "gpt-4o",
+                    Some("gpt-4o".into()),
+                    Instant::now(),
+                ),
+            );
+        }
+
+        let app = test_app(state.clone());
+        let (status, json) = delete_target(app, serde_json::json!({ "model": "*" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ok"], true);
+
+        let inner = state.active_targets.read().await;
+        assert!(
+            !inner.contains_key("gpt-4.1"),
+            "concrete wildcard pin must be cleared"
+        );
+        assert!(
+            !inner.contains_key("claude-3-opus"),
+            "second concrete wildcard pin must be cleared"
+        );
+        assert!(
+            inner.contains_key("gpt-4o"),
+            "exact-route pin must NOT be cleared by the wildcard DELETE"
+        );
+        assert_eq!(inner.get("gpt-4o").unwrap().route_model, "gpt-4o");
+        assert_eq!(
+            inner.generation("gpt-4.1"),
+            1,
+            "cleared concrete key's generation bumps so stale writebacks fail"
+        );
+        assert_eq!(
+            inner.epoch(),
+            1,
+            "wildcard DELETE bumps the global epoch (never-pinned concrete keys)"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_wildcard_does_not_clear_shadowed_pin() {
+        // A wildcard pin whose request key is now shadowed by an exact route
+        // no longer belongs to the wildcard route: the wildcard DELETE must
+        // leave it for the exact route's own DELETE.
+        let state = state_with_routes(vec![
+            route("gpt-4o", vec![target("openai", None, 10)]),
+            route("*", vec![target("openai", None, 5)]),
+        ])
+        .await;
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new("openai", "gpt-4o", "*", None, Instant::now()),
+        );
+        state.active_targets.write().await.insert(
+            "gpt-4.1".into(),
+            ActiveTargetEntry::new("openai", "gpt-4.1", "*", None, Instant::now()),
+        );
+
+        let app = test_app(state.clone());
+        let (status, _) = delete_target(app, serde_json::json!({ "model": "*" })).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let inner = state.active_targets.read().await;
+        assert!(
+            inner.contains_key("gpt-4o"),
+            "shadowed wildcard pin survives the wildcard DELETE"
+        );
+        assert!(
+            !inner.contains_key("gpt-4.1"),
+            "still-wildcard pin is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_exact_route_does_not_clear_wildcard_pins() {
+        // A plain route DELETE keeps its single-key semantics: DELETE
+        // "gpt-4o" clears only that key — a wildcard concrete pin on another
+        // request model must survive (no wildcard path is taken).
+        let state = state_with_routes(vec![
+            route("gpt-4o", vec![target("openai", Some("gpt-4o"), 10)]),
+            route("*", vec![target("openai", None, 5)]),
+        ])
+        .await;
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+        state.active_targets.write().await.insert(
+            "gpt-4.1".into(),
+            ActiveTargetEntry::new("openai", "gpt-4.1", "*", None, Instant::now()),
+        );
+
+        let app = test_app(state.clone());
+        let (status, _) = delete_target(app, serde_json::json!({ "model": "gpt-4o" })).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let inner = state.active_targets.read().await;
+        assert!(
+            !inner.contains_key("gpt-4o"),
+            "exact DELETE clears its own pin"
+        );
+        assert!(
+            inner.contains_key("gpt-4.1"),
+            "wildcard concrete pin must NOT be cleared by an exact-route DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_wildcard_fill_first_clears_concrete_orders_only() {
+        // A wildcard fill-first route caches its shuffled orders under the
+        // concrete request models. DELETE with model="*" must drop exactly
+        // those keys that still belong to the wildcard route — an exact
+        // route sharing a key (here "gpt-4o") keeps its own cached order.
+        let state = state_with_routes(vec![
+            route_with_strategy(
+                "gpt-4o",
+                vec![target("openai", Some("gpt-4o"), 10)],
+                sag_config::Strategy::FillFirst,
+            ),
+            route_with_strategy(
+                "*",
+                vec![target("openai", None, 5)],
+                sag_config::Strategy::FillFirst,
+            ),
+        ])
+        .await;
+        {
+            let mut guard = state.fill_first_orders.write().await;
+            for key in ["gpt-4.1", "claude-3-opus"] {
+                guard.insert(
+                    key.into(),
+                    sag_state::CachedOrder {
+                        targets: std::sync::Arc::from(vec![target("openai", None, 5)]),
+                        created_at: Instant::now(),
+                        routes_version: Some(1),
+                    },
+                );
+            }
+            // The exact route's own cache under the same-looking concrete key
+            // "gpt-4o" — must survive (it resolves to the exact route).
+            guard.insert(
+                "gpt-4o".into(),
+                sag_state::CachedOrder {
+                    targets: std::sync::Arc::from(vec![target("openai", Some("gpt-4o"), 10)]),
+                    created_at: Instant::now(),
+                    routes_version: Some(1),
+                },
+            );
+        }
+
+        let app = test_app(state.clone());
+        let (status, _) = delete_target(app, serde_json::json!({ "model": "*" })).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let orders = state.fill_first_orders.read().await;
+        assert!(!orders.contains_key("gpt-4.1"));
+        assert!(!orders.contains_key("claude-3-opus"));
+        assert!(
+            orders.contains_key("gpt-4o"),
+            "an exact route sharing the key keeps its cached order"
         );
     }
 }

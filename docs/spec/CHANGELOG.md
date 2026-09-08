@@ -1,11 +1,16 @@
 ---
 created: 2026-06-03
-updated: 2026-09-07
+updated: 2026-09-08
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-09-08
+
+- **Sticky Targets**：[0005 target_index 权威首项判定与策略切换残留清理](sticky-targets-observability/changes/0005-target-index-and-strategy-switch-cleanup.md) — DTO 携带 0-based `target_index` 作首项权威来源（取代对象身份）；GET 只对 StickyFailover 展示 pin（切换后残留报 idle）；DELETE 对每种策略都清 active_targets、FillFirst 额外清 order cache；route CRUD 与 gateway hot-reload（含 fallback retry）成功后立即 prune
+- **Sticky Targets**：[0004 expired 圆点改 muted 灰绿/灰橙](sticky-targets-observability/changes/0004-expired-dot-muted-hue.md) — expired 不再统一灰色：命中 route.targets 首项 `bg-green-500/40`、非首项/无法确认 `bg-orange-500/40`（expired 表示过期 pin 的配置位置，非当前流量）；pinned 与 fill_first 行为不变
 
 ## 2026-09-07
 

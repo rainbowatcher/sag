@@ -124,6 +124,39 @@ fn validate_targets(
 // Handlers
 // ═══════════════════════════════════════════════════════════════════
 
+/// After a committed route mutation, prune the shared routing memory so it
+/// matches the new config without waiting for the next dispatch:
+/// - drop `active_targets` entries whose request model no longer resolves to
+///   a [`Strategy::StickyFailover`] route — a strategy switch
+///   (StickyFailover → FillFirst / RoundRobin) or a route removal /
+///   shadowing leaves a stale sticky pin that must not linger;
+/// - drop `fill_first_orders` entries whose key no longer resolves to **any**
+///   route — a deleted route's cached shuffle must not linger either. Keys
+///   are judged by re-resolving against the current route table, never by
+///   membership in the config's `model_name` set: a wildcard route's caches
+///   live under concrete request models, which still resolve to the
+///   wildcard route and are therefore kept. Still-resolving caches are left
+///   untouched — `order_fill_first` self-heals any targets mismatch by
+///   re-shuffling on next use, so a live fill-first order is never broken.
+///
+/// Mirrors [`sag_dispatch::DispatchRuntime::prune_stale_entries`]'s
+/// fill-first rule. Runs with no config read guard held across the writes
+/// (routes are cloned first), so it cannot deadlock against dispatch or the
+/// coordinator.
+async fn prune_stale_routing_state(state: &AppState) {
+    let routes = state.config.read().await.routes.clone();
+    let resolves_to = |k: &str| sag_config::resolve_model_route(&routes, k).is_some();
+    {
+        let mut orders = state.fill_first_orders.write().await;
+        orders.retain(|k, _| resolves_to(k));
+    }
+    state
+        .active_targets
+        .write()
+        .await
+        .retain_sticky_routes(&routes);
+}
+
 /// GET /api/routes — list all routing rules.
 pub async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
@@ -169,13 +202,16 @@ pub async fn create_route(
     };
 
     match state.coordinator.create_route(route).await {
-        Ok(_report) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "model_name": req.model_name,
-            })),
-        )
-            .into_response(),
+        Ok(_report) => {
+            prune_stale_routing_state(&state).await;
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "model_name": req.model_name,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -231,13 +267,19 @@ pub async fn update_route(
 
     // 2. Delegate to the coordinator.
     match state.coordinator.update_route(&req.model_name, route).await {
-        Ok(_report) => (
-            StatusCode::OK,
-            Json(json!({
-                "model_name": req.model_name,
-            })),
-        )
-            .into_response(),
+        Ok(_report) => {
+            // The mutation may have switched the route's strategy (or
+            // removed targets / the route itself): proactively drop stale
+            // sticky pins so the routing memory matches the new config.
+            prune_stale_routing_state(&state).await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "model_name": req.model_name,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -251,13 +293,17 @@ pub async fn delete_route(
     tracing::Span::current().record("model_name", &req.model_name);
 
     match state.coordinator.delete_route(&req.model_name).await {
-        Ok(_report) => (
-            StatusCode::OK,
-            Json(json!({
-                "model_name": req.model_name,
-            })),
-        )
-            .into_response(),
+        Ok(_report) => {
+            // The route is gone: drop any pins recorded under it.
+            prune_stale_routing_state(&state).await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "model_name": req.model_name,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -584,6 +630,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_route_strategy_switch_prunes_stale_active_target() {
+        // A route pinned under StickyFailover; switching it to FillFirst via
+        // the admin API must proactively drop the stale pin (without waiting
+        // for the next dispatch prune).
+        let (providers, _) = one_provider_config("openai", vec![]);
+        let route = RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::StickyFailover,
+            targets: vec![RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                retries: None,
+                timeout_secs: None,
+                priority: 1,
+                extra: HashMap::new(),
+            }],
+        };
+        let state = build_state(providers, vec![route]).await;
+        state.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            sag_state::ActiveTargetEntry::new(
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                std::time::Instant::now(),
+            ),
+        );
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model_name":"gpt-4o","strategy":"fill_first"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            state.active_targets.read().await.get("gpt-4o").is_none(),
+            "strategy switch to fill_first must prune the stale sticky pin"
+        );
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.routes[0].strategy, Strategy::FillFirst);
+    }
+
+    #[tokio::test]
     async fn update_route_not_found() {
         let (providers, routes) = one_provider_config("openai", vec![]);
         let state = build_state(providers, routes).await;
@@ -637,5 +736,125 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Build a FillFirst route config (mirror of `one_provider_config`).
+    fn fill_first_route(model: &str) -> RouteConfig {
+        RouteConfig {
+            model_name: model.into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::FillFirst,
+            targets: vec![RouteTarget {
+                provider: "openai".into(),
+                real_model: Some(model.into()),
+                retries: None,
+                timeout_secs: None,
+                priority: 1,
+                extra: HashMap::new(),
+            }],
+        }
+    }
+
+    fn cached_order(model: &str) -> sag_state::CachedOrder {
+        sag_state::CachedOrder {
+            targets: std::sync::Arc::from(vec![RouteTarget {
+                provider: "openai".into(),
+                real_model: Some(model.into()),
+                retries: None,
+                timeout_secs: None,
+                priority: 1,
+                extra: HashMap::new(),
+            }]),
+            created_at: std::time::Instant::now(),
+            routes_version: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_route_prunes_fill_first_orders_cache() {
+        // A deleted route must not leave its cached shuffled order behind:
+        // the proactive prune drops fill_first_orders keys that no longer
+        // resolve to any route, while keeping caches of still-existing routes.
+        let (providers, _) = one_provider_config("openai", vec![]);
+        let state = build_state(
+            providers,
+            vec![fill_first_route("gpt-4o"), fill_first_route("dall-e")],
+        )
+        .await;
+        {
+            let mut orders = state.fill_first_orders.write().await;
+            orders.insert("gpt-4o".into(), cached_order("gpt-4o"));
+            orders.insert("dall-e".into(), cached_order("dall-e"));
+            orders.insert(
+                "old-deleted-model".into(),
+                cached_order("old-deleted-model"),
+            );
+        }
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model_name":"dall-e"}"#))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let orders = state.fill_first_orders.read().await;
+        assert!(
+            orders.contains_key("gpt-4o"),
+            "surviving route's cached order is kept"
+        );
+        assert!(
+            !orders.contains_key("dall-e"),
+            "deleted route's cached order is pruned"
+        );
+        assert!(
+            !orders.contains_key("old-deleted-model"),
+            "stale key from an already-deleted route is pruned too"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_route_keeps_wildcard_concrete_fill_first_caches() {
+        // fill_first_orders is keyed by the request model; for a wildcard
+        // route that is any concrete model it served. The proactive prune
+        // must not mis-clear those keys: after deleting an exact route, a
+        // concrete key that now resolves to the wildcard route keeps its
+        // cache (and self-heals its targets on next use).
+        let (providers, _) = one_provider_config("openai", vec![]);
+        let state = build_state(
+            providers,
+            vec![fill_first_route("gpt-4o"), fill_first_route("*")],
+        )
+        .await;
+        {
+            let mut orders = state.fill_first_orders.write().await;
+            orders.insert("gpt-4o".into(), cached_order("gpt-4o"));
+            orders.insert("gpt-4.1".into(), cached_order("gpt-4.1"));
+        }
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/routes")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model_name":"gpt-4o"}"#))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let orders = state.fill_first_orders.read().await;
+        assert!(
+            orders.contains_key("gpt-4o"),
+            "key still resolving (now via the wildcard) keeps its cache"
+        );
+        assert!(
+            orders.contains_key("gpt-4.1"),
+            "wildcard concrete request key keeps its cache"
+        );
     }
 }

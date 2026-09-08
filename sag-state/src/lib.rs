@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sag_analytics::{AnalyticsQueryEngine, CallLogCollector, EventCollector};
-use sag_config::{ConfigHandle, RouteTarget};
+use sag_config::{ConfigHandle, RouteConfig, RouteTarget, Strategy};
 use sag_core::{RouteCircuitBreaker, RouteTargetKey};
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
@@ -301,6 +301,83 @@ impl ActiveTargetsInner {
             let generation = self.generations.entry(model).or_insert(0);
             *generation += 1;
         }
+    }
+
+    /// Strategy-aware prune shared by the dispatch `prune_stale_entries` and
+    /// the admin route-mutation handlers: drop active entries whose
+    /// request-model key no longer resolves — under the current route table
+    /// — to the route that recorded them **and** whose resolved route is
+    /// still [`Strategy::StickyFailover`].
+    ///
+    /// A route that switched from StickyFailover to FillFirst (or
+    /// RoundRobin), or that was removed / shadowed by an exact route, leaves
+    /// a stale pin behind: the key still resolves, so the route-membership
+    /// check alone keeps it, and the current strategy never writes (or
+    /// clears) it. This prunes exactly those entries so the memory reflects
+    /// the live config without waiting for the next dispatch.
+    ///
+    /// The keep rule mirrors dispatch + prune semantics:
+    /// - the key must still resolve to the entry's recorded `route_model`
+    ///   (an exact route now shadowing a previously-wildcard key, or a
+    ///   removed route, drops the entry), and
+    /// - the resolved route must still be StickyFailover — a strategy switch
+    ///   drops every entry pinned under the old strategy.
+    ///
+    /// Generation-only tombstones (no entry) are kept while their key still
+    /// resolves to any route: they are inert for non-sticky strategies
+    /// (fill-first / round-robin never write back) and must keep rejecting
+    /// pre-clear sticky writebacks if the route ever switches back.
+    ///
+    /// Dropped models get their generation bumped (see [`Self::retain`]), so
+    /// a decision captured before the prune can never write back afterwards.
+    pub fn retain_sticky_routes(&mut self, routes: &[RouteConfig]) {
+        let resolves_to = |model: &str| sag_config::resolve_model_route(routes, model);
+        self.retain(|model, entry| match entry {
+            Some(e) => matches!(
+                resolves_to(model),
+                Some(r) if r.model_name == e.route_model && r.strategy == Strategy::StickyFailover
+            ),
+            None => resolves_to(model).is_some(),
+        });
+    }
+
+    /// Clear every active entry that belongs to the wildcard route: entries
+    /// whose recorded [`ActiveTargetEntry::route_model`] is `"*"` and whose
+    /// request-model key still resolves to the wildcard route under the
+    /// current route table. Each dropped model's generation is bumped so a
+    /// decision captured before the clear can never write back (see
+    /// [`Self::retain`]); the global epoch is additionally bumped so a
+    /// never-pinned concrete key — the wildcard route's request models are
+    /// unbounded and cannot be enumerated in advance — also rejects a
+    /// pre-clear writeback (see [`Self::clear`]).
+    ///
+    /// The keep rule mirrors [`Self::retain_sticky_routes`]'s membership
+    /// check, so entries belonging to **other** routes are never cleared:
+    /// - an entry pinned by an exact route (`route_model` = the exact name)
+    ///   is kept even when it shares a provider / real model with a wildcard
+    ///   target;
+    /// - a wildcard pin whose key is now shadowed by an exact route (no
+    ///   longer resolving to `"*"`) is kept — it no longer belongs to the
+    ///   wildcard route and is cleared by that exact route's own DELETE;
+    /// - generation-only tombstones (no entry) are kept: they carry no pin
+    ///   to clear and already reject stale writebacks for their key.
+    ///
+    /// Used by `DELETE /api/active-targets` when the request names the
+    /// wildcard route itself (`model = "*"`): the frontend cannot name every
+    /// concrete request model the route pinned, so "clear this route" clears
+    /// them all, precisely.
+    pub fn clear_wildcard_route(&mut self, routes: &[RouteConfig]) {
+        let belongs_to_wildcard = |model: &str| {
+            matches!(
+                sag_config::resolve_model_route(routes, model),
+                Some(r) if r.model_name == "*"
+            )
+        };
+        self.retain(|model, entry| match entry {
+            Some(e) => !(e.route_model == "*" && belongs_to_wildcard(model)),
+            None => true,
+        });
+        self.epoch += 1;
     }
 }
 
@@ -738,6 +815,186 @@ mod tests {
         assert!(
             inner.contains_key("gpt-4.1"),
             "wildcard-route entry must be kept"
+        );
+    }
+
+    #[test]
+    fn retain_sticky_routes_drops_entries_for_non_sticky_routes() {
+        use sag_config::{RouteConfig, Strategy};
+        fn route(model: &str, strategy: Strategy) -> RouteConfig {
+            RouteConfig {
+                model_name: model.into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy,
+                retries: None,
+                timeout_secs: None,
+                targets: vec![],
+            }
+        }
+        let routes = vec![
+            route("exact", Strategy::StickyFailover),
+            route("*", Strategy::FillFirst),
+        ];
+        let mut inner = ActiveTargetsInner::new();
+        // Entry pinned through the exact sticky route — must survive.
+        inner.insert(
+            "exact".into(),
+            ActiveTargetEntry::new("p", "exact", "exact", Some("exact".into()), Instant::now()),
+        );
+        // Entry pinned through the wildcard route while it was sticky — the
+        // wildcard is now FillFirst, so the stale pin must be dropped.
+        inner.insert(
+            "gpt-4.1".into(),
+            ActiveTargetEntry::new("p", "gpt-4.1", "*", None, Instant::now()),
+        );
+        // Generation-only tombstone whose key still resolves — kept.
+        inner.generations.insert("tomb".into(), 3);
+
+        inner.retain_sticky_routes(&routes);
+
+        assert!(inner.contains_key("exact"), "sticky route entry survives");
+        assert!(
+            !inner.contains_key("gpt-4.1"),
+            "wildcard entry must be dropped once the route is no longer sticky"
+        );
+        assert_eq!(
+            inner.generation("gpt-4.1"),
+            1,
+            "dropped pin's generation bumps so pre-prune writebacks fail"
+        );
+        assert_eq!(
+            inner.generation("tomb"),
+            3,
+            "tombstone kept, generation untouched"
+        );
+    }
+
+    #[test]
+    fn clear_wildcard_route_drops_only_wildcard_entries_and_bumps_both() {
+        use sag_config::{RouteConfig, Strategy};
+        fn route(model: &str, strategy: Strategy) -> RouteConfig {
+            RouteConfig {
+                model_name: model.into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy,
+                retries: None,
+                timeout_secs: None,
+                targets: vec![],
+            }
+        }
+        // An exact route plus a wildcard route.
+        let routes = vec![
+            route("gpt-4o", Strategy::StickyFailover),
+            route("*", Strategy::StickyFailover),
+        ];
+        let mut inner = ActiveTargetsInner::new();
+
+        // Wildcard pins: concrete request keys belonging to the wildcard route.
+        inner.insert(
+            "gpt-4.1".into(),
+            ActiveTargetEntry::new("p", "gpt-4.1", "*", None, Instant::now()),
+        );
+        inner.insert(
+            "claude-3-opus".into(),
+            ActiveTargetEntry::new("p", "claude-3-opus", "*", None, Instant::now()),
+        );
+        // Exact-route pin — must survive even though it shares a provider
+        // with wildcard targets.
+        inner.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new(
+                "p",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+        // A wildcard pin for the literal key "*" (a request literally named "*").
+        inner.insert(
+            "*".into(),
+            ActiveTargetEntry::new("p", "*", "*", None, Instant::now()),
+        );
+        // Generation-only tombstone for a wildcard concrete key — kept, untouched.
+        inner.generations.insert("gpt-4.2".into(), 3);
+
+        let epoch_before = inner.epoch();
+        inner.clear_wildcard_route(&routes);
+
+        // The two concrete wildcard pins and the literal "*" key are cleared.
+        assert!(!inner.contains_key("gpt-4.1"));
+        assert!(!inner.contains_key("claude-3-opus"));
+        assert!(!inner.contains_key("*"));
+        assert!(
+            inner.contains_key("gpt-4o"),
+            "exact-route pin must survive the wildcard clear"
+        );
+        assert_eq!(inner.get("gpt-4o").unwrap().route_model, "gpt-4o");
+        assert_eq!(
+            inner.generation("gpt-4.1"),
+            1,
+            "dropped pin's generation bumps so pre-clear writebacks fail"
+        );
+        assert_eq!(
+            inner.generation("gpt-4.2"),
+            3,
+            "tombstone kept, generation untouched"
+        );
+        assert_eq!(
+            inner.epoch(),
+            epoch_before + 1,
+            "the epoch must bump to reject never-pinned concrete writebacks"
+        );
+
+        // A pre-clear writeback for a cleared concrete key is rejected (the
+        // bumped generation alone would do it; the epoch check is the catch-all).
+        let version = 1;
+        assert!(!inner.insert_if_generation(
+            "gpt-4.1".into(),
+            ActiveTargetEntry::new("p", "gpt-4.1", "*", None, Instant::now()),
+            &token(epoch_before, 0, version),
+            version,
+        ));
+    }
+
+    #[test]
+    fn clear_wildcard_route_keeps_shadowed_and_other_route_entries() {
+        use sag_config::{RouteConfig, Strategy};
+        fn route(model: &str) -> RouteConfig {
+            RouteConfig {
+                model_name: model.into(),
+                api_endpoint: "/chat/completions".into(),
+                strategy: Strategy::StickyFailover,
+                retries: None,
+                timeout_secs: None,
+                targets: vec![],
+            }
+        }
+        // An exact route now shadows the previously-wildcard key "gpt-4o".
+        let routes = vec![route("gpt-4o"), route("*")];
+        let mut inner = ActiveTargetsInner::new();
+        // Wildcard pin whose key no longer resolves to "*" — it belongs to
+        // the exact route now and must survive (the exact route's own DELETE
+        // clears it).
+        inner.insert(
+            "gpt-4o".into(),
+            ActiveTargetEntry::new("p", "gpt-4o", "*", None, Instant::now()),
+        );
+        // A second wildcard concrete key still belonging to the wildcard route.
+        inner.insert(
+            "gpt-4.1".into(),
+            ActiveTargetEntry::new("p", "gpt-4.1", "*", None, Instant::now()),
+        );
+
+        inner.clear_wildcard_route(&routes);
+
+        assert!(
+            inner.contains_key("gpt-4o"),
+            "shadowed wildcard pin must not be cleared by the wildcard DELETE"
+        );
+        assert!(
+            !inner.contains_key("gpt-4.1"),
+            "still-wildcard pin is cleared"
         );
     }
 

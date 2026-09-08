@@ -5,6 +5,13 @@ type: 修改
 
 # 0003 — Routes 页 Active Target 状态圆点颜色
 
+> **已被 0004/0005 部分取代**：0004 把 expired 从统一 `bg-gray-500` 改为按配置位置 muted（首项
+> `bg-green-500/40`、非首项/无法确认 `bg-orange-500/40`）；0005 把「对象身份首项判定」改为后端
+> `ActiveTargetDto.target_index === 0` 权威判定。本节「expired 改灰」「对象身份首项判定」的描述
+> 仅代表 0003 当时的决定，当前行为以 [0004](0004-expired-dot-muted-hue.md)、
+> [0005](0005-target-index-and-strategy-switch-cleanup.md) 与 spec.md 为准；pinned 首项绿/非首项
+> 橙、FillFirst 恒 emerald 仍按本节不变。
+
 ## 动机
 
 Routes 页 Active Target 列的圆形状态点此前只有三态：FillFirst 恒 emerald、

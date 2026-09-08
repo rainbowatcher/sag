@@ -105,12 +105,17 @@ impl DispatchRuntime {
     /// by checking membership in the config's `model_name` set (which may
     /// only contain `"*"`). Active entries additionally record the route that
     /// created them (`ActiveTargetEntry::route_model`); an entry is kept only
-    /// while its key still resolves to that same route, so:
+    /// while its key still resolves to that same route **and** the resolved
+    /// route is still [`sag_config::Strategy::StickyFailover`] (see
+    /// [`ActiveTargetsInner::retain_sticky_routes`]), so:
     /// - a wildcard request key survives config changes that do not affect
-    ///   the wildcard route (it keeps resolving to `"*"`), and
+    ///   the wildcard route (it keeps resolving to `"*"`),
     /// - a key that no longer resolves to its recorded route — an exact route
     ///   now shadowing a previously-wildcard key, or the route being removed
-    ///   entirely — is dropped.
+    ///   entirely — is dropped, and
+    /// - a pin whose route switched away from StickyFailover (e.g. to
+    ///   FillFirst) is dropped, so no stale active target lingers after a
+    ///   strategy change.
     pub async fn prune_stale_entries(&self, routes: &[sag_config::RouteConfig]) {
         let resolves_to = |request_model: &str| -> Option<&str> {
             sag_config::resolve_model_route(routes, request_model).map(|r| r.model_name.as_str())
@@ -125,10 +130,7 @@ impl DispatchRuntime {
         }
         {
             let mut guard = self.active_targets.write().await;
-            guard.retain(|k, entry| match entry {
-                Some(e) => resolves_to(k) == Some(e.route_model.as_str()),
-                None => resolves_to(k).is_some(),
-            });
+            guard.retain_sticky_routes(routes);
         }
     }
 }
@@ -436,6 +438,57 @@ mod tests {
         // (they self-heal by re-shuffling on next use).
         assert!(rt.fill_first_orders.read().await.contains_key("gpt-4o"));
         assert!(rt.route_counters.read().await.contains_key("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn prune_stale_entries_drops_active_pin_after_strategy_switch_to_fill_first() {
+        let rt = DispatchRuntime::default();
+        // A pin recorded while the route was StickyFailover.
+        rt.active_targets.write().await.insert(
+            "gpt-4o".into(),
+            sag_state::ActiveTargetEntry::new(
+                "p",
+                "gpt-4o",
+                "gpt-4o",
+                Some("gpt-4o".into()),
+                Instant::now(),
+            ),
+        );
+        // The route is now FillFirst — the fill-first order cache and the
+        // round-robin counter (both keyed by request model) still resolve
+        // and must survive; the sticky pin must be dropped.
+        rt.fill_first_orders.write().await.insert(
+            "gpt-4o".into(),
+            CachedOrder {
+                targets: Arc::from([]),
+                created_at: std::time::Instant::now(),
+                routes_version: None,
+            },
+        );
+        rt.route_counters.write().await.insert("gpt-4o".into(), 2);
+
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            strategy: sag_config::Strategy::FillFirst,
+            retries: None,
+            timeout_secs: None,
+            targets: vec![],
+        }];
+        rt.prune_stale_entries(&routes).await;
+
+        assert!(
+            !rt.active_targets.read().await.contains_key("gpt-4o"),
+            "sticky pin must be pruned once the route switches to fill_first"
+        );
+        assert!(
+            rt.fill_first_orders.read().await.contains_key("gpt-4o"),
+            "fill_first_orders entry for a resolving key survives the prune"
+        );
+        assert!(
+            rt.route_counters.read().await.contains_key("gpt-4o"),
+            "route_counters entry for a resolving key survives the prune"
+        );
     }
 
     #[tokio::test]
