@@ -38,6 +38,11 @@ node_modules
 .claude/
 .mimocode/
 .openclaude/
+.zcode/
+.pi-subagents/
+.pi/
+.workbuddy/
+.codebuddy/
 
 # test-env state (Phase 2 — see .plan/test-environment.md)
 .test-env/
@@ -55,7 +60,4 @@ docs/.vitepress/dist
 # misc
 .plan/
 gateway.toml
-.zcode/
 PLAN.md
-.pi-subagents/
-.pi/
