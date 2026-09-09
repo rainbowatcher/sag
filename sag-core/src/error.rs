@@ -374,8 +374,12 @@ mod tests {
     #[tokio::test]
     async fn network_error_returns_502() {
         // Construct a reqwest error by connecting to an unreachable port
-        // on localhost with a minimal timeout.
+        // on localhost with a minimal timeout. `.no_proxy()` keeps the
+        // test hermetic: without it a machine-level `HTTP_PROXY` env var
+        // would route the request through the proxy, which answers with
+        // 502 instead of failing to connect.
         let err = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(std::time::Duration::from_millis(5))
             .timeout(std::time::Duration::from_millis(10))
             .build()
@@ -501,8 +505,11 @@ mod tests {
 
     #[tokio::test]
     async fn error_category_network() {
-        // Build a minimal reqwest::Error
+        // Build a minimal reqwest::Error. `.no_proxy()` keeps the test
+        // hermetic against a machine-level `HTTP_PROXY` env var (see
+        // `network_error_returns_502`).
         let req_err = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(std::time::Duration::from_millis(5))
             .timeout(std::time::Duration::from_millis(10))
             .build()
@@ -733,7 +740,10 @@ mod tests {
     #[tokio::test]
     async fn failure_reason_network_is_model_failure() {
         // Build a minimal reqwest::Error via an unreachable localhost port.
+        // `.no_proxy()` keeps the test hermetic against a machine-level
+        // `HTTP_PROXY` env var (see `network_error_returns_502`).
         let req_err = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(std::time::Duration::from_millis(5))
             .timeout(std::time::Duration::from_millis(10))
             .build()
