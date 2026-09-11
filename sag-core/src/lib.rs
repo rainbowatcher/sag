@@ -10,6 +10,7 @@
 
 pub mod circuit_breaker;
 pub mod error;
+pub mod http_client;
 pub mod types;
 
 // Re-export key types at crate level for convenience
@@ -18,6 +19,7 @@ pub use circuit_breaker::{
     compute_stale_probe_threshold,
 };
 pub use error::AppError;
+pub use http_client::build_http_client;
 pub use types::{
     CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FailureReason,
     FinalStatus, ImageData, ImageGenerationRequest, ImageGenerationResponse, RequestResultFact,
