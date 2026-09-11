@@ -133,7 +133,31 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     let mut providers: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
 
     for (name, provider_config) in &config.providers {
-        match sag_providers::create_provider(name.clone(), provider_config) {
+        // Resolve this provider's effective proxy (global `proxy_url` + its
+        // `proxy_mode`) and build the adapter with it — the same resolution
+        // every construction path uses, so startup, hot reload and admin
+        // mutations agree on the proxy policy. Resolution errors follow the
+        // existing startup handling for provider construction: logged and the
+        // provider is skipped (never unwrap/panic). With enabled providers
+        // present, an invalid global proxy / unsatisfiable `enabled` mode then
+        // surfaces below as "no provider adapters could be initialized", which
+        // `load_config`'s validation would already have rejected. No proxy URL
+        // or credential is ever logged.
+        let effective = match sag_state::config_mutation::effective_proxy_for(
+            &config,
+            provider_config,
+        ) {
+            Ok(effective) => effective,
+            Err(e) => {
+                tracing::error!(name, error = %e, "invalid proxy configuration, skipping provider");
+                continue;
+            }
+        };
+        match sag_providers::create_provider_with_proxy(
+            name.clone(),
+            provider_config,
+            effective.as_ref(),
+        ) {
             Ok(provider) => {
                 info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
                 providers.insert(name.clone(), provider);
