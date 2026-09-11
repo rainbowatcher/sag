@@ -48,14 +48,38 @@ pub struct ProviderBase {
 
 impl ProviderBase {
     /// Create a new provider base from configuration.
+    ///
+    /// Connects **directly**: the system proxy environment variables
+    /// (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) are explicitly ignored.
+    /// Use [`ProviderBase::new_with_proxy`] to route upstream traffic
+    /// through an explicit proxy.
     pub fn new(name: String, config: &ProviderConfig) -> sag_core::Result<Self> {
-        // No client-level `.timeout(...)`: that would impose a total
-        // request deadline that truncates healthy long-lived streams.
-        // `timeout_secs` still applies to non-streaming requests via
-        // `RequestBuilder::timeout` in `send_json`.
-        let http_client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| AppError::Internal(format!("failed to build reqwest client: {e}")))?;
+        Self::new_with_proxy(name, config, None)
+    }
+
+    /// Create a new provider base from configuration with an explicit
+    /// effective proxy.
+    ///
+    /// `proxy: None` → direct connection with the system proxy explicitly
+    /// disabled. `Some(proxy)` → all upstream traffic is routed through
+    /// that single proxy URL (e.g. resolved via
+    /// `sag_config::resolve_effective_proxy` and reconstructed with
+    /// `ProxyConfig::to_connect_url`); the system proxy environment
+    /// variables are ignored either way.
+    ///
+    /// No client-level `.timeout(...)` is set: that would impose a total
+    /// request deadline that truncates healthy long-lived streams.
+    /// `timeout_secs` still applies to non-streaming requests via
+    /// `RequestBuilder::timeout` in `send_json`, and streaming keeps its
+    /// TTFB / chunk-idle semantics.
+    pub fn new_with_proxy(
+        name: String,
+        config: &ProviderConfig,
+        proxy: Option<&sag_config::ProxyConfig>,
+    ) -> sag_core::Result<Self> {
+        let http_client =
+            sag_core::build_http_client(proxy.map(|p| p.to_connect_url()).as_deref(), None)
+                .map_err(|e| AppError::Internal(format!("failed to build reqwest client: {e}")))?;
 
         if config.api_keys.is_empty() {
             return Err(AppError::BadRequest(format!(
@@ -1021,5 +1045,236 @@ mod tests {
         base.apply_role_mappings(&mut msgs);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
+    }
+
+    // ── proxy / system-env behavior ────────────────────────────────
+
+    /// Serializes tests that mutate the process-global proxy env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// All spellings of the system proxy env vars reqwest would honor.
+    const PROXY_ENV_VARS: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ];
+
+    /// Set every system proxy env var to `value`, returning the previous
+    /// values so [`restore_proxy_env`] can put them back.
+    ///
+    /// # Safety
+    ///
+    /// `std::env::set_var` is `unsafe` in edition 2024 (concurrent access
+    /// to process env is UB). All callers hold [`ENV_LOCK`] for the whole
+    /// mutation + use window, and every client built by this crate ignores
+    /// the proxy env, so no other code observes the mutation.
+    fn set_proxy_env(value: &str) -> Vec<(&'static str, Option<String>)> {
+        PROXY_ENV_VARS
+            .iter()
+            .map(|var| {
+                let old = std::env::var(var).ok();
+                // SAFETY: caller holds ENV_LOCK; see doc comment.
+                unsafe { std::env::set_var(var, value) };
+                (*var, old)
+            })
+            .collect()
+    }
+
+    fn restore_proxy_env(saved: Vec<(&'static str, Option<String>)>) {
+        for (var, old) in saved {
+            match old {
+                Some(v) => {
+                    // SAFETY: caller holds ENV_LOCK; see [`set_proxy_env`].
+                    unsafe { std::env::set_var(var, v) };
+                }
+                None => {
+                    // SAFETY: caller holds ENV_LOCK; see [`set_proxy_env`].
+                    unsafe { std::env::remove_var(var) };
+                }
+            }
+        }
+    }
+
+    fn proxy_config(scheme: &str, host: &str, port: u16) -> sag_config::ProxyConfig {
+        sag_config::ProxyConfig {
+            scheme: scheme.into(),
+            host: host.into(),
+            port: Some(port),
+        }
+    }
+
+    /// Spawn a listener that counts every accepted connection and answers
+    /// each with `200 OK` and `body`. Returns `(base_url, connection_count)`.
+    async fn spawn_probe_server(
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_task = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                count_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    #[test]
+    fn provider_base_accepts_direct_and_explicit_proxy() {
+        // Direct (None) — the old-wrapper code path.
+        let direct = ProviderBase::new(
+            "test".into(),
+            &crate::test_support::test_config("https://example.com", 30, None, None),
+        )
+        .expect("direct construction succeeds");
+        assert_eq!(
+            direct.build_url("chat/completions"),
+            "https://example.com/chat/completions"
+        );
+
+        // Explicit HTTP proxy.
+        let http_proxy = ProviderBase::new_with_proxy(
+            "test".into(),
+            &crate::test_support::test_config("https://example.com", 30, None, None),
+            Some(&proxy_config("http", "127.0.0.1", 8080)),
+        )
+        .expect("http proxy construction succeeds");
+
+        // Explicit HTTPS proxy.
+        let https_proxy = ProviderBase::new_with_proxy(
+            "test".into(),
+            &crate::test_support::test_config("https://example.com", 30, None, None),
+            Some(&proxy_config("https", "proxy.example.com", 8443)),
+        )
+        .expect("https proxy construction succeeds");
+
+        let _ = (direct, http_proxy, https_proxy);
+    }
+
+    #[test]
+    fn create_provider_accepts_proxy() {
+        let config = crate::test_support::test_config("https://example.com", 30, None, None);
+        let _ = crate::create_provider("t".into(), &config).expect("direct create_provider works");
+        let _ = crate::create_provider_with_proxy(
+            "t".into(),
+            &config,
+            Some(&proxy_config("http", "127.0.0.1", 8080)),
+        )
+        .expect("create_provider_with_proxy works");
+    }
+
+    #[tokio::test]
+    async fn old_wrapper_client_ignores_system_proxy_env() {
+        // Spawn the servers first — they do not depend on env vars.
+        // A "detector" stands in for whatever HTTP_PROXY might point at. If
+        // the client ever read the system proxy env, it would connect here.
+        // It answers with a body distinct from the target's so a wrongly
+        // proxied request is recognizable from the response alone.
+        let (detector_url, detector_hits) = spawn_probe_server("det").await;
+        let target = crate::test_support::spawn_server(|mut stream| async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        })
+        .await;
+
+        // Build through the old 2-arg wrapper while the env is poisoned: any
+        // implicit system-proxy discovery would pick up `detector_url`.
+        // reqwest reads the proxy env at client-build time, and the build is
+        // synchronous, so the lock scope covers mutation → construction and
+        // is dropped before any await.
+        let base = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let saved = set_proxy_env(&detector_url);
+            let base = ProviderBase::new(
+                "test".into(),
+                &crate::test_support::test_config(&target, 30, None, None),
+            )
+            .expect("provider builds with poisoned proxy env");
+            restore_proxy_env(saved);
+            base
+        };
+
+        // A real direct request still succeeds against the local target.
+        // reqwest connections are lazy: even if the client had wrongly
+        // captured the system proxy at build time, the detector would only
+        // be contacted here. Asserting the body and the hit count only after
+        // the request completes ensures a (wrong) proxied connection cannot
+        // slip past either check.
+        let url = base.build_url("chat/completions");
+        let body = base
+            .send_json(&url, serde_json::json!({}), &HashMap::new(), &[], None)
+            .await
+            .expect("direct request succeeds");
+        assert_eq!(
+            body, "ok",
+            "direct request must hit the target, not the proxy"
+        );
+
+        // The detector must never have been contacted.
+        assert_eq!(
+            detector_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "old wrapper must not read the system proxy env"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_routes_upstream_through_proxy() {
+        // The probe server doubles as the explicit proxy: it answers every
+        // request itself, so if the client correctly proxies through it, the
+        // real target is never contacted.
+        let (proxy_url, proxy_hits) = spawn_probe_server("ok").await;
+        let proxy_port: u16 = proxy_url
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("probe server url has a port");
+
+        // A real, reachable target that must NOT receive the request when
+        // the client honors the explicit proxy.
+        let (target_url, target_hits) = spawn_probe_server("ok").await;
+
+        let base = ProviderBase::new_with_proxy(
+            "test".into(),
+            &crate::test_support::test_config(&target_url, 30, None, None),
+            Some(&proxy_config("http", "127.0.0.1", proxy_port)),
+        )
+        .expect("explicit http proxy construction succeeds");
+
+        let url = base.build_url("chat/completions");
+        let body = base
+            .send_json(&url, serde_json::json!({}), &HashMap::new(), &[], None)
+            .await
+            .expect("request routed through the explicit proxy succeeds");
+
+        assert_eq!(body, "ok");
+        assert_eq!(
+            proxy_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the request must go through the explicit proxy"
+        );
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the real target must not be contacted when proxied"
+        );
     }
 }

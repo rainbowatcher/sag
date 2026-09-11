@@ -476,9 +476,25 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     /// Create a new Anthropic provider from configuration.
+    ///
+    /// Connects **directly**: the system proxy environment variables
+    /// (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) are explicitly ignored.
+    /// Use [`AnthropicProvider::new_with_proxy`] to route upstream traffic
+    /// through an explicit proxy.
     pub fn new(name: String, config: &sag_config::ProviderConfig) -> sag_core::Result<Self> {
+        Self::new_with_proxy(name, config, None)
+    }
+
+    /// Create a new Anthropic provider from configuration with an explicit
+    /// effective proxy. See [`ProviderBase::new_with_proxy`] for the proxy
+    /// semantics.
+    pub fn new_with_proxy(
+        name: String,
+        config: &sag_config::ProviderConfig,
+        proxy: Option<&sag_config::ProxyConfig>,
+    ) -> sag_core::Result<Self> {
         Ok(Self {
-            base: ProviderBase::new(name, config)?,
+            base: ProviderBase::new_with_proxy(name, config, proxy)?,
         })
     }
 
