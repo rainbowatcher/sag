@@ -71,6 +71,11 @@ pub struct UpdateProviderRequest {
     pub api_keys: Option<Vec<String>>,
     #[serde(default)]
     pub key_strategy: Option<KeyStrategy>,
+    /// Optional proxy-mode patch: omitted/`null` keeps the current value;
+    /// `Some(ProxyMode::Inherit)` explicitly resets to `inherit`. This
+    /// mirrors the other `Option<...>` patch fields.
+    #[serde(default)]
+    pub proxy_mode: Option<ProxyMode>,
     pub provider_type: Option<ProviderType>,
     pub base_url: Option<String>,
     pub models_endpoint: Option<String>,
@@ -99,6 +104,7 @@ pub struct ProviderInfo {
     pub provider_type: String,
     pub base_url: String,
     pub models_endpoint: String,
+    pub proxy_mode: ProxyMode,
     pub timeout_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_timeout_secs: Option<u64>,
@@ -154,6 +160,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         provider_type: cfg.provider_type.as_str().to_string(),
         base_url: cfg.base_url.clone(),
         models_endpoint: cfg.models_endpoint.clone(),
+        proxy_mode: cfg.proxy_mode,
         timeout_secs: cfg.timeout_secs,
         chunk_timeout_secs: cfg.chunk_timeout_secs,
         ttfb_timeout_secs: cfg.ttfb_timeout_secs,
@@ -240,7 +247,13 @@ pub async fn add_provider(
             })),
         )
             .into_response(),
-        Err(e) => e.into_response(),
+        Err(e) => match e {
+            // A config-invalid provider (e.g. `proxy_mode = "enabled"` with
+            // no global `proxy_url`) is a request-level error, not a server
+            // fault: report 400 rather than 500.
+            AppError::Config(msg) => AppError::BadRequest(msg).into_response(),
+            other => other.into_response(),
+        },
     }
 }
 
@@ -271,6 +284,9 @@ pub async fn update_provider(
         }
         if let Some(v) = req.key_strategy {
             pc.key_strategy = v;
+        }
+        if let Some(v) = req.proxy_mode {
+            pc.proxy_mode = v;
         }
         if let Some(v) = req.provider_type {
             pc.provider_type = v;
@@ -320,7 +336,13 @@ pub async fn update_provider(
         .await
     {
         Ok(_report) => (StatusCode::OK, Json(json!({ "name": req.name }))).into_response(),
-        Err(e) => e.into_response(),
+        Err(e) => match e {
+            // A config-invalid provider (e.g. `proxy_mode = "enabled"` with
+            // no global `proxy_url`) is a request-level error, not a server
+            // fault: report 400 rather than 500.
+            AppError::Config(msg) => AppError::BadRequest(msg).into_response(),
+            other => other.into_response(),
+        },
     }
 }
 
@@ -384,12 +406,12 @@ pub async fn delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{build_state, one_provider_config, test_app};
+    use crate::test_utils::{build_state, build_state_with_proxy, one_provider_config, test_app};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
-    use sag_config::{ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy};
+    use sag_config::{ProviderConfig, ProviderType, ProxyMode, RouteConfig, RouteTarget, Strategy};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1039,5 +1061,263 @@ targets = [
         let cfg2 = state.config.read().await;
         let p2 = cfg2.providers.get("new_provider").unwrap();
         assert!(p2.model_strip_fields.is_empty());
+    }
+
+    // ── proxy_mode support ────────────────────────────────────────────
+
+    #[test]
+    fn add_provider_request_defaults_proxy_mode_to_inherit() {
+        let req: AddProviderRequest =
+            serde_json::from_str(r#"{"name":"p","api_keys":["k"]}"#).unwrap();
+        assert_eq!(req.proxy_mode, ProxyMode::Inherit);
+
+        let req: AddProviderRequest =
+            serde_json::from_str(r#"{"name":"p","api_keys":["k"],"proxy_mode":"disabled"}"#)
+                .unwrap();
+        assert_eq!(req.proxy_mode, ProxyMode::Disabled);
+    }
+
+    #[test]
+    fn update_provider_request_proxy_mode_is_optional_patch() {
+        // Omitted -> keep current value (None patch).
+        let req: UpdateProviderRequest = serde_json::from_str(r#"{"name":"p"}"#).unwrap();
+        assert_eq!(req.proxy_mode, None);
+
+        // Explicit null -> also keep current value.
+        let req: UpdateProviderRequest =
+            serde_json::from_str(r#"{"name":"p","proxy_mode":null}"#).unwrap();
+        assert_eq!(req.proxy_mode, None);
+
+        // Explicit value -> patch (including resetting to inherit).
+        let req: UpdateProviderRequest =
+            serde_json::from_str(r#"{"name":"p","proxy_mode":"inherit"}"#).unwrap();
+        assert_eq!(req.proxy_mode, Some(ProxyMode::Inherit));
+    }
+
+    #[tokio::test]
+    async fn add_provider_defaults_proxy_mode_to_inherit() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let cfg = state.config.read().await;
+        assert_eq!(
+            cfg.providers.get("new_provider").unwrap().proxy_mode,
+            ProxyMode::Inherit
+        );
+    }
+
+    #[tokio::test]
+    async fn add_provider_with_explicit_proxy_mode_and_info_echo() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1","proxy_mode":"disabled"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let cfg = state.config.read().await;
+        assert_eq!(
+            cfg.providers.get("new_provider").unwrap().proxy_mode,
+            ProxyMode::Disabled
+        );
+        drop(cfg);
+
+        // GET /api/providers echoes proxy_mode for every provider.
+        let req_get = Request::builder()
+            .method("GET")
+            .uri("/api/providers")
+            .body(Body::empty())
+            .unwrap();
+        let response_get = app.oneshot(req_get).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response_get.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let providers = body["providers"].as_array().unwrap();
+        let new_provider = providers
+            .iter()
+            .find(|item| item["name"] == "new_provider")
+            .unwrap();
+        assert_eq!(new_provider["proxy_mode"], "disabled");
+        let openai = providers
+            .iter()
+            .find(|item| item["name"] == "openai")
+            .unwrap();
+        assert_eq!(openai["proxy_mode"], "inherit");
+    }
+
+    #[tokio::test]
+    async fn update_provider_proxy_mode_keeps_value_when_omitted() {
+        // Start with a Disabled-mode provider; a patch that does not mention
+        // proxy_mode must keep Disabled.
+        let (mut providers, routes) = one_provider_config("openai", vec![]);
+        providers.get_mut("openai").unwrap().proxy_mode = ProxyMode::Disabled;
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"openai","base_url":"https://custom.com/v1"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let p = cfg.providers.get("openai").unwrap();
+        assert_eq!(p.proxy_mode, ProxyMode::Disabled);
+        assert_eq!(p.base_url, "https://custom.com/v1");
+    }
+
+    #[tokio::test]
+    async fn update_provider_proxy_mode_reset_to_inherit() {
+        // Start with a Disabled-mode provider; an explicit
+        // `"proxy_mode":"inherit"` patch resets it to Inherit. A global
+        // proxy is configured so the later `enabled` switch is satisfiable.
+        let (mut providers, routes) = one_provider_config("openai", vec![]);
+        providers.get_mut("openai").unwrap().proxy_mode = ProxyMode::Disabled;
+        let state =
+            build_state_with_proxy(providers, routes, Some("http://proxy.example:8080".into()))
+                .await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"openai","proxy_mode":"inherit"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Drop the read guard before the next PUT (which needs a write lock).
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.providers["openai"].proxy_mode, ProxyMode::Inherit);
+        }
+
+        // And a follow-up patch switching to enabled round-trips too.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"openai","proxy_mode":"enabled"}"#))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.providers["openai"].proxy_mode, ProxyMode::Enabled);
+    }
+
+    // ── coordinator `AppError::Config` surfaces as 400 (not 500) ──────
+
+    #[tokio::test]
+    async fn add_provider_proxy_enabled_without_global_proxy_is_400() {
+        // `proxy_mode = "enabled"` with no global `proxy_url` is rejected by
+        // the coordinator with `AppError::Config`; the admin API must report
+        // it as 400 BAD_REQUEST rather than 500.
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1","proxy_mode":"enabled"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+
+        // The invalid provider must not be committed.
+        let cfg = state.config.read().await;
+        assert!(!cfg.providers.contains_key("new_provider"));
+        let reg = state.providers.read().await;
+        assert!(!reg.contains_key("new_provider"));
+    }
+
+    #[tokio::test]
+    async fn add_provider_proxy_enabled_with_global_proxy_succeeds() {
+        // Sanity: the same request succeeds when a global proxy exists —
+        // only genuine `AppError::Config` failures are remapped.
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state =
+            build_state_with_proxy(providers, routes, Some("http://proxy.example:8080".into()))
+                .await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1","proxy_mode":"enabled"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.providers["new_provider"].proxy_mode, ProxyMode::Enabled);
+    }
+
+    #[tokio::test]
+    async fn update_provider_proxy_enabled_without_global_proxy_is_400_and_config_unchanged() {
+        // Switching an existing provider to `proxy_mode = "enabled"` without
+        // a global `proxy_url` must fail with 400 and leave config intact.
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"openai","proxy_mode":"enabled"}"#))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+
+        // The failed mutation must not commit.
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.providers["openai"].proxy_mode, ProxyMode::Inherit);
     }
 }

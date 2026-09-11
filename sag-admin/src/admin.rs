@@ -7,6 +7,7 @@
 //! - [`admin_routes`] — `GET|POST|PUT|DELETE /api/routes`
 //! - [`admin_testing`] — `POST /api/providers/fetch-models` and
 //!   `POST /api/model/test`
+//! - [`admin_settings`] — `GET|PUT /api/settings`.
 //! - [`admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`
 //! - [`admin_active_targets`] — `GET|DELETE /api/active-targets`
@@ -23,6 +24,7 @@ use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
 };
 use crate::admin_routes::{create_route, delete_route, list_routes, update_route};
+use crate::admin_settings::{get_settings, update_settings};
 use crate::admin_testing::{fetch_models, model_test};
 use sag_state::AppState;
 
@@ -46,6 +48,7 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .put(update_route)
                 .delete(delete_route),
         )
+        .route("/settings", get(get_settings).put(update_settings))
         .route("/logs", get(list_logs))
         .route("/circuit-breaker", get(list_circuit_breakers))
         .route("/circuit-breaker/close", post(close_circuit_breaker))

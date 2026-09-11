@@ -7,12 +7,15 @@
 
 use std::collections::HashMap;
 
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use reqwest::header::CONTENT_TYPE;
-use sag_config::ProviderType;
+use sag_config::{ProviderType, ProxyMode};
+use sag_core::AppError;
 use sag_providers::{provider_auth_headers, provider_chat_endpoint};
 use serde_json::json;
 use tracing::{instrument, warn};
+
+use sag_state::AppState;
 
 #[derive(serde::Deserialize)]
 pub struct FetchModelsRequest {
@@ -26,6 +29,12 @@ pub struct FetchModelsRequest {
     /// When empty, falls back to `models` appended to `base_url`.
     #[serde(default)]
     pub models_endpoint: String,
+    /// Proxy policy for this temporary request only (default `inherit`):
+    /// resolved against the **current in-memory** gateway proxy and never
+    /// persisted. `enabled` without a global proxy is a 400; `disabled`
+    /// forces a direct connection ignoring the global/system proxy.
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
 }
 
 fn build_models_url(base_url: &str, models_endpoint: &str) -> String {
@@ -33,10 +42,39 @@ fn build_models_url(base_url: &str, models_endpoint: &str) -> String {
     format!("{}/{}", base_url.trim_end_matches('/'), endpoint)
 }
 
+/// Resolve the temporary test request's proxy policy against the **current
+/// in-memory** gateway config (never the file, never a saved provider's
+/// mode). Errors — a malformed in-memory global URL or `enabled` mode with
+/// no global proxy — are surfaced as 400-style [`AppError::BadRequest`]
+/// per the temporary-test API contract.
+async fn resolve_test_proxy(state: &AppState, mode: ProxyMode) -> Result<Option<String>, AppError> {
+    let global = state
+        .config
+        .read()
+        .await
+        .normalized_global_proxy()
+        .map_err(AppError::BadRequest)?;
+    let effective =
+        sag_config::resolve_effective_proxy(mode, global.as_ref()).map_err(AppError::BadRequest)?;
+    Ok(effective.map(|p| p.to_connect_url()))
+}
+
+/// Build the short-lived reqwest client for a temporary test request,
+/// honoring the resolved proxy policy: `None` → explicit direct connection
+/// (system proxy disabled), `Some(connect_url)` → that single explicit
+/// proxy. Never falls back to reqwest's default system-proxy discovery.
+fn build_test_client(connect_url: Option<&str>) -> Result<reqwest::Client, AppError> {
+    sag_core::build_http_client(connect_url, Some(std::time::Duration::from_secs(30)))
+        .map_err(|e| AppError::Internal(format!("failed to build http client: {e}")))
+}
+
 /// POST /api/model/test — test a specific model by sending a real chat completion.
 /// POST /api/providers/fetch-models — fetch upstream models using a temporary provider config.
-#[instrument(skip(req), fields(url))]
-pub async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoResponse {
+#[instrument(skip(state, req), fields(url))]
+pub async fn fetch_models(
+    State(state): State<AppState>,
+    Json(req): Json<FetchModelsRequest>,
+) -> impl IntoResponse {
     let Some(api_key) = req.api_keys.first() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -50,13 +88,20 @@ pub async fn fetch_models(Json(req): Json<FetchModelsRequest>) -> impl IntoRespo
     let models_url = build_models_url(&req.base_url, &req.models_endpoint);
     tracing::Span::current().record("url", &models_url);
 
-    let provider_type = req.provider_type.unwrap_or_default();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("valid reqwest client with timeout");
+    let connect_url = match resolve_test_proxy(&state, req.proxy_mode).await {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
+    let client = match build_test_client(connect_url.as_deref()) {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(?e, "failed to build temporary test http client");
+            return e.into_response();
+        }
+    };
     let http_req = client.get(&models_url);
 
+    let provider_type = req.provider_type.unwrap_or_default();
     let auth_headers = provider_auth_headers(provider_type, api_key);
     let extra_refs: Vec<(&str, &str)> =
         auth_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -126,13 +171,29 @@ pub struct ModelTestRequest {
     pub provider_type: Option<ProviderType>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Proxy policy for this temporary request only (default `inherit`):
+    /// resolved against the **current in-memory** gateway proxy and never
+    /// persisted. `enabled` without a global proxy is a 400; `disabled`
+    /// forces a direct connection ignoring the global/system proxy.
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
 }
 
-pub async fn model_test(Json(req): Json<ModelTestRequest>) -> impl IntoResponse {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap();
+pub async fn model_test(
+    State(state): State<AppState>,
+    Json(req): Json<ModelTestRequest>,
+) -> impl IntoResponse {
+    let connect_url = match resolve_test_proxy(&state, req.proxy_mode).await {
+        Ok(url) => url,
+        Err(e) => return e.into_response(),
+    };
+    let client = match build_test_client(connect_url.as_deref()) {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(?e, "failed to build temporary test http client");
+            return e.into_response();
+        }
+    };
 
     if req.api_keys.is_empty() {
         return Json(json!({ "results": [] })).into_response();
@@ -217,6 +278,13 @@ async fn test_single_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{build_state_with_proxy, test_app};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use std::collections::HashMap;
+    use tower::ServiceExt;
 
     #[test]
     fn build_models_url_normalizes_endpoint_path() {
@@ -231,6 +299,156 @@ mod tests {
         assert_eq!(
             build_models_url("https://example.com/v1", "v1/models/"),
             "https://example.com/v1/v1/models"
+        );
+    }
+
+    // ── proxy_mode support ────────────────────────────────────────────
+
+    #[test]
+    fn fetch_models_request_defaults_proxy_mode_to_inherit() {
+        let req: FetchModelsRequest =
+            serde_json::from_str(r#"{"base_url":"https://example.com/v1"}"#).unwrap();
+        assert_eq!(req.proxy_mode, ProxyMode::Inherit);
+
+        let req: FetchModelsRequest = serde_json::from_str(
+            r#"{"base_url":"https://example.com/v1","proxy_mode":"disabled"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.proxy_mode, ProxyMode::Disabled);
+    }
+
+    #[test]
+    fn model_test_request_defaults_proxy_mode_to_inherit() {
+        let req: ModelTestRequest =
+            serde_json::from_str(r#"{"model":"gpt-4o","base_url":"https://x.com"}"#).unwrap();
+        assert_eq!(req.proxy_mode, ProxyMode::Inherit);
+
+        let req: ModelTestRequest = serde_json::from_str(
+            r#"{"model":"gpt-4o","base_url":"https://x.com","proxy_mode":"enabled"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.proxy_mode, ProxyMode::Enabled);
+    }
+
+    async fn state_with_global_proxy(proxy: Option<&str>) -> sag_state::AppState {
+        build_state_with_proxy(HashMap::new(), vec![], proxy.map(str::to_string)).await
+    }
+
+    #[tokio::test]
+    async fn resolve_inherit_uses_in_memory_global_proxy() {
+        let state = state_with_global_proxy(Some("http://proxy.example:8080")).await;
+        assert_eq!(
+            resolve_test_proxy(&state, ProxyMode::Inherit)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("http://proxy.example:8080")
+        );
+
+        // No global proxy configured -> direct connection.
+        let state = state_with_global_proxy(None).await;
+        assert_eq!(
+            resolve_test_proxy(&state, ProxyMode::Inherit)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_disabled_is_direct_even_with_global_proxy() {
+        // `disabled` must resolve to a direct connection even when the
+        // in-memory gateway has a global proxy. Combined with
+        // `build_http_client(None)` (→ `.no_proxy()`), this is what ignores
+        // both the gateway proxy and the system proxy environment.
+        let state = state_with_global_proxy(Some("http://proxy.example:8080")).await;
+        assert_eq!(
+            resolve_test_proxy(&state, ProxyMode::Disabled)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_enabled_uses_global_proxy_or_errors() {
+        let state = state_with_global_proxy(Some("http://proxy.example:8080")).await;
+        assert_eq!(
+            resolve_test_proxy(&state, ProxyMode::Enabled)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("http://proxy.example:8080")
+        );
+
+        // `enabled` with no global proxy is a 400-style error.
+        let state = state_with_global_proxy(None).await;
+        let err = resolve_test_proxy(&state, ProxyMode::Enabled)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(err.to_string().contains("proxy_url"));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_enabled_without_global_proxy_is_400_before_network() {
+        // `proxy_mode: enabled` with no global proxy must fail with 400
+        // *before* any upstream request is attempted: the response is the
+        // proxy-resolution error, never a CONNECTION_ERROR from a send.
+        let state = state_with_global_proxy(None).await;
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers/fetch-models")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"base_url":"http://127.0.0.1:9/v1","api_keys":["sk-test"],"proxy_mode":"enabled"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("proxy_url"),
+            "failure must come from proxy resolution, not a network attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_enabled_without_global_proxy_is_400_before_network() {
+        let state = state_with_global_proxy(None).await;
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/model/test")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","base_url":"http://127.0.0.1:9/v1","api_keys":["sk-test"],"proxy_mode":"enabled"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("proxy_url")
         );
     }
 }

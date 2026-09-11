@@ -7,6 +7,7 @@
 //! - [`admin_providers`] — `GET|POST|PUT|DELETE /api/providers`.
 //! - [`admin_routes`] — `GET|POST|PUT|DELETE /api/routes`.
 //! - [`admin_logs`] — `GET /api/logs`.
+//! - [`admin_settings`] — `GET|PUT /api/settings`.
 //! - [`admin_testing`] — `POST /api/providers/fetch-models` and
 //!   `POST /api/model/test`.
 //! - [`admin_circuit_breaker`] — `GET /api/circuit-breaker` and
@@ -19,6 +20,7 @@ pub mod admin_circuit_breaker;
 pub mod admin_logs;
 pub mod admin_providers;
 pub mod admin_routes;
+pub mod admin_settings;
 pub mod admin_testing;
 
 pub use admin::build_admin_routes;
