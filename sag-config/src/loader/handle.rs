@@ -105,6 +105,7 @@ mod tests {
             shuffle_cache_ttl_secs: 7200,
             sticky_failover_reset_secs: 7200,
             circuit_breaker: CircuitBreakerConfig::default(),
+            proxy_url: None,
         };
         let h1 = ConfigHandle::from_config(config);
         let h2 = h1.clone();

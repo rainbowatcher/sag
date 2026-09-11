@@ -5,7 +5,8 @@ use std::path::Path;
 use tracing::info;
 
 use crate::config::{
-    GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
+    GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig, RouteTarget,
+    Strategy,
 };
 use crate::loader::json_util::{check_json_map, json_to_toml_value};
 use crate::toml_edit_util::{
@@ -142,6 +143,24 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
         write_route_fields,
     )?;
 
+    // ── top-level proxy_url — write or remove ──
+    // The admin save path owns the top-level `proxy_url` scalar (unlike
+    // `shuffle_cache_ttl_secs`, which is intentionally read-only).
+    // `Some` writes the URL trimmed of surrounding whitespace (so a
+    // `Some("  http://…  ")` value persists canonically); `None` — or a
+    // value that is empty/whitespace-only after trimming — removes the
+    // key so a cleared global proxy leaves no stale `proxy_url` behind
+    // (and never an empty string). Everything else in the document —
+    // comments, other top-level scalars and tables — is preserved.
+    match config.proxy_url.as_deref().map(str::trim) {
+        Some(url) if !url.is_empty() => {
+            doc["proxy_url"] = toml_edit::value(url);
+        }
+        _ => {
+            doc.as_table_mut().remove("proxy_url");
+        }
+    }
+
     // ── Write back (atomic: temp-file + rename) ──
     // Multi-line layout for inline-table-arrays (e.g. `targets`) is
     // handled natively by `toml_edit` 0.24.1 via per-item
@@ -266,6 +285,15 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
         });
     } else {
         table.remove("key_strategy");
+    }
+    // proxy_mode — skip if default (mirrors `skip_serializing_if =
+    // "is_default_proxy_mode"`). `inherit` is the load-time default, so
+    // omitting the key on disk is both lossless and keeps user-authored
+    // provider blocks minimal.
+    if provider.proxy_mode != ProxyMode::default() {
+        table["proxy_mode"] = toml_edit::value(provider.proxy_mode.as_str());
+    } else {
+        table.remove("proxy_mode");
     }
     table["enabled"] = toml_edit::value(provider.enabled);
     // headers — inline table; remove the key entirely if empty.
@@ -545,6 +573,7 @@ mod tests {
             provider_type: ProviderType::OpenAI,
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
+            proxy_mode: ProxyMode::Inherit,
             base_url: "https://api.openai.com/v1".into(),
             models_endpoint: "models".into(),
             timeout_secs: 120,
@@ -682,6 +711,7 @@ base_url = "https://api.anthropic.com"
                     provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
+                    proxy_mode: ProxyMode::Inherit,
                     base_url: "https://api.openai.com/v1".into(),
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
@@ -830,6 +860,7 @@ key_strategy = "round_robin"
                     provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
+                    proxy_mode: ProxyMode::Inherit,
                     base_url: "https://api.openai.com/v1".into(),
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
@@ -969,6 +1000,7 @@ targets = [
                     provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
+                    proxy_mode: ProxyMode::Inherit,
                     base_url: "https://api.openai.com/v1".into(),
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
@@ -1035,6 +1067,7 @@ targets = [
                     provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
+                    proxy_mode: ProxyMode::Inherit,
                     base_url: "https://api.openai.com/v1".into(),
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
@@ -1095,6 +1128,7 @@ targets = [
                     provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
                     key_strategy: KeyStrategy::FillFirst,
+                    proxy_mode: ProxyMode::Inherit,
                     base_url: "https://api.openai.com/v1".into(),
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
@@ -2491,6 +2525,7 @@ api_keys = ["sk-test"]
                 provider_type: ProviderType::Anthropic,
                 api_keys: vec!["sk-a".into(), "sk-b".into()],
                 key_strategy: KeyStrategy::RoundRobin,
+                proxy_mode: ProxyMode::Disabled,
                 base_url: "https://custom.example.com/v1".into(),
                 models_endpoint: "v1/list".into(),
                 timeout_secs: 300,
@@ -2517,6 +2552,7 @@ api_keys = ["sk-test"]
         assert_eq!(p.provider_type, ProviderType::Anthropic);
         assert_eq!(p.api_keys, vec!["sk-a", "sk-b"]);
         assert_eq!(p.key_strategy, KeyStrategy::RoundRobin);
+        assert_eq!(p.proxy_mode, ProxyMode::Disabled);
         assert_eq!(p.base_url, "https://custom.example.com/v1");
         assert_eq!(p.models_endpoint, "v1/list");
         assert_eq!(p.timeout_secs, 300);
@@ -2723,6 +2759,222 @@ api_keys = ["sk-test"]
             !saved_raw.contains("model_strip_fields"),
             "empty model_strip_fields section should be removed from saved file, got:\n{saved_raw}"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── proxy_url / proxy_mode round-trip tests ──
+
+    #[test]
+    fn save_round_trips_proxy_url() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+        assert_eq!(config.proxy_url, None);
+
+        // Write a global proxy.
+        config.proxy_url = Some("http://proxy.example.com:8080".into());
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("proxy_url = \"http://proxy.example.com:8080\""),
+            "proxy_url should be written, got:\n{saved}"
+        );
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.proxy_url.as_deref(),
+            Some("http://proxy.example.com:8080"),
+            "proxy_url should survive round-trip"
+        );
+        drop(reloaded);
+        drop(reloaded_handle);
+
+        // Clearing the global proxy removes the key from disk.
+        let mut config2 = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        config2.proxy_url = None;
+        save_config_to_file(&config2, &path).unwrap();
+
+        let saved2 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved2.contains("proxy_url"),
+            "cleared proxy_url should be removed from disk, got:\n{saved2}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_removes_blank_proxy_url_and_trims_padded_url() {
+        // `Some("")` / `Some("   ")` must delete the key (never write an
+        // empty string), so a subsequent reload sees `None`. A
+        // whitespace-padded URL must be persisted trimmed.
+        let content = r#"
+proxy_url = "http://proxy.example.com:8080"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+
+        let mut config = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        config.proxy_url = Some("   ".into());
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("proxy_url"),
+            "blank proxy_url should remove the key from disk, got:\n{saved}"
+        );
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.proxy_url, None,
+            "reload after clearing a blank proxy_url must be None"
+        );
+        drop(reloaded);
+        drop(reloaded_handle);
+
+        // Whitespace-padded URL → written trimmed.
+        let mut config2 = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        config2.proxy_url = Some("  http://proxy2.example.com:9090  ".into());
+        save_config_to_file(&config2, &path).unwrap();
+
+        let saved2 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved2.contains("proxy_url = \"http://proxy2.example.com:9090\""),
+            "padded proxy_url should be written trimmed, got:\n{saved2}"
+        );
+        let reloaded2_handle = load_config(&path).unwrap();
+        let reloaded2 = reloaded2_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded2.proxy_url.as_deref(),
+            Some("http://proxy2.example.com:9090"),
+            "trimmed proxy_url should survive round-trip"
+        );
+        drop(reloaded2);
+        drop(reloaded2_handle);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_proxy_mode() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+        assert_eq!(config.providers["openai"].proxy_mode, ProxyMode::Inherit);
+
+        // Write a non-default mode (`disabled` needs no global proxy, so the
+        // reload's validate() still passes).
+        config.providers.get_mut("openai").unwrap().proxy_mode = ProxyMode::Disabled;
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("proxy_mode = \"disabled\""),
+            "non-default proxy_mode should be written, got:\n{saved}"
+        );
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.providers["openai"].proxy_mode,
+            ProxyMode::Disabled,
+            "proxy_mode should survive round-trip"
+        );
+        drop(reloaded);
+        drop(reloaded_handle);
+
+        // Back to the default `inherit`: the key must be removed from disk.
+        let mut config2 = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        config2.providers.get_mut("openai").unwrap().proxy_mode = ProxyMode::Inherit;
+        save_config_to_file(&config2, &path).unwrap();
+
+        let saved2 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved2.contains("proxy_mode"),
+            "default inherit proxy_mode should be removed from disk, got:\n{saved2}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_proxy_url_and_proxy_mode_together() {
+        // End-to-end: global proxy + provider forced through that proxy.
+        let content = r#"
+proxy_url = "http://proxy.example.com:8080"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+proxy_mode = "enabled"
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+        assert_eq!(
+            config.proxy_url.as_deref(),
+            Some("http://proxy.example.com:8080")
+        );
+        assert_eq!(config.providers["openai"].proxy_mode, ProxyMode::Enabled);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.proxy_url.as_deref(),
+            Some("http://proxy.example.com:8080")
+        );
+        assert_eq!(reloaded.providers["openai"].proxy_mode, ProxyMode::Enabled);
 
         let _ = std::fs::remove_file(&path);
     }

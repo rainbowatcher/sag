@@ -884,7 +884,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig};
+    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, ProxyMode};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1001,6 +1001,7 @@ mod tests {
             api_keys: vec!["sk-test".into()],
             key_strategy: sag_config::KeyStrategy::FillFirst,
             base_url: "https://api.openai.com/v1".into(),
+            proxy_mode: ProxyMode::default(),
             models_endpoint: "models".into(),
             timeout_secs: 120,
             chunk_timeout_secs: None,

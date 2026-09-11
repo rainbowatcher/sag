@@ -553,8 +553,8 @@ mod tests {
     // ── stale_probe_threshold_from_config tests ────────────────────
 
     use sag_config::{
-        BackoffConfig, GatewayConfig, ProviderConfig, ProviderType, RouteConfig, RouteTarget,
-        Strategy,
+        BackoffConfig, GatewayConfig, ProviderConfig, ProviderType, ProxyMode, RouteConfig,
+        RouteTarget, Strategy,
     };
 
     /// Minimal provider config with a custom `timeout_secs` and optional ttfb.
@@ -564,6 +564,7 @@ mod tests {
             api_keys: vec!["sk-test".into()],
             key_strategy: sag_config::KeyStrategy::FillFirst,
             base_url: "https://api.openai.com/v1".into(),
+            proxy_mode: ProxyMode::default(),
             models_endpoint: "models".into(),
             timeout_secs,
             headers: HashMap::new(),

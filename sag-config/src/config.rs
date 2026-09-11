@@ -39,6 +39,7 @@ macro_rules! gateway_config_base {
             shuffle_cache_ttl_secs: 7200,
             sticky_failover_reset_secs: 7200,
             circuit_breaker: $crate::CircuitBreakerConfig::default(),
+            proxy_url: ::std::option::Option::None,
         }
     };
 }
@@ -73,6 +74,16 @@ pub struct GatewayConfig {
     /// The `RUST_LOG` environment variable, if set, takes precedence.
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Optional global HTTP/HTTPS proxy URL, used as the default upstream
+    /// proxy for all providers unless a provider opts out via
+    /// `proxy_mode`. `None` (or an empty/whitespace-only value) means no
+    /// explicit proxy is configured. SAG **never** reads system proxy
+    /// environment variables (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`),
+    /// so a missing `proxy_url` always means direct connections unless a
+    /// provider sets `proxy_mode = "enabled"`. Only `http://` and
+    /// `https://` URLs are supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 /// Result of removing a provider from the configuration, describing which
@@ -138,6 +149,19 @@ impl GatewayConfig {
         resolve_model_route(&self.routes, model)
     }
 
+    /// Normalize the gateway-level `proxy_url` into a [`ProxyConfig`].
+    ///
+    /// Returns `Ok(None)` for `None`, empty, or whitespace-only values
+    /// ("no global proxy configured"), and `Err(String)` for malformed
+    /// URLs — the same condition [`GatewayConfig::validate`] reports as a
+    /// `proxy_url` error. Downstream consumers should use this rather than
+    /// re-parsing the raw string, so every caller agrees on what counts as
+    /// "a usable global proxy" (including that a blank or invalid value
+    /// does **not** count).
+    pub fn normalized_global_proxy(&self) -> Result<Option<ProxyConfig>, String> {
+        normalize_proxy_url(self.proxy_url.as_deref())
+    }
+
     /// Validate the configuration, returning all semantic errors found.
     /// Returns `Ok(())` if no errors, `Err(Vec<String>)` with all error messages.
     pub fn validate(&self) -> std::result::Result<(), Vec<String>> {
@@ -176,6 +200,22 @@ impl GatewayConfig {
                 "gateway_auth.api_keys must not be empty when authentication is configured".into(),
             );
         }
+
+        // ── Proxy validation ──
+        // A malformed top-level `proxy_url` is a configuration error; a
+        // whitespace-only value normalizes to `None` and is fine. The
+        // normalized global proxy is also the single source of truth for
+        // whether a usable global proxy exists: `Some("")`,
+        // `Some("   ")` and invalid URLs all resolve to `None` here, so
+        // an `enabled` provider is correctly rejected for all of them —
+        // not just for a literal `None`.
+        let normalized_global_proxy = match self.normalized_global_proxy() {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                errors.push(format!("proxy_url: {e}"));
+                None
+            }
+        };
 
         // ── Providers validation ──
         let provider_names: HashSet<&str> = self.providers.keys().map(String::as_str).collect();
@@ -219,6 +259,16 @@ impl GatewayConfig {
         for (name, provider) in &self.providers {
             if provider.api_keys.is_empty() {
                 errors.push(format!("provider '{name}': api_keys must not be empty"));
+            }
+            // `proxy_mode = "enabled"` forces the top-level `proxy_url`;
+            // without one it cannot be satisfied and is a config error.
+            // The check runs against the *normalized* global proxy so a
+            // blank or invalid `proxy_url` is treated as "no proxy
+            // available" rather than silently satisfying the mode.
+            if provider.proxy_mode == ProxyMode::Enabled && normalized_global_proxy.is_none() {
+                errors.push(format!(
+                    "provider '{name}': proxy_mode='enabled' requires a top-level proxy_url to be configured"
+                ));
             }
             match url::Url::parse(&provider.base_url) {
                 Ok(url) => {
@@ -535,6 +585,157 @@ pub enum KeyStrategy {
     RoundRobin,
 }
 
+/// How a provider resolves the upstream HTTP proxy.
+///
+/// Serde values are `inherit` / `enabled` / `disabled`. Unknown values
+/// follow the same strict pattern as the other config enums
+/// ([`Strategy`], [`KeyStrategy`], [`ProviderType`]) — they fail config
+/// parsing rather than silently guessing, and there is no lenient
+/// fallback for unknown enum values anywhere in the loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    /// Inherit the gateway-level `proxy_url` (default). When no global
+    /// proxy is configured this means a direct connection.
+    #[default]
+    Inherit,
+    /// Force using the gateway-level `proxy_url`; a configuration error
+    /// when no top-level `proxy_url` is set.
+    Enabled,
+    /// Force a direct connection, ignoring any gateway-level proxy.
+    Disabled,
+}
+
+impl ProxyMode {
+    /// Stable snake_case identifier matching the serde representation
+    /// (`rename_all = "snake_case"`), used by the save path to write the
+    /// value to TOML without a serde round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProxyMode::Inherit => "inherit",
+            ProxyMode::Enabled => "enabled",
+            ProxyMode::Disabled => "disabled",
+        }
+    }
+}
+
+/// A normalized HTTP/HTTPS proxy endpoint.
+///
+/// Stores only the connection metadata (scheme, host, port). The original
+/// URL string — and any userinfo credentials embedded in it — is
+/// deliberately **not** retained, so logging or `Debug`-printing a
+/// [`ProxyConfig`] can never leak proxy credentials. Transport-layer code
+/// reconstructs a connect URL from these fields via
+/// [`ProxyConfig::to_connect_url`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProxyConfig {
+    /// `"http"` or `"https"`.
+    pub scheme: String,
+    /// Host, IPv6 literals stored without brackets (as `url` reports them).
+    pub host: String,
+    /// Explicit port, or `None` when omitted / the scheme default applies.
+    pub port: Option<u16>,
+}
+
+impl ProxyConfig {
+    /// Reconstruct a connect URL from the stored scheme/host/port (e.g. for
+    /// building a transport-layer proxy). IPv6 hosts are re-bracketed.
+    /// No userinfo is ever present in the returned URL — credentials are
+    /// not stored by [`ProxyConfig`].
+    pub fn to_connect_url(&self) -> String {
+        // Defensive: strip any brackets a caller may have embedded in an
+        // IPv6 host before re-bracketing, so directly-constructed
+        // `ProxyConfig`s never produce `[[::1]]`.
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        match self.port {
+            Some(port) => format!("{}://{}:{}", self.scheme, host, port),
+            None => format!("{}://{}", self.scheme, host),
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_connect_url())
+    }
+}
+
+/// Normalize and validate a raw proxy URL (the top-level `proxy_url` value).
+///
+/// - `None` → `Ok(None)` (no proxy configured).
+/// - A value that is empty / whitespace-only after trimming → `Ok(None)`
+///   (treated as "not configured").
+/// - Must parse as a URL with the `http` or `https` scheme and a non-empty
+///   host. Non-standard ports and IPv6 literals are allowed.
+/// - URLs containing userinfo (`user:pass@`) are **rejected**: SAG never
+///   records or forwards proxy credentials, so such a URL could never be
+///   used and would only risk leaking credentials if echoed into logs.
+///
+/// Returns `Err(String)` with a human-readable reason for invalid input.
+/// The returned [`ProxyConfig`] stores only scheme/host/port — no raw URL
+/// text, no credentials — so downstream logging cannot leak them.
+pub fn normalize_proxy_url(raw: Option<&str>) -> Result<Option<ProxyConfig>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let url = url::Url::parse(trimmed).map_err(|e| format!("invalid proxy URL: {e}"))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "unsupported scheme '{scheme}': only 'http' and 'https' proxy URLs are supported"
+        ));
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => return Err("proxy URL must have a host".into()),
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("proxy URL must not contain userinfo (username/password)".into());
+    }
+
+    Ok(Some(ProxyConfig {
+        scheme: scheme.to_string(),
+        host,
+        port: url.port(),
+    }))
+}
+
+/// Resolve the effective proxy for a provider from its [`ProxyMode`] and
+/// the gateway-level proxy.
+///
+/// - [`ProxyMode::Inherit`] → the gateway-level proxy if any, otherwise
+///   `None` (direct connection).
+/// - [`ProxyMode::Enabled`] → the gateway-level proxy; `Err` when none is
+///   configured (the same condition [`GatewayConfig::validate`] rejects).
+/// - [`ProxyMode::Disabled`] → always `None` (forced direct connection).
+///
+/// This is the pure resolution step — it does not construct any
+/// transport-layer (reqwest) type.
+pub fn resolve_effective_proxy(
+    mode: ProxyMode,
+    global_proxy: Option<&ProxyConfig>,
+) -> Result<Option<ProxyConfig>, String> {
+    match mode {
+        ProxyMode::Inherit => Ok(global_proxy.cloned()),
+        ProxyMode::Enabled => global_proxy.cloned().map(Some).ok_or_else(|| {
+            "proxy_mode='enabled' requires a top-level proxy_url to be configured".into()
+        }),
+        ProxyMode::Disabled => Ok(None),
+    }
+}
+
 /// Upstream LLM provider configuration.
 ///
 /// Provider-level priority is not part of routing selection. Target ordering is
@@ -553,6 +754,16 @@ pub struct ProviderConfig {
     /// Base URL for the provider's API.
     #[serde(default = "default_base_url")]
     pub base_url: String,
+    /// How this provider resolves the upstream HTTP proxy.
+    ///
+    /// - `inherit` (default): use the gateway-level `proxy_url` if one is
+    ///   configured, otherwise connect directly.
+    /// - `enabled`: force using the gateway-level `proxy_url`; a
+    ///   configuration error if no top-level `proxy_url` is set.
+    /// - `disabled`: force a direct connection, ignoring any gateway-level
+    ///   proxy.
+    #[serde(default, skip_serializing_if = "is_default_proxy_mode")]
+    pub proxy_mode: ProxyMode,
     /// Upstream endpoint path used by admin APIs to fetch available models.
     /// Defaults to `models`, appended to `base_url`.
     ///
@@ -661,6 +872,31 @@ pub struct ProviderConfig {
     /// with stable prefixes.
     #[serde(default = "default_true")]
     pub anthropic_cache_control: bool,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider_type: ProviderType::default(),
+            api_keys: Vec::new(),
+            key_strategy: KeyStrategy::default(),
+            base_url: default_base_url(),
+            proxy_mode: ProxyMode::default(),
+            models_endpoint: default_models_endpoint(),
+            timeout_secs: default_timeout_secs(),
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            strip_fields: Vec::new(),
+            model_strip_fields: HashMap::new(),
+            model_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
+            enabled: default_true(),
+            enabled_models: Vec::new(),
+            anthropic_cache_control: default_true(),
+        }
+    }
 }
 
 pub fn default_base_url() -> String {
@@ -818,6 +1054,9 @@ fn is_default_provider_type(v: &ProviderType) -> bool {
 }
 fn is_default_key_strategy(v: &KeyStrategy) -> bool {
     *v == KeyStrategy::default()
+}
+fn is_default_proxy_mode(v: &ProxyMode) -> bool {
+    *v == ProxyMode::default()
 }
 fn is_default_strategy(v: &Strategy) -> bool {
     *v == Strategy::default()
@@ -1400,6 +1639,303 @@ enabled = false
         assert!(!config.enabled);
     }
 
+    mod proxy_tests {
+        use super::*;
+
+        // ── default compatibility with legacy configs ──
+
+        #[test]
+        fn parse_legacy_config_without_proxy_fields() {
+            // Old configs (no `proxy_url` / no `proxy_mode`) must keep
+            // working: `proxy_url` defaults to `None`, provider
+            // `proxy_mode` defaults to `Inherit`.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert_eq!(config.proxy_url, None);
+            assert_eq!(
+                config.providers.get("openai").unwrap().proxy_mode,
+                ProxyMode::Inherit
+            );
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn parse_proxy_url_and_proxy_mode() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+proxy_url = "http://proxy.example.com:8080"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+proxy_mode = "disabled"
+"#,
+            )
+            .unwrap();
+            assert_eq!(
+                config.proxy_url.as_deref(),
+                Some("http://proxy.example.com:8080")
+            );
+            assert_eq!(
+                config.providers.get("openai").unwrap().proxy_mode,
+                ProxyMode::Disabled
+            );
+            assert!(config.validate().is_ok());
+        }
+
+        // ── ProxyMode serde ──
+
+        #[test]
+        fn proxy_mode_serde_roundtrip() {
+            for (mode, name) in [
+                (ProxyMode::Inherit, "inherit"),
+                (ProxyMode::Enabled, "enabled"),
+                (ProxyMode::Disabled, "disabled"),
+            ] {
+                assert_eq!(mode.as_str(), name);
+                let reparsed: ProviderConfig = toml::from_str(&format!(
+                    "api_keys = [\"sk-test\"]\nproxy_mode = \"{name}\""
+                ))
+                .unwrap();
+                assert_eq!(reparsed.proxy_mode, mode);
+            }
+        }
+
+        #[test]
+        fn proxy_mode_defaults_to_inherit() {
+            let config: ProviderConfig = toml::from_str(r#"api_keys = ["sk-test"]"#).unwrap();
+            assert_eq!(config.proxy_mode, ProxyMode::Inherit);
+        }
+
+        #[test]
+        fn proxy_mode_unknown_value_fails_parse() {
+            // There is no lenient fallback for unknown enum values anywhere
+            // in the loader (same as `strategy` / `key_strategy` /
+            // `provider_type`): an unknown `proxy_mode` value is a hard
+            // parse error, never silently coerced to `Inherit`. This is the
+            // established strict-value-validation pattern the loader relies
+            // on; a forward-compatible *field* is tolerated via
+            // `serde_ignored` (unknown keys warn), but an unknown *value*
+            // for a known enum field is rejected.
+            let result: Result<ProviderConfig, _> = toml::from_str(
+                r#"
+api_keys = ["sk-test"]
+proxy_mode = "auto"
+"#,
+            );
+            assert!(
+                result.is_err(),
+                "unknown proxy_mode value must fail parsing, got: {result:?}"
+            );
+        }
+
+        // ── normalize_proxy_url ──
+
+        #[test]
+        fn normalize_proxy_url_none_and_blank_are_unset() {
+            assert_eq!(normalize_proxy_url(None), Ok(None));
+            assert_eq!(normalize_proxy_url(Some("")), Ok(None));
+            assert_eq!(normalize_proxy_url(Some("   ")), Ok(None));
+            assert_eq!(normalize_proxy_url(Some("\t\n")), Ok(None));
+        }
+
+        #[test]
+        fn normalize_proxy_url_accepts_http_and_https() {
+            let http = normalize_proxy_url(Some("http://proxy.example.com:8080"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(http.scheme, "http");
+            assert_eq!(http.host, "proxy.example.com");
+            assert_eq!(http.port, Some(8080));
+            assert_eq!(http.to_connect_url(), "http://proxy.example.com:8080");
+
+            let https = normalize_proxy_url(Some("https://proxy.example.com"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(https.scheme, "https");
+            assert_eq!(https.host, "proxy.example.com");
+            assert_eq!(https.port, None);
+            assert_eq!(https.to_connect_url(), "https://proxy.example.com");
+        }
+
+        #[test]
+        fn normalize_proxy_url_allows_nonstandard_port_and_ipv6() {
+            let v6 = normalize_proxy_url(Some("http://[::1]:3128"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(v6.host, "::1");
+            assert_eq!(v6.port, Some(3128));
+            // to_connect_url re-brackets IPv6 hosts so the transport layer
+            // gets a usable URL.
+            assert_eq!(v6.to_connect_url(), "http://[::1]:3128");
+
+            let v4 = normalize_proxy_url(Some("http://192.168.1.10:8080"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(v4.host, "192.168.1.10");
+            assert_eq!(v4.port, Some(8080));
+        }
+
+        #[test]
+        fn to_connect_url_avoids_double_bracketing_ipv6() {
+            // Directly-constructed `ProxyConfig`s may already carry an
+            // IPv6 host with brackets; `to_connect_url` must not double
+            // them (`[[::1]]`).
+            let bracketed = ProxyConfig {
+                scheme: "http".into(),
+                host: "[::1]".into(),
+                port: Some(3128),
+            };
+            assert_eq!(bracketed.to_connect_url(), "http://[::1]:3128");
+
+            let plain = ProxyConfig {
+                scheme: "http".into(),
+                host: "::1".into(),
+                port: None,
+            };
+            assert_eq!(plain.to_connect_url(), "http://[::1]");
+        }
+
+        #[test]
+        fn normalize_proxy_url_rejects_invalid_scheme() {
+            let err = normalize_proxy_url(Some("ftp://proxy.example.com:8080")).unwrap_err();
+            assert!(err.contains("scheme"), "got: {err}");
+            let err = normalize_proxy_url(Some("socks5://proxy.example.com:1080")).unwrap_err();
+            assert!(err.contains("scheme"), "got: {err}");
+        }
+
+        #[test]
+        fn normalize_proxy_url_rejects_missing_host() {
+            // `url` rejects empty hosts for http(s) at parse time (e.g.
+            // "empty host" / "invalid IPv6 address" errors).
+            let err = normalize_proxy_url(Some("http://")).unwrap_err();
+            assert!(err.contains("host"), "got: {err}");
+            let err = normalize_proxy_url(Some("http://:8080")).unwrap_err();
+            assert!(err.contains("host"), "got: {err}");
+        }
+
+        #[test]
+        fn normalize_proxy_url_rejects_userinfo() {
+            let err =
+                normalize_proxy_url(Some("http://user:pass@proxy.example.com:8080")).unwrap_err();
+            assert!(err.contains("userinfo"), "got: {err}");
+        }
+
+        #[test]
+        fn normalize_proxy_url_trims_surrounding_whitespace() {
+            let p = normalize_proxy_url(Some("  https://proxy.example.com  "))
+                .unwrap()
+                .unwrap();
+            assert_eq!(p.host, "proxy.example.com");
+        }
+
+        // ── resolve_effective_proxy ──
+
+        fn global(url: &str) -> Option<ProxyConfig> {
+            normalize_proxy_url(Some(url)).unwrap()
+        }
+
+        #[test]
+        fn effective_proxy_inherit_uses_global_when_present() {
+            let g = global("http://proxy.example.com:8080");
+            assert_eq!(
+                resolve_effective_proxy(ProxyMode::Inherit, g.as_ref()),
+                Ok(g.clone())
+            );
+        }
+
+        #[test]
+        fn effective_proxy_inherit_without_global_is_direct() {
+            assert_eq!(resolve_effective_proxy(ProxyMode::Inherit, None), Ok(None));
+        }
+
+        #[test]
+        fn effective_proxy_enabled_requires_global() {
+            let g = global("http://proxy.example.com:8080");
+            assert_eq!(
+                resolve_effective_proxy(ProxyMode::Enabled, g.as_ref()),
+                Ok(g.clone())
+            );
+            let err = resolve_effective_proxy(ProxyMode::Enabled, None).unwrap_err();
+            assert!(err.contains("proxy_url"), "got: {err}");
+        }
+
+        #[test]
+        fn effective_proxy_disabled_always_direct() {
+            let g = global("http://proxy.example.com:8080");
+            assert_eq!(
+                resolve_effective_proxy(ProxyMode::Disabled, g.as_ref()),
+                Ok(None)
+            );
+            assert_eq!(resolve_effective_proxy(ProxyMode::Disabled, None), Ok(None));
+        }
+
+        #[test]
+        fn provider_config_default_uses_field_defaults() {
+            // `Default` must agree with the serde load-time defaults so a
+            // `ProviderConfig::default()` is exactly what a minimal TOML
+            // block deserializes to.
+            let p = ProviderConfig::default();
+            assert_eq!(p.provider_type, ProviderType::default());
+            assert!(p.api_keys.is_empty());
+            assert_eq!(p.key_strategy, KeyStrategy::default());
+            assert_eq!(p.base_url, default_base_url());
+            assert_eq!(p.proxy_mode, ProxyMode::default());
+            assert_eq!(p.models_endpoint, default_models_endpoint());
+            assert_eq!(p.timeout_secs, default_timeout_secs());
+            assert!(p.chunk_timeout_secs.is_none());
+            assert!(p.ttfb_timeout_secs.is_none());
+            assert!(p.headers.is_empty());
+            assert!(p.body_overrides.is_empty());
+            assert!(p.strip_fields.is_empty());
+            assert!(p.model_strip_fields.is_empty());
+            assert!(p.model_overrides.is_empty());
+            assert!(p.role_mappings.is_empty());
+            assert!(p.enabled);
+            assert!(p.enabled_models.is_empty());
+            assert!(p.anthropic_cache_control);
+        }
+
+        #[test]
+        fn normalized_global_proxy_matches_validate_semantics() {
+            let mut config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+"#,
+            )
+            .unwrap();
+            assert_eq!(config.normalized_global_proxy().unwrap(), None);
+
+            config.proxy_url = Some("   ".into());
+            assert_eq!(config.normalized_global_proxy().unwrap(), None);
+
+            config.proxy_url = Some("http://proxy.example.com:8080".into());
+            let g = config.normalized_global_proxy().unwrap().unwrap();
+            assert_eq!(g.host, "proxy.example.com");
+            assert_eq!(g.port, Some(8080));
+
+            config.proxy_url = Some("ftp://proxy.example.com".into());
+            assert!(config.normalized_global_proxy().is_err());
+        }
+    }
+
     mod validate_tests {
         use super::*;
 
@@ -1427,6 +1963,119 @@ targets = [
         fn valid_config_passes() {
             let config = valid_config();
             assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_proxy_mode_enabled_without_global_proxy_url() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+proxy_mode = "enabled"
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("proxy_mode='enabled'") && e.contains("proxy_url")),
+                "expected enabled-without-global-proxy error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_proxy_mode_enabled_with_global_proxy_url() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+proxy_url = "http://proxy.example.com:8080"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+proxy_mode = "enabled"
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_invalid_top_level_proxy_url() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+proxy_url = "ftp://proxy.example.com"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("proxy_url") && e.contains("scheme")),
+                "expected proxy_url scheme error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn blank_proxy_url_normalizes_to_none_and_passes() {
+            // A whitespace-only `proxy_url` must be treated as "not
+            // configured" rather than a validation error.
+            let mut config = valid_config();
+            config.proxy_url = Some("   ".into());
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_proxy_mode_enabled_with_blank_proxy_url() {
+            // `Some("")` / `Some("   ")` normalize to "no global proxy",
+            // so `enabled` must be rejected just like a literal `None`.
+            for blank in ["", "   ", "\t\n"] {
+                let mut config = valid_config();
+                config.providers.get_mut("openai").unwrap().proxy_mode = ProxyMode::Enabled;
+                config.proxy_url = Some(blank.into());
+                let err = config.validate().unwrap_err();
+                assert!(
+                    err.iter()
+                        .any(|e| e.contains("proxy_mode='enabled'") && e.contains("proxy_url")),
+                    "blank proxy_url {blank:?} + enabled must be rejected, got {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_proxy_mode_enabled_with_invalid_proxy_url() {
+            // An invalid `proxy_url` must (a) still be reported as a
+            // `proxy_url` error and (b) not count as an available global
+            // proxy for `enabled` providers.
+            let mut config = valid_config();
+            config.providers.get_mut("openai").unwrap().proxy_mode = ProxyMode::Enabled;
+            config.proxy_url = Some("ftp://proxy.example.com".into());
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("proxy_url") && e.contains("scheme")),
+                "expected proxy_url scheme error, got {err:?}"
+            );
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("proxy_mode='enabled'") && e.contains("proxy_url")),
+                "enabled provider must not see the invalid URL as a usable proxy, got {err:?}"
+            );
         }
 
         #[test]
@@ -1910,6 +2559,7 @@ targets = [
                     api_keys: vec![format!("sk-{name}")],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://example.com".into(),
+                    proxy_mode: ProxyMode::Inherit,
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
                     chunk_timeout_secs: None,

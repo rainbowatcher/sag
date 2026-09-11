@@ -316,7 +316,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use sag_config::{
-        KeyStrategy, ProviderConfig, ProviderType, RouteConfig, RouteTarget, Strategy,
+        KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig, RouteTarget, Strategy,
     };
     use std::collections::HashMap;
     use tower::ServiceExt;
@@ -388,6 +388,7 @@ mod tests {
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -441,6 +442,7 @@ mod tests {
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -486,6 +488,7 @@ mod tests {
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -528,6 +531,7 @@ mod tests {
                 api_keys: vec!["sk-test".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),

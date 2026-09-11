@@ -48,6 +48,7 @@ fn base_provider() -> ProviderConfig {
         api_keys: vec!["sk-test".into()],
         key_strategy: KeyStrategy::FillFirst,
         base_url: "https://api.openai.com/v1".into(),
+        proxy_mode: sag_config::ProxyMode::default(),
         models_endpoint: "models".into(),
         timeout_secs: 600,
         chunk_timeout_secs: None,

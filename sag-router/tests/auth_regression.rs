@@ -19,7 +19,7 @@ use axum::{
 };
 use sag_config::{
     ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
-    RouteConfig, RouteTarget, Strategy,
+    ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::AppState;
 use sag_router::admin::build_admin_routes;
@@ -36,6 +36,7 @@ async fn build_protected_state() -> AppState {
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
             base_url: "https://api.openai.com/v1".into(),
+            proxy_mode: ProxyMode::default(),
             models_endpoint: "models".into(),
             timeout_secs: 120,
             headers: HashMap::new(),

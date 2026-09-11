@@ -37,6 +37,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         api_keys: vec!["sk-test".into()],
         key_strategy: sag_config::KeyStrategy::FillFirst,
         base_url: "https://api.openai.com/v1".into(),
+        proxy_mode: sag_config::ProxyMode::default(),
         models_endpoint: "models".into(),
         timeout_secs: 120,
         headers: std::collections::HashMap::new(),

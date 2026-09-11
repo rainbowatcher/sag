@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use axum::Router;
 use sag_config::{
-    ConfigHandle, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, RouteConfig,
+    ConfigHandle, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig,
     RouteTarget, Strategy,
 };
 use sag_state::AppState;
@@ -21,9 +21,21 @@ pub(crate) async fn build_state(
     providers: HashMap<String, ProviderConfig>,
     routes: Vec<RouteConfig>,
 ) -> AppState {
+    build_state_with_proxy(providers, routes, None).await
+}
+
+/// Build an in-memory `AppState` with the given providers, routes, and an
+/// optional gateway-level `proxy_url`. Same as [`build_state`] but lets
+/// tests exercise proxy resolution paths.
+pub(crate) async fn build_state_with_proxy(
+    providers: HashMap<String, ProviderConfig>,
+    routes: Vec<RouteConfig>,
+    proxy_url: Option<String>,
+) -> AppState {
     let config = GatewayConfig {
         providers,
         routes,
+        proxy_url,
         ..sag_config::gateway_config_base!()
     };
     let handle = ConfigHandle::from_config(config);
@@ -52,6 +64,7 @@ pub(crate) fn one_provider_config(
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
             base_url: "https://api.openai.com/v1".into(),
+            proxy_mode: ProxyMode::default(),
             models_endpoint: "models".into(),
             timeout_secs: 120,
             headers: HashMap::new(),

@@ -46,6 +46,7 @@ pub(crate) fn test_config(
         base_url: base_url.into(),
         models_endpoint: "models".into(),
         timeout_secs,
+        proxy_mode: sag_config::ProxyMode::default(),
         headers: HashMap::new(),
         body_overrides: HashMap::new(),
         strip_fields: vec![],

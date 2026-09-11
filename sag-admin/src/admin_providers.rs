@@ -11,7 +11,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use sag_config::{KeyStrategy, ProviderConfig, ProviderType};
+use sag_config::{KeyStrategy, ProviderConfig, ProviderType, ProxyMode};
 use sag_core::AppError;
 use serde_json::json;
 use tracing::instrument;
@@ -32,6 +32,13 @@ pub struct AddProviderRequest {
     pub base_url: String,
     #[serde(default = "sag_config::default_models_endpoint")]
     pub models_endpoint: String,
+    /// How this provider resolves the upstream proxy: `inherit` (default),
+    /// `enabled`, or `disabled`. Unknown *fields* on the request body are
+    /// tolerated as elsewhere in the admin DTOs, but an unknown
+    /// `proxy_mode` *value* fails deserialization (axum 422) — the same
+    /// strictness as the config loader's typed enums.
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
     #[serde(default = "sag_config::default_timeout_secs")]
     pub timeout_secs: u64,
     /// Custom headers to override upstream request headers.
@@ -204,6 +211,7 @@ pub async fn add_provider(
         api_keys: req.api_keys.clone(),
         key_strategy: req.key_strategy,
         base_url: req.base_url.clone(),
+        proxy_mode: req.proxy_mode,
         models_endpoint: sag_config::normalize_models_endpoint(&req.models_endpoint),
         timeout_secs: req.timeout_secs,
         headers: req.headers.clone(),
@@ -482,6 +490,7 @@ mod tests {
                     api_keys: vec![format!("sk-{name}")],
                     key_strategy: KeyStrategy::FillFirst,
                     base_url: "https://example.com".into(),
+                    proxy_mode: ProxyMode::default(),
                     models_endpoint: "models".into(),
                     timeout_secs: 120,
                     headers: HashMap::new(),
@@ -712,6 +721,7 @@ targets = [
                 api_keys: vec!["sk-z".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -734,6 +744,7 @@ targets = [
                 api_keys: vec!["sk-a".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.anthropic.com".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -756,6 +767,7 @@ targets = [
                 api_keys: vec!["sk-m".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://example.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -797,6 +809,7 @@ targets = [
                 api_keys: vec!["sk-openai".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),
@@ -819,6 +832,7 @@ targets = [
                 api_keys: vec!["sk-restricted".into()],
                 key_strategy: KeyStrategy::FillFirst,
                 base_url: "https://example.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
                 models_endpoint: "models".into(),
                 timeout_secs: 120,
                 headers: HashMap::new(),

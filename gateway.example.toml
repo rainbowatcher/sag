@@ -13,6 +13,13 @@
 # fill-first order. Set to 0 to never expire. Default: 7200 (2 hours).
 # sticky_failover_reset_secs = 7200
 
+# Optional global HTTP/HTTPS proxy URL, used as the default upstream proxy for
+# all providers. Only http:// and https:// URLs are supported (no SOCKS).
+# SAG never reads system proxy env vars (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY),
+# so leaving this unset always means direct connections unless a provider sets
+# proxy_mode = "enabled". URLs must not embed credentials (user:pass@).
+# Example: proxy_url = "http://proxy.example.com:8080"
+
 # Logging configuration (optional, defaults below).
 # The RUST_LOG environment variable, if set, takes precedence over level.
 [logging]
@@ -76,6 +83,11 @@ base_url = "https://api.openai.com/v1"
 timeout_secs = 120
 # 角色映射：将不支持的角色映射为兼容角色
 # role_mappings = { "developer" = "system" }
+# Per-provider proxy mode (default: "inherit" — use the top-level proxy_url):
+#   "inherit"  — use top-level proxy_url if set, else direct
+#   "enabled"  — force top-level proxy_url (config error if none is set)
+#   "disabled" — force direct connection, ignoring any top-level proxy
+# proxy_mode = "inherit"
 
 [providers.anthropic]
 api_keys = ["sk-ant-your-anthropic-api-key"]

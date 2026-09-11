@@ -648,7 +648,8 @@ mod tests {
     use std::collections::HashMap;
 
     use sag_config::{
-        KeyStrategy, ProviderConfig, ProviderType, RouteConfig, Strategy, gateway_config_base,
+        GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig, Strategy,
+        gateway_config_base,
     };
     use sag_core::AppError;
 
@@ -682,6 +683,7 @@ mod tests {
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
             base_url: "https://api.openai.com/v1".into(),
+            proxy_mode: ProxyMode::default(),
             models_endpoint: "models".into(),
             timeout_secs: 600,
             chunk_timeout_secs: None,
