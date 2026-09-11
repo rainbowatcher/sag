@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-03
+updated: 2026-09-08
 ---
 
 # 配置
@@ -65,6 +65,8 @@ updated: 2026-09-03
 - 路由 target 引用存在的 provider
 - 同一路由内 `(provider, real_model)` 不重复
 - `models_endpoint` 不含 scheme / query / fragment / 空白
+- `proxy_url` 为合法 `http://` / `https://` URL，且不含 userinfo（空白/纯空白视为未配置，不报错）
+- `proxy_mode='enabled'` 的 provider 要求存在可用的顶层 `proxy_url`，否则报错
 - 单 key + RoundRobin → warning（非 error）
 
 ### 保存
@@ -74,6 +76,21 @@ updated: 2026-09-03
 - 保留注释和空白
 - 默认值跳过序列化（`skip_serializing_if`）
 - `extra` / `body_overrides` / `headers` 使用原地编辑，保留 key 顺序
+- 顶层 `proxy_url` 与 provider `proxy_mode` 同样原地编辑：清除全局代理时移除 key（不残留空值），`proxy_mode` 为默认 `inherit` 时跳过
+
+### 出站代理
+
+SAG 的出站代理完全由配置显式控制，**不**依赖系统代理环境变量（[0005](changes/0005-outbound-proxy-configuration.md) 起）：
+
+- 顶层 `proxy_url: Option<String>` 定义全局 HTTP/HTTPS 代理；`None` / 空 / 纯空白值表示未配置（直连）。
+- SAG 默认显式屏蔽 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 及大小写变体环境代理：没有显式代理时所有 outbound client 使用 `no_proxy` 直连，绝不静默走系统代理。
+- provider 三态 `proxy_mode`：
+  - `inherit`（默认）— 继承全局 `proxy_url`；无全局代理时直连。
+  - `enabled` — 强制使用顶层 `proxy_url`；未配置顶层代理时，配置加载/保存/接口请求失败。
+  - `disabled` — 强制直连，忽略全局代理。
+- provider client、gateway 启动、state upsert、mutation / hot reload、admin settings、provider CRUD、fetch-models / model-test 均遵循有效代理策略；Web UI provider add/edit 的临时测试使用当前 dialog 内存 `proxy_mode` 与当前内存全局 `proxy_url`，不要求先保存。
+- 仅支持 HTTP/HTTPS，不支持 SOCKS；代理 URL 拒绝 userinfo（`user:pass@`），避免凭据泄漏。
+- hot reload 按 effective proxy（全局 `proxy_url` + provider `proxy_mode` 解析结果）差异重建受影响 provider；`disabled` provider 不因全局代理变化重建；在途请求不强行中断。
 
 ## 配置 Schema
 
@@ -88,6 +105,7 @@ updated: 2026-09-03
 
 ## 变更记录
 
+- [0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](changes/0005-outbound-proxy-configuration.md)
 - [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)
 - [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)
 - [0002 热重载 watcher 加固：尾部防抖、目录监听与瞬时失败重试](changes/0002-hot-reload-trailing-debounce.md)

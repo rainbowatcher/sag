@@ -9,6 +9,7 @@ updated: 2026-09-08
 
 ## 2026-09-08
 
+- **配置**：[0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](config/changes/0005-outbound-proxy-configuration.md) — 顶层 `proxy_url` 定义全局 HTTP/HTTPS 代理，provider 三态 `proxy_mode`（inherit/enabled/disabled）控制继承/强制/直连；SAG 显式屏蔽系统代理环境变量，`ProxyConfig` 仅存 scheme/host/port 拒绝 userinfo 防泄漏；启动/热重载/mutation/临时测试统一经 `effective_proxy_for` 解析，hot reload 按 effective proxy 差异重建受影响 provider；新增 GET/PUT `/api/settings` 与 Settings 页
 - **Sticky Targets**：[0005 target_index 权威首项判定与策略切换残留清理](sticky-targets-observability/changes/0005-target-index-and-strategy-switch-cleanup.md) — DTO 携带 0-based `target_index` 作首项权威来源（取代对象身份）；GET 只对 StickyFailover 展示 pin（切换后残留报 idle）；DELETE 对每种策略都清 active_targets、FillFirst 额外清 order cache；route CRUD 与 gateway hot-reload（含 fallback retry）成功后立即 prune
 - **Sticky Targets**：[0004 expired 圆点改 muted 灰绿/灰橙](sticky-targets-observability/changes/0004-expired-dot-muted-hue.md) — expired 不再统一灰色：命中 route.targets 首项 `bg-green-500/40`、非首项/无法确认 `bg-orange-500/40`（expired 表示过期 pin 的配置位置，非当前流量）；pinned 与 fill_first 行为不变
 
