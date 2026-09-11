@@ -26,8 +26,8 @@ updated: 2026-08-11
 
 - [sag-analytics/src/lib.rs](../../../sag-analytics/src/lib.rs) — `CallLogCollector` 等公共导出（现状）
 - [sag-analytics/src/store.rs](../../../sag-analytics/src/store.rs) — `LogStore` trait：`insert_batch` / `query_stats` / `query_logs` / `query_cache_stats` / `query_trend` / `query_distribution`（现状）
-- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、旧统计/趋势/分布查询、`ensure_schema_consistency`（现状）
-- [sag-analytics/src/collector.rs](../../../sag-analytics/src/collector.rs) — `CallLogCollector`：bounded mpsc + 后台写入 + `try_send` 丢弃语义（现状，可丢弃链路）
+- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、旧统计/趋势/分布查询、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭）
+- [sag-analytics/src/collector.rs](../../../sag-analytics/src/collector.rs) — `CallLogCollector`：bounded mpsc + 后台写入 + `try_send` 丢弃语义（现状，可丢弃链路；0005 起新增 `new_shared(pool)` 共享池构造）
 - [sag-analytics/migrations/](../../../sag-analytics/migrations/) — `call_logs` schema 迁移（现状，`.sqlite.sql` 后缀约定）
 - [sag-router/src/handlers/mod.rs](../../../sag-router/src/handlers/mod.rs) — 旧 `/v1/analytics/stats|trend|distribution|cache` 处理器（现状）
 - [sag-admin/src/admin_logs.rs](../../../sag-admin/src/admin_logs.rs) — 旧 `/api/logs` 日志接口（现状）
@@ -240,7 +240,7 @@ pub struct TargetAttemptFact {
   3. 插入该事件全部 `target_attempts`；
   4. 提交。
 - 幂等：冲突时 `rows() == 0` → 该事件已写入，跳过 target_attempts（同一事务内，防重复）。
-- `call_logs` 仍走独立 `CallLogCollector`（可丢弃，无上述原子性/背压保证），仅复用 dispatch 侧已解析的 id 填入可空列。
+- `call_logs` 仍走独立 `CallLogCollector`（可丢弃，无上述原子性/背压保证），仅复用 dispatch 侧已解析的 id 填入可空列。0005 起旧链路并入与正式分析**共享的连接池**（`CallLogCollector::new_shared` / `SqliteLogStore::from_pool`，store 不关闭共享 pool），批量插入整批 `BEGIN IMMEDIATE` 单事务。
 
 数据流：
 
@@ -643,6 +643,9 @@ stateDiagram-v2
 - 正式队列 bounded（容量常量）+ 满时 `await`（无 `drop` 路径）
 - shutdown 先 drop sender 再等 writer 排空
 - `call_logs` 保持 `try_send` 丢弃语义（可丢弃）
+- 旧 call_logs store（`SqliteLogStore`）与正式 writer / rollup / 查询引擎**共享同一个连接池**（`from_pool` / `CallLogCollector::new_shared`）；store 不拥有该 pool，`shutdown` 不 close 调用方 pool（DSN 构造的 store 仍拥有并 close 自己的 pool）
+- file DSN 连接统一 `analytics_connect_options`（foreign_keys + 5s busy_timeout + WAL + `synchronous=NORMAL`）；`:memory:` 跳过 WAL
+- 所有分析写事务（`EventWriter::write` / `RollupEngine::compute_bucket` / `IdentityRegistry::sync` / `SqliteLogStore::insert_batch` 整批）以 `BEGIN IMMEDIATE` 开始，先取写锁避免 deferred BEGIN 升级竞态
 
 ### 查询与 Rollup
 - `hour = completed_at / 3_600_000`（UTC）
@@ -695,6 +698,7 @@ stateDiagram-v2
 
 ## 变更记录
 
+- [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)
 - [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
 - [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)
 - [0002 双层事实与 Rollup](changes/0002-two-level-facts.md)

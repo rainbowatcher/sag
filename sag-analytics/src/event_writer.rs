@@ -41,7 +41,6 @@ use crate::rollup;
 use sag_core::{AppError, FinalStatus, TargetStatus};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
-use std::time::Duration;
 
 /// Single-transaction fact writer over a shared SQLite pool.
 ///
@@ -59,7 +58,8 @@ impl EventWriter {
     }
 
     /// Open a pool on `dsn` with the same connect options as
-    /// [`crate::SqliteLogStore`] (foreign keys enabled) and apply the
+    /// [`crate::SqliteLogStore`] (foreign keys enabled, WAL +
+    /// `synchronous = NORMAL` for file DSNs) and apply the
     /// migrations. File-backed DSNs share the physical database with an
     /// existing `SqliteLogStore`.
     ///
@@ -81,17 +81,7 @@ impl EventWriter {
             )));
         }
 
-        let options = if dsn.starts_with("sqlite:") {
-            SqliteConnectOptions::from_str(dsn)?
-                .foreign_keys(true)
-                .busy_timeout(Duration::from_secs(5))
-        } else {
-            SqliteConnectOptions::new()
-                .filename(dsn)
-                .create_if_missing(true)
-                .foreign_keys(true)
-                .busy_timeout(Duration::from_secs(5))
-        };
+        let options = crate::analytics_connect_options(dsn)?;
 
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
@@ -146,9 +136,13 @@ impl EventWriter {
         validate(&event)?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
+        // `BEGIN IMMEDIATE`: take the write lock up front instead of a
+        // deferred BEGIN that upgrades mid-transaction (which can fail
+        // with SQLITE_BUSY_SNAPSHOT under concurrent writers on the same
+        // file in WAL mode). The busy_timeout covers the wait.
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AppError::Internal(format!("event write begin: {e}")))?;
 
@@ -333,7 +327,8 @@ impl EventWriter {
 /// DSNs up front: each new connection would get its *own* database, so the
 /// pool and the rest of the gateway would silently write into separate,
 /// split-brain databases. Normal file DSNs (plain paths, `file:...` URIs,
-/// `sqlite:` URLs) are unaffected.
+/// `sqlite:` URLs) are unaffected. Crate-visible: the shared connect-options
+/// helper uses it to skip WAL for in-memory databases.
 ///
 /// SQLite itself recognizes the following spellings (see
 /// <https://www.sqlite.org/uri.html> and
@@ -357,7 +352,7 @@ impl EventWriter {
 /// same percent-decoded form semantics sqlx applies (its rebuilt canonical
 /// URL is not used — it panics for filenames containing `:`); a parse
 /// error is not classified here and surfaces from `open` itself.
-fn is_in_memory_dsn(dsn: &str) -> bool {
+pub(crate) fn is_in_memory_dsn(dsn: &str) -> bool {
     // Raw filename semantics (the `sqlite:` scheme is not part of the
     // filename, mirroring sqlx's own prefix stripping): SQLite parses a
     // filename as a URI when it starts with `file:` or `:`. Split off the

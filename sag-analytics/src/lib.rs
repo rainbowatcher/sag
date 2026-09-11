@@ -24,9 +24,48 @@ pub use rollup::{
 pub use sqlite_store::SqliteLogStore;
 pub use store::*;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use std::str::FromStr;
 use std::time::Duration;
+
+/// Build the sqlx connect options shared by **every** analytics SQLite pool
+/// — the formal [`open_analytics_pool`], the legacy [`SqliteLogStore`] /
+/// [`CallLogCollector`], and [`EventWriter::open`]: foreign keys on, an
+/// explicit 5s `busy_timeout`, and — for file-backed databases — WAL
+/// journal mode with `synchronous = NORMAL`.
+///
+/// WAL is what lets multiple pool connections (formal fact writer, rollup
+/// engine, legacy call-log store, query engine) write the same file without
+/// one-shot `SQLITE_BUSY` failures: readers never block writers and writers
+/// serialize on the single WAL write lock, waiting via the busy timeout
+/// instead of erroring. `synchronous = NORMAL` in WAL mode keeps fsyncs off
+/// the hot path while remaining crash-consistent (SQLite's recommended
+/// combination). In-memory DSNs (`:memory:` and friends, per
+/// [`crate::event_writer::is_in_memory_dsn`]) skip both: SQLite does not
+/// support WAL for in-memory databases.
+pub(crate) fn analytics_connect_options(dsn: &str) -> Result<SqliteConnectOptions, sqlx::Error> {
+    let options = if dsn.starts_with("sqlite:") || dsn == ":memory:" {
+        SqliteConnectOptions::from_str(dsn)?
+    } else {
+        SqliteConnectOptions::new()
+            .filename(dsn)
+            .create_if_missing(true)
+    };
+
+    let options = options
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+
+    if crate::event_writer::is_in_memory_dsn(dsn) {
+        Ok(options)
+    } else {
+        Ok(options
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal))
+    }
+}
 
 /// Open the shared SQLite pool for the formal analytics path.
 ///
@@ -49,20 +88,13 @@ use std::time::Duration;
 /// [`AnalyticsQueryEngine`], and background rollup write transactions
 /// contend with fact writes on the same SQLite file. Relying on
 /// sqlx/libsqlite defaults is fragile (they have changed across
-/// versions), so the lock wait is pinned explicitly. Journal mode and
-/// synchronous level are intentionally left untouched.
+/// versions), so the lock wait is pinned explicitly. File-backed databases
+/// additionally run in WAL journal mode with `synchronous = NORMAL` (see
+/// [`analytics_connect_options`]) so all writer connections coordinate
+/// through the single WAL write lock instead of racing for the database
+/// lock; `:memory:` databases keep their default journal mode.
 pub async fn open_analytics_pool(dsn: &str) -> Result<SqlitePool, sqlx::Error> {
-    let options = if dsn.starts_with("sqlite:") || dsn == ":memory:" {
-        SqliteConnectOptions::from_str(dsn)?
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5))
-    } else {
-        SqliteConnectOptions::new()
-            .filename(dsn)
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5))
-    };
+    let options = analytics_connect_options(dsn)?;
 
     let max_connections = if dsn == ":memory:" { 1 } else { 4 };
     let pool = SqlitePoolOptions::new()
@@ -102,6 +134,63 @@ mod tests {
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// File-backed pools must report WAL journal mode, `synchronous =
+    /// NORMAL` (SQLite numeric value 1) and the explicit 5s
+    /// `busy_timeout` on every connection — the three settings that keep
+    /// multiple analytics writers (fact writer, rollup, legacy store)
+    /// from failing with one-shot `SQLITE_BUSY` on the same file.
+    #[tokio::test]
+    async fn file_pool_connections_report_wal_normal_and_busy_timeout() {
+        let dir = std::env::temp_dir().join(format!("sag-analytics-lib-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal-options.db");
+        let dsn = path.to_str().unwrap();
+
+        let pool = open_analytics_pool(dsn).await.unwrap();
+
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(journal, "wal", "file pool must run WAL, got {journal}");
+        assert_eq!(sync, 1, "file pool must run synchronous=NORMAL, got {sync}");
+        assert_eq!(
+            timeout, 5000,
+            "file pool must keep the 5s busy_timeout, got {timeout}ms"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In-memory pools must NOT be forced into WAL (SQLite does not
+    /// support WAL for `:memory:` databases) and must keep the test
+    /// construction path working unchanged.
+    #[tokio::test]
+    async fn memory_pool_keeps_default_journal_mode() {
+        let pool = open_analytics_pool(":memory:").await.unwrap();
+
+        let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal, "memory",
+            "in-memory pool must keep its default journal mode, got {journal}"
+        );
+
+        pool.close().await;
     }
 
     /// Behavioral guard for the rollup-vs-fact-writer lock contention the

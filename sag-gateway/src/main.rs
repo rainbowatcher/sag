@@ -103,7 +103,10 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     //    aborts startup. The exact-detail query engine (`/v1/analytics/v2/*`)
     //    is assembled over the same shared pool, so it observes exactly
     //    what the writer commits. The legacy CallLogCollector is kept for
-    //    the `/v1/analytics/*` and `/api/logs` paths.
+    //    the `/v1/analytics/*` and `/api/logs` paths and is built over
+    //    the SAME shared pool (`new_shared`) — one pool for writer /
+    //    registry / query / rollup / legacy store, no second pool on the
+    //    same file.
     let analytics_pool = sag_analytics::open_analytics_pool(&analytics_dsn).await?;
     let identity_registry = Arc::new(sag_analytics::IdentityRegistry::new(analytics_pool.clone()));
     identity_registry.sync(&routes_identity).await?;
@@ -120,11 +123,18 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         Arc::new(sag_analytics::RollupEngine::new(analytics_pool.clone())),
         ROLLUP_INTERVAL,
     );
+    // 5b. The legacy CallLogCollector (backing `/v1/analytics/*` and
+    //     `/api/logs`) is built over the SAME shared pool — `new_shared`,
+    //     never `CallLogCollector::new(dsn)` which would open a second,
+    //     independent pool on the same file and close it on shutdown,
+    //     racing the formal pool. The store does not own the pool, so its
+    //     shutdown is a no-op for the pool itself. Cloned here before the
+    //     pool is moved into the EventWriter below.
+    let collector =
+        Arc::new(sag_analytics::CallLogCollector::new_shared(analytics_pool.clone()).await?);
     let event_collector = Arc::new(sag_analytics::EventCollector::new(
         sag_analytics::EventWriter::new(analytics_pool),
     ));
-
-    let collector = Arc::new(sag_analytics::CallLogCollector::new(&analytics_dsn).await?);
 
     // 6. Initialize provider registry from config and compute the
     //    stale-probe threshold for the circuit breaker in the same read

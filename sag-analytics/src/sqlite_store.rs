@@ -1,10 +1,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use sag_core::{AppError, CallLog, Usage};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::collections::HashSet;
-use std::str::FromStr;
-use std::time::Duration;
 use tracing::warn;
 
 use crate::store::{
@@ -67,28 +65,29 @@ async fn ensure_schema_consistency(pool: &SqlitePool) -> Result<(), sqlx::Error>
 /// SQLite-backed implementation of [`LogStore`].
 pub struct SqliteLogStore {
     pool: SqlitePool,
+    /// Whether `shutdown` closes the pool. DSN-constructed stores
+    /// ([`SqliteLogStore::new`]) own the pool they create; stores built
+    /// over a caller-provided shared pool ([`SqliteLogStore::from_pool`])
+    /// must NOT close it — production wires the legacy collector over the
+    /// same pool as the formal writer / rollup / query engine, and closing
+    /// it would break the whole analytics subsystem.
+    owns_pool: bool,
 }
 
 impl SqliteLogStore {
     /// Create a new SQLite store. `dsn` may be a file path, `:memory:`, or a
     /// `sqlite://...` URI. The schema is created/updated via `sqlx::migrate!`.
     ///
-    /// Connections pin an explicit 5s `busy_timeout` so writes to the same
-    /// physical file as the formal analytics pool (rollup background
-    /// transactions, fact writes) wait for the lock instead of failing
-    /// immediately with SQLITE_BUSY.
+    /// Connections share the same connect options as the formal analytics
+    /// pool ([`crate::open_analytics_pool`]): foreign keys on, an explicit
+    /// 5s `busy_timeout`, and — for file DSNs — WAL journal mode with
+    /// `synchronous = NORMAL`, so writes to the same physical file as the
+    /// formal analytics pool (rollup background transactions, fact writes)
+    /// wait for the lock instead of failing immediately with SQLITE_BUSY.
+    ///
+    /// The returned store owns its pool: [`LogStore::shutdown`] closes it.
     pub async fn new(dsn: &str) -> Result<Self, sqlx::Error> {
-        let options = if dsn.starts_with("sqlite:") || dsn == ":memory:" {
-            SqliteConnectOptions::from_str(dsn)?
-                .foreign_keys(true)
-                .busy_timeout(Duration::from_secs(5))
-        } else {
-            SqliteConnectOptions::new()
-                .filename(dsn)
-                .create_if_missing(true)
-                .foreign_keys(true)
-                .busy_timeout(Duration::from_secs(5))
-        };
+        let options = crate::analytics_connect_options(dsn)?;
 
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
@@ -104,7 +103,27 @@ impl SqliteLogStore {
         // installs where `pragma_table_info` sees the columns already.
         ensure_schema_consistency(&pool).await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            owns_pool: true,
+        })
+    }
+
+    /// Wrap a caller-provided pool (migrations already applied). The store
+    /// does NOT own the pool: [`LogStore::shutdown`] is a no-op for the
+    /// pool itself, so the caller (e.g. the gateway, which shares one
+    /// analytics pool across the formal writer / rollup / query engine /
+    /// legacy collector) keeps full control of its lifetime.
+    ///
+    /// The schema-drift repair still runs (idempotent, short-circuits on a
+    /// consistent schema) so the legacy store keeps its invariant that the
+    /// `call_logs` table is always in the expected shape.
+    pub async fn from_pool(pool: SqlitePool) -> Result<Self, sqlx::Error> {
+        ensure_schema_consistency(&pool).await?;
+        Ok(Self {
+            pool,
+            owns_pool: false,
+        })
     }
 
     /// Create an in-memory SQLite store (for testing).
@@ -116,6 +135,25 @@ impl SqliteLogStore {
 #[async_trait]
 impl LogStore for SqliteLogStore {
     async fn insert_batch(&self, logs: &[CallLog]) -> sag_core::Result<()> {
+        // Fast path: an empty batch is a no-op (no need to open a write
+        // transaction for it).
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        // Persist the whole batch in ONE `BEGIN IMMEDIATE` transaction:
+        // atomicity (a batch either fully lands or not at all) and a single
+        // short write-lock hold instead of one lock acquisition per row.
+        // `BEGIN IMMEDIATE` takes the write lock up front so the deferred
+        // `BEGIN` upgrade race (SQLITE_BUSY_SNAPSHOT) under concurrent
+        // writers in WAL mode is avoided; the pool's busy_timeout covers
+        // the wait.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| AppError::Internal(format!("insert_batch begin: {e}")))?;
+
         for log in logs {
             let (prompt, completion, total) = match &log.usage {
                 Some(u) => (
@@ -166,10 +204,14 @@ impl LogStore for SqliteLogStore {
             .bind(log.user_agent.as_ref())
             .bind(log.client_ip.as_ref())
             .bind(log.error_category.as_ref())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert call log: {e}")))?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("insert_batch commit: {e}")))?;
         Ok(())
     }
 
@@ -499,7 +541,13 @@ impl LogStore for SqliteLogStore {
     }
 
     async fn shutdown(&self) {
-        self.pool.close().await;
+        // Only close the pool when this store owns it. A store built over a
+        // shared pool (`from_pool`) must leave the caller's pool untouched —
+        // closing it would kill the formal writer / rollup / query engine
+        // sharing the same pool.
+        if self.owns_pool {
+            self.pool.close().await;
+        }
     }
 }
 
@@ -599,7 +647,11 @@ impl LogRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::CallLogCollector;
+    use crate::open_analytics_pool;
     use sag_core::Usage;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn make_log(provider: &str, model: &str, real_model: &str) -> CallLog {
@@ -1094,6 +1146,146 @@ mod tests {
         assert_eq!(rows[0].total_prompt_tokens, 110);
         assert_eq!(rows[0].total_cached_tokens, 30);
         assert_eq!(rows[0].total_cache_creation_tokens, 15);
+    }
+
+    // ─── Shared-pool lifecycle & write contention ────────────────────
+
+    /// Blocker regression: a store built over a caller-provided shared pool
+    /// (`from_pool`) must NOT close that pool on `shutdown` — production
+    /// builds the legacy collector over the same pool as the formal
+    /// EventWriter / rollup / query engine, and closing it would break the
+    /// whole analytics subsystem.
+    #[tokio::test]
+    async fn shared_pool_store_shutdown_does_not_close_caller_pool() {
+        let pool = crate::event::test_support::test_pool().await;
+        let store = SqliteLogStore::from_pool(pool.clone()).await.unwrap();
+
+        store.shutdown().await;
+
+        // The caller's pool must still serve queries after the store
+        // shutdown (a closed pool returns PoolClosed here).
+        let one: i64 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(one, 1, "shared pool must survive store shutdown");
+    }
+
+    /// A DSN-constructed store owns its pool: `shutdown` must close it
+    /// (backward-compatible with the pre-shared-pool behavior).
+    #[tokio::test]
+    async fn owned_dsn_store_shutdown_closes_its_own_pool() {
+        let dir = std::env::temp_dir().join(format!("sag-analytics-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("owned.db");
+
+        let store = SqliteLogStore::new(path.to_str().unwrap()).await.unwrap();
+        let pool = store.pool.clone();
+
+        store.shutdown().await;
+
+        let err = sqlx::query_scalar::<_, i64>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, sqlx::Error::PoolClosed),
+            "owned store shutdown must close its pool, got: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Temporary-file concurrent-writer regression: several writers over
+    /// the SAME shared file-backed pool (WAL + busy_timeout +
+    /// `synchronous = NORMAL`) must never fail with a locked-database
+    /// error — each batch is one `BEGIN IMMEDIATE` transaction that waits
+    /// on the WAL write lock — and every queued event must be persisted.
+    #[tokio::test]
+    async fn concurrent_writers_on_shared_file_pool_persist_all_events() {
+        let dir = std::env::temp_dir().join(format!("sag-analytics-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("concurrent.db");
+
+        let pool = open_analytics_pool(path.to_str().unwrap()).await.unwrap();
+
+        // 4 writers × 20 batches × 5 logs each, all through separate
+        // stores over the one shared pool (like the production assembly).
+        const WRITERS: usize = 4;
+        const BATCHES: usize = 20;
+        const BATCH_SIZE: usize = 5;
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let store = SqliteLogStore::from_pool(pool).await.unwrap();
+                    for b in 0..BATCHES {
+                        let logs: Vec<CallLog> = (0..BATCH_SIZE)
+                            .map(|i| make_log("openai", &format!("w{w}-b{b}-m{i}"), "real"))
+                            .collect();
+                        store.insert_batch(&logs).await?;
+                    }
+                    Ok::<(), sag_core::AppError>(())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.await
+                .expect("writer task panicked")
+                .expect("insert_batch must not fail with a locked database");
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count,
+            (WRITERS * BATCHES * BATCH_SIZE) as i64,
+            "all queued events must be persisted"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Collector-level regression: `CallLogCollector::new_shared` over the
+    /// caller's pool persists events and its `shutdown` must NOT close that
+    /// pool (production wires the legacy collector over the same pool as
+    /// the formal writer / rollup).
+    #[tokio::test]
+    async fn shared_pool_collector_shutdown_keeps_caller_pool_alive() {
+        let dir = std::env::temp_dir().join(format!("sag-analytics-store-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collector-shared.db");
+
+        let pool = open_analytics_pool(path.to_str().unwrap()).await.unwrap();
+        let collector = Arc::new(CallLogCollector::new_shared(pool.clone()).await.unwrap());
+
+        for i in 0..20 {
+            collector.log(make_log("openai", &format!("m{i}"), "real"));
+        }
+        collector.flush().await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_logs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 20, "all logged events must be persisted");
+
+        let collector = Arc::into_inner(collector).expect("only one strong ref");
+        collector.shutdown().await;
+
+        // The shared pool must survive the collector shutdown.
+        let one: i64 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(one, 1, "collector shutdown must not close the shared pool");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── M1 migration: FK enforcement + rollup CHECK constraints ─────

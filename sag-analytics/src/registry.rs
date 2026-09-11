@@ -118,9 +118,14 @@ impl IdentityRegistry {
     /// half-reconciled cache. IDs are never written back to any TOML.
     pub async fn sync(&self, routes: &[RouteIdentity]) -> sag_core::Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
+        // `BEGIN IMMEDIATE`: take the write lock up front instead of a
+        // deferred BEGIN that upgrades mid-transaction (which can fail
+        // with SQLITE_BUSY_SNAPSHOT under concurrent event writes in WAL
+        // mode — hot reload can run a sync while facts are being written).
+        // The busy_timeout covers the wait.
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AppError::Internal(format!("identity sync begin: {e}")))?;
 

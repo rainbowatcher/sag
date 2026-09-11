@@ -51,10 +51,13 @@
 //!
 //! Everything here uses SQLx **runtime queries** (no compile-time `query!`
 //! macros). The pool must have foreign keys enabled and the analytics
-//! migrations applied (see [`crate::open_analytics_pool`]); journal mode /
-//! synchronous level are left untouched, while the busy timeout is pinned
-//! explicitly to 5s at pool construction so rollup write transactions
-//! waiting on a fact-writer lock block instead of failing with SQLITE_BUSY.
+//! migrations applied (see [`crate::open_analytics_pool`]); file-backed
+//! pools additionally run WAL journal mode with `synchronous = NORMAL`,
+//! and the busy timeout is pinned explicitly to 5s at pool construction,
+//! so rollup write transactions waiting on a fact-writer lock block
+//! instead of failing with SQLITE_BUSY. The bucket recompute transaction
+//! itself starts with `BEGIN IMMEDIATE` (it is a write transaction
+//! upgrading a deferred `BEGIN` could race under concurrent writers).
 //!
 //! # Scheduler contract (not implemented here)
 //!
@@ -678,9 +681,13 @@ impl RollupEngine {
     /// histograms, then `completed` (dirty cleared). Any error rolls back
     /// everything and leaves the previous rollup rows untouched.
     async fn compute_bucket(&self, hour: i64) -> sag_core::Result<()> {
+        // `BEGIN IMMEDIATE`: take the write lock up front instead of a
+        // deferred BEGIN that upgrades mid-transaction (which can fail
+        // with SQLITE_BUSY_SNAPSHOT under concurrent fact writes in WAL
+        // mode). The busy_timeout covers the wait.
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AppError::Internal(format!("rollup begin hour={hour}: {e}")))?;
 

@@ -7,6 +7,10 @@ updated: 2026-09-08
 
 按时间倒序列出所有模块的变更记录。
 
+## 2026-09-11
+
+- **分析**：[0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](analytics/changes/0005-shared-pool-lock-fix.md) — 旧 CallLogCollector 改为共享正式分析连接池（`new_shared` / `from_pool`，store 不关闭共享 pool）；file DSN 统一 WAL + `synchronous=NORMAL` + busy_timeout 连接选项（`:memory:` 跳过 WAL）；EventWriter / RollupEngine / 身份 sync / 旧 store 整批插入的写事务全部改 `BEGIN IMMEDIATE`，消除双 pool 锁竞争与 deferred-BEGIN 升级竞态
+
 ## 2026-09-08
 
 - **配置**：[0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](config/changes/0005-outbound-proxy-configuration.md) — 顶层 `proxy_url` 定义全局 HTTP/HTTPS 代理，provider 三态 `proxy_mode`（inherit/enabled/disabled）控制继承/强制/直连；SAG 显式屏蔽系统代理环境变量，`ProxyConfig` 仅存 scheme/host/port 拒绝 userinfo 防泄漏；启动/热重载/mutation/临时测试统一经 `effective_proxy_for` 解析，hot reload 按 effective proxy 差异重建受影响 provider；新增 GET/PUT `/api/settings` 与 Settings 页

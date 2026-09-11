@@ -1,4 +1,5 @@
 use sag_core::CallLog;
+use sqlx::sqlite::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -28,8 +29,19 @@ pub struct CallLogCollector {
 impl CallLogCollector {
     /// Create a new collector backed by SQLite and spawn background persistence.
     /// `dsn` is a simple path (e.g. `analytics.db`) or `:memory:` for in-memory.
+    /// The store owns its pool: [`Self::shutdown`] closes it.
     pub async fn new(dsn: &str) -> Result<Self, sqlx::Error> {
         let store = Arc::new(SqliteLogStore::new(dsn).await?);
+        Self::with_store(store).await
+    }
+
+    /// Create a new collector over an existing shared pool (the production
+    /// path: the same pool backing [`crate::EventWriter`], the identity
+    /// registry, the rollup engine and the query engine). The store does
+    /// NOT own the pool, so [`Self::shutdown`] never closes it — closing
+    /// it would break every other analytics subsystem sharing the pool.
+    pub async fn new_shared(pool: SqlitePool) -> Result<Self, sqlx::Error> {
+        let store = Arc::new(SqliteLogStore::from_pool(pool).await?);
         Self::with_store(store).await
     }
 

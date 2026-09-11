@@ -49,7 +49,9 @@ updated: 2026-08-11
 - 正式分析事件必须异步写入，不阻塞请求处理；写入队列满时系统应**背压**（放慢/等待），不得静默丢弃。
 - 正常关闭时，系统必须**排空**待写入的分析事件后再退出。
 - 异常崩溃允许少量未提交的分析事件丢失（不要求崩溃恢复）。
-- call_logs 保留原有"可丢弃"的诊断语义，不纳入上述原子性与背压保证。
+- call_logs 保留原有“可丢弃”的诊断语义，不纳入上述原子性与背压保证。
+- 旧 call_logs 链路与正式分析路径**共用同一个 SQLite 连接池**（生产装配经 `CallLogCollector::new_shared(pool)` 构建，不再为同一文件另开私有 pool）；file-backed 分析库统一使用 WAL journal mode + `synchronous=NORMAL` + 5s busy_timeout 的连接选项，`:memory:` 等内存 DSN 除外（SQLite 不支持内存库 WAL）。
+- 旧 store 的批量插入必须整批走单个 `BEGIN IMMEDIATE` 事务（原子落库，单次短写锁）；正式 writer / rollup / 身份 sync 的写事务同样以 `BEGIN IMMEDIATE` 开始，先取写锁，避免 deferred BEGIN 升级竞态（SQLITE_BUSY_SNAPSHOT）。
 
 ### 最终状态与失败率
 
@@ -141,7 +143,8 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 ## 兼容性说明（迁移前现状）
 
 - 旧 `call_logs` 可能一条请求对应多行记录；旧 `/v1/analytics/*` 接口按旧明细聚合，保持兼容，不迁移为两级事实口径。
-- 旧 call_logs 写入链路保留"可丢弃"诊断语义：可能丢弃诊断事件，不承诺背压或原子性。
+- 旧 call_logs 写入链路保留“可丢弃”诊断语义：可能丢弃诊断事件，不承诺背压或原子性。
+- 旧 call_logs 的落库路径并入与正式分析共享的连接池（`SqliteLogStore::from_pool` / `CallLogCollector::new_shared`）：store 自身不关闭共享 pool，旧链路的批量插入与正式写事务共用 WAL + `BEGIN IMMEDIATE` 的并发安全设置。
 - 旧历史不强行回填 route/target 身份，旧记录中的身份字段为空。
 - 旧接口的既有响应字段（如聚合错误率、按 provider/model 过滤）按迁移前现状保留；新分析的口径以本文「最终状态与失败率」为准。
 
@@ -174,6 +177,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 变更记录
 
+- [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)
 - [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
 - [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)
 - [0002 双层事实与 Rollup](changes/0002-two-level-facts.md)
