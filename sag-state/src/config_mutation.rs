@@ -77,6 +77,24 @@ impl std::fmt::Debug for PreparedProviderSync {
     }
 }
 
+/// Resolve the effective proxy a provider adapter must be built with:
+/// `config`'s normalized global `proxy_url` combined with `pc.proxy_mode`.
+///
+/// This is the single resolution used by **every** production
+/// provider-construction path (gateway startup, coordinator
+/// mutations/reloads, [`AppState::upsert_provider`](crate::AppState)), so
+/// the proxy a provider actually uses never diverges between paths. Errors
+/// (malformed global URL, `enabled` mode with no global proxy) map to
+/// [`AppError::Config`] and are surfaced per each caller's error handling
+/// — never unwrapped/panicked.
+pub fn effective_proxy_for(
+    config: &GatewayConfig,
+    pc: &ProviderConfig,
+) -> Result<Option<sag_config::ProxyConfig>, AppError> {
+    let global = config.normalized_global_proxy().map_err(AppError::Config)?;
+    sag_config::resolve_effective_proxy(pc.proxy_mode, global.as_ref()).map_err(AppError::Config)
+}
+
 /// Compare only the fields that `ProviderBase::new()` captures, so that
 /// purely scheduling/display changes (`enabled`, `enabled_models`,
 /// `models_endpoint`, `model_overrides`) do not trigger an adapter rebuild.
@@ -201,7 +219,7 @@ impl ConfigMutationCoordinator {
         f(&mut candidate)?;
 
         // Step 4: Pre-build adapters (all RwLock guards are dropped).
-        let sync = self.prepare_provider_sync(&old_config.providers, &candidate.providers)?;
+        let sync = self.prepare_provider_sync(&old_config, &candidate)?;
 
         // Step 5: Persist (if requested and file-backed).
         if persist && let Some(path) = self.config.path() {
@@ -276,16 +294,29 @@ impl ConfigMutationCoordinator {
         })
     }
 
-    /// Compute the diff between `old` and `new` provider maps and pre-build
-    /// any new or changed adapters. Returns a `PreparedProviderSync` ready for
-    /// commit.
+    /// Compute the diff between the provider sets of the `old` and `new` full
+    /// gateway configs and pre-build any new or changed adapters. Returns a
+    /// `PreparedProviderSync` ready for commit.
     ///
-    /// Adapter construction failures (e.g. empty `api_keys`) are propagated
-    /// immediately, preventing any partial commit.
+    /// A provider is (re)built when:
+    /// - it is new in `new`;
+    /// - any adapter-captured field changed ([`adapter_config_changed`]);
+    /// - its `proxy_mode` changed; or
+    /// - its **effective** proxy changed — the resolved combination of the
+    ///   gateway-level `proxy_url` and its `proxy_mode`. Comparing resolved
+    ///   effective proxies (rather than the raw `proxy_url`) is what makes a
+    ///   top-level proxy change rebuild only the providers it actually
+    ///   affects: `inherit`/`enabled` providers whose effective proxy moved
+    ///   are rebuilt, while `disabled` providers (whose effective proxy is
+    ///   always `None`) are left untouched.
+    ///
+    /// Adapter construction / proxy-resolution failures (e.g. empty
+    /// `api_keys`, `enabled` mode without a global proxy, malformed global
+    /// URL) are propagated immediately, preventing any partial commit.
     fn prepare_provider_sync(
         &self,
-        old: &HashMap<String, ProviderConfig>,
-        new: &HashMap<String, ProviderConfig>,
+        old: &GatewayConfig,
+        new: &GatewayConfig,
     ) -> Result<PreparedProviderSync, AppError> {
         let mut to_remove: Vec<String> = Vec::new();
         let mut to_insert: Vec<(String, Arc<dyn LlmProvider>)> = Vec::new();
@@ -294,26 +325,42 @@ impl ConfigMutationCoordinator {
         let mut removed: Vec<String> = Vec::new();
 
         // Providers that existed in old but are gone from new -> remove.
-        for name in old.keys() {
-            if !new.contains_key(name) {
+        for name in old.providers.keys() {
+            if !new.providers.contains_key(name) {
                 to_remove.push(name.clone());
                 removed.push(name.clone());
             }
         }
 
         // Providers in the new config.
-        for (name, new_pc) in new.iter() {
-            match old.get(name) {
+        for (name, new_pc) in new.providers.iter() {
+            match old.providers.get(name) {
                 None => {
-                    // New provider: build adapter.
-                    let provider = sag_providers::create_provider(name.clone(), new_pc)?;
+                    // New provider: resolve its effective proxy under the new
+                    // config and build the adapter with it.
+                    let effective = effective_proxy_for(new, new_pc)?;
+                    let provider = sag_providers::create_provider_with_proxy(
+                        name.clone(),
+                        new_pc,
+                        effective.as_ref(),
+                    )?;
                     to_insert.push((name.clone(), provider));
                     added.push(name.clone());
                 }
                 Some(old_pc) => {
-                    if adapter_config_changed(old_pc, new_pc) {
-                        // Adapter-captured fields changed: rebuild.
-                        let provider = sag_providers::create_provider(name.clone(), new_pc)?;
+                    let adapter_changed = adapter_config_changed(old_pc, new_pc);
+                    let mode_changed = old_pc.proxy_mode != new_pc.proxy_mode;
+                    // Compare the effective proxies each side resolves to (old
+                    // config + old mode vs new config + new mode).
+                    let old_effective = effective_proxy_for(old, old_pc)?;
+                    let new_effective = effective_proxy_for(new, new_pc)?;
+                    if adapter_changed || mode_changed || old_effective != new_effective {
+                        // Rebuild with the new effective proxy.
+                        let provider = sag_providers::create_provider_with_proxy(
+                            name.clone(),
+                            new_pc,
+                            new_effective.as_ref(),
+                        )?;
                         to_insert.push((name.clone(), provider));
                         rebuilt.push(name.clone());
                     }
@@ -460,7 +507,7 @@ impl ConfigMutationCoordinator {
             drop(current);
 
             // d) Pre-build adapters (all RwLock guards are dropped).
-            let sync = self.prepare_provider_sync(&old_config.providers, &candidate.providers)?;
+            let sync = self.prepare_provider_sync(&old_config, &candidate)?;
 
             // e) Read file revision again to check stability.
             let rev2 = FileRevision::from_path(path)?;
@@ -636,6 +683,41 @@ impl ConfigMutationCoordinator {
             if candidate.routes.len() == before {
                 return Err(AppError::NotFound(format!("route '{name}' not found")));
             }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update gateway-level settings. Currently supports the top-level
+    /// `proxy_url`; setting it to `None` (or an empty/whitespace value)
+    /// clears the global proxy.
+    ///
+    /// Goes through the exact same unified mutation protocol as provider /
+    /// route CRUD: the mutation mutex, validation (a malformed `proxy_url` is
+    /// rejected up front, and effective-proxy resolution rejects `enabled`
+    /// providers without a global proxy), atomic TOML persistence, config
+    /// commit + `routes_version` bump, and the provider registry sync — so
+    /// providers whose effective proxy changed are rebuilt exactly as a hot
+    /// reload would, while `disabled` providers are left untouched. Handlers
+    /// must call this instead of writing `config` / `providers` directly.
+    pub async fn update_settings(
+        &self,
+        proxy_url: Option<String>,
+    ) -> Result<MutationReport, AppError> {
+        // Normalize empty/whitespace-only values to `None` (no proxy) so the
+        // in-memory config matches what the save path persists (it removes
+        // the key for empty/None). Validate up front so a malformed
+        // `proxy_url` is rejected even when the provider set is empty (the
+        // provider sync below only resolves proxies for configured providers,
+        // so an empty set would otherwise let an invalid URL through). The
+        // error message never echoes the URL itself (see `normalize_proxy_url`).
+        let normalized = match proxy_url.as_deref().map(str::trim) {
+            Some("") => None,
+            other => other.map(str::to_string),
+        };
+        sag_config::normalize_proxy_url(normalized.as_deref()).map_err(AppError::Config)?;
+        self.mutate(true, |candidate| {
+            candidate.proxy_url = normalized;
             Ok(())
         })
         .await
@@ -932,12 +1014,38 @@ mod tests {
         (coord, config)
     }
 
+    /// Build a full `GatewayConfig` with the given top-level `proxy_url` and
+    /// provider map (the shape `prepare_provider_sync` now compares).
+    fn cfg(proxy_url: Option<&str>, providers: HashMap<String, ProviderConfig>) -> GatewayConfig {
+        GatewayConfig {
+            providers,
+            proxy_url: proxy_url.map(str::to_string),
+            ..gateway_config_base!()
+        }
+    }
+
+    /// A provider with `proxy_mode = "disabled"`.
+    fn disabled_provider() -> ProviderConfig {
+        ProviderConfig {
+            proxy_mode: ProxyMode::Disabled,
+            ..base_provider()
+        }
+    }
+
+    /// A provider with `proxy_mode = "enabled"`.
+    fn enabled_provider() -> ProviderConfig {
+        ProviderConfig {
+            proxy_mode: ProxyMode::Enabled,
+            ..base_provider()
+        }
+    }
+
     #[test]
     fn prepare_sync_new_provider() {
         let (coord, _config) = make_coordinator();
-        let old: HashMap<String, ProviderConfig> = HashMap::new();
-        let mut new: HashMap<String, ProviderConfig> = HashMap::new();
-        new.insert("openai".into(), base_provider());
+        let old = cfg(None, HashMap::new());
+        let mut new = cfg(None, HashMap::new());
+        new.providers.insert("openai".into(), base_provider());
 
         let sync = coord.prepare_provider_sync(&old, &new).unwrap();
         assert_eq!(sync.added, vec!["openai"]);
@@ -951,9 +1059,9 @@ mod tests {
     #[test]
     fn prepare_sync_removed_provider() {
         let (coord, _config) = make_coordinator();
-        let mut old: HashMap<String, ProviderConfig> = HashMap::new();
-        old.insert("openai".into(), base_provider());
-        let new: HashMap<String, ProviderConfig> = HashMap::new();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("openai".into(), base_provider());
+        let new = cfg(None, HashMap::new());
 
         let sync = coord.prepare_provider_sync(&old, &new).unwrap();
         assert_eq!(sync.removed, vec!["openai"]);
@@ -967,8 +1075,9 @@ mod tests {
         let (coord, _config) = make_coordinator();
         let mut map: HashMap<String, ProviderConfig> = HashMap::new();
         map.insert("openai".into(), base_provider());
+        let both = cfg(None, map);
 
-        let sync = coord.prepare_provider_sync(&map, &map).unwrap();
+        let sync = coord.prepare_provider_sync(&both, &both).unwrap();
         assert!(sync.added.is_empty());
         assert!(sync.rebuilt.is_empty());
         assert!(sync.removed.is_empty());
@@ -978,12 +1087,12 @@ mod tests {
     #[test]
     fn prepare_sync_rebuild_on_adapter_config_change() {
         let (coord, _config) = make_coordinator();
-        let mut old: HashMap<String, ProviderConfig> = HashMap::new();
-        old.insert("openai".into(), base_provider());
-        let mut new: HashMap<String, ProviderConfig> = HashMap::new();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("openai".into(), base_provider());
+        let mut new = cfg(None, HashMap::new());
         let mut changed = base_provider();
         changed.base_url = "https://new.example.com".into();
-        new.insert("openai".into(), changed);
+        new.providers.insert("openai".into(), changed);
 
         let sync = coord.prepare_provider_sync(&old, &new).unwrap();
         assert_eq!(sync.rebuilt, vec!["openai"]);
@@ -995,16 +1104,16 @@ mod tests {
     #[test]
     fn prepare_sync_skip_rebuild_on_non_adapter_change() {
         let (coord, _config) = make_coordinator();
-        let mut old: HashMap<String, ProviderConfig> = HashMap::new();
-        old.insert("openai".into(), base_provider());
-        let mut new: HashMap<String, ProviderConfig> = HashMap::new();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("openai".into(), base_provider());
+        let mut new = cfg(None, HashMap::new());
         let mut changed = base_provider();
         changed.enabled = false;
         changed.model_overrides.insert(
             "gpt-4".into(),
             HashMap::from([("temperature".into(), serde_json::json!(0.5))]),
         );
-        new.insert("openai".into(), changed);
+        new.providers.insert("openai".into(), changed);
 
         let sync = coord.prepare_provider_sync(&old, &new).unwrap();
         assert!(sync.added.is_empty());
@@ -1016,14 +1125,192 @@ mod tests {
     #[test]
     fn prepare_sync_fails_on_empty_api_keys() {
         let (coord, _config) = make_coordinator();
-        let old: HashMap<String, ProviderConfig> = HashMap::new();
-        let mut new: HashMap<String, ProviderConfig> = HashMap::new();
+        let old = cfg(None, HashMap::new());
+        let mut new = cfg(None, HashMap::new());
         let mut bad = base_provider();
         bad.api_keys.clear();
-        new.insert("broken".into(), bad);
+        new.providers.insert("broken".into(), bad);
 
         let err = coord.prepare_provider_sync(&old, &new).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // ── effective_proxy_for tests ─────────────────────────────────────
+    //
+    // The resolution feeding every construction path: `proxy_mode` combined
+    // with the normalized global `proxy_url`.
+
+    fn proxy_cfg(proxy_url: Option<&str>) -> GatewayConfig {
+        cfg(proxy_url, HashMap::new())
+    }
+
+    #[test]
+    fn effective_proxy_default_mode_without_global_is_direct() {
+        // Legacy configs (no `proxy_url`, default `proxy_mode = inherit`)
+        // must resolve to a direct connection — never to a system proxy.
+        let config = proxy_cfg(None);
+        let pc = base_provider();
+        assert_eq!(effective_proxy_for(&config, &pc).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_proxy_inherit_uses_global() {
+        let config = proxy_cfg(Some("http://proxy.example:8080"));
+        let pc = base_provider();
+        let effective = effective_proxy_for(&config, &pc).unwrap().unwrap();
+        assert_eq!(effective.to_connect_url(), "http://proxy.example:8080");
+    }
+
+    #[test]
+    fn effective_proxy_blank_global_treated_as_none() {
+        // Empty / whitespace-only global values normalize to "no proxy".
+        let config = proxy_cfg(Some("   "));
+        let pc = base_provider();
+        assert_eq!(effective_proxy_for(&config, &pc).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_proxy_disabled_ignores_global() {
+        let config = proxy_cfg(Some("http://proxy.example:8080"));
+        let pc = disabled_provider();
+        assert_eq!(effective_proxy_for(&config, &pc).unwrap(), None);
+    }
+
+    #[test]
+    fn effective_proxy_enabled_uses_global() {
+        let config = proxy_cfg(Some("http://proxy.example:8080"));
+        let pc = enabled_provider();
+        let effective = effective_proxy_for(&config, &pc).unwrap().unwrap();
+        assert_eq!(effective.to_connect_url(), "http://proxy.example:8080");
+    }
+
+    #[test]
+    fn effective_proxy_enabled_without_global_is_error() {
+        let config = proxy_cfg(None);
+        let pc = enabled_provider();
+        let err = effective_proxy_for(&config, &pc).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+    }
+
+    #[test]
+    fn effective_proxy_malformed_global_is_error() {
+        let config = proxy_cfg(Some("http://user:pass@proxy.example"));
+        let pc = base_provider();
+        let err = effective_proxy_for(&config, &pc).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+    }
+
+    // ── proxy-driven rebuild diff tests ───────────────────────────────
+
+    #[test]
+    fn global_proxy_added_rebuilds_inherit_provider() {
+        let (coord, _config) = make_coordinator();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("openai".into(), base_provider());
+        let mut new = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        new.providers.insert("openai".into(), base_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        assert_eq!(sync.rebuilt, vec!["openai"]);
+    }
+
+    #[test]
+    fn global_proxy_url_change_rebuilds_inherit_and_enabled() {
+        let (coord, _config) = make_coordinator();
+        let mut old = cfg(Some("http://proxy-a.example:8080"), HashMap::new());
+        old.providers.insert("inherit".into(), base_provider());
+        old.providers.insert("forced".into(), enabled_provider());
+        let mut new = cfg(Some("http://proxy-b.example:8080"), HashMap::new());
+        new.providers.insert("inherit".into(), base_provider());
+        new.providers.insert("forced".into(), enabled_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        let mut rebuilt = sync.rebuilt.clone();
+        rebuilt.sort();
+        assert_eq!(rebuilt, vec!["forced", "inherit"]);
+    }
+
+    #[test]
+    fn global_proxy_change_does_not_rebuild_disabled() {
+        let (coord, _config) = make_coordinator();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("direct".into(), disabled_provider());
+        let mut new = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        new.providers.insert("direct".into(), disabled_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        assert!(sync.rebuilt.is_empty());
+        assert!(sync.added.is_empty());
+        assert!(sync.to_insert.is_empty());
+    }
+
+    #[test]
+    fn global_proxy_change_with_mixed_modes_rebuilds_only_affected() {
+        let (coord, _config) = make_coordinator();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("inherit".into(), base_provider());
+        old.providers.insert("direct".into(), disabled_provider());
+        let mut new = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        new.providers.insert("inherit".into(), base_provider());
+        new.providers.insert("direct".into(), disabled_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        assert_eq!(sync.rebuilt, vec!["inherit"]);
+        assert!(!sync.rebuilt.contains(&"direct".to_string()));
+    }
+
+    #[test]
+    fn proxy_mode_switch_rebuilds_even_when_effective_unchanged() {
+        // Inherit -> Disabled with no global proxy: the effective proxy is
+        // `None` on both sides, but the explicit mode switch must still
+        // rebuild the adapter.
+        let (coord, _config) = make_coordinator();
+        let mut old = cfg(None, HashMap::new());
+        old.providers.insert("openai".into(), base_provider());
+        let mut new = cfg(None, HashMap::new());
+        new.providers.insert("openai".into(), disabled_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        assert_eq!(sync.rebuilt, vec!["openai"]);
+    }
+
+    #[test]
+    fn proxy_mode_switch_inherit_to_enabled_with_global_rebuilds() {
+        let (coord, _config) = make_coordinator();
+        let mut old = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        old.providers.insert("openai".into(), base_provider());
+        let mut new = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        new.providers.insert("openai".into(), enabled_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        assert_eq!(sync.rebuilt, vec!["openai"]);
+    }
+
+    #[test]
+    fn new_provider_is_added_with_global_proxy_present() {
+        // A provider added while a global proxy is configured resolves under
+        // the new config without error and enters the insert set.
+        let (coord, _config) = make_coordinator();
+        let old = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        let mut new = cfg(Some("http://proxy.example:8080"), HashMap::new());
+        new.providers.insert("openai".into(), base_provider());
+
+        let sync = coord.prepare_provider_sync(&old, &new).unwrap();
+        assert_eq!(sync.added, vec!["openai"]);
+        assert_eq!(sync.to_insert.len(), 1);
+    }
+
+    #[test]
+    fn enabled_without_global_rejects_mutation() {
+        // A new provider in `enabled` mode with no global proxy cannot be
+        // satisfied: the sync must fail (config error), never unwrap/panic.
+        let (coord, _config) = make_coordinator();
+        let old = cfg(None, HashMap::new());
+        let mut new = cfg(None, HashMap::new());
+        new.providers.insert("forced".into(), enabled_provider());
+
+        let err = coord.prepare_provider_sync(&old, &new).unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
     }
 
     // ── Config read-guard / routes_version atomicity ──────────────────

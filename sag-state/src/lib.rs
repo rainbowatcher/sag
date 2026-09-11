@@ -484,12 +484,26 @@ impl AppState {
     ///
     /// The caller should pass the up-to-date [`ProviderConfig`] that was just
     /// written to `config.providers`; this avoids an extra config read lock.
+    ///
+    /// The effective proxy is resolved from the live gateway config (global
+    /// `proxy_url` + the provider's `proxy_mode`) — the same resolution every
+    /// other construction path uses — so the runtime adapter always follows
+    /// the configured proxy policy. Resolution errors are returned, never
+    /// unwrapped/panicked.
     pub async fn upsert_provider(
         &self,
         name: &str,
         config: &sag_config::ProviderConfig,
     ) -> sag_core::Result<()> {
-        match sag_providers::create_provider(name.to_string(), config) {
+        let effective = {
+            let cfg = self.config.read().await;
+            crate::config_mutation::effective_proxy_for(&cfg, config)?
+        };
+        match sag_providers::create_provider_with_proxy(
+            name.to_string(),
+            config,
+            effective.as_ref(),
+        ) {
             Ok(provider) => {
                 let mut providers = self.providers.write().await;
                 providers.insert(name.to_string(), provider);
@@ -592,6 +606,12 @@ pub mod testing {
     /// Build a provider registry from the given config handle, optionally
     /// filtering to only enabled providers. Returns the registry wrapped in
     /// an `Arc<RwLock<...>>` ready for [`test_app_state`].
+    ///
+    /// Adapters are constructed with their **effective proxy** (global
+    /// `proxy_url` + `proxy_mode`), mirroring the production construction
+    /// paths, so a test config carrying a global proxy yields a registry that
+    /// matches what the gateway would build. Configs without a proxy resolve
+    /// to explicit direct connections (the default).
     pub async fn build_provider_registry(
         handle: &ConfigHandle,
         only_enabled: bool,
@@ -600,8 +620,21 @@ pub mod testing {
         let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
         for (name, pc) in cfg_read.providers.iter() {
             if !only_enabled || pc.enabled {
-                let provider: Arc<dyn sag_providers::LlmProvider> =
-                    Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
+                let effective = {
+                    let global = cfg_read
+                        .normalized_global_proxy()
+                        .expect("test config global proxy must be valid");
+                    sag_config::resolve_effective_proxy(pc.proxy_mode, global.as_ref())
+                        .expect("test config proxy_mode must be satisfiable")
+                };
+                let provider: Arc<dyn sag_providers::LlmProvider> = Arc::new(
+                    sag_providers::OpenAiProvider::new_with_proxy(
+                        name.clone(),
+                        pc,
+                        effective.as_ref(),
+                    )
+                    .unwrap(),
+                );
                 registry.insert(name.clone(), provider);
             }
         }
