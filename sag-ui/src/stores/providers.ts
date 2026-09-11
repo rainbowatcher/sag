@@ -2,7 +2,7 @@ import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api } from "@/lib/client"
 import { getErrorMessage } from "@/lib/utils"
-import type { ModelTestResult, Provider } from "@/types/api"
+import type { ModelTestResult, Provider, ProxyMode } from "@/types/api"
 import { useConnectionStore } from "./connection"
 
 export interface FetchProvidersParams {
@@ -68,6 +68,7 @@ export const useProviderStore = defineStore("providers", () => {
     headers?: Record<string, string>
     provider_type?: string
     models_endpoint?: string
+    proxy_mode?: ProxyMode
   }) {
     upstreamModelsLoading.value = true
     upstreamModelsError.value = ""
@@ -112,6 +113,7 @@ export const useProviderStore = defineStore("providers", () => {
       base_url: string
       provider_type?: string
       headers?: Record<string, string>
+      proxy_mode?: ProxyMode
     },
   ) {
     return await testModelState.execute(model, async () => {
@@ -135,6 +137,7 @@ export const useProviderStore = defineStore("providers", () => {
     strip_fields?: string[]
     enabled_models?: string[]
     models_endpoint?: string
+    proxy_mode?: ProxyMode
   }) {
     try {
       await api.post("/api/providers", payload)
@@ -180,6 +183,7 @@ export const useProviderStore = defineStore("providers", () => {
       strip_fields?: string[]
       enabled_models?: string[]
       enabled?: boolean
+      proxy_mode?: ProxyMode
     },
   ) {
     try {

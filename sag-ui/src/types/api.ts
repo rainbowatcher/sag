@@ -1,3 +1,11 @@
+/**
+ * How a provider resolves the upstream HTTP proxy.
+ * - `inherit` — follow the gateway-level `proxy_url` (default).
+ * - `enabled` — force using the gateway-level `proxy_url`.
+ * - `disabled` — force a direct connection, ignoring any global proxy.
+ */
+export type ProxyMode = "inherit" | "enabled" | "disabled"
+
 export interface Provider {
   name: string
   api_keys: string[]
@@ -12,6 +20,20 @@ export interface Provider {
   model_overrides: Record<string, Record<string, any>>
   enabled_models: string[]
   enabled: boolean
+  /** How this provider resolves the upstream HTTP proxy. */
+  proxy_mode: ProxyMode
+}
+
+/** Gateway-level settings returned by `GET /api/settings`. */
+export interface Settings {
+  /** Global upstream HTTP proxy URL; `null` when none is configured. */
+  proxy_url: string | null
+}
+
+/** Payload of `PUT /api/settings` (same shape as `Settings`). */
+export interface UpdateSettingsPayload {
+  /** Empty string or `null` clears the global proxy. */
+  proxy_url: string | null
 }
 
 export interface ModelTestResult {

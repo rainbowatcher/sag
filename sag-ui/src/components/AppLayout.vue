@@ -5,6 +5,7 @@ import {
   GitBranch,
   BarChart3,
   ScrollText,
+  Settings,
   Wifi,
   WifiOff,
   Moon,
@@ -41,6 +42,7 @@ const navItems: NavItem[] = [
   { label: "Routes", path: "/routes", icon: GitBranch },
   { label: "Analytics", path: "/analytics", icon: BarChart3 },
   { label: "Logs", path: "/logs", icon: ScrollText },
+  { label: "Settings", path: "/settings", icon: Settings },
 ]
 </script>
 

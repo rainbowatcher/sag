@@ -21,6 +21,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
+import type { ProxyMode } from "@/types/api"
 
 const store = useProviderStore()
 
@@ -49,22 +50,42 @@ function defaultModelsEndpoint(providerType?: string) {
   return providerType === "anthropic" ? "v1/models" : "models"
 }
 
-function onFetchModels(endpoint: string) {
-  const parsedHeaders = headers.value.reduce(
+function parsedHeadersValue(): Record<string, string> {
+  return headers.value.reduce(
     (acc, h) => {
       if (h.key.trim() && h.value.trim()) acc[h.key.trim()] = h.value.trim()
       return acc
     },
     {} as Record<string, string>,
   )
+}
+
+function onFetchModels(endpoint: string) {
   store.fetchUpstreamModels({
     base_url: form.state.values.base_url,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    headers: parsedHeaders,
+    headers: parsedHeadersValue(),
     provider_type: form.state.values.provider_type,
     models_endpoint: endpoint,
+    proxy_mode: proxyMode.value,
   })
 }
+
+function onTestModel(model: string) {
+  store.testModelWithState(model, {
+    model,
+    api_keys: apiKeys.value.filter((k) => k.trim()),
+    base_url: form.state.values.base_url,
+    provider_type: form.state.values.provider_type,
+    headers: parsedHeadersValue(),
+    proxy_mode: proxyMode.value,
+  })
+}
+
+// ── Proxy mode ───────────────────────────────────────────────
+// Inherit (default) follows the gateway-level proxy_url; never reuse a
+// saved value — the form's current selection is always what gets sent.
+const proxyMode = ref<ProxyMode>("inherit")
 
 // ── KV pairs ─────────────────────────────────────────────────
 const headers = ref<{ key: string; value: string }[]>([])
@@ -108,15 +129,7 @@ const form = useForm({
       return
     }
 
-    const parsedHeaders = headers.value.reduce(
-      (acc, h) => {
-        if (h.key.trim() && h.value.trim()) {
-          acc[h.key.trim()] = h.value.trim()
-        }
-        return acc
-      },
-      {} as Record<string, string>,
-    )
+    const parsedHeaders = parsedHeadersValue()
 
     const parsedOverrides = bodyOverrides.value.reduce(
       (acc, h) => {
@@ -176,6 +189,7 @@ const form = useForm({
           modelsEndpoint.value !== defaultModelsEndpoint(value.provider_type)
             ? modelsEndpoint.value
             : undefined,
+        proxy_mode: proxyMode.value,
       })
 
       emit("created")
@@ -313,6 +327,27 @@ async function handleSubmit(event: Event) {
                 </Field>
               </form.Field>
             </div>
+
+            <div class="space-y-1">
+              <FieldLabel>Proxy Mode</FieldLabel>
+              <Select
+                :model-value="proxyMode"
+                @update:model-value="(v) => (proxyMode = v as ProxyMode)"
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="inherit">Inherit</SelectItem>
+                  <SelectItem value="enabled">Enabled</SelectItem>
+                  <SelectItem value="disabled">Disabled</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-muted-foreground text-xs">
+                How this provider resolves the upstream proxy. Inherit follows the gateway-level
+                proxy URL.
+              </p>
+            </div>
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
@@ -323,10 +358,12 @@ async function handleSubmit(event: Event) {
               :upstream-models="store.upstreamModels"
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
+              :model-test-states="store.testModelState.states"
               v-model:models-endpoint="modelsEndpoint"
               v-model:model-overrides="modelOverridesMap"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
+              @test-model="onTestModel"
             />
           </TabsContent>
 

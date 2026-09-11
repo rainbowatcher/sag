@@ -39,7 +39,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { Provider } from "@/types/api"
+import type { Provider, ProxyMode } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
@@ -83,6 +83,11 @@ const providerType = ref(props.provider.provider_type)
 const baseUrl = ref(props.provider.base_url)
 const timeoutSecs = ref(props.provider.timeout_secs)
 
+// ── Proxy mode ───────────────────────────────────────────────
+// Initialize from the saved provider; the current in-memory selection is
+// always what gets sent (explicitly, so switching back to inherit works).
+const proxyMode = ref<ProxyMode>(props.provider.proxy_mode ?? "inherit")
+
 // ── API keys ─────────────────────────────────────────────────
 const apiKeys = ref<string[]>([...props.provider.api_keys])
 const keyStrategy = ref<"fill_first" | "round_robin">(props.provider.key_strategy)
@@ -102,6 +107,7 @@ function onTestModel(model: string) {
     base_url: baseUrl.value,
     provider_type: providerType.value,
     headers: headersMap(),
+    proxy_mode: proxyMode.value,
   })
 }
 
@@ -146,6 +152,7 @@ function onFetchModels(endpoint: string) {
     headers: headersMap(),
     provider_type: providerType.value,
     models_endpoint: endpoint,
+    proxy_mode: proxyMode.value,
   })
 }
 
@@ -239,6 +246,10 @@ async function handleSubmit() {
       payload.models_endpoint = modelsEndpoint.value.trim() || undefined
     }
 
+    // Always send the current proxy mode — an explicit "inherit" is required
+    // to reset a provider that was saved as enabled/disabled.
+    payload.proxy_mode = proxyMode.value
+
     await store.updateProvider(props.provider.name, payload)
     toast.success(`Provider "${props.provider.name}" updated`)
     emit("updated")
@@ -325,6 +336,27 @@ async function handleSubmit() {
                 :model-value="timeoutSecs"
                 @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
               />
+            </div>
+
+            <div class="space-y-1">
+              <FieldLabel>Proxy Mode</FieldLabel>
+              <Select
+                :model-value="proxyMode"
+                @update:model-value="(v) => (proxyMode = v as ProxyMode)"
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="inherit">Inherit</SelectItem>
+                  <SelectItem value="enabled">Enabled</SelectItem>
+                  <SelectItem value="disabled">Disabled</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-muted-foreground text-xs">
+                How this provider resolves the upstream proxy. Inherit follows the gateway-level
+                proxy URL.
+              </p>
             </div>
           </TabsContent>
 
