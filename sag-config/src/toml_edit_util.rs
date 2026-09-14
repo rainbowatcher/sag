@@ -22,13 +22,14 @@
 //! callbacks keep the surface minimal: each call site writes the field-assign
 //! logic inline and never touches `Table`/`Item` directly.
 //!
-//! # When `on_create` can fail
+//! # When callbacks can fail
 //!
-//! `on_create` returns `Result<Item, AppError>` because the most common case
+//! `on_create` returns `Result` because the most common case
 //! (serializing a `serde::Serialize` value via `toml_edit::ser::to_document`)
-//! can fail. `on_update` returns `()` because it does in-place mutation
-//! (typically a series of `item["key"] = value;` assignments) which cannot
-//! fail in practice.
+//! can fail. `on_update` also returns `Result` so that fallible value
+//! converters nested inside an update (e.g. `json_to_toml_value`, which
+//! rejects JSON `null`) can abort the save before the atomic write —
+//! infallible call sites simply return `Ok(())`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -192,11 +193,11 @@ pub fn upsert_table<F, G>(
 ) -> Result<(), AppError>
 where
     F: FnOnce() -> Result<Item, AppError>,
-    G: FnOnce(&mut Item),
+    G: FnOnce(&mut Item) -> Result<(), AppError>,
 {
     match navigate_mut(doc.as_item_mut(), path) {
         Some(existing) => {
-            on_update(existing);
+            on_update(existing)?;
             Ok(())
         }
         None => {
@@ -234,7 +235,7 @@ pub fn sync_array_of_tables<T, K, FC, FU>(
 where
     K: Fn(&T) -> &str,
     FC: Fn(&T) -> Result<Table, AppError>,
-    FU: Fn(&mut Table, &T),
+    FU: Fn(&mut Table, &T) -> Result<(), AppError>,
 {
     assert!(!path.is_empty(), "path must be non-empty");
 
@@ -319,7 +320,7 @@ where
         match position_by_key.get(key).copied() {
             Some(pos) => {
                 let existing = arr.get_mut(pos).expect("position was just indexed");
-                on_update(existing, item);
+                on_update(existing, item)?;
             }
             None => {
                 let new_table = on_create(item)?;
@@ -398,9 +399,9 @@ where
 ///     &route.targets,
 ///     &["provider", "real_model"],                                 // composite key
 ///     |t| vec![Some(t.provider.clone()), t.real_model.clone()],    // in-memory key
-///     |t| build_new_target(t),
-///     |existing, t| write_target_fields(existing, t),
-/// );
+///     |t| build_new_target(t),         // returns Result<InlineTable, AppError>
+///     |existing, t| write_target_fields(existing, t), // returns Result<(), AppError>
+/// )?;
 /// ```
 pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
     array: &mut Array,
@@ -409,10 +410,11 @@ pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
     key_fn: K,
     on_create: FC,
     on_update: FU,
-) where
+) -> Result<(), AppError>
+where
     K: Fn(&T) -> Vec<Option<String>>,
-    FC: Fn(&T) -> InlineTable,
-    FU: Fn(&mut InlineTable, &T),
+    FC: Fn(&T) -> Result<InlineTable, AppError>,
+    FU: Fn(&mut InlineTable, &T) -> Result<(), AppError>,
 {
     assert!(
         !key_fields.is_empty(),
@@ -461,14 +463,14 @@ pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
         match position_by_key.get(&key).copied() {
             Some(pos) => {
                 if let Some(existing) = array.get_mut(pos).and_then(|v| v.as_inline_table_mut()) {
-                    on_update(existing, item);
+                    on_update(existing, item)?;
                 }
                 // If the indexed entry is somehow no longer an inline
                 // table, silently skip the update — the retain pass
                 // below will drop it as a defensive measure.
             }
             None => {
-                let new_table = on_create(item);
+                let new_table = on_create(item)?;
                 array.push(Value::InlineTable(new_table));
             }
         }
@@ -486,6 +488,7 @@ pub fn sync_inline_table_array_in_place<T, K, FC, FU>(
     });
 
     format_array_multiline(array);
+    Ok(())
 }
 
 /// Read a composite key from an inline-table entry: for each name in
@@ -648,6 +651,11 @@ pub fn sync_string_array_in_place(array: &mut Array, in_memory: &[String]) {
 /// function work with any value type (e.g. `serde_json::Value`,
 /// `String`).
 ///
+/// The converter is fallible so that validation-gap errors (e.g. a
+/// JSON `null` reaching `json_to_toml_value` despite upstream checks)
+/// abort the save instead of panicking or writing a corrupted file.
+/// Infallible converters wrap their result in `Ok`.
+///
 /// # Behavior
 ///
 /// - Existing keys are iterated in their on-disk order. Each is either
@@ -657,12 +665,16 @@ pub fn sync_string_array_in_place(array: &mut Array, in_memory: &[String]) {
 ///   the end in **sorted** order for determinism. (Sorted, not in-memory
 ///   order, because `HashMap` iteration is non-deterministic; the user
 ///   can't rely on insertion order at this layer.)
+/// - On converter error, the function returns `Err` immediately. The
+///   partially-mutated table is discarded by the caller's error path —
+///   the save function never renders/renames after an error.
 pub fn sync_inline_table_in_place<V, F>(
     existing: &mut InlineTable,
     in_memory: &std::collections::HashMap<String, V>,
     to_toml_value: F,
-) where
-    F: Fn(&V) -> Value,
+) -> Result<(), AppError>
+where
+    F: Fn(&V) -> Result<Value, AppError>,
 {
     // Step 1: snapshot existing keys (in on-disk order) before mutating.
     let existing_keys: Vec<String> = existing.iter().map(|(k, _)| k.to_string()).collect();
@@ -678,7 +690,7 @@ pub fn sync_inline_table_in_place<V, F>(
     // preserves position).
     for key in &existing_keys {
         if let Some(value) = in_memory.get(key) {
-            existing.insert(key, to_toml_value(value));
+            existing.insert(key, to_toml_value(value)?);
         }
     }
 
@@ -689,8 +701,9 @@ pub fn sync_inline_table_in_place<V, F>(
         .collect();
     new_keys.sort();
     for key in new_keys {
-        existing.insert(key, to_toml_value(&in_memory[key]));
+        existing.insert(key, to_toml_value(&in_memory[key])?);
     }
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -792,6 +805,7 @@ jitter = true
             },
             |_| {
                 update_called = true;
+                Ok(())
             },
         )
         .unwrap();
@@ -819,6 +833,7 @@ base_ms = 100
             |item| {
                 update_called = true;
                 item["base_ms"] = toml_edit::value(200i64);
+                Ok(())
             },
         )
         .unwrap();
@@ -851,6 +866,7 @@ extra_field = "untouched"
             || unreachable!(),
             |item| {
                 item["base_ms"] = toml_edit::value(200i64);
+                Ok(())
             },
         )
         .unwrap();
@@ -902,7 +918,7 @@ extra_field = "untouched"
             &items,
             |(k, _)| k.as_str(),
             |(_, v)| make_table(v),
-            |_, _| {},
+            |_, _| Ok(()),
         )
         .unwrap();
         let s = doc.to_string();
@@ -954,6 +970,7 @@ strategy = "fill_first"
             |_| unreachable!("on_create should not fire for existing entry"),
             |existing, (_, _)| {
                 existing["strategy"] = toml_edit::value("round_robin");
+                Ok(())
             },
         )
         .unwrap();
@@ -979,7 +996,7 @@ model_name = "gpt-4"
             &items,
             |(k, _)| k.as_str(),
             |(_, v)| make_table(v),
-            |_, _| {},
+            |_, _| Ok(()),
         )
         .unwrap();
         let s = doc.to_string();
@@ -1009,7 +1026,7 @@ model_name = "gemini"
             &items,
             |(k, _)| k.as_str(),
             |_| unreachable!(),
-            |_, _| {},
+            |_, _| Ok(()),
         )
         .unwrap();
         let s = doc.to_string();
@@ -1040,6 +1057,7 @@ strategy = "fill_first"
             |_| unreachable!(),
             |existing, (_, _)| {
                 existing["strategy"] = toml_edit::value("round_robin");
+                Ok(())
             },
         )
         .unwrap();
@@ -1105,6 +1123,7 @@ strategy = "fill_first"
             |(_, v)| make_table(v),
             |existing, (_, _)| {
                 existing.insert("strategy", toml_edit::value("round_robin"));
+                Ok(())
             },
         )
         .unwrap();
@@ -1128,10 +1147,10 @@ strategy = "fill_first"
         (provider.to_string(), provider.to_string())
     }
 
-    fn build_target_table((_, v): &(String, String)) -> InlineTable {
+    fn build_target_table((_, v): &(String, String)) -> Result<InlineTable, AppError> {
         let mut t = InlineTable::new();
         t.insert("provider", Value::from(v.as_str()));
-        t
+        Ok(t)
     }
 
     #[test]
@@ -1144,8 +1163,9 @@ strategy = "fill_first"
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
             build_target_table,
-            |_, _| {},
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let s = arr.to_string();
         assert!(s.contains("provider = \"openai\""));
         assert!(s.contains("provider = \"anthropic\""));
@@ -1170,8 +1190,10 @@ targets = [
             |_| unreachable!("on_create should not fire for existing entry"),
             |existing, (_, priority)| {
                 existing.insert("priority", Value::from(*priority));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         let s = doc.to_string();
         assert!(s.contains("priority = 10"));
         assert!(!s.contains("priority = 5"));
@@ -1196,8 +1218,10 @@ targets = [
             build_target_table,
             |existing, (provider, _)| {
                 existing.insert("provider", Value::from(provider.as_str()));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         let s = doc.to_string();
         assert!(s.contains("provider = \"openai\""));
         assert!(s.contains("provider = \"anthropic\""));
@@ -1222,8 +1246,9 @@ targets = [
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
             |_| unreachable!(),
-            |_, _| {},
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let s = doc.to_string();
         assert!(s.contains("provider = \"openai\""));
         assert!(!s.contains("anthropic"));
@@ -1250,8 +1275,10 @@ targets = [
             |_| unreachable!(),
             |existing, (_, priority)| {
                 existing.insert("priority", Value::from(*priority));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         let s = doc.to_string();
         assert!(s.contains("# Comment for openai target"));
         assert!(s.contains("priority = 10"));
@@ -1278,8 +1305,10 @@ targets = [
                 // Only update priority; temperature and other fields should
                 // be preserved.
                 existing.insert("priority", Value::from(*priority));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         let s = doc.to_string();
         assert!(s.contains("priority = 10"));
         assert!(s.contains("temperature = 0.7"));
@@ -1304,8 +1333,9 @@ targets = [
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
             build_target_table,
-            |_, _| {},
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let s = arr.to_string();
         assert!(!s.contains("42"), "non-inline-table item should be removed");
         assert!(s.contains("openai"));
@@ -1319,13 +1349,15 @@ targets = [
         // be inferred — the closures are never called (the function panics
         // before reaching them) but Rust still needs to resolve them.
         let items: Vec<(String, String)> = vec![];
-        sync_inline_table_array_in_place(
+        // `let _ =` silences `unused_must_use`: the function panics on the
+        // empty `key_fields` assert before any Result is produced.
+        let _ = sync_inline_table_array_in_place(
             &mut arr,
             &items,
             &[],
             |_| unreachable!(),
             |_| unreachable!(),
-            |_, _| {},
+            |_, _| Ok(()),
         );
     }
 
@@ -1360,8 +1392,10 @@ targets = [
             |_| unreachable!(),
             |existing, (_, _)| {
                 existing.insert("priority", Value::from(7i64));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
 
         // After sync, every entry should still be present, in REVERSE
         // order (preserved by the position map), with priority updated
@@ -1416,8 +1450,10 @@ targets = [
             |_| unreachable!("on_create should not fire — all keys exist on disk"),
             |existing, (_, _, priority)| {
                 existing.insert("priority", Value::from(*priority));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         // Drop the mutable borrow on `doc` before re-borrowing it for
         // `doc.to_string()`. Use the array length now (last use of `arr`)
         // so the borrow ends cleanly here.
@@ -1470,8 +1506,10 @@ targets = [
             |_| unreachable!("on_create should not fire — both keys distinguishable on disk"),
             |existing, (_, _, priority)| {
                 existing.insert("priority", Value::from(*priority));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         // Drop the mutable borrow on `doc` from `arr` before re-borrowing
         // it for `doc.to_string()`. Use the array length now (last use)
         // so the borrow ends cleanly here.
@@ -1517,8 +1555,9 @@ targets = [
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
             |_| unreachable!(),
-            |_, _| {},
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let s = arr.to_string();
         assert!(
             !s.contains('\n'),
@@ -1552,8 +1591,9 @@ targets = [
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
             |_| unreachable!(),
-            |_, _| {},
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let s = arr.to_string();
         assert!(
             s.contains('\n'),
@@ -1585,8 +1625,10 @@ targets = [
             |_| unreachable!(),
             |existing, (_, priority)| {
                 existing.insert("priority", Value::from(*priority));
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         let s = arr.to_string();
         assert!(s.contains('\n'), "should be multi-line");
         // Trailing comma: last item should have `},` before the closing
@@ -1616,8 +1658,9 @@ targets = [
             &["provider"],
             |(k, _)| vec![Some(k.clone())],
             |_| unreachable!(),
-            |_, _| {},
-        );
+            |_, _| Ok(()),
+        )
+        .unwrap();
         let s = doc.to_string();
         assert!(
             s.contains('\n'),

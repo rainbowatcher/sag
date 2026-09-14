@@ -124,6 +124,7 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
             item["jitter"] = toml_edit::value(config.backoff.jitter);
             item["retry_on_empty_response"] =
                 toml_edit::value(config.backoff.retry_on_empty_response);
+            Ok(())
         },
     )?;
 
@@ -235,7 +236,10 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), sag_core::AppError> {
 /// order. This means the user's comments and ordering are kept across
 /// saves — previously these were rebuilt from scratch via `HashMap`
 /// iteration, which lost comments and produced non-deterministic output.
-fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfig) {
+fn update_existing_provider(
+    item: &mut toml_edit::Item,
+    provider: &ProviderConfig,
+) -> Result<(), sag_core::AppError> {
     // The `item` is a provider sub-table (a `&mut Item` whose value is a
     // `Table`). We resolve it to `&mut Table` once and use it
     // consistently — `toml_edit`'s `Table` type does not have an
@@ -302,8 +306,8 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
     } else {
         let headers = ensure_inline_table_field(table, "headers");
         sync_inline_table_in_place(headers, &provider.headers, |v| {
-            toml_edit::Value::from(v.as_str())
-        });
+            Ok(toml_edit::Value::from(v.as_str()))
+        })?;
     }
     // model_overrides — inline table keyed by model name; remove
     // key entirely if empty. Saved as inline-table syntax (like
@@ -334,7 +338,7 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
                 mo_inline.remove(model);
             } else {
                 let model_table = ensure_nested_inline_table(mo_inline, model);
-                sync_inline_table_in_place(model_table, overrides, json_to_toml_value);
+                sync_inline_table_in_place(model_table, overrides, json_to_toml_value)?;
             }
         }
     }
@@ -342,7 +346,7 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
         table.remove("body_overrides");
     } else {
         let body_overrides = ensure_inline_table_field(table, "body_overrides");
-        sync_inline_table_in_place(body_overrides, &provider.body_overrides, json_to_toml_value);
+        sync_inline_table_in_place(body_overrides, &provider.body_overrides, json_to_toml_value)?;
     }
     // strip_fields — string array; remove if empty
     if provider.strip_fields.is_empty() {
@@ -401,11 +405,12 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
     } else {
         let rm = ensure_inline_table_field(table, "role_mappings");
         sync_inline_table_in_place(rm, &provider.role_mappings, |v| {
-            toml_edit::Value::from(v.as_str())
-        });
+            Ok(toml_edit::Value::from(v.as_str()))
+        })?;
     }
     // anthropic_cache_control — always write (no skip_serializing_if)
     table["anthropic_cache_control"] = toml_edit::value(provider.anthropic_cache_control);
+    Ok(())
 }
 
 /// Update fields of an existing route's TOML sub-table (a single
@@ -423,7 +428,10 @@ fn update_existing_provider(item: &mut toml_edit::Item, provider: &ProviderConfi
 /// `real_model`s differ (e.g. `[{ provider="openai", real_model="gpt-4"
 /// }, { provider="openai", real_model="gpt-3.5-turbo" }]`); matching
 /// on `provider` alone would silently confuse the two on save.
-fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
+fn write_route_fields(
+    existing: &mut toml_edit::Table,
+    route: &RouteConfig,
+) -> Result<(), sag_core::AppError> {
     // model_name — always written
     existing["model_name"] = toml_edit::value(route.model_name.as_str());
 
@@ -479,7 +487,7 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
         |t| vec![Some(t.provider.clone()), t.real_model.clone()],
         build_target_table,
         write_target_fields,
-    );
+    )?;
 
     // Multi-line layout (`[\n    { ... },\n    { ... }\n]`) for
     // inline-table arrays is handled natively by `toml_edit` 0.24.1
@@ -487,16 +495,17 @@ fn write_route_fields(existing: &mut toml_edit::Table, route: &RouteConfig) {
     // `sync_inline_table_array_in_place` — no string-level
     // post-processing is needed.
     // the payload and skips).
+    Ok(())
 }
 
 /// Build a brand-new `InlineTable` for a route target. Used by
 /// `write_route_fields` for the `on_create` closure of the inline-table
 /// array sync. For the update path, [`write_target_fields`] is called
 /// directly on the existing inline table.
-fn build_target_table(target: &RouteTarget) -> toml_edit::InlineTable {
+fn build_target_table(target: &RouteTarget) -> Result<toml_edit::InlineTable, sag_core::AppError> {
     let mut new_table = toml_edit::InlineTable::new();
-    write_target_fields(&mut new_table, target);
-    new_table
+    write_target_fields(&mut new_table, target)?;
+    Ok(new_table)
 }
 
 /// Update fields of an existing route target's inline table in place.
@@ -505,7 +514,10 @@ fn build_target_table(target: &RouteTarget) -> toml_edit::InlineTable {
 /// are preserved. The `extra` map is synced via
 /// [`toml_edit_util::sync_inline_table_in_place`] to preserve the user's
 /// on-disk key ordering inside the nested `extra = { ... }` table.
-fn write_target_fields(existing: &mut toml_edit::InlineTable, target: &RouteTarget) {
+fn write_target_fields(
+    existing: &mut toml_edit::InlineTable,
+    target: &RouteTarget,
+) -> Result<(), sag_core::AppError> {
     // provider — always written (insert preserves position if the key
     // already exists, so the user's ordering is retained).
     existing.insert("provider", toml_edit::Value::from(target.provider.as_str()));
@@ -545,8 +557,9 @@ fn write_target_fields(existing: &mut toml_edit::InlineTable, target: &RouteTarg
         existing.remove("extra");
     } else {
         let extra_table = ensure_nested_inline_table(existing, "extra");
-        sync_inline_table_in_place(extra_table, &target.extra, json_to_toml_value);
+        sync_inline_table_in_place(extra_table, &target.extra, json_to_toml_value)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
