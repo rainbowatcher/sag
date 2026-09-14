@@ -41,6 +41,7 @@ use crate::rollup;
 use sag_core::{AppError, FinalStatus, TargetStatus};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
+use uuid::Uuid;
 
 /// Single-transaction fact writer over a shared SQLite pool.
 ///
@@ -113,7 +114,7 @@ impl EventWriter {
     /// 3. `INSERT INTO request_results ... ON CONFLICT(request_id)
     ///    DO NOTHING` — `rows_affected() == 0` (only reachable in a
     ///    concurrent-writer race past the check above) skips the attempt
-    ///    inserts;
+    ///    inserts and late-fact dirty-hour marking;
     /// 4. insert every `target_attempts` row (each target identity resolved
     ///    or created additively, including passthrough dynamic registration)
     ///    with `ON CONFLICT(request_id, target_id) DO NOTHING` — the
@@ -136,190 +137,247 @@ impl EventWriter {
         validate(&event)?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
-        // `BEGIN IMMEDIATE`: take the write lock up front instead of a
-        // deferred BEGIN that upgrades mid-transaction (which can fail
-        // with SQLITE_BUSY_SNAPSHOT under concurrent writers on the same
-        // file in WAL mode). The busy_timeout covers the wait.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| AppError::Internal(format!("event write begin: {e}")))?;
+        let mut tx = begin_write(&self.pool).await?;
 
         // Strict no-op for duplicates: a request that already landed must
         // not touch identity state (active / last_seen) or any fact row.
-        let already_written: i64 =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM request_results WHERE request_id = ?)")
-                .bind(event.result.request_id.to_string())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| AppError::Internal(format!("event write idempotency check: {e}")))?;
-        if already_written != 0 {
+        if already_written(&mut tx, &event).await? {
             return Ok(());
         }
 
-        // Additive identity resolution: create if missing, never refresh
-        // existing rows (config sync is the authority on active/last_seen).
-        let route_id = match event.result.route_name.as_deref() {
-            Some(name) => Some(registry::resolve_or_create_route(&mut tx, name, now_ms).await?),
-            None => None,
-        };
+        let route_id = resolve_route_id(&mut tx, &event, now_ms).await?;
+        let inserted = insert_request_result(&mut tx, &event, route_id).await?;
 
-        // request_results — idempotent by request_id.
+        // A concurrent-writer no-op (`rows_affected() == 0`) means no *new*
+        // fact landed — skip attempt inserts and late-fact marking.
+        if inserted {
+            insert_target_attempts(&mut tx, &event, route_id, now_ms).await?;
+            mark_dirty_hours(&mut tx, &event, now_ms).await?;
+        }
+
+        commit(tx).await
+    }
+}
+
+/// Open the single write transaction for one event.
+///
+/// `BEGIN IMMEDIATE`: take the write lock up front instead of a
+/// deferred BEGIN that upgrades mid-transaction (which can fail
+/// with SQLITE_BUSY_SNAPSHOT under concurrent writers on the same
+/// file in WAL mode). The busy_timeout covers the wait.
+async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, AppError> {
+    pool.begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| AppError::Internal(format!("event write begin: {e}")))
+}
+
+/// Idempotency gate: true when `request_id` already landed in
+/// `request_results`.
+async fn already_written(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &AnalyticsEvent,
+) -> sag_core::Result<bool> {
+    let exists: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM request_results WHERE request_id = ?)")
+            .bind(event.result.request_id.to_string())
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("event write idempotency check: {e}")))?;
+    Ok(exists != 0)
+}
+
+/// Additive identity resolution for the request route: create if missing,
+/// never refresh existing rows (config sync is the authority on
+/// active/last_seen). Route-less statuses (`no_route` / `client_error`)
+/// keep `route_id` NULL.
+async fn resolve_route_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &AnalyticsEvent,
+    now_ms: i64,
+) -> sag_core::Result<Option<Uuid>> {
+    match event.result.route_name.as_deref() {
+        Some(name) => Ok(Some(
+            registry::resolve_or_create_route(tx, name, now_ms).await?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Persist the `request_results` row (idempotent by `request_id`).
+/// Returns whether this call actually inserted a new row — `false` is a
+/// concurrent-writer race past the idempotency check.
+async fn insert_request_result(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &AnalyticsEvent,
+    route_id: Option<Uuid>,
+) -> sag_core::Result<bool> {
+    let (prompt_tokens, completion_tokens, total_tokens) =
+        token_tuple(is_success(&event.result.final_status), &event.result.usage);
+    let result = sqlx::query(
+        r#"
+        INSERT INTO request_results (
+            request_id, route_id, final_status, failure_reason, requested_model,
+            actual_model, stream, started_at, completed_at, duration_ms,
+            prompt_tokens, completion_tokens, total_tokens,
+            cached_tokens, cache_creation_tokens, ttft_ms, upstream_duration_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(request_id) DO NOTHING
+        "#,
+    )
+    .bind(event.result.request_id.to_string())
+    .bind(route_id.map(|id| id.to_string()))
+    .bind(final_status_str(event.result.final_status))
+    .bind(event.result.failure_reason.map(|r| r.as_str()))
+    .bind(&event.result.requested_model)
+    .bind(actual_model(event))
+    .bind(event.result.stream as i32)
+    .bind(event.result.started_at.timestamp_millis())
+    .bind(event.result.completed_at.timestamp_millis())
+    .bind(duration_ms(
+        event.result.completed_at,
+        event.result.started_at,
+    ))
+    .bind(prompt_tokens)
+    .bind(completion_tokens)
+    .bind(total_tokens)
+    .bind(
+        event
+            .result
+            .cached_tokens
+            .filter(|_| is_success(&event.result.final_status))
+            .map(|v| v as i64),
+    )
+    .bind(
+        event
+            .result
+            .cache_creation_tokens
+            .filter(|_| is_success(&event.result.final_status))
+            .map(|v| v as i64),
+    )
+    .bind(event.result.ttft_ms.map(|v| v as i64))
+    .bind(event.result.upstream_duration_ms.map(|v| v as i64))
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Internal(format!("event write request_results: {e}")))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Persist every `target_attempts` row. No-op for an empty `targets` list.
+///
+/// Only route-bearing events can carry attempts (enforced by `validate`);
+/// a valid `no_route` / `client_error` event has no targets and succeeds
+/// with `route_id` NULL instead.
+async fn insert_target_attempts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &AnalyticsEvent,
+    route_id: Option<Uuid>,
+    now_ms: i64,
+) -> sag_core::Result<()> {
+    if event.targets.is_empty() {
+        return Ok(());
+    }
+
+    let route_id = route_id.ok_or_else(|| {
+        AppError::Internal(
+            "event write: target attempts require a resolved route (validation missed it)"
+                .to_string(),
+        )
+    })?;
+
+    for attempt in &event.targets {
+        let target_id = registry::resolve_or_create_target(
+            tx,
+            route_id,
+            &attempt.provider,
+            &attempt.real_model,
+            now_ms,
+        )
+        .await?;
+
         let (prompt_tokens, completion_tokens, total_tokens) =
-            token_tuple(is_success(&event.result.final_status), &event.result.usage);
-        let result = sqlx::query(
+            token_tuple(attempt.status == TargetStatus::Success, &attempt.usage);
+        sqlx::query(
             r#"
-            INSERT INTO request_results (
-                request_id, route_id, final_status, failure_reason, requested_model,
-                actual_model, stream, started_at, completed_at, duration_ms,
+            INSERT INTO target_attempts (
+                request_id, target_id, route_id, actual_model, status,
+                failure_reason, stream,
+                started_at, completed_at, duration_ms,
                 prompt_tokens, completion_tokens, total_tokens,
-                cached_tokens, cache_creation_tokens, ttft_ms, upstream_duration_ms
+                cached_tokens, ttft_ms, upstream_duration_ms
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(request_id) DO NOTHING
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id, target_id) DO NOTHING
             "#,
         )
         .bind(event.result.request_id.to_string())
-        .bind(route_id.map(|id| id.to_string()))
-        .bind(final_status_str(event.result.final_status))
-        .bind(event.result.failure_reason.map(|r| r.as_str()))
-        .bind(&event.result.requested_model)
-        .bind(actual_model(&event))
+        .bind(target_id.to_string())
+        .bind(route_id.to_string())
+        .bind(&attempt.real_model)
+        .bind(target_status_str(attempt.status))
+        .bind(attempt.failure_reason.map(|r| r.as_str()))
         .bind(event.result.stream as i32)
-        .bind(event.result.started_at.timestamp_millis())
-        .bind(event.result.completed_at.timestamp_millis())
-        .bind(duration_ms(
-            event.result.completed_at,
-            event.result.started_at,
-        ))
+        .bind(attempt.started_at.timestamp_millis())
+        .bind(attempt.completed_at.timestamp_millis())
+        .bind(duration_ms(attempt.completed_at, attempt.started_at))
         .bind(prompt_tokens)
         .bind(completion_tokens)
         .bind(total_tokens)
         .bind(
-            event
-                .result
+            attempt
                 .cached_tokens
-                .filter(|_| is_success(&event.result.final_status))
+                .filter(|_| attempt.status == TargetStatus::Success)
                 .map(|v| v as i64),
         )
-        .bind(
-            event
-                .result
-                .cache_creation_tokens
-                .filter(|_| is_success(&event.result.final_status))
-                .map(|v| v as i64),
-        )
-        .bind(event.result.ttft_ms.map(|v| v as i64))
-        .bind(event.result.upstream_duration_ms.map(|v| v as i64))
-        .execute(&mut *tx)
+        .bind(attempt.ttft_ms.map(|v| v as i64))
+        .bind(attempt.upstream_duration_ms.map(|v| v as i64))
+        .execute(&mut **tx)
         .await
-        .map_err(|e| AppError::Internal(format!("event write request_results: {e}")))?;
-
-        if result.rows_affected() > 0 && !event.targets.is_empty() {
-            // Only route-bearing events can carry attempts (enforced by
-            // `validate`); a valid `no_route` / `client_error` event has no
-            // targets and succeeds with `route_id` NULL instead.
-            let route_id = route_id.ok_or_else(|| {
-                AppError::Internal(
-                    "event write: target attempts require a resolved route (validation missed it)"
-                        .to_string(),
-                )
-            })?;
-
-            for attempt in &event.targets {
-                let target_id = registry::resolve_or_create_target(
-                    &mut tx,
-                    route_id,
-                    &attempt.provider,
-                    &attempt.real_model,
-                    now_ms,
-                )
-                .await?;
-
-                let (prompt_tokens, completion_tokens, total_tokens) =
-                    token_tuple(attempt.status == TargetStatus::Success, &attempt.usage);
-                sqlx::query(
-                    r#"
-                    INSERT INTO target_attempts (
-                        request_id, target_id, route_id, actual_model, status,
-                        failure_reason, stream,
-                        started_at, completed_at, duration_ms,
-                        prompt_tokens, completion_tokens, total_tokens,
-                        cached_tokens, ttft_ms, upstream_duration_ms
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(request_id, target_id) DO NOTHING
-                    "#,
-                )
-                .bind(event.result.request_id.to_string())
-                .bind(target_id.to_string())
-                .bind(route_id.to_string())
-                .bind(&attempt.real_model)
-                .bind(target_status_str(attempt.status))
-                .bind(attempt.failure_reason.map(|r| r.as_str()))
-                .bind(event.result.stream as i32)
-                .bind(attempt.started_at.timestamp_millis())
-                .bind(attempt.completed_at.timestamp_millis())
-                .bind(duration_ms(attempt.completed_at, attempt.started_at))
-                .bind(prompt_tokens)
-                .bind(completion_tokens)
-                .bind(total_tokens)
-                .bind(
-                    attempt
-                        .cached_tokens
-                        .filter(|_| attempt.status == TargetStatus::Success)
-                        .map(|v| v as i64),
-                )
-                .bind(attempt.ttft_ms.map(|v| v as i64))
-                .bind(attempt.upstream_duration_ms.map(|v| v as i64))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| AppError::Internal(format!("event write target_attempts: {e}")))?;
-            }
-        }
-
-        // Late-fact marking: a newly committed fact whose UTC hour bucket is
-        // already `completed` makes that bucket's rollup rows stale, so mark
-        // the hour `dirty = 1` in the *same* transaction — the next rollup
-        // round recomputes it. Only `completed` buckets are touched:
-        // pending / processing / failed pick the fact up when computed, and
-        // hours with no state row must not be created here (the rollup
-        // startup scan registers hours with facts itself). Skipped entirely
-        // when the request_results insert was a concurrent-writer no-op
-        // (`rows_affected() == 0`): no *new* fact landed, nothing is stale.
-        if result.rows_affected() > 0 {
-            let mut hours = Vec::new();
-            hours.push(
-                (event.result.completed_at.timestamp_millis() / rollup::HOUR_MS) * rollup::HOUR_MS,
-            );
-            for attempt in &event.targets {
-                hours.push(
-                    (attempt.completed_at.timestamp_millis() / rollup::HOUR_MS) * rollup::HOUR_MS,
-                );
-            }
-            hours.sort_unstable();
-            hours.dedup();
-            for hour in hours {
-                sqlx::query(
-                    "UPDATE rollup_bucket_state SET dirty = 1, updated_at = ? \
-                     WHERE hour = ? AND state = 'completed'",
-                )
-                .bind(now_ms)
-                .bind(hour)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("event write mark dirty hour={hour}: {e}"))
-                })?;
-            }
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Internal(format!("event write commit: {e}")))?;
-        Ok(())
+        .map_err(|e| AppError::Internal(format!("event write target_attempts: {e}")))?;
     }
+    Ok(())
+}
+
+/// Late-fact marking: a newly committed fact whose UTC hour bucket is
+/// already `completed` makes that bucket's rollup rows stale, so mark
+/// the hour `dirty = 1` in the *same* transaction — the next rollup
+/// round recomputes it. Only `completed` buckets are touched:
+/// pending / processing / failed pick the fact up when computed, and
+/// hours with no state row must not be created here (the rollup
+/// startup scan registers hours with facts itself).
+async fn mark_dirty_hours(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &AnalyticsEvent,
+    now_ms: i64,
+) -> sag_core::Result<()> {
+    let mut hours = Vec::new();
+    hours.push((event.result.completed_at.timestamp_millis() / rollup::HOUR_MS) * rollup::HOUR_MS);
+    for attempt in &event.targets {
+        hours.push((attempt.completed_at.timestamp_millis() / rollup::HOUR_MS) * rollup::HOUR_MS);
+    }
+    hours.sort_unstable();
+    hours.dedup();
+    for hour in hours {
+        sqlx::query(
+            "UPDATE rollup_bucket_state SET dirty = 1, updated_at = ? \
+             WHERE hour = ? AND state = 'completed'",
+        )
+        .bind(now_ms)
+        .bind(hour)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("event write mark dirty hour={hour}: {e}")))?;
+    }
+    Ok(())
+}
+
+async fn commit(tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> sag_core::Result<()> {
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("event write commit: {e}")))?;
+    Ok(())
 }
 
 /// Whether SQLite would resolve `dsn` to an in-memory (or otherwise
