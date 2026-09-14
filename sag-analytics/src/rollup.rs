@@ -681,15 +681,7 @@ impl RollupEngine {
     /// histograms, then `completed` (dirty cleared). Any error rolls back
     /// everything and leaves the previous rollup rows untouched.
     async fn compute_bucket(&self, hour: i64) -> sag_core::Result<()> {
-        // `BEGIN IMMEDIATE`: take the write lock up front instead of a
-        // deferred BEGIN that upgrades mid-transaction (which can fail
-        // with SQLITE_BUSY_SNAPSHOT under concurrent fact writes in WAL
-        // mode). The busy_timeout covers the wait.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup begin hour={hour}: {e}")))?;
+        let mut tx = begin_compute(&self.pool, hour).await?;
 
         let global = global_agg(&mut tx, hour).await?;
         let routes = route_aggs(&mut tx, hour).await?;
@@ -697,165 +689,13 @@ impl RollupEngine {
         let hist_rows = collect_histograms(&mut tx, hour).await?;
 
         // Full replace: recompute is idempotent and never accumulates.
-        sqlx::query("DELETE FROM rollup_global_hourly WHERE hour = ?")
-            .bind(hour)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup delete global hour={hour}: {e}")))?;
-        sqlx::query(
-            r#"
-            INSERT INTO rollup_global_hourly (
-                hour, requests, success, client_error, no_route, all_disabled, model_failure,
-                client_cancelled, prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-                cache_creation_tokens, cached_known_count, cached_hit_count,
-                prompt_tokens_cached_known, e2e_count, e2e_sum_ms, ttft_count, ttft_sum_ms,
-                upstream_count, upstream_sum_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(hour)
-        .bind(global.requests)
-        .bind(global.success)
-        .bind(global.client_error)
-        .bind(global.no_route)
-        .bind(global.all_disabled)
-        .bind(global.model_failure)
-        .bind(global.client_cancelled)
-        .bind(global.prompt_tokens)
-        .bind(global.completion_tokens)
-        .bind(global.total_tokens)
-        .bind(global.cached_tokens)
-        .bind(global.cache_creation_tokens)
-        .bind(global.cached_known_count)
-        .bind(global.cached_hit_count)
-        .bind(global.prompt_tokens_cached_known)
-        .bind(global.e2e_count)
-        .bind(global.e2e_sum_ms)
-        .bind(global.ttft_count)
-        .bind(global.ttft_sum_ms)
-        .bind(global.upstream_count)
-        .bind(global.upstream_sum_ms)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(format!("rollup upsert global hour={hour}: {e}")))?;
+        replace_global_hourly(&mut tx, hour, &global).await?;
+        replace_route_hourly(&mut tx, hour, &routes).await?;
+        replace_target_hourly(&mut tx, hour, &targets).await?;
+        replace_latency_hist(&mut tx, hour, &hist_rows).await?;
 
-        sqlx::query("DELETE FROM rollup_route_hourly WHERE hour = ?")
-            .bind(hour)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup delete route hour={hour}: {e}")))?;
-        for r in &routes {
-            sqlx::query(
-                r#"
-                INSERT INTO rollup_route_hourly (
-                    hour, route_id, requests, success, model_failure, all_disabled,
-                    client_cancelled, prompt_tokens, completion_tokens, total_tokens,
-                    cached_tokens, cached_known_count, cached_hit_count,
-                    prompt_tokens_cached_known, e2e_count, e2e_sum_ms, ttft_count, ttft_sum_ms,
-                    upstream_count, upstream_sum_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(hour)
-            .bind(&r.route_id)
-            .bind(r.requests)
-            .bind(r.success)
-            .bind(r.model_failure)
-            .bind(r.all_disabled)
-            .bind(r.client_cancelled)
-            .bind(r.prompt_tokens)
-            .bind(r.completion_tokens)
-            .bind(r.total_tokens)
-            .bind(r.cached_tokens)
-            .bind(r.cached_known_count)
-            .bind(r.cached_hit_count)
-            .bind(r.prompt_tokens_cached_known)
-            .bind(r.e2e_count)
-            .bind(r.e2e_sum_ms)
-            .bind(r.ttft_count)
-            .bind(r.ttft_sum_ms)
-            .bind(r.upstream_count)
-            .bind(r.upstream_sum_ms)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup upsert route hour={hour}: {e}")))?;
-        }
-
-        sqlx::query("DELETE FROM rollup_target_hourly WHERE hour = ?")
-            .bind(hour)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup delete target hour={hour}: {e}")))?;
-        for t in &targets {
-            sqlx::query(
-                r#"
-                INSERT INTO rollup_target_hourly (
-                    hour, target_id, attempts, success, failure, cancelled, prompt_tokens,
-                    completion_tokens, total_tokens, cached_tokens, cached_known_count,
-                    cached_hit_count, prompt_tokens_cached_known, e2e_count, e2e_sum_ms,
-                    ttft_count, ttft_sum_ms, upstream_count, upstream_sum_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(hour)
-            .bind(&t.target_id)
-            .bind(t.attempts)
-            .bind(t.success)
-            .bind(t.failure)
-            .bind(t.cancelled)
-            .bind(t.prompt_tokens)
-            .bind(t.completion_tokens)
-            .bind(t.total_tokens)
-            .bind(t.cached_tokens)
-            .bind(t.cached_known_count)
-            .bind(t.cached_hit_count)
-            .bind(t.prompt_tokens_cached_known)
-            .bind(t.e2e_count)
-            .bind(t.e2e_sum_ms)
-            .bind(t.ttft_count)
-            .bind(t.ttft_sum_ms)
-            .bind(t.upstream_count)
-            .bind(t.upstream_sum_ms)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup upsert target hour={hour}: {e}")))?;
-        }
-
-        sqlx::query("DELETE FROM rollup_latency_hist WHERE hour = ?")
-            .bind(hour)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup delete hist hour={hour}: {e}")))?;
-        for h in &hist_rows {
-            sqlx::query(
-                "INSERT INTO rollup_latency_hist (hour, scope, owner_id, dim, bucket_idx, count) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(hour)
-            .bind(&h.scope)
-            .bind(&h.owner_id)
-            .bind(&h.dim)
-            .bind(h.bucket_idx)
-            .bind(h.count)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup upsert hist hour={hour}: {e}")))?;
-        }
-
-        sqlx::query(
-            "UPDATE rollup_bucket_state SET state = 'completed', dirty = 0, updated_at = ? \
-             WHERE hour = ?",
-        )
-        .bind(now_ms())
-        .bind(hour)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(format!("rollup mark completed hour={hour}: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Internal(format!("rollup commit hour={hour}: {e}")))?;
-        Ok(())
+        mark_bucket_completed(&mut tx, hour).await?;
+        commit_compute(tx, hour).await
     }
 
     /// Mark a claimed bucket `failed` (retryable). Called outside the
@@ -880,6 +720,227 @@ impl RollupEngine {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Open the single recompute transaction for one bucket.
+///
+/// `BEGIN IMMEDIATE`: take the write lock up front instead of a deferred
+/// BEGIN that upgrades mid-transaction (which can fail with
+/// SQLITE_BUSY_SNAPSHOT under concurrent fact writes in WAL mode). The
+/// busy_timeout covers the wait.
+async fn begin_compute(
+    pool: &SqlitePool,
+    hour: i64,
+) -> sag_core::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup begin hour={hour}: {e}")))
+}
+
+/// Full replace of `rollup_global_hourly` for one hour (DELETE + INSERT).
+async fn replace_global_hourly(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour: i64,
+    global: &GlobalRollupRow,
+) -> sag_core::Result<()> {
+    sqlx::query("DELETE FROM rollup_global_hourly WHERE hour = ?")
+        .bind(hour)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup delete global hour={hour}: {e}")))?;
+    sqlx::query(
+        r#"
+        INSERT INTO rollup_global_hourly (
+            hour, requests, success, client_error, no_route, all_disabled, model_failure,
+            client_cancelled, prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+            cache_creation_tokens, cached_known_count, cached_hit_count,
+            prompt_tokens_cached_known, e2e_count, e2e_sum_ms, ttft_count, ttft_sum_ms,
+            upstream_count, upstream_sum_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(hour)
+    .bind(global.requests)
+    .bind(global.success)
+    .bind(global.client_error)
+    .bind(global.no_route)
+    .bind(global.all_disabled)
+    .bind(global.model_failure)
+    .bind(global.client_cancelled)
+    .bind(global.prompt_tokens)
+    .bind(global.completion_tokens)
+    .bind(global.total_tokens)
+    .bind(global.cached_tokens)
+    .bind(global.cache_creation_tokens)
+    .bind(global.cached_known_count)
+    .bind(global.cached_hit_count)
+    .bind(global.prompt_tokens_cached_known)
+    .bind(global.e2e_count)
+    .bind(global.e2e_sum_ms)
+    .bind(global.ttft_count)
+    .bind(global.ttft_sum_ms)
+    .bind(global.upstream_count)
+    .bind(global.upstream_sum_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Internal(format!("rollup upsert global hour={hour}: {e}")))?;
+    Ok(())
+}
+
+/// Full replace of `rollup_route_hourly` for one hour (DELETE + loop INSERT).
+async fn replace_route_hourly(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour: i64,
+    routes: &[RouteRollupRow],
+) -> sag_core::Result<()> {
+    sqlx::query("DELETE FROM rollup_route_hourly WHERE hour = ?")
+        .bind(hour)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup delete route hour={hour}: {e}")))?;
+    for r in routes {
+        sqlx::query(
+            r#"
+            INSERT INTO rollup_route_hourly (
+                hour, route_id, requests, success, model_failure, all_disabled,
+                client_cancelled, prompt_tokens, completion_tokens, total_tokens,
+                cached_tokens, cached_known_count, cached_hit_count,
+                prompt_tokens_cached_known, e2e_count, e2e_sum_ms, ttft_count, ttft_sum_ms,
+                upstream_count, upstream_sum_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(hour)
+        .bind(&r.route_id)
+        .bind(r.requests)
+        .bind(r.success)
+        .bind(r.model_failure)
+        .bind(r.all_disabled)
+        .bind(r.client_cancelled)
+        .bind(r.prompt_tokens)
+        .bind(r.completion_tokens)
+        .bind(r.total_tokens)
+        .bind(r.cached_tokens)
+        .bind(r.cached_known_count)
+        .bind(r.cached_hit_count)
+        .bind(r.prompt_tokens_cached_known)
+        .bind(r.e2e_count)
+        .bind(r.e2e_sum_ms)
+        .bind(r.ttft_count)
+        .bind(r.ttft_sum_ms)
+        .bind(r.upstream_count)
+        .bind(r.upstream_sum_ms)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup upsert route hour={hour}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Full replace of `rollup_target_hourly` for one hour (DELETE + loop INSERT).
+async fn replace_target_hourly(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour: i64,
+    targets: &[TargetRollupRow],
+) -> sag_core::Result<()> {
+    sqlx::query("DELETE FROM rollup_target_hourly WHERE hour = ?")
+        .bind(hour)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup delete target hour={hour}: {e}")))?;
+    for t in targets {
+        sqlx::query(
+            r#"
+            INSERT INTO rollup_target_hourly (
+                hour, target_id, attempts, success, failure, cancelled, prompt_tokens,
+                completion_tokens, total_tokens, cached_tokens, cached_known_count,
+                cached_hit_count, prompt_tokens_cached_known, e2e_count, e2e_sum_ms,
+                ttft_count, ttft_sum_ms, upstream_count, upstream_sum_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(hour)
+        .bind(&t.target_id)
+        .bind(t.attempts)
+        .bind(t.success)
+        .bind(t.failure)
+        .bind(t.cancelled)
+        .bind(t.prompt_tokens)
+        .bind(t.completion_tokens)
+        .bind(t.total_tokens)
+        .bind(t.cached_tokens)
+        .bind(t.cached_known_count)
+        .bind(t.cached_hit_count)
+        .bind(t.prompt_tokens_cached_known)
+        .bind(t.e2e_count)
+        .bind(t.e2e_sum_ms)
+        .bind(t.ttft_count)
+        .bind(t.ttft_sum_ms)
+        .bind(t.upstream_count)
+        .bind(t.upstream_sum_ms)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup upsert target hour={hour}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Full replace of `rollup_latency_hist` for one hour (DELETE + loop INSERT).
+async fn replace_latency_hist(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour: i64,
+    hist_rows: &[HistogramRow],
+) -> sag_core::Result<()> {
+    sqlx::query("DELETE FROM rollup_latency_hist WHERE hour = ?")
+        .bind(hour)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup delete hist hour={hour}: {e}")))?;
+    for h in hist_rows {
+        sqlx::query(
+            "INSERT INTO rollup_latency_hist (hour, scope, owner_id, dim, bucket_idx, count) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(hour)
+        .bind(&h.scope)
+        .bind(&h.owner_id)
+        .bind(&h.dim)
+        .bind(h.bucket_idx)
+        .bind(h.count)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup upsert hist hour={hour}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Mark the bucket `completed` with `dirty` cleared, inside the compute
+/// transaction.
+async fn mark_bucket_completed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour: i64,
+) -> sag_core::Result<()> {
+    sqlx::query(
+        "UPDATE rollup_bucket_state SET state = 'completed', dirty = 0, updated_at = ? \
+         WHERE hour = ?",
+    )
+    .bind(now_ms())
+    .bind(hour)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Internal(format!("rollup mark completed hour={hour}: {e}")))?;
+    Ok(())
+}
+
+/// Commit the bucket recompute transaction.
+async fn commit_compute(
+    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour: i64,
+) -> sag_core::Result<()> {
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("rollup commit hour={hour}: {e}")))?;
+    Ok(())
 }
 
 /// Global per-hour aggregate over `request_results` (one row, even for an
