@@ -136,8 +136,9 @@ setup:
 tree:
     find . -not -path './target/*' -not -path './sag-ui/node_modules/*' -not -path './.git/*' -not -name '*.db*' | head -120
 
-# 升级 Rust + npm 项目版本号：`just bump-version minor`（支持 major/minor/patch，
-# 及 --dry-run 预览、--npm 指定 package.json）
+# 升级 Rust + npm 项目版本号并自动提交：`just bump minor`
+# （major/minor/patch；升级后自动 git commit "chore: release vX.Y.Z"，不推送，
+# 只提交本次升级文件；--dry-run 预览、--no-commit 跳过提交、--npm 指定 package.json）
 bump *args:
     python3 scripts/bump-version.py {{ args }}
 

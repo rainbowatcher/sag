@@ -2,7 +2,7 @@
 """bump-version.py — 递归升级 Rust + npm 项目文件版本号。
 
 用法:
-  python3 scripts/bump-version.py major|minor|patch [--dry-run] [--npm PATH ...]
+  python3 scripts/bump-version.py major|minor|patch [--dry-run] [--no-commit] [--npm PATH ...]
 
 升级对象:
   - Rust: 递归发现的所有 Cargo.toml（跳过 target/、node_modules/ 等），
@@ -13,6 +13,10 @@
     可通过 --npm 追加/替换。
 
 语义: 按 semver 递增指定段并清零低位段，丢弃 pre-release / build 后缀。
+
+提交: 升级完成后自动执行 `git commit -m "chore: release vX.Y.Z"`，
+只提交本次升级改动的文件（不推送、不碰其他工作区变更）；
+--dry-run / --no-commit 可跳过提交。不传升级段则打印 help。
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -178,13 +183,19 @@ def main() -> int:
     )
     parser.add_argument(
         "kind",
+        nargs="?",
         choices=("major", "minor", "patch"),
-        help="升级方式: major / minor / patch",
+        help="升级方式: major / minor / patch（必传；不传则打印本帮助）",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="只打印将发生的变更，不写文件",
+        help="只打印将发生的变更，不写文件、不提交",
+    )
+    parser.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="升级后跳过自动 git commit（默认会提交 chore: release vX.Y.Z）",
     )
     parser.add_argument(
         "--npm",
@@ -200,6 +211,10 @@ def main() -> int:
         help=f"项目根目录（默认: {REPO_ROOT}）",
     )
     args = parser.parse_args()
+
+    if args.kind is None:
+        parser.print_help()
+        return 0
 
     root = args.root.resolve()
     if not root.is_dir():
@@ -280,6 +295,35 @@ def main() -> int:
     if lock_changed:
         lock_rel = lock.relative_to(root)
         print(f"  {lock_rel}: 同步 {lock_changed} 个 crate 的 version")
+
+    # ── 自动提交 ────────────────────────────────────────────────────
+    release_version = changes[0][2]
+    message = f"chore: release v{release_version}"
+    commit_files = [str(rel) for rel, _, _ in changes]
+    if lock_changed:
+        commit_files.append(str(lock.relative_to(root)))
+
+    if args.dry_run:
+        print(f"将提交: {message}（{len(commit_files)} 个文件）")
+        return 0
+    if args.no_commit:
+        print(f"[INFO] --no-commit 指定，跳过自动提交: {message}")
+        return 0
+
+    print(f"提交: {message}")
+    print(f"  文件: {' '.join(commit_files)}")
+    # `git commit -- <paths>` 只用 worktree 内容提交这些路径，
+    # 不触碰其他暂存/未暂存变更；也不会推送。
+    proc = subprocess.run(
+        ["git", "-C", str(root), "commit", "-m", message, "--", *commit_files],
+        capture_output=True,
+        text=True,
+    )
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.returncode != 0:
+        print(f"[ERR] git commit 失败:\n{proc.stderr.strip()}", file=sys.stderr)
+        return 1
     return 0
 
 
