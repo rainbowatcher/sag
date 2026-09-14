@@ -168,7 +168,35 @@ impl GatewayConfig {
         let mut errors: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
-        // ── Server validation ──
+        self.validate_server(&mut errors);
+        self.validate_analytics(&mut errors);
+        self.validate_gateway_auth(&mut errors);
+        let normalized_global_proxy = self.validate_proxy(&mut errors);
+        // The empty-map check is emitted here, before circuit-breaker and
+        // backoff errors, to preserve the historical error-vector order;
+        // the per-provider entry checks run later via `validate_providers`.
+        if self.providers.is_empty() {
+            errors.push("at least one provider is required".into());
+        }
+        self.validate_circuit_breaker(&mut errors);
+        self.validate_backoff(&mut errors, &mut warnings);
+        self.validate_providers(normalized_global_proxy.as_ref(), &mut errors, &mut warnings);
+        self.validate_routes(&mut errors, &mut warnings);
+
+        // Log warnings
+        for w in &warnings {
+            tracing::warn!("configuration warning: {w}");
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// ── Server validation ──
+    fn validate_server(&self, errors: &mut Vec<String>) {
         if self.server.host.trim().is_empty() {
             errors.push("server.host must not be empty".into());
         }
@@ -181,8 +209,10 @@ impl GatewayConfig {
                 "server address '{server_addr}' is not a valid socket address (must be IP:port)"
             ));
         }
+    }
 
-        // ── Analytics validation ──
+    /// ── Analytics validation ──
+    fn validate_analytics(&self, errors: &mut Vec<String>) {
         if let Some(ref analytics) = self.analytics
             && analytics.enabled
             && !analytics.storage_dsn.starts_with("sqlite://")
@@ -191,8 +221,10 @@ impl GatewayConfig {
             errors
                 .push("analytics.storage_dsn must start with 'sqlite://' or be ':memory:'".into());
         }
+    }
 
-        // ── Gateway auth validation ──
+    /// ── Gateway auth validation ──
+    fn validate_gateway_auth(&self, errors: &mut Vec<String>) {
         if let Some(ref auth) = self.gateway_auth
             && auth.api_keys.is_empty()
         {
@@ -200,31 +232,30 @@ impl GatewayConfig {
                 "gateway_auth.api_keys must not be empty when authentication is configured".into(),
             );
         }
+    }
 
-        // ── Proxy validation ──
-        // A malformed top-level `proxy_url` is a configuration error; a
-        // whitespace-only value normalizes to `None` and is fine. The
-        // normalized global proxy is also the single source of truth for
-        // whether a usable global proxy exists: `Some("")`,
-        // `Some("   ")` and invalid URLs all resolve to `None` here, so
-        // an `enabled` provider is correctly rejected for all of them —
-        // not just for a literal `None`.
-        let normalized_global_proxy = match self.normalized_global_proxy() {
+    /// ── Proxy validation ──
+    ///
+    /// Returns the normalized global proxy for later provider checks.
+    /// A malformed top-level `proxy_url` is a configuration error; a
+    /// whitespace-only value normalizes to `None` and is fine. The
+    /// normalized global proxy is also the single source of truth for
+    /// whether a usable global proxy exists: `Some("")`,
+    /// `Some("   ")` and invalid URLs all resolve to `None` here, so
+    /// an `enabled` provider is correctly rejected for all of them —
+    /// not just for a literal `None`.
+    fn validate_proxy(&self, errors: &mut Vec<String>) -> Option<ProxyConfig> {
+        match self.normalized_global_proxy() {
             Ok(proxy) => proxy,
             Err(e) => {
                 errors.push(format!("proxy_url: {e}"));
                 None
             }
-        };
-
-        // ── Providers validation ──
-        let provider_names: HashSet<&str> = self.providers.keys().map(String::as_str).collect();
-
-        if self.providers.is_empty() {
-            errors.push("at least one provider is required".into());
         }
+    }
 
-        // ── Circuit breaker validation ──
+    /// ── Circuit breaker validation ──
+    fn validate_circuit_breaker(&self, errors: &mut Vec<String>) {
         if self.circuit_breaker.quota_exhausted_secs == 0 {
             errors.push("circuit_breaker.quota_exhausted_secs must be greater than 0".into());
         }
@@ -237,7 +268,10 @@ impl GatewayConfig {
         if self.circuit_breaker.probe_interval_secs == 0 {
             errors.push("circuit_breaker.probe_interval_secs must be greater than 0".into());
         }
+    }
 
+    /// ── Backoff validation ──
+    fn validate_backoff(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
         if self.backoff.retries > 10 {
             warnings.push(format!(
                 "global retries={} seems unusually high",
@@ -245,7 +279,6 @@ impl GatewayConfig {
             ));
         }
 
-        // ── Backoff validation ──
         if self.backoff.base_ms == 0 {
             errors.push("backoff.base_ms must be greater than 0".into());
         }
@@ -255,7 +288,15 @@ impl GatewayConfig {
                 self.backoff.max_ms, self.backoff.base_ms
             ));
         }
+    }
 
+    /// ── Providers validation (per-provider entry checks) ──
+    fn validate_providers(
+        &self,
+        normalized_global_proxy: Option<&ProxyConfig>,
+        errors: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+    ) {
         for (name, provider) in &self.providers {
             if provider.api_keys.is_empty() {
                 errors.push(format!("provider '{name}': api_keys must not be empty"));
@@ -324,8 +365,12 @@ impl GatewayConfig {
                 ));
             }
         }
+    }
 
-        // ── Routes validation ──
+    /// ── Routes validation (including wildcard-not-last checks) ──
+    fn validate_routes(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+        let provider_names: HashSet<&str> = self.providers.keys().map(String::as_str).collect();
+
         if self.routes.is_empty() {
             warnings.push(
                 "no routes configured; the gateway will not handle any /v1/chat/completions requests"
@@ -463,17 +508,6 @@ impl GatewayConfig {
                     self.routes[after_idx].model_name
                 ));
             }
-        }
-
-        // Log warnings
-        for w in &warnings {
-            tracing::warn!("configuration warning: {w}");
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
         }
     }
 }
