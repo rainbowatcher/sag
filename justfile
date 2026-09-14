@@ -136,6 +136,11 @@ setup:
 tree:
     find . -not -path './target/*' -not -path './sag-ui/node_modules/*' -not -path './.git/*' -not -name '*.db*' | head -120
 
+# 升级 Rust + npm 项目版本号：`just bump-version minor`（支持 major/minor/patch，
+# 及 --dry-run 预览、--npm 指定 package.json）
+bump *args:
+    python3 scripts/bump-version.py {{ args }}
+
 # ── 测试环境 (test-env) ─────────────────────────────────────────────────
 
 # 转发到 scripts/test-env.py：`just test-env start` / `stop` / `restart` / `status`
