@@ -149,12 +149,13 @@ green。`expired` 的 amber 与 `pinned` 的 green 视觉区分度低，且颜�
 
 1. `fill_first`（`fill` 存在且无 sticky）→ `bg-emerald-500`（保持）
 2. 其余按首项判定分流（先判 `isActiveFirstTarget`，再按状态取色）：
-   - 命中 route.targets 原顺序首项 → `expired` 用 `bg-green-500/40`（灰绿）、`pinned` 用 `bg-green-500`
+   - 命中 route 最高优先级（primary）target → `expired` 用 `bg-green-500/40`（灰绿）、`pinned` 用 `bg-green-500`
    - 非首项 / 无法确认 → `expired` 用 `bg-orange-500/40`（灰橙）、`pinned` 用 `bg-orange-500`
 
 首项判定 `isActiveFirstTarget` 用后端 `ActiveTargetDto.target_index`：DTO 每 route.targets 一个，
-`target_index` 是该 target 在原始 `route.targets` 数组中的 0-based 索引（与 `priority` 无关），
-`target_index === 0` 即命中 route 配置首项。权威来源在后端——前端不依赖响应顺序、对象身份或
+`target_index` 是该 target 在 route 优先级降序排序中的秩（stable sort by `priority` 降序，同
+优先级保持原始数组顺序，rank 0 = 最高优先级 target），`target_index === 0` 即命中 route 的
+最高优先级（primary）target。权威来源在后端——前端不依赖响应顺序、对象身份或
 `real_model` 字符串。
 
 - ✅ 语义清晰：绿 = 首选目标在吸收流量、橙 = 已落到 fallback、灰绿/灰橙 = pin 已过期（muted 保留
@@ -162,14 +163,14 @@ green。`expired` 的 amber 与 `pinned` 的 green 视觉区分度低，且颜�
 - ✅ `expired` 只表示 pin 超过 `sticky_failover_reset_secs` 未更新，**不等同于当前实际承载流量**；
   灰绿/灰橙的 muted 色既表达「过期」又保留「配置位置」信息，比统一灰更可读
 - ✅ 为什么不比 `real_model` 字段：passthrough 与显式 target 可能解析出相同 `real_model`（如 exact
-  route passthrough 解析为 route 名），字段比较无法区分；`target_index` 由后端按配置数组位置直接
+  route passthrough 解析为 route 名），字段比较无法区分；`target_index` 由后端按优先级降序秩直接
   给出，天然精确
 - ✅ 保守方向：`target_index` 缺失（旧后端）或非 0 时返回 `false` → 渲染橙色（`pinned` 橙或
   `expired` 灰橙）而非绿色，绝不误报绿
 - ❌ 备选「按 real_model 字符串比较」被否：会在 passthrough 解析与显式 target 同名时误报首项绿
 - ❌ 备选「前端按响应顺序 + 对象身份判定」（早期实现）被否：依赖 store 保持响应顺序与 DTO 对象
-  身份，脆弱且无法跨请求比对；改由后端 DTO 直接携带 `target_index`（0-based 原始 route.targets
-  索引）作为权威来源
+  身份，脆弱且无法跨请求比对；改由后端 DTO 直接携带 `target_index`（优先级降序秩，rank 0 =
+  最高优先级 target）作为权威来源
 
 #### 非 StickyFailover 路由不展示 sticky 残留 pin
 
@@ -220,7 +221,7 @@ hot-reload（`sag-gateway/src/main.rs` `GatewayReloadHandler`，含 unstable-fil
 
 - `DELETE /api/active-targets` 按 model 解析 route strategy：**所有策略**都执行 `active_targets.clear(model)`（清除跨策略残留 pin + bump generation/epoch），FillFirst 路由额外 `fill_first_orders.remove(model)`（下次请求重新洗牌）；两者都不触碰 `circuit_breaker`（grep: 无 `circuit_breaker` 引用）
 - GET 只对 `Strategy::StickyFailover` 路由匹配 `active_targets`：FillFirst / RoundRobin 路由的残留 pin 报 `idle`（不展示 pinned/expired），见 `list_active_targets` 的 strategy 分支（测试 `fill_first_route_ignores_stale_active_targets_entry` 断言）
-- 每 route × target 一个 DTO，`target_index` 为该 target 在原始 `route.targets` 数组中的 0-based 索引（与 `priority` 无关），GET/DELETE 语义不依赖它（仅前端判首项用）
+- 每 route × target 一个 DTO，`target_index` 为该 target 在 route 优先级降序排序中的秩（stable sort by `priority` 降序，同优先级保持原始数组顺序，rank 0 = 最高优先级 target）；响应 `targets` 数组本身保持原始 config 顺序不变，GET/DELETE 语义不依赖它（仅前端判首项用）
 - FillFirst 的 DELETE 与 sticky 的 DELETE 互不干扰：fill-first 分支额外清 order cache，sticky 分支不动 `fill_first_orders`（测试 `delete_fill_first_resets_order_cache_and_clears_stale_pin` / `delete_sticky_does_not_touch_fill_first_cache` 断言隔离）
 - route CRUD（create/update/delete）与 gateway hot-reload（含 unstable-file fallback retry 成功路径）成功后立即 prune：`admin_routes.rs` 调 `retain_sticky_routes`，`main.rs` `GatewayReloadHandler` 调 `prune_stale_entries`；不等待下一 dispatch 的 `routes_version` 检查
 - `active_targets` 的 key 是 model，value 是 `(provider, real_model, Instant)`；entry 的 `age_secs = recorded_at.elapsed().as_secs()`（grep: `recorded_at.elapsed().as_secs()`）
@@ -235,14 +236,15 @@ hot-reload（`sag-gateway/src/main.rs` `GatewayReloadHandler`，含 unstable-fil
 - `ActiveTargetEntry` 字段与后端 serde 输出一致（snake_case：`age_secs` / `expired`），仿 `CircuitBreakerEntry` 风格
 - 401 一律走 `useConnectionStore().handle401()`（与 `circuitBreaker.ts` 一致）
 - 状态圆点着色（`activeTargetDotColor`）：fill_first 恒 emerald；sticky `expired` 按配置位置 muted（首项 `bg-green-500/40`、非首项/无法确认 `bg-orange-500/40`）——`expired` 只表示过期 pin 的配置位置，不等同于当前实际承载流量；sticky `pinned` 命中首项 green、非首项/无法确认 orange；无 active 时返回 `null` 不渲染圆点
-- `isActiveFirstTarget` 用后端 `target_index === 0` 判首项（权威来源在 DTO，0-based 原始 `route.targets` 索引）；`target_index` 缺失（旧后端）或非 0 返回 `false`，渲染橙色而非绿色
+- `isActiveFirstTarget` 用后端 `target_index === 0` 判首项（权威来源在 DTO，`target_index` 是优先级降序秩，0 = 最高优先级 target）；`target_index` 缺失（旧后端）或非 0 返回 `false`，渲染橙色而非绿色
 
 ## 测试策略
 
 ### 后端 `sag-admin/src/admin_active_targets.rs`（内联 `#[cfg(test)] mod tests`）
 
 - `no_routes_returns_empty_array` / `all_route_targets_are_idle_when_active_map_empty` — 空态返回 200 与 `targets: []`、全 idle
-- `target_index_mirrors_route_targets_array_order` — `target_index` 取自 route.targets 数组位置（与 priority 无关），pin 后仍报其配置数组索引
+- `target_index_follows_priority_order` — `target_index` 是优先级降序秩（priorities [10,20,0] → target_index [1,0,2]，rank 0 = 最高优先级 target），pin 后仍报其优先级秩
+- `target_index_stable_for_equal_priorities` — 全部默认优先级 0 时 stable sort 保持数组顺序，`target_index` 等于数组位置（行为与旧语义一致）
 - `pinned_and_expired_statuses` — 手动写入 active_targets 后 GET 报 `pinned`/`expired`，`age_secs` 用范围断言防秒边界 flaky
 - `orphan_active_entries_without_route_target_are_not_listed` — 无对应 route target 的孤儿 entry 不进响应（响应以 config routes 为纲）
 - `delete_removes_target_and_bumps_generation_idempotently` — 首次 DELETE 移除 + bump generation；无 entry 的 DELETE bump 全局 epoch；重复 DELETE 仍 200
@@ -274,6 +276,8 @@ hot-reload（`sag-gateway/src/main.rs` `GatewayReloadHandler`，含 unstable-fil
 - `oxlint` 通过（`pnpm lint`）
 
 ## 变更记录
+
+- [0006 target_index 改为优先级降序秩](changes/0006-target-index-priority-rank.md)
 
 - [0005 target_index 权威首项判定与策略切换残留清理](changes/0005-target-index-and-strategy-switch-cleanup.md)
 

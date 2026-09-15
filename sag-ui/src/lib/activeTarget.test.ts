@@ -8,11 +8,13 @@ import {
   selectFillFirstTarget,
 } from "./activeTarget.ts"
 
-// Boundary tests for the active-target "first target" / status-dot logic.
+// Boundary tests for the active-target "primary target" / status-dot logic.
 // The backend `/api/active-targets` emits one DTO per config target, in
-// config order, each carrying its 0-based `target_index` — the source of
-// truth for "did the pin land on the route's first target". These tests
-// exercise the index-based discrimination against those shapes.
+// config order, each carrying its 0-based `target_index` — the target's rank
+// in the route's priority-sorted order (priority descending, ties keep array
+// order), the source of truth for "did the pin land on the route's
+// highest-priority (primary) target". These tests exercise the index-based
+// discrimination against those shapes.
 
 function target(provider: string, realModel: string | null): RouteConfig["targets"][number] {
   return { provider, real_model: realModel, priority: 0 }
@@ -57,7 +59,7 @@ function entry(
     target_index: 0,
     status: "pinned",
   })
-  assert.equal(isActiveFirstTarget(first), true, "target_index 0 is the first target")
+  assert.equal(isActiveFirstTarget(first), true, "target_index 0 is the highest-priority target")
   assert.equal(activeTargetDotColor(first, undefined), "bg-green-500")
 
   const fallback = entry({
@@ -70,7 +72,7 @@ function entry(
   assert.equal(isActiveFirstTarget(fallback), false, "target_index 1 is a fallback")
   assert.equal(activeTargetDotColor(fallback, undefined), "bg-orange-500")
 
-  // A later config position is equally non-first.
+  // A lower-priority rank is equally non-primary.
   assert.equal(
     isActiveFirstTarget(entry({ model: "gpt-4o", target_index: 2, status: "pinned" })),
     false,
@@ -111,7 +113,7 @@ function entry(
   assert.equal(
     isActiveFirstTarget(expiredFirst),
     true,
-    "index is independent of expiry (expired pins keep their config position)",
+    "index is independent of expiry (expired pins keep their priority rank)",
   )
   assert.equal(activeTargetDotColor(expiredFirst, undefined), "bg-green-500/40")
 

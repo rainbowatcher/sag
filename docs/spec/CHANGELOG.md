@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-09-08
+updated: 2026-09-15
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-09-15
+
+- **Sticky Targets**：[0006 target_index 改为优先级降序秩](sticky-targets-observability/changes/0006-target-index-priority-rank.md) — 前端用 `target_index === 0` 判定主目标，原始数组位置在配置 priority 时会指错主目标；`target_index` 改为优先级降序秩（stable sort by priority 降序、同优先级保持数组顺序、rank 0 = 最高优先级 target），响应 targets 数组保持 config 顺序，全默认优先级时行为不变
 
 ## 2026-09-11
 

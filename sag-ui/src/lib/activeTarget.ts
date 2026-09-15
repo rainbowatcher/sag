@@ -50,11 +50,12 @@ export function selectFillFirstTarget(
 
 /**
  * Whether a sticky-failover `active` entry (pinned) corresponds to the
- * route's first target in its original (config) order — the green dot case.
+ * route's highest-priority (primary) target — the green dot case.
  *
  * The `/api/active-targets` DTO carries each target's 0-based `target_index`
- * within `route.targets`, so the pin's config position is known directly:
- * index 0 is the first target. A missing or non-zero `target_index` (older
+ * in the route's priority-sorted order (priority descending, ties keep array
+ * order), so the pin's rank is known directly: index 0 is the
+ * highest-priority target. A missing or non-zero `target_index` (older
  * backend, malformed payload) returns `false` — the conservative choice: an
  * unverifiable pin renders orange, never green.
  */
@@ -81,9 +82,9 @@ export function clearActiveTargetModel(entry: ActiveTargetEntry, isFillFirst: bo
 /**
  * Status-dot CSS class for a route's active target, mirroring the cell in
  * RouteList.vue: fill-first traffic is always emerald; an expired sticky pin
- * is muted — gray-green when it hit the route's first config target,
- * gray-orange otherwise (muted hue = expired, color family = config
- * position); a live pin on the route's first config target is green and any
+ * is muted — gray-green when it hit the route's highest-priority target,
+ * gray-orange otherwise (muted hue = expired, color family = priority
+ * rank); a live pin on the route's highest-priority target is green and any
  * fallback is orange. Returns `null` when there is no active target to
  * display.
  */

@@ -48,10 +48,11 @@ pub struct ActiveTargetDto {
     real_model: String,
     /// Target priority within the route.
     priority: u32,
-    /// 0-based index of this target inside the route's original
-    /// `route.targets` config array. The frontend uses it (instead of object
-    /// identity) to confirm which config target a pin landed on:
-    /// `target_index == 0` means the route's first configured target.
+    /// 0-based position of this target in the route's priority-sorted target
+    /// order (priority descending, ties keep original array order). The
+    /// frontend uses it (instead of object identity) to confirm which config
+    /// target a pin landed on: `target_index == 0` means the route's
+    /// highest-priority (primary) target.
     target_index: u32,
     /// `idle` (no active entry), `pinned` (active entry, not expired) or
     /// `expired` (active entry past `sticky_failover_reset_secs`).
@@ -108,7 +109,12 @@ pub async fn list_active_targets(State(state): State<AppState>) -> Json<serde_js
 
     let mut targets = Vec::new();
     for route in &routes {
-        for (target_index, target) in route.targets.iter().enumerate() {
+        // `target_index` is the target's rank in the route's priority-sorted
+        // order (stable, priority descending, ties keep original array
+        // order) — index 0 = highest-priority target. The response `targets`
+        // array itself stays in original config order.
+        let ranks = priority_ranks(&route.targets);
+        for (config_index, target) in route.targets.iter().enumerate() {
             // Sticky pins are only meaningful for StickyFailover routes. A
             // route that switched to FillFirst / RoundRobin writes no pin
             // anymore, but a stale `active_targets` entry from its previous
@@ -178,7 +184,7 @@ pub async fn list_active_targets(State(state): State<AppState>) -> Json<serde_js
                 provider: target.provider.clone(),
                 real_model,
                 priority: target.priority,
-                target_index: target_index as u32,
+                target_index: ranks[config_index],
                 status: status.to_string(),
                 age_secs,
                 strategy: route.strategy.as_str().to_string(),
@@ -189,6 +195,28 @@ pub async fn list_active_targets(State(state): State<AppState>) -> Json<serde_js
         }
     }
     Json(serde_json::json!({ "targets": targets }))
+}
+
+/// Rank of each target in a route's priority-sorted order: a stable sort by
+/// `priority` descending (ties keep original array order), so rank 0 is the
+/// route's highest-priority (primary) target. Returns a `Vec` indexed by the
+/// target's position in `route.targets` — `result[0]` is the rank of the
+/// first configured target, `result[1]` the second, etc. Mirrors the
+/// dispatch layer's priority ordering (`sag-dispatch` sorts targets by
+/// `Reverse(priority)`).
+fn priority_ranks(targets: &[RouteTarget]) -> Vec<u32> {
+    let mut ranked: Vec<(u32, usize)> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.priority, i))
+        .collect();
+    // `sort_by_key` is a stable sort: equal priorities keep array order.
+    ranked.sort_by_key(|&(priority, _)| std::cmp::Reverse(priority));
+    let mut ranks = vec![0u32; targets.len()];
+    for (rank, &(_, original_index)) in ranked.iter().enumerate() {
+        ranks[original_index] = rank as u32;
+    }
+    ranks
 }
 
 /// Find the active entry (if any) that corresponds to `target` on `route`.
@@ -493,9 +521,16 @@ mod tests {
         assert_eq!(targets[1]["provider"], "anthropic");
         assert_eq!(targets[2]["model"], "dall-e");
         assert_eq!(targets[2]["priority"], 0);
-        // `target_index` mirrors the original `route.targets` array order.
-        assert_eq!(targets[0]["target_index"], 0, "first target of the route");
-        assert_eq!(targets[1]["target_index"], 1, "second target of the route");
+        // These priorities are already descending ([10, 5] and [0]), so the
+        // priority-sorted rank equals the array position.
+        assert_eq!(
+            targets[0]["target_index"], 0,
+            "highest-priority target of the route"
+        );
+        assert_eq!(
+            targets[1]["target_index"], 1,
+            "second-highest-priority target of the route"
+        );
         assert_eq!(
             targets[2]["target_index"], 0,
             "single-target route starts at 0"
@@ -503,16 +538,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_index_mirrors_route_targets_array_order() {
-        // The frontend keys off `target_index == 0` to identify the first
-        // configured target; priorities need not be unique or sorted, so the
-        // index must come from the array position, never from `priority`.
+    async fn target_index_follows_priority_order() {
+        // `target_index` is the target's rank in the route's priority-sorted
+        // order (priority descending, ties keep array order) — NOT its
+        // position in the original `route.targets` array. Array order below
+        // is [priority 10, priority 20, priority 0], so the priority
+        // descending ranks are: array index 1 → 0 (highest priority), array
+        // index 0 → 1, array index 2 → 2. The response `targets` array keeps
+        // original config order but reports those ranks as the indexes.
         let state = state_with_routes(vec![route(
             "gpt-4o",
             vec![
-                target("anthropic", Some("claude-3"), 5),
                 target("openai", Some("gpt-4o"), 10),
-                target("openai", Some("gpt-4o-mini"), 1),
+                target("anthropic", Some("claude-3"), 20),
+                target("openai", Some("gpt-4o-mini"), 0),
             ],
         )])
         .await;
@@ -520,21 +559,28 @@ mod tests {
         let (_, json) = fetch_targets(app).await;
         let targets = json["targets"].as_array().unwrap();
         assert_eq!(targets.len(), 3);
-        assert_eq!(targets[0]["provider"], "anthropic");
-        assert_eq!(targets[0]["target_index"], 0);
-        assert_eq!(targets[1]["provider"], "openai");
-        assert_eq!(targets[1]["target_index"], 1);
+        // Response entries stay in original config array order...
+        assert_eq!(targets[0]["provider"], "openai");
+        assert_eq!(targets[1]["provider"], "anthropic");
         assert_eq!(targets[2]["provider"], "openai");
+        // ...but `target_index` is the priority-descending rank.
+        assert_eq!(targets[0]["target_index"], 1);
+        assert_eq!(
+            targets[1]["target_index"], 0,
+            "the highest-priority target ranks 0"
+        );
         assert_eq!(targets[2]["target_index"], 2);
-        // The pinned target keeps its own index: pin `gpt-4o` (array index
-        // 1, priority 10) and the DTO must still report index 1 on it.
+
+        // The pinned target keeps its priority rank: pin the
+        // highest-priority target (array index 1, priority 20) and the DTO
+        // must report rank 0 on it.
         state.active_targets.write().await.insert(
             "gpt-4o".into(),
             ActiveTargetEntry::new(
-                "openai",
+                "anthropic",
+                "claude-3",
                 "gpt-4o",
-                "gpt-4o",
-                Some("gpt-4o".into()),
+                Some("claude-3".into()),
                 Instant::now(),
             ),
         );
@@ -542,11 +588,34 @@ mod tests {
         let (_, json2) = fetch_targets(app2).await;
         let targets2 = json2["targets"].as_array().unwrap();
         let pinned = targets2.iter().find(|t| t["status"] == "pinned").unwrap();
-        assert_eq!(pinned["provider"], "openai");
+        assert_eq!(pinned["provider"], "anthropic");
         assert_eq!(
-            pinned["target_index"], 1,
-            "index is the config array position"
+            pinned["target_index"], 0,
+            "index is the priority-sorted position"
         );
+    }
+
+    #[tokio::test]
+    async fn target_index_stable_for_equal_priorities() {
+        // All targets share the default priority 0: the stable sort keeps
+        // their original array order, so `target_index` equals the array
+        // position (ties break in favor of the earlier-configured target).
+        let state = state_with_routes(vec![route(
+            "gpt-4o",
+            vec![
+                target("anthropic", Some("claude-3"), 0),
+                target("openai", Some("gpt-4o"), 0),
+                target("openai", Some("gpt-4o-mini"), 0),
+            ],
+        )])
+        .await;
+        let app = test_app(state);
+        let (_, json) = fetch_targets(app).await;
+        let targets = json["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0]["target_index"], 0);
+        assert_eq!(targets[1]["target_index"], 1);
+        assert_eq!(targets[2]["target_index"], 2);
     }
 
     #[tokio::test]

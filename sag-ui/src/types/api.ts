@@ -221,11 +221,12 @@ export interface ActiveTargetEntry {
   provider: string
   real_model: string
   /**
-   * 0-based index of this target within `route.targets` (config order) — the
-   * authoritative signal for whether a pin landed on the route's first
-   * target (index 0) or a fallback. The UI uses it to pick the status-dot
-   * color; a missing / non-zero value is treated conservatively as "not the
-   * first target" (never green).
+   * 0-based position of this target in the route's priority-sorted target
+   * order (priority descending, ties keep original array order) — the
+   * authoritative signal for whether a pin landed on the route's
+   * highest-priority (primary) target (index 0) or a fallback. The UI uses
+   * it to pick the status-dot color; a missing / non-zero value is treated
+   * conservatively as "not the primary target" (never green).
    */
   target_index: number
   age_secs: number
