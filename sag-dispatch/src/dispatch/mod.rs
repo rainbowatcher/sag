@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::dispatch::retry::RetryOutcome;
 use crate::state::{AppState, DispatchRuntime};
-use sag_analytics::EventCollector;
+use sag_analytics::{CallLogCollector, EventCollector};
 use sag_core::RouteTargetKey;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -487,9 +487,10 @@ pub(crate) struct InFlightAttempt {
 
 /// Shared state of one dispatch: the request-identity facts needed to
 /// build the `client_cancelled` terminal plus the in-flight attempt
-/// marker.
+/// marker and the legacy `call_logs` context for the pre-commit cancel row.
 pub(crate) struct DispatchAnalytics {
     event_collector: Arc<EventCollector>,
+    call_log_collector: Arc<CallLogCollector>,
     request_id: uuid::Uuid,
     route_name: String,
     /// The model the client requested (route-level identity).
@@ -497,6 +498,14 @@ pub(crate) struct DispatchAnalytics {
     is_stream: bool,
     /// Wall-clock route start captured at dispatch time (fact timestamp).
     started_at: chrono::DateTime<chrono::Utc>,
+    /// Wall-clock route start (`Instant`) for the `duration_ms` column of
+    /// the pre-commit-cancel `call_logs` row.
+    start: Instant,
+    /// Client-request metadata carried onto the pre-commit-cancel
+    /// `call_logs` row.
+    reasoning_effort: Option<String>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
     /// Set by every normal terminal **before** it emits; the drop guard
     /// claims this flag so it can never emit a second request result.
     done: std::sync::atomic::AtomicBool,
@@ -510,6 +519,19 @@ pub(crate) struct DispatchAnalytics {
     /// `std::sync::Mutex`: the guard's `Drop` cannot await, and the
     /// critical sections are a single set/clear with no await inside.
     in_flight: std::sync::Mutex<Option<InFlightAttempt>>,
+    /// Failure facts of targets whose retry sequence already terminated
+    /// *before* the currently in-flight one (multi-target fallback: target
+    /// A failed, target B is being tried). The dispatch loop appends each
+    /// completed fact here as soon as it is built; a client disconnect on a
+    /// later target then emits them together with the in-flight `cancelled`
+    /// fact in the single `client_cancelled` event, so the request's fact
+    /// set stays complete and atomic.
+    ///
+    /// Order is the attempt order (`Vec` push), so persisted
+    /// `target_attempts` rows follow the same sequence as every other
+    /// terminal path. Never read on a normal terminal — `mark_done`
+    /// short-circuits the drop guard before it is consulted.
+    completed: std::sync::Mutex<Vec<TargetAttemptFact>>,
 }
 
 /// Drop guard on the dispatch loop: emits the `client_cancelled` terminal
@@ -518,6 +540,13 @@ pub(crate) struct DispatchAnalytics {
 /// for **streaming** requests cancelled before `build_streaming_response`
 /// commits (the stream body's own `TerminalGuard` only covers post-commit
 /// drops).
+///
+/// The event carries the whole attempt history: the in-flight attempt (as
+/// `cancelled`, if the drop landed inside a provider call) preceded by the
+/// failure facts of targets that already completed before it (multi-target
+/// fallback), see [`DispatchAnalytics::completed`]. A cancel during a
+/// retry/backoff gap contributes no *new* fact (spec scenario 11) but still
+/// keeps any earlier completed failure facts.
 ///
 /// Fires at most once: every normal terminal (success / client_error /
 /// all-exhausted / stream handoff) calls [`mark_done`](Self::mark_done)
@@ -563,30 +592,57 @@ impl DispatchAnalytics {
         let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         *slot = None;
     }
+
+    /// Append a completed target fact (typically a failure produced by a
+    /// target that fell through) so it survives a later client disconnect.
+    ///
+    /// Called by the dispatch loop right before the same fact is pushed onto
+    /// the loop-local `target_facts` vec. Both copies are disjoint by
+    /// construction: a normal terminal consumes the loop-local copy and
+    /// `mark_done`s (this copy is then never read), while the drop guard
+    /// reads only this copy and writes no other row for the request.
+    fn push_completed(&self, fact: TargetAttemptFact) {
+        self.completed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(fact);
+    }
 }
 
 impl DispatchCancelGuard {
     /// Create the guard for one dispatch. Must be kept alive until the
     /// dispatch returns; every terminal path calls [`mark_done`](Self::mark_done)
     /// before emitting its own event.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         event_collector: Arc<EventCollector>,
+        call_log_collector: Arc<CallLogCollector>,
         request_id: uuid::Uuid,
         route_name: &str,
         requested_model: &str,
         is_stream: bool,
         started_at: chrono::DateTime<chrono::Utc>,
+        start: Instant,
+        reasoning_effort: Option<String>,
+        user_agent: Option<String>,
+        client_ip: Option<String>,
     ) -> Self {
         Self {
             analytics: Arc::new(DispatchAnalytics {
                 event_collector,
+                call_log_collector,
                 request_id,
                 route_name: route_name.to_string(),
                 requested_model: requested_model.to_string(),
                 is_stream,
                 started_at,
+                start,
+                reasoning_effort,
+                user_agent,
+                client_ip,
                 done: std::sync::atomic::AtomicBool::new(false),
                 in_flight: std::sync::Mutex::new(None),
+                completed: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -601,6 +657,19 @@ impl DispatchCancelGuard {
     pub(crate) fn analytics(&self) -> Arc<DispatchAnalytics> {
         self.analytics.clone()
     }
+
+    /// Record a target's terminal (failed) fact so a client disconnect on a
+    /// *later* target still persists it in the request's single
+    /// `client_cancelled` event.
+    ///
+    /// The dispatch loop calls this for every `TargetAttemptFact` it builds,
+    /// immediately before pushing it onto its loop-local vec. A duplicate
+    /// request result is impossible: the normal terminal emits the
+    /// loop-local vec and `mark_done`s first, so the guard's copy is dropped
+    /// unread.
+    pub(crate) fn record_target_fact(&self, fact: TargetAttemptFact) {
+        self.analytics.push_completed(fact);
+    }
 }
 
 impl Drop for DispatchCancelGuard {
@@ -614,16 +683,36 @@ impl Drop for DispatchCancelGuard {
         let completed_at = chrono::Utc::now();
         // Take the in-flight attempt, if any. A `Some` becomes one
         // `cancelled` target fact; `None` (cancel during a retry/backoff
-        // gap or between targets) leaves the event without target
-        // attempts — spec scenario 11.
+        // gap or between targets) leaves the current target without a
+        // fact — spec scenario 11.
         let in_flight = self
             .analytics
             .in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        let targets = match in_flight {
-            Some(att) => vec![TargetAttemptFact {
+        // Provider / real-model identity for the legacy `call_logs` row:
+        // the in-flight attempt when there was one, else a sentinel (a
+        // pre-commit cancel during resolve/backoff/handshake has no target
+        // identity to report).
+        let (provider, real_model) = match &in_flight {
+            Some(att) => (att.provider.clone(), att.real_model.clone()),
+            None => ("__cancelled__".to_string(), "__cancelled__".to_string()),
+        };
+        // Facts of targets that already completed (failed) before the
+        // in-flight one — a multi-target fallback cancelled on a later
+        // target must keep them: the per-request fact set is atomic, so the
+        // single `client_cancelled` event carries the whole attempt history.
+        // A cancel during a retry/backoff gap contributes no *new* fact,
+        // but any earlier completed failure facts are still emitted.
+        let mut targets = self
+            .analytics
+            .completed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(att) = in_flight {
+            targets.push(TargetAttemptFact {
                 provider: att.provider,
                 real_model: att.real_model,
                 status: TargetStatus::Cancelled,
@@ -634,9 +723,8 @@ impl Drop for DispatchCancelGuard {
                 cached_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
-            }],
-            None => Vec::new(),
-        };
+            });
+        }
         let event = sag_analytics::AnalyticsEvent {
             result: RequestResultFact {
                 request_id: analytics.request_id,
@@ -660,9 +748,45 @@ impl Drop for DispatchCancelGuard {
             analytics.event_collector.clone(),
             event,
         );
+        // A pre-commit cancellation was invisible in the admin logs list
+        // (`GET /api/logs` reads `call_logs` only): the stream
+        // `TerminalGuard` is never reached because every normal dispatch
+        // terminal (including the stream handoff) sets `done` before
+        // `build_streaming_response` commits. Write the row here so the
+        // cancel shows up: status 499, `client_cancelled` category, usage
+        // NULL. Single-row-per-request invariant: a pre-commit cancel
+        // never overlaps the stream `TerminalGuard` (post-commit only) and
+        // every normal terminal sets `done` before writing its own row.
+        // `CallLogCollector::log` is synchronous (a channel `try_send`),
+        // safe inside `Drop`.
+        analytics.call_log_collector.log(CallLog {
+            request_id: analytics.request_id,
+            provider,
+            model: analytics.requested_model.clone(),
+            real_model,
+            stream: analytics.is_stream,
+            status_code: 499,
+            duration_ms: analytics.start.elapsed().as_millis() as u64,
+            error: Some("client disconnected before dispatch completed".to_string()),
+            timestamp: completed_at,
+            reasoning_effort: analytics.reasoning_effort.clone(),
+            upstream_duration_ms: None,
+            ttft_ms: None,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            usage: None,
+            user_agent: analytics.user_agent.clone(),
+            client_ip: analytics.client_ip.clone(),
+            error_category: Some("client_cancelled".to_string()),
+            // Legacy call_logs keeps its diagnostic role: formal identity
+            // columns stay NULL here, matching the other dispatch rows.
+            route_id: None,
+            target_id: None,
+        });
         warn!(
             request_id = %request_id,
-            "dispatch cancelled by client disconnect; client_cancelled fact enqueued"
+            "dispatch cancelled by client disconnect; client_cancelled fact + call_logs row enqueued"
         );
     }
 }
@@ -1277,11 +1401,16 @@ mod tests {
         let started_at = chrono::Utc::now();
         let guard = DispatchCancelGuard::new(
             state.event_collector.clone(),
+            state.collector.clone(),
             trace_id,
             "test-route",
             "gpt-4o",
             false,
             started_at,
+            Instant::now(),
+            None,
+            None,
+            None,
         );
         drop(guard);
 
@@ -1327,11 +1456,16 @@ mod tests {
         let trace_id = uuid::Uuid::new_v4();
         let guard = DispatchCancelGuard::new(
             state.event_collector.clone(),
+            state.collector.clone(),
             trace_id,
             "test-route",
             "gpt-4o",
             true, // streaming
             chrono::Utc::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
         );
         guard.analytics().begin_attempt("openai", "gpt-4o");
         drop(guard);
@@ -1371,11 +1505,16 @@ mod tests {
         let trace_id = uuid::Uuid::new_v4();
         let guard = DispatchCancelGuard::new(
             state.event_collector.clone(),
+            state.collector.clone(),
             trace_id,
             "test-route",
             "gpt-4o",
             false,
             chrono::Utc::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
         );
         guard.mark_done();
         guard.analytics().begin_attempt("openai", "gpt-4o");
@@ -1390,6 +1529,249 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0, "mark_done must suppress the drop terminal");
+    }
+
+    /// A pre-commit cancel (request aborted before any normal terminal —
+    /// during resolve/backoff/handshake) must persist exactly one
+    /// `client_cancelled` request fact AND exactly one `call_logs` row
+    /// (499 / `client_cancelled`), so the cancellation is visible in the
+    /// admin logs list (`GET /api/logs` reads `call_logs` only).
+    #[tokio::test]
+    async fn dispatch_cancel_guard_writes_call_logs_row_for_precommit_cancel() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            state.collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            true, // streaming — cancelled before `build_streaming_response` commits
+            chrono::Utc::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+        guard.analytics().begin_attempt("openai", "gpt-4o");
+        drop(guard);
+
+        state.event_collector.shutdown().await;
+
+        // Request fact: exactly one `client_cancelled`.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly one request result for the pre-commit cancel"
+        );
+        let (final_status, failure_reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT final_status, failure_reason FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("client_cancelled fact must be persisted");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(failure_reason.as_deref(), Some("client_cancelled"));
+
+        // call_logs row: exactly one, cancellation status + category.
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.retain(|l| l.request_id == trace_id);
+        assert_eq!(
+            logs.len(),
+            1,
+            "exactly one call_logs row for the pre-commit cancel"
+        );
+        assert_eq!(logs[0].status_code, 499, "pre-commit cancel row uses 499");
+        assert_eq!(logs[0].error_category.as_deref(), Some("client_cancelled"));
+        assert_eq!(logs[0].provider, "openai");
+        assert_eq!(logs[0].model, "gpt-4o");
+        assert_eq!(logs[0].real_model, "gpt-4o");
+        assert!(logs[0].stream, "streaming flag must round-trip");
+        assert!(logs[0].usage.is_none(), "cancel row keeps usage NULL");
+    }
+
+    /// A pre-commit cancel with no in-flight attempt (during a retry /
+    /// backoff gap) must still write exactly one `call_logs` row (499):
+    /// no target identity is known, so provider / real_model fall back to
+    /// the sentinel.
+    #[tokio::test]
+    async fn dispatch_cancel_guard_no_in_flight_still_writes_call_logs_row() {
+        let (state, _pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            state.collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            false,
+            chrono::Utc::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+        drop(guard);
+
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.retain(|l| l.request_id == trace_id);
+        assert_eq!(
+            logs.len(),
+            1,
+            "exactly one call_logs row even without an in-flight attempt"
+        );
+        assert_eq!(logs[0].status_code, 499);
+        assert_eq!(logs[0].error_category.as_deref(), Some("client_cancelled"));
+        assert_eq!(logs[0].provider, "__cancelled__");
+        assert_eq!(logs[0].real_model, "__cancelled__");
+        assert_eq!(logs[0].model, "gpt-4o");
+    }
+
+    /// Major-3 unit: completed facts mirrored into the guard survive a
+    /// later cancel and land in the single `client_cancelled` event,
+    /// ordered before the in-flight `cancelled` attempt.
+    #[tokio::test]
+    async fn dispatch_cancel_guard_combines_completed_and_in_flight_facts() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            state.collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            false,
+            chrono::Utc::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+        // A prior target failed and its fact was mirrored into the guard…
+        let completed_at = chrono::Utc::now();
+        guard.record_target_fact(TargetAttemptFact {
+            provider: "first".into(),
+            real_model: "gpt-4o".into(),
+            status: TargetStatus::Failure,
+            failure_reason: Some(FailureReason::ProviderError),
+            started_at: completed_at,
+            completed_at,
+            usage: None,
+            cached_tokens: None,
+            ttft_ms: None,
+            upstream_duration_ms: None,
+        });
+        // …then the next target's call is in flight when the client leaves.
+        guard.analytics().begin_attempt("second", "gpt-4o");
+        drop(guard);
+
+        state.event_collector.shutdown().await;
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rt.provider, t.status \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.started_at",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("first".to_string(), "failure".to_string()),
+                ("second".to_string(), "cancelled".to_string()),
+            ],
+            "the guard must emit completed facts before the in-flight cancel"
+        );
+        let request_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(request_rows, 1, "exactly one request fact");
+    }
+
+    /// Major-3 unit: a cancel during a retry/backoff gap (no in-flight
+    /// attempt) still emits any completed facts — spec scenario 11 only
+    /// says the *current* target contributes no fact, not that prior ones
+    /// are discarded.
+    #[tokio::test]
+    async fn dispatch_cancel_guard_backoff_gap_keeps_completed_facts() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = uuid::Uuid::new_v4();
+        let guard = DispatchCancelGuard::new(
+            state.event_collector.clone(),
+            state.collector.clone(),
+            trace_id,
+            "test-route",
+            "gpt-4o",
+            false,
+            chrono::Utc::now(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+        let completed_at = chrono::Utc::now();
+        guard.record_target_fact(TargetAttemptFact {
+            provider: "first".into(),
+            real_model: "gpt-4o".into(),
+            status: TargetStatus::Failure,
+            failure_reason: Some(FailureReason::ProviderError),
+            started_at: completed_at,
+            completed_at,
+            usage: None,
+            cached_tokens: None,
+            ttft_ms: None,
+            upstream_duration_ms: None,
+        });
+        // No `begin_attempt` — the drop lands in a backoff/fallback gap.
+        drop(guard);
+
+        state.event_collector.shutdown().await;
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rt.provider, t.status \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("first".to_string(), "failure".to_string())],
+            "only the completed fact is kept; no fabricated in-flight attempt"
+        );
     }
 
     // ── CircuitPermit / ProbeGuard RAII contract ───────────────────

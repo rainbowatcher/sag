@@ -1200,6 +1200,139 @@ async fn dispatch_chat_cancelled_during_backoff_emits_client_cancelled_without_a
     );
 }
 
+/// Major-3 e2e: a client disconnect on a *later* fallback target must not
+/// drop the failure fact of an earlier target that already completed.
+/// Target `first` fails fast; target `second` is cancelled mid-call, so
+/// the single `client_cancelled` fact must carry **both** attempts —
+/// `first` → `failure`, `second` → `cancelled` — in attempt order.
+#[tokio::test]
+#[allow(clippy::type_complexity)]
+async fn dispatch_chat_cancel_on_later_target_keeps_prior_failure_facts() {
+    let first = Arc::new(MockProvider::new("first"));
+    first.push_chat(ChatBehavior::Retryable(AppError::Internal("boom".into())));
+    let second = Arc::new(BlockingProvider::new("second"));
+    let (state, pool) = build_state_with_event_pool(vec![first.clone(), second.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+
+    // The second provider call never resolves; the timeout drops the
+    // handler future mid-call — the client-disconnect signal.
+    let result = tokio::time::timeout(Duration::from_millis(100), dispatch_chat(ctx)).await;
+    assert!(result.is_err(), "dispatch must be cancelled by the timeout");
+
+    state.event_collector.shutdown().await;
+
+    let (final_status, stream): (String, i32) =
+        sqlx::query_as("SELECT final_status, stream FROM request_results WHERE request_id = ?")
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("client_cancelled fact must be persisted");
+    assert_eq!(final_status, "client_cancelled");
+    assert_eq!(stream, 0);
+
+    // Both attempts must survive: the completed `first` failure and the
+    // in-flight `second` cancel, in attempt order.
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT rt.provider, t.status \
+         FROM target_attempts t \
+         JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+         WHERE t.request_id = ? ORDER BY t.started_at",
+    )
+    .bind(trace_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "cancel on a later target must keep the earlier completed failure fact; got {rows:?}"
+    );
+    assert_eq!(rows[0], ("first".to_string(), "failure".to_string()));
+    assert_eq!(rows[1], ("second".to_string(), "cancelled".to_string()));
+}
+
+/// Major-3 e2e for the non-streaming success shape: after a completed
+/// failure on target `first`, a client disconnect on target `second` must
+/// still not downgrade or duplicate the request fact — exactly one
+/// `client_cancelled` request row, and one attempt row per target (the
+/// guard's mirror must never produce a second write on a normal
+/// terminal).
+#[tokio::test]
+async fn dispatch_chat_cancel_on_later_target_writes_single_request_fact() {
+    let first = Arc::new(MockProvider::new("first"));
+    first.push_chat(ChatBehavior::Retryable(AppError::Internal("boom".into())));
+    let second = Arc::new(BlockingProvider::new("second"));
+    let (state, pool) = build_state_with_event_pool(vec![first.clone(), second.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+
+    let result = tokio::time::timeout(Duration::from_millis(100), dispatch_chat(ctx)).await;
+    assert!(result.is_err());
+    state.event_collector.shutdown().await;
+
+    let request_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        request_rows, 1,
+        "the guard's mirrored facts must never add a second request fact"
+    );
+}
+
+/// Major-3 negative control: a normal successful fallback still emits the
+/// loop-local facts exactly once (the guard's mirror is dropped unread
+/// after `mark_done`) — no duplicated `target_attempts` rows.
+#[tokio::test]
+async fn dispatch_chat_successful_fallback_does_not_duplicate_attempts() {
+    let first = Arc::new(MockProvider::new("first"));
+    first.push_chat(ChatBehavior::Retryable(AppError::Internal("boom".into())));
+    let second = Arc::new(MockProvider::new("second"));
+    second.push_chat(ChatBehavior::Ok(build_response_with_content(
+        "gpt-4o",
+        Some(Usage {
+            prompt_tokens: 5,
+            completion_tokens: 7,
+            total_tokens: 12,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+        }),
+        "hello",
+    )));
+    let (state, pool) = build_state_with_event_pool(vec![first.clone(), second.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    state.event_collector.shutdown().await;
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM target_attempts WHERE request_id = ?")
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 2,
+        "a normal terminal must emit exactly one attempt row per target"
+    );
+}
+
 #[tokio::test]
 async fn dispatch_chat_non_streaming_success() {
     let mock = Arc::new(MockProvider::new("openai"));

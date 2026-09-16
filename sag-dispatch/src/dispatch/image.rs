@@ -59,11 +59,16 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     // is covered. Every terminal below calls `mark_done()` first.
     let cancel_guard = DispatchCancelGuard::new(
         state.event_collector.clone(),
+        state.collector.clone(),
         trace_id,
         route_name,
         &request.model,
         false, // image generation is always non-streaming
         started_at,
+        start,
+        None, // image requests carry no reasoning_effort
+        user_agent.clone(),
+        client_ip.clone(),
     );
 
     let img_request = build_image_request(request);
@@ -187,6 +192,14 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
                 chrono::Utc::now(),
             )
         {
+            // Mirror the fact into the cancel guard *before* continuing to
+            // the next target: if the client disconnects while a later
+            // target is in flight (or during the fallback gap), the final
+            // `client_cancelled` event must still carry this completed
+            // failure. The normal terminals consume the loop-local vec
+            // only and `mark_done` first, so the guard's copy is dropped
+            // unread — never a duplicate row.
+            cancel_guard.record_target_fact(fact.clone());
             target_facts.push(fact);
         }
 
@@ -535,6 +548,60 @@ mod tests {
         }
     }
 
+    /// Provider whose `chat_image` never resolves: holds a dispatch in an
+    /// in-flight image call so the test can cancel the handler future
+    /// mid-call (client-disconnect simulation).
+    struct BlockingImageProvider {
+        name: String,
+    }
+
+    impl BlockingImageProvider {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for BlockingImageProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn chat(
+            &self,
+            _request: &ChatCompletionRequest,
+            _real_model: &str,
+            _api_endpoint: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
+        ) -> sag_core::Result<ChatCompletionResponse> {
+            unreachable!("image dispatch should not call chat")
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatCompletionRequest,
+            _real_model: &str,
+            _api_endpoint: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
+        ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            unreachable!("image dispatch should not call chat_stream")
+        }
+
+        async fn chat_image(
+            &self,
+            _request: &ImageGenerationRequest,
+            _real_model: &str,
+            _target_extra: &HashMap<String, serde_json::Value>,
+            _timeout_secs: u64,
+        ) -> sag_core::Result<ImageGenerationResponse> {
+            std::future::pending().await
+        }
+    }
+
     fn build_image_response() -> ImageGenerationResponse {
         ImageGenerationResponse {
             created: 0,
@@ -834,6 +901,63 @@ mod tests {
         assert_eq!(rows[0].1, "failure");
         assert_eq!(rows[1].0, "second");
         assert_eq!(rows[1].1, "failure");
+    }
+
+    /// Major-3 e2e (image path): a client disconnect on a *later* fallback
+    /// target must keep the failure fact of an earlier completed target.
+    /// `first` fails fast, `second` is cancelled mid-call, so the single
+    /// `client_cancelled` fact must carry both attempts in order:
+    /// `first` → `failure`, `second` → `cancelled`.
+    #[tokio::test]
+    async fn dispatch_image_cancel_on_later_target_keeps_prior_failure_facts() {
+        let m1 = Arc::new(MockImageProvider::new("first"));
+        m1.push_image(ImageBehavior::Retryable(AppError::Internal("boom".into())));
+        let m2 = Arc::new(BlockingImageProvider::new("second"));
+        let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request("dall-e-3");
+        let targets = vec![
+            target("first", "dall-e-3", 0),
+            target("second", "dall-e-3", 0),
+        ];
+        let mut errors = Vec::new();
+        let ctx = make_ctx(&state, &rt, &req, &targets, &mut errors);
+        let trace_id = ctx.trace_id;
+
+        // The second image call never resolves; the timeout drops the
+        // handler future mid-call — the client-disconnect signal.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), dispatch_image(ctx)).await;
+        assert!(result.is_err(), "dispatch must be cancelled by the timeout");
+
+        state.event_collector.shutdown().await;
+
+        let (final_status, stream): (String, i32) =
+            sqlx::query_as("SELECT final_status, stream FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("client_cancelled fact must be persisted");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(stream, 0, "image dispatch is non-streaming");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rt.provider, t.status \
+             FROM target_attempts t \
+             JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+             WHERE t.request_id = ? ORDER BY t.started_at",
+        )
+        .bind(trace_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "image cancel on a later target must keep the earlier completed failure; got {rows:?}"
+        );
+        assert_eq!(rows[0], ("first".to_string(), "failure".to_string()));
+        assert_eq!(rows[1], ("second".to_string(), "cancelled".to_string()));
     }
 
     #[test]

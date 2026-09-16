@@ -69,11 +69,16 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     // own event.
     let cancel_guard = DispatchCancelGuard::new(
         state.event_collector.clone(),
+        state.collector.clone(),
         trace_id,
         route_name,
         &request.model,
         is_stream,
         started_at,
+        start,
+        request.reasoning_effort.clone(),
+        user_agent.clone(),
+        client_ip.clone(),
     );
 
     // Snapshot the backoff config once so the per-target retry loop doesn't
@@ -255,6 +260,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 chrono::Utc::now(),
             )
         {
+            // Mirror the fact into the cancel guard *before* continuing to
+            // the next target: if the client disconnects while a later
+            // target is in flight (or during the fallback gap), the final
+            // `client_cancelled` event must still carry this completed
+            // failure. The normal terminals consume the loop-local vec
+            // only and `mark_done` first, so the guard's copy is dropped
+            // unread — never a duplicate row.
+            cancel_guard.record_target_fact(fact.clone());
             target_facts.push(fact);
         }
 
