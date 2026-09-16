@@ -9,6 +9,7 @@ updated: 2026-09-15
 
 ## 2026-09-15
 
+- **分析**：[0006 200 状态内上游错误识别 + 取消流写 call_logs](analytics/changes/0006-upstream-error-in-200-and-cancelled-call-logs.md) — 识别 HTTP 200 内交付的上游错误（SSE data frame / 200 body 顶层 `error` 对象）：流式进入 `model_failure` / `stream_error_after_commit` 失败路径，非流式记为失败尝试并可 failover、限流特征映射 `rate_limited`、`call_logs` 记 502（限流 429）+ 上游消息；被取消的流式请求在 `TerminalGuard` 之外补写 `call_logs` 行（499 / `client_cancelled`），保证管理面板日志列表可见
 - **Sticky Targets**：[0006 target_index 改为优先级降序秩](sticky-targets-observability/changes/0006-target-index-priority-rank.md) — 前端用 `target_index === 0` 判定主目标，原始数组位置在配置 priority 时会指错主目标；`target_index` 改为优先级降序秩（stable sort by priority 降序、同优先级保持数组顺序、rank 0 = 最高优先级 target），响应 targets 数组保持 config 顺序，全默认优先级时行为不变
 
 ## 2026-09-11

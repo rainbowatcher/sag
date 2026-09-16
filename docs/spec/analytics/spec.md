@@ -186,7 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_target_attempts_route_completed
 | `target_attempts.actual_model` | 恒非 NULL（该次尝试实际调用模型，passthrough = 请求 model） |
 | token 列（两级） | 仅最终成功（`success`）非 NULL；失败/取消**不得**当作 0 |
 | `cached_tokens` | NULL = unknown，UI 与「未命中」区分显示 |
-| `ttft_ms` / `upstream_duration_ms` | 缺失为 NULL，延迟统计排除并计入 coverage 分母 |
+| `ttft_ms` / `upstream_duration_ms` | 缺失为 NULL，延迟统计排除并计入 coverage 分母；失败/取消终止一律 NULL（含已转发部分 `Data` 的失败流）——仅成功样本带值 |
 
 `call_logs` 保持现状（可丢弃诊断 + 旧接口数据源），新迁移增加可空列 `route_id TEXT`、`target_id TEXT`（新写入已知则填，旧记录保持 NULL，**不回填**）。
 
@@ -692,12 +692,15 @@ stateDiagram-v2
 8. **Rollup 精确对照**：同一小时桶的 Rollup 聚合值 == 明细聚合值（请求数、状态计数、Token 和、延迟 sum/count、直方图）。
 9. **迟到/缺失桶、幂等、恢复**：已完成桶收到迟写事实 → `dirty=1` → 下一轮重算；启动扫描只登记缺失/脏桶不计算；processing 超时回 pending 可恢复；同桶事务失败整体回滚后重试幂等。
 10. **缓存/缺失延迟/low_sample**：`cached_tokens` NULL 与 0 区分（unknown vs 未命中）；延迟 NULL 样本排除且 coverage 正确；有效样本 < 100 → `low_sample=true`。
-11. **client_cancelled 边界**：取消发生在无在途 target 尝试时（重试/退避/fallback 间隙）→ `request_results` 一条 `client_cancelled`、`target_attempts` 0 条；取消发生在在途调用 → 该尝试记 `cancelled`（不计 success/failure）。
+11. **client_cancelled 边界**：取消发生在无在途 target 尝试时（重试/退避/fallback 间隙）→ `request_results` 一条 `client_cancelled`、当前 target 的 `target_attempts` 不产生；取消发生在在途调用 → 该尝试记 `cancelled`（不计 success/failure）。多 target fallback 下若前序 target 已完成（已产生 `TargetAttemptFact`）而取消落在后续 target，则事件必须按尝试顺序携带前序已完成事实 + 在途 `cancelled` 事实（实现：`DispatchAnalytics::completed` 镜像 + `DispatchCancelGuard::drop` 拼接；正常终止先消费局部 `target_facts` 再 `mark_done`，镜像副本永不被读，故无重复）。
 12. **缓存命中率 Rollup 对照**：`cached_known_count` / `cached_hit_count` 与明细口径一致（请求命中率，unknown 不计分母）；Token 命中率 = `cached_tokens` 之和 / `prompt_tokens` 之和（全部成功样本），跨桶合并（>24h 混合查询）与明细计算值一致；覆盖 成功 + cached>0 / cached=0 / cached=NULL 与失败请求被排除四种组合。
 13. **失败原因映射合法组合**：`failure_reason` 与 `final_status` 的组合符合「状态判定」映射表；未登记的非法组合不得产生。
+14. **取消/出错流写 call_logs**：客户端断开（未到正常终结）→ `request_results` 一条 `client_cancelled` + `call_logs` 恰一条（状态码 499、`error_category=client_cancelled`、usage NULL）；流式中段错误后断开 → `model_failure` / `stream_error_after_commit`（不被降级为 `client_cancelled`）+ `call_logs` 恰一条（502 + 上游错误消息）。同一失败契约适用**正常 EOF/Done 终止**：中段错误后客户端继续读到流结束同样写 502 / `stream_error` + 上游消息，且 usage / cached / cache_creation / reasoning / `ttft_ms` / `upstream_duration_ms` 均 NULL（失败行绝不携带成功形态的 token/timing 样本）。
+15. **200 状态内上游错误**：SSE data frame / 200 body 顶层 `error` 对象被识别为上游错误——流式进入 `stream_error_after_commit` 失败路径（错误帧仍透传）；非流式记为失败尝试并 failover，全耗尽保持标准错误 envelope 并保留消息；限流特征（数字 code 429 或 code/message 含 rate limit/burst/flow/quota）→ `failure_reason=rate_limited`，否则 `provider_error`。
 
 ## 变更记录
 
+- [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)
 - [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)
 - [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
 - [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)

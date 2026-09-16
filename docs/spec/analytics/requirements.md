@@ -63,7 +63,8 @@ updated: 2026-08-11
 - `model_failure` 涵盖：目标全部耗尽、上游错误/超时、流式已开始输出后的错误。
 - `client_cancelled`（客户端取消）独立计为整体失败率，不计入模型失败率与客户端错误率。
 - target 级尝试结果枚举：`success` / `failure` / `cancelled`（客户端取消的在途尝试）；`cancelled` 仍属实际尝试（计入分母），但不计 success 也不计 failure。
-- 客户端取消发生在尚无在途 target 尝试时（如重试/退避间隙）：`request_results` 仍产生一条 `client_cancelled`，`target_attempts` 为 0 条。
+- 客户端取消发生在尚无在途 target 尝试时（如重试/退避间隙）：`request_results` 仍产生一条 `client_cancelled`，`target_attempts` 为 0 条。多 target fallback 下若前序 target 已完成（fallback 中即先行失败）而已产生 `target_attempts` 事实，而取消发生在后续 target，则该请求的 `client_cancelled` 事件必须**同时**携带已完成事实与在途 `cancelled` 事实（按尝试顺序），不得丢失已完成事实。
+- 被取消的流式请求（客户端中断、未到正常终结）除 `client_cancelled` 分析事实外，还必须写一条 `call_logs` 行（状态码 499、`error_category=client_cancelled`、usage 为 NULL），保证在管理面板日志列表（只读 `call_logs`）中可见；流式已开始输出后报错再断开（`stream_error_after_commit`）的请求，其 `call_logs` 行记 502 与上游错误消息。流式已开始输出后报错、但客户端继续读到正常终结（EOF/Done）的请求，其 `call_logs` 行同样记 502 + 上游错误消息，且与取消/断开终止一致：usage 与 cache/reasoning/timing 列保持 NULL（失败不得作为成功样本）。
 
 失败率口径必须按下述分母计算：
 
@@ -83,6 +84,10 @@ updated: 2026-08-11
 - **target 延迟**：从实际发起该 target 的上游调用开始，到该 target 完成/失败/取消为止。
 - 流式响应在**首个数据块输出前**失败：允许重试/fallback。
 - 流式响应**已开始输出后**发生错误：不得切换 target，直接记为最终 `model_failure`。
+- 上游可能以 **HTTP 200** 返回错误（SSE data frame 的顶层 `error` 对象，或 200 JSON body 的顶层 `error` 对象；`"error": null` 视为无错误）。此类错误必须识别为上游错误并记录：
+  - 流式 → 进入流式已开始输出后的失败路径：最终 `model_failure` / `stream_error_after_commit`，`call_logs` 记 502 + 上游错误消息；错误帧仍透传给客户端（行为兼容）。
+  - 非流式 → 记为失败尝试，dispatch 按失败处理（failover 到下一 target）；全部耗尽时最终响应保持标准错误 envelope 并保留原始错误消息；`call_logs` 状态码为 502（限流特征时为 429），`error` 列携带上游错误消息便于搜索。
+  - 失败原因映射（保守）：错误对象数字 `code == 429`，或字符串 code/message 含限流标记（rate limit / burst / flow / quota，不区分大小写）→ `rate_limited`；否则 `provider_error`。
 - HTTP 状态码为 200 不保证分析事件已成功写入（分析异步落库，客户端可能先收到响应）。
 
 ### 指标口径（Token 与缓存）
@@ -177,6 +182,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 变更记录
 
+- [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)
 - [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)
 - [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
 - [0003 UUID v4/v7 版本分层决策](changes/0003-uuid-version-layering.md)
