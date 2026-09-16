@@ -107,7 +107,12 @@ pub fn apply_body_strip(mut body: serde_json::Value, fields: &[String]) -> serde
 
 /// Iterate the byte buffer, extract complete SSE frames (delimited by `\n\n` or `\r\n\r\n`),
 /// parse them, and send the resulting `StreamChunk` items through the channel.
-pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) {
+///
+/// Returns `true` when a frame carried an upstream error delivered inside a
+/// 200 SSE data frame (the frame was forwarded and an `Error` chunk sent by
+/// [`process_sse_frame`]); the caller must stop forwarding further frames.
+pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
+    let mut saw_error = false;
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
         // Remove the delimiter (\n\n or \r\n\r\n)
@@ -117,17 +122,25 @@ pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamC
             2
         };
         buffer.drain(..delim_len);
-        process_sse_frame(&frame, tx);
+        if process_sse_frame(&frame, tx) {
+            saw_error = true;
+            break;
+        }
     }
+    saw_error
 }
 
 /// Drain remaining frames and flush any un-delimited trailing frame upon stream end.
-pub fn flush_sse_buffer(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) {
-    drain_sse_frames(buffer, tx);
-    if !buffer.is_empty() {
+///
+/// Returns `true` when the trailing frame (or a frame drained first) carried a
+/// 200-delivered upstream error, mirroring [`drain_sse_frames`].
+pub fn flush_sse_buffer(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
+    let mut saw_error = drain_sse_frames(buffer, tx);
+    if !saw_error && !buffer.is_empty() {
         let frame = std::mem::take(buffer);
-        process_sse_frame(&frame, tx);
+        saw_error = process_sse_frame(&frame, tx);
     }
+    saw_error
 }
 
 /// Search for the SSE frame delimiter `\n\n` (or `\r\n\r\n`), returning the
@@ -149,7 +162,13 @@ pub(crate) fn find_sse_boundary(buf: &[u8]) -> Option<usize> {
 }
 
 /// Parse a single SSE frame and send chunks through the channel.
-fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
+///
+/// Returns `true` when the frame carried a 200-delivered upstream error (a
+/// data line whose JSON has a top-level `error` object): the raw
+/// frame is still forwarded to the client for behavior compatibility, an
+/// `Error` chunk is emitted, and the caller must stop processing further
+/// frames.
+fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
     let text = String::from_utf8_lossy(frame);
 
     for line in text.lines() {
@@ -161,7 +180,7 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
 
         if json_str == "[DONE]" {
             let _ = tx.send(StreamChunk::Data(b"data: [DONE]\n\n".to_vec()));
-            return;
+            return false;
         }
 
         // Compute the raw SSE data line; forwarding is deferred until after
@@ -175,6 +194,31 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
             let _ = tx.send(StreamChunk::Data(raw));
             continue;
         };
+
+        // An upstream error delivered inside a 200 SSE data frame: the JSON
+        // carries a top-level `error` object. Forward the frame to the
+        // client (behavior-compatible), then surface the error so the
+        // dispatcher records the attempt as a FAILURE, not success or
+        // client_cancelled.
+        if crate::base::body_has_error_object(&val) {
+            let err_obj = val.get("error").expect("checked error object");
+            let msg = crate::base::body_error_message(err_obj);
+            warn!(status = 200, %msg, "upstream returned error");
+            // Enqueue the `Error` chunk BEFORE the forwarded `Data` frame.
+            // The dispatch unfold loop (stream.rs) consumes `Error` inline
+            // — recording the analytics error state — before it yields the
+            // `Data` frame to the client. If the client disconnects
+            // immediately after receiving the `Data` frame (the production
+            // incident), the stream is dropped without polling the `Error`
+            // chunk, so the error state must already be recorded by the
+            // time the `Data` frame is delivered: this ordering makes the
+            // request classify as `model_failure` / 502 (with the upstream
+            // message), never `client_cancelled` / 499. The client still
+            // receives the forwarded error frame (behavior-compatible).
+            let _ = tx.send(StreamChunk::Error(msg));
+            let _ = tx.send(StreamChunk::Data(raw));
+            return true;
+        }
 
         if let Some(usage_val) = val.get("usage") {
             let pt = usage_val
@@ -324,6 +368,7 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) {
             let _ = tx.send(StreamChunk::Data(raw));
         }
     }
+    false
 }
 
 #[cfg(test)]
@@ -947,5 +992,113 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].prompt_tokens, 100);
         assert_eq!(chunks[0].completion_tokens, 20);
+    }
+
+    // ── 200-delivered upstream error detection in SSE frames ────
+
+    /// A data frame whose JSON has a top-level `error` object must
+    /// be forwarded to the client (behavior-compatible) and surfaced as an
+    /// in-stream error: the `Error` chunk is enqueued before the `Data`
+    /// frame (so the dispatch loop records the error state before the data
+    /// can be delivered to a disconnecting client), and
+    /// `process_sse_frame` returns `true`.
+    #[test]
+    fn sse_frame_with_top_level_error_surfaces_in_stream_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame =
+            b"data: {\"error\":{\"message\":\"burst tokens limit\",\"code\":429},\"id\":\"x\"}\n\n";
+        let saw_error = process_sse_frame(frame, &tx);
+        drop(tx);
+
+        assert!(
+            saw_error,
+            "an error object frame must signal an in-stream error"
+        );
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Error + Data chunks");
+        // The `Error` chunk is enqueued first so the dispatch unfold loop
+        // records the analytics error state before the `Data` frame is
+        // delivered to the client.
+        match &chunks[0] {
+            StreamChunk::Error(msg) => assert_eq!(msg, "burst tokens limit"),
+            other => panic!("expected an Error chunk first, got {other:?}"),
+        }
+        assert!(
+            matches!(&chunks[1], StreamChunk::Data(d) if d == b"data: {\"error\":{\"message\":\"burst tokens limit\",\"code\":429},\"id\":\"x\"}\n\n"),
+            "the error frame must still be forwarded verbatim: {:?}",
+            chunks[1]
+        );
+    }
+
+    /// `"error": null` must be treated as absent — the frame is a normal
+    /// payload forwarded verbatim with no error signal.
+    #[test]
+    fn sse_frame_with_null_error_is_not_an_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        let frame = b"data: {\"error\":null,\"choices\":[]}\n\n";
+        let saw_error = process_sse_frame(frame, &tx);
+        drop(tx);
+
+        assert!(!saw_error, "null error must be treated as absent");
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 1, "only the forwarded Data chunk");
+        assert!(matches!(chunks[0], StreamChunk::Data(_)));
+    }
+
+    /// Normal content / usage frames are unaffected: forwarded with no error
+    /// signal and `process_sse_frame` returns `false`.
+    #[test]
+    fn sse_normal_frames_unaffected_by_error_detection() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // Content delta.
+        let content = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let saw_content = process_sse_frame(content, &tx);
+        assert!(!saw_content);
+        // Usage frame.
+        let usage = b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n";
+        let saw_usage = process_sse_frame(usage, &tx);
+        assert!(!saw_usage);
+        // Non-JSON keepalive.
+        let keepalive = b"data: : keep-alive\n\n";
+        let saw_keepalive = process_sse_frame(keepalive, &tx);
+        assert!(!saw_keepalive);
+        drop(tx);
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 4, "3 Data + 1 Usage");
+        assert!(chunks.iter().any(|c| matches!(c, StreamChunk::Usage(_))));
+    }
+
+    /// `drain_sse_frames` returns `true` when an error frame is encountered
+    /// mid-buffer and stops draining; `flush_sse_buffer` surfaces an error in
+    /// a trailing (un-delimited) frame.
+    #[test]
+    fn drain_and_flush_propagate_200_error_frames() {
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        // Error frame delimited mid-buffer.
+        let mut buffer =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"error\":{\"message\":\"boom\"}}\n\n".to_vec();
+        let saw_error = drain_sse_frames(&mut buffer, &tx);
+        assert!(saw_error, "mid-buffer error frame must be detected");
+
+        // Trailing un-delimited error frame.
+        let mut trailing = b"data: {\"error\":{\"message\":\"boom\"}}".to_vec();
+        let saw_trailing = flush_sse_buffer(&mut trailing, &tx);
+        assert!(saw_trailing, "trailing error frame must be detected");
+        assert!(trailing.is_empty());
     }
 }

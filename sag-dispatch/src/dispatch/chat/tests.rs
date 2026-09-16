@@ -611,6 +611,170 @@ async fn dispatch_chat_all_exhausted_emits_model_failure_with_all_attempts() {
     );
 }
 
+// ─── Fix B.2: upstream errors delivered inside HTTP 200 (non-streaming) ─
+//
+// The provider adapters surface a 200 body carrying a top-level `error`
+// object as `AppError::Upstream` (502; 429 when rate-limit-ish). These tests
+// cover how dispatch classifies and fails over that error.
+
+/// A 200-delivered upstream error (surfaced by the provider as
+/// `Upstream { status: 502 }`) is a failed attempt: the next target is
+/// tried and the first target's attempt records `provider_error`.
+#[tokio::test]
+async fn dispatch_chat_200_error_body_fails_over_to_next_target() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    m1.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+        provider: "first".into(),
+        status: 502,
+        body: "upstream burst error".into(),
+    }));
+    m2.push_chat(ChatBehavior::Ok(build_response_with_content(
+        "gpt-4o", None, "ok",
+    )));
+    let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "fallback success is route success"
+    );
+    assert_eq!(m1.chat_calls(), 1, "first target attempted once");
+    assert_eq!(m2.chat_calls(), 1, "second target must be tried (failover)");
+
+    state.event_collector.shutdown().await;
+
+    let final_status: String =
+        sqlx::query_scalar("SELECT final_status FROM request_results WHERE request_id = ?")
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(final_status, "success");
+
+    let (provider, status, reason): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT rt.provider, t.status, t.failure_reason \
+         FROM target_attempts t \
+         JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+         WHERE t.request_id = ? ORDER BY t.started_at",
+    )
+    .bind(trace_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .next()
+    .expect("first target attempt row");
+    assert_eq!(provider, "first");
+    assert_eq!(status, "failure");
+    assert_eq!(
+        reason.as_deref(),
+        Some("provider_error"),
+        "200-delivered error (non rate-limit) → provider_error"
+    );
+}
+
+/// A rate-limit-ish error object (surfaced by the provider as
+/// `Upstream { status: 429 }`) maps the failed attempt to `rate_limited`.
+#[tokio::test]
+async fn dispatch_chat_200_rate_limit_error_maps_to_rate_limited() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    m1.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+        provider: "first".into(),
+        status: 429,
+        body: "burst tokens limit".into(),
+    }));
+    m2.push_chat(ChatBehavior::Ok(build_response_with_content(
+        "gpt-4o", None, "ok",
+    )));
+    let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(m2.chat_calls(), 1, "failover to the next target");
+
+    state.event_collector.shutdown().await;
+
+    let (provider, status, reason): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT rt.provider, t.status, t.failure_reason \
+         FROM target_attempts t \
+         JOIN analytics_route_targets rt ON rt.target_id = t.target_id \
+         WHERE t.request_id = ? ORDER BY t.started_at",
+    )
+    .bind(trace_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .next()
+    .expect("first target attempt row");
+    assert_eq!(provider, "first");
+    assert_eq!(status, "failure");
+    assert_eq!(
+        reason.as_deref(),
+        Some("rate_limited"),
+        "rate-limit-ish 200 error → rate_limited"
+    );
+}
+
+/// When every target returns a 200-delivered upstream error, the final
+/// response is the standard all-exhausted envelope and preserves the
+/// upstream error message.
+#[tokio::test]
+async fn dispatch_chat_200_error_body_all_exhausted_preserves_message() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    m1.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+        provider: "first".into(),
+        status: 502,
+        body: "ark burst error".into(),
+    }));
+    m2.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+        provider: "second".into(),
+        status: 502,
+        body: "ark burst error".into(),
+    }));
+    let (state, pool) = build_state_with_event_pool(vec![m1.clone(), m2.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("first", "gpt-4o", 0), target("second", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body_str = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        body_str.contains("ark burst error"),
+        "final envelope must preserve the upstream message: {body_str}"
+    );
+
+    state.event_collector.shutdown().await;
+
+    let (final_status, failure_reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT final_status, failure_reason FROM request_results WHERE request_id = ?",
+    )
+    .bind(trace_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(final_status, "model_failure");
+    assert_eq!(failure_reason.as_deref(), Some("all_exhausted"));
+}
+
 #[tokio::test]
 async fn dispatch_chat_streaming_success_emits_success_analytics_event() {
     // Streaming success now emits the formal analytics event: one

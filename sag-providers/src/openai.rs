@@ -8,7 +8,7 @@ use sag_core::{
     ImageGenerationResponse, StreamChunk,
 };
 use tokio::sync::mpsc;
-use tracing::{error, instrument, trace};
+use tracing::{error, instrument, trace, warn};
 
 use crate::{LlmProvider, ProviderBase, drain_sse_frames};
 
@@ -91,6 +91,33 @@ impl LlmProvider for OpenAiProvider {
                 Some(timeout_secs),
             )
             .await?;
+
+        // Some upstreams deliver errors with HTTP 200 by embedding a
+        // top-level `error` object in the JSON body (observed with Volcano
+        // Ark). Treat it as an upstream error rather than relaying a
+        // success-shaped body: the same `AppError::Upstream` the non-2xx
+        // path produces, so dispatch records a failed attempt and fails
+        // over (or surfaces the all-exhausted envelope) instead of silently
+        // reporting success. Rate-limit-ish errors map to 429 so the
+        // analytics failure reason is `rate_limited`.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+            && crate::base::body_has_error_object(&raw)
+        {
+            let err_obj = raw.get("error").expect("checked error object");
+            let body = crate::base::body_error_message(err_obj);
+            let status = if crate::base::body_error_is_rate_limited(err_obj) {
+                429
+            } else {
+                // Upstream error delivered with 200 → 502 (bad gateway).
+                502
+            };
+            warn!(status = 200, %body_text, "upstream returned error");
+            return Err(AppError::Upstream {
+                provider: self.base.name.clone(),
+                status,
+                body,
+            });
+        }
 
         let mut completion: ChatCompletionResponse = serde_json::from_str(&body_text)
             .map_err(|e| AppError::Internal(format!("failed to parse upstream response: {e}")))?;
@@ -191,7 +218,16 @@ impl LlmProvider for OpenAiProvider {
                     Ok(Some(Ok(chunk))) => {
                         trace!(received_bytes = chunk.len(), "received upstream SSE chunk");
                         buffer.extend_from_slice(&chunk);
-                        drain_sse_frames(&mut buffer, &tx);
+                        if drain_sse_frames(&mut buffer, &tx) {
+                            // A 200-delivered upstream error frame:
+                            // `process_sse_frame` already forwarded the frame
+                            // and emitted an `Error` chunk. Drop any frames
+                            // buffered after it — nothing may be forwarded
+                            // beyond the error frame.
+                            buffer.clear();
+                            had_error = true;
+                            break;
+                        }
                     }
                     Ok(Some(Err(e))) => {
                         error!(?e, "error reading upstream stream chunk");
@@ -216,8 +252,12 @@ impl LlmProvider for OpenAiProvider {
                 }
             }
 
-            if !buffer.is_empty() {
-                crate::flush_sse_buffer(&mut buffer, &tx);
+            if !buffer.is_empty() && !had_error {
+                // A trailing un-delimited frame at EOF may carry a
+                // 200-delivered error — surface it like any other.
+                if crate::flush_sse_buffer(&mut buffer, &tx) {
+                    had_error = true;
+                }
             }
 
             if !had_error {
@@ -506,5 +546,167 @@ mod tests {
             assert_eq!(usage.cache_creation_tokens, exp_creation);
             assert_eq!(usage.reasoning_tokens, exp_reasoning);
         }
+    }
+
+    // ── 200-delivered upstream error detection (non-streaming) ──
+
+    /// A 200 JSON body carrying a top-level non-null `error` object must be
+    /// surfaced as `AppError::Upstream` (status 502, the 200-delivered-error
+    /// convention), not silently parsed as a success-shaped response.
+    #[tokio::test]
+    async fn chat_200_body_with_error_object_returns_upstream_error() {
+        let body = r#"{"error":{"message":"model overloaded","code":500}}"#;
+        let base_url = spawn_server(move |mut stream| {
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let provider = openai_provider(&base_url, 30, None);
+        let err = provider
+            .chat(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 502, "200-delivered error maps to 502");
+                assert_eq!(body, "model overloaded", "message must be extracted");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    /// A rate-limit-ish error object (numeric code 429) inside a 200 body
+    /// maps to `Upstream` status 429 so the analytics failure reason becomes
+    /// `rate_limited`.
+    #[tokio::test]
+    async fn chat_200_body_with_rate_limit_error_maps_to_429() {
+        let body = r#"{"error":{"message":"burst tokens limit","code":429}}"#;
+        let base_url = spawn_server(move |mut stream| {
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let provider = openai_provider(&base_url, 30, None);
+        let err = provider
+            .chat(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 429, "rate-limit-ish error maps to 429");
+                assert_eq!(body, "burst tokens limit");
+            }
+            other => panic!("expected Upstream 429, got {other:?}"),
+        }
+    }
+
+    /// An SSE data frame carrying a top-level `error` object (delivered with
+    /// HTTP 200) is forwarded to the client and surfaced as an in-stream
+    /// Error chunk; frames after it are NOT forwarded and no `Done` is
+    /// emitted (the dispatcher records the attempt as a failure).
+    #[tokio::test]
+    async fn chat_stream_in_stream_error_frame_emits_error_and_stops() {
+        let base_url = spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+                .write_all(b"data: {\"error\":{\"message\":\"burst limit\"}}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            // A frame after the error must NOT be forwarded.
+            stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        })
+        .await;
+
+        let provider = openai_provider(&base_url, 30, None);
+        let mut stream = provider
+            .chat_stream(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut data: Vec<Vec<u8>> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut saw_done = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(d) => data.push(d),
+                StreamChunk::Error(e) => errors.push(e),
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+
+        // The error frame itself is still forwarded (behavior-compatible);
+        // nothing after it is, and no Done is emitted.
+        assert_eq!(
+            data.len(),
+            2,
+            "content frame + forwarded error frame only, got {}: {:?}",
+            data.len(),
+            data
+        );
+        assert_eq!(
+            data[0],
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n".to_vec()
+        );
+        assert_eq!(
+            data[1],
+            b"data: {\"error\":{\"message\":\"burst limit\"}}\n\n".to_vec()
+        );
+        assert_eq!(errors.len(), 1, "exactly one in-stream error signal");
+        assert_eq!(errors[0], "burst limit");
+        assert!(!saw_done, "no Done after an in-stream upstream error");
     }
 }

@@ -348,6 +348,65 @@ impl ProviderBase {
     }
 }
 
+// ── 200-delivered upstream error detection ───────────────────────
+//
+// Some upstreams (observed with Volcano Ark) deliver errors with HTTP 200,
+// either as an SSE data frame whose JSON carries a top-level `error` object,
+// or as an error object inside a 200 JSON body. These helpers centralize the
+// "does this 200 payload contain an error" check for reuse across every
+// provider impl and the SSE frame path.
+
+/// Return true when a 200 response body JSON carries a top-level `error`
+/// **object** — the OpenAI-style error payload some upstreams deliver with
+/// HTTP 200 instead of a non-2xx status. Only an actual JSON object counts:
+/// `"error": null`, an absent `error` key, or a scalar `error` value
+/// (string / bool / array / number) is treated as no error, so a 200
+/// payload with a non-object `error` field is never misclassified.
+pub fn body_has_error_object(value: &serde_json::Value) -> bool {
+    value.get("error").is_some_and(|e| e.is_object())
+}
+
+/// Extract a human-readable message from an upstream error object.
+/// Prefers `message`, then `msg`; falls back to the serialized object so
+/// the value stays searchable in the UI even for unusual error shapes.
+pub fn body_error_message(error: &serde_json::Value) -> String {
+    error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| error.get("msg").and_then(|m| m.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// Conservative rate-limit detection on an upstream error object.
+///
+/// Returns true when the numeric `code` == 429, or a string `code` /
+/// `message` contains a rate-limit marker ("rate limit", "burst", "flow",
+/// "quota", case-insensitive). Anything else → false. Conservative by
+/// design: it only inspects the `code` / `message` fields (never arbitrary
+/// object keys), so a generic upstream failure is never misclassified.
+pub fn body_error_is_rate_limited(error: &serde_json::Value) -> bool {
+    // "ratelimit" (no space) covers camelCase codes like `RateLimitExceeded`;
+    // the spaced form covers human-readable messages.
+    const MARKERS: &[&str] = &["rate limit", "ratelimit", "burst", "flow", "quota"];
+
+    if let Some(429) = error.get("code").and_then(|c| c.as_u64()) {
+        return true;
+    }
+    let lower_code = error
+        .get("code")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_lowercase());
+    let lower_msg = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_lowercase());
+    lower_code
+        .iter()
+        .chain(lower_msg.iter())
+        .any(|h| MARKERS.iter().any(|m| h.contains(m)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,5 +1335,96 @@ mod tests {
             0,
             "the real target must not be contacted when proxied"
         );
+    }
+
+    // ── 200-delivered upstream error detection ───────────────────
+
+    #[test]
+    fn body_has_error_object_detects_real_error_object() {
+        // A real JSON object `error` → error.
+        assert!(body_has_error_object(&serde_json::json!({
+            "error": { "message": "burst" }
+        })));
+        // `error` absent → no error.
+        assert!(!body_has_error_object(&serde_json::json!({
+            "choices": []
+        })));
+        // `error: null` is treated as absent.
+        assert!(!body_has_error_object(&serde_json::json!({
+            "error": null,
+            "choices": []
+        })));
+        // Non-object error values (string / bool / array / number) must be
+        // treated as absent — only an actual JSON object signals a real
+        // upstream error object.
+        for non_object in [
+            serde_json::json!("oops"),
+            serde_json::json!(true),
+            serde_json::json!([1, 2]),
+            serde_json::json!(0),
+        ] {
+            assert!(
+                !body_has_error_object(&serde_json::json!({ "error": non_object })),
+                "non-object error value {non_object} must be treated as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn body_error_message_extracts_human_readable_message() {
+        let err = serde_json::json!({ "message": "upstream overloaded", "code": "500" });
+        assert_eq!(body_error_message(&err), "upstream overloaded");
+        // `msg` alias.
+        assert_eq!(
+            body_error_message(&serde_json::json!({ "msg": "boom" })),
+            "boom"
+        );
+        // Falls back to the serialized object when no message field exists.
+        let obj = serde_json::json!({ "code": "EMPTY" });
+        assert_eq!(body_error_message(&obj), obj.to_string());
+    }
+
+    #[test]
+    fn body_error_is_rate_limited_matches_expected_markers() {
+        // Numeric code 429.
+        assert!(body_error_is_rate_limited(&serde_json::json!({
+            "code": 429,
+            "message": "too many requests"
+        })));
+        // String code with a marker.
+        assert!(body_error_is_rate_limited(&serde_json::json!({
+            "code": "RateLimitExceeded",
+            "message": "n/a"
+        })));
+        // Message-only markers (case-insensitive).
+        for msg in [
+            "rate limit reached",
+            "BURST tokens exceeded",
+            "flow control",
+            "quota exceeded",
+        ] {
+            assert!(
+                body_error_is_rate_limited(&serde_json::json!({ "message": msg })),
+                "message {msg:?} should classify as rate-limited"
+            );
+        }
+    }
+
+    #[test]
+    fn body_error_is_rate_limited_is_conservative() {
+        // Generic failures must not be misclassified.
+        assert!(!body_error_is_rate_limited(&serde_json::json!({
+            "code": 500,
+            "message": "internal server error"
+        })));
+        assert!(!body_error_is_rate_limited(&serde_json::json!({
+            "code": "ModelNotFound",
+            "message": "unknown model"
+        })));
+        // Numeric code != 429 is never rate-limited, even with a generic body.
+        assert!(!body_error_is_rate_limited(&serde_json::json!({
+            "code": 503,
+            "message": "service unavailable"
+        })));
     }
 }

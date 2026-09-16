@@ -9,7 +9,7 @@ use sag_core::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{error, instrument, trace};
+use tracing::{error, instrument, trace, warn};
 
 use crate::{LlmProvider, ProviderBase, find_sse_boundary};
 
@@ -76,11 +76,18 @@ fn map_stop_reason(reason: &str) -> &str {
 
 /// Drain complete SSE frames from the buffer, normalizing Anthropic events
 /// into OpenAI-compatible SSE chunks.
+///
+/// Returns `true` when a frame carried a 200-delivered upstream error (the
+/// Anthropic `type: "error"` event or a top-level `error` object): the
+/// frame was forwarded and an `Error` chunk sent by
+/// [`process_anthropic_sse_frame`]; the caller must stop forwarding further
+/// frames.
 fn drain_anthropic_sse_frames(
     buffer: &mut Vec<u8>,
     tx: &mpsc::UnboundedSender<StreamChunk>,
     state: &mut AnthropicStreamState,
-) {
+) -> bool {
+    let mut saw_error = false;
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
         let delim_len = if buffer.starts_with(b"\r\n\r\n") {
@@ -89,29 +96,43 @@ fn drain_anthropic_sse_frames(
             2
         };
         buffer.drain(..delim_len);
-        process_anthropic_sse_frame(&frame, tx, state);
+        if process_anthropic_sse_frame(&frame, tx, state) {
+            saw_error = true;
+            break;
+        }
     }
+    saw_error
 }
 
 /// Drain remaining frames and flush any un-delimited trailing frame upon stream end.
+///
+/// Returns `true` when the trailing frame (or a frame drained first) carried a
+/// 200-delivered upstream error, mirroring [`drain_anthropic_sse_frames`].
 fn flush_anthropic_sse_buffer(
     buffer: &mut Vec<u8>,
     tx: &mpsc::UnboundedSender<StreamChunk>,
     state: &mut AnthropicStreamState,
-) {
-    drain_anthropic_sse_frames(buffer, tx, state);
-    if !buffer.is_empty() {
+) -> bool {
+    let mut saw_error = drain_anthropic_sse_frames(buffer, tx, state);
+    if !saw_error && !buffer.is_empty() {
         let frame = std::mem::take(buffer);
-        process_anthropic_sse_frame(&frame, tx, state);
+        saw_error = process_anthropic_sse_frame(&frame, tx, state);
     }
+    saw_error
 }
 
 /// Parse a single Anthropic SSE frame and emit normalized OpenAI-format chunks.
+///
+/// Returns `true` when the frame carried a 200-delivered upstream error (the
+/// Anthropic `type: "error"` event or a top-level `error` object): the raw
+/// frame is still forwarded to the client for behavior compatibility, an
+/// `Error` chunk is emitted, and the caller must stop processing further
+/// frames.
 fn process_anthropic_sse_frame(
     frame: &[u8],
     tx: &mpsc::UnboundedSender<StreamChunk>,
     state: &mut AnthropicStreamState,
-) {
+) -> bool {
     let text = String::from_utf8_lossy(frame);
 
     for line in text.lines() {
@@ -128,6 +149,32 @@ fn process_anthropic_sse_frame(
             }
             continue;
         };
+
+        // A 200-delivered upstream error: the Anthropic `type: "error"`
+        // event (e.g. `{"type":"error","error":{"type":"overloaded_error","message":"..."}}`)
+        // or a top-level `error` object in a frame that lacks a `type`.
+        // Mirror the OpenAI SSE path: forward the frame to the client
+        // (behavior-compatible), surface the error so the dispatcher
+        // records the attempt as a FAILURE, and stop processing.
+        if val["type"].as_str() == Some("error") || crate::base::body_has_error_object(&val) {
+            let raw = format!("data: {json_str}\n\n").into_bytes();
+            // Extract the message from the inner `error` object when
+            // present, falling back to the whole value.
+            let msg = val
+                .get("error")
+                .map(crate::base::body_error_message)
+                .unwrap_or_else(|| crate::base::body_error_message(&val));
+            warn!(status = 200, %msg, "upstream returned error");
+            // Enqueue the `Error` chunk BEFORE the forwarded `Data` frame:
+            // the dispatch unfold loop records the analytics error state
+            // before the `Data` frame is delivered to the client, so a
+            // disconnect immediately after this frame still classifies as
+            // `model_failure` / 502, never `client_cancelled` / 499 (same
+            // ordering discipline as the OpenAI SSE path).
+            let _ = tx.send(StreamChunk::Error(msg));
+            let _ = tx.send(StreamChunk::Data(raw));
+            return true;
+        }
 
         let Some(event_type) = val["type"].as_str() else {
             // No "type" field — forward as-is for safety
@@ -214,6 +261,7 @@ fn process_anthropic_sse_frame(
             }
         }
     }
+    false
 }
 
 // ── Anthropic wire types ─────────────────────────────────────────
@@ -648,6 +696,31 @@ impl LlmProvider for AnthropicProvider {
             )
             .await?;
 
+        // Some upstreams deliver errors with HTTP 200 by embedding a
+        // top-level `error` object in the JSON body. Treat it as an upstream
+        // error (same `AppError::Upstream` as the non-2xx path) so dispatch
+        // records a failed attempt instead of silently relaying a
+        // success-shaped body. Rate-limit-ish errors map to 429 so the
+        // analytics failure reason is `rate_limited`.
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+            && crate::base::body_has_error_object(&raw)
+        {
+            let err_obj = raw.get("error").expect("checked error object");
+            let body = crate::base::body_error_message(err_obj);
+            let status = if crate::base::body_error_is_rate_limited(err_obj) {
+                429
+            } else {
+                // Upstream error delivered with 200 → 502 (bad gateway).
+                502
+            };
+            warn!(status = 200, %body_text, "upstream returned error");
+            return Err(AppError::Upstream {
+                provider: self.base.name.clone(),
+                status,
+                body,
+            });
+        }
+
         let anthropic_resp: AnthropicResponse = serde_json::from_str(&body_text)
             .map_err(|e| AppError::Internal(format!("failed to parse anthropic response: {e}")))?;
 
@@ -723,7 +796,16 @@ impl LlmProvider for AnthropicProvider {
                     Ok(Some(Ok(chunk))) => {
                         trace!(received_bytes = chunk.len(), "received anthropic SSE chunk");
                         buffer.extend_from_slice(&chunk);
-                        drain_anthropic_sse_frames(&mut buffer, &tx, &mut state);
+                        if drain_anthropic_sse_frames(&mut buffer, &tx, &mut state) {
+                            // A 200-delivered upstream error frame:
+                            // `process_anthropic_sse_frame` already forwarded
+                            // the frame and emitted an `Error` chunk. Drop any
+                            // frames buffered after it — nothing may be
+                            // forwarded beyond the error frame.
+                            buffer.clear();
+                            had_error = true;
+                            break;
+                        }
                     }
                     Ok(Some(Err(e))) => {
                         error!(?e, "error reading anthropic stream chunk");
@@ -748,8 +830,12 @@ impl LlmProvider for AnthropicProvider {
                 }
             }
 
-            if !buffer.is_empty() {
-                flush_anthropic_sse_buffer(&mut buffer, &tx, &mut state);
+            if !buffer.is_empty() && !had_error {
+                // A trailing un-delimited frame at EOF may carry a
+                // 200-delivered error — surface it like any other.
+                if flush_anthropic_sse_buffer(&mut buffer, &tx, &mut state) {
+                    had_error = true;
+                }
             }
 
             if !had_error {
@@ -1391,6 +1477,132 @@ mod tests {
         assert_eq!(chunks[0].completion_tokens, 42);
     }
 
+    // ── 200-delivered upstream error detection in SSE frames ────
+
+    /// The Anthropic in-stream error event
+    /// (`{"type":"error","error":{...}}`) must be forwarded to the client
+    /// (behavior-compatible) and surfaced as an in-stream error: the `Error`
+    /// chunk is enqueued before the forwarded `Data` frame (so the dispatch
+    /// loop records the error state before the data can be delivered to a
+    /// disconnecting client), and `process_anthropic_sse_frame` returns
+    /// `true`.
+    #[test]
+    fn anthropic_sse_error_event_surfaces_in_stream_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut state = AnthropicStreamState::default();
+
+        let frame = b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n";
+        let saw_error = process_anthropic_sse_frame(frame, &tx, &mut state);
+        drop(tx);
+
+        assert!(saw_error, "an error event must signal an in-stream error");
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert_eq!(chunks.len(), 2, "Error + forwarded Data chunks");
+        match &chunks[0] {
+            StreamChunk::Error(msg) => assert_eq!(msg, "upstream overloaded"),
+            other => panic!("expected an Error chunk first, got {other:?}"),
+        }
+        assert!(
+            matches!(&chunks[1], StreamChunk::Data(d) if d == b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n"),
+            "the error frame must still be forwarded verbatim: {:?}",
+            chunks[1]
+        );
+    }
+
+    /// `"error": null` or a non-object `error` value inside an Anthropic
+    /// frame must be treated as absent — normal event processing is
+    /// unaffected and no `Error` chunk is emitted.
+    #[test]
+    fn anthropic_sse_null_or_non_object_error_is_not_an_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut state = AnthropicStreamState::default();
+
+        // `error: null` inside an otherwise-normal event.
+        let null_err = b"data: {\"type\":\"message_delta\",\"error\":null,\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n";
+        let saw_null = process_anthropic_sse_frame(null_err, &tx, &mut state);
+        assert!(!saw_null, "`error: null` must be treated as absent");
+
+        // A scalar `error` value is not an error object either.
+        let scalar_err = b"data: {\"type\":\"ping\",\"error\":\"nope\"}\n\n";
+        let saw_scalar = process_anthropic_sse_frame(scalar_err, &tx, &mut state);
+        assert!(
+            !saw_scalar,
+            "a non-object `error` value must be treated as absent"
+        );
+
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert!(
+            !chunks.iter().any(|c| matches!(c, StreamChunk::Error(_))),
+            "no Error chunk for null / non-object error values"
+        );
+    }
+
+    /// Normal Anthropic frames (message_start / content_block_delta /
+    /// message_delta with usage) are unaffected by error detection:
+    /// `process_anthropic_sse_frame` returns `false` and only Data / Usage
+    /// chunks are emitted.
+    #[test]
+    fn anthropic_sse_normal_frames_unaffected_by_error_detection() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut state = AnthropicStreamState::default();
+
+        let start = b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-3\",\"usage\":{\"input_tokens\":10}}}\n\n";
+        assert!(!process_anthropic_sse_frame(start, &tx, &mut state));
+
+        let delta = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        assert!(!process_anthropic_sse_frame(delta, &tx, &mut state));
+
+        let done = b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n";
+        assert!(!process_anthropic_sse_frame(done, &tx, &mut state));
+
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert!(
+            !chunks.iter().any(|c| matches!(c, StreamChunk::Error(_))),
+            "normal frames must never produce an Error chunk"
+        );
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Usage(_))),
+            "usage frames must still emit Usage chunks"
+        );
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Data(_))),
+            "content frames must still be forwarded"
+        );
+    }
+
+    /// `drain_anthropic_sse_frames` returns `true` when an error event is
+    /// encountered mid-buffer and stops draining; `flush_anthropic_sse_buffer`
+    /// surfaces an error event in a trailing (un-delimited) frame.
+    #[test]
+    fn drain_anthropic_sse_frames_stops_on_error_event() {
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut state = AnthropicStreamState::default();
+
+        // Normal delta frame followed by an error event.
+        let mut buffer =
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"boom\"}}\n\n".to_vec();
+        let saw_error = drain_anthropic_sse_frames(&mut buffer, &tx, &mut state);
+        assert!(saw_error, "mid-buffer error event must be detected");
+
+        // Trailing un-delimited error event.
+        let mut trailing = b"data: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}".to_vec();
+        let saw_trailing = flush_anthropic_sse_buffer(&mut trailing, &tx, &mut state);
+        assert!(saw_trailing, "trailing error event must be detected");
+        assert!(trailing.is_empty());
+    }
+
     // ── chunk idle timeout (local HTTP mock) ─────────────────────
 
     fn anthropic_provider(
@@ -1569,5 +1781,135 @@ mod tests {
             elapsed < std::time::Duration::from_secs(3),
             "idle timeout should fire at ~1s, not wait for the connection close: {elapsed:?}"
         );
+    }
+
+    /// An in-stream Anthropic error event must emit an `Error` chunk (with
+    /// the upstream message) and STOP the stream: no `Done` is ever sent,
+    /// and bytes after the error frame are ignored. The error frame itself
+    /// is still forwarded to the client (behavior-compatible).
+    #[tokio::test]
+    async fn chat_stream_error_event_emits_error_chunk_and_no_done() {
+        use tokio::io::AsyncWriteExt;
+        let base_url = crate::test_support::spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            // A normal delta before the error.
+            stream
+                .write_all(
+                    b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                )
+                .await
+                .unwrap();
+            // The in-stream error event.
+            stream
+                .write_all(
+                    b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            // Any bytes after the error must be ignored.
+            stream
+                .write_all(b"data: {\"type\":\"message_stop\"}\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, None);
+        let mut stream = provider
+            .chat_stream(
+                &crate::test_support::chat_request(),
+                "claude-3",
+                "/messages",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut saw_error = false;
+        let mut saw_done = false;
+        let mut saw_forwarded_error_frame = false;
+        let mut saw_partial = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(d) => {
+                    let text = String::from_utf8_lossy(&d).to_string();
+                    if text.contains("upstream overloaded") {
+                        saw_forwarded_error_frame = true;
+                    } else if text.contains("partial") {
+                        saw_partial = true;
+                    }
+                }
+                StreamChunk::Error(msg) => {
+                    saw_error = true;
+                    assert_eq!(msg, "upstream overloaded");
+                }
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+
+        assert!(saw_partial, "the delta before the error must be forwarded");
+        assert!(
+            saw_error,
+            "the in-stream error event must emit an Error chunk"
+        );
+        assert!(
+            saw_forwarded_error_frame,
+            "the error frame must still be forwarded to the client"
+        );
+        assert!(!saw_done, "an errored stream must never emit Done");
+    }
+
+    // ── 200-delivered upstream error detection (non-streaming) ──
+
+    /// A 200 JSON body carrying a top-level non-null `error` object must be
+    /// surfaced as `AppError::Upstream` (status 502), not silently parsed as
+    /// a success-shaped response.
+    #[tokio::test]
+    async fn chat_200_body_with_error_object_returns_upstream_error() {
+        use tokio::io::AsyncWriteExt;
+        let body = r#"{"type":"error","error":{"message":"upstream overloaded","code":"overloaded_error"}}"#;
+        let base_url = crate::test_support::spawn_server(move |mut stream| {
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, None);
+        let err = provider
+            .chat(
+                &crate::test_support::chat_request(),
+                "claude-3",
+                "/messages",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 502, "200-delivered error maps to 502");
+                assert_eq!(body, "upstream overloaded", "message must be extracted");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
     }
 }
