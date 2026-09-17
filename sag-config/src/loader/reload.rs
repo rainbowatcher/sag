@@ -71,7 +71,13 @@ impl HotReloadHandle {
     /// OS-level file-watching threads (FSEvents on macOS, inotify on Linux).
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(error = %e, "hot-reload watcher task panicked"),
+            // Timeout: task dropped without completing — Watcher::Drop may
+            // never run and OS watch threads can block process exit.
+            Err(_) => error!("hot-reload watcher did not stop within 5s"),
+        }
     }
 }
 

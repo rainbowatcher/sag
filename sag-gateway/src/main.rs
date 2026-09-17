@@ -577,7 +577,11 @@ impl ThresholdWatcherHandle {
     /// that happens to be mid-sleep.
     async fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.task).await {
+            Ok(Ok(())) => info!("threshold watcher shut down"),
+            Ok(Err(e)) => tracing::error!(error = %e, "threshold watcher task panicked"),
+            Err(_) => tracing::warn!("threshold watcher did not stop within 5s"),
+        }
     }
 }
 

@@ -65,6 +65,12 @@ SAG 选择单进程架构，所有功能在一个二进制中。
 
 Guard 在 `main()` 中声明为第一个局部变量，利用 Rust 的**反向 drop 顺序**确保它在所有其它资源之后释放——包括 `hot_reload_handle` 和 axum server。这保证了所有 tracing 消息在进程退出前被 flush。
 
+## 版本升级脚本
+
+`scripts/bump-version.py` 将每个版本源文件实际修改后的路径收集为候选变更文件，行为与 `bumpp` 的 `updatedFiles` 类似：只有检测到替换的文件才进入候选列表。自动提交前通过 `git ls-files --cached` 过滤候选列表，仅向 `git commit -- <paths>` 传入已被 Git 跟踪的路径。
+
+因此，Cargo workspace 即使因项目策略将 `Cargo.lock` 放入 `.gitignore`，脚本仍会同步本地 lockfile，但会跳过该文件的自动提交，不会因无效 pathspec 失败。其它未跟踪或忽略的版本文件遵循同样规则。
+
 ## 不变式
 
 - `sag-core` 不依赖任何工作区子包
@@ -80,3 +86,4 @@ Guard 在 `main()` 中声明为第一个局部变量，利用 Rust 的**反向 d
 
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
+- [0002 版本升级提交按实际变更文件过滤](changes/0002-version-bump-commit-files.md)

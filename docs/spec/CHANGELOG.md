@@ -7,6 +7,10 @@ updated: 2026-09-15
 
 按时间倒序列出所有模块的变更记录。
 
+## 2026-09-17
+
+- **架构**：[0002 版本升级提交按实际变更文件过滤](architecture/changes/0002-version-bump-commit-files.md) — 版本升级脚本参考 `bumpp` 的 `updatedFiles` 语义，仅提交实际变更且已被 Git 跟踪的文件，避免被忽略的 `Cargo.lock` 触发无效 pathspec
+
 ## 2026-09-15
 
 - **分析**：[0006 200 状态内上游错误识别 + 取消流写 call_logs](analytics/changes/0006-upstream-error-in-200-and-cancelled-call-logs.md) — 识别 HTTP 200 内交付的上游错误（SSE data frame / 200 body 顶层 `error` 对象）：流式进入 `model_failure` / `stream_error_after_commit` 失败路径，非流式记为失败尝试并可 failover、限流特征映射 `rate_limited`、`call_logs` 记 502（限流 429）+ 上游消息；被取消的流式请求在 `TerminalGuard` 之外补写 `call_logs` 行（499 / `client_cancelled`），保证管理面板日志列表可见

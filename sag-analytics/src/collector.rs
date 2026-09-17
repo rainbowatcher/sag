@@ -3,7 +3,7 @@ use sqlx::sqlite::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::sqlite_store::SqliteLogStore;
 use crate::store::LogStore;
@@ -123,9 +123,15 @@ impl CallLogCollector {
     /// background task to finish, and close the store.
     pub async fn shutdown(self) {
         drop(self.tx);
-        // Use tokio::spawn so we don't block forever in case the background
-        // task panicked or is stuck.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.handle).await;
+        // Use a timeout so we don't block forever in case the background
+        // task panicked or is stuck; a timeout or panic is logged (on
+        // timeout the store is still shut down below, with the task
+        // possibly still running).
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(error = %e, "analytics collector task panicked"),
+            Err(_) => warn!("analytics collector did not stop within 5s"),
+        }
         self.store.shutdown().await;
     }
 }
