@@ -23,14 +23,18 @@ use crate::toml_edit_util::{
 /// place, preserving comments and field order in any field/table the
 /// in-memory config does not explicitly touch.
 ///
-/// All other sections — `[server]`, `[analytics]`, `[gateway_auth]`,
-/// `[circuit_breaker]`, `[logging]`, and the top-level scalar
-/// `shuffle_cache_ttl_secs` — are intentionally **not** written back.
-/// The admin save path only mutates the three sections above, so any
-/// user-authored values (and comments) in these untouched sections are
-/// preserved verbatim across saves. This also means admin-initiated
-/// saves won't accidentally revert hand-edited tuning of these
-/// read-only fields.
+/// `[gateway_auth]` is written back as well: the Settings page manages
+/// client API keys, so the admin save path owns `gateway_auth.api_keys`.
+/// An empty key list disables authentication (same as omitting the
+/// section) and is persisted as `api_keys = []`.
+///
+/// All other sections — `[server]`, `[analytics]`, `[circuit_breaker]`,
+/// `[logging]`, and the top-level scalar `shuffle_cache_ttl_secs` — are
+/// intentionally **not** written back. The admin save path only mutates
+/// the sections above, so any user-authored values (and comments) in
+/// these untouched sections are preserved verbatim across saves. This
+/// also means admin-initiated saves won't accidentally revert hand-edited
+/// tuning of these read-only fields.
 ///
 /// # Concurrency and crash-safety
 ///
@@ -127,6 +131,49 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
             Ok(())
         },
     )?;
+
+    // ── [gateway_auth] — write or leave absent ──
+    // The Settings page owns client API keys, so this section is written
+    // back. Field-level update via upsert_table preserves comments and
+    // any future sibling fields. Empty/`None` removes the section so a
+    // cleared auth config leaves no stale `api_keys` behind (empty list
+    // and missing section are equivalent: auth disabled).
+    match &config.gateway_auth {
+        Some(auth) if !auth.api_keys.is_empty() => {
+            let keys = auth.api_keys.clone();
+            upsert_table(
+                &mut doc,
+                &["gateway_auth"],
+                || {
+                    let mut table = toml_edit::Table::new();
+                    let array = ensure_array_field(&mut table, "api_keys");
+                    sync_string_array_in_place(array, &keys);
+                    Ok(toml_edit::Item::Table(table))
+                },
+                |item| {
+                    let table = item.as_table_mut().ok_or_else(|| {
+                        sag_core::AppError::Config(
+                            "gateway_auth is not a table in the config file".into(),
+                        )
+                    })?;
+                    sync_string_array_in_place(ensure_array_field(table, "api_keys"), &keys);
+                    Ok(())
+                },
+            )?;
+        }
+        _ => {
+            if let Some(table) = doc.as_table_mut().get_mut("gateway_auth")
+                && let Some(inner) = table.as_table_mut()
+            {
+                inner.remove("api_keys");
+                // Drop the section entirely when it has no remaining fields
+                // (avoid leaving a bare `[gateway_auth]` behind).
+                if inner.is_empty() {
+                    doc.as_table_mut().remove("gateway_auth");
+                }
+            }
+        }
+    }
 
     // ── [[routes]] — array of tables, key-matched on model_name ──
     sync_array_of_tables(
@@ -2828,6 +2875,64 @@ api_keys = ["sk-test"]
         assert!(
             !saved2.contains("proxy_url"),
             "cleared proxy_url should be removed from disk, got:\n{saved2}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_gateway_auth_api_keys() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+        assert!(config.gateway_auth.is_none());
+
+        // Install gateway auth keys.
+        config.gateway_auth = Some(crate::GatewayAuthConfig {
+            api_keys: vec!["sk-client-a".into(), "sk-client-b".into()],
+        });
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("[gateway_auth]"),
+            "gateway_auth section should be written, got:\n{saved}"
+        );
+        assert!(
+            saved.contains("sk-client-a") && saved.contains("sk-client-b"),
+            "api keys should be written, got:\n{saved}"
+        );
+
+        let reloaded = load_config(&path).unwrap();
+        let cfg = reloaded.inner.try_read().unwrap();
+        let auth = cfg.gateway_auth.as_ref().expect("gateway_auth must reload");
+        assert_eq!(auth.api_keys, vec!["sk-client-a", "sk-client-b"]);
+        drop(cfg);
+        drop(reloaded);
+
+        // Clearing auth removes the section from disk.
+        let mut config2 = load_config(&path)
+            .unwrap()
+            .inner
+            .try_read()
+            .unwrap()
+            .clone();
+        config2.gateway_auth = None;
+        save_config_to_file(&config2, &path).unwrap();
+
+        let saved2 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved2.contains("[gateway_auth]"),
+            "cleared gateway_auth should be removed from disk, got:\n{saved2}"
         );
 
         let _ = std::fs::remove_file(&path);

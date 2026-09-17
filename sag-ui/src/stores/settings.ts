@@ -8,6 +8,8 @@ import { useConnectionStore } from "./connection"
 export const useSettingsStore = defineStore("settings", () => {
   /** Current gateway-level proxy URL; `null` when none is configured. */
   const proxyUrl = ref<string | null>(null)
+  /** Gateway client-auth API keys; empty = authentication disabled. */
+  const apiKeys = ref<string[]>([])
   const loading = ref(false)
   const saving = ref(false)
   const error = ref("")
@@ -19,6 +21,7 @@ export const useSettingsStore = defineStore("settings", () => {
     try {
       const { data } = await api.get<Settings>("/api/settings")
       proxyUrl.value = data.proxy_url ?? null
+      apiKeys.value = data.api_keys ?? []
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
       error.value = getErrorMessage(e, String(e))
@@ -34,6 +37,7 @@ export const useSettingsStore = defineStore("settings", () => {
     try {
       const { data } = await api.put<Settings>("/api/settings", payload)
       proxyUrl.value = data.proxy_url ?? null
+      apiKeys.value = data.api_keys ?? []
       return data
     } catch (e: any) {
       if (e.response?.status === 401) useConnectionStore().handle401()
@@ -46,6 +50,7 @@ export const useSettingsStore = defineStore("settings", () => {
 
   return {
     proxyUrl,
+    apiKeys,
     loading,
     saving,
     error,

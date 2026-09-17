@@ -1,7 +1,7 @@
 //! Gateway-level settings handlers for the admin API.
 //!
 //! - `GET /api/settings` — read-only snapshot of the current in-memory
-//!   settings (the gateway-level `proxy_url`).
+//!   settings (the gateway-level `proxy_url` and client-auth `api_keys`).
 //! - `PUT /api/settings` — update settings, delegating to the
 //!   [`ConfigMutationCoordinator`](sag_state::ConfigMutationCoordinator) so
 //!   the change goes through the same atomic config + provider-registry +
@@ -19,25 +19,39 @@ use sag_state::AppState;
 
 /// Request body for `PUT /api/settings`.
 ///
-/// `proxy_url` is an explicit HTTP/HTTPS proxy URL, or `null` / `""` /
-/// whitespace-only to clear the global proxy. The handler never stores
-/// credentials: the config layer rejects userinfo-bearing URLs outright.
+/// - `proxy_url` is an explicit HTTP/HTTPS proxy URL, or `null` / `""` /
+///   whitespace-only to clear the global proxy. The handler never stores
+///   credentials: the config layer rejects userinfo-bearing URLs outright.
+/// - `api_keys`, when present, replaces the gateway client-auth key list.
+///   An empty array disables authentication (same as removing
+///   `[gateway_auth]`). When the field is omitted the current key list is
+///   left unchanged.
 #[derive(Debug, serde::Deserialize)]
 pub struct UpdateSettingsRequest {
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub api_keys: Option<Vec<String>>,
 }
 
 /// GET /api/settings — return the current in-memory settings.
 ///
 /// Reads the live `state.config` value (never the file, never a provider's
 /// saved mode). The config layer already rejects userinfo credentials, so
-/// echoing the stored value cannot leak credentials.
+/// echoing the stored proxy cannot leak credentials.
 #[instrument(skip(state))]
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().await;
+    let api_keys: Vec<String> = config
+        .gateway_auth
+        .as_ref()
+        .map(|auth| auth.api_keys.clone())
+        .unwrap_or_default();
     (
         StatusCode::OK,
-        Json(json!({ "proxy_url": config.proxy_url })),
+        Json(json!({
+            "proxy_url": config.proxy_url,
+            "api_keys": api_keys,
+        })),
     )
         .into_response()
 }
@@ -46,30 +60,43 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// Delegates to [`ConfigMutationCoordinator::update_settings`](sag_state::ConfigMutationCoordinator::update_settings)
 /// which normalizes empty/whitespace `proxy_url` to "no proxy", validates
-/// the URL up front, and atomically commits config + provider registry +
-/// version (rebuilding adapters whose effective proxy changed) and persists
-/// to disk when the config is file-backed. This handler never writes
-/// `state.config` or saves files directly.
+/// the URL up front, applies the optional `api_keys` replacement, and
+/// atomically commits config + provider registry + version (rebuilding
+/// adapters whose effective proxy changed) and persists to disk when the
+/// config is file-backed. This handler never writes `state.config` or
+/// saves files directly.
 ///
 /// Malformed proxy URLs and `proxy_mode = "enabled"` providers left without
 /// a global proxy surface as [`AppError::Config`] from the coordinator; the
 /// admin API reports those as **400** `BAD_REQUEST` rather than 500.
-#[instrument(skip(state), fields(proxy_url))]
+#[instrument(skip(state), fields(proxy_url, api_keys_supplied))]
 pub async fn update_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSettingsRequest>,
 ) -> impl IntoResponse {
     // Never log the URL itself (could be mis-typed with embedded
-    // credentials); log only whether a value was supplied.
+    // credentials) or the key material; log only whether values were
+    // supplied.
     tracing::Span::current().record("proxy_url", req.proxy_url.is_some());
+    tracing::Span::current().record("api_keys_supplied", req.api_keys.is_some());
 
-    match state.coordinator.update_settings(req.proxy_url).await {
+    match state
+        .coordinator
+        .update_settings(req.proxy_url, req.api_keys)
+        .await
+    {
         Ok(report) => {
             let config = state.config.read().await;
+            let api_keys: Vec<String> = config
+                .gateway_auth
+                .as_ref()
+                .map(|auth| auth.api_keys.clone())
+                .unwrap_or_default();
             (
                 StatusCode::OK,
                 Json(json!({
                     "proxy_url": config.proxy_url,
+                    "api_keys": api_keys,
                     "report": {
                         "providers_added": report.providers_added,
                         "providers_rebuilt": report.providers_rebuilt,
@@ -82,8 +109,8 @@ pub async fn update_settings(
                 .into_response()
         }
         Err(e) => match e {
-            // Invalid proxy URL / `enabled`-mode conflict: a request-level
-            // error, not a server fault.
+            // Invalid proxy URL / `enabled`-mode conflict / blank API key:
+            // a request-level error, not a server fault.
             AppError::Config(msg) => AppError::BadRequest(msg).into_response(),
             other => other.into_response(),
         },
@@ -303,5 +330,81 @@ mod tests {
 
         // The runtime registry still holds the rebuilt adapter.
         assert!(state.providers.read().await.contains_key("openai"));
+    }
+
+    #[tokio::test]
+    async fn get_settings_returns_empty_api_keys_when_auth_absent() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state_with_proxy(providers, routes, None).await;
+        // The shared fixture ships with a default key; clear it so this test
+        // exercises the "no auth configured" path.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.gateway_auth = None;
+        }
+        let app = test_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/settings")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["api_keys"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn put_settings_manages_api_keys() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state_with_proxy(providers, routes, None).await;
+        let app = test_app(state.clone());
+
+        // Install keys.
+        let response = put_settings(&app, r#"{"proxy_url":null,"api_keys":["sk-a","sk-b"]}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["api_keys"], serde_json::json!(["sk-a", "sk-b"]));
+
+        // Omitting api_keys leaves them unchanged (proxy-only update).
+        let response = put_settings(&app, r#"{"proxy_url":"http://proxy.example:8080"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["api_keys"], serde_json::json!(["sk-a", "sk-b"]));
+        assert_eq!(body["proxy_url"], "http://proxy.example:8080");
+
+        // Empty list disables auth.
+        let response = put_settings(&app, r#"{"proxy_url":null,"api_keys":[]}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["api_keys"], serde_json::json!([]));
+
+        let cfg = state.config.read().await;
+        assert!(cfg.gateway_auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_settings_blank_api_key_is_400() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state_with_proxy(providers, routes, None).await;
+        // Start from "no auth" so a rejected mutation cannot leave a fixture
+        // default key looking like a successful commit.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.gateway_auth = None;
+        }
+        let app = test_app(state.clone());
+
+        let response = put_settings(&app, r#"{"proxy_url":null,"api_keys":["sk-ok",""]}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+
+        let cfg = state.config.read().await;
+        assert!(
+            cfg.gateway_auth.is_none(),
+            "rejected mutation must not commit keys"
+        );
     }
 }

@@ -283,12 +283,13 @@ targets = [
 - `api_keys` — 允许的 API Key 列表，客户端需在请求头中携带 `Authorization: Bearer <key>` 进行认证
 - 删除（或注释掉）整个 `[gateway_auth]` 段可关闭认证，允许所有请求通过
 - 保留 `[gateway_auth]` 段但设 `api_keys = []`（空列表）等同于关闭认证，行为与删除该段一致
+- 也可在 Dashboard 的 **Settings → Gateway API Keys** 中在线增删密钥；变更会写回配置文件并即时生效（认证中间件每次请求读取当前内存配置）
 
 Dashboard 前端在登录页输入 URL 和 API Key 后，会将连接信息保存在浏览器 `localStorage` 中（有效期 30 天）。重启服务后自动使用保存的 key 重连，无需重新输入。
 
 ## 热重载
 
-配置文件使用 `notify` 库监听变化。更新后，供应商和路由会在不重启服务器的情况下即时生效。认证配置（`[gateway_auth]`）和服务器设置（`[server]`）暂不支持热更新，需重启服务。
+配置文件使用 `notify` 库监听变化。更新后，供应商和路由会在不重启服务器的情况下即时生效。服务器设置（`[server]`）不支持热更新，需重启服务。通过 Settings 页 / `PUT /api/settings` 修改的 `gateway_auth.api_keys` 会立即在内存生效并持久化；外部直接改配置文件中的 `[gateway_auth]` 则需重启（文件热重载路径不重建认证中间件依赖的 router）。
 
 ## 环境变量
 

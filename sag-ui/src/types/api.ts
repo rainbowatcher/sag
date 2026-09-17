@@ -28,12 +28,22 @@ export interface Provider {
 export interface Settings {
   /** Global upstream HTTP proxy URL; `null` when none is configured. */
   proxy_url: string | null
+  /**
+   * Gateway client-auth API keys (`[gateway_auth].api_keys`). Empty array
+   * means authentication is disabled.
+   */
+  api_keys: string[]
 }
 
-/** Payload of `PUT /api/settings` (same shape as `Settings`). */
+/** Payload of `PUT /api/settings`. */
 export interface UpdateSettingsPayload {
   /** Empty string or `null` clears the global proxy. */
   proxy_url: string | null
+  /**
+   * Omit to leave the current key list unchanged. An empty array disables
+   * authentication.
+   */
+  api_keys?: string[]
 }
 
 export interface ModelTestResult {

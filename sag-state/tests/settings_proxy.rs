@@ -73,7 +73,7 @@ async fn update_settings_persists_and_hot_rebuilds_providers() {
     // Set the global proxy: only the inherit provider's effective proxy
     // moves (None -> Some), so only p1 is rebuilt.
     let report = coord
-        .update_settings(Some("http://proxy.example:8080".into()))
+        .update_settings(Some("http://proxy.example:8080".into()), None)
         .await
         .expect("setting a proxy must succeed");
     assert_eq!(report.providers_rebuilt, vec!["p1"]);
@@ -97,7 +97,7 @@ async fn update_settings_persists_and_hot_rebuilds_providers() {
 
     // Change the URL: the inherit provider's effective proxy moves again.
     let report = coord
-        .update_settings(Some("http://proxy2.example:8080".into()))
+        .update_settings(Some("http://proxy2.example:8080".into()), None)
         .await
         .expect("changing the proxy must succeed");
     assert_eq!(report.providers_rebuilt, vec!["p1"]);
@@ -109,7 +109,7 @@ async fn update_settings_persists_and_hot_rebuilds_providers() {
     // Clear the global proxy: p1's effective proxy moves Some -> None
     // (rebuild to direct), p2 stays untouched, and the file key is removed.
     let report = coord
-        .update_settings(None)
+        .update_settings(None, None)
         .await
         .expect("clearing the proxy must succeed");
     assert_eq!(report.providers_rebuilt, vec!["p1"]);
@@ -136,14 +136,14 @@ async fn update_settings_rejects_malformed_proxy_url() {
     // Credentials embedded in the proxy URL are rejected (SAG never stores
     // or forwards proxy credentials).
     let err = coord
-        .update_settings(Some("http://user:pass@proxy.example:8080".into()))
+        .update_settings(Some("http://user:pass@proxy.example:8080".into()), None)
         .await
         .expect_err("userinfo proxy URL must be rejected");
     assert!(err.to_string().contains("userinfo"));
 
     // An unparseable URL is rejected too.
     let err = coord
-        .update_settings(Some("not a url".into()))
+        .update_settings(Some("not a url".into()), None)
         .await
         .expect_err("unparseable proxy URL must be rejected");
     assert!(err.to_string().contains("proxy"));
@@ -188,7 +188,7 @@ async fn update_settings_rejects_clearing_global_while_enabled_provider_exists()
     let version_before = handle.routes_version();
 
     let err = coord
-        .update_settings(None)
+        .update_settings(None, None)
         .await
         .expect_err("clearing the global proxy with an enabled provider must be rejected");
     assert!(err.to_string().contains("enabled"));
@@ -217,14 +217,14 @@ async fn update_settings_normalizes_blank_proxy_to_none() {
 
     let (coord, handle) = make_coordinator(&path);
     let report = coord
-        .update_settings(Some("http://proxy.example:8080".into()))
+        .update_settings(Some("http://proxy.example:8080".into()), None)
         .await
         .expect("setting a proxy must succeed");
     assert_eq!(report.providers_rebuilt, vec!["p1"]);
 
     // A whitespace-only value clears the proxy exactly like `None`.
     let report = coord
-        .update_settings(Some("   ".into()))
+        .update_settings(Some("   ".into()), None)
         .await
         .expect("blank value must clear the proxy");
     assert_eq!(report.providers_rebuilt, vec!["p1"]);
@@ -254,14 +254,14 @@ async fn update_settings_validates_even_with_empty_provider_set() {
     let coord = ConfigMutationCoordinator::new(handle, providers);
 
     let err = coord
-        .update_settings(Some("http://user:pass@proxy.example:8080".into()))
+        .update_settings(Some("http://user:pass@proxy.example:8080".into()), None)
         .await
         .expect_err("malformed URL must be rejected even with no providers");
     assert!(err.to_string().contains("userinfo"));
 
     // A valid value is accepted (in-memory config: no file to persist).
     let report = coord
-        .update_settings(Some("http://proxy.example:8080".into()))
+        .update_settings(Some("http://proxy.example:8080".into()), None)
         .await
         .expect("valid settings must be accepted");
     assert!(report.providers_added.is_empty());
@@ -343,4 +343,101 @@ async fn reload_from_path_rebuilds_only_affected_providers() {
     );
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// Setting `api_keys` persists `[gateway_auth]` to disk, leaves an omitted
+/// `api_keys` (`None`) untouched, and an empty list disables auth by
+/// removing the section.
+#[tokio::test]
+async fn update_settings_manages_gateway_auth_api_keys() {
+    let path = unique_temp_path("sag_settings_auth_keys");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, initial_toml()).unwrap();
+
+    let (coord, handle) = make_coordinator(&path);
+
+    // Install two keys: persisted under [gateway_auth].
+    coord
+        .update_settings(None, Some(vec!["sk-client-a".into(), "sk-client-b".into()]))
+        .await
+        .expect("setting api keys must succeed");
+    {
+        let cfg = handle.read().await;
+        let auth = cfg.gateway_auth.as_ref().expect("gateway_auth must be set");
+        assert_eq!(auth.api_keys, vec!["sk-client-a", "sk-client-b"]);
+    }
+    assert!(
+        file_contains(&path, "[gateway_auth]"),
+        "gateway_auth section must be persisted"
+    );
+    assert!(
+        file_contains(&path, "sk-client-a"),
+        "api keys must be written to the config file"
+    );
+
+    // Omitting api_keys (None) must not touch the existing auth config.
+    coord
+        .update_settings(Some("http://proxy.example:8080".into()), None)
+        .await
+        .expect("proxy-only update must succeed");
+    {
+        let cfg = handle.read().await;
+        assert_eq!(
+            cfg.gateway_auth.as_ref().map(|a| a.api_keys.as_slice()),
+            Some(["sk-client-a".to_string(), "sk-client-b".to_string()].as_slice()),
+            "omitting api_keys must leave auth unchanged"
+        );
+        assert_eq!(
+            cfg.proxy_url.as_deref(),
+            Some("http://proxy.example:8080"),
+            "proxy update must still apply"
+        );
+    }
+
+    // Blank entries inside a non-empty list are rejected.
+    let err = coord
+        .update_settings(None, Some(vec!["sk-ok".into(), "  ".into()]))
+        .await
+        .expect_err("whitespace-only key must be rejected");
+    assert!(err.to_string().contains("api_keys"));
+
+    // Empty list disables auth: section removed from the file.
+    coord
+        .update_settings(None, Some(vec![]))
+        .await
+        .expect("clearing api keys must succeed");
+    {
+        let cfg = handle.read().await;
+        assert!(
+            cfg.gateway_auth.is_none(),
+            "empty key list must clear gateway_auth"
+        );
+    }
+    assert!(
+        !file_contains(&path, "[gateway_auth]"),
+        "clearing api keys must remove the section from the file"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Keys are trimmed before storage so surrounding whitespace never becomes
+/// part of the credential.
+#[tokio::test]
+async fn update_settings_trims_api_keys() {
+    let handle = sag_config::ConfigHandle::from_config(sag_config::GatewayConfig {
+        ..sag_config::gateway_config_base!()
+    });
+    let providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let coord = ConfigMutationCoordinator::new(handle.clone(), providers);
+
+    coord
+        .update_settings(None, Some(vec!["  sk-padded  ".into()]))
+        .await
+        .expect("trimmed key must be accepted");
+
+    let cfg = handle.read().await;
+    let auth = cfg.gateway_auth.as_ref().expect("gateway_auth must be set");
+    assert_eq!(auth.api_keys, vec!["sk-padded"]);
 }

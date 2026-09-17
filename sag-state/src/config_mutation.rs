@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use sag_analytics::{IdentityRegistry, RouteIdentity, TargetIdentity};
-use sag_config::{ConfigHandle, GatewayConfig, ProviderConfig, RouteConfig};
+use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig};
 use sag_core::AppError;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
@@ -702,9 +702,13 @@ impl ConfigMutationCoordinator {
         .await
     }
 
-    /// Update gateway-level settings. Currently supports the top-level
-    /// `proxy_url`; setting it to `None` (or an empty/whitespace value)
-    /// clears the global proxy.
+    /// Update gateway-level settings. Supports the top-level `proxy_url`
+    /// and the gateway client-auth `api_keys` list.
+    ///
+    /// - `proxy_url`: `None` (or empty/whitespace) clears the global proxy.
+    /// - `api_keys`: `None` leaves the current auth config unchanged;
+    ///   `Some(keys)` replaces it. An empty list disables authentication
+    ///   (same as removing `[gateway_auth]`).
     ///
     /// Goes through the exact same unified mutation protocol as provider /
     /// route CRUD: the mutation mutex, validation (a malformed `proxy_url` is
@@ -717,6 +721,7 @@ impl ConfigMutationCoordinator {
     pub async fn update_settings(
         &self,
         proxy_url: Option<String>,
+        api_keys: Option<Vec<String>>,
     ) -> Result<MutationReport, AppError> {
         // Normalize empty/whitespace-only values to `None` (no proxy) so the
         // in-memory config matches what the save path persists (it removes
@@ -730,8 +735,32 @@ impl ConfigMutationCoordinator {
             other => other.map(str::to_string),
         };
         sag_config::normalize_proxy_url(normalized.as_deref()).map_err(AppError::Config)?;
+
+        // Reject blank entries inside a supplied key list so a typo cannot
+        // silently create a key that can never authenticate. Empty list is
+        // allowed and means "disable authentication".
+        if let Some(ref keys) = api_keys
+            && keys.iter().any(|k| k.trim().is_empty())
+        {
+            return Err(AppError::Config(
+                "api_keys must not contain empty or whitespace-only values".into(),
+            ));
+        }
+        let normalized_keys = api_keys.map(|keys| {
+            keys.into_iter()
+                .map(|k| k.trim().to_string())
+                .collect::<Vec<String>>()
+        });
+
         self.mutate(true, |candidate| {
             candidate.proxy_url = normalized;
+            if let Some(keys) = normalized_keys {
+                candidate.gateway_auth = if keys.is_empty() {
+                    None
+                } else {
+                    Some(GatewayAuthConfig { api_keys: keys })
+                };
+            }
             Ok(())
         })
         .await

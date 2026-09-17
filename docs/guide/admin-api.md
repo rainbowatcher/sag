@@ -232,3 +232,48 @@ Content-Type: application/json
   "model_name": "gpt-4o"
 }
 ```
+
+### 读取网关设置
+
+```
+GET /api/settings
+```
+
+返回网关级配置快照：
+
+```json
+{
+  "proxy_url": "http://proxy.example:8080",
+  "api_keys": ["sk-client-a", "sk-client-b"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `proxy_url` | string \| null | 全局出站 HTTP/HTTPS 代理；`null` 表示直连 |
+| `api_keys` | array | 网关客户端认证密钥（`[gateway_auth].api_keys`）；空数组表示未启用认证 |
+
+### 更新网关设置
+
+```
+PUT /api/settings
+Content-Type: application/json
+
+{
+  "proxy_url": "http://proxy.example:8080",
+  "api_keys": ["sk-client-a"]
+}
+```
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `proxy_url` | string \| null | 是 | 设置或清除全局代理（`null` / 空字符串清除） |
+| `api_keys` | array | 否 | 替换网关客户端认证密钥列表；省略则保持不变；空数组关闭认证 |
+
+**校验**：
+
+- `proxy_url` 必须是合法 `http://` / `https://` URL，且不含 userinfo；否则 400
+- `api_keys` 中不得包含空白条目；否则 400
+- 将 `proxy_url` 清空时，若存在 `proxy_mode = "enabled"` 的供应商会返回 400
+
+**副作用**：变更会立即写入配置文件并在内存生效；认证中间件每次请求读取当前配置，因此密钥变更即时生效，无需重启。
