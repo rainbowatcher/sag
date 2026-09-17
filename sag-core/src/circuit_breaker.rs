@@ -3,7 +3,7 @@
 //! A route target is opened after its per-request retry budget is exhausted.
 //! While open, later requests skip that target and immediately try the next
 //! target in route order. The open duration depends on the error that caused
-//! the exhaustion, as classified by [`crate::CircuitHint`]:
+//! the exhaustion, as classified by [`crate::error::CircuitHint`]:
 //!
 //! | Trigger | Default Duration |
 //! |---|---|
@@ -82,7 +82,7 @@ struct CircuitEntry {
     /// target instead of probing again.
     probe_in_flight: bool,
     /// Timestamp when the probe slot was last acquired via
-    /// [`try_acquire_probe`]. Used to detect stale slots (future was cancelled
+    /// [`RouteCircuitBreaker::try_acquire_probe`]. Used to detect stale slots (future was cancelled
     /// before `apply_circuit_outcome` released the slot). `None` if no probe
     /// is in flight or the entry was just created / transitioned.
     probe_acquired_at: Option<Instant>,
@@ -112,7 +112,7 @@ impl RouteTargetKey {
 
 /// Public, serializable state kind for circuit breaker snapshots.
 ///
-/// This is a projection of the private [`CircuitState`] enum that does not
+/// This is a projection of the private `CircuitState` enum that does not
 /// expose internal `Instant` fields. Serialized as `"open"` / `"half_open"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,7 +188,7 @@ impl RouteCircuitBreaker {
     /// the current provider/route timeout settings.
     ///
     /// In-flight probe state (entries, `probe_in_flight`) is fully preserved —
-    /// only the threshold parameter used by [`try_acquire_probe`] is updated.
+    /// only the threshold parameter used by [`Self::try_acquire_probe`] is updated.
     pub fn set_stale_probe_threshold(&mut self, threshold: Duration) {
         self.stale_probe_threshold = threshold;
     }
@@ -240,7 +240,7 @@ impl RouteCircuitBreaker {
 
     /// Mark a target unavailable after its retry budget has been exhausted.
     /// `duration_secs` is the hard cooldown lower bound (from
-    /// [`crate::CircuitHint`]); `probe_interval_secs` is how often a
+    /// [`crate::error::CircuitHint`]); `probe_interval_secs` is how often a
     /// recovery probe is permitted while cooling down.
     pub fn open(&mut self, key: RouteTargetKey, duration_secs: u64, probe_interval_secs: u64) {
         let now = Instant::now();
@@ -306,7 +306,7 @@ impl RouteCircuitBreaker {
     /// probe_in_flight` slot whose `probe_acquired_at` is older than the
     /// breaker's `stale_probe_threshold`. This handles the case where a probe
     /// future was cancelled (e.g. client disconnect) before
-    /// [`apply_circuit_outcome`] released the slot, preventing permanent
+    /// `apply_circuit_outcome` released the slot, preventing permanent
     /// entry leaks.
     pub fn try_acquire_probe(&mut self, key: &RouteTargetKey) -> bool {
         let now = Instant::now();

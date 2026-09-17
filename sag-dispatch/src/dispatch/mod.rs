@@ -6,9 +6,9 @@
 //!   with disabled-provider filtering and retry-count inheritance.
 //! - [`dispatch_chat`] / [`dispatch_image`] — multi-provider fallback loops
 //!   for chat and image generation respectively.
-//! - [`run_with_retries`] — generic per-target retry loop shared by both
+//! - [`retry::run_with_retries`] — generic per-target retry loop shared by both
 //!   dispatch paths.
-//! - [`build_streaming_response`] — SSE response builder that forwards
+//! - [`stream::build_streaming_response`] — SSE response builder that forwards
 //!   `StreamChunk::Data` to the client and accumulates `Usage` / `Error`
 //!   chunks into a final `CallLog`.
 //!

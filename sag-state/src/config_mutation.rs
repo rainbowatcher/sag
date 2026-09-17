@@ -188,7 +188,7 @@ impl ConfigMutationCoordinator {
     ///
     /// When attached, each committed mutation that changes the routes list
     /// reconciles the registry with the live routes (see
-    /// [`Self::sync_identity_if_routes_changed`]). A failed sync surfaces as
+    /// `Self::sync_identity_if_routes_changed`). A failed sync surfaces as
     /// an explicit half-commit error and leaves a pending retry: the next
     /// mutation or reload — even a provider-only one — retries the sync.
     /// Existing `new` call sites stay registry-free and behave exactly as

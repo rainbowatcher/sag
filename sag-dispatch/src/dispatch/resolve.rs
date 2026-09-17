@@ -318,7 +318,7 @@ fn route_failure_event(
 }
 
 /// Enqueue a route-level failure event with formal backpressure
-/// ([`EventCollector::emit`], never `try_emit` — the fact must not be
+/// ([`sag_analytics::EventCollector::emit`], never `try_emit` — the fact must not be
 /// dropped). A collector failure is only possible once the collector is
 /// shut down; it is logged and swallowed so the client-facing response
 /// already built by the caller keeps its exact semantics.

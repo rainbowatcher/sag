@@ -139,7 +139,7 @@ fn validate_targets(
 ///   untouched — `order_fill_first` self-heals any targets mismatch by
 ///   re-shuffling on next use, so a live fill-first order is never broken.
 ///
-/// Mirrors [`sag_dispatch::DispatchRuntime::prune_stale_entries`]'s
+/// Mirrors `sag_dispatch::DispatchRuntime::prune_stale_entries`'s
 /// fill-first rule. Runs with no config read guard held across the writes
 /// (routes are cloned first), so it cannot deadlock against dispatch or the
 /// coordinator.

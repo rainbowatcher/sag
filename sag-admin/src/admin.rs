@@ -2,15 +2,15 @@
 //!
 //! This file owns the route wiring only. The handlers themselves live in:
 //!
-//! - [`admin_providers`] — `GET|POST|PUT|DELETE /api/providers` and
+//! - [`crate::admin_providers`] — `GET|POST|PUT|DELETE /api/providers` and
 //!   `GET /api/providers/{name}/models`
-//! - [`admin_routes`] — `GET|POST|PUT|DELETE /api/routes`
-//! - [`admin_testing`] — `POST /api/providers/fetch-models` and
+//! - [`crate::admin_routes`] — `GET|POST|PUT|DELETE /api/routes`
+//! - [`crate::admin_testing`] — `POST /api/providers/fetch-models` and
 //!   `POST /api/model/test`
-//! - [`admin_settings`] — `GET|PUT /api/settings`.
-//! - [`admin_circuit_breaker`] — `GET /api/circuit-breaker` and
+//! - [`crate::admin_settings`] — `GET|PUT /api/settings`.
+//! - [`crate::admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`
-//! - [`admin_active_targets`] — `GET|DELETE /api/active-targets`
+//! - [`crate::admin_active_targets`] — `GET|DELETE /api/active-targets`
 //!
 //! All admin routes are intended to be wrapped in the `gateway_auth`
 //! middleware by the parent router in `routes.rs`.

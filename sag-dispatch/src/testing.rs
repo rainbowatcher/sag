@@ -1,6 +1,6 @@
 //! Shared test helpers for constructing [`DispatchRuntime`].
 //!
-//! [`AppState`] construction helpers (`test_app_state`,
+//! [`crate::state::AppState`] construction helpers (`test_app_state`,
 //! `build_provider_registry`) have moved to `sag-state` and are
 //! re-exported here for backwards compatibility.
 //!

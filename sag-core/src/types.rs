@@ -371,7 +371,7 @@ pub struct CallLog {
     /// Client IP extracted from X-Forwarded-For / X-Real-IP headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
-    /// Machine-readable error category derived from the [`AppError`] variant
+    /// Machine-readable error category derived from the [`crate::AppError`] variant
     /// (e.g. `"model_not_found"`, `"provider_error"`, `"timeout"`). `None`
     /// for successful calls.    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,

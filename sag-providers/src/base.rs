@@ -234,7 +234,7 @@ impl ProviderBase {
     /// Combines `build_request` + `send` + `ensure_success`. Used by
     /// `chat_stream()`.
     ///
-    /// Unlike [`send_json`], streaming does **not** apply a total
+    /// Unlike [`Self::send_json`], streaming does **not** apply a total
     /// request deadline (that would truncate a healthy long-lived
     /// stream). The provider's `timeout_secs` is therefore a **no-op**
     /// for a successful streaming request: once the 2xx headers arrive,

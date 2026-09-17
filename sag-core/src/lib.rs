@@ -2,7 +2,7 @@
 //!
 //! Also hosts [`circuit_breaker`] — the in-memory per-target circuit breaker
 //! state machine. It lives here (rather than in `sag-dispatch`) so that both
-//! the dispatch engine and the shared [`AppState`] (in `sag-state`) can hold
+//! the dispatch engine and the shared `AppState` (in `sag-state`) can hold
 //! a handle to the same `Arc<RwLock<RouteCircuitBreaker>>` without `sag-state`
 //! depending on `sag-dispatch`. The breaker's `CircuitHint` classification
 //! logic is co-located in [`error`] (`AppError::circuit_hint`), so the two

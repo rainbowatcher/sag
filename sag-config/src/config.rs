@@ -1025,7 +1025,7 @@ pub fn default_retry_on_empty_response() -> bool {
 ///
 /// Each field specifies how long (in seconds) a route target stays open
 /// after its retries are exhausted. The mapping from upstream error to
-/// category is performed by [`sag_core::CircuitHint`].
+/// category is performed by [`sag_core::error::CircuitHint`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
     /// Cooldown after quota/billing exhaustion (HTTP 429 with quota keywords).

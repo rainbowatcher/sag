@@ -1,7 +1,7 @@
 //! Shared application state for SAG.
 //!
 //! This crate owns [`AppState`], the cross-cutting type used as Axum
-//! [`axum::extract::State`] by all handler families (proxy dispatch,
+//! `axum::extract::State` by all handler families (proxy dispatch,
 //! admin CRUD, health/analytics). It lives here — below both
 //! `sag-admin` and `sag-dispatch` — so that the management layer
 //! does not depend on the execution layer.
@@ -423,7 +423,7 @@ pub type FillFirstOrders = Arc<RwLock<HashMap<String, CachedOrder>>>;
 /// (proxy dispatch, admin CRUD, health/analytics) needs: the hot-reloadable
 /// config, the provider registry, the analytics collector, and the shared
 /// circuit-breaker handle. The circuit breaker is shared with
-/// [`sag_dispatch::DispatchRuntime`] via the same `Arc` so admin handlers
+/// `sag_dispatch::DispatchRuntime` via the same `Arc` so admin handlers
 /// can observe live breaker state without depending on the dispatch crate.
 #[derive(Clone)]
 pub struct AppState {
@@ -482,7 +482,7 @@ impl AppState {
     /// Create or update a provider runtime adapter from the given config and
     /// insert it into the live registry.
     ///
-    /// The caller should pass the up-to-date [`ProviderConfig`] that was just
+    /// The caller should pass the up-to-date [`sag_config::ProviderConfig`] that was just
     /// written to `config.providers`; this avoids an extra config read lock.
     ///
     /// The effective proxy is resolved from the live gateway config (global

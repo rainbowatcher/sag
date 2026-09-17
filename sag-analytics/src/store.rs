@@ -5,7 +5,7 @@ use serde::Serialize;
 
 /// Persistence abstraction for analytics data.
 ///
-/// Implementations include [`SqliteLogStore`] (local) and potentially
+/// Implementations include [`crate::SqliteLogStore`] (local) and potentially
 /// `PostgresLogStore` or `ClickHouseLogStore` for commercial deployments.
 /// The trait is designed so that collector and query layers never need to
 /// know which backend is in use.

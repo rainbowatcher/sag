@@ -16,7 +16,7 @@
 //!   ever turn retries into duplicate attempt rows.
 //!
 //! Identity resolution is strictly additive (create if missing, never
-//! refresh existing rows — see [`crate::registry::resolve_or_create_route`]).
+//! refresh existing rows — see `crate::registry::resolve_or_create_route`.
 //! Nullability is enforced from the final status — illegal combinations
 //! (e.g. `client_error` carrying a route, `no_route` / `all_disabled`
 //! carrying target attempts, `success` without a successful attempt) are

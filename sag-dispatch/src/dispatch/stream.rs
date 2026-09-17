@@ -664,7 +664,7 @@ async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
 ///   `stream_error_after_commit` if a mid-stream error was already
 ///   observed); tokens stay NULL; no fallback.
 ///
-/// The terminal event is delivered by [`deliver_terminal_event`], which
+/// The terminal event is delivered by `deliver_terminal_event`, which
 /// decouples the enqueue from the body future's cancellation lifecycle:
 /// the common path enqueues synchronously (`try_emit` — nothing to cancel,
 /// nothing to drain later), and only when the queue is genuinely full does

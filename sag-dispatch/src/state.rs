@@ -48,12 +48,12 @@ pub struct DispatchRuntime {
     /// immediately visible to dispatch ordering.
     pub active_targets: sag_state::ActiveTargets,
     /// Runtime availability memory for route targets. Shared with
-    /// [`AppState`](sag_state::AppState) via the same `Arc` (injected through
+    /// [`AppState`] via the same `Arc` (injected through
     /// [`DispatchRuntime::with_shared_state`]) so admin mutations — e.g. a
     /// manual breaker close — are immediately visible to dispatch ordering.
     pub circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
     /// Last routes version seen by the prune guard. When this matches
-    /// [`ConfigHandle::routes_version`] the prune is skipped entirely,
+    /// [`sag_config::ConfigHandle::routes_version`] the prune is skipped entirely,
     /// avoiding three write-lock acquisitions on every request.
     pub(crate) last_prune_version: Arc<AtomicU64>,
 }
@@ -107,7 +107,7 @@ impl DispatchRuntime {
     /// created them (`ActiveTargetEntry::route_model`); an entry is kept only
     /// while its key still resolves to that same route **and** the resolved
     /// route is still [`sag_config::Strategy::StickyFailover`] (see
-    /// [`ActiveTargetsInner::retain_sticky_routes`]), so:
+    /// [`sag_state::ActiveTargetsInner::retain_sticky_routes`]), so:
     /// - a wildcard request key survives config changes that do not affect
     ///   the wildcard route (it keeps resolving to `"*"`),
     /// - a key that no longer resolves to its recorded route — an exact route
@@ -172,7 +172,7 @@ impl DispatchRuntime {
 ///   `compute_stale_probe_threshold` floor (600s) is the final safety net.
 ///
 /// This is a pure, synchronous function over a config snapshot; callers should
-/// hold a read lock on the [`ConfigHandle`] when invoking it during hot-reload.
+/// hold a read lock on the [`sag_config::ConfigHandle`] when invoking it during hot-reload.
 pub fn stale_probe_threshold_from_config(config: &GatewayConfig) -> Duration {
     let global_retries = config.backoff.retries;
     let max_backoff_ms = config.backoff.max_ms;

@@ -178,10 +178,10 @@ async fn reload_once(
 ///   when the file is replaced).
 /// - Events are filtered to the config file and `Access` reads are ignored.
 /// - A **trailing** debounce merges bursts of events: reload fires only after
-///   the file has been quiet for [`DEBOUNCE`], so the final version is always
+///   the file has been quiet for `DEBOUNCE`, so the final version is always
 ///   what gets read.
 /// - A reload that fails transiently (invalid intermediate content, file
-///   briefly missing mid-replace) is retried up to [`MAX_RELOAD_RETRIES`]
+///   briefly missing mid-replace) is retried up to `MAX_RELOAD_RETRIES`
 ///   times before the watcher waits for the next file event.
 pub fn spawn_hot_reload(
     handle: ConfigHandle,

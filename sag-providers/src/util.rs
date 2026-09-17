@@ -110,7 +110,7 @@ pub fn apply_body_strip(mut body: serde_json::Value, fields: &[String]) -> serde
 ///
 /// Returns `true` when a frame carried an upstream error delivered inside a
 /// 200 SSE data frame (the frame was forwarded and an `Error` chunk sent by
-/// [`process_sse_frame`]); the caller must stop forwarding further frames.
+/// `process_sse_frame`); the caller must stop forwarding further frames.
 pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
     let mut saw_error = false;
     while let Some(end) = find_sse_boundary(buffer) {

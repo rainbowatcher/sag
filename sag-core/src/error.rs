@@ -7,7 +7,7 @@ use crate::types::{FailureReason, FinalStatus};
 
 /// Circuit breaker open-duration hint extracted from an upstream error.
 ///
-/// [`AppError::circuit_open_duration_secs`] returns one of these
+/// [`AppError::circuit_hint`] returns one of these
 /// categories so the dispatch layer can choose an appropriate cooldown
 /// without string-matching on error bodies at every call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

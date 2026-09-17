@@ -3,7 +3,7 @@
 //! This crate owns the management endpoints that were previously part of
 //! `sag-router`:
 //!
-//! - [`admin`] — route wiring, builds the `/api/*` Axum [`Router`].
+//! - [`admin`] — route wiring, builds the `/api/*` Axum [`axum::Router`].
 //! - [`admin_providers`] — `GET|POST|PUT|DELETE /api/providers`.
 //! - [`admin_routes`] — `GET|POST|PUT|DELETE /api/routes`.
 //! - [`admin_logs`] — `GET /api/logs`.

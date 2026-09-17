@@ -18,7 +18,7 @@
 //!
 //! The writer's resolution is **strictly additive**: missing identities are
 //! created, but existing ones are never re-activated or timestamp-refreshed
-//! ([`resolve_or_create_route`] / [`resolve_or_create_target`]). Config sync
+//! (`resolve_or_create_route` / `resolve_or_create_target`). Config sync
 //! is the sole authority over `active` / `last_seen`; a late or replayed
 //! event must never resurrect a deactivated route.
 

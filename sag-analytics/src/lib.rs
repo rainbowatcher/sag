@@ -90,7 +90,7 @@ pub(crate) fn analytics_connect_options(dsn: &str) -> Result<SqliteConnectOption
 /// sqlx/libsqlite defaults is fragile (they have changed across
 /// versions), so the lock wait is pinned explicitly. File-backed databases
 /// additionally run in WAL journal mode with `synchronous = NORMAL` (see
-/// [`analytics_connect_options`]) so all writer connections coordinate
+/// `analytics_connect_options`) so all writer connections coordinate
 /// through the single WAL write lock instead of racing for the database
 /// lock; `:memory:` databases keep their default journal mode.
 pub async fn open_analytics_pool(dsn: &str) -> Result<SqlitePool, sqlx::Error> {
