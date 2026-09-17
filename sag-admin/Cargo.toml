@@ -24,4 +24,4 @@ sag-analytics = { path = "../sag-analytics" }
 sag-state = { path = "../sag-state" }
 
 [dev-dependencies]
-http-body-util = "0.1"
+http-body-util = { workspace = true }

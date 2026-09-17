@@ -16,8 +16,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-fastrand = "2"
-futures-util = "0.3"
+fastrand = { workspace = true }
+futures-util = { workspace = true }
 sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
@@ -25,6 +25,6 @@ sag-analytics = { path = "../sag-analytics" }
 sag-state = { path = "../sag-state" }
 
 [dev-dependencies]
-async-trait = "0.1"
-http-body-util = "0.1"
+async-trait = { workspace = true }
+http-body-util = { workspace = true }
 sqlx = { workspace = true }

@@ -23,6 +23,6 @@ sag-dispatch = { path = "../sag-dispatch" }
 sag-admin = { path = "../sag-admin" }
 
 [dev-dependencies]
-async-trait = "0.1"
-http-body-util = "0.1"
+async-trait = { workspace = true }
+http-body-util = { workspace = true }
 sqlx = { workspace = true }

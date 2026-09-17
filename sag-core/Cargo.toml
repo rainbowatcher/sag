@@ -15,4 +15,4 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-fastrand = "2"
+fastrand = { workspace = true }
