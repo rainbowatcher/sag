@@ -140,6 +140,11 @@ pub struct ConfigMutationCoordinator {
     /// Last accepted file revision; `None` for in-memory configs.
     /// Guarded by `mutation_lock` -- accessed only within its scope,
     /// so a `std::sync::Mutex` suffices for interior mutability.
+    /// In `reload_from_path` this is a pure assignment. In `mutate` the
+    /// guard spans conflict-check and atomic write (`FileRevision::from_path`
+    /// / `save_config_to_file`); those return `Result` and are not expected
+    /// to panic, and no user callbacks run while the lock is held. Poison
+    /// is treated as a prior bug and surfaced as `AppError::Internal`.
     accepted_file_revision: std::sync::Mutex<Option<FileRevision>>,
     /// Optional analytics identity registry. When attached, every committed
     /// mutation that actually changes the routes list (route
@@ -223,7 +228,9 @@ impl ConfigMutationCoordinator {
 
         // Step 5: Persist (if requested and file-backed).
         if persist && let Some(path) = self.config.path() {
-            let mut accepted_guard = self.accepted_file_revision.lock().unwrap();
+            let mut accepted_guard = self.accepted_file_revision.lock().map_err(|e| {
+                AppError::Internal(format!("accepted_file_revision mutex poisoned: {e}"))
+            })?;
             // Conflict detection: file must still match our accepted revision.
             let current_rev = FileRevision::from_path(path)?;
             if let Some(ref accepted_rev) = *accepted_guard
@@ -535,7 +542,9 @@ impl ConfigMutationCoordinator {
                 }
 
                 // Update accepted file revision.
-                *self.accepted_file_revision.lock().unwrap() = Some(rev2);
+                *self.accepted_file_revision.lock().map_err(|e| {
+                    AppError::Internal(format!("accepted_file_revision mutex poisoned: {e}"))
+                })? = Some(rev2);
 
                 // Reconcile analytics identities with the committed routes
                 // when the routes list actually changed (same gate and lock
@@ -632,8 +641,13 @@ impl ConfigMutationCoordinator {
                 None => Err(AppError::NotFound(format!("provider '{name}' not found"))),
             })
             .await?;
-        // mutate succeeded, so the closure ran and cascade_result was set.
-        Ok((report, cascade_result.unwrap()))
+        // mutate returned Ok, so the closure ran and the only Ok(())
+        // path sets cascade_result.
+        Ok((
+            report,
+            cascade_result
+                .expect("mutate returned Ok so remove_provider ran and set cascade_result"),
+        ))
     }
 
     /// Create a new route. Returns `AppError::Conflict` if a route with the
