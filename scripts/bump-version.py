@@ -8,14 +8,16 @@
   - Rust: 递归发现的所有 Cargo.toml（跳过 target/、node_modules/ 等），
     仅升级 [package] 与 [workspace.package] 段内的 `version = "x.y.z"`；
     同步更新 Cargo.lock 中对应 crate 的 version（workspace 成员依赖引用
-    不带版本限定符，直接改 block 是安全的）。
+    不带版本限定符，直接改 block 是安全的）；若 Cargo.lock 被 .gitignore 忽略，
+    仍更新本地文件但不会把它传给 git commit。
   - npm: 默认 sag-ui/package.json 与 docs/package.json 的顶层 "version"，
     可通过 --npm 追加/替换。
 
 语义: 按 semver 递增指定段并清零低位段，丢弃 pre-release / build 后缀。
 
 提交: 升级完成后自动执行 `git commit -m "chore: release vX.Y.Z"`，
-只提交本次升级改动的文件（不推送、不碰其他工作区变更）；
+只提交本次实际改动且已被 Git 跟踪的文件（不推送、不碰其他工作区变更）；
+未跟踪或被忽略的文件仅保留工作区更新，不传给 git commit；
 --dry-run / --no-commit 可跳过提交。不传升级段则打印 help。
 """
 
@@ -120,8 +122,13 @@ def bump_cargo_toml(path: Path, kind: str) -> tuple[str, str] | None:
     return (old_result, new_result)
 
 
-def sync_cargo_lock(lock_path: Path, version_map: dict[str, tuple[str, str]]) -> int:
-    """按 crate 名同步 Cargo.lock 中的 version，返回修改的 crate 数。"""
+def sync_cargo_lock(
+    lock_path: Path,
+    version_map: dict[str, tuple[str, str]],
+    *,
+    write: bool = True,
+) -> int:
+    """按 crate 名同步 Cargo.lock，返回实际修改的 crate 数。"""
     if not version_map or not lock_path.exists():
         return 0
     lines = lock_path.read_text(encoding="utf-8").splitlines(keepends=True)
@@ -140,9 +147,23 @@ def sync_cargo_lock(lock_path: Path, version_map: dict[str, tuple[str, str]]) ->
                 )
                 updated.add(name)
             name = None  # version 紧跟 name 之后，处理完即复位
-    if updated:
+    if updated and write:
         lock_path.write_text("".join(lines), encoding="utf-8")
     return len(updated)
+
+
+def git_tracked_files(root: Path, paths: list[str]) -> list[str]:
+    """返回 paths 中已被 Git 跟踪的文件，保留传入顺序。"""
+    if not paths:
+        return []
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--cached", "--", *paths],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    tracked = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
+    return [path for path in paths if path in tracked]
 
 
 def bump_npm(path: Path, kind: str) -> tuple[str, str] | None:
@@ -258,11 +279,9 @@ def main() -> int:
 
     # ── Cargo.lock ──────────────────────────────────────────────────
     lock = root / "Cargo.lock"
-    lock_changed = 0
-    if not args.dry_run:
-        lock_changed = sync_cargo_lock(lock, version_map)
-    else:
-        lock_changed = len(version_map)
+    # 与 bumpp 的 updateFiles() 一样，只把实际发生替换的文件视为 changed。
+    # dry-run 也复用同一套检测逻辑，避免 Cargo.lock 不存在或已经同步时误报。
+    lock_changed = sync_cargo_lock(lock, version_map, write=not args.dry_run)
 
     # ── npm ─────────────────────────────────────────────────────────
     for p in npm_files:
@@ -299,15 +318,29 @@ def main() -> int:
     # ── 自动提交 ────────────────────────────────────────────────────
     release_version = changes[0][2]
     message = f"chore: release v{release_version}"
-    commit_files = [str(rel) for rel, _, _ in changes]
+    changed_files = [str(rel) for rel, _, _ in changes]
     if lock_changed:
-        commit_files.append(str(lock.relative_to(root)))
+        changed_files.append(str(lock.relative_to(root)))
+
+    # bumpp 只将 updateFile() 确认实际修改过的文件传给 git commit；
+    # 这里再过滤 Git 未跟踪文件，避免被 .gitignore 忽略的 Cargo.lock
+    # 触发 "pathspec ... did not match any file(s) known to git"。
+    commit_files = git_tracked_files(root, changed_files)
+    skipped_files = [path for path in changed_files if path not in commit_files]
+    if skipped_files:
+        print(
+            "[INFO] 以下文件已更新但未被 Git 跟踪，跳过自动提交: "
+            + " ".join(skipped_files)
+        )
 
     if args.dry_run:
         print(f"将提交: {message}（{len(commit_files)} 个文件）")
         return 0
     if args.no_commit:
         print(f"[INFO] --no-commit 指定，跳过自动提交: {message}")
+        return 0
+    if not commit_files:
+        print("[INFO] 没有可提交的已跟踪变更，跳过自动提交。")
         return 0
 
     print(f"提交: {message}")
