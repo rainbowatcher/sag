@@ -1849,7 +1849,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sag-admin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "chrono",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "sag-analytics"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "sag-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "notify",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "sag-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "sag-dispatch"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "sag-gateway"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "sag-providers"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "sag-router"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "sag-state"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "sag-analytics",
