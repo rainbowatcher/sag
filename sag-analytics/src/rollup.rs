@@ -633,7 +633,7 @@ impl RollupEngine {
         &self,
         hours: &[i64],
         scope: &str,
-        owner_ids: Option<&[String]>,
+        owner_ids: Option<&[&str]>,
     ) -> sag_core::Result<Vec<HistogramRow>> {
         if hours.is_empty() || owner_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
@@ -658,7 +658,7 @@ impl RollupEngine {
         }
         if let Some(ids) = owner_ids {
             for id in ids {
-                q = q.bind(id);
+                q = q.bind(*id);
             }
         }
         q.fetch_all(&self.pool)
@@ -672,7 +672,7 @@ impl RollupEngine {
         &self,
         hours: &[i64],
     ) -> sag_core::Result<Vec<HistogramRow>> {
-        let owner = [GLOBAL_HIST_OWNER.to_string()];
+        let owner = [GLOBAL_HIST_OWNER];
         self.histogram_rows(hours, "route", Some(&owner)).await
     }
 
@@ -1227,7 +1227,9 @@ pub fn bucket_lower_bound_ms(bucket_idx: i64) -> Option<f64> {
 /// into per-dim [`HistogramBins`]: regular buckets are summed by
 /// `bucket_idx`, overflow samples accumulate separately. The global
 /// sentinel row is included as-is — callers decide what to merge.
-pub fn merge_histogram_buckets(rows: &[HistogramRow]) -> BTreeMap<String, HistogramBins> {
+pub fn merge_histogram_buckets<'a>(
+    rows: impl IntoIterator<Item = &'a HistogramRow>,
+) -> BTreeMap<String, HistogramBins> {
     let mut out: BTreeMap<String, HistogramBins> = BTreeMap::new();
     for row in rows {
         let bins = out.entry(row.dim.clone()).or_default();

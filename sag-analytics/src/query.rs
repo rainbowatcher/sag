@@ -510,8 +510,7 @@ impl AnalyticsQueryEngine {
                 if !split.rollup_hours.is_empty() {
                     let hours = &split.rollup_hours;
                     let r_rows = self.fetch_rollup_route(params, hours).await?;
-                    let route_ids: Vec<String> =
-                        r_rows.iter().map(|r| r.route_id.clone()).collect();
+                    let route_ids: Vec<&str> = r_rows.iter().map(|r| r.route_id.as_str()).collect();
                     let filtered = params.route.as_deref().is_some_and(|r| !r.is_empty());
                     let (globals, hist) = if filtered {
                         (
@@ -550,8 +549,7 @@ impl AnalyticsQueryEngine {
                 if !split.rollup_hours.is_empty() {
                     let hours = &split.rollup_hours;
                     let rows = self.fetch_rollup_target(params, hours).await?;
-                    let target_ids: Vec<String> =
-                        rows.iter().map(|r| r.target_id.clone()).collect();
+                    let target_ids: Vec<&str> = rows.iter().map(|r| r.target_id.as_str()).collect();
                     let filtered = target_scope_filtered(params);
                     let hist = self
                         .rollup()
@@ -632,37 +630,39 @@ impl AnalyticsQueryEngine {
         if !split.rollup_hours.is_empty() {
             let hours = &split.rollup_hours;
             let r_rows = self.fetch_rollup_route(params, hours).await?;
-            let route_ids: Vec<String> = r_rows.iter().map(|r| r.route_id.clone()).collect();
+            let route_ids: Vec<&str> = r_rows.iter().map(|r| r.route_id.as_str()).collect();
             let filtered = params.route.as_deref().is_some_and(|r| !r.is_empty());
-            let (globals, overall_hist, group_hist) = if filtered {
+            if filtered {
                 let hist = self
                     .rollup()
                     .histogram_rows(hours, "route", Some(&route_ids))
                     .await
                     .map_err(app_err)?;
-                (Vec::new(), hist.clone(), hist)
+                if !r_rows.is_empty() {
+                    agg.merge(aggregate_rollup_route(&r_rows, &[], &hist, &hist));
+                }
             } else {
-                (
-                    self.rollup().global_rows(hours).await.map_err(app_err)?,
-                    self.rollup()
-                        .global_histogram_rows(hours)
-                        .await
-                        .map_err(app_err)?,
-                    self.rollup()
-                        .histogram_rows(hours, "route", Some(&route_ids))
-                        .await
-                        .map_err(app_err)?,
-                )
-            };
-            // No rollup data at all (e.g. an empty historical region) must
-            // not fabricate an (empty) histogram block.
-            if !r_rows.is_empty() || !globals.is_empty() {
-                agg.merge(aggregate_rollup_route(
-                    &r_rows,
-                    &globals,
-                    &overall_hist,
-                    &group_hist,
-                ));
+                let globals = self.rollup().global_rows(hours).await.map_err(app_err)?;
+                let overall_hist = self
+                    .rollup()
+                    .global_histogram_rows(hours)
+                    .await
+                    .map_err(app_err)?;
+                let group_hist = self
+                    .rollup()
+                    .histogram_rows(hours, "route", Some(&route_ids))
+                    .await
+                    .map_err(app_err)?;
+                // No rollup data at all (e.g. an empty historical region) must
+                // not fabricate an (empty) histogram block.
+                if !r_rows.is_empty() || !globals.is_empty() {
+                    agg.merge(aggregate_rollup_route(
+                        &r_rows,
+                        &globals,
+                        &overall_hist,
+                        &group_hist,
+                    ));
+                }
             }
         }
         Ok(agg)
@@ -679,7 +679,7 @@ impl AnalyticsQueryEngine {
         if !split.rollup_hours.is_empty() {
             let hours = &split.rollup_hours;
             let rows = self.fetch_rollup_target(params, hours).await?;
-            let target_ids: Vec<String> = rows.iter().map(|r| r.target_id.clone()).collect();
+            let target_ids: Vec<&str> = rows.iter().map(|r| r.target_id.as_str()).collect();
             let hist = self
                 .rollup()
                 .histogram_rows(
@@ -1415,10 +1415,10 @@ impl LatencySamples {
     }
 
     /// Fold another block's latency into this one (rollup + detail merge).
-    fn merge(&mut self, other: &LatencySamples) {
-        self.e2e.merge(other.e2e.clone());
-        self.ttft.merge(other.ttft.clone());
-        self.upstream.merge(other.upstream.clone());
+    fn merge(&mut self, other: LatencySamples) {
+        self.e2e.merge(other.e2e);
+        self.ttft.merge(other.ttft);
+        self.upstream.merge(other.upstream);
     }
 }
 
@@ -1505,13 +1505,13 @@ struct MixedSplit {
 }
 
 /// Stable ordering key of a group key (for deterministic output).
-fn key_sort_key(key: &GroupKey) -> (String, String) {
+fn key_sort_key(key: &GroupKey) -> (&str, &str) {
     match key {
-        GroupKey::Route { route_name } => (route_name.clone(), String::new()),
+        GroupKey::Route { route_name } => (route_name.as_str(), ""),
         GroupKey::Target {
             provider,
             real_model,
-        } => (provider.clone(), real_model.clone()),
+        } => (provider.as_str(), real_model.as_str()),
     }
 }
 
@@ -1630,7 +1630,10 @@ struct RollupLatSums {
 
 /// Build a latency block from the dimension's histogram rows and the
 /// rollup rows' exact sums.
-fn hist_to_latency(rows: &[HistogramRow], sums: &RollupLatSums) -> LatencySamples {
+fn hist_to_latency<'a>(
+    rows: impl IntoIterator<Item = &'a HistogramRow>,
+    sums: &RollupLatSums,
+) -> LatencySamples {
     let merged = merge_histogram_buckets(rows);
     LatencySamples {
         e2e: LatencySource::Hist {
@@ -1780,9 +1783,9 @@ impl RouteAggregates {
         for (category, count) in other.unassigned {
             *self.unassigned.entry(category).or_default() += count;
         }
-        self.lat_overall.merge(&other.lat_overall);
+        self.lat_overall.merge(other.lat_overall);
         for (key, lat) in other.lat_by_group {
-            self.lat_by_group.entry(key).or_default().merge(&lat);
+            self.lat_by_group.entry(key).or_default().merge(lat);
         }
     }
 
@@ -1922,11 +1925,6 @@ fn aggregate_rollup_route(
             overall_sums.upstream += row.upstream_sum_ms;
         }
         feed_route_counts(agg.groups.entry(key.clone()).or_default(), row);
-        let owner_rows: Vec<HistogramRow> = group_hist
-            .iter()
-            .filter(|h| h.owner_id == row.route_id)
-            .cloned()
-            .collect();
         let sums = RollupLatSums {
             e2e: row.e2e_sum_ms,
             ttft: row.ttft_sum_ms,
@@ -1935,7 +1933,10 @@ fn aggregate_rollup_route(
         agg.lat_by_group
             .entry(key)
             .or_default()
-            .merge(&hist_to_latency(&owner_rows, &sums));
+            .merge(hist_to_latency(
+                group_hist.iter().filter(|h| h.owner_id == row.route_id),
+                &sums,
+            ));
     }
     agg.lat_overall = hist_to_latency(overall_hist, &overall_sums);
     agg
@@ -1957,9 +1958,9 @@ impl TargetAggregates {
         for (key, acc) in other.groups {
             self.groups.entry(key).or_default().merge(&acc);
         }
-        self.lat_overall.merge(&other.lat_overall);
+        self.lat_overall.merge(other.lat_overall);
         for (key, lat) in other.lat_by_group {
-            self.lat_by_group.entry(key).or_default().merge(&lat);
+            self.lat_by_group.entry(key).or_default().merge(lat);
         }
     }
 
@@ -2051,11 +2052,6 @@ fn aggregate_rollup_target(rows: &[RollupTargetRow], hist: &[HistogramRow]) -> T
         overall_sums.e2e += row.e2e_sum_ms;
         overall_sums.ttft += row.ttft_sum_ms;
         overall_sums.upstream += row.upstream_sum_ms;
-        let owner_rows: Vec<HistogramRow> = hist
-            .iter()
-            .filter(|h| h.owner_id == row.target_id)
-            .cloned()
-            .collect();
         let sums = RollupLatSums {
             e2e: row.e2e_sum_ms,
             ttft: row.ttft_sum_ms,
@@ -2064,7 +2060,10 @@ fn aggregate_rollup_target(rows: &[RollupTargetRow], hist: &[HistogramRow]) -> T
         agg.lat_by_group
             .entry(key)
             .or_default()
-            .merge(&hist_to_latency(&owner_rows, &sums));
+            .merge(hist_to_latency(
+                hist.iter().filter(|h| h.owner_id == row.target_id),
+                &sums,
+            ));
     }
     agg.lat_overall = hist_to_latency(hist, &overall_sums);
     agg
@@ -2091,7 +2090,7 @@ impl TrendAggregates {
                 .merge(&acc);
         }
         for (hour, lat) in other.per_hour_lat {
-            self.per_hour_lat.entry(hour).or_default().merge(&lat);
+            self.per_hour_lat.entry(hour).or_default().merge(lat);
         }
     }
 }
@@ -2124,7 +2123,7 @@ where
     }
     for lat in lats {
         let (hour, samples) = lat_row(lat);
-        agg.per_hour_lat.entry(hour).or_default().merge(&samples);
+        agg.per_hour_lat.entry(hour).or_default().merge(samples);
     }
     agg
 }
@@ -2273,13 +2272,13 @@ fn aggregate_rollup_route_trend(
             s.upstream += row.upstream_sum_ms;
         }
     }
-    let mut by_hour: HashMap<i64, Vec<HistogramRow>> = HashMap::new();
+    let mut by_hour: HashMap<i64, Vec<&HistogramRow>> = HashMap::new();
     for hrow in hist {
-        by_hour.entry(hrow.hour).or_default().push(hrow.clone());
+        by_hour.entry(hrow.hour).or_default().push(hrow);
     }
     for (hour, rows) in by_hour {
         let sums = per_hour_sums.remove(&hour).unwrap_or_default();
-        agg.per_hour_lat.insert(hour, hist_to_latency(&rows, &sums));
+        agg.per_hour_lat.insert(hour, hist_to_latency(rows, &sums));
     }
     agg
 }
@@ -2303,13 +2302,13 @@ fn aggregate_rollup_target_trend(
         s.ttft += row.ttft_sum_ms;
         s.upstream += row.upstream_sum_ms;
     }
-    let mut by_hour: HashMap<i64, Vec<HistogramRow>> = HashMap::new();
+    let mut by_hour: HashMap<i64, Vec<&HistogramRow>> = HashMap::new();
     for hrow in hist {
-        by_hour.entry(hrow.hour).or_default().push(hrow.clone());
+        by_hour.entry(hrow.hour).or_default().push(hrow);
     }
     for (hour, rows) in by_hour {
         let sums = per_hour_sums.remove(&hour).unwrap_or_default();
-        agg.per_hour_lat.insert(hour, hist_to_latency(&rows, &sums));
+        agg.per_hour_lat.insert(hour, hist_to_latency(rows, &sums));
     }
     agg
 }
