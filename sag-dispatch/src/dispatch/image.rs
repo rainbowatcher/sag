@@ -7,20 +7,23 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sag_analytics::AnalyticsEvent;
+use sag_config::{GatewayConfig, Strategy};
 use sag_core::{
     AppError, ChatCompletionRequest, FailureReason, FinalStatus, ImageGenerationRequest,
     ImageGenerationResponse, RequestResultFact, TargetAttemptFact, TargetStatus,
 };
+use std::time::Instant;
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
 use crate::dispatch::retry::is_client_caused_4xx;
 use crate::dispatch::retry::run_with_retries_outcome;
 use crate::dispatch::{
-    CircuitPermit, DispatchCancelGuard, DispatchCtx, apply_circuit_outcome, circuit_allows_target,
-    client_error_failure_reason, emit_analytics_event, fallback_exhausted_response,
-    log_per_target_failure, merge_model_overrides, success_log,
+    CircuitPermit, DispatchCancelGuard, DispatchCtx, ResolvedTarget, apply_circuit_outcome,
+    circuit_allows_target, client_error_failure_reason, emit_analytics_event,
+    fallback_exhausted_response, log_per_target_failure, merge_model_overrides, success_log,
 };
+use crate::state::{AppState, DispatchRuntime};
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
 /// always non-streaming.
@@ -73,11 +76,10 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
 
     let img_request = build_image_request(request);
 
-    // Snapshot the backoff config once for the whole dispatch — see
-    // `dispatch_chat` for the rationale.
+    // Snapshot the config once for the whole dispatch (backoff, circuit
+    // breaker, provider overrides) so the per-target retry loop doesn't
+    // hold the config read lock — see `dispatch_chat` for the rationale.
     let config = state.config.read().await.clone();
-    let backoff = config.backoff.clone();
-    let circuit_breaker_cfg = config.circuit_breaker.clone();
 
     // One `TargetAttemptFact` per actually-issued target, emitted once in a
     // single atomic request event at the end of the dispatch. Skipped
@@ -85,259 +87,68 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     // and produce no fact.
     let mut target_facts: Vec<TargetAttemptFact> = Vec::new();
 
+    let attempt_ctx = ImageAttemptCtx {
+        state,
+        runtime,
+        request_model: &request.model,
+        img_request: &img_request,
+        config: &config,
+        cancel_guard: &cancel_guard,
+        strategy,
+        sticky_token: &sticky_token,
+        trace_id,
+        start,
+        user_agent: user_agent.as_deref(),
+        client_ip: client_ip.as_deref(),
+    };
+
     for target in targets {
-        let provider_name = &target.provider;
-        let real_model = &target.real_model;
-
-        let Some(permit) = circuit_allows_target(
-            runtime,
-            &request.model,
-            provider_name,
-            real_model,
-            &circuit_breaker_cfg,
-        )
-        .await
-        else {
-            errors.push(format!("{provider_name}/{real_model}: circuit open"));
-            continue;
-        };
-
-        let Some(provider) = resolve_provider(state, provider_name, errors).await else {
-            // Provider is disabled / unregistered. If this request claimed the
-            // half-open probe slot we must release it synchronously, otherwise
-            // the target would be skipped forever (probe_in_flight stuck
-            // true). `release_probe_slot` consumes the guard (mark_completed
-            // first), so the drop after this branch can never release twice.
-            if let CircuitPermit::Probe(guard) = permit {
-                guard.release_probe_slot().await;
+        match attempt_one_image_target(&attempt_ctx, target, errors, &mut target_facts).await {
+            TargetOutcome::Success(resp) => {
+                state.collector.log(success_log(
+                    trace_id,
+                    &target.provider,
+                    &request.model,
+                    &target.real_model,
+                    false,
+                    start,
+                    None,
+                    None, // reasoning_effort — not applicable for image generation
+                    None, // upstream_duration_ms — image path timing is out of scope for stage 2
+                    None, // ttft_ms — image generation is single-shot, conceptually non-streaming
+                    user_agent.clone(),
+                    client_ip.clone(),
+                ));
+                emit_image_success_event(
+                    state,
+                    &cancel_guard,
+                    trace_id,
+                    route_name,
+                    &request.model,
+                    started_at,
+                    target_facts,
+                )
+                .await;
+                return (StatusCode::OK, Json(resp)).into_response();
             }
-            continue;
-        };
-
-        let real_model = real_model.clone();
-        let target_extra =
-            merge_model_overrides(&config.providers, provider_name, &real_model, &target.extra);
-        let retries = target.retries;
-        let timeout_secs = target.timeout_secs;
-        let img_request = img_request.clone();
-
-        // Wall-clock start of this target's first actual provider call,
-        // captured inside the retry closure on attempt 0. Retries of the
-        // same target extend the single fact's duration.
-        let mut target_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
-
-        let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
-            provider_name,
-            retries,
-            &backoff,
-            errors,
-            |attempt| {
-                if attempt == 0 {
-                    target_started_at = Some(chrono::Utc::now());
-                }
-                let provider = provider.clone();
-                let real_model = real_model.clone();
-                let target_extra = target_extra.clone();
-                let img_request = img_request.clone();
-                let cancel = cancel_guard.analytics();
-                async move {
-                    // An actual provider call is in flight from here until
-                    // the attempt's future resolves; a client disconnect
-                    // during this window is persisted as a `cancelled`
-                    // attempt by the dispatch cancel guard (spec scenario
-                    // 11).
-                    cancel.begin_attempt(provider_name, &real_model);
-                    let result = async move {
-                        provider
-                            .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
-                            .await
-                    }
-                    .await;
-                    cancel.end_attempt();
-                    result
-                }
-            },
-        )
-        .await;
-
-        // Extract the error_category from the outcome before
-        // `apply_circuit_outcome` consumes it.
-        let category = match &outcome {
-            RetryOutcome::Exhausted(e) => e.error_category(),
-            RetryOutcome::NonRetryable(_) => "bad_request",
-            RetryOutcome::Success(_) => "", // never logged
-        };
-
-        // Extract the real HTTP status from the outcome error so the
-        // per-target `call_logs` row carries the actual upstream status
-        // (429/500/503/…) instead of a hardcoded 502.
-        let attempt_status = match &outcome {
-            RetryOutcome::Exhausted(e) | RetryOutcome::NonRetryable(e) => e.status_code().as_u16(),
-            RetryOutcome::Success(_) => 200, // never logged
-        };
-
-        // Collapse this target's whole retry sequence into exactly one
-        // `TargetAttemptFact` (final outcome only — no retry counts). The
-        // client-caused 4xx path is excluded: per the writer's validation
-        // contract a `client_error` event can carry no target attempts, so
-        // that attempt is recorded only in call_logs.
-        let is_client_error_path =
-            matches!(&outcome, RetryOutcome::NonRetryable(e) if is_client_caused_4xx(e));
-        if !is_client_error_path
-            && let Some(fact) = build_target_attempt_fact(
-                provider_name,
-                &real_model,
-                &outcome,
-                target_started_at,
-                chrono::Utc::now(),
-            )
-        {
-            // Mirror the fact into the cancel guard *before* continuing to
-            // the next target: if the client disconnects while a later
-            // target is in flight (or during the fallback gap), the final
-            // `client_cancelled` event must still carry this completed
-            // failure. The normal terminals consume the loop-local vec
-            // only and `mark_done` first, so the guard's copy is dropped
-            // unread — never a duplicate row.
-            cancel_guard.record_target_fact(fact.clone());
-            target_facts.push(fact);
-        }
-
-        // Client-attributed 4xx (400/413/422/unknown 4xx): return straight
-        // to the client — no failover, no pin movement, no circuit change.
-        // `AppError` is not `Clone`, so peel the error out of the outcome by
-        // value and hand the breaker a placeholder `NonRetryable` (its
-        // payload is ignored — the breaker only needs the verdict to release
-        // a half-open probe slot). The peel happens *before*
-        // `apply_circuit_outcome` consumes the outcome.
-        let (client_error, cb_outcome) = match outcome {
-            RetryOutcome::NonRetryable(e) if is_client_caused_4xx(&e) => (
-                Some(e),
-                RetryOutcome::NonRetryable(AppError::Internal("client 4xx".into())),
-            ),
-            other => (None, other),
-        };
-
-        let Some(resp) =
-            apply_circuit_outcome(runtime, permit, cb_outcome, &circuit_breaker_cfg).await
-        else {
-            // Per-provider failure: log a failure entry with the actual provider/real_model
-            // so the analytics table knows which provider was attempted.
-            log_per_target_failure(
-                state,
-                trace_id,
-                provider_name,
-                &request.model,
-                &real_model,
-                false,
-                start,
-                errors,
-                category,
-                attempt_status,
-                None, // reasoning_effort — not applicable for image generation
-                user_agent.as_deref(),
-                client_ip.as_deref(),
-            );
-            if let Some(err) = client_error {
+            TargetOutcome::ClientError(err) => {
                 // Client-attributed 4xx: return to the client directly — no
                 // failover to the next target, no pin movement, no circuit
                 // change. `into_response` transparently forwards the upstream
                 // status code + body.
-                // Formal analytics event: `client_error`, no route identity
-                // and no target attempts (writer validation contract); the
-                // attempt is still visible in the legacy call_logs row.
-                cancel_guard.mark_done();
-                emit_analytics_event(
+                emit_image_client_error_event(
                     state,
-                    AnalyticsEvent::new(RequestResultFact {
-                        request_id: trace_id,
-                        route_name: None,
-                        requested_model: request.model.clone(),
-                        final_status: FinalStatus::ClientError,
-                        failure_reason: Some(client_error_failure_reason(&err)),
-                        stream: false,
-                        started_at,
-                        completed_at: chrono::Utc::now(),
-                        usage: None,
-                        cached_tokens: None,
-                        cache_creation_tokens: None,
-                        ttft_ms: None,
-                        upstream_duration_ms: None,
-                    }),
+                    &cancel_guard,
+                    trace_id,
+                    &request.model,
+                    started_at,
+                    &err,
                 )
                 .await;
                 return err.into_response();
             }
-            continue; // provider-persistent 4xx: failover as before
-        };
-
-        if strategy == sag_config::Strategy::StickyFailover {
-            // Conditional writeback — see `dispatch_chat` for the race this
-            // closes. The config read guard is held across the version read
-            // *and* the active write so a config mutation (commit + version
-            // bump are atomic under `config.write()`) can never interleave
-            // between them: either the writeback linearizes before the
-            // mutation or the version mismatch rejects the pin. The
-            // read-compare-insert runs under the single active write lock.
-            let _config_guard = state.config.read().await;
-            let current_version = state.config.routes_version();
-            let mut active = runtime.active_targets.write().await;
-            active.insert_if_generation(
-                request.model.clone(),
-                sag_state::ActiveTargetEntry::new(
-                    provider_name.clone(),
-                    real_model.clone(),
-                    target.route_model.clone(),
-                    target.target_real_model.clone(),
-                    std::time::Instant::now(),
-                ),
-                &sticky_token,
-                current_version,
-            );
-            drop(active);
+            TargetOutcome::Failover => continue,
         }
-
-        state.collector.log(success_log(
-            trace_id,
-            provider_name,
-            &request.model,
-            &real_model,
-            false,
-            start,
-            None,
-            None, // reasoning_effort — not applicable for image generation
-            None, // upstream_duration_ms — image path timing is out of scope for stage 2
-            None, // ttft_ms — image generation is single-shot, conceptually non-streaming
-            user_agent.clone(),
-            client_ip.clone(),
-        ));
-        // Formal analytics event: the request completed successfully. Image
-        // responses carry no usage — all token / cache fields stay NULL
-        // (unknown), never fabricated as 0.
-        cancel_guard.mark_done();
-        emit_analytics_event(
-            state,
-            AnalyticsEvent {
-                result: RequestResultFact {
-                    request_id: trace_id,
-                    route_name: Some(route_name.to_string()),
-                    requested_model: request.model.clone(),
-                    final_status: FinalStatus::Success,
-                    failure_reason: None,
-                    stream: false,
-                    started_at,
-                    completed_at: chrono::Utc::now(),
-                    usage: None,
-                    cached_tokens: None,
-                    cache_creation_tokens: None,
-                    ttft_ms: None,
-                    upstream_duration_ms: None,
-                },
-                targets: target_facts,
-            },
-        )
-        .await;
-        return (StatusCode::OK, Json(resp)).into_response();
     }
 
     let response = fallback_exhausted_response(
@@ -351,9 +162,286 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         user_agent.as_deref(),
         client_ip.as_deref(),
     );
-    // Formal analytics event: every target exhausted → `model_failure` with
-    // `all_exhausted` and one failure fact per actually-issued target
-    // (circuit-open / disabled skips never produce facts).
+    emit_image_model_failure_event(
+        state,
+        &cancel_guard,
+        trace_id,
+        route_name,
+        &request.model,
+        started_at,
+        target_facts,
+    )
+    .await;
+    response
+}
+
+/// Verdict of one target attempt in the image fallback loop.
+enum TargetOutcome {
+    /// The provider produced an image response — terminal success.
+    Success(ImageGenerationResponse),
+    /// Client-attributed 4xx — terminal, failover forbidden.
+    ClientError(AppError),
+    /// Continue with the next target: either the target was skipped
+    /// before any provider call (circuit open / provider disabled — no
+    /// fact) or its attempt failed provider-attributably (one fact was
+    /// recorded).
+    Failover,
+}
+
+/// Bundled dispatch-level parameters for one target attempt, so
+/// [`attempt_one_image_target`] keeps a short signature as the loop body
+/// grows. Mirrors the [`DispatchCtx`] pattern.
+struct ImageAttemptCtx<'a> {
+    state: &'a AppState,
+    runtime: &'a DispatchRuntime,
+    request_model: &'a str,
+    img_request: &'a ImageGenerationRequest,
+    config: &'a GatewayConfig,
+    cancel_guard: &'a DispatchCancelGuard,
+    strategy: Strategy,
+    sticky_token: &'a sag_state::StickyToken,
+    trace_id: uuid::Uuid,
+    start: Instant,
+    user_agent: Option<&'a str>,
+    client_ip: Option<&'a str>,
+}
+
+/// Run one target of the image fallback loop: circuit gate → provider
+/// resolve → retries → single attempt fact → circuit outcome → sticky
+/// writeback on success. Skipped targets (circuit open / provider
+/// disabled) produce no fact; client-caused 4xx produce no fact either
+/// (writer validation contract — see the fact-building block below).
+async fn attempt_one_image_target(
+    ctx: &ImageAttemptCtx<'_>,
+    target: &ResolvedTarget,
+    errors: &mut Vec<String>,
+    target_facts: &mut Vec<TargetAttemptFact>,
+) -> TargetOutcome {
+    let ImageAttemptCtx {
+        state,
+        runtime,
+        request_model,
+        img_request,
+        config,
+        cancel_guard,
+        strategy,
+        sticky_token,
+        trace_id,
+        start,
+        user_agent,
+        client_ip,
+    } = *ctx;
+    let provider_name = &target.provider;
+    let real_model = &target.real_model;
+
+    let Some(permit) = circuit_allows_target(
+        runtime,
+        request_model,
+        provider_name,
+        real_model,
+        &config.circuit_breaker,
+    )
+    .await
+    else {
+        errors.push(format!("{provider_name}/{real_model}: circuit open"));
+        return TargetOutcome::Failover;
+    };
+
+    let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+        // Provider is disabled / unregistered. If this request claimed the
+        // half-open probe slot we must release it synchronously, otherwise
+        // the target would be skipped forever (probe_in_flight stuck
+        // true). `release_probe_slot` consumes the guard (mark_completed
+        // first), so the drop after this branch can never release twice.
+        if let CircuitPermit::Probe(guard) = permit {
+            guard.release_probe_slot().await;
+        }
+        return TargetOutcome::Failover;
+    };
+
+    let real_model = real_model.clone();
+    let target_extra =
+        merge_model_overrides(&config.providers, provider_name, &real_model, &target.extra);
+    let retries = target.retries;
+    let timeout_secs = target.timeout_secs;
+    let img_request = img_request.clone();
+
+    // Wall-clock start of this target's first actual provider call,
+    // captured inside the retry closure on attempt 0. Retries of the
+    // same target extend the single fact's duration.
+    let mut target_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
+        provider_name,
+        retries,
+        &config.backoff,
+        errors,
+        |attempt| {
+            if attempt == 0 {
+                target_started_at = Some(chrono::Utc::now());
+            }
+            let provider = provider.clone();
+            let real_model = real_model.clone();
+            let target_extra = target_extra.clone();
+            let img_request = img_request.clone();
+            let cancel = cancel_guard.analytics();
+            async move {
+                // An actual provider call is in flight from here until
+                // the attempt's future resolves; a client disconnect
+                // during this window is persisted as a `cancelled`
+                // attempt by the dispatch cancel guard (spec scenario
+                // 11).
+                cancel.begin_attempt(provider_name, &real_model);
+                let result = async move {
+                    provider
+                        .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
+                        .await
+                }
+                .await;
+                cancel.end_attempt();
+                result
+            }
+        },
+    )
+    .await;
+
+    // Extract the error_category from the outcome before
+    // `apply_circuit_outcome` consumes it.
+    let category = match &outcome {
+        RetryOutcome::Exhausted(e) => e.error_category(),
+        RetryOutcome::NonRetryable(_) => "bad_request",
+        RetryOutcome::Success(_) => "", // never logged
+    };
+
+    // Extract the real HTTP status from the outcome error so the
+    // per-target `call_logs` row carries the actual upstream status
+    // (429/500/503/…) instead of a hardcoded 502.
+    let attempt_status = match &outcome {
+        RetryOutcome::Exhausted(e) | RetryOutcome::NonRetryable(e) => e.status_code().as_u16(),
+        RetryOutcome::Success(_) => 200, // never logged
+    };
+
+    // Collapse this target's whole retry sequence into exactly one
+    // `TargetAttemptFact` (final outcome only — no retry counts). The
+    // client-caused 4xx path is excluded: per the writer's validation
+    // contract a `client_error` event can carry no target attempts, so
+    // that attempt is recorded only in call_logs.
+    let is_client_error_path =
+        matches!(&outcome, RetryOutcome::NonRetryable(e) if is_client_caused_4xx(e));
+    if !is_client_error_path
+        && let Some(fact) = build_target_attempt_fact(
+            provider_name,
+            &real_model,
+            &outcome,
+            target_started_at,
+            chrono::Utc::now(),
+        )
+    {
+        // Mirror the fact into the cancel guard *before* continuing to
+        // the next target: if the client disconnects while a later
+        // target is in flight (or during the fallback gap), the final
+        // `client_cancelled` event must still carry this completed
+        // failure. The normal terminals consume the loop-local vec
+        // only and `mark_done` first, so the guard's copy is dropped
+        // unread — never a duplicate row.
+        cancel_guard.record_target_fact(fact.clone());
+        target_facts.push(fact);
+    }
+
+    // Client-attributed 4xx (400/413/422/unknown 4xx): return straight
+    // to the client — no failover, no pin movement, no circuit change.
+    // `AppError` is not `Clone`, so peel the error out of the outcome by
+    // value and hand the breaker a placeholder `NonRetryable` (its
+    // payload is ignored — the breaker only needs the verdict to release
+    // a half-open probe slot). The peel happens *before*
+    // `apply_circuit_outcome` consumes the outcome.
+    let (client_error, cb_outcome) = match outcome {
+        RetryOutcome::NonRetryable(e) if is_client_caused_4xx(&e) => (
+            Some(e),
+            RetryOutcome::NonRetryable(AppError::Internal("client 4xx".into())),
+        ),
+        other => (None, other),
+    };
+
+    let Some(resp) =
+        apply_circuit_outcome(runtime, permit, cb_outcome, &config.circuit_breaker).await
+    else {
+        // Per-provider failure: log a failure entry with the actual provider/real_model
+        // so the analytics table knows which provider was attempted.
+        log_per_target_failure(
+            state,
+            trace_id,
+            provider_name,
+            request_model,
+            &real_model,
+            false,
+            start,
+            errors,
+            category,
+            attempt_status,
+            None, // reasoning_effort — not applicable for image generation
+            user_agent,
+            client_ip,
+        );
+        if let Some(err) = client_error {
+            return TargetOutcome::ClientError(err);
+        }
+        return TargetOutcome::Failover; // provider-persistent 4xx: failover as before
+    };
+
+    if strategy == Strategy::StickyFailover {
+        writeback_sticky_target(state, runtime, request_model, target, sticky_token).await;
+    }
+
+    TargetOutcome::Success(resp)
+}
+
+/// Sticky-failover writeback for a successful image target. Conditional
+/// version/generation guard — see `dispatch_chat` for the race this
+/// closes: the config read guard is held across the version read *and*
+/// the active write so a config mutation (commit + version bump are
+/// atomic under `config.write()`) can never interleave between them:
+/// either the writeback linearizes before the mutation or the version
+/// mismatch rejects the pin. The read-compare-insert runs under the
+/// single active write lock.
+async fn writeback_sticky_target(
+    state: &AppState,
+    runtime: &DispatchRuntime,
+    request_model: &str,
+    target: &ResolvedTarget,
+    sticky_token: &sag_state::StickyToken,
+) {
+    let _config_guard = state.config.read().await;
+    let current_version = state.config.routes_version();
+    let mut active = runtime.active_targets.write().await;
+    active.insert_if_generation(
+        request_model.to_string(),
+        sag_state::ActiveTargetEntry::new(
+            target.provider.clone(),
+            target.real_model.clone(),
+            target.route_model.clone(),
+            target.target_real_model.clone(),
+            Instant::now(),
+        ),
+        sticky_token,
+        current_version,
+    );
+    drop(active);
+}
+
+/// Formal success terminal: claim the cancel-guard terminal via
+/// `mark_done`, then emit the `success` request event. Image responses
+/// carry no usage — all token / cache fields stay NULL (unknown), never
+/// fabricated as 0.
+async fn emit_image_success_event(
+    state: &AppState,
+    cancel_guard: &DispatchCancelGuard,
+    trace_id: uuid::Uuid,
+    route_name: &str,
+    requested_model: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    target_facts: Vec<TargetAttemptFact>,
+) {
     cancel_guard.mark_done();
     emit_analytics_event(
         state,
@@ -361,7 +449,79 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
             result: RequestResultFact {
                 request_id: trace_id,
                 route_name: Some(route_name.to_string()),
-                requested_model: request.model.clone(),
+                requested_model: requested_model.to_string(),
+                final_status: FinalStatus::Success,
+                failure_reason: None,
+                stream: false,
+                started_at,
+                completed_at: chrono::Utc::now(),
+                usage: None,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            },
+            targets: target_facts,
+        },
+    )
+    .await;
+}
+
+/// Formal client-error terminal: claim the cancel-guard terminal via
+/// `mark_done`, then emit the `client_error` request event — no route
+/// identity and no target attempts (writer validation contract); the
+/// attempt is still visible in the legacy call_logs row.
+async fn emit_image_client_error_event(
+    state: &AppState,
+    cancel_guard: &DispatchCancelGuard,
+    trace_id: uuid::Uuid,
+    requested_model: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    err: &AppError,
+) {
+    cancel_guard.mark_done();
+    emit_analytics_event(
+        state,
+        AnalyticsEvent::new(RequestResultFact {
+            request_id: trace_id,
+            route_name: None,
+            requested_model: requested_model.to_string(),
+            final_status: FinalStatus::ClientError,
+            failure_reason: Some(client_error_failure_reason(err)),
+            stream: false,
+            started_at,
+            completed_at: chrono::Utc::now(),
+            usage: None,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            ttft_ms: None,
+            upstream_duration_ms: None,
+        }),
+    )
+    .await;
+}
+
+/// Formal all-exhausted terminal: claim the cancel-guard terminal via
+/// `mark_done`, then emit the `model_failure` request event with
+/// `all_exhausted` and one failure fact per actually-issued target
+/// (circuit-open / disabled skips never produce facts).
+async fn emit_image_model_failure_event(
+    state: &AppState,
+    cancel_guard: &DispatchCancelGuard,
+    trace_id: uuid::Uuid,
+    route_name: &str,
+    requested_model: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    target_facts: Vec<TargetAttemptFact>,
+) {
+    cancel_guard.mark_done();
+    emit_analytics_event(
+        state,
+        AnalyticsEvent {
+            result: RequestResultFact {
+                request_id: trace_id,
+                route_name: Some(route_name.to_string()),
+                requested_model: requested_model.to_string(),
                 final_status: FinalStatus::ModelFailure,
                 failure_reason: Some(FailureReason::AllExhausted),
                 stream: false,
@@ -377,7 +537,6 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         },
     )
     .await;
-    response
 }
 
 /// Build the single [`TargetAttemptFact`] for an actually-issued target

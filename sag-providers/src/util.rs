@@ -184,8 +184,9 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) -> b
         }
 
         // Compute the raw SSE data line; forwarding is deferred until after
-        // JSON/usage parsing so that anomalous usage frames (see below) can be
-        // selectively intercepted rather than forwarded unconditionally.
+        // JSON/usage parsing so that anomalous usage frames (see
+        // `handle_usage_frame`) can be selectively intercepted rather than
+        // forwarded unconditionally.
         let raw = format!("data: {json_str}\n\n").into_bytes();
 
         // Non-JSON text (e.g. provider-specific keepalive comments) is forwarded
@@ -195,180 +196,213 @@ fn process_sse_frame(frame: &[u8], tx: &mpsc::UnboundedSender<StreamChunk>) -> b
             continue;
         };
 
-        // An upstream error delivered inside a 200 SSE data frame: the JSON
-        // carries a top-level `error` object. Forward the frame to the
-        // client (behavior-compatible), then surface the error so the
-        // dispatcher records the attempt as a FAILURE, not success or
-        // client_cancelled.
+        // An upstream error delivered inside a 200 SSE data frame.
         if crate::base::body_has_error_object(&val) {
-            let err_obj = val.get("error").expect("checked error object");
-            let msg = crate::base::body_error_message(err_obj);
-            warn!(status = 200, %msg, "upstream returned error");
-            // Enqueue the `Error` chunk BEFORE the forwarded `Data` frame.
-            // The dispatch unfold loop (stream.rs) consumes `Error` inline
-            // — recording the analytics error state — before it yields the
-            // `Data` frame to the client. If the client disconnects
-            // immediately after receiving the `Data` frame (the production
-            // incident), the stream is dropped without polling the `Error`
-            // chunk, so the error state must already be recorded by the
-            // time the `Data` frame is delivered: this ordering makes the
-            // request classify as `model_failure` / 502 (with the upstream
-            // message), never `client_cancelled` / 499. The client still
-            // receives the forwarded error frame (behavior-compatible).
-            let _ = tx.send(StreamChunk::Error(msg));
-            let _ = tx.send(StreamChunk::Data(raw));
-            return true;
+            return forward_error_frame(tx, &val, raw);
         }
 
         if let Some(usage_val) = val.get("usage") {
-            let pt = usage_val
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let mut ct = usage_val
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-
-            let total_from_upstream = usage_val
-                .get("total_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-
-            // OpenAI nests cache/reasoning tokens inside details objects.
-            let pt_details = usage_val.get("prompt_tokens_details");
-            let cached_tokens = pt_details
-                .and_then(|v| v.get("cached_tokens"))
-                .or_else(|| usage_val.get("prompt_cache_hit_tokens"))
-                .or_else(|| usage_val.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .or(pt_details.is_some().then_some(0));
-            let cache_creation_tokens = pt_details
-                .and_then(|v| v.get("cache_creation_input_tokens"))
-                .or_else(|| usage_val.get("cache_creation_input_tokens"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let reasoning_tokens = usage_val
-                .get("completion_tokens_details")
-                .and_then(|v| v.get("reasoning_tokens"))
-                .or_else(|| usage_val.get("reasoning_tokens"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-
-            // Fallback for missing/zero completion_tokens:
-            if ct == 0
-                && let Some(tot) = total_from_upstream
-                && tot > pt
-            {
-                ct = tot - pt;
-            }
-            // Strategy 2: completion_tokens must be at least reasoning_tokens.
-            // Note: If Strategy 2 intervenes due to self-contradictory upstream usage fields
-            // (e.g. prompt=100, reasoning=50, total=110), pt + ct (150) may exceed upstream total (110).
-            // We intentionally prioritize completion_tokens >= reasoning_tokens over total consistency.
-            if let Some(rt) = reasoning_tokens
-                && ct < rt
-            {
-                ct = rt;
-            }
-
-            // A frame that credits prompt tokens but zero completion tokens
-            // (after all fallback strategies) is anomalous. When such a frame
-            // also lacks meaningful choices, forwarding the raw SSE data to the
-            // client is actively harmful:
-            //
-            //   1. Many third-party clients unconditionally index `choices[0]`
-            //      and crash with IndexError on the empty `choices: []` that
-            //      accompanies the usage-only final chunk.
-            //   2. The OpenAI Python SDK's `CompletionUsage` pydantic model
-            //      requires `completion_tokens` as a mandatory `int`; when the
-            //      upstream omits the field entirely (as observed in production
-            //      logs) the SDK raises `APIResponseValidationError`. An
-            //      explicit `0` is a valid int, but the empty `choices` still
-            //      triggers point 1.
-            //
-            // We therefore intercept the raw data frame (skip the Data send)
-            // while still emitting `StreamChunk::Usage` so the gateway's own
-            // CallLog records the anomalous token counts for diagnosis.
-            let is_anomalous = ct == 0 && pt > 0;
-
-            // Guard against false positives: if the frame also carries a
-            // meaningful choice (non-empty content / reasoning_content /
-            // refusal / tool_calls, or a non-null finish_reason) we must
-            // forward it to avoid dropping content or the stream-termination
-            // signal.
-            let has_meaningful_choice =
-                val.get("choices")
-                    .and_then(|c| c.as_array())
-                    .is_some_and(|arr| {
-                        arr.iter().any(|choice| {
-                            let has_finish =
-                                choice.get("finish_reason").is_some_and(|f| !f.is_null());
-                            let has_delta = choice.get("delta").is_some_and(|d| {
-                                d.get("content")
-                                    .and_then(|v| v.as_str())
-                                    .is_some_and(|s| !s.is_empty())
-                                    || d.get("reasoning_content")
-                                        .and_then(|v| v.as_str())
-                                        .is_some_and(|s| !s.is_empty())
-                                    || d.get("refusal")
-                                        .and_then(|v| v.as_str())
-                                        .is_some_and(|s| !s.is_empty())
-                                    || d.get("tool_calls")
-                                        .and_then(|t| t.as_array())
-                                        .is_some_and(|a| !a.is_empty())
-                            });
-                            has_finish || has_delta
-                        })
-                    });
-
-            let intercept = is_anomalous && !has_meaningful_choice;
-
-            if is_anomalous {
-                let choices_arr = val.get("choices").and_then(|c| c.as_array());
-                warn!(
-                    pt = pt,
-                    ct = ct,
-                    usage = %usage_val,
-                    intercepted = intercept,
-                    choices_count = choices_arr.map(|a| a.len()).unwrap_or(0),
-                    finish_reasons = ?choices_arr
-                        .map(|a| a.iter()
-                            .map(|ch| ch.get("finish_reason").and_then(|f| f.as_str()))
-                            .collect::<Vec<_>>()),
-                    "upstream usage frame credits zero completion_tokens despite non-zero prompt; \
-                     this is the source of Completion=0 in the call log",
-                );
-            }
-
-            if !intercept {
-                let _ = tx.send(StreamChunk::Data(raw));
-            }
-
-            // Skip entirely-zero usage objects to avoid noise; partial
-            // data (e.g. prompt_tokens present but completion_tokens
-            // absent) is still valuable for cache/reasoning extraction.
-            if pt == 0 && ct == 0 {
-                debug!(usage = %usage_val, "skipping all-zero usage frame");
-                continue;
-            }
-
-            let total = total_from_upstream.unwrap_or_else(|| pt.saturating_add(ct));
-            let _ = tx.send(StreamChunk::Usage(Usage {
-                prompt_tokens: pt,
-                completion_tokens: ct,
-                total_tokens: total,
-                cached_tokens,
-                cache_creation_tokens,
-                reasoning_tokens,
-            }));
+            handle_usage_frame(tx, &val, usage_val, raw);
         } else {
             // JSON frame without a usage field — forward verbatim.
             let _ = tx.send(StreamChunk::Data(raw));
         }
     }
     false
+}
+
+/// Forward a 200-delivered upstream error frame and surface the in-stream
+/// error. The JSON carries a top-level `error` object: forward the frame to
+/// the client (behavior-compatible), then surface the error so the
+/// dispatcher records the attempt as a FAILURE, not success or
+/// client_cancelled. Returns `true` so the caller stops processing further
+/// frames.
+fn forward_error_frame(
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    val: &serde_json::Value,
+    raw: Vec<u8>,
+) -> bool {
+    let err_obj = val.get("error").expect("checked error object");
+    let msg = crate::base::body_error_message(err_obj);
+    warn!(status = 200, %msg, "upstream returned error");
+    // Enqueue the `Error` chunk BEFORE the forwarded `Data` frame.
+    // The dispatch unfold loop (stream.rs) consumes `Error` inline
+    // — recording the analytics error state — before it yields the
+    // `Data` frame to the client. If the client disconnects
+    // immediately after receiving the `Data` frame (the production
+    // incident), the stream is dropped without polling the `Error`
+    // chunk, so the error state must already be recorded by the
+    // time the `Data` frame is delivered: this ordering makes the
+    // request classify as `model_failure` / 502 (with the upstream
+    // message), never `client_cancelled` / 499. The client still
+    // receives the forwarded error frame (behavior-compatible).
+    let _ = tx.send(StreamChunk::Error(msg));
+    let _ = tx.send(StreamChunk::Data(raw));
+    true
+}
+
+/// Extract a [`Usage`] from a JSON `usage` object, applying the
+/// completion_tokens fallback strategies (see inline comments).
+fn extract_stream_usage(usage_val: &serde_json::Value) -> Usage {
+    let pt = usage_val
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let mut ct = usage_val
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let total_from_upstream = usage_val
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    // OpenAI nests cache/reasoning tokens inside details objects.
+    let pt_details = usage_val.get("prompt_tokens_details");
+    let cached_tokens = pt_details
+        .and_then(|v| v.get("cached_tokens"))
+        .or_else(|| usage_val.get("prompt_cache_hit_tokens"))
+        .or_else(|| usage_val.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .or(pt_details.is_some().then_some(0));
+    let cache_creation_tokens = pt_details
+        .and_then(|v| v.get("cache_creation_input_tokens"))
+        .or_else(|| usage_val.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let reasoning_tokens = usage_val
+        .get("completion_tokens_details")
+        .and_then(|v| v.get("reasoning_tokens"))
+        .or_else(|| usage_val.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    // Fallback for missing/zero completion_tokens:
+    if ct == 0
+        && let Some(tot) = total_from_upstream
+        && tot > pt
+    {
+        ct = tot - pt;
+    }
+    // Strategy 2: completion_tokens must be at least reasoning_tokens.
+    // Note: If Strategy 2 intervenes due to self-contradictory upstream usage fields
+    // (e.g. prompt=100, reasoning=50, total=110), pt + ct (150) may exceed upstream total (110).
+    // We intentionally prioritize completion_tokens >= reasoning_tokens over total consistency.
+    if let Some(rt) = reasoning_tokens
+        && ct < rt
+    {
+        ct = rt;
+    }
+
+    let total = total_from_upstream.unwrap_or_else(|| pt.saturating_add(ct));
+    Usage {
+        prompt_tokens: pt,
+        completion_tokens: ct,
+        total_tokens: total,
+        cached_tokens,
+        cache_creation_tokens,
+        reasoning_tokens,
+    }
+}
+
+/// A frame that credits prompt tokens but zero completion tokens (after all
+/// fallback strategies) is anomalous.
+fn usage_is_anomalous(u: &Usage) -> bool {
+    u.completion_tokens == 0 && u.prompt_tokens > 0
+}
+
+/// Guard against false positives: if the frame also carries a meaningful
+/// choice (non-empty content / reasoning_content / refusal / tool_calls, or
+/// a non-null finish_reason) we must forward it to avoid dropping content or
+/// the stream-termination signal.
+fn frame_has_meaningful_choice(val: &serde_json::Value) -> bool {
+    val.get("choices")
+        .and_then(|c| c.as_array())
+        .is_some_and(|arr| {
+            arr.iter().any(|choice| {
+                let has_finish = choice.get("finish_reason").is_some_and(|f| !f.is_null());
+                let has_delta = choice.get("delta").is_some_and(|d| {
+                    d.get("content")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty())
+                        || d.get("reasoning_content")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty())
+                        || d.get("refusal")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty())
+                        || d.get("tool_calls")
+                            .and_then(|t| t.as_array())
+                            .is_some_and(|a| !a.is_empty())
+                });
+                has_finish || has_delta
+            })
+        })
+}
+
+/// Handle a data frame that carries a `usage` object: extract token counts,
+/// intercept anomalous usage-only frames (skip the Data send while still
+/// emitting Usage for CallLog diagnosis), and emit Data/Usage chunks.
+fn handle_usage_frame(
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    val: &serde_json::Value,
+    usage_val: &serde_json::Value,
+    raw: Vec<u8>,
+) {
+    let usage = extract_stream_usage(usage_val);
+
+    // When an anomalous frame also lacks meaningful choices, forwarding the
+    // raw SSE data to the client is actively harmful:
+    //
+    //   1. Many third-party clients unconditionally index `choices[0]`
+    //      and crash with IndexError on the empty `choices: []` that
+    //      accompanies the usage-only final chunk.
+    //   2. The OpenAI Python SDK's `CompletionUsage` pydantic model
+    //      requires `completion_tokens` as a mandatory `int`; when the
+    //      upstream omits the field entirely (as observed in production
+    //      logs) the SDK raises `APIResponseValidationError`. An
+    //      explicit `0` is a valid int, but the empty `choices` still
+    //      triggers point 1.
+    //
+    // We therefore intercept the raw data frame (skip the Data send)
+    // while still emitting `StreamChunk::Usage` so the gateway's own
+    // CallLog records the anomalous token counts for diagnosis.
+    let is_anomalous = usage_is_anomalous(&usage);
+    let has_meaningful_choice = frame_has_meaningful_choice(val);
+    let intercept = is_anomalous && !has_meaningful_choice;
+
+    if is_anomalous {
+        let choices_arr = val.get("choices").and_then(|c| c.as_array());
+        warn!(
+            pt = usage.prompt_tokens,
+            ct = usage.completion_tokens,
+            usage = %usage_val,
+            intercepted = intercept,
+            choices_count = choices_arr.map(|a| a.len()).unwrap_or(0),
+            finish_reasons = ?choices_arr
+                .map(|a| a.iter()
+                    .map(|ch| ch.get("finish_reason").and_then(|f| f.as_str()))
+                    .collect::<Vec<_>>()),
+            "upstream usage frame credits zero completion_tokens despite non-zero prompt; \
+             this is the source of Completion=0 in the call log",
+        );
+    }
+
+    if !intercept {
+        let _ = tx.send(StreamChunk::Data(raw));
+    }
+
+    // Skip entirely-zero usage objects to avoid noise; partial
+    // data (e.g. prompt_tokens present but completion_tokens
+    // absent) is still valuable for cache/reasoning extraction.
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
+        debug!(usage = %usage_val, "skipping all-zero usage frame");
+        return;
+    }
+
+    let _ = tx.send(StreamChunk::Usage(usage));
 }
 
 #[cfg(test)]

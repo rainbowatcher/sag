@@ -318,6 +318,323 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Per-response mutable state carried through the `unfold` loop of
+/// [`build_streaming_response`].
+struct StreamState<S> {
+    stream: S,
+    usage: Usage,
+    error: Option<String>,
+    done: bool,
+    first_byte_at: Option<Instant>,
+    collector: Arc<CallLogCollector>,
+    start: Instant,
+    upstream_start: Instant,
+    reasoning_effort: Option<String>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
+    // Declared before the guard so it drops first; the guard's own
+    // `Arc` clone keeps the shared data alive regardless. The guard
+    // field is never read — it exists solely for its `Drop` (client
+    // disconnect terminal), hence the underscore name.
+    analytics: Arc<StreamAnalytics>,
+    _guard: TerminalGuard,
+}
+
+/// Construct the shared [`StreamAnalytics`] for one streamed response from
+/// the dispatch args / app state.
+#[allow(clippy::too_many_arguments)]
+fn make_stream_analytics(
+    state: &AppState,
+    trace_id: uuid::Uuid,
+    route_name: &str,
+    provider_name: &str,
+    model: &str,
+    real_model: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    target_started_at: chrono::DateTime<chrono::Utc>,
+    target_facts: Vec<TargetAttemptFact>,
+    start: Instant,
+    reasoning_effort: Option<String>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
+) -> Arc<StreamAnalytics> {
+    Arc::new(StreamAnalytics {
+        event_collector: state.event_collector.clone(),
+        request_id: trace_id,
+        route_name: route_name.to_string(),
+        requested_model: model.to_string(),
+        provider: provider_name.to_string(),
+        real_model: real_model.to_string(),
+        started_at,
+        target_started_at,
+        prior_target_facts: target_facts,
+        done: AtomicBool::new(false),
+        error: AtomicBool::new(false),
+        error_message: Mutex::new(None),
+        call_log_collector: state.collector.clone(),
+        start,
+        reasoning_effort,
+        user_agent,
+        client_ip,
+    })
+}
+
+/// Construct the [`StreamState`] that seeds the `unfold` loop, wiring the
+/// client-disconnect [`TerminalGuard`].
+#[allow(clippy::too_many_arguments)]
+fn make_stream_state<S>(
+    stream: S,
+    collector: Arc<CallLogCollector>,
+    analytics: Arc<StreamAnalytics>,
+    start: Instant,
+    upstream_start: Instant,
+    reasoning_effort: Option<String>,
+    user_agent: Option<String>,
+    client_ip: Option<String>,
+) -> StreamState<S> {
+    StreamState {
+        stream,
+        usage: Usage::default(),
+        error: None,
+        done: false,
+        first_byte_at: None,
+        collector,
+        start,
+        upstream_start,
+        reasoning_effort,
+        user_agent,
+        client_ip,
+        analytics: analytics.clone(),
+        _guard: TerminalGuard { analytics },
+    }
+}
+
+/// Accumulate one `Usage` frame into the running total.
+///
+/// Token-count heuristics & aggregation strategy:
+/// 1. prompt_tokens: Take maximum across frames because providers report cumulative
+///    prompt_tokens (handling GLM echoes as well as Anthropic tool-use/web-search
+///    prompt token expansion).
+/// 2. completion_tokens: Take maximum across frames because providers (including Anthropic
+///    message_start + message_delta) report cumulative completion_tokens in usage events.
+/// 3. total_tokens: Respect upstream's reported total_tokens when specified, while
+///    ensuring total_tokens is at least prompt_tokens + completion_tokens.
+fn merge_stream_usage(acc: &mut Usage, frame: &Usage) {
+    if frame.prompt_tokens > 0 {
+        acc.prompt_tokens = acc.prompt_tokens.max(frame.prompt_tokens);
+    }
+    acc.completion_tokens = acc.completion_tokens.max(frame.completion_tokens);
+
+    let derived_total = acc.prompt_tokens.saturating_add(acc.completion_tokens);
+
+    acc.total_tokens = if frame.total_tokens > 0 {
+        acc.total_tokens.max(frame.total_tokens).max(derived_total)
+    } else {
+        derived_total
+    };
+    // Cache/reasoning fields take the last non-None value.
+    if frame.cached_tokens.is_some() {
+        acc.cached_tokens = frame.cached_tokens;
+    }
+    if frame.cache_creation_tokens.is_some() {
+        acc.cache_creation_tokens = frame.cache_creation_tokens;
+    }
+    if frame.reasoning_tokens.is_some() {
+        acc.reasoning_tokens = frame.reasoning_tokens;
+    }
+}
+
+/// Record a mid-stream `Error` chunk: stash the message for the terminal
+/// `call_logs` row and flag the shared analytics state —
+///
+/// Shared with the drop guard: an abandoned stream after
+/// an upstream error classifies as `stream_error_after_commit`,
+/// not `client_cancelled`, and the call_logs `error` column
+/// carries the upstream message.
+fn record_stream_error<S>(state: &mut StreamState<S>, msg: String) {
+    warn!(
+        provider = %state.analytics.provider,
+        error = %msg,
+        "mid-stream error"
+    );
+    state.error = Some(msg.clone());
+    state.analytics.error.store(true, Ordering::SeqCst);
+    *state
+        .analytics
+        .error_message
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(msg);
+}
+
+/// Build the terminal `call_logs` row of the normal `Done`/`None` path.
+/// `error` is the taken mid-stream error (if any).
+///
+/// `upstream_duration_ms` / `ttft_ms` are the success-only payload: on the
+/// mid-stream error terminal every flat timing / token / cache column stays
+/// NULL — together with `usage` — so a failed row can never feed the
+/// latency coverage denominators or be mistaken for a success sample.
+/// `duration_ms` (route wall-clock) still carries the total request time
+/// for diagnostics.
+fn build_stream_call_log<S>(
+    state: &StreamState<S>,
+    error: Option<String>,
+    upstream_duration_ms: u64,
+    ttft_ms: Option<u64>,
+    usage: &Usage,
+) -> CallLog {
+    let had_error = error.is_some();
+    let status_code = if had_error { 502 } else { 200 };
+    // Mirror success_log (mod.rs:151-153): the flat
+    // cache/reasoning columns must carry the same values as
+    // `usage`, because the persistence layer binds these
+    // columns from the flat fields, not from `log.usage`.
+    // Without this, query_cache_stats undercounts streaming
+    // responses. Capture before the move into `Some(state.usage)`.
+    // On the error terminal they revert to NULL (the same
+    // failure contract as the flat token columns).
+    let cached_tokens = if had_error { None } else { usage.cached_tokens };
+    let cache_creation_tokens = if had_error {
+        None
+    } else {
+        usage.cache_creation_tokens
+    };
+    let reasoning_tokens = if had_error {
+        None
+    } else {
+        usage.reasoning_tokens
+    };
+    CallLog {
+        request_id: state.analytics.request_id,
+        provider: state.analytics.provider.clone(),
+        model: state.analytics.requested_model.clone(),
+        real_model: state.analytics.real_model.clone(),
+        stream: true,
+        status_code,
+        duration_ms: state.start.elapsed().as_millis() as u64,
+        error,
+        timestamp: chrono::Utc::now(),
+        reasoning_effort: state.reasoning_effort.clone(),
+        upstream_duration_ms: if had_error {
+            None
+        } else {
+            Some(upstream_duration_ms)
+        },
+        ttft_ms: if had_error { None } else { ttft_ms },
+        cached_tokens,
+        cache_creation_tokens,
+        reasoning_tokens,
+        usage: if had_error { None } else { Some(usage.clone()) },
+        user_agent: state.user_agent.clone(),
+        client_ip: state.client_ip.clone(),
+        error_category: if status_code == 200 {
+            None
+        } else {
+            Some("stream_error".to_string())
+        },
+        // Legacy call_logs keep its diagnostic role: the
+        // formal identity columns stay NULL here; the
+        // request_results / target_attempts facts resolve
+        // identity via route_name / provider / real_model.
+        route_id: None,
+        target_id: None,
+    }
+}
+
+/// Claim the stream terminal and write both the `call_logs` row and the
+/// formal analytics terminal event for the normal `Done`/`None` path.
+/// Call order is load-bearing: mark `done` → `CallLog` → `terminal_event`
+/// → deliver → return.
+async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
+    state.done = true;
+    // Claim the terminal *before* writing the call_logs row
+    // or delivering the event: if log construction panics or
+    // this body future is dropped mid-terminal, the drop
+    // guard sees `done` and must not emit a second,
+    // conflicting request result or a duplicate call_logs
+    // row.
+    state.analytics.done.store(true, Ordering::SeqCst);
+    let error = state.error.take();
+    let had_error = error.is_some();
+    // `upstream_duration_ms` / `ttft_ms` mark *successful*
+    // stream timing: they are the success-only payload, the
+    // same contract the formal analytics fact follows (see
+    // `terminal_event`). On the mid-stream error terminal the
+    // call_logs flat columns stay NULL — together with the
+    // token / cache columns — so a failed row can never feed
+    // the latency coverage denominators or be mistaken for a
+    // success sample. `duration_ms` (route wall-clock) still
+    // carries the total request time for diagnostics.
+    let upstream_duration_ms = Instant::now()
+        .duration_since(state.upstream_start)
+        .as_millis() as u64;
+    let ttft_ms = state
+        .first_byte_at
+        .map(|t| t.duration_since(state.upstream_start).as_millis() as u64);
+    // Also shared by the analytics success fact below — the
+    // fact's usage must be the *final* accumulated usage,
+    // not a mid-stream partial frame.
+    let usage = state.usage.clone();
+    state.collector.log(build_stream_call_log(
+        state,
+        error,
+        upstream_duration_ms,
+        ttft_ms,
+        &usage,
+    ));
+
+    // ── Formal analytics terminal event ──
+    let (result_status, result_reason) = if had_error {
+        (
+            FinalStatus::ModelFailure,
+            Some(FailureReason::StreamErrorAfterCommit),
+        )
+    } else {
+        (FinalStatus::Success, None)
+    };
+    let (target_status, target_reason) = if had_error {
+        (
+            TargetStatus::Failure,
+            Some(FailureReason::StreamErrorAfterCommit),
+        )
+    } else {
+        (TargetStatus::Success, None)
+    };
+    let completed_at = chrono::Utc::now();
+    let event = terminal_event(
+        &state.analytics,
+        result_status,
+        result_reason,
+        completed_at,
+        // Success-only payload: usage / cache / TTFT /
+        // upstream timing come from StreamState; failure
+        // keeps every token / timing field NULL.
+        if had_error { None } else { Some(usage) },
+        if had_error { None } else { ttft_ms },
+        if had_error {
+            None
+        } else {
+            Some(upstream_duration_ms)
+        },
+        target_status,
+        target_reason,
+    );
+    // Deliver the terminal outside this body future's
+    // cancellation scope: dropping the body while the
+    // queue is full must not cancel the enqueue — the
+    // drop guard skips (the claim above), so this is the
+    // only delivery for the normal terminal. The fast
+    // path enqueues synchronously; under backpressure a
+    // detached task owns the backpressured `emit`.
+    // Awaiting the task here only binds a *normal*
+    // completion to the enqueue — the event is in the
+    // channel before the body ends, hence drained by
+    // shutdown; cancelling this await (body drop) cannot
+    // cancel the task.
+    if let Some(task) = deliver_terminal_event(state.analytics.event_collector.clone(), event) {
+        let _ = task.await;
+    }
+}
+
 /// Wrap a `StreamChunk` stream in an SSE `Response`, forwarding data chunks
 /// to the client verbatim and accumulating `Usage` / `Error` chunks into
 /// a final `CallLog` when the stream ends.
@@ -386,63 +703,31 @@ where
     // be boxed by the caller first.
     S: Stream<Item = StreamChunk> + Send + Unpin + 'static,
 {
-    struct StreamState<S> {
-        stream: S,
-        usage: Usage,
-        error: Option<String>,
-        done: bool,
-        first_byte_at: Option<Instant>,
-        collector: Arc<CallLogCollector>,
-        start: Instant,
-        upstream_start: Instant,
-        reasoning_effort: Option<String>,
-        user_agent: Option<String>,
-        client_ip: Option<String>,
-        // Declared before the guard so it drops first; the guard's own
-        // `Arc` clone keeps the shared data alive regardless. The guard
-        // field is never read — it exists solely for its `Drop` (client
-        // disconnect terminal), hence the underscore name.
-        analytics: Arc<StreamAnalytics>,
-        _guard: TerminalGuard,
-    }
-
-    let collector = state.collector.clone();
-    let analytics = Arc::new(StreamAnalytics {
-        event_collector: state.event_collector.clone(),
-        request_id: trace_id,
-        route_name: route_name.to_string(),
-        requested_model: model.to_string(),
-        provider: provider_name.to_string(),
-        real_model: real_model.to_string(),
+    let analytics = make_stream_analytics(
+        state,
+        trace_id,
+        route_name,
+        provider_name,
+        model,
+        real_model,
         started_at,
         target_started_at,
-        prior_target_facts: target_facts,
-        done: AtomicBool::new(false),
-        error: AtomicBool::new(false),
-        error_message: Mutex::new(None),
-        call_log_collector: state.collector.clone(),
+        target_facts,
         start,
-        reasoning_effort: reasoning_effort.clone(),
-        user_agent: user_agent.clone(),
-        client_ip: client_ip.clone(),
-    });
-    let state = StreamState {
-        stream: chunk_stream,
-        usage: Usage::default(),
-        error: None,
-        done: false,
-        first_byte_at: None,
-        collector,
+        reasoning_effort.clone(),
+        user_agent.clone(),
+        client_ip.clone(),
+    );
+    let state = make_stream_state(
+        chunk_stream,
+        state.collector.clone(),
+        analytics,
         start,
         upstream_start,
         reasoning_effort,
         user_agent,
         client_ip,
-        analytics: analytics.clone(),
-        _guard: TerminalGuard {
-            analytics: analytics.clone(),
-        },
-    };
+    );
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
         if state.done {
@@ -458,202 +743,13 @@ where
                     return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(raw)), state));
                 }
                 Some(StreamChunk::Usage(u)) => {
-                    // Token-count heuristics & aggregation strategy:
-                    // 1. prompt_tokens: Take maximum across frames because providers report cumulative
-                    //    prompt_tokens (handling GLM echoes as well as Anthropic tool-use/web-search
-                    //    prompt token expansion).
-                    // 2. completion_tokens: Take maximum across frames because providers (including Anthropic
-                    //    message_start + message_delta) report cumulative completion_tokens in usage events.
-                    // 3. total_tokens: Respect upstream's reported total_tokens when specified, while
-                    //    ensuring total_tokens is at least prompt_tokens + completion_tokens.
-                    if u.prompt_tokens > 0 {
-                        state.usage.prompt_tokens = state.usage.prompt_tokens.max(u.prompt_tokens);
-                    }
-                    state.usage.completion_tokens =
-                        state.usage.completion_tokens.max(u.completion_tokens);
-
-                    let derived_total = state
-                        .usage
-                        .prompt_tokens
-                        .saturating_add(state.usage.completion_tokens);
-
-                    state.usage.total_tokens = if u.total_tokens > 0 {
-                        state
-                            .usage
-                            .total_tokens
-                            .max(u.total_tokens)
-                            .max(derived_total)
-                    } else {
-                        derived_total
-                    };
-                    // Cache/reasoning fields take the last non-None value.
-                    if u.cached_tokens.is_some() {
-                        state.usage.cached_tokens = u.cached_tokens;
-                    }
-                    if u.cache_creation_tokens.is_some() {
-                        state.usage.cache_creation_tokens = u.cache_creation_tokens;
-                    }
-                    if u.reasoning_tokens.is_some() {
-                        state.usage.reasoning_tokens = u.reasoning_tokens;
-                    }
+                    merge_stream_usage(&mut state.usage, &u);
                 }
                 Some(StreamChunk::Error(msg)) => {
-                    warn!(provider = %state.analytics.provider, error = %msg, "mid-stream error");
-                    state.error = Some(msg.clone());
-                    // Shared with the drop guard: an abandoned stream after
-                    // an upstream error classifies as `stream_error_after_commit`,
-                    // not `client_cancelled`, and the call_logs `error` column
-                    // carries the upstream message.
-                    state.analytics.error.store(true, Ordering::SeqCst);
-                    *state
-                        .analytics
-                        .error_message
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(msg);
+                    record_stream_error(&mut state, msg);
                 }
                 Some(StreamChunk::Done) | None => {
-                    state.done = true;
-                    // Claim the terminal *before* writing the call_logs row
-                    // or delivering the event: if log construction panics or
-                    // this body future is dropped mid-terminal, the drop
-                    // guard sees `done` and must not emit a second,
-                    // conflicting request result or a duplicate call_logs
-                    // row.
-                    state.analytics.done.store(true, Ordering::SeqCst);
-                    let error = state.error.take();
-                    let had_error = error.is_some();
-                    let status_code = if had_error { 502 } else { 200 };
-                    // `upstream_duration_ms` / `ttft_ms` mark *successful*
-                    // stream timing: they are the success-only payload, the
-                    // same contract the formal analytics fact follows (see
-                    // `terminal_event`). On the mid-stream error terminal the
-                    // call_logs flat columns stay NULL — together with the
-                    // token / cache columns — so a failed row can never feed
-                    // the latency coverage denominators or be mistaken for a
-                    // success sample. `duration_ms` (route wall-clock) still
-                    // carries the total request time for diagnostics.
-                    let upstream_duration_ms = Instant::now()
-                        .duration_since(state.upstream_start)
-                        .as_millis() as u64;
-                    let ttft_ms = state
-                        .first_byte_at
-                        .map(|t| t.duration_since(state.upstream_start).as_millis() as u64);
-                    // Mirror success_log (mod.rs:151-153): the flat
-                    // cache/reasoning columns must carry the same values as
-                    // `usage`, because the persistence layer binds these
-                    // columns from the flat fields, not from `log.usage`.
-                    // Without this, query_cache_stats undercounts streaming
-                    // responses. Capture before the move into `Some(state.usage)`.
-                    // On the error terminal they revert to NULL (the same
-                    // failure contract as the flat token columns).
-                    let cached_tokens = if had_error {
-                        None
-                    } else {
-                        state.usage.cached_tokens
-                    };
-                    let cache_creation_tokens = if had_error {
-                        None
-                    } else {
-                        state.usage.cache_creation_tokens
-                    };
-                    let reasoning_tokens = if had_error {
-                        None
-                    } else {
-                        state.usage.reasoning_tokens
-                    };
-                    // Also shared by the analytics success fact below — the
-                    // fact's usage must be the *final* accumulated usage,
-                    // not a mid-stream partial frame.
-                    let usage = state.usage.clone();
-                    state.collector.log(CallLog {
-                        request_id: state.analytics.request_id,
-                        provider: state.analytics.provider.clone(),
-                        model: state.analytics.requested_model.clone(),
-                        real_model: state.analytics.real_model.clone(),
-                        stream: true,
-                        status_code,
-                        duration_ms: state.start.elapsed().as_millis() as u64,
-                        error,
-                        timestamp: chrono::Utc::now(),
-                        reasoning_effort: state.reasoning_effort.clone(),
-                        upstream_duration_ms: if had_error {
-                            None
-                        } else {
-                            Some(upstream_duration_ms)
-                        },
-                        ttft_ms: if had_error { None } else { ttft_ms },
-                        cached_tokens,
-                        cache_creation_tokens,
-                        reasoning_tokens,
-                        usage: if had_error { None } else { Some(usage.clone()) },
-                        user_agent: state.user_agent.clone(),
-                        client_ip: state.client_ip.clone(),
-                        error_category: if status_code == 200 {
-                            None
-                        } else {
-                            Some("stream_error".to_string())
-                        },
-                        // Legacy call_logs keep its diagnostic role: the
-                        // formal identity columns stay NULL here; the
-                        // request_results / target_attempts facts resolve
-                        // identity via route_name / provider / real_model.
-                        route_id: None,
-                        target_id: None,
-                    });
-
-                    // ── Formal analytics terminal event ──
-                    let (result_status, result_reason) = if had_error {
-                        (
-                            FinalStatus::ModelFailure,
-                            Some(FailureReason::StreamErrorAfterCommit),
-                        )
-                    } else {
-                        (FinalStatus::Success, None)
-                    };
-                    let (target_status, target_reason) = if had_error {
-                        (
-                            TargetStatus::Failure,
-                            Some(FailureReason::StreamErrorAfterCommit),
-                        )
-                    } else {
-                        (TargetStatus::Success, None)
-                    };
-                    let completed_at = chrono::Utc::now();
-                    let event = terminal_event(
-                        &state.analytics,
-                        result_status,
-                        result_reason,
-                        completed_at,
-                        // Success-only payload: usage / cache / TTFT /
-                        // upstream timing come from StreamState; failure
-                        // keeps every token / timing field NULL.
-                        if had_error { None } else { Some(usage) },
-                        if had_error { None } else { ttft_ms },
-                        if had_error {
-                            None
-                        } else {
-                            Some(upstream_duration_ms)
-                        },
-                        target_status,
-                        target_reason,
-                    );
-                    // Deliver the terminal outside this body future's
-                    // cancellation scope: dropping the body while the
-                    // queue is full must not cancel the enqueue — the
-                    // drop guard skips (the claim above), so this is the
-                    // only delivery for the normal terminal. The fast
-                    // path enqueues synchronously; under backpressure a
-                    // detached task owns the backpressured `emit`.
-                    // Awaiting the task here only binds a *normal*
-                    // completion to the enqueue — the event is in the
-                    // channel before the body ends, hence drained by
-                    // shutdown; cancelling this await (body drop) cannot
-                    // cancel the task.
-                    if let Some(task) =
-                        deliver_terminal_event(state.analytics.event_collector.clone(), event)
-                    {
-                        let _ = task.await;
-                    }
+                    finish_stream_terminal(&mut state).await;
                     return None;
                 }
             }

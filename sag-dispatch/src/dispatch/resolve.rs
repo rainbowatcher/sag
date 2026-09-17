@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use axum::{body::Body, http::StatusCode, response::Response};
 use sag_analytics::AnalyticsEvent;
-use sag_config::{ProviderConfig, RouteTarget};
+use sag_config::{ProviderConfig, RouteConfig, RouteTarget};
 use sag_core::{AppError, ChatCompletionRequest, FailureReason, FinalStatus, RequestResultFact};
 use sag_providers::LlmProvider;
 use tracing::{info, warn};
@@ -38,108 +38,36 @@ pub async fn resolve_route(
     client_ip: Option<&str>,
 ) -> Result<ResolvedRoute, Response<Body>> {
     let config_guard = state.config.read().await;
+    let current_version = prune_stale_if_needed(state, runtime, &config_guard.routes).await;
 
-    // Prune stale cache entries for routes that have been deleted
-    // (e.g. via admin API or config hot-reload). Skip when the
-    // routes_version hasn't changed — in steady state every request
-    // avoids three write-lock acquisitions.
-    let current_version = state.config.routes_version();
-    let last = runtime
-        .last_prune_version
-        .load(std::sync::atomic::Ordering::Acquire);
-    if current_version != last {
-        runtime.prune_stale_entries(&config_guard.routes).await;
-        runtime
-            .last_prune_version
-            .store(current_version, std::sync::atomic::Ordering::Release);
-    }
-
-    let route = config_guard
-        .routes
-        .iter()
-        .find(|r| r.model_name == request.model)
-        .or_else(|| config_guard.routes.iter().find(|r| r.model_name == "*"));
-
+    let route = sag_config::resolve_model_route(&config_guard.routes, &request.model);
     let Some(route) = route else {
-        let response = failure_response(
-            state,
-            trace_id,
-            "__no_route__",
-            &request.model,
-            "__no_route__",
-            is_stream,
-            start,
-            StatusCode::NOT_FOUND,
-            AppError::ModelNotFound(request.model.clone()),
-            request.reasoning_effort.as_deref(),
-            user_agent,
-            client_ip,
-        );
-        // Formal analytics fact: no route matched → no route identity, no
-        // target attempts. The sentinel `__no_route__` CallLog row above is
-        // left untouched and must never leak into this fact.
-        emit_route_failure_event(
-            state,
-            route_failure_event(
-                trace_id,
-                &request.model,
-                None,
-                FinalStatus::NoRoute,
-                FailureReason::ModelNotFound,
-                is_stream,
-                started_at,
-            ),
+        return Err(emit_no_route_failure(
+            state, request, trace_id, is_stream, start, started_at, user_agent, client_ip,
         )
-        .await;
-        return Err(response);
+        .await);
     };
 
     // Drop targets pointing at disabled providers or models not in enabled_models.
     let targets = filter_enabled_targets(&config_guard.providers, &route.targets, &request.model);
 
     if targets.is_empty() {
-        let err = AppError::AllProvidersExhausted {
-            model: request.model.clone(),
-            reason: format!(
-                "all targets for route '{}' point to disabled or unavailable providers/models",
-                route.model_name
-            ),
-        };
-        let response = failure_response(
+        return Err(emit_all_disabled_failure(
             state,
+            request,
+            &route.model_name,
             trace_id,
-            "__all_disabled__",
-            &request.model,
-            "__all_disabled__",
             is_stream,
             start,
-            StatusCode::BAD_GATEWAY,
-            err,
-            request.reasoning_effort.as_deref(),
+            started_at,
             user_agent,
             client_ip,
-        );
-        // Formal analytics fact: the route matched but every target is
-        // disabled → carry the real matched route name (never the
-        // `__all_disabled__` sentinel); the writer resolves `route_id` from
-        // it. No target attempts, and the sentinel CallLog row above is
-        // left untouched.
-        emit_route_failure_event(
-            state,
-            route_failure_event(
-                trace_id,
-                &request.model,
-                Some(route.model_name.clone()),
-                FinalStatus::AllDisabled,
-                FailureReason::AllDisabled,
-                is_stream,
-                started_at,
-            ),
         )
-        .await;
-        return Err(response);
+        .await);
     }
 
+    // Snapshot route + global settings so the config guard can be dropped
+    // before the async `order_targets` call below.
     let strategy = route.strategy;
     let api_endpoint = route.api_endpoint.clone();
     let route_retries = route.retries;
@@ -172,30 +100,15 @@ pub async fn resolve_route(
     )
     .await;
 
-    // Resolve effective retries and timeout per target:
-    // target → route → provider / global
-    let resolved: Vec<ResolvedTarget> = ordered
-        .into_iter()
-        .map(|t| {
-            let target_real_model = t.real_model.clone();
-            let rm = t.real_model.unwrap_or_else(|| request.model.clone());
-            let retries = t.retries.or(route_retries).unwrap_or(global_retries);
-            let timeout_secs = t
-                .timeout_secs
-                .or(route_timeout)
-                .or_else(|| provider_timeouts.get(&t.provider).copied())
-                .unwrap_or(sag_config::default_timeout_secs());
-            ResolvedTarget {
-                provider: t.provider,
-                real_model: rm,
-                route_model: route_model_name.clone(),
-                target_real_model,
-                extra: t.extra,
-                retries,
-                timeout_secs,
-            }
-        })
-        .collect();
+    let resolved = map_resolved_targets(
+        ordered,
+        &request.model,
+        route_retries,
+        route_timeout,
+        &route_model_name,
+        global_retries,
+        &provider_timeouts,
+    );
 
     Ok(ResolvedRoute {
         targets: resolved,
@@ -205,6 +118,165 @@ pub async fn resolve_route(
         route_name: route_model_name,
         started_at,
     })
+}
+
+/// Prune stale cache entries for routes that have been deleted (e.g. via
+/// admin API or config hot-reload). Skip when the `routes_version` hasn't
+/// changed — in steady state every request avoids three write-lock
+/// acquisitions. Returns the current `routes_version`.
+async fn prune_stale_if_needed(
+    state: &AppState,
+    runtime: &DispatchRuntime,
+    routes: &[RouteConfig],
+) -> u64 {
+    let current_version = state.config.routes_version();
+    let last = runtime
+        .last_prune_version
+        .load(std::sync::atomic::Ordering::Acquire);
+    if current_version != last {
+        runtime.prune_stale_entries(routes).await;
+        runtime
+            .last_prune_version
+            .store(current_version, std::sync::atomic::Ordering::Release);
+    }
+    current_version
+}
+
+/// No-route terminal: fully-built 404 response (legacy CallLog row with the
+/// `__no_route__` sentinel) plus the formal analytics fact.
+#[allow(clippy::too_many_arguments)]
+async fn emit_no_route_failure(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    trace_id: uuid::Uuid,
+    is_stream: bool,
+    start: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
+) -> Response<Body> {
+    let response = failure_response(
+        state,
+        trace_id,
+        "__no_route__",
+        &request.model,
+        "__no_route__",
+        is_stream,
+        start,
+        StatusCode::NOT_FOUND,
+        AppError::ModelNotFound(request.model.clone()),
+        request.reasoning_effort.as_deref(),
+        user_agent,
+        client_ip,
+    );
+    // Formal analytics fact: no route matched → no route identity, no
+    // target attempts. The sentinel `__no_route__` CallLog row above is
+    // left untouched and must never leak into this fact.
+    emit_route_failure_event(
+        state,
+        route_failure_event(
+            trace_id,
+            &request.model,
+            None,
+            FinalStatus::NoRoute,
+            FailureReason::ModelNotFound,
+            is_stream,
+            started_at,
+        ),
+    )
+    .await;
+    response
+}
+
+/// All-disabled terminal: fully-built 502 response (legacy CallLog row with
+/// the `__all_disabled__` sentinel) plus the formal analytics fact carrying
+/// the real matched route name.
+#[allow(clippy::too_many_arguments)]
+async fn emit_all_disabled_failure(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    route_model_name: &str,
+    trace_id: uuid::Uuid,
+    is_stream: bool,
+    start: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
+) -> Response<Body> {
+    let err = AppError::AllProvidersExhausted {
+        model: request.model.clone(),
+        reason: format!(
+            "all targets for route '{route_model_name}' point to disabled or unavailable providers/models"
+        ),
+    };
+    let response = failure_response(
+        state,
+        trace_id,
+        "__all_disabled__",
+        &request.model,
+        "__all_disabled__",
+        is_stream,
+        start,
+        StatusCode::BAD_GATEWAY,
+        err,
+        request.reasoning_effort.as_deref(),
+        user_agent,
+        client_ip,
+    );
+    // Formal analytics fact: the route matched but every target is
+    // disabled → carry the real matched route name (never the
+    // `__all_disabled__` sentinel); the writer resolves `route_id` from
+    // it. No target attempts, and the sentinel CallLog row above is
+    // left untouched.
+    emit_route_failure_event(
+        state,
+        route_failure_event(
+            trace_id,
+            &request.model,
+            Some(route_model_name.to_string()),
+            FinalStatus::AllDisabled,
+            FailureReason::AllDisabled,
+            is_stream,
+            started_at,
+        ),
+    )
+    .await;
+    response
+}
+
+/// Resolve effective retries and timeout per target:
+/// target → route → provider / global.
+fn map_resolved_targets(
+    ordered: Vec<RouteTarget>,
+    requested_model: &str,
+    route_retries: Option<u32>,
+    route_timeout: Option<u64>,
+    route_model_name: &str,
+    global_retries: u32,
+    provider_timeouts: &HashMap<String, u64>,
+) -> Vec<ResolvedTarget> {
+    ordered
+        .into_iter()
+        .map(|t| {
+            let target_real_model = t.real_model.clone();
+            let rm = t.real_model.unwrap_or_else(|| requested_model.to_string());
+            let retries = t.retries.or(route_retries).unwrap_or(global_retries);
+            let timeout_secs = t
+                .timeout_secs
+                .or(route_timeout)
+                .or_else(|| provider_timeouts.get(&t.provider).copied())
+                .unwrap_or(sag_config::default_timeout_secs());
+            ResolvedTarget {
+                provider: t.provider,
+                real_model: rm,
+                route_model: route_model_name.to_string(),
+                target_real_model,
+                extra: t.extra,
+                retries,
+                timeout_secs,
+            }
+        })
+        .collect()
 }
 
 /// Build the formal analytics event for a request that failed during route

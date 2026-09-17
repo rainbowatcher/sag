@@ -70,128 +70,22 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     // 4. Determine analytics storage DSN from config, and snapshot the
     //    configured route identities (route_name → static targets) from
     //    the same read lock.
-    let config = config_handle.read().await;
-    let analytics_dsn = config
-        .analytics
-        .as_ref()
-        .map(|a| a.storage_dsn.clone())
-        .unwrap_or_else(|| "sqlite://analytics.db".into());
-    let routes_identity: Vec<sag_analytics::RouteIdentity> = config
-        .routes
-        .iter()
-        .map(|route| sag_analytics::RouteIdentity {
-            route_name: route.model_name.clone(),
-            targets: route
-                .targets
-                .iter()
-                .map(|t| sag_analytics::TargetIdentity {
-                    provider: t.provider.clone(),
-                    real_model: t.real_model.clone(),
-                })
-                .collect(),
-        })
-        .collect();
-    drop(config);
+    let (analytics_dsn, routes_identity) = snapshot_analytics_inputs(&config_handle).await;
 
-    // 5. Initialize analytics. The formal path (EventCollector →
-    //    EventWriter + IdentityRegistry) opens ONE shared, migrated pool
-    //    on the analytics DSN — the same SQLite file the legacy
-    //    call_logs store writes to; the writer is built over that shared
-    //    pool (`EventWriter::new`), never over a private one. The
-    //    identity registry is synced against the configured routes
-    //    *before* startup proceeds (config-sync-first); a failed sync
-    //    aborts startup. The exact-detail query engine (`/v1/analytics/v2/*`)
-    //    is assembled over the same shared pool, so it observes exactly
-    //    what the writer commits. The legacy CallLogCollector is kept for
-    //    the `/v1/analytics/*` and `/api/logs` paths and is built over
-    //    the SAME shared pool (`new_shared`) — one pool for writer /
-    //    registry / query / rollup / legacy store, no second pool on the
-    //    same file.
-    let analytics_pool = sag_analytics::open_analytics_pool(&analytics_dsn).await?;
-    let identity_registry = Arc::new(sag_analytics::IdentityRegistry::new(analytics_pool.clone()));
-    identity_registry.sync(&routes_identity).await?;
-    let analytics_query = sag_analytics::AnalyticsQueryEngine::new(analytics_pool.clone());
-    // 5a. 1h rollup engine over the SAME shared pool (one pool for writer /
-    //     registry / query / rollup — a failed sync aborts startup above,
-    //     so the rollup can only ever see a migrated, consistent DB). The
-    //     single-worker scheduler is spawned immediately but only
-    //     *registers* missing hours at startup (scan → `pending`, never
-    //     compute) in the background while the rest of the gateway comes
-    //     up — registration cannot block service startup, and a failed
-    //     scan is warned and retried by every hourly cycle.
-    let rollup_scheduler_handle = spawn_rollup_scheduler(
-        Arc::new(sag_analytics::RollupEngine::new(analytics_pool.clone())),
-        ROLLUP_INTERVAL,
-    );
-    // 5b. The legacy CallLogCollector (backing `/v1/analytics/*` and
-    //     `/api/logs`) is built over the SAME shared pool — `new_shared`,
-    //     never `CallLogCollector::new(dsn)` which would open a second,
-    //     independent pool on the same file and close it on shutdown,
-    //     racing the formal pool. The store does not own the pool, so its
-    //     shutdown is a no-op for the pool itself. Cloned here before the
-    //     pool is moved into the EventWriter below.
-    let collector =
-        Arc::new(sag_analytics::CallLogCollector::new_shared(analytics_pool.clone()).await?);
-    let event_collector = Arc::new(sag_analytics::EventCollector::new(
-        sag_analytics::EventWriter::new(analytics_pool),
-    ));
+    // 5. Initialize analytics (shared pool + identity registry + query
+    //    engine + rollup scheduler + legacy collector + event collector).
+    let analytics = load_analytics_stack(&analytics_dsn, routes_identity).await?;
+    let AnalyticsStack {
+        identity_registry,
+        analytics_query,
+        collector,
+        event_collector,
+        rollup_scheduler_handle,
+    } = analytics;
 
     // 6. Initialize provider registry from config and compute the
-    //    stale-probe threshold for the circuit breaker in the same read
-    //    lock (avoiding an extra lock acquisition).
-    let config = config_handle.read().await;
-    let mut providers: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
-
-    for (name, provider_config) in &config.providers {
-        // Resolve this provider's effective proxy (global `proxy_url` + its
-        // `proxy_mode`) and build the adapter with it — the same resolution
-        // every construction path uses, so startup, hot reload and admin
-        // mutations agree on the proxy policy. Resolution errors follow the
-        // existing startup handling for provider construction: logged and the
-        // provider is skipped (never unwrap/panic). With enabled providers
-        // present, an invalid global proxy / unsatisfiable `enabled` mode then
-        // surfaces below as "no provider adapters could be initialized", which
-        // `load_config`'s validation would already have rejected. No proxy URL
-        // or credential is ever logged.
-        let effective = match sag_state::config_mutation::effective_proxy_for(
-            &config,
-            provider_config,
-        ) {
-            Ok(effective) => effective,
-            Err(e) => {
-                tracing::error!(name, error = %e, "invalid proxy configuration, skipping provider");
-                continue;
-            }
-        };
-        match sag_providers::create_provider_with_proxy(
-            name.clone(),
-            provider_config,
-            effective.as_ref(),
-        ) {
-            Ok(provider) => {
-                info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
-                providers.insert(name.clone(), provider);
-            }
-            Err(e) => {
-                tracing::error!(name, error = %e, "failed to create provider adapter, skipping");
-            }
-        }
-    }
-
-    // Ensure at least one enabled provider adapter is available
-    let enabled_count = config.providers.values().filter(|p| p.enabled).count();
-    if providers.is_empty() && enabled_count > 0 {
-        return Err(anyhow::anyhow!(
-            "no provider adapters could be initialized; check provider configuration and credentials"
-        ));
-    }
-
-    // Compute the stale-probe threshold from the current config snapshot.
-    // The threshold is derived from the worst-case (route, target) timeout /
-    // retries / ttfb across all configured targets.
-    let stale_probe_threshold = sag_router::stale_probe_threshold_from_config(&config);
-    drop(config);
-
+    //    stale-probe threshold for the circuit breaker.
+    let (providers, stale_probe_threshold) = build_provider_registry(&config_handle).await?;
     let provider_registry = Arc::new(RwLock::new(providers));
 
     // 7. Create config mutation coordinator (serialises all production
@@ -279,6 +173,197 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     let app = app.fallback(crate::ui_routes::ui_handler);
 
     // 12. Determine listen address
+    let addr = parse_listen_addr(&config_handle).await?;
+    info!(%addr, "gateway listening");
+
+    // 13. Start server with graceful shutdown
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("gateway shut down");
+
+    // 14–15. Shut down watchers / rollup, then drain the event queue.
+    graceful_shutdown(
+        rollup_scheduler_handle,
+        hot_reload_handle,
+        threshold_watcher_handle,
+        event_collector,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Phase 4: Determine analytics storage DSN from config, and snapshot the
+/// configured route identities (route_name → static targets) from
+/// the same read lock.
+async fn snapshot_analytics_inputs(
+    config_handle: &sag_config::ConfigHandle,
+) -> (String, Vec<sag_analytics::RouteIdentity>) {
+    let config = config_handle.read().await;
+    let analytics_dsn = config
+        .analytics
+        .as_ref()
+        .map(|a| a.storage_dsn.clone())
+        .unwrap_or_else(|| "sqlite://analytics.db".into());
+    let routes_identity: Vec<sag_analytics::RouteIdentity> = config
+        .routes
+        .iter()
+        .map(|route| sag_analytics::RouteIdentity {
+            route_name: route.model_name.clone(),
+            targets: route
+                .targets
+                .iter()
+                .map(|t| sag_analytics::TargetIdentity {
+                    provider: t.provider.clone(),
+                    real_model: t.real_model.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    (analytics_dsn, routes_identity)
+}
+
+/// Analytics subsystem handles assembled over ONE shared pool.
+///
+/// `event_collector` and `rollup_scheduler_handle` are consumed by
+/// [`graceful_shutdown`]; the rest are handed to `AppState` / the
+/// coordinator. The pool itself is not retained here — it is moved into
+/// the [`sag_analytics::EventWriter`] and shared via `Arc` clones held by
+/// the registry / query engine / rollup engine / legacy collector.
+struct AnalyticsStack {
+    identity_registry: Arc<sag_analytics::IdentityRegistry>,
+    analytics_query: sag_analytics::AnalyticsQueryEngine,
+    collector: Arc<sag_analytics::CallLogCollector>,
+    event_collector: Arc<sag_analytics::EventCollector>,
+    rollup_scheduler_handle: RollupSchedulerHandle,
+}
+
+/// Phases 5–5b: Initialize analytics. The formal path (EventCollector →
+/// EventWriter + IdentityRegistry) opens ONE shared, migrated pool
+/// on the analytics DSN — the same SQLite file the legacy
+/// call_logs store writes to; the writer is built over that shared
+/// pool (`EventWriter::new`), never over a private one. The
+/// identity registry is synced against the configured routes
+/// *before* startup proceeds (config-sync-first); a failed sync
+/// aborts startup. The exact-detail query engine (`/v1/analytics/v2/*`)
+/// is assembled over the same shared pool, so it observes exactly
+/// what the writer commits. The legacy CallLogCollector is kept for
+/// the `/v1/analytics/*` and `/api/logs` paths and is built over
+/// the SAME shared pool (`new_shared`) — one pool for writer /
+/// registry / query / rollup / legacy store, no second pool on the
+/// same file.
+async fn load_analytics_stack(
+    analytics_dsn: &str,
+    routes_identity: Vec<sag_analytics::RouteIdentity>,
+) -> anyhow::Result<AnalyticsStack> {
+    let analytics_pool = sag_analytics::open_analytics_pool(analytics_dsn).await?;
+    let identity_registry = Arc::new(sag_analytics::IdentityRegistry::new(analytics_pool.clone()));
+    identity_registry.sync(&routes_identity).await?;
+    let analytics_query = sag_analytics::AnalyticsQueryEngine::new(analytics_pool.clone());
+    // 5a. 1h rollup engine over the SAME shared pool (one pool for writer /
+    //     registry / query / rollup — a failed sync aborts startup above,
+    //     so the rollup can only ever see a migrated, consistent DB). The
+    //     single-worker scheduler is spawned immediately but only
+    //     *registers* missing hours at startup (scan → `pending`, never
+    //     compute) in the background while the rest of the gateway comes
+    //     up — registration cannot block service startup, and a failed
+    //     scan is warned and retried by every hourly cycle.
+    let rollup_scheduler_handle = spawn_rollup_scheduler(
+        Arc::new(sag_analytics::RollupEngine::new(analytics_pool.clone())),
+        ROLLUP_INTERVAL,
+    );
+    // 5b. The legacy CallLogCollector (backing `/v1/analytics/*` and
+    //     `/api/logs`) is built over the SAME shared pool — `new_shared`,
+    //     never `CallLogCollector::new(dsn)` which would open a second,
+    //     independent pool on the same file and close it on shutdown,
+    //     racing the formal pool. The store does not own the pool, so its
+    //     shutdown is a no-op for the pool itself. Cloned here before the
+    //     pool is moved into the EventWriter below.
+    let collector =
+        Arc::new(sag_analytics::CallLogCollector::new_shared(analytics_pool.clone()).await?);
+    let event_collector = Arc::new(sag_analytics::EventCollector::new(
+        sag_analytics::EventWriter::new(analytics_pool),
+    ));
+
+    Ok(AnalyticsStack {
+        identity_registry,
+        analytics_query,
+        collector,
+        event_collector,
+        rollup_scheduler_handle,
+    })
+}
+
+/// Phase 6: Initialize provider registry from config and compute the
+/// stale-probe threshold for the circuit breaker in the same read
+/// lock (avoiding an extra lock acquisition).
+async fn build_provider_registry(
+    config_handle: &sag_config::ConfigHandle,
+) -> anyhow::Result<(
+    HashMap<String, Arc<dyn sag_providers::LlmProvider>>,
+    Duration,
+)> {
+    let config = config_handle.read().await;
+    let mut providers: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+
+    for (name, provider_config) in &config.providers {
+        // Resolve this provider's effective proxy (global `proxy_url` + its
+        // `proxy_mode`) and build the adapter with it — the same resolution
+        // every construction path uses, so startup, hot reload and admin
+        // mutations agree on the proxy policy. Resolution errors follow the
+        // existing startup handling for provider construction: logged and the
+        // provider is skipped (never unwrap/panic). With enabled providers
+        // present, an invalid global proxy / unsatisfiable `enabled` mode then
+        // surfaces below as "no provider adapters could be initialized", which
+        // `load_config`'s validation would already have rejected. No proxy URL
+        // or credential is ever logged.
+        let effective = match sag_state::config_mutation::effective_proxy_for(
+            &config,
+            provider_config,
+        ) {
+            Ok(effective) => effective,
+            Err(e) => {
+                tracing::error!(name, error = %e, "invalid proxy configuration, skipping provider");
+                continue;
+            }
+        };
+        match sag_providers::create_provider_with_proxy(
+            name.clone(),
+            provider_config,
+            effective.as_ref(),
+        ) {
+            Ok(provider) => {
+                info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
+                providers.insert(name.clone(), provider);
+            }
+            Err(e) => {
+                tracing::error!(name, error = %e, "failed to create provider adapter, skipping");
+            }
+        }
+    }
+
+    // Ensure at least one enabled provider adapter is available
+    let enabled_count = config.providers.values().filter(|p| p.enabled).count();
+    if providers.is_empty() && enabled_count > 0 {
+        return Err(anyhow::anyhow!(
+            "no provider adapters could be initialized; check provider configuration and credentials"
+        ));
+    }
+
+    // Compute the stale-probe threshold from the current config snapshot.
+    // The threshold is derived from the worst-case (route, target) timeout /
+    // retries / ttfb across all configured targets.
+    let stale_probe_threshold = sag_router::stale_probe_threshold_from_config(&config);
+    drop(config);
+
+    Ok((providers, stale_probe_threshold))
+}
+
+/// Phase 12: Determine listen address.
+async fn parse_listen_addr(config_handle: &sag_config::ConfigHandle) -> anyhow::Result<SocketAddr> {
     let config = config_handle.read().await;
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
         .parse()
@@ -289,18 +374,25 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
                 config.server.port
             )
         })?;
-
-    info!(%addr, "gateway listening");
     drop(config);
+    Ok(addr)
+}
 
-    // 13. Start server with graceful shutdown
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
-    info!("gateway shut down");
-
+/// Phases 14–15: Shut down background watchers and drain the analytics
+/// event queue after the server has stopped.
+///
+/// Shutdown order is load-bearing:
+/// 1. hot-reload watcher, then threshold watcher — the hot-reload watcher
+///    uses `notify` OS threads whose `Drop` must run (see below);
+/// 2. rollup scheduler BEFORE the event drain — the drain must be the last
+///    writer to touch the analytics DB;
+/// 3. event collector drain last.
+async fn graceful_shutdown(
+    rollup_scheduler_handle: RollupSchedulerHandle,
+    hot_reload_handle: sag_config::HotReloadHandle,
+    threshold_watcher_handle: ThresholdWatcherHandle,
+    event_collector: Arc<sag_analytics::EventCollector>,
+) {
     // 14. Gracefully shut down the hot-reload watcher and the threshold
     //     watcher. These MUST happen after the server stops because the
     //     hot-reload watcher uses `notify` which spawns OS-level threads
@@ -309,7 +401,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     //     blocking process exit.
     //
     //     The router (and its internal AppState) was dropped when axum::serve
-    //     completed above, which already closes the analytics channel and lets
+    //     completed, which already closes the analytics channel and lets
     //     the SQLite background task exit.
     hot_reload_handle.shutdown().await;
     threshold_watcher_handle.shutdown().await;
@@ -335,8 +427,6 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     info!("analytics event collector drained");
 
     info!("all subsystems shut down");
-
-    Ok(())
 }
 
 /// Handler that wraps the [`ConfigMutationCoordinator`] for the hot-reload
