@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use reqwest::RequestBuilder;
 use sag_config::ProviderType;
 use sag_core::{StreamChunk, Usage};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Return the (name, value) pairs for auth headers that a provider type uses
 /// for chat and models API requests.
@@ -106,12 +107,18 @@ pub fn apply_body_strip(mut body: serde_json::Value, fields: &[String]) -> serde
 // ── SSE stream parsing helpers ─────────────────────────────────────
 
 /// Iterate the byte buffer, extract complete SSE frames (delimited by `\n\n` or `\r\n\r\n`),
-/// parse them, and send the resulting `StreamChunk` items through the channel.
+/// and pass each frame to `process_frame`.
 ///
-/// Returns `true` when a frame carried an upstream error delivered inside a
-/// 200 SSE data frame (the frame was forwarded and an `Error` chunk sent by
-/// `process_sse_frame`); the caller must stop forwarding further frames.
-pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
+/// Returns `true` when `process_frame` signals an error; draining stops
+/// immediately in that case.
+pub fn drain_sse_frames_with<F>(
+    buffer: &mut Vec<u8>,
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    mut process_frame: F,
+) -> bool
+where
+    F: FnMut(&[u8], &mpsc::UnboundedSender<StreamChunk>) -> bool,
+{
     let mut saw_error = false;
     while let Some(end) = find_sse_boundary(buffer) {
         let frame: Vec<u8> = buffer.drain(..end).collect();
@@ -122,10 +129,41 @@ pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamC
             2
         };
         buffer.drain(..delim_len);
-        if process_sse_frame(&frame, tx) {
+        if process_frame(&frame, tx) {
             saw_error = true;
             break;
         }
+    }
+    saw_error
+}
+
+/// Iterate the byte buffer, extract complete SSE frames (delimited by `\n\n` or `\r\n\r\n`),
+/// parse them, and send the resulting `StreamChunk` items through the channel.
+///
+/// Returns `true` when a frame carried an upstream error delivered inside a
+/// 200 SSE data frame (the frame was forwarded and an `Error` chunk sent by
+/// `process_sse_frame`); the caller must stop forwarding further frames.
+pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
+    drain_sse_frames_with(buffer, tx, process_sse_frame)
+}
+
+/// Drain remaining frames and flush any un-delimited trailing frame upon stream end,
+/// passing each frame to `process_frame`.
+///
+/// Returns `true` when the trailing frame (or a frame drained first) signaled
+/// an error.
+pub fn flush_sse_buffer_with<F>(
+    buffer: &mut Vec<u8>,
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    mut process_frame: F,
+) -> bool
+where
+    F: FnMut(&[u8], &mpsc::UnboundedSender<StreamChunk>) -> bool,
+{
+    let mut saw_error = drain_sse_frames_with(buffer, tx, &mut process_frame);
+    if !saw_error && !buffer.is_empty() {
+        let frame = std::mem::take(buffer);
+        saw_error = process_frame(&frame, tx);
     }
     saw_error
 }
@@ -135,12 +173,29 @@ pub fn drain_sse_frames(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamC
 /// Returns `true` when the trailing frame (or a frame drained first) carried a
 /// 200-delivered upstream error, mirroring [`drain_sse_frames`].
 pub fn flush_sse_buffer(buffer: &mut Vec<u8>, tx: &mpsc::UnboundedSender<StreamChunk>) -> bool {
-    let mut saw_error = drain_sse_frames(buffer, tx);
-    if !saw_error && !buffer.is_empty() {
-        let frame = std::mem::take(buffer);
-        saw_error = process_sse_frame(&frame, tx);
+    flush_sse_buffer_with(buffer, tx, process_sse_frame)
+}
+
+/// Emit the SSE chunk idle-timeout error path: log + `Error` chunk.
+///
+/// Returns `true` (a timeout is always an error terminal — the caller must
+/// not emit `Done`). The `Error` chunk message is only sent when
+/// `chunk_timeout` is `Some` (the timeout branch is only reachable then).
+pub fn emit_idle_timeout(
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    provider_label: &str,
+    chunk_timeout: &Option<Duration>,
+) -> bool {
+    error!(chunk_timeout_secs = ?chunk_timeout, provider = provider_label, "stream chunk idle timeout");
+    if !tx.is_closed()
+        && let Some(s) = chunk_timeout
+    {
+        let _ = tx.send(StreamChunk::Error(format!(
+            "stream chunk idle timeout after {}s",
+            s.as_secs()
+        )));
     }
-    saw_error
+    true
 }
 
 /// Search for the SSE frame delimiter `\n\n` (or `\r\n\r\n`), returning the

@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, trace, warn};
 
+use crate::event_collector::DEFAULT_EVENT_QUEUE_CAPACITY;
 use crate::sqlite_store::SqliteLogStore;
 use crate::store::LogStore;
 
@@ -53,7 +54,7 @@ impl CallLogCollector {
 
     /// Build a collector around an existing [`LogStore`].
     async fn with_store(store: Arc<dyn LogStore>) -> Result<Self, sqlx::Error> {
-        let (tx, mut rx) = mpsc::channel::<CollectorCommand>(4096);
+        let (tx, mut rx) = mpsc::channel::<CollectorCommand>(DEFAULT_EVENT_QUEUE_CAPACITY);
         let store_clone = Arc::clone(&store);
 
         let handle = tokio::spawn(async move {

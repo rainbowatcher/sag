@@ -21,7 +21,7 @@ pub use rollup::{
     RollupRunReport, RouteRollupRow, TargetRollupRow, bucket_lower_bound_ms, bucket_to_percentile,
     histogram_bucket_idx, merge_histogram_buckets,
 };
-pub use sqlite_store::SqliteLogStore;
+pub use sqlite_store::{MAX_LOG_LIMIT, SqliteLogStore};
 pub use store::*;
 
 use sqlx::sqlite::{

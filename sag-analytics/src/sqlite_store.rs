@@ -23,10 +23,10 @@ const STAGE_04_COLUMNS: &[(&str, &str)] = &[
     ("reasoning_tokens", "INTEGER"),
 ];
 
-/// Maximum page size for `query_logs`. Mirrors the route-layer clamp in
-/// `sag-router/src/admin_logs.rs` so a runaway `?limit=` cannot stream
-/// gigabytes into the dashboard.
-const MAX_LOG_LIMIT: u64 = 500;
+/// Maximum page size for `query_logs`. Shared with the admin API layer
+/// (via `sag-admin`) so a runaway `?limit=` cannot stream gigabytes into
+/// the dashboard.
+pub const MAX_LOG_LIMIT: u64 = 500;
 
 /// Idempotent schema-drift repair for `call_logs`. Runs at every store
 /// startup. Missing extension columns are added with `ALTER TABLE … ADD COLUMN`

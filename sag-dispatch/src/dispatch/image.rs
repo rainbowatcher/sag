@@ -6,13 +6,17 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
 use sag_analytics::AnalyticsEvent;
 use sag_config::{GatewayConfig, Strategy};
 use sag_core::{
     AppError, ChatCompletionRequest, FailureReason, FinalStatus, ImageGenerationRequest,
     ImageGenerationResponse, RequestResultFact, TargetAttemptFact, TargetStatus,
 };
-use std::time::Instant;
+use sag_providers::LlmProvider;
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
@@ -81,12 +85,6 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     // hold the config read lock — see `dispatch_chat` for the rationale.
     let config = state.config.read().await.clone();
 
-    // One `TargetAttemptFact` per actually-issued target, emitted once in a
-    // single atomic request event at the end of the dispatch. Skipped
-    // targets (circuit open / provider disabled) never reach the provider
-    // and produce no fact.
-    let mut target_facts: Vec<TargetAttemptFact> = Vec::new();
-
     let attempt_ctx = ImageAttemptCtx {
         state,
         runtime,
@@ -102,72 +100,142 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         client_ip: client_ip.as_deref(),
     };
 
+    run_image_fallback(&attempt_ctx, route_name, started_at, targets, errors).await
+}
+
+/// Drive the image fallback loop to a terminal response: try each target
+/// via [`attempt_one_image_target`], returning on the first success /
+/// client error, or the all-exhausted response when every target fell
+/// through. Each terminal emits its own analytics request event.
+///
+/// One `TargetAttemptFact` per actually-issued target, emitted once in a
+/// single atomic request event at the terminal. Skipped targets (circuit
+/// open / provider disabled) never reach the provider and produce no
+/// fact.
+async fn run_image_fallback(
+    attempt_ctx: &ImageAttemptCtx<'_>,
+    route_name: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    targets: &[ResolvedTarget],
+    errors: &mut Vec<String>,
+) -> Response<Body> {
+    let mut target_facts: Vec<TargetAttemptFact> = Vec::new();
+
     for target in targets {
-        match attempt_one_image_target(&attempt_ctx, target, errors, &mut target_facts).await {
+        match attempt_one_image_target(attempt_ctx, target, errors, &mut target_facts).await {
             TargetOutcome::Success(resp) => {
-                state.collector.log(success_log(
-                    trace_id,
-                    &target.provider,
-                    &request.model,
-                    &target.real_model,
-                    false,
-                    start,
-                    None,
-                    None, // reasoning_effort — not applicable for image generation
-                    None, // upstream_duration_ms — image path timing is out of scope for stage 2
-                    None, // ttft_ms — image generation is single-shot, conceptually non-streaming
-                    user_agent.clone(),
-                    client_ip.clone(),
-                ));
-                emit_image_success_event(
-                    state,
-                    &cancel_guard,
-                    trace_id,
+                return finish_image_success(
+                    attempt_ctx,
                     route_name,
-                    &request.model,
                     started_at,
+                    target,
                     target_facts,
+                    resp,
                 )
                 .await;
-                return (StatusCode::OK, Json(resp)).into_response();
             }
             TargetOutcome::ClientError(err) => {
-                // Client-attributed 4xx: return to the client directly — no
-                // failover to the next target, no pin movement, no circuit
-                // change. `into_response` transparently forwards the upstream
-                // status code + body.
-                emit_image_client_error_event(
-                    state,
-                    &cancel_guard,
-                    trace_id,
-                    &request.model,
-                    started_at,
-                    &err,
-                )
-                .await;
-                return err.into_response();
+                return finish_image_client_error(attempt_ctx, started_at, err).await;
             }
             TargetOutcome::Failover => continue,
         }
     }
 
-    let response = fallback_exhausted_response(
-        state,
-        &request.model,
+    finish_image_exhausted(attempt_ctx, route_name, started_at, errors, target_facts).await
+}
+
+/// Success terminal: per-target success log, then claim the cancel-guard
+/// terminal via `mark_done` and emit the `success` request event (see
+/// [`emit_image_success_event`]). Image responses carry no usage — all
+/// token / cache fields stay NULL (unknown), never fabricated as 0.
+/// Returns the 200 JSON response.
+async fn finish_image_success(
+    attempt_ctx: &ImageAttemptCtx<'_>,
+    route_name: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    target: &ResolvedTarget,
+    target_facts: Vec<TargetAttemptFact>,
+    resp: ImageGenerationResponse,
+) -> Response<Body> {
+    attempt_ctx.state.collector.log(success_log(
+        attempt_ctx.trace_id,
+        &target.provider,
+        attempt_ctx.request_model,
+        &target.real_model,
         false,
-        trace_id,
-        start,
+        attempt_ctx.start,
+        None,
+        None, // reasoning_effort — not applicable for image generation
+        None, // upstream_duration_ms — image path timing is out of scope for stage 2
+        None, // ttft_ms — image generation is single-shot, conceptually non-streaming
+        attempt_ctx.user_agent.map(str::to_string),
+        attempt_ctx.client_ip.map(str::to_string),
+    ));
+    emit_image_success_event(
+        attempt_ctx.state,
+        attempt_ctx.cancel_guard,
+        attempt_ctx.trace_id,
+        route_name,
+        attempt_ctx.request_model,
+        started_at,
+        target_facts,
+    )
+    .await;
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Client-error terminal: emit the `client_error` request event (see
+/// [`emit_image_client_error_event`]) — no route identity, no target
+/// attempts (writer validation contract) — then hand the error straight
+/// back to the client: no failover to the next target, no pin movement,
+/// no circuit change. `into_response` transparently forwards the
+/// upstream status code + body.
+async fn finish_image_client_error(
+    attempt_ctx: &ImageAttemptCtx<'_>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    err: AppError,
+) -> Response<Body> {
+    emit_image_client_error_event(
+        attempt_ctx.state,
+        attempt_ctx.cancel_guard,
+        attempt_ctx.trace_id,
+        attempt_ctx.request_model,
+        started_at,
+        &err,
+    )
+    .await;
+    err.into_response()
+}
+
+/// All-exhausted terminal: build the 502 fallback response (which also
+/// logs the `__all_exhausted__` call row), then claim the cancel-guard
+/// terminal via `mark_done` and emit the `model_failure` request event
+/// with `all_exhausted` and one failure fact per actually-issued target
+/// (see [`emit_image_model_failure_event`]).
+async fn finish_image_exhausted(
+    attempt_ctx: &ImageAttemptCtx<'_>,
+    route_name: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    errors: &[String],
+    target_facts: Vec<TargetAttemptFact>,
+) -> Response<Body> {
+    let response = fallback_exhausted_response(
+        attempt_ctx.state,
+        attempt_ctx.request_model,
+        false,
+        attempt_ctx.trace_id,
+        attempt_ctx.start,
         errors,
         None, // reasoning_effort — not applicable for image generation
-        user_agent.as_deref(),
-        client_ip.as_deref(),
+        attempt_ctx.user_agent,
+        attempt_ctx.client_ip,
     );
     emit_image_model_failure_event(
-        state,
-        &cancel_guard,
-        trace_id,
+        attempt_ctx.state,
+        attempt_ctx.cancel_guard,
+        attempt_ctx.trace_id,
         route_name,
-        &request.model,
+        attempt_ctx.request_model,
         started_at,
         target_facts,
     )
@@ -210,44 +278,81 @@ struct ImageAttemptCtx<'a> {
 /// resolve → retries → single attempt fact → circuit outcome → sticky
 /// writeback on success. Skipped targets (circuit open / provider
 /// disabled) produce no fact; client-caused 4xx produce no fact either
-/// (writer validation contract — see the fact-building block below).
+/// (writer validation contract — see [`record_image_attempt`]).
 async fn attempt_one_image_target(
     ctx: &ImageAttemptCtx<'_>,
     target: &ResolvedTarget,
     errors: &mut Vec<String>,
     target_facts: &mut Vec<TargetAttemptFact>,
 ) -> TargetOutcome {
-    let ImageAttemptCtx {
-        state,
-        runtime,
-        request_model,
-        img_request,
-        config,
-        cancel_guard,
-        strategy,
-        sticky_token,
-        trace_id,
-        start,
-        user_agent,
-        client_ip,
-    } = *ctx;
+    let Some(prepared) = prepare_image_attempt(ctx, target, errors).await else {
+        return TargetOutcome::Failover;
+    };
+
+    let (outcome, started_at) = send_image_attempt(ctx, &target.provider, &prepared, errors).await;
+
+    let (category, attempt_status) = image_failure_log_fields(&outcome);
+    record_image_attempt(
+        ctx.cancel_guard,
+        &target.provider,
+        &prepared.real_model,
+        &outcome,
+        started_at,
+        target_facts,
+    );
+
+    apply_image_outcome(
+        ctx,
+        target,
+        prepared,
+        outcome,
+        category,
+        attempt_status,
+        errors,
+    )
+    .await
+}
+
+/// Inputs for one circuit-gated, provider-resolved image attempt:
+/// everything [`send_image_attempt`] and [`apply_image_outcome`] need
+/// after [`prepare_image_attempt`] succeeds.
+struct PreparedAttempt<'a> {
+    permit: CircuitPermit<'a>,
+    provider: Arc<dyn LlmProvider>,
+    real_model: String,
+    target_extra: HashMap<String, serde_json::Value>,
+    img_request: ImageGenerationRequest,
+    retries: u32,
+    timeout_secs: u64,
+}
+
+/// Stage 1 — circuit gate → provider resolve → cloned per-attempt
+/// inputs. `None` means the target is skipped before any provider call
+/// (circuit open / provider disabled): no attempt fact is produced; a
+/// claimed half-open probe slot is released on the provider-unresolved
+/// path so `probe_in_flight` cannot stick true forever.
+async fn prepare_image_attempt<'a>(
+    ctx: &ImageAttemptCtx<'a>,
+    target: &ResolvedTarget,
+    errors: &mut Vec<String>,
+) -> Option<PreparedAttempt<'a>> {
     let provider_name = &target.provider;
     let real_model = &target.real_model;
 
     let Some(permit) = circuit_allows_target(
-        runtime,
-        request_model,
+        ctx.runtime,
+        ctx.request_model,
         provider_name,
         real_model,
-        &config.circuit_breaker,
+        &ctx.config.circuit_breaker,
     )
     .await
     else {
         errors.push(format!("{provider_name}/{real_model}: circuit open"));
-        return TargetOutcome::Failover;
+        return None;
     };
 
-    let Some(provider) = resolve_provider(state, provider_name, errors).await else {
+    let Some(provider) = resolve_provider(ctx.state, provider_name, errors).await else {
         // Provider is disabled / unregistered. If this request claimed the
         // half-open probe slot we must release it synchronously, otherwise
         // the target would be skipped forever (probe_in_flight stuck
@@ -256,16 +361,41 @@ async fn attempt_one_image_target(
         if let CircuitPermit::Probe(guard) = permit {
             guard.release_probe_slot().await;
         }
-        return TargetOutcome::Failover;
+        return None;
     };
 
     let real_model = real_model.clone();
-    let target_extra =
-        merge_model_overrides(&config.providers, provider_name, &real_model, &target.extra);
-    let retries = target.retries;
-    let timeout_secs = target.timeout_secs;
-    let img_request = img_request.clone();
+    let target_extra = merge_model_overrides(
+        &ctx.config.providers,
+        provider_name,
+        &real_model,
+        &target.extra,
+    );
 
+    Some(PreparedAttempt {
+        permit,
+        provider,
+        real_model,
+        target_extra,
+        img_request: ctx.img_request.clone(),
+        retries: target.retries,
+        timeout_secs: target.timeout_secs,
+    })
+}
+
+/// Stage 2 — run the retry sequence for a prepared target. Returns the
+/// terminal outcome plus the wall-clock start of attempt 0 (the first
+/// actual provider call), which the collapsed attempt fact uses so
+/// retries of the same target extend its single duration.
+async fn send_image_attempt(
+    ctx: &ImageAttemptCtx<'_>,
+    provider_name: &str,
+    prepared: &PreparedAttempt<'_>,
+    errors: &mut Vec<String>,
+) -> (
+    RetryOutcome<ImageGenerationResponse>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
     // Wall-clock start of this target's first actual provider call,
     // captured inside the retry closure on attempt 0. Retries of the
     // same target extend the single fact's duration.
@@ -273,18 +403,19 @@ async fn attempt_one_image_target(
 
     let outcome = run_with_retries_outcome::<ImageGenerationResponse, _, _>(
         provider_name,
-        retries,
-        &config.backoff,
+        prepared.retries,
+        &ctx.config.backoff,
         errors,
         |attempt| {
             if attempt == 0 {
                 target_started_at = Some(chrono::Utc::now());
             }
-            let provider = provider.clone();
-            let real_model = real_model.clone();
-            let target_extra = target_extra.clone();
-            let img_request = img_request.clone();
-            let cancel = cancel_guard.analytics();
+            let provider = prepared.provider.clone();
+            let real_model = prepared.real_model.clone();
+            let target_extra = prepared.target_extra.clone();
+            let img_request = prepared.img_request.clone();
+            let timeout_secs = prepared.timeout_secs;
+            let cancel = ctx.cancel_guard.analytics();
             async move {
                 // An actual provider call is in flight from here until
                 // the attempt's future resolves; a client disconnect
@@ -292,12 +423,9 @@ async fn attempt_one_image_target(
                 // attempt by the dispatch cancel guard (spec scenario
                 // 11).
                 cancel.begin_attempt(provider_name, &real_model);
-                let result = async move {
-                    provider
-                        .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
-                        .await
-                }
-                .await;
+                let result = provider
+                    .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
+                    .await;
                 cancel.end_attempt();
                 result
             }
@@ -305,35 +433,50 @@ async fn attempt_one_image_target(
     )
     .await;
 
-    // Extract the error_category from the outcome before
-    // `apply_circuit_outcome` consumes it.
-    let category = match &outcome {
+    (outcome, target_started_at)
+}
+
+/// Per-target failure-log fields extracted from the terminal retry
+/// outcome *before* [`apply_image_outcome`] consumes it: the error
+/// category and the real HTTP status, so the per-target `call_logs` row
+/// carries the actual upstream status (429/500/503/…) instead of a
+/// hardcoded 502. `Success` sentinels are never logged.
+fn image_failure_log_fields(
+    outcome: &RetryOutcome<ImageGenerationResponse>,
+) -> (&'static str, u16) {
+    let category = match outcome {
         RetryOutcome::Exhausted(e) => e.error_category(),
         RetryOutcome::NonRetryable(_) => "bad_request",
         RetryOutcome::Success(_) => "", // never logged
     };
-
-    // Extract the real HTTP status from the outcome error so the
-    // per-target `call_logs` row carries the actual upstream status
-    // (429/500/503/…) instead of a hardcoded 502.
-    let attempt_status = match &outcome {
+    let attempt_status = match outcome {
         RetryOutcome::Exhausted(e) | RetryOutcome::NonRetryable(e) => e.status_code().as_u16(),
         RetryOutcome::Success(_) => 200, // never logged
     };
+    (category, attempt_status)
+}
 
-    // Collapse this target's whole retry sequence into exactly one
-    // `TargetAttemptFact` (final outcome only — no retry counts). The
-    // client-caused 4xx path is excluded: per the writer's validation
-    // contract a `client_error` event can carry no target attempts, so
-    // that attempt is recorded only in call_logs.
+/// Stage 3 — collapse this target's whole retry sequence into exactly
+/// one [`TargetAttemptFact`] (final outcome only — no retry counts). The
+/// client-caused 4xx path is excluded: per the writer's validation
+/// contract a `client_error` event can carry no target attempts, so
+/// that attempt is recorded only in call_logs.
+fn record_image_attempt(
+    cancel_guard: &DispatchCancelGuard,
+    provider_name: &str,
+    real_model: &str,
+    outcome: &RetryOutcome<ImageGenerationResponse>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    target_facts: &mut Vec<TargetAttemptFact>,
+) {
     let is_client_error_path =
-        matches!(&outcome, RetryOutcome::NonRetryable(e) if is_client_caused_4xx(e));
+        matches!(outcome, RetryOutcome::NonRetryable(e) if is_client_caused_4xx(e));
     if !is_client_error_path
         && let Some(fact) = build_target_attempt_fact(
             provider_name,
-            &real_model,
-            &outcome,
-            target_started_at,
+            real_model,
+            outcome,
+            started_at,
             chrono::Utc::now(),
         )
     {
@@ -347,7 +490,22 @@ async fn attempt_one_image_target(
         cancel_guard.record_target_fact(fact.clone());
         target_facts.push(fact);
     }
+}
 
+/// Stage 4 — apply the terminal retry outcome to the circuit breaker and
+/// map it to the loop verdict: client-caused 4xx →
+/// [`TargetOutcome::ClientError`] (terminal, failover forbidden),
+/// otherwise failure → [`TargetOutcome::Failover`], success →
+/// [`TargetOutcome::Success`] plus sticky writeback.
+async fn apply_image_outcome<'a>(
+    ctx: &ImageAttemptCtx<'a>,
+    target: &ResolvedTarget,
+    prepared: PreparedAttempt<'a>,
+    outcome: RetryOutcome<ImageGenerationResponse>,
+    category: &str,
+    attempt_status: u16,
+    errors: &[String],
+) -> TargetOutcome {
     // Client-attributed 4xx (400/413/422/unknown 4xx): return straight
     // to the client — no failover, no pin movement, no circuit change.
     // `AppError` is not `Clone`, so peel the error out of the outcome by
@@ -363,25 +521,29 @@ async fn attempt_one_image_target(
         other => (None, other),
     };
 
+    let PreparedAttempt {
+        permit, real_model, ..
+    } = prepared;
+
     let Some(resp) =
-        apply_circuit_outcome(runtime, permit, cb_outcome, &config.circuit_breaker).await
+        apply_circuit_outcome(ctx.runtime, permit, cb_outcome, &ctx.config.circuit_breaker).await
     else {
         // Per-provider failure: log a failure entry with the actual provider/real_model
         // so the analytics table knows which provider was attempted.
         log_per_target_failure(
-            state,
-            trace_id,
-            provider_name,
-            request_model,
+            ctx.state,
+            ctx.trace_id,
+            &target.provider,
+            ctx.request_model,
             &real_model,
             false,
-            start,
+            ctx.start,
             errors,
             category,
             attempt_status,
             None, // reasoning_effort — not applicable for image generation
-            user_agent,
-            client_ip,
+            ctx.user_agent,
+            ctx.client_ip,
         );
         if let Some(err) = client_error {
             return TargetOutcome::ClientError(err);
@@ -389,8 +551,15 @@ async fn attempt_one_image_target(
         return TargetOutcome::Failover; // provider-persistent 4xx: failover as before
     };
 
-    if strategy == Strategy::StickyFailover {
-        writeback_sticky_target(state, runtime, request_model, target, sticky_token).await;
+    if ctx.strategy == Strategy::StickyFailover {
+        writeback_sticky_target(
+            ctx.state,
+            ctx.runtime,
+            ctx.request_model,
+            target,
+            ctx.sticky_token,
+        )
+        .await;
     }
 
     TargetOutcome::Success(resp)

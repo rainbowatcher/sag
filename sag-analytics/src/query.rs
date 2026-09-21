@@ -713,9 +713,10 @@ impl AnalyticsQueryEngine {
     ) -> QueryResult<(Vec<RouteAggRow>, Vec<RouteLatRow>)> {
         let (where_clause, binds) = route_where_clause(params);
         let agg_sql = format!(
-            "{ROUTE_AGG_SQL_BASE}{where_clause}\nGROUP BY hour_ms, rr.route_id, rr.final_status"
+            "{}{where_clause}\nGROUP BY hour_ms, rr.route_id, rr.final_status",
+            route_agg_sql_base()
         );
-        let lat_sql = format!("{ROUTE_LAT_SQL_BASE}{where_clause}");
+        let lat_sql = format!("{}{where_clause}", route_lat_sql_base());
 
         let mut agg_q = sqlx::query_as::<_, RouteAggRow>(&agg_sql);
         agg_q = agg_q.bind(from_ms).bind(to_ms);
@@ -739,9 +740,10 @@ impl AnalyticsQueryEngine {
     ) -> QueryResult<(Vec<TargetAggRow>, Vec<TargetLatRow>)> {
         let (where_clause, binds) = target_where_clause(params);
         let agg_sql = format!(
-            "{TARGET_AGG_SQL_BASE}{where_clause}\nGROUP BY hour_ms, art.provider, ta.actual_model, ta.status"
+            "{}{where_clause}\nGROUP BY hour_ms, art.provider, ta.actual_model, ta.status",
+            target_agg_sql_base()
         );
-        let lat_sql = format!("{TARGET_LAT_SQL_BASE}{where_clause}");
+        let lat_sql = format!("{}{where_clause}", target_lat_sql_base());
 
         let mut agg_q = sqlx::query_as::<_, TargetAggRow>(&agg_sql);
         agg_q = agg_q.bind(from_ms).bind(to_ms);
@@ -905,9 +907,14 @@ struct TargetLatRow {
     upstream_duration_ms: Option<i64>,
 }
 
-const ROUTE_AGG_SQL_BASE: &str = r#"
+/// SQL text is built via `format!` at each call site; interpolating
+/// `HOUR_MS` here (instead of hardcoding `3600000`) keeps the hour-bucket
+/// expression in sync with the crate constant.
+fn route_agg_sql_base() -> String {
+    format!(
+        r#"
 SELECT
-    (rr.completed_at / 3600000) * 3600000 AS hour_ms,
+    (rr.completed_at / {HOUR_MS}) * {HOUR_MS} AS hour_ms,
     rr.route_id,
     ar.route_name,
     rr.final_status AS status,
@@ -928,11 +935,15 @@ SELECT
 FROM request_results rr
 LEFT JOIN analytics_routes ar ON ar.route_id = rr.route_id
 WHERE rr.completed_at >= ? AND rr.completed_at < ?
-"#;
+"#
+    )
+}
 
-const ROUTE_LAT_SQL_BASE: &str = r#"
+fn route_lat_sql_base() -> String {
+    format!(
+        r#"
 SELECT
-    (rr.completed_at / 3600000) * 3600000 AS hour_ms,
+    (rr.completed_at / {HOUR_MS}) * {HOUR_MS} AS hour_ms,
     rr.route_id,
     rr.duration_ms,
     rr.ttft_ms,
@@ -941,11 +952,15 @@ FROM request_results rr
 LEFT JOIN analytics_routes ar ON ar.route_id = rr.route_id
 WHERE rr.completed_at >= ? AND rr.completed_at < ?
   AND rr.final_status IN ('success', 'model_failure', 'all_disabled', 'client_cancelled')
-"#;
+"#
+    )
+}
 
-const TARGET_AGG_SQL_BASE: &str = r#"
+fn target_agg_sql_base() -> String {
+    format!(
+        r#"
 SELECT
-    (ta.completed_at / 3600000) * 3600000 AS hour_ms,
+    (ta.completed_at / {HOUR_MS}) * {HOUR_MS} AS hour_ms,
     art.provider,
     ta.actual_model,
     ta.status,
@@ -966,11 +981,15 @@ SELECT
 FROM target_attempts ta
 JOIN analytics_route_targets art ON art.target_id = ta.target_id
 WHERE ta.completed_at >= ? AND ta.completed_at < ?
-"#;
+"#
+    )
+}
 
-const TARGET_LAT_SQL_BASE: &str = r#"
+fn target_lat_sql_base() -> String {
+    format!(
+        r#"
 SELECT
-    (ta.completed_at / 3600000) * 3600000 AS hour_ms,
+    (ta.completed_at / {HOUR_MS}) * {HOUR_MS} AS hour_ms,
     art.provider,
     ta.actual_model,
     ta.duration_ms,
@@ -979,7 +998,9 @@ SELECT
 FROM target_attempts ta
 JOIN analytics_route_targets art ON art.target_id = ta.target_id
 WHERE ta.completed_at >= ? AND ta.completed_at < ?
-"#;
+"#
+    )
+}
 
 /// Extra `WHERE` predicate for the optional route-name filter (both
 /// scopes), with the bound value in matching order. Empty strings are

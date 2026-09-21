@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, instrument, trace, warn};
 
-use crate::{LlmProvider, ProviderBase, find_sse_boundary};
+use crate::{
+    LlmProvider, ProviderBase, drain_sse_frames_with, emit_idle_timeout, flush_sse_buffer_with,
+};
 
 // ── SSE normalization ───────────────────────────────────────────────
 
@@ -87,21 +89,9 @@ fn drain_anthropic_sse_frames(
     tx: &mpsc::UnboundedSender<StreamChunk>,
     state: &mut AnthropicStreamState,
 ) -> bool {
-    let mut saw_error = false;
-    while let Some(end) = find_sse_boundary(buffer) {
-        let frame: Vec<u8> = buffer.drain(..end).collect();
-        let delim_len = if buffer.starts_with(b"\r\n\r\n") {
-            4
-        } else {
-            2
-        };
-        buffer.drain(..delim_len);
-        if process_anthropic_sse_frame(&frame, tx, state) {
-            saw_error = true;
-            break;
-        }
-    }
-    saw_error
+    drain_sse_frames_with(buffer, tx, |frame, tx| {
+        process_anthropic_sse_frame(frame, tx, state)
+    })
 }
 
 /// Drain remaining frames and flush any un-delimited trailing frame upon stream end.
@@ -113,12 +103,9 @@ fn flush_anthropic_sse_buffer(
     tx: &mpsc::UnboundedSender<StreamChunk>,
     state: &mut AnthropicStreamState,
 ) -> bool {
-    let mut saw_error = drain_anthropic_sse_frames(buffer, tx, state);
-    if !saw_error && !buffer.is_empty() {
-        let frame = std::mem::take(buffer);
-        saw_error = process_anthropic_sse_frame(&frame, tx, state);
-    }
-    saw_error
+    flush_sse_buffer_with(buffer, tx, |frame, tx| {
+        process_anthropic_sse_frame(frame, tx, state)
+    })
 }
 
 /// Parse a single Anthropic SSE frame and emit normalized OpenAI-format chunks.
@@ -817,14 +804,7 @@ impl LlmProvider for AnthropicProvider {
                     }
                     Ok(None) => break,
                     Err(_elapsed) => {
-                        error!(chunk_timeout_secs = ?chunk_timeout, "anthropic stream chunk idle timeout");
-                        if !tx.is_closed() {
-                            let _ = tx.send(StreamChunk::Error(format!(
-                                "stream chunk idle timeout after {}s",
-                                chunk_timeout.unwrap().as_secs()
-                            )));
-                        }
-                        had_error = true;
+                        had_error = emit_idle_timeout(&tx, "anthropic", &chunk_timeout);
                         break;
                     }
                 }

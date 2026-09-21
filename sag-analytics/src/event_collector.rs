@@ -46,20 +46,25 @@ impl Default for RetryPolicy {
 }
 
 /// Failure modes of enqueueing an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventQueueError {
     /// The bounded queue is full; use [`EventCollector::emit`] to await
     /// backpressure instead of dropping.
     Full,
-    /// The collector is shut down; the event was not enqueued.
-    Closed,
+    /// Collector shut down; optional detail preserves the underlying send failure.
+    Closed(Option<String>),
 }
 
 impl fmt::Display for EventQueueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EventQueueError::Full => write!(f, "analytics event queue full"),
-            EventQueueError::Closed => write!(f, "analytics event collector shut down"),
+            EventQueueError::Closed(None) => {
+                write!(f, "analytics event collector shut down")
+            }
+            EventQueueError::Closed(Some(reason)) => {
+                write!(f, "analytics event collector shut down: {reason}")
+            }
         }
     }
 }
@@ -125,13 +130,13 @@ impl EventCollector {
     /// [`EventQueueError::Full`] when the queue is full — callers that must
     /// not drop the event should fall back to [`Self::emit`] (backpressure).
     pub fn try_emit(&self, event: AnalyticsEvent) -> std::result::Result<(), EventQueueError> {
-        let guard = self.tx.lock().expect("analytics tx mutex poisoned");
+        let guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(tx) => tx.try_send(event).map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => EventQueueError::Full,
-                mpsc::error::TrySendError::Closed(_) => EventQueueError::Closed,
+                mpsc::error::TrySendError::Closed(_) => EventQueueError::Closed(None),
             }),
-            None => Err(EventQueueError::Closed),
+            None => Err(EventQueueError::Closed(None)),
         }
     }
 
@@ -140,10 +145,13 @@ impl EventCollector {
     pub async fn emit(&self, event: AnalyticsEvent) -> std::result::Result<(), EventQueueError> {
         // Clone the sender out of the slot so the lock is not held across
         // the await; the channel itself enforces backpressure unchanged.
-        let sender = self.tx.lock().expect("analytics tx mutex poisoned").clone();
+        let sender = self.tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
         match sender {
-            Some(tx) => tx.send(event).await.map_err(|_| EventQueueError::Closed),
-            None => Err(EventQueueError::Closed),
+            Some(tx) => tx
+                .send(event)
+                .await
+                .map_err(|e| EventQueueError::Closed(Some(e.to_string()))),
+            None => Err(EventQueueError::Closed(None)),
         }
     }
 
@@ -160,7 +168,7 @@ impl EventCollector {
         // Close the sender. In-flight `emit` callers that already cloned
         // the sender may still enqueue until the channel is truly closed;
         // the writer drains everything before exiting.
-        self.tx.lock().expect("analytics tx mutex poisoned").take();
+        self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
         // Take the writer handle exactly once. The guard is held across
         // the await, so a concurrent second shutdown waits for the same
         // drain; the writer loop never acquires this lock, so this
@@ -487,11 +495,11 @@ mod tests {
         // Both handles observe the closed state afterwards.
         assert_eq!(
             collector.try_emit(success_event()),
-            Err(EventQueueError::Closed)
+            Err(EventQueueError::Closed(None))
         );
         assert_eq!(
             app_state_clone.try_emit(success_event()),
-            Err(EventQueueError::Closed)
+            Err(EventQueueError::Closed(None))
         );
     }
 

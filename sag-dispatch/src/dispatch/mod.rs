@@ -744,7 +744,8 @@ impl Drop for DispatchCancelGuard {
             targets,
         };
         let request_id = event.result.request_id;
-        let _ = crate::dispatch::stream::deliver_terminal_event(
+        // `Drop` cannot await; detached path logs enqueue failure + panics.
+        crate::dispatch::stream::deliver_terminal_event_detached(
             analytics.event_collector.clone(),
             event,
         );

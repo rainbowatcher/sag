@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::GatewayConfig;
 use crate::loader::handle::ConfigHandle;
@@ -161,6 +161,95 @@ async fn reload_once(
     }
 }
 
+/// Outcome of consuming one watcher-channel message: keep looping or exit.
+enum LoopAction {
+    Continue,
+    Exit,
+}
+
+/// Classify a watcher-channel message: update `last_event` on relevant
+/// config events, log watcher errors, and signal exit when the channel closes.
+fn classify_watcher_event(
+    event_res: Option<Result<Event, notify::Error>>,
+    path: &Path,
+    last_event: &mut Option<tokio::time::Instant>,
+) -> LoopAction {
+    match event_res {
+        Some(Ok(event)) => {
+            if event_targets_config(&event, path) {
+                // Trailing debounce: every relevant event pushes the reload
+                // deadline out so we never read an intermediate version.
+                *last_event = Some(tokio::time::Instant::now());
+            }
+            LoopAction::Continue
+        }
+        Some(Err(e)) => {
+            error!("file watcher error: {e}");
+            LoopAction::Continue
+        }
+        None => {
+            // All senders dropped - watcher was destroyed.
+            info!("file watcher channel closed, exiting");
+            LoopAction::Exit
+        }
+    }
+}
+
+/// Debounce-tick body: once the file has been quiet for `DEBOUNCE`, settle,
+/// drain/rearm on straggler events, then reload with bounded retries.
+/// Returns early (no-op) while the debounce window is still open.
+async fn try_debounced_reload(
+    last_event: &mut Option<tokio::time::Instant>,
+    rx: &mut tokio::sync::mpsc::Receiver<Result<Event, notify::Error>>,
+    handler: &Option<Arc<dyn ConfigReloadHandler>>,
+    inner: &Arc<RwLock<GatewayConfig>>,
+    routes_version: &Arc<AtomicU64>,
+    path: &Path,
+) {
+    let since = last_event
+        .expect("debounce arm guarded by last_event.is_some()")
+        .elapsed();
+    if since < DEBOUNCE {
+        return;
+    }
+    *last_event = None;
+
+    // Let the filesystem settle, then drain any events that arrived right
+    // at the boundary. A new relevant event during settle means the file is
+    // still being written — re-arm instead of reloading an intermediate state.
+    tokio::time::sleep(SETTLE).await;
+    let mut rearm = false;
+    while let Ok(event_res) = rx.try_recv() {
+        match event_res {
+            Ok(event) if event_targets_config(&event, path) => {
+                rearm = true;
+            }
+            Err(e) => {
+                // Must not be silently dropped, but must not re-arm either.
+                error!("file watcher error: {e}");
+            }
+            Ok(_) => {}
+        }
+    }
+    if rearm {
+        *last_event = Some(tokio::time::Instant::now());
+        return;
+    }
+
+    // Bounded retry for transient failures (truncated intermediate state,
+    // file briefly absent during an atomic replace).
+    let mut attempts = 1;
+    let mut ok = reload_once(handler, inner, routes_version, path).await;
+    while !ok && attempts <= MAX_RELOAD_RETRIES {
+        tokio::time::sleep(RETRY_DELAY).await;
+        ok = reload_once(handler, inner, routes_version, path).await;
+        attempts += 1;
+    }
+    if !ok {
+        warn!("config reload failed after {attempts} attempts; will retry on next file event");
+    }
+}
+
 /// Spawn a background task that watches the config file for changes and reloads it.
 ///
 /// If `handler` is `Some`, file events are delegated to the handler which
@@ -203,7 +292,9 @@ pub fn spawn_hot_reload(
 
         let mut watcher = match RecommendedWatcher::new(
             move |res| {
-                let _ = tx.blocking_send(res);
+                if tx.blocking_send(res).is_err() {
+                    debug!("config watcher event dropped (receiver gone or channel full)");
+                }
             },
             notify::Config::default(),
         ) {
@@ -251,78 +342,23 @@ pub fn spawn_hot_reload(
                     return;
                 }
                 event_res = rx.recv() => {
-                    match event_res {
-                        Some(Ok(event)) => {
-                            if event_targets_config(&event, &path) {
-                                // Trailing debounce: every relevant event
-                                // pushes the reload deadline out so we never
-                                // read an intermediate version of the file.
-                                last_event = Some(tokio::time::Instant::now());
-                            }
-                        }
-                        Some(Err(e)) => {
-                            error!("file watcher error: {e}");
-                        }
-                        None => {
-                            // All senders dropped - watcher was destroyed.
-                            info!("file watcher channel closed, exiting");
-                            return;
-                        }
+                    if matches!(
+                        classify_watcher_event(event_res, &path, &mut last_event),
+                        LoopAction::Exit
+                    ) {
+                        return;
                     }
                 }
                 _ = tokio::time::sleep(DEBOUNCE_TICK), if last_event.is_some() => {
-                    // A relevant event is pending; check whether the file has
-                    // been quiet long enough to reload.
-                    let since = last_event.expect("guard ensures Some").elapsed();
-                    if since < DEBOUNCE {
-                        continue;
-                    }
-                    last_event = None;
-
-                    // Let the filesystem settle, then drain any events that
-                    // arrived right at the boundary. If a new relevant event
-                    // showed up during the settle window the file is still
-                    // being written — re-arm the debounce instead of
-                    // reloading a possibly-intermediate state.
-                    tokio::time::sleep(SETTLE).await;
-                    let mut rearm = false;
-                    while let Ok(event_res) = rx.try_recv() {
-                        match event_res {
-                            Ok(event) if event_targets_config(&event, &path) => {
-                                rearm = true;
-                            }
-                            Err(e) => {
-                                // Same as the main loop: a watcher error must
-                                // not be silently dropped, but it also must
-                                // not re-arm the debounce (nothing new was
-                                // written).
-                                error!("file watcher error: {e}");
-                            }
-                            Ok(_) => {}
-                        }
-                    }
-                    if rearm {
-                        last_event = Some(tokio::time::Instant::now());
-                        continue;
-                    }
-
-                    // Reload, with a bounded retry for transient failures.
-                    // A single reload can fail if the read lands on a
-                    // truncated/invalid intermediate state (in-place editor
-                    // writes) or while the file is briefly absent during an
-                    // atomic replace; a couple of quick retries cover that.
-                    let mut attempts = 1;
-                    let mut ok = reload_once(&handler, &inner, &routes_version, &path).await;
-                    while !ok && attempts <= MAX_RELOAD_RETRIES {
-                        tokio::time::sleep(RETRY_DELAY).await;
-                        ok = reload_once(&handler, &inner, &routes_version, &path).await;
-                        attempts += 1;
-                    }
-                    if !ok {
-                        warn!(
-                            "config reload failed after {attempts} attempts; will retry on next file event"
-                        );
-                    }
+                    try_debounced_reload(
+                        &mut last_event,
+                        &mut rx,
+                        &handler,
+                        &inner,
+                        &routes_version,
+                        &path,
+                    )
+                    .await;
                 }
             }
         }

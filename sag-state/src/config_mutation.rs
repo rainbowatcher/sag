@@ -641,13 +641,12 @@ impl ConfigMutationCoordinator {
                 None => Err(AppError::NotFound(format!("provider '{name}' not found"))),
             })
             .await?;
-        // mutate returned Ok, so the closure ran and the only Ok(())
-        // path sets cascade_result.
-        Ok((
-            report,
-            cascade_result
-                .expect("mutate returned Ok so remove_provider ran and set cascade_result"),
-        ))
+        let cascade = cascade_result.ok_or_else(|| {
+            AppError::Internal(
+                "delete_provider: mutate returned Ok but cascade_result was not set".into(),
+            )
+        })?;
+        Ok((report, cascade))
     }
 
     /// Create a new route. Returns `AppError::Conflict` if a route with the

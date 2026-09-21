@@ -10,7 +10,7 @@ use sag_core::{
 use tokio::sync::mpsc;
 use tracing::{error, instrument, trace, warn};
 
-use crate::{LlmProvider, ProviderBase, drain_sse_frames};
+use crate::{LlmProvider, ProviderBase, drain_sse_frames, emit_idle_timeout};
 
 /// OpenAI-compatible provider adapter.
 ///
@@ -239,14 +239,7 @@ impl LlmProvider for OpenAiProvider {
                     }
                     Ok(None) => break,
                     Err(_elapsed) => {
-                        error!(chunk_timeout_secs = ?chunk_timeout, "stream chunk idle timeout");
-                        if !tx.is_closed() {
-                            let _ = tx.send(StreamChunk::Error(format!(
-                                "stream chunk idle timeout after {}s",
-                                chunk_timeout.unwrap().as_secs()
-                            )));
-                        }
-                        had_error = true;
+                        had_error = emit_idle_timeout(&tx, "openai", &chunk_timeout);
                         break;
                     }
                 }

@@ -572,7 +572,7 @@ struct ThresholdWatcherHandle {
 
 impl ThresholdWatcherHandle {
     /// Signal the watcher to shut down and wait up to 5s for it to exit.
-    /// Unlike [`HotReloadHandle::shutdown`] this task owns no OS file-watch
+    /// Unlike [`sag_config::HotReloadHandle::shutdown`] this task owns no OS file-watch
     /// threads, so the 5s timeout is purely a safety bound against a poll
     /// that happens to be mid-sleep.
     async fn shutdown(self) {
@@ -586,13 +586,13 @@ impl ThresholdWatcherHandle {
 }
 
 /// Interval between rollup scheduler cycles: one compute run per hour
-/// (spec: 每小时执行一轮). Combined with [`MissedTickBehavior::Skip`], a
+/// (spec: 每小时执行一轮). Combined with [`tokio::time::MissedTickBehavior::Skip`], a
 /// cycle that overruns its hour delays the next run instead of bursting
 /// into catch-up runs — the engine's lease-based claim is safe only for a
 /// single worker, and one run per hour is the contract.
 const ROLLUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Registration lookback for [`RollupEngine::register_missing_hours`]: each
+/// Registration lookback for [`sag_analytics::RollupEngine::register_missing_hours`]: each
 /// cycle scans facts in `[now - window, now)` and registers the hours that
 /// need rollup as `pending` (missing / dirty / failed / expired-lease). The
 /// window bounds the scan cost (index-backed distinct on `completed_at`);

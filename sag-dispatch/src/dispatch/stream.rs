@@ -12,7 +12,6 @@ use sag_core::{
     TargetStatus, Usage,
 };
 use std::sync::Mutex;
-use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::state::AppState;
@@ -140,12 +139,10 @@ fn terminal_event(
 ///    off-runtime) — warn and retry `try_emit` once; the writer may have
 ///    freed a slot in the meantime.
 ///
-/// Returns the spawned task's join handle when one was spawned, so the
-/// body-future terminal can await it: a *normal* completion then also
-/// guarantees the event is enqueued before the response body ends (fully
-/// drained by shutdown), while cancelling that await (body drop) cannot
-/// cancel the task itself. The drop guard — `Drop` cannot await — ignores
-/// the returned handle and the task runs detached.
+/// Returns the spawned backpressure task's join handle when one was
+/// spawned, so awaitable call sites can bind normal completion to the
+/// enqueue. [`deliver_terminal_event_detached`] covers `Drop` (cannot
+/// await) and logs task panics.
 ///
 /// `pub(crate)`: also used by the dispatch-level `DispatchCancelGuard`
 /// (the client-disconnect terminal of the dispatch loop) to deliver the
@@ -154,12 +151,12 @@ fn terminal_event(
 pub(crate) fn deliver_terminal_event(
     collector: Arc<EventCollector>,
     event: sag_analytics::AnalyticsEvent,
-) -> Option<JoinHandle<()>> {
+) -> Option<tokio::task::JoinHandle<()>> {
     let request_id = event.result.request_id;
     let status = event.result.final_status;
     match collector.try_emit(event.clone()) {
         Ok(()) => None,
-        Err(EventQueueError::Closed) => {
+        Err(EventQueueError::Closed(_)) => {
             warn!(
                 request_id = %request_id,
                 status = ?status,
@@ -168,7 +165,7 @@ pub(crate) fn deliver_terminal_event(
             None
         }
         Err(EventQueueError::Full) => match tokio::runtime::Handle::try_current() {
-            Ok(handle) => Some(handle.spawn(async move {
+            Ok(rt) => Some(rt.spawn(async move {
                 if let Err(e) = collector.emit(event).await {
                     warn!(
                         request_id = %request_id,
@@ -195,6 +192,25 @@ pub(crate) fn deliver_terminal_event(
                 None
             }
         },
+    }
+}
+
+/// Fire-and-forget delivery for contexts that cannot await (`Drop`).
+/// Enqueue failures are logged by [`deliver_terminal_event`]; panics in
+/// an already-spawned backpressure task are logged here via a supervisor.
+pub(crate) fn deliver_terminal_event_detached(
+    collector: Arc<EventCollector>,
+    event: sag_analytics::AnalyticsEvent,
+) {
+    let Some(handle) = deliver_terminal_event(collector, event) else {
+        return;
+    };
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move {
+            if let Err(e) = handle.await {
+                warn!(error = ?e, "analytics terminal delivery task panicked");
+            }
+        });
     }
 }
 
@@ -277,11 +293,8 @@ impl Drop for TerminalGuard {
             target_reason,
         );
         // Same decoupled delivery as the normal terminal. `Drop` cannot
-        // await, so the queue-full path runs its backpressured `emit` in a
-        // detached task (the join handle is ignored — the task is
-        // independent); the common fast path enqueues synchronously and is
-        // fully drained by shutdown.
-        let _ = deliver_terminal_event(self.analytics.event_collector.clone(), event);
+        // await, so use the detached path (logs enqueue failure + panics).
+        deliver_terminal_event_detached(self.analytics.event_collector.clone(), event);
 
         // The client-disconnect terminal ALSO writes a `call_logs` row so the
         // request is visible in the admin logs list (`GET /api/logs` reads
@@ -618,20 +631,17 @@ async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
         target_status,
         target_reason,
     );
-    // Deliver the terminal outside this body future's
-    // cancellation scope: dropping the body while the
-    // queue is full must not cancel the enqueue — the
-    // drop guard skips (the claim above), so this is the
-    // only delivery for the normal terminal. The fast
-    // path enqueues synchronously; under backpressure a
-    // detached task owns the backpressured `emit`.
-    // Awaiting the task here only binds a *normal*
-    // completion to the enqueue — the event is in the
-    // channel before the body ends, hence drained by
-    // shutdown; cancelling this await (body drop) cannot
-    // cancel the task.
-    if let Some(task) = deliver_terminal_event(state.analytics.event_collector.clone(), event) {
-        let _ = task.await;
+    // Deliver the terminal outside this body future's cancellation
+    // scope: dropping the body while the queue is full must not cancel
+    // the enqueue — the drop guard skips (the claim above), so this is
+    // the only delivery for the normal terminal. The fast path enqueues
+    // synchronously; under backpressure awaiting the task binds a normal
+    // completion to the enqueue (event is in the channel before the body
+    // ends). Cancelling that await (body drop) cannot cancel the task.
+    if let Some(task) = deliver_terminal_event(state.analytics.event_collector.clone(), event)
+        && let Err(e) = task.await
+    {
+        warn!(error = ?e, "analytics terminal delivery task panicked");
     }
 }
 

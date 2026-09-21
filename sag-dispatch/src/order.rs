@@ -42,95 +42,16 @@ pub async fn order_targets(
 ) -> (Vec<RouteTarget>, sag_state::StickyToken) {
     match strategy {
         Strategy::StickyFailover => {
-            let targets_changed = {
-                let guard = fill_first_orders.read().await;
-                if let Some(cached) = guard.get(model_name) {
-                    !targets_match(&targets, &cached.targets)
-                } else {
-                    false
-                }
-            };
-            if targets_changed {
-                let mut active = active_targets.write().await;
-                // The version check must hold *together with* the clear
-                // decision: only a request at least as new as the cached
-                // entry may invalidate the shared order — and with it the
-                // active pin a newer config may have recorded. The cache is
-                // re-checked under the active write lock so a cache entry
-                // written (and pin recorded) between the read above and this
-                // clear can never be clobbered by a stale request. A stale
-                // request (routes_version < cache version) falls through
-                // without clearing: the shared cache/active state belongs to
-                // the newer config.
-                let clear_gate = fill_first_orders
-                    .read()
-                    .await
-                    .get(model_name)
-                    .is_some_and(|cached| routes_version >= cached.routes_version.unwrap_or(0));
-                if clear_gate {
-                    active.clear(model_name);
-                }
-            }
-
-            // Capture the sticky decision state (entry + generation + epoch)
-            // at the linearization point — *before* the async shuffle
-            // below. A clear (DELETE / breaker close / targets-changed /
-            // prune) that lands during `order_fill_first` must fail the
-            // eventual writeback, so the token has to be captured here,
-            // never after the await. The snapshot doubles as the decision
-            // input, so the returned token always represents the state this
-            // order used.
-            let sticky = {
-                let active = active_targets.read().await;
-                (
-                    active.get(model_name).cloned(),
-                    active.generation(model_name),
-                    active.epoch(),
-                )
-            };
-
-            let mut shuffled = order_fill_first(
+            order_sticky_failover(
                 targets,
                 model_name,
                 fill_first_orders,
+                active_targets,
                 shuffle_cache_ttl_secs,
-                Instant::now(),
+                sticky_failover_reset_secs,
                 routes_version,
             )
-            .await;
-
-            if let Some(entry) = &sticky.0 {
-                let expired = sticky_failover_reset_secs > 0
-                    && entry.recorded_at.elapsed().as_secs() >= sticky_failover_reset_secs;
-                if expired {
-                    // 过期：不做任何事，自然 fall through 到 fill-first 顺序。
-                    // 不在此处删除 entry——避免 read-then-write 竞态；
-                    // stale entry 下次成功调度时会被 insert 覆盖。
-                    tracing::debug!(
-                        model = %model_name,
-                        sticky_failover_reset_secs,
-                        "sticky-failover active target expired, using fill-first order"
-                    );
-                } else if let Some(idx) = shuffled.iter().position(|t| {
-                    // Target identity is provider + the target's *original*
-                    // `real_model` spec, not the effective real model: a
-                    // passthrough target (`None`) and an explicit target
-                    // (`Some(rm)`) on the same provider can both resolve to
-                    // the same effective real model, and must not be
-                    // treated as the same sticky target. The effective-model
-                    // comparison stays as a cross-check.
-                    t.provider == entry.provider
-                        && t.real_model == entry.target_real_model
-                        && t.real_model.as_deref().unwrap_or(model_name) == entry.real_model
-                }) {
-                    let active_target = shuffled.remove(idx);
-                    shuffled.insert(0, active_target);
-                }
-            }
-            (
-                shuffled,
-                sag_state::StickyToken::new(sticky.2, sticky.1, routes_version),
-            )
+            .await
         }
         Strategy::FillFirst => {
             let ordered = order_fill_first(
@@ -150,6 +71,152 @@ pub async fn order_targets(
             let ordered = order_round_robin(targets, model_name, counters).await;
             (ordered, sag_state::StickyToken::new(0, 0, routes_version))
         }
+    }
+}
+
+/// Sticky-failover branch of [`order_targets`]: clear a stale shared
+/// order/pin when the route's targets changed, capture the sticky
+/// decision state at its linearization point, shuffle (fill-first), then
+/// hoist the pinned target to the front when it is still present and
+/// unexpired. Returns the ordered targets plus the [`StickyToken`]
+/// captured at the decision point (see [`order_targets`] for what each
+/// component blocks).
+#[allow(clippy::too_many_arguments)]
+async fn order_sticky_failover(
+    targets: Vec<RouteTarget>,
+    model_name: &str,
+    fill_first_orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
+    active_targets: &sag_state::ActiveTargets,
+    shuffle_cache_ttl_secs: u64,
+    sticky_failover_reset_secs: u64,
+    routes_version: u64,
+) -> (Vec<RouteTarget>, sag_state::StickyToken) {
+    clear_stale_order_if_targets_changed(
+        &targets,
+        model_name,
+        fill_first_orders,
+        active_targets,
+        routes_version,
+    )
+    .await;
+
+    // Capture the sticky decision state (entry + generation + epoch)
+    // at the linearization point — *before* the async shuffle
+    // below. A clear (DELETE / breaker close / targets-changed /
+    // prune) that lands during `order_fill_first` must fail the
+    // eventual writeback, so the token has to be captured here,
+    // never after the await. The snapshot doubles as the decision
+    // input, so the returned token always represents the state this
+    // order used.
+    let sticky = {
+        let active = active_targets.read().await;
+        (
+            active.get(model_name).cloned(),
+            active.generation(model_name),
+            active.epoch(),
+        )
+    };
+
+    let mut shuffled = order_fill_first(
+        targets,
+        model_name,
+        fill_first_orders,
+        shuffle_cache_ttl_secs,
+        Instant::now(),
+        routes_version,
+    )
+    .await;
+
+    if let Some(entry) = &sticky.0 {
+        prepend_sticky_target(&mut shuffled, entry, model_name, sticky_failover_reset_secs);
+    }
+    (
+        shuffled,
+        sag_state::StickyToken::new(sticky.2, sticky.1, routes_version),
+    )
+}
+
+/// When the route's targets changed since the cached shuffle was built
+/// (config reload), clear the shared order — and with it the active pin
+/// — but only when this request is at least as new as the cache entry.
+///
+/// The version check must hold *together with* the clear decision: only a
+/// request at least as new as the cached entry may invalidate the shared
+/// order — and with it the active pin a newer config may have recorded.
+/// The cache is re-checked under the active write lock so a cache entry
+/// written (and pin recorded) between the read above and this clear can
+/// never be clobbered by a stale request. A stale request
+/// (routes_version < cache version) falls through without clearing: the
+/// shared cache/active state belongs to the newer config.
+async fn clear_stale_order_if_targets_changed(
+    targets: &[RouteTarget],
+    model_name: &str,
+    fill_first_orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
+    active_targets: &sag_state::ActiveTargets,
+    routes_version: u64,
+) {
+    let targets_changed = {
+        let guard = fill_first_orders.read().await;
+        if let Some(cached) = guard.get(model_name) {
+            !targets_match(targets, &cached.targets)
+        } else {
+            false
+        }
+    };
+    if !targets_changed {
+        return;
+    }
+    let mut active = active_targets.write().await;
+    let clear_gate = fill_first_orders
+        .read()
+        .await
+        .get(model_name)
+        .is_some_and(|cached| routes_version >= cached.routes_version.unwrap_or(0));
+    if clear_gate {
+        active.clear(model_name);
+    }
+}
+
+/// Hoist the sticky-pinned target to the front of the shuffled order,
+/// when the pin is present in `shuffled` and not expired. An expired or
+/// absent pin falls through to the fill-first order.
+///
+/// Target identity is provider + the target's *original* `real_model`
+/// spec, not the effective real model: a passthrough target (`None`) and
+/// an explicit target (`Some(rm)`) on the same provider can both resolve
+/// to the same effective real model, and must not be treated as the same
+/// sticky target. The effective-model comparison stays as a cross-check.
+///
+/// Expiry: with `sticky_failover_reset_secs > 0` and the entry older
+/// than that window, do nothing (fall through to fill-first order). The
+/// stale entry is *not* deleted here — that would be a read-then-write
+/// race; the next successful schedule overwrites it via `insert`.
+fn prepend_sticky_target(
+    shuffled: &mut Vec<RouteTarget>,
+    entry: &sag_state::ActiveTargetEntry,
+    model_name: &str,
+    sticky_failover_reset_secs: u64,
+) {
+    let expired = sticky_failover_reset_secs > 0
+        && entry.recorded_at.elapsed().as_secs() >= sticky_failover_reset_secs;
+    if expired {
+        // 过期：不做任何事，自然 fall through 到 fill-first 顺序。
+        // 不在此处删除 entry——避免 read-then-write 竞态；
+        // stale entry 下次成功调度时会被 insert 覆盖。
+        tracing::debug!(
+            model = %model_name,
+            sticky_failover_reset_secs,
+            "sticky-failover active target expired, using fill-first order"
+        );
+        return;
+    }
+    if let Some(idx) = shuffled.iter().position(|t| {
+        t.provider == entry.provider
+            && t.real_model == entry.target_real_model
+            && t.real_model.as_deref().unwrap_or(model_name) == entry.real_model
+    }) {
+        let active_target = shuffled.remove(idx);
+        shuffled.insert(0, active_target);
     }
 }
 
@@ -495,6 +562,90 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn active_map() -> sag_state::ActiveTargets {
         Arc::new(RwLock::new(sag_state::ActiveTargetsInner::new()))
+    }
+
+    #[test]
+    fn prepend_sticky_target_hoists_matching_pin_to_front() {
+        let mut shuffled = vec![target("a", 0), target("b", 0), target("c", 0)];
+        let entry = sag_state::ActiveTargetEntry::new("b", "model", "model", None, Instant::now());
+
+        prepend_sticky_target(&mut shuffled, &entry, "model", 0);
+
+        assert_eq!(shuffled[0].provider, "b");
+        assert_eq!(shuffled.len(), 3);
+    }
+
+    #[test]
+    fn prepend_sticky_target_identity_uses_original_real_model_spec() {
+        // A passthrough pin (`target_real_model: None`) must NOT hoist an
+        // explicit-spec target (`Some("model")`) even though both resolve
+        // to the same effective real model.
+        let mut shuffled = vec![
+            target("b", 0),
+            RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("model".into()),
+                priority: 0,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+            },
+        ];
+        let entry =
+            sag_state::ActiveTargetEntry::new("openai", "model", "model", None, Instant::now());
+
+        prepend_sticky_target(&mut shuffled, &entry, "model", 0);
+
+        assert_eq!(
+            shuffled[0].provider, "b",
+            "passthrough pin must not hoist the explicit-spec target"
+        );
+    }
+
+    #[test]
+    fn prepend_sticky_target_expired_pin_falls_through() {
+        let mut shuffled = vec![target("a", 0), target("b", 0)];
+        let entry = sag_state::ActiveTargetEntry::new(
+            "b",
+            "model",
+            "model",
+            None,
+            Instant::now() - std::time::Duration::from_secs(7200),
+        );
+
+        prepend_sticky_target(&mut shuffled, &entry, "model", 3600);
+
+        assert_eq!(
+            shuffled[0].provider, "a",
+            "expired pin must not alter the order"
+        );
+    }
+
+    #[test]
+    fn prepend_sticky_target_zero_ttl_never_expires() {
+        let mut shuffled = vec![target("a", 0), target("b", 0)];
+        let entry = sag_state::ActiveTargetEntry::new(
+            "b",
+            "model",
+            "model",
+            None,
+            Instant::now() - std::time::Duration::from_secs(7200),
+        );
+
+        prepend_sticky_target(&mut shuffled, &entry, "model", 0);
+
+        assert_eq!(shuffled[0].provider, "b", "ttl=0 means never expire");
+    }
+
+    #[test]
+    fn prepend_sticky_target_absent_pin_is_noop() {
+        let mut shuffled = vec![target("a", 0), target("b", 0)];
+        let entry = sag_state::ActiveTargetEntry::new("z", "model", "model", None, Instant::now());
+
+        prepend_sticky_target(&mut shuffled, &entry, "model", 3600);
+
+        assert_eq!(shuffled[0].provider, "a");
+        assert_eq!(shuffled.len(), 2);
     }
 
     #[tokio::test]

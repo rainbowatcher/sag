@@ -18,6 +18,12 @@ use tracing::{error, instrument};
 
 use sag_state::AppState;
 
+/// Maximum page size we will return regardless of what the caller asks
+/// for. Re-exported from `sag-analytics` (single source of truth with the
+/// store clamp) so a runaway `?limit=999999` cannot stream gigabytes into
+/// the dashboard.
+pub use sag_analytics::MAX_LOG_LIMIT;
+
 /// Query parameters accepted by `GET /api/logs`. Missing or empty
 /// values are treated as "no filter" rather than a 400.
 #[derive(Debug, serde::Deserialize)]
@@ -39,11 +45,6 @@ pub struct LogsQuery {
 fn default_log_limit() -> u64 {
     50
 }
-
-/// Maximum page size we will return regardless of what the caller asks
-/// for. Mirrors the analytics-store clamp and keeps a runaway
-/// `?limit=999999` from streaming gigabytes into the dashboard.
-pub const MAX_LOG_LIMIT: u64 = 500;
 
 fn build_filter(query: LogsQuery) -> LogFilter {
     LogFilter {
