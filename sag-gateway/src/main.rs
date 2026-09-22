@@ -35,8 +35,15 @@ async fn main() {
     // 2. Peek at the config file for logging.level and logging.format, then
     //    initialize tracing. The peek is done before full config load so the
     //    early startup log messages respect the configured level and format.
-    //    If the file can't be read or the keys are missing, defaults apply.
-    let (log_level, log_format) = sag_config::peek_logging_config(&config_path);
+    //    Missing keys use defaults; an unknown `format` value is a hard error
+    //    (same strict enum policy as the main loader).
+    let (log_level, log_format) = match sag_config::peek_logging_config(&config_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
     // Declared first in main() → dropped last by Rust's reverse drop order,
     // keeping the non-blocking writer alive through `info!("all subsystems shut down")`
     // and through the `tracing::error!` emitted when startup fails.

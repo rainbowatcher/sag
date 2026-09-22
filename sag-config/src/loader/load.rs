@@ -9,27 +9,44 @@ use crate::config::{GatewayConfig, LogFormat};
 use crate::loader::handle::ConfigHandle;
 
 /// Quickly read `logging.level` and `logging.format` from a TOML file without
-/// full config parsing. Returns `(level, format)` filled with defaults where
-/// the file can't be read or the keys are missing.
+/// full config parsing. Returns `(level, format)`.
+///
+/// - Missing `format` key or missing `[logging]` section → defaults
+///   (`level = "info"`, `format = LogFormat::default()` = Compact). The
+///   default only ever fills in *absent* keys (same semantics as the main
+///   loader's `#[serde(default)]` policy) — peek never deserializes into
+///   `LoggingConfig` itself.
+/// - `format` present but unknown (not `"compact"` / `"json"`, or not a
+///   string) → `Err(AppError::Config)`, same hard-reject policy as the main
+///   loader for typed enum values: never silently coerce to Compact.
+/// - Unreadable file / invalid TOML → defaults with an eprintln so bootstrap
+///   can still start tracing; the subsequent `load_config` surfaces the real
+///   error.
 ///
 /// This is used before tracing is initialized so that the log level and format
 /// from the config file can be applied early, without waiting for the full
 /// config load.
-pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
-    let content = match std::fs::read_to_string(path.as_ref()) {
+pub fn peek_logging_config(
+    path: impl AsRef<Path>,
+) -> Result<(String, LogFormat), sag_core::AppError> {
+    let path = path.as_ref();
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
                 "[sag] failed to read config file '{}' for logging peek: {e}",
-                path.as_ref().display()
+                path.display()
             );
-            return ("info".into(), LogFormat::default());
+            return Ok(("info".into(), LogFormat::default()));
         }
     };
+    // `format` is read as `toml::Value` (not `String`) so a non-string value
+    // reaches the hard-reject below instead of failing the whole ConfigPeek
+    // and falling into the "TOML failed → bootstrap default" branch.
     #[derive(serde::Deserialize)]
     struct LoggingPeek {
         level: Option<String>,
-        format: Option<String>,
+        format: Option<toml::Value>,
     }
     #[derive(serde::Deserialize)]
     struct ConfigPeek {
@@ -40,9 +57,9 @@ pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
         Err(e) => {
             eprintln!(
                 "[sag] failed to parse config file '{}' as TOML for logging peek: {e}",
-                path.as_ref().display()
+                path.display()
             );
-            return ("info".into(), LogFormat::default());
+            return Ok(("info".into(), LogFormat::default()));
         }
     };
     let logging = match config.logging {
@@ -50,17 +67,30 @@ pub fn peek_logging_config(path: impl AsRef<Path>) -> (String, LogFormat) {
         None => {
             eprintln!(
                 "[sag] no [logging] section found in config file '{}', using defaults",
-                path.as_ref().display()
+                path.display()
             );
-            return ("info".into(), LogFormat::default());
+            return Ok(("info".into(), LogFormat::default()));
         }
     };
     let level = logging.level.unwrap_or_else(|| "info".into());
-    let format = match logging.format.as_deref() {
-        Some("json") => LogFormat::Json,
-        _ => LogFormat::Compact,
+    let format = match logging.format {
+        None => LogFormat::default(),
+        Some(toml::Value::String(s)) => match s.as_str() {
+            "compact" => LogFormat::Compact,
+            "json" => LogFormat::Json,
+            other => {
+                return Err(sag_core::AppError::Config(format!(
+                    "invalid logging.format '{other}': expected \"compact\" or \"json\""
+                )));
+            }
+        },
+        Some(other) => {
+            return Err(sag_core::AppError::Config(format!(
+                "invalid logging.format: expected string, got {other}"
+            )));
+        }
     };
-    (level, format)
+    Ok((level, format))
 }
 
 /// Parse a TOML document into `T`, returning the typed value plus the dotted
@@ -192,6 +222,84 @@ api_keys = ["sk-test"]
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("failed to parse config"));
+    }
+
+    // ── peek_logging_config: format enum strictness ──
+    //
+    // Missing key / missing [logging] → default Compact (serde `#[default]`
+    // serves absence only). Present-but-unknown format value → hard reject,
+    // matching the main loader's typed-enum policy. Unreadable file / invalid
+    // TOML still return Ok defaults for bootstrap resilience.
+
+    #[test]
+    fn peek_missing_format_defaults_to_compact() {
+        let path = temp_toml("[logging]\nlevel = \"debug\"\n");
+        let (level, format) = peek_logging_config(&path).unwrap();
+        assert_eq!(level, "debug");
+        assert_eq!(format, LogFormat::default());
+    }
+
+    #[test]
+    fn peek_valid_format_values_parse() {
+        for (value, expected) in [("compact", LogFormat::Compact), ("json", LogFormat::Json)] {
+            let path = temp_toml(&format!("[logging]\nformat = \"{value}\"\n"));
+            let (level, format) = peek_logging_config(&path).unwrap();
+            assert_eq!(format, expected, "format = \"{value}\"");
+            assert_eq!(level, "info");
+        }
+    }
+
+    #[test]
+    fn peek_unknown_format_values_hard_reject() {
+        for bad in [
+            r#""pretty""#,
+            r#""JSON""#,
+            r#""""#,
+            "42",
+            "true",
+            // Non-string illegal types: array and table.
+            r#"["json"]"#,
+            "{ a = 1 }",
+        ] {
+            let path = temp_toml(&format!("[logging]\nformat = {bad}\n"));
+            let err = match peek_logging_config(&path) {
+                Err(e) => e,
+                Ok(v) => panic!("format = {bad} must hard-reject, got: {v:?}"),
+            };
+            assert!(
+                matches!(err, sag_core::AppError::Config(_)),
+                "format = {bad} must be AppError::Config, got: {err:?}"
+            );
+            if bad == r#""pretty""# {
+                assert!(
+                    err.to_string().contains("logging.format"),
+                    "pretty error must mention logging.format, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn peek_no_logging_section_returns_ok_default() {
+        let path = temp_toml("[server]\nport = 9090\n");
+        let (level, format) = peek_logging_config(&path).unwrap();
+        assert_eq!(level, "info");
+        assert_eq!(format, LogFormat::default());
+    }
+
+    #[test]
+    fn peek_unreadable_file_returns_ok_default() {
+        let (level, format) = peek_logging_config("/tmp/does-not-exist-sag-peek.toml").unwrap();
+        assert_eq!(level, "info");
+        assert_eq!(format, LogFormat::default());
+    }
+
+    #[test]
+    fn peek_invalid_toml_returns_ok_default() {
+        let path = temp_toml("this is not valid toml {{{ ");
+        let (level, format) = peek_logging_config(&path).unwrap();
+        assert_eq!(level, "info");
+        assert_eq!(format, LogFormat::default());
     }
 
     #[test]
