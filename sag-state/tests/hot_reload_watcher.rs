@@ -178,7 +178,7 @@ async fn external_edit_reloaded_then_ui_mutation_succeeds() {
     let handler: Arc<dyn sag_config::ConfigReloadHandler> = Arc::new(CoordHandler {
         coordinator: coord.clone(),
     });
-    let watcher = sag_config::spawn_hot_reload(handle.clone(), Some(handler));
+    let watcher = sag_config::spawn_hot_reload(handle.clone(), handler);
 
     // External edit: the user manually adds `enabled_models = ["gpt-4"]` to
     // provider `p1` in the file. SAG must detect and reload it.
@@ -225,7 +225,7 @@ async fn atomic_replace_burst_reloads_final_version() {
     let handler: Arc<dyn sag_config::ConfigReloadHandler> = Arc::new(CoordHandler {
         coordinator: coord.clone(),
     });
-    let watcher = sag_config::spawn_hot_reload(handle.clone(), Some(handler));
+    let watcher = sag_config::spawn_hot_reload(handle.clone(), handler);
 
     // Two consecutive atomic temp-file + rename saves in a burst — exactly
     // what SAG's own persistence (`save_config_to_file`) does. The watcher
@@ -321,7 +321,7 @@ async fn sag_own_persist_reloaded_without_false_conflict() {
     let handler: Arc<dyn sag_config::ConfigReloadHandler> = Arc::new(CoordHandler {
         coordinator: coord.clone(),
     });
-    let watcher = sag_config::spawn_hot_reload(handle.clone(), Some(handler));
+    let watcher = sag_config::spawn_hot_reload(handle.clone(), handler);
 
     // Ensure the watcher has registered its watches before the admin
     // mutation, so the mutation's own atomic save is observed. A benign

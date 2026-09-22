@@ -145,7 +145,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         runtime: dispatch_runtime.clone(),
         config: config_handle.clone(),
     });
-    let hot_reload_handle = sag_config::spawn_hot_reload(config_handle.clone(), Some(handler));
+    let hot_reload_handle = sag_config::spawn_hot_reload(config_handle.clone(), handler);
 
     // 10. Spawn a watcher that recomputes the stale-probe threshold whenever
     //     the config changes (hot-reload of `gateway.toml` or admin API

@@ -1,15 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::config::GatewayConfig;
 use crate::loader::handle::ConfigHandle;
-use crate::loader::load::reload_config;
 
 /// Trailing-debounce window: a reload is triggered only after the config file
 /// has been quiet for this long. Trailing (not leading) — every relevant
@@ -41,10 +37,6 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 /// handler. This lets the gateway coordinate config reload with the
 /// provider-registry sync (see `ConfigMutationCoordinator` in `sag-state`)
 /// without `sag-config` depending on `sag-state` or `sag-providers`.
-///
-/// When `None` is passed to `spawn_hot_reload`, the watcher falls back to
-/// the legacy behavior of replacing only the in-memory config and bumping
-/// `routes_version`.
 #[async_trait::async_trait]
 pub trait ConfigReloadHandler: Send + Sync {
     /// Re-read, validate, and atomically publish the config at `path`.
@@ -119,44 +111,20 @@ fn event_targets_config(event: &Event, config_path: &Path) -> bool {
         .any(|p| p == config_path || (file_name.is_some() && p.file_name() == file_name))
 }
 
-/// Perform a single reload of the config at `path`, delegating to the
-/// handler when present (coordinated reload: re-read + validate + atomic
-/// publication of config, provider registry, and version bump) or falling
-/// back to the legacy in-place config swap. Returns `true` on success.
-async fn reload_once(
-    handler: &Option<Arc<dyn ConfigReloadHandler>>,
-    inner: &Arc<RwLock<GatewayConfig>>,
-    routes_version: &Arc<AtomicU64>,
-    path: &Path,
-) -> bool {
-    if let Some(handler) = handler {
-        // Delegated reload: handler owns re-read, validation, and atomic
-        // publication of config + provider registry + version.
-        match handler.reload_from_path(path).await {
-            Ok(()) => {
-                info!("configuration hot-reloaded");
-                true
-            }
-            Err(e) => {
-                warn!("failed to reload config: {e}");
-                false
-            }
+/// Perform a single reload of the config at `path` via the handler
+/// (coordinated reload: re-read + validate + atomic publication of config,
+/// provider registry, and version bump). Returns `true` on success.
+async fn reload_once(handler: &Arc<dyn ConfigReloadHandler>, path: &Path) -> bool {
+    // Delegated reload: handler owns re-read, validation, and atomic
+    // publication of config + provider registry + version.
+    match handler.reload_from_path(path).await {
+        Ok(()) => {
+            info!("configuration hot-reloaded");
+            true
         }
-    } else {
-        // Legacy config-only reload (backward compat, tests, and in-memory
-        // scenarios that still have a file path).
-        match reload_config(path).await {
-            Ok(new_config) => {
-                let mut guard = inner.write().await;
-                *guard = new_config;
-                routes_version.fetch_add(1, Ordering::Release);
-                info!("configuration hot-reloaded");
-                true
-            }
-            Err(e) => {
-                warn!("failed to reload config: {e}");
-                false
-            }
+        Err(e) => {
+            warn!("failed to reload config: {e}");
+            false
         }
     }
 }
@@ -201,9 +169,7 @@ fn classify_watcher_event(
 async fn try_debounced_reload(
     last_event: &mut Option<tokio::time::Instant>,
     rx: &mut tokio::sync::mpsc::Receiver<Result<Event, notify::Error>>,
-    handler: &Option<Arc<dyn ConfigReloadHandler>>,
-    inner: &Arc<RwLock<GatewayConfig>>,
-    routes_version: &Arc<AtomicU64>,
+    handler: &Arc<dyn ConfigReloadHandler>,
     path: &Path,
 ) {
     let since = last_event
@@ -239,10 +205,10 @@ async fn try_debounced_reload(
     // Bounded retry for transient failures (truncated intermediate state,
     // file briefly absent during an atomic replace).
     let mut attempts = 1;
-    let mut ok = reload_once(handler, inner, routes_version, path).await;
+    let mut ok = reload_once(handler, path).await;
     while !ok && attempts <= MAX_RELOAD_RETRIES {
         tokio::time::sleep(RETRY_DELAY).await;
-        ok = reload_once(handler, inner, routes_version, path).await;
+        ok = reload_once(handler, path).await;
         attempts += 1;
     }
     if !ok {
@@ -252,10 +218,8 @@ async fn try_debounced_reload(
 
 /// Spawn a background task that watches the config file for changes and reloads it.
 ///
-/// If `handler` is `Some`, file events are delegated to the handler which
-/// owns the full reload protocol (re-read, validate, publish config + registry).
-/// If `handler` is `None`, the watcher falls back to legacy config-only reload
-/// (replaces the in-memory `GatewayConfig` and bumps `routes_version`).
+/// File events are delegated to `handler`, which owns the full reload
+/// protocol (re-read, validate, publish config + provider registry + version).
 ///
 /// The returned handle will reflect the latest config. If `handle` is in-memory
 /// (no associated file path), the watcher task exits immediately.
@@ -274,11 +238,9 @@ async fn try_debounced_reload(
 ///   times before the watcher waits for the next file event.
 pub fn spawn_hot_reload(
     handle: ConfigHandle,
-    handler: Option<Arc<dyn ConfigReloadHandler>>,
+    handler: Arc<dyn ConfigReloadHandler>,
 ) -> HotReloadHandle {
-    let inner = handle.inner.clone();
     let path = handle.config_path.clone();
-    let routes_version = handle.routes_version.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let task = tokio::spawn(async move {
@@ -354,8 +316,6 @@ pub fn spawn_hot_reload(
                         &mut last_event,
                         &mut rx,
                         &handler,
-                        &inner,
-                        &routes_version,
                         &path,
                     )
                     .await;

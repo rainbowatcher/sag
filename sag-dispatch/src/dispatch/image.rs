@@ -1303,7 +1303,6 @@ mod tests {
             n: Some(2),
             stream: None,
             stop: None,
-            max_tokens: None,
             presence_penalty: None,
             frequency_penalty: None,
             logit_bias: None,
@@ -1321,7 +1320,6 @@ mod tests {
             seed: None,
             logprobs: None,
             top_logprobs: None,
-            user: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
             safety_identifier: None,
@@ -1330,8 +1328,6 @@ mod tests {
             verbosity: None,
             moderation: None,
             web_search_options: None,
-            function_call: None,
-            functions: None,
             extra: serde_json::Map::new(),
         };
 
@@ -1484,7 +1480,6 @@ mod tests {
             n: None,
             stream: None,
             stop: None,
-            max_tokens: None,
             presence_penalty: None,
             frequency_penalty: None,
             logit_bias: None,
@@ -1502,7 +1497,6 @@ mod tests {
             seed: None,
             logprobs: None,
             top_logprobs: None,
-            user: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
             safety_identifier: None,
@@ -1511,8 +1505,6 @@ mod tests {
             verbosity: None,
             moderation: None,
             web_search_options: None,
-            function_call: None,
-            functions: None,
             extra,
         };
 

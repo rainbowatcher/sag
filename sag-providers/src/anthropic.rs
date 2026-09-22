@@ -562,7 +562,16 @@ impl AnthropicProvider {
             })
             .collect();
 
-        let max_tokens = request.max_tokens.unwrap_or(1024);
+        let max_tokens = request
+            .max_completion_tokens
+            .or_else(|| {
+                request
+                    .extra
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u32::try_from(v).ok())
+            })
+            .unwrap_or(1024);
 
         let stop_sequences = request.stop.clone().map(|s| s.into_vec());
 
@@ -1368,6 +1377,8 @@ mod tests {
     // ── to_anthropic_request thinking integration tests ────────────
 
     fn req_with_reasoning(effort: &str, max_tokens: u32) -> ChatCompletionRequest {
+        let mut extra = serde_json::Map::new();
+        extra.insert("max_tokens".into(), serde_json::json!(max_tokens));
         ChatCompletionRequest {
             model: "claude-sonnet-4-20250514".into(),
             messages: vec![ChatMessage {
@@ -1376,8 +1387,8 @@ mod tests {
                 name: None,
                 extra: serde_json::Map::new(),
             }],
-            max_tokens: Some(max_tokens),
             reasoning_effort: Some(effort.to_string()),
+            extra,
             ..Default::default()
         }
     }
@@ -1402,7 +1413,10 @@ mod tests {
                 name: None,
                 extra: serde_json::Map::new(),
             }],
-            max_tokens: Some(10000),
+            extra: serde_json::Map::from_iter([(
+                "max_tokens".to_string(),
+                serde_json::json!(10000),
+            )]),
             ..Default::default()
         };
         let anthropic_req =
@@ -1420,7 +1434,7 @@ mod tests {
 
     #[test]
     fn to_anthropic_request_no_thinking_when_downgraded_out() {
-        // default max_tokens=1024 → nothing fits
+        // max_tokens=1024 (same as default) → high budget does not fit
         let req = req_with_reasoning("high", 1024);
         let anthropic_req =
             AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
@@ -1433,6 +1447,76 @@ mod tests {
         let anthropic_req =
             AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
         assert!(anthropic_req.thinking.is_none());
+    }
+
+    // ── max_tokens resolution ─────────────────────────────────────
+
+    #[test]
+    fn to_anthropic_request_prefers_max_completion_tokens() {
+        let req = ChatCompletionRequest {
+            model: "claude-sonnet-4-20250514".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("hello".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            max_completion_tokens: Some(10000),
+            ..Default::default()
+        };
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        assert_eq!(anthropic_req.max_tokens, 10000);
+    }
+
+    #[test]
+    fn to_anthropic_request_max_completion_tokens_wins_over_extra_max_tokens() {
+        let req = ChatCompletionRequest {
+            model: "claude-sonnet-4-20250514".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("hello".into()),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            max_completion_tokens: Some(10000),
+            extra: serde_json::Map::from_iter([(
+                "max_tokens".to_string(),
+                serde_json::json!(2000),
+            )]),
+            ..Default::default()
+        };
+        let anthropic_req =
+            AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+        assert_eq!(anthropic_req.max_tokens, 10000);
+    }
+
+    #[test]
+    fn to_anthropic_request_dirty_extra_max_tokens_falls_back_to_default() {
+        for dirty in [
+            serde_json::json!("abc"),
+            serde_json::json!(-1),
+            serde_json::json!(12.5),
+            serde_json::json!(u64::from(u32::MAX) + 1), // 4294967296
+        ] {
+            let req = ChatCompletionRequest {
+                model: "claude-sonnet-4-20250514".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: serde_json::Value::String("hello".into()),
+                    name: None,
+                    extra: serde_json::Map::new(),
+                }],
+                extra: serde_json::Map::from_iter([("max_tokens".to_string(), dirty.clone())]),
+                ..Default::default()
+            };
+            let anthropic_req =
+                AnthropicProvider::to_anthropic_request(&req, "claude-sonnet-4-20250514", false);
+            assert_eq!(
+                anthropic_req.max_tokens, 1024,
+                "dirty max_tokens={dirty} should fall back to default"
+            );
+        }
     }
 
     #[test]

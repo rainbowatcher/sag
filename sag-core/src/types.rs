@@ -48,9 +48,6 @@ pub struct ChatCompletionRequest {
     /// Accepts either a single string or an array of strings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopSequence>,
-    /// The maximum number of tokens that can be generated (deprecated in favor of max_completion_tokens).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
     /// Number between -2.0 and 2.0. Positive values penalize tokens based on their existing frequency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
@@ -110,10 +107,6 @@ pub struct ChatCompletionRequest {
     /// An integer specifying the number of most likely tokens to return at each token position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<i64>,
-    /// A unique identifier representing your end-user (being replaced by
-    /// `safety_identifier` and `prompt_cache_key`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
     /// Used by OpenAI to cache responses for similar requests to optimize
     /// cache hit rates. Replaces `user` for caching purposes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,16 +137,12 @@ pub struct ChatCompletionRequest {
     /// Web search options for models that support the web search tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_search_options: Option<serde_json::Value>,
-    /// Deprecated in favor of `tool_choice`. Controls which (if any)
-    /// function is called by the model.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_call: Option<serde_json::Value>,
-    /// Deprecated in favor of `tools`. A list of functions the model
-    /// may generate JSON inputs for.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub functions: Option<serde_json::Value>,
     /// Catch-all for non-standard / provider-specific parameters.
     /// Filtered per-provider against supported params.
+    ///
+    /// Also holds OpenAI-deprecated fields clients may still send
+    /// (`max_tokens`, `function_call`, `functions`, `user`) so they are
+    /// carried transparently without typed support.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -624,6 +613,43 @@ mod tests {
                 .unwrap();
         req.normalize_reasoning_effort();
         assert_eq!(req.reasoning_effort.as_deref(), Some("ultra"));
+    }
+
+    // ── deprecated-field flatten passthrough tests ──────────────
+
+    #[test]
+    fn deprecated_openai_fields_land_in_extra() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 256,
+            "function_call": "auto",
+            "functions": [{"name": "f"}],
+            "user": "user-123"
+        }))
+        .unwrap();
+        assert_eq!(req.extra.get("max_tokens"), Some(&json!(256)));
+        assert_eq!(req.extra.get("function_call"), Some(&json!("auto")));
+        assert_eq!(req.extra.get("functions"), Some(&json!([{"name": "f"}])));
+        assert_eq!(req.extra.get("user"), Some(&json!("user-123")));
+    }
+
+    #[test]
+    fn deprecated_openai_fields_survive_reserialize() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "max_tokens": 256,
+            "function_call": "auto",
+            "functions": [{"name": "f"}],
+            "user": "user-123"
+        }))
+        .unwrap();
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value.get("max_tokens"), Some(&json!(256)));
+        assert_eq!(value.get("function_call"), Some(&json!("auto")));
+        assert_eq!(value.get("functions"), Some(&json!([{"name": "f"}])));
+        assert_eq!(value.get("user"), Some(&json!("user-123")));
     }
 
     // ── CallLog internal identity fields tests ──────────────────
