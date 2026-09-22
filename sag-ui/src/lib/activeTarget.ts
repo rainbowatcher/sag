@@ -1,4 +1,4 @@
-import type { ActiveTargetEntry, Strategy } from "@/types/api"
+import type { ActiveTargetEntry } from "@/types/api"
 
 /**
  * Best sticky-failover active entry for a route: prefer a live `pinned` pin
@@ -7,24 +7,16 @@ import type { ActiveTargetEntry, Strategy } from "@/types/api"
  * at once (one per request model), so a plain `find` would return an
  * arbitrary first match — this picks the most meaningful one.
  *
- * `strategy` is the route's *current* strategy (from the route config, not
- * from any entry's `strategy` field). Only `sticky_failover` routes have a
- * meaningful pin: `fill_first` and `round_robin` never write
- * `active_targets`, so a leftover pin on such a route is stale — it does not
- * reflect where traffic currently goes and must never be treated as the
- * active target (e.g. after a route switches from sticky_failover to
- * fill_first, the stale pin must not override the fill-first display).
- * Filtering by route strategy — not entry strategy — keeps this correct both
- * immediately after a strategy switch (entries still carry the old DTO) and
- * after a refresh (entries carry the new one).
+ * Only `sticky_failover` entries carry a pin (`entry.strategy` filters);
+ * `fill_first` / `round_robin` entries are never returned.
  */
 export function selectActiveTarget(
   entries: ActiveTargetEntry[],
   model: string,
-  strategy: Strategy,
 ): ActiveTargetEntry | undefined {
-  if (strategy !== "sticky_failover") return undefined
-  const candidates = entries.filter((s) => s.model === model && s.status !== "idle")
+  const candidates = entries.filter(
+    (s) => s.model === model && s.strategy === "sticky_failover" && s.status !== "idle",
+  )
   if (candidates.length === 0) return undefined
   const pinned = candidates.filter((s) => s.status === "pinned")
   const pool = pinned.length > 0 ? pinned : candidates
@@ -54,10 +46,7 @@ export function selectFillFirstTarget(
  *
  * The `/api/active-targets` DTO carries each target's 0-based `target_index`
  * in the route's priority-sorted order (priority descending, ties keep array
- * order), so the pin's rank is known directly: index 0 is the
- * highest-priority target. A missing or non-zero `target_index` (older
- * backend, malformed payload) returns `false` — the conservative choice: an
- * unverifiable pin renders orange, never green.
+ * order): index 0 is the highest-priority target.
  */
 export function isActiveFirstTarget(active: ActiveTargetEntry): boolean {
   return active.target_index === 0
@@ -68,15 +57,9 @@ export function isActiveFirstTarget(active: ActiveTargetEntry): boolean {
  * active entry. Fill-first order caches live under the route model name;
  * sticky pins under the request-model key (`entry.key`, the concrete request
  * model the pin was recorded under).
- *
- * Defensive fallback: an entry whose `key` is empty (older backend shape,
- * malformed payload) falls back to the route model name — for a wildcard
- * route that is `"*"`, which the backend resolves to "clear all concrete
- * pins of the wildcard route", so the clear still works even when the
- * concrete key is unknown. Normal (non-empty-key) semantics are unchanged.
  */
 export function clearActiveTargetModel(entry: ActiveTargetEntry, isFillFirst: boolean): string {
-  return isFillFirst ? entry.model : entry.key || entry.model
+  return isFillFirst ? entry.model : entry.key
 }
 
 /**

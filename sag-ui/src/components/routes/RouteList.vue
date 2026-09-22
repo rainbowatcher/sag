@@ -344,7 +344,7 @@ const columns = [
       const hasActive = (route: RouteConfig) => {
         const entries = activeTargetStore.targets
         return (
-          selectActiveTarget(entries, route.model_name, route.strategy) !== undefined ||
+          selectActiveTarget(entries, route.model_name) !== undefined ||
           selectFillFirstTarget(entries, route.model_name) !== undefined
         )
       }
@@ -353,7 +353,7 @@ const columns = [
     cell: (info) => {
       const model = info.row.original.model_name
       const entries = activeTargetStore.targets
-      const sticky = selectActiveTarget(entries, model, info.row.original.strategy)
+      const sticky = selectActiveTarget(entries, model)
       const fill = selectFillFirstTarget(entries, model)
       const active = sticky ?? fill
 

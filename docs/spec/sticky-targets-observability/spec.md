@@ -43,7 +43,7 @@ FillFirst 策略不写 `active_targets`，它的粘性是 `fill_first_orders` �
 - `sag-ui/src/types/api.ts` — `ActiveTargetEntry` 接口（snake_case，仿 `CircuitBreakerEntry` 风格）
 - `sag-ui/src/stores/activeTarget.ts` — Pinia store：`fetchActiveTargets` / `clearActiveTarget`，401 处理
 - `sag-ui/src/components/routes/RouteList.vue` — Routes 页表格内嵌「Active Target」列：StickyFailover 显示 pin（Active/Expired 徽标 + 清除）、FillFirst 显示当前 fill target（Fill 徽标 + 重置）；状态圆点颜色调 `activeTargetDotColor`
-- `sag-ui/src/lib/activeTarget.ts` — active-target 纯函数：`selectActiveTarget`（按 route 当前 strategy 过滤 sticky）/ `selectFillFirstTarget`（自 RouteList 内联迁移）、`isActiveFirstTarget`（按后端 `target_index == 0` 判定首 target）、`activeTargetDotColor`（统一圆点着色）
+- `sag-ui/src/lib/activeTarget.ts` — active-target 纯函数：`selectActiveTarget`（按 `entry.strategy` 过滤 sticky）/ `selectFillFirstTarget`（自 RouteList 内联迁移）、`isActiveFirstTarget`（按后端 `target_index == 0` 判定首 target）、`activeTargetDotColor`（统一圆点着色）
 - `sag-ui/src/lib/activeTarget.test.ts` — 前端边界测试（`node --experimental-strip-types` 直接运行）
 
 ## 核心设计
@@ -150,7 +150,7 @@ green。`expired` 的 amber 与 `pinned` 的 green 视觉区分度低，且颜�
 1. `fill_first`（`fill` 存在且无 sticky）→ `bg-emerald-500`（保持）
 2. 其余按首项判定分流（先判 `isActiveFirstTarget`，再按状态取色）：
    - 命中 route 最高优先级（primary）target → `expired` 用 `bg-green-500/40`（灰绿）、`pinned` 用 `bg-green-500`
-   - 非首项 / 无法确认 → `expired` 用 `bg-orange-500/40`（灰橙）、`pinned` 用 `bg-orange-500`
+   - 非首项 → `expired` 用 `bg-orange-500/40`（灰橙）、`pinned` 用 `bg-orange-500`
 
 首项判定 `isActiveFirstTarget` 用后端 `ActiveTargetDto.target_index`：DTO 每 route.targets 一个，
 `target_index` 是该 target 在 route 优先级降序排序中的秩（stable sort by `priority` 降序，同
@@ -165,8 +165,7 @@ green。`expired` 的 amber 与 `pinned` 的 green 视觉区分度低，且颜�
 - ✅ 为什么不比 `real_model` 字段：passthrough 与显式 target 可能解析出相同 `real_model`（如 exact
   route passthrough 解析为 route 名），字段比较无法区分；`target_index` 由后端按优先级降序秩直接
   给出，天然精确
-- ✅ 保守方向：`target_index` 缺失（旧后端）或非 0 时返回 `false` → 渲染橙色（`pinned` 橙或
-  `expired` 灰橙）而非绿色，绝不误报绿
+- ✅ 信任字段：`target_index === 0` 即首项绿，非 0 即 fallback 橙（前后端同版本，字段恒有）
 - ❌ 备选「按 real_model 字符串比较」被否：会在 passthrough 解析与显式 target 同名时误报首项绿
 - ❌ 备选「前端按响应顺序 + 对象身份判定」（早期实现）被否：依赖 store 保持响应顺序与 DTO 对象
   身份，脆弱且无法跨请求比对；改由后端 DTO 直接携带 `target_index`（优先级降序秩，rank 0 =
@@ -182,7 +181,7 @@ green。`expired` 的 amber 与 `pinned` 的 green 视觉区分度低，且颜�
 一律报 `idle`，不显示为 pinned/expired。
 
 - ✅ 残留 pin 不代表当前流量方向（新策略不再写 pin），展示为 pinned/expired 会误导运维；与前端
-  `selectActiveTarget` 按 route 当前 strategy 过滤的语义对齐
+  `selectActiveTarget` 按 `entry.strategy` 过滤的语义对齐（entry.strategy 即后端读到的 route strategy）
 - ❌ 展示残留 pin（旧行为）：切换策略后 UI 仍显示旧 pin，用户无法区分「当前生效」与「历史残留」
 - 注意：这只是 GET 展示层过滤，`active_targets` 内存与 dispatch 语义不变；残留由 proactive prune
   或下一 dispatch prune 清除
@@ -233,10 +232,10 @@ hot-reload（`sag-gateway/src/main.rs` `GatewayReloadHandler`，含 unstable-fil
 
 ### 前端
 
-- `ActiveTargetEntry` 字段与后端 serde 输出一致（snake_case：`age_secs` / `expired`），仿 `CircuitBreakerEntry` 风格
+- `ActiveTargetEntry` 字段与后端 serde 输出一致（snake_case：`age_secs` / `status`），仿 `CircuitBreakerEntry` 风格
 - 401 一律走 `useConnectionStore().handle401()`（与 `circuitBreaker.ts` 一致）
-- 状态圆点着色（`activeTargetDotColor`）：fill_first 恒 emerald；sticky `expired` 按配置位置 muted（首项 `bg-green-500/40`、非首项/无法确认 `bg-orange-500/40`）——`expired` 只表示过期 pin 的配置位置，不等同于当前实际承载流量；sticky `pinned` 命中首项 green、非首项/无法确认 orange；无 active 时返回 `null` 不渲染圆点
-- `isActiveFirstTarget` 用后端 `target_index === 0` 判首项（权威来源在 DTO，`target_index` 是优先级降序秩，0 = 最高优先级 target）；`target_index` 缺失（旧后端）或非 0 返回 `false`，渲染橙色而非绿色
+- 状态圆点着色（`activeTargetDotColor`）：fill_first 恒 emerald；sticky `expired` 按配置位置 muted（首项 `bg-green-500/40`、非首项 `bg-orange-500/40`）——`expired` 只表示过期 pin 的配置位置，不等同于当前实际承载流量；sticky `pinned` 命中首项 green、非首项 orange；无 active 时返回 `null` 不渲染圆点
+- `isActiveFirstTarget` 用后端 `target_index === 0` 判首项（权威来源在 DTO，`target_index` 是优先级降序秩，0 = 最高优先级 target）
 
 ## 测试策略
 
@@ -267,10 +266,8 @@ hot-reload（`sag-gateway/src/main.rs` `GatewayReloadHandler`，含 unstable-fil
 ### 前端
 
 - `sag-ui/src/lib/activeTarget.test.ts`（`node --experimental-strip-types` 直接运行）— 边界测试：
-  `target_index` 0/1+/缺失/非法值判首项（缺失或非 0 恒非首项）、expired 首项灰绿 / 非首项与
-  无法确认灰橙（expired 表示过期 pin 的配置位置而非当前流量）、fill 保持 emerald 且与 sticky
-  共存时 sticky 优先、`selectActiveTarget` 按 route 当前 strategy 过滤（fill_first / round_robin
-  不展示残留 pin）、fill_first 无缓存 order 不算 active（sorting 不误判）、多 route entries 按
+  `target_index` 0/1+ 判首项、expired 首项灰绿 / 非首项灰橙（expired 表示过期 pin 的配置位置而非当前流量）、fill 保持 emerald 且与 sticky
+  共存时 sticky 优先、`selectActiveTarget` 按 `entry.strategy` 过滤（仅 sticky_failover entry 是 pin）、fill_first 无缓存 order 不算 active（sorting 不误判）、多 route entries 按
   `model` 作用域不串扰、wildcard 多 pin 按 `age_secs` 取最新
 - `vue-tsc` typecheck 通过（`pnpm typecheck`）
 - `oxlint` 通过（`pnpm lint`）
