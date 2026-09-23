@@ -58,6 +58,7 @@ pub(crate) fn test_config(
         anthropic_cache_control: true,
         chunk_timeout_secs,
         ttfb_timeout_secs,
+        upstream_protocol: None,
     }
 }
 

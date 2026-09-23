@@ -298,7 +298,9 @@ fn forward_error_frame(
 
 /// Extract a [`Usage`] from a JSON `usage` object, applying the
 /// completion_tokens fallback strategies (see inline comments).
-fn extract_stream_usage(usage_val: &serde_json::Value) -> Usage {
+///
+/// Shared by stream frame handling and the Chat Completions codec.
+pub fn extract_usage_from_value(usage_val: &serde_json::Value) -> Usage {
     let pt = usage_val
         .get("prompt_tokens")
         .and_then(|v| v.as_u64())
@@ -406,7 +408,7 @@ fn handle_usage_frame(
     usage_val: &serde_json::Value,
     raw: Vec<u8>,
 ) {
-    let usage = extract_stream_usage(usage_val);
+    let usage = extract_usage_from_value(usage_val);
 
     // When an anomalous frame also lacks meaningful choices, forwarding the
     // raw SSE data to the client is actively harmful:

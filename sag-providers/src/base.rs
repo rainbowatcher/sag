@@ -432,6 +432,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         };
         ProviderBase::new("test".into(), &config).unwrap()
     }
@@ -489,6 +490,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         };
         ProviderBase::new("test".into(), &config).unwrap()
     }
@@ -974,6 +976,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         };
         let base = ProviderBase::new("test".into(), &config).unwrap();
         let req = base
@@ -1028,6 +1031,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         };
         let base = ProviderBase::new("test".into(), &config).unwrap();
 

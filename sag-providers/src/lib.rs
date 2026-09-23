@@ -1,7 +1,9 @@
 pub mod anthropic;
 pub mod base;
+pub mod codec;
 pub mod openai;
 pub mod traits;
+pub mod upstream;
 pub mod util;
 
 #[cfg(test)]
@@ -9,8 +11,10 @@ mod test_support;
 
 pub use anthropic::*;
 pub use base::*;
+pub use codec::*;
 pub use openai::*;
 pub use traits::*;
+pub use upstream::*;
 pub use util::*;
 
 /// Create a provider adapter from its type and configuration.
