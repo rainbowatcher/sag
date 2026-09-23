@@ -102,7 +102,15 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
                         "failed to serialize provider '{name}': {e}"
                     ))
                 })?;
-                Ok(toml_edit::Item::Table((*pd).clone()))
+                let mut table = (*pd).clone();
+                // Strip anthropic_cache_control unless this is an Anthropic provider
+                // with an explicit opt-out (false). Same predicate as the update path.
+                if !(matches!(provider.provider_type, ProviderType::Anthropic)
+                    && !provider.anthropic_cache_control)
+                {
+                    table.remove("anthropic_cache_control");
+                }
+                Ok(toml_edit::Item::Table(table))
             },
             |item| update_existing_provider(item, provider),
         )?;
@@ -455,8 +463,16 @@ fn update_existing_provider(
             Ok(toml_edit::Value::from(v.as_str()))
         })?;
     }
-    // anthropic_cache_control — always write (no skip_serializing_if)
-    table["anthropic_cache_control"] = toml_edit::value(provider.anthropic_cache_control);
+    // anthropic_cache_control — only meaningful for Anthropic providers.
+    // Keep only the explicit opt-out (false); default `true` and any value
+    // on non-Anthropic providers are stripped so config files stay clean.
+    if matches!(provider.provider_type, ProviderType::Anthropic)
+        && !provider.anthropic_cache_control
+    {
+        table["anthropic_cache_control"] = toml_edit::value(false);
+    } else {
+        table.remove("anthropic_cache_control");
+    }
     Ok(())
 }
 
@@ -962,6 +978,10 @@ key_strategy = "round_robin"
         assert!(
             !saved.contains("enabled_models"),
             "empty enabled_models should not be written"
+        );
+        assert!(
+            !saved.contains("anthropic_cache_control"),
+            "default anthropic_cache_control (OpenAI + true) should not be written, got:\n{saved}"
         );
         assert!(
             saved.contains("models_endpoint = \"models\""),
@@ -2638,6 +2658,14 @@ api_keys = ["sk-test"]
         assert_eq!(p.enabled_models, vec!["gpt-4o"]);
         assert!(!p.anthropic_cache_control);
 
+        // Content assertion alongside the round-trip assert: Anthropic +
+        // false must actually be written to disk.
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("anthropic_cache_control = false"),
+            "Anthropic + false should be written to TOML, got:\n{saved}"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2648,8 +2676,10 @@ api_keys = ["sk-test"]
 host = "127.0.0.1"
 port = 9090
 
-[providers.openai]
-api_keys = ["sk-test"]
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-ant"]
+base_url = "https://api.anthropic.com"
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2658,18 +2688,218 @@ api_keys = ["sk-test"]
 
         config
             .providers
+            .get_mut("anthropic")
+            .unwrap()
+            .anthropic_cache_control = false;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("anthropic_cache_control = false"),
+            "Anthropic + false should be written to TOML, got:\n{saved}"
+        );
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        let p = reloaded.providers.get("anthropic").unwrap();
+        assert!(
+            !p.anthropic_cache_control,
+            "anthropic_cache_control=false should survive round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn default_anthropic_cache_control_not_written() {
+        // Anthropic + true (default): key must not be written; reload
+        // falls back to the serde default (`true`).
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+        let mut config = openai_only_config();
+        let mut p = minimal_provider();
+        p.provider_type = ProviderType::Anthropic;
+        p.base_url = "https://api.anthropic.com".into();
+        p.anthropic_cache_control = true;
+        config.providers.insert("anthropic".into(), p);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("anthropic_cache_control"),
+            "Anthropic + true (default) should not write the key, got:\n{saved}"
+        );
+
+        let reloaded = load_config(&path).unwrap();
+        let c = reloaded.inner.try_read().unwrap();
+        assert!(
+            c.providers
+                .get("anthropic")
+                .unwrap()
+                .anthropic_cache_control,
+            "reload without the key should default to true"
+        );
+        drop(c);
+        drop(reloaded);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn openai_never_writes_anthropic_cache_control() {
+        // OpenAI + false: key must still not be written (predicate
+        // requires Anthropic type regardless of value).
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+        let mut config = openai_only_config();
+        config
+            .providers
             .get_mut("openai")
             .unwrap()
             .anthropic_cache_control = false;
 
         save_config_to_file(&config, &path).unwrap();
 
-        let reloaded_handle = load_config(&path).unwrap();
-        let reloaded = reloaded_handle.inner.try_read().unwrap();
-        let p = reloaded.providers.get("openai").unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !p.anthropic_cache_control,
-            "anthropic_cache_control=false should survive round-trip"
+            !saved.contains("anthropic_cache_control"),
+            "non-Anthropic provider must never write the key, got:\n{saved}"
+        );
+
+        let reloaded = load_config(&path).unwrap();
+        let c = reloaded.inner.try_read().unwrap();
+        assert!(
+            c.providers.get("openai").unwrap().anthropic_cache_control,
+            "reload without the key should default to true"
+        );
+        drop(c);
+        drop(reloaded);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_path_keeps_anthropic_cache_control_false() {
+        // New provider (create path via to_document): Anthropic + false
+        // must survive serialization and be written as `= false`.
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+        let mut config = openai_only_config();
+        let mut p = minimal_provider();
+        p.provider_type = ProviderType::Anthropic;
+        p.base_url = "https://api.anthropic.com".into();
+        p.anthropic_cache_control = false;
+        config.providers.insert("anthropic".into(), p);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("anthropic_cache_control = false"),
+            "create path should keep Anthropic + false, got:\n{saved}"
+        );
+
+        let reloaded = load_config(&path).unwrap();
+        let c = reloaded.inner.try_read().unwrap();
+        assert!(
+            !c.providers
+                .get("anthropic")
+                .unwrap()
+                .anthropic_cache_control,
+            "Anthropic + false should reload as false"
+        );
+        drop(c);
+        drop(reloaded);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_clears_anthropic_cache_control_on_true() {
+        // Existing `= false` on disk, in-memory value flipped to `true`
+        // → key removed on save; reload sees the default `true`.
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-ant"]
+base_url = "https://api.anthropic.com"
+anthropic_cache_control = false
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        assert!(
+            !config.providers["anthropic"].anthropic_cache_control,
+            "fixture should load as false"
+        );
+        config
+            .providers
+            .get_mut("anthropic")
+            .unwrap()
+            .anthropic_cache_control = true;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("anthropic_cache_control"),
+            "setting back to true should remove the key, got:\n{saved}"
+        );
+
+        let reloaded = load_config(&path).unwrap();
+        let c = reloaded.inner.try_read().unwrap();
+        assert!(
+            c.providers
+                .get("anthropic")
+                .unwrap()
+                .anthropic_cache_control,
+            "reload without the key should default to true"
+        );
+        drop(c);
+        drop(reloaded);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn provider_type_switch_to_openai_strips_cache_control() {
+        // Anthropic + false persisted, then provider_type switched to
+        // OpenAI in the same process → save strips the key (acceptable
+        // edge: the false is lost after a restart in this state).
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-ant"]
+base_url = "https://api.anthropic.com"
+anthropic_cache_control = false
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        assert!(
+            !config.providers["anthropic"].anthropic_cache_control,
+            "fixture should load as false"
+        );
+        // Switch type to OpenAI while the in-memory value stays false.
+        config.providers.get_mut("anthropic").unwrap().provider_type = ProviderType::OpenAI;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("anthropic_cache_control"),
+            "switching to OpenAI must strip the key even when value is false, got:\n{saved}"
         );
 
         let _ = std::fs::remove_file(&path);
