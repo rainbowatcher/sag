@@ -112,6 +112,7 @@ fn adapter_config_changed(old: &ProviderConfig, new: &ProviderConfig) -> bool {
         || old.model_strip_fields != new.model_strip_fields
         || old.role_mappings != new.role_mappings
         || old.anthropic_cache_control != new.anthropic_cache_control
+        || old.upstream_protocol != new.upstream_protocol
 }
 
 /// Count routes whose model_name differs between old and new configs
@@ -821,6 +822,7 @@ mod tests {
             enabled: true,
             enabled_models: vec![],
             anthropic_cache_control: false,
+            upstream_protocol: None,
         }
     }
 
@@ -926,6 +928,28 @@ mod tests {
         let b = base_provider();
         a.anthropic_cache_control = true;
         assert!(adapter_config_changed(&a, &b));
+    }
+
+    #[test]
+    fn upstream_protocol_change_triggers_rebuild() {
+        let mut a = base_provider();
+        let b = base_provider();
+        a.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
+        assert!(adapter_config_changed(&a, &b));
+        // None → Some and Some → None must also rebuild.
+        let mut with_explicit = base_provider();
+        with_explicit.upstream_protocol = Some(sag_core::UpstreamProtocol::ChatCompletions);
+        assert!(adapter_config_changed(&with_explicit, &b));
+        assert!(adapter_config_changed(&b, &with_explicit));
+    }
+
+    #[test]
+    fn same_upstream_protocol_does_not_trigger_rebuild() {
+        let mut a = base_provider();
+        let mut b = base_provider();
+        a.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
+        b.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
+        assert!(!adapter_config_changed(&a, &b));
     }
 
     #[test]

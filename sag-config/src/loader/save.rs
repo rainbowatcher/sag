@@ -473,6 +473,12 @@ fn update_existing_provider(
     } else {
         table.remove("anthropic_cache_control");
     }
+    // upstream_protocol — skip if None (mirrors skip_serializing_if).
+    if let Some(up) = provider.upstream_protocol {
+        table["upstream_protocol"] = toml_edit::value(up.as_str());
+    } else {
+        table.remove("upstream_protocol");
+    }
     Ok(())
 }
 
@@ -622,6 +628,13 @@ fn write_target_fields(
         let extra_table = ensure_nested_inline_table(existing, "extra");
         sync_inline_table_in_place(extra_table, &target.extra, json_to_toml_value)?;
     }
+
+    // upstream_protocol — skip if None (mirrors skip_serializing_if).
+    if let Some(up) = target.upstream_protocol {
+        existing.insert("upstream_protocol", toml_edit::Value::from(up.as_str()));
+    } else {
+        existing.remove("upstream_protocol");
+    }
     Ok(())
 }
 
@@ -664,6 +677,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         }
     }
 
@@ -802,6 +816,7 @@ base_url = "https://api.anthropic.com"
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
                     ttfb_timeout_secs: None,
+                    upstream_protocol: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -817,6 +832,7 @@ base_url = "https://api.anthropic.com"
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -951,6 +967,7 @@ key_strategy = "round_robin"
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
                     ttfb_timeout_secs: None,
+                    upstream_protocol: None,
                 },
             )]),
             ..crate::gateway_config_base!()
@@ -1095,6 +1112,7 @@ targets = [
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
                     ttfb_timeout_secs: None,
+                    upstream_protocol: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1113,6 +1131,7 @@ targets = [
                         "nested".into(),
                         serde_json::json!({ "temperature": null }),
                     )]),
+                    upstream_protocol: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1162,6 +1181,7 @@ targets = [
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
                     ttfb_timeout_secs: None,
+                    upstream_protocol: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1177,6 +1197,7 @@ targets = [
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::from([("list".into(), serde_json::json!([1, null, 3]))]),
+                    upstream_protocol: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1223,6 +1244,7 @@ targets = [
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
                     ttfb_timeout_secs: None,
+                    upstream_protocol: None,
                 },
             )]),
             routes: vec![RouteConfig {
@@ -1238,6 +1260,7 @@ targets = [
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::from([("temperature".into(), serde_json::Value::Null)]),
+                    upstream_protocol: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1529,6 +1552,7 @@ targets = [
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         });
 
@@ -2620,6 +2644,7 @@ api_keys = ["sk-test"]
                 enabled: false,
                 enabled_models: vec!["gpt-4o".into()],
                 anthropic_cache_control: false,
+                upstream_protocol: None,
             },
         );
 
@@ -3323,6 +3348,85 @@ proxy_mode = "enabled"
             Some("http://proxy.example.com:8080")
         );
         assert_eq!(reloaded.providers["openai"].proxy_mode, ProxyMode::Enabled);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_upstream_protocol_roundtrip_some_and_none() {
+        let content = r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        // Set Some on provider and target.
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
+        config.routes[0].targets[0].upstream_protocol =
+            Some(sag_core::UpstreamProtocol::AnthropicMessages);
+
+        save_config_to_file(&config, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("upstream_protocol = \"responses\""),
+            "provider upstream_protocol must be written, got:\n{saved}"
+        );
+        assert!(
+            saved.contains("upstream_protocol = \"anthropic_messages\""),
+            "target upstream_protocol must be written, got:\n{saved}"
+        );
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.providers.get("openai").unwrap().upstream_protocol,
+            Some(sag_core::UpstreamProtocol::Responses)
+        );
+        assert_eq!(
+            reloaded.routes[0].targets[0].upstream_protocol,
+            Some(sag_core::UpstreamProtocol::AnthropicMessages)
+        );
+        drop(reloaded);
+
+        // Clear back to None → keys removed.
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .upstream_protocol = None;
+        config.routes[0].targets[0].upstream_protocol = None;
+        save_config_to_file(&config, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("upstream_protocol"),
+            "None must omit the key, got:\n{saved}"
+        );
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(
+            reloaded.providers.get("openai").unwrap().upstream_protocol,
+            None
+        );
+        assert_eq!(reloaded.routes[0].targets[0].upstream_protocol, None);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -37,6 +37,7 @@ impl From<RouteTargetInput> for RouteTarget {
             timeout_secs: None,
             priority: t.priority,
             extra: t.extra,
+            upstream_protocol: None,
         }
     }
 }
@@ -402,6 +403,7 @@ mod tests {
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -456,6 +458,7 @@ mod tests {
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -502,6 +505,7 @@ mod tests {
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         let state = build_state(providers, vec![]).await;
@@ -545,6 +549,7 @@ mod tests {
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         let routes = vec![RouteConfig {
@@ -560,6 +565,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         }];
         let state = build_state(providers, routes).await;
@@ -652,6 +658,7 @@ mod tests {
                 timeout_secs: None,
                 priority: 1,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         };
         let state = build_state(providers, vec![route]).await;
@@ -757,6 +764,7 @@ mod tests {
                 timeout_secs: None,
                 priority: 1,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         }
     }
@@ -770,6 +778,7 @@ mod tests {
                 timeout_secs: None,
                 priority: 1,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }]),
             created_at: std::time::Instant::now(),
             routes_version: Some(1),

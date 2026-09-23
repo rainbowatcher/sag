@@ -62,6 +62,7 @@ async fn sequential_mutations_with_persistence_succeed() {
         enabled: true,
         enabled_models: vec![],
         anthropic_cache_control: false,
+        upstream_protocol: None,
     };
     let report1 = coord
         .update_provider("p1", cfg1)
@@ -92,6 +93,7 @@ async fn sequential_mutations_with_persistence_succeed() {
         enabled: true,
         enabled_models: vec![],
         anthropic_cache_control: false,
+        upstream_protocol: None,
     };
     let report2 = coord
         .update_provider("p1", cfg2)

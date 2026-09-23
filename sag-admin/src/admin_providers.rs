@@ -232,6 +232,7 @@ pub async fn add_provider(
         anthropic_cache_control: true,
         chunk_timeout_secs: None,
         ttfb_timeout_secs: None,
+        upstream_protocol: None,
     };
 
     // Delegate to the coordinator which atomically writes config + provider
@@ -526,6 +527,7 @@ mod tests {
                     anthropic_cache_control: true,
                     chunk_timeout_secs: None,
                     ttfb_timeout_secs: None,
+                    upstream_protocol: None,
                 },
             );
         }
@@ -545,6 +547,7 @@ mod tests {
                         retries: None,
                         timeout_secs: None,
                         extra: HashMap::new(),
+                        upstream_protocol: None,
                     },
                     RouteTarget {
                         provider: "anthropic".into(),
@@ -553,6 +556,7 @@ mod tests {
                         timeout_secs: None,
                         extra: HashMap::new(),
                         priority: 2,
+                        upstream_protocol: None,
                     },
                 ],
             },
@@ -569,6 +573,7 @@ mod tests {
                     timeout_secs: None,
                     real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
+                    upstream_protocol: None,
                 }],
             },
         ];
@@ -757,6 +762,7 @@ targets = [
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         providers.insert(
@@ -780,6 +786,7 @@ targets = [
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         providers.insert(
@@ -803,6 +810,7 @@ targets = [
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
 
@@ -845,6 +853,7 @@ targets = [
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
         providers.insert(
@@ -868,6 +877,7 @@ targets = [
                 anthropic_cache_control: true,
                 chunk_timeout_secs: None,
                 ttfb_timeout_secs: None,
+                upstream_protocol: None,
             },
         );
 

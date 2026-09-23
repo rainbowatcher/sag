@@ -78,6 +78,7 @@ pub(crate) fn one_provider_config(
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         },
     );
     let routes = routes
@@ -95,6 +96,7 @@ pub(crate) fn one_provider_config(
                 timeout_secs: None,
                 priority: prio,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         })
         .collect();

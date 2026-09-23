@@ -165,6 +165,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         }
     }
 

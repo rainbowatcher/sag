@@ -450,6 +450,7 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
+            upstream_protocol: None,
         }
     }
 

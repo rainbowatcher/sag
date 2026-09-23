@@ -38,6 +38,7 @@ fn base_provider() -> ProviderConfig {
         enabled: true,
         enabled_models: vec![],
         anthropic_cache_control: false,
+        upstream_protocol: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn route(model_name: &str, targets: &[(&str, Option<&str>)]) -> RouteConfig {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             })
             .collect(),
     }

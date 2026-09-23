@@ -906,6 +906,12 @@ pub struct ProviderConfig {
     /// with stable prefixes.
     #[serde(default = "default_true")]
     pub anthropic_cache_control: bool,
+    /// Optional explicit upstream protocol. `None` derives from
+    /// `provider_type` (openai→chat_completions, anthropic→anthropic_messages).
+    /// The derived value only selects the translated-lane encoder; Native
+    /// requires an explicit declaration equal to the ingress protocol (§4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
 }
 
 impl Default for ProviderConfig {
@@ -929,6 +935,7 @@ impl Default for ProviderConfig {
             enabled: default_true(),
             enabled_models: Vec::new(),
             anthropic_cache_control: default_true(),
+            upstream_protocol: None,
         }
     }
 }
@@ -1214,7 +1221,7 @@ impl RouteConfig {
 /// Multiple targets in a route are grouped by priority and tried based on the
 /// route's `strategy`. Targets with the same priority are shuffled once then
 /// cached when strategy is `FillFirst`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Provider name (must match a key in `providers`).
     pub provider: String,
@@ -1251,6 +1258,12 @@ pub struct RouteTarget {
     /// the on-disk key order preserved.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
+    /// Per-target explicit upstream protocol override (priority over the
+    /// provider-level field). `None` falls back to the provider's value,
+    /// then to derivation from `provider_type`. Native only when this
+    /// (effective) explicit declaration equals the ingress protocol (§4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
 }
 
 #[cfg(test)]
@@ -2380,6 +2393,7 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 },
                 RouteTarget {
                     provider: "openai".into(),
@@ -2388,6 +2402,7 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 },
             ];
             let err = config.validate().unwrap_err();
@@ -2414,6 +2429,7 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 },
                 RouteTarget {
                     provider: "openai".into(),
@@ -2422,6 +2438,7 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 },
             ];
             assert!(
@@ -2568,6 +2585,63 @@ targets = [
         }
     }
 
+    #[test]
+    fn parse_upstream_protocol_on_provider_and_target() {
+        let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+upstream_protocol = "responses"
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", real_model = "gpt-4o", upstream_protocol = "responses" },
+]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let p = config.providers.get("openai").unwrap();
+        assert_eq!(
+            p.upstream_protocol,
+            Some(sag_core::UpstreamProtocol::Responses)
+        );
+        assert_eq!(
+            config.routes[0].targets[0].upstream_protocol,
+            Some(sag_core::UpstreamProtocol::Responses)
+        );
+    }
+
+    #[test]
+    fn parse_upstream_protocol_rejects_unknown_value() {
+        let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+upstream_protocol = "nope"
+"#;
+        let result = toml::from_str::<GatewayConfig>(toml_str);
+        assert!(result.is_err(), "unknown upstream_protocol must fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("upstream_protocol") || err.contains("nope"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_protocol_defaults_to_none_when_omitted() {
+        let config: GatewayConfig = toml::from_str(minimal_toml()).unwrap();
+        let p = config.providers.get("openai").unwrap();
+        assert_eq!(p.upstream_protocol, None);
+        assert_eq!(config.routes[0].targets[0].upstream_protocol, None);
+    }
+
     // ── remove_provider unit tests ──────────────────────────────────
     mod remove_provider {
         use super::*;
@@ -2607,6 +2681,7 @@ targets = [
                     enabled_models: vec![],
                     enabled: true,
                     anthropic_cache_control: false,
+                    upstream_protocol: None,
                 },
             )
         }
@@ -2620,6 +2695,7 @@ targets = [
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }
         }
 
