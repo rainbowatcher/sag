@@ -227,6 +227,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             },
             RouteConfig {
@@ -242,6 +243,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             },
             RouteConfig {
@@ -258,6 +260,7 @@ mod tests {
                         retries: None,
                         timeout_secs: None,
                         extra: HashMap::new(),
+                        upstream_protocol: None,
                     },
                     RouteTarget {
                         provider: "openai-enabled".into(),
@@ -266,6 +269,7 @@ mod tests {
                         retries: None,
                         timeout_secs: None,
                         extra: HashMap::new(),
+                        upstream_protocol: None,
                     },
                 ],
             },
@@ -318,6 +322,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             },
             RouteConfig {
@@ -333,6 +338,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             },
         ];

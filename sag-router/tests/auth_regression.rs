@@ -50,6 +50,7 @@ async fn build_protected_state() -> AppState {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
+            upstream_protocol: None,
         },
     );
     let config = GatewayConfig {
@@ -70,6 +71,7 @@ async fn build_protected_state() -> AppState {
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 1,
+                upstream_protocol: None,
             }],
         }],
         ..sag_config::gateway_config_base!()

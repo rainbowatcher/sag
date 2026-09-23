@@ -8,8 +8,9 @@ use futures_util::Stream;
 use sag_analytics::StatsFilter;
 use sag_config::{CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, Strategy};
 use sag_core::AppError;
+use sag_core::IrStreamEvent;
 use sag_core::types::{ChatCompletionRequest, ChatCompletionResponse, StreamChunk, Usage};
-use sag_providers::LlmProvider;
+use sag_providers::{ChatCompletionsCodec, LlmProvider};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -287,6 +288,8 @@ fn make_ctx_with_strategy<'a>(
         sticky_token: sag_state::StickyToken::default(),
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     }
 }
 
@@ -318,6 +321,8 @@ fn make_ctx_with_token<'a>(
         sticky_token,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     }
 }
 
@@ -2469,6 +2474,7 @@ async fn build_state_with_strategy(
                     retries: Some(0),
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 },
                 sag_config::RouteTarget {
                     provider: "second".into(),
@@ -2477,6 +2483,7 @@ async fn build_state_with_strategy(
                     retries: Some(0),
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 },
             ],
             retries: None,
@@ -2529,6 +2536,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         sticky_token,
         route_name,
         started_at,
+        precheck_errors: _,
     } = crate::dispatch::resolve_route(
         &state,
         &rt,
@@ -2567,6 +2575,8 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         sticky_token,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2603,6 +2613,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         sticky_token,
         route_name,
         started_at,
+        precheck_errors: _,
     } = crate::dispatch::resolve_route(
         &state,
         &rt,
@@ -2635,6 +2646,8 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         sticky_token,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2680,6 +2693,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         sticky_token,
         route_name,
         started_at,
+        precheck_errors: _,
     } = crate::dispatch::resolve_route(
         &state,
         &rt,
@@ -2721,6 +2735,8 @@ async fn stale_writeback_after_clear_does_not_repin() {
         sticky_token,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2759,6 +2775,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         sticky_token,
         route_name,
         started_at,
+        precheck_errors: _,
     } = crate::dispatch::resolve_route(
         &state,
         &rt,
@@ -2792,6 +2809,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         });
         state.config.bump_routes_version();
@@ -2816,6 +2834,8 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         sticky_token,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2835,6 +2855,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         sticky_token: token2,
         route_name,
         started_at,
+        precheck_errors: _,
     } = crate::dispatch::resolve_route(
         &state,
         &rt,
@@ -2865,6 +2886,8 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         sticky_token: token2,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     };
     let resp2 = dispatch_chat(ctx2).await;
     assert_eq!(resp2.status(), StatusCode::OK);
@@ -2903,6 +2926,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         sticky_token,
         route_name,
         started_at,
+        precheck_errors: _,
     } = crate::dispatch::resolve_route(
         &state,
         &rt,
@@ -2958,6 +2982,8 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         sticky_token,
         user_agent: None,
         client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -3123,4 +3149,173 @@ async fn dispatch_non_streaming_empty_resp_disabled_passes_through() {
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(mock.chat_calls(), 1, "single attempt, no retry");
+}
+
+// ─── M4 byte-regression golden tests ─────────────────────────────
+
+/// Golden: non-stream gateway body is byte-identical to
+/// `serde_json::to_vec(&original ChatCompletionResponse)` — the dual-hold
+/// egress path must not re-encode via `encode_response` (which rewrites
+/// `content: null` → `""` and can reorder fields).
+#[tokio::test]
+async fn m4_non_stream_body_bytes_match_original_response() {
+    // Build an original response with null content + tool_calls in extra —
+    // a shape that `encode_response` would rewrite.
+    let original = ChatCompletionResponse {
+        id: "chatcmpl-golden".into(),
+        object: "chat.completion".into(),
+        created: 1_700_000_000,
+        model: "gpt-4o".into(),
+        choices: vec![sag_core::types::ChatChoice {
+            index: 0,
+            message: sag_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                name: Some("golden".into()),
+                extra: serde_json::Map::from_iter([(
+                    "tool_calls".into(),
+                    json!([{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"}
+                    }]),
+                )]),
+            },
+            finish_reason: Some("tool_calls".into()),
+        }],
+        usage: Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+        }),
+    };
+    let golden_bytes = serde_json::to_vec(&original).expect("serialize golden");
+
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(original.clone()));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        &golden_bytes[..],
+        "M4 non-stream egress must be byte-identical to the original ChatCompletionResponse"
+    );
+
+    // Prove the dual-hold rationale: encode_response would have diverged.
+    let ir = ChatCompletionsCodec::decode_response(&original);
+    let reencoded = serde_json::to_vec(&ChatCompletionsCodec::encode_response(&ir)).unwrap();
+    assert_ne!(
+        reencoded, golden_bytes,
+        "fixture must be a case where encode_response diverges (null content / name / …)"
+    );
+}
+
+/// Golden: streaming gateway body is byte-identical to the concatenation
+/// of the provider's `StreamChunk::Data` frames (Raw passthrough; Usage /
+/// Error / End never rewrite client bytes; `[DONE]` arrives as Data).
+#[tokio::test]
+async fn m4_stream_body_bytes_match_upstream_data_frames() {
+    let f1 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n".to_vec();
+    let f2 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n".to_vec();
+    let f3 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n".to_vec();
+    let f_done = b"data: [DONE]\n\n".to_vec();
+    let golden: Vec<u8> = [f1.clone(), f2.clone(), f3.clone(), f_done.clone()].concat();
+
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(f1),
+        StreamChunk::Data(f2),
+        // Anomalous-looking usage-only meta chunk (analytics only — must
+        // NOT appear in the client body).
+        StreamChunk::Usage(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+        }),
+        StreamChunk::Data(f3),
+        // Mid-stream Error records analytics but emits no client bytes of
+        // its own (the error Data frame is separate when present).
+        StreamChunk::Error("ignored-for-body".into()),
+        StreamChunk::Data(f_done),
+        StreamChunk::Done,
+    ]));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        &golden[..],
+        "M4 stream egress must be byte-identical to upstream Data frames (Raw passthrough)"
+    );
+}
+
+/// Byte fidelity of the StreamChunk → IrStreamEvent mapping used at the
+/// dispatch boundary: Data bytes are preserved exactly.
+#[test]
+fn m4_stream_chunk_to_ir_raw_preserves_bytes() {
+    let raw = b"data: {\"choices\":[{\"delta\":{\"content\":\"exact-bytes\"}}]}\n\n".to_vec();
+    let expected = raw.clone();
+    let ev = IrStreamEvent::from(StreamChunk::Data(raw));
+    match ev {
+        IrStreamEvent::Raw(got) => assert_eq!(got, expected),
+        other => panic!("expected Raw, got {other:?}"),
+    }
+}
+
+/// Chat stream encoder: Raw yields original bytes; structured events go
+/// through `ChatCompletionsCodec::encode_stream_event`.
+#[test]
+fn m4_chat_stream_encoder_raw_passthrough_and_structured() {
+    let raw = b"data: {\"unparsed\":true}\n\n".to_vec();
+    assert_eq!(
+        ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::Raw(raw.clone())),
+        raw
+    );
+    // Structured TextDelta encodes to a data: JSON frame (M5+ path).
+    let enc = ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::TextDelta {
+        index: 0,
+        text: "hi".into(),
+    });
+    assert!(
+        enc.starts_with(b"data: "),
+        "structured frame has data prefix"
+    );
+    // Control frames align with StreamChunk::to_sse_bytes shapes.
+    let usage = Usage {
+        prompt_tokens: 1,
+        completion_tokens: 2,
+        total_tokens: 3,
+        cached_tokens: None,
+        cache_creation_tokens: None,
+        reasoning_tokens: None,
+    };
+    let ir_u = ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::Usage(usage.clone()));
+    let chunk_u = StreamChunk::Usage(usage).to_sse_bytes();
+    assert_eq!(ir_u, chunk_u, "usage frame must match to_sse_bytes");
+    let ir_e = ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::Error("x".into()));
+    let chunk_e = StreamChunk::Error("x".into()).to_sse_bytes();
+    assert_eq!(ir_e, chunk_e, "error frame must match to_sse_bytes");
+    assert_eq!(
+        ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::End),
+        b"data: [DONE]\n\n"
+    );
 }

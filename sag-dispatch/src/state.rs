@@ -272,6 +272,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             }
         }
@@ -578,6 +579,7 @@ mod tests {
             anthropic_cache_control: true,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: ttfb,
+            upstream_protocol: None,
         }
     }
 
@@ -600,6 +602,7 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
+            upstream_protocol: None,
         }
     }
 

@@ -11,9 +11,17 @@ use sag_core::{AppError, ChatCompletionRequest, FailureReason, FinalStatus, Requ
 use sag_providers::LlmProvider;
 use tracing::{info, warn};
 
+use crate::dispatch::capability::filter_capable_targets;
 use crate::dispatch::{ResolvedRoute, ResolvedTarget, failure_response};
 use crate::order::order_targets;
 use crate::state::{AppState, DispatchRuntime};
+
+/// Snapshot of provider fields needed to fill `ResolvedTarget` lane fields.
+#[derive(Clone)]
+struct ProviderLaneMeta {
+    provider_type: String,
+    upstream_protocol: Option<sag_core::UpstreamProtocol>,
+}
 
 /// Resolve a chat request to an ordered list of fallback targets and the
 /// configured `api_endpoint`, carrying the matched `route_name` and the
@@ -36,6 +44,39 @@ pub async fn resolve_route(
     is_stream: bool,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+) -> Result<ResolvedRoute, Response<Body>> {
+    // M3: only the Chat Completions mount exists; lane decisions use this
+    // ingress. Future ingress mounts pass their own protocol here.
+    resolve_route_with_ingress(
+        state,
+        runtime,
+        request,
+        trace_id,
+        start,
+        started_at,
+        is_stream,
+        user_agent,
+        client_ip,
+        sag_core::IngressProtocol::ChatCompletions,
+    )
+    .await
+}
+
+/// Same as [`resolve_route`] with an explicit ingress protocol for lane
+/// decisions (§4.2).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+pub async fn resolve_route_with_ingress(
+    state: &AppState,
+    runtime: &DispatchRuntime,
+    request: &ChatCompletionRequest,
+    trace_id: uuid::Uuid,
+    start: Instant,
+    started_at: chrono::DateTime<chrono::Utc>,
+    is_stream: bool,
+    user_agent: Option<&str>,
+    client_ip: Option<&str>,
+    ingress_protocol: sag_core::IngressProtocol,
 ) -> Result<ResolvedRoute, Response<Body>> {
     let config_guard = state.config.read().await;
     let current_version = prune_stale_if_needed(state, runtime, &config_guard.routes).await;
@@ -62,6 +103,31 @@ pub async fn resolve_route(
             started_at,
             user_agent,
             client_ip,
+            &[],
+        )
+        .await);
+    }
+
+    // Hard-requirement capability pre-check (after enabled filter, before
+    // ordering). Per-drop `info!` happens inside `filter_capable_targets`.
+    // Partial drops ride on `ResolvedRoute::precheck_errors` into the
+    // dispatch `errors` channel; a full drop builds the 502 with the
+    // capability reason inline (not the generic disabled wording).
+    let mut cap_errors = Vec::new();
+    let targets =
+        filter_capable_targets(request, &config_guard.providers, targets, &mut cap_errors);
+    if targets.is_empty() {
+        return Err(emit_all_disabled_failure(
+            state,
+            request,
+            &route.model_name,
+            trace_id,
+            is_stream,
+            start,
+            started_at,
+            user_agent,
+            client_ip,
+            &cap_errors,
         )
         .await);
     }
@@ -80,6 +146,20 @@ pub async fn resolve_route(
         .providers
         .iter()
         .map(|(k, v)| (k.clone(), v.timeout_secs))
+        .collect();
+    // provider_type + explicit upstream_protocol for lane / ResolvedTarget.
+    let provider_meta: HashMap<String, ProviderLaneMeta> = config_guard
+        .providers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                ProviderLaneMeta {
+                    provider_type: v.provider_type.as_str().to_string(),
+                    upstream_protocol: v.upstream_protocol,
+                },
+            )
+        })
         .collect();
     drop(config_guard);
 
@@ -108,6 +188,8 @@ pub async fn resolve_route(
         &route_model_name,
         global_retries,
         &provider_timeouts,
+        &provider_meta,
+        ingress_protocol,
     );
 
     Ok(ResolvedRoute {
@@ -117,6 +199,7 @@ pub async fn resolve_route(
         sticky_token,
         route_name: route_model_name,
         started_at,
+        precheck_errors: cap_errors,
     })
 }
 
@@ -188,9 +271,15 @@ async fn emit_no_route_failure(
     response
 }
 
-/// All-disabled terminal: fully-built 502 response (legacy CallLog row with
-/// the `__all_disabled__` sentinel) plus the formal analytics fact carrying
-/// the real matched route name.
+/// All-disabled / all-unincapable terminal: fully-built 502 response
+/// (legacy CallLog row with the `__all_disabled__` sentinel) plus the
+/// formal analytics fact carrying the real matched route name.
+///
+/// `capability_errors` is empty on the plain all-disabled path; when the
+/// capability pre-check emptied the target list it carries the per-drop
+/// `"{provider}/{model}: lacks capability X"` strings, which are merged
+/// verbatim into the client-facing reason / CallLog message so the 502
+/// never falls back to the generic "disabled or unavailable" wording.
 #[allow(clippy::too_many_arguments)]
 async fn emit_all_disabled_failure(
     state: &AppState,
@@ -202,12 +291,21 @@ async fn emit_all_disabled_failure(
     started_at: chrono::DateTime<chrono::Utc>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    capability_errors: &[String],
 ) -> Response<Body> {
+    let reason = if capability_errors.is_empty() {
+        format!(
+            "all targets for route '{route_model_name}' point to disabled or unavailable providers/models"
+        )
+    } else {
+        format!(
+            "all targets for route '{route_model_name}' lack required capabilities: {}",
+            capability_errors.join("; ")
+        )
+    };
     let err = AppError::AllProvidersExhausted {
         model: request.model.clone(),
-        reason: format!(
-            "all targets for route '{route_model_name}' point to disabled or unavailable providers/models"
-        ),
+        reason,
     };
     let response = failure_response(
         state,
@@ -245,7 +343,9 @@ async fn emit_all_disabled_failure(
 }
 
 /// Resolve effective retries and timeout per target:
-/// target → route → provider / global.
+/// target → route → provider / global. Also fills lane / upstream protocol
+/// fields from explicit target declaration > provider declaration > derivation.
+#[allow(clippy::too_many_arguments)]
 fn map_resolved_targets(
     ordered: Vec<RouteTarget>,
     requested_model: &str,
@@ -254,6 +354,8 @@ fn map_resolved_targets(
     route_model_name: &str,
     global_retries: u32,
     provider_timeouts: &HashMap<String, u64>,
+    provider_meta: &HashMap<String, ProviderLaneMeta>,
+    ingress_protocol: sag_core::IngressProtocol,
 ) -> Vec<ResolvedTarget> {
     ordered
         .into_iter()
@@ -266,6 +368,19 @@ fn map_resolved_targets(
                 .or(route_timeout)
                 .or_else(|| provider_timeouts.get(&t.provider).copied())
                 .unwrap_or(sag_config::default_timeout_secs());
+
+            let meta = provider_meta.get(&t.provider);
+            let provider_type = meta.map(|m| m.provider_type.as_str()).unwrap_or("openai");
+            // Explicit: target wins over provider; missing → derived only.
+            let explicit = t
+                .upstream_protocol
+                .or_else(|| meta.and_then(|m| m.upstream_protocol));
+            let explicit_flag = explicit.is_some();
+            let derived = sag_core::derive_upstream_protocol(provider_type);
+            let upstream_protocol = sag_core::effective_upstream_protocol(explicit, derived);
+            // §4.2: Native only when explicit and == ingress.
+            let lane = sag_core::resolve_lane(explicit, ingress_protocol);
+
             ResolvedTarget {
                 provider: t.provider,
                 real_model: rm,
@@ -274,6 +389,9 @@ fn map_resolved_targets(
                 extra: t.extra,
                 retries,
                 timeout_secs,
+                upstream_protocol,
+                upstream_protocol_explicit: explicit_flag,
+                lane,
             }
         })
         .collect()
@@ -425,6 +543,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             },
             RouteTarget {
                 provider: "off".into(),
@@ -433,6 +552,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             },
         ];
 
@@ -460,6 +580,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             },
             RouteTarget {
                 provider: "openai".into(),
@@ -468,6 +589,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             },
         ];
 
@@ -483,6 +605,7 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
+            upstream_protocol: None,
         }];
         let filtered_pass = filter_enabled_targets(&providers, &passthrough_targets, "gpt-4o-mini");
         assert_eq!(filtered_pass.len(), 1);
@@ -503,6 +626,7 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
+            upstream_protocol: None,
         }];
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");
         assert_eq!(filtered.len(), 1);
@@ -535,6 +659,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         }];
 
@@ -739,6 +864,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             });
             state.config.bump_routes_version();
@@ -826,6 +952,7 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
+                    upstream_protocol: None,
                 }],
             });
             state.config.bump_routes_version();
@@ -865,6 +992,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         }];
         let config = sag_config::GatewayConfig {
@@ -916,6 +1044,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         }];
 
@@ -995,6 +1124,179 @@ mod tests {
         assert_eq!(log.model, "gpt-4o");
         assert_eq!(log.status_code, 502);
         assert_eq!(log.error_category.as_deref(), Some("all_exhausted"));
+    }
+
+    // ── capability pre-check observability (B1) ─────────────────
+
+    /// Build state with two targets for `gpt-4o`:
+    /// - `weird`: openai + explicit anthropic_messages → unknown combo,
+    ///   no `reasoning` capability;
+    /// - `good`: plain openai → has `reasoning`.
+    ///
+    /// A `reasoning_effort` request therefore partially drops only `weird`.
+    async fn build_state_partial_capability() -> (AppState, DispatchRuntime) {
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        providers.insert("good".into(), provider_config(true));
+        let mut weird = provider_config(true);
+        weird.upstream_protocol = Some(sag_core::UpstreamProtocol::AnthropicMessages);
+        providers.insert("weird".into(), weird);
+
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![
+                sag_config::RouteTarget {
+                    provider: "weird".into(),
+                    real_model: Some("gpt-4o".into()),
+                    priority: 10,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                    upstream_protocol: None,
+                },
+                sag_config::RouteTarget {
+                    provider: "good".into(),
+                    real_model: Some("gpt-4o".into()),
+                    priority: 5,
+                    retries: None,
+                    timeout_secs: None,
+                    extra: HashMap::new(),
+                    upstream_protocol: None,
+                },
+            ],
+        }];
+
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+        (state, runtime)
+    }
+
+    #[tokio::test]
+    async fn resolve_route_partial_capability_drop_carries_precheck_errors() {
+        let (state, runtime) = build_state_partial_capability().await;
+        let req = test_request_with_reasoning("gpt-4o", "high");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
+
+        let resolved = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await
+        .expect("one capable target remains");
+
+        assert!(
+            resolved.targets.iter().any(|t| t.provider == "good"),
+            "capable target must survive"
+        );
+        assert!(
+            !resolved.targets.iter().any(|t| t.provider == "weird"),
+            "incapable target must be dropped"
+        );
+        assert_eq!(
+            resolved.precheck_errors.len(),
+            1,
+            "partial drop must surface one precheck error"
+        );
+        assert!(
+            resolved.precheck_errors[0].contains("lacks capability reasoning"),
+            "precheck_errors must name the missing capability; got: {:?}",
+            resolved.precheck_errors
+        );
+        assert!(
+            resolved.precheck_errors[0].contains("weird/"),
+            "precheck_errors must identify the dropped provider; got: {:?}",
+            resolved.precheck_errors
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_all_lack_capability_reports_reason_in_body_and_calllog() {
+        // Only the incapable target — full capability drop → 502 with the
+        // capability detail in the response body and the CallLog row.
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        let mut weird = provider_config(true);
+        weird.upstream_protocol = Some(sag_core::UpstreamProtocol::AnthropicMessages);
+        providers.insert("weird".into(), weird);
+        let routes = vec![sag_config::RouteConfig {
+            model_name: "gpt-4o".into(),
+            api_endpoint: "/chat/completions".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![sag_config::RouteTarget {
+                provider: "weird".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                upstream_protocol: None,
+            }],
+        }];
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+
+        let req = test_request_with_reasoning("gpt-4o", "high");
+        let trace_id = uuid::Uuid::new_v4();
+        let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
+
+        let result = resolve_route(
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+        )
+        .await;
+        let response = result.err().expect("all targets lack capability → 502");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("lacks capability"),
+            "response body must expose the capability reason; got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("disabled or unavailable"),
+            "capability full-drop must not fall back to generic disabled wording; got: {body_str}"
+        );
+
+        state.collector.flush().await;
+        let logs = state
+            .collector
+            .store()
+            .query_logs(sag_analytics::LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "one call log should be written");
+        let log = &logs[0];
+        assert_eq!(log.status_code, 502);
+        let error = log.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("lacks capability"),
+            "CallLog error must expose the capability reason; got: {error}"
+        );
     }
 
     // ── reasoning_effort round-trip test ─────────────────
@@ -1164,6 +1466,7 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
+                upstream_protocol: None,
             }],
         }];
 

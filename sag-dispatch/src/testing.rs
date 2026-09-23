@@ -26,6 +26,9 @@ pub fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget 
         extra: std::collections::HashMap::new(),
         retries,
         timeout_secs: 120,
+        upstream_protocol: sag_core::UpstreamProtocol::ChatCompletions,
+        upstream_protocol_explicit: false,
+        lane: sag_core::Lane::Translated,
     }
 }
 
@@ -51,6 +54,7 @@ pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
         anthropic_cache_control: true,
         chunk_timeout_secs: None,
         ttfb_timeout_secs: None,
+        upstream_protocol: None,
     }
 }
 

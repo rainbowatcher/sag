@@ -6,8 +6,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use sag_analytics::AnalyticsEvent;
 use sag_core::{AppError, FailureReason, FinalStatus, RequestResultFact, TargetAttemptFact};
+use sag_providers::ChatCompletionsCodec;
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
@@ -26,9 +28,16 @@ mod empty;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use attempt::ChatAttempt;
-pub(crate) use attempt::build_target_attempt_fact;
-pub(crate) use empty::{is_empty_non_stream_response, validate_stream_first_chunk};
+pub(crate) use attempt::{ChatAttempt, NonStreamAttempt, build_target_attempt_fact};
+pub(crate) use empty::{is_empty_ir_response, validate_stream_first_chunk};
+
+/// Chat ingress stream encoder: Raw bytes pass through unchanged; structured
+/// events / control frames go through the Chat codec. (`End` / `Usage` /
+/// `Error` are handled inline by the unfold loop and never reach `encode`
+/// for client yield — this fn is only for client-visible events.)
+fn encode_chat_stream_event(ev: &sag_core::IrStreamEvent) -> Vec<u8> {
+    ChatCompletionsCodec::encode_stream_event(ev)
+}
 
 /// Try each target in order. On a retryable error, retry the same target with
 /// exponential backoff. On a non-retryable 4xx error, do **not** retry the
@@ -57,7 +66,26 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         sticky_token,
         user_agent,
         client_ip,
+        ingress_protocol: _,
+        ir,
     } = ctx;
+
+    // IR orchestration view: routes.rs decodes once after
+    // `normalize_reasoning_effort`; fall back to a local decode so direct
+    // test constructions that pass `ir: None` still work. Model / reasoning
+    // identity continues to read from `request` for exact parity with the
+    // pre-M4 path (`request.model` is the route identity).
+    let ir_fallback;
+    let ir = match ir {
+        Some(ir) => ir,
+        None => {
+            ir_fallback = ChatCompletionsCodec::decode_request(request);
+            &ir_fallback
+        }
+    };
+    // M5+ lane selection may read `ir` / `target.lane`; M4 keeps the
+    // skeleton identical (provider still called via chat/chat_stream).
+    let _ = ir;
 
     // Client-disconnect terminal: if the handler future is dropped before
     // any normal terminal (non-streaming request, or a streaming request
@@ -179,17 +207,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     timeout_secs,
                                 )
                                 .await?;
+                            // Dispatch-boundary mapping: Data → Raw (original
+                            // bytes, no re-parse), Usage/Error/Done → IR 1:1.
+                            let s = s.map(sag_core::IrStreamEvent::from).boxed();
                             if retry_on_empty {
                                 // Peek at the first chunk before committing the HTTP
                                 // 200 response.  If the upstream returned an empty
                                 // response (ct=0, no content), surface an
                                 // `EmptyResponse` error so the retry loop retries the
                                 // same target with backoff.
-                                let s = validate_stream_first_chunk(Box::pin(s), &provider_name)
-                                    .await?;
+                                let s = validate_stream_first_chunk(s, &provider_name).await?;
                                 Ok(ChatAttempt::Stream(s, upstream_start))
                             } else {
-                                Ok(ChatAttempt::Stream(Box::pin(s), upstream_start))
+                                Ok(ChatAttempt::Stream(s, upstream_start))
                             }
                         } else {
                             let r = provider
@@ -201,12 +231,21 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     timeout_secs,
                                 )
                                 .await?;
-                            if retry_on_empty && is_empty_non_stream_response(&r) {
+                            // Decode once for IR-aware empty detection + usage
+                            // facts; the original `r` is retained for egress.
+                            let ir_resp = ChatCompletionsCodec::decode_response(&r);
+                            if retry_on_empty && is_empty_ir_response(&ir_resp) {
                                 return Err(AppError::EmptyResponse {
                                     provider: provider_name.clone(),
                                 });
                             }
-                            Ok(ChatAttempt::NonStream(r, upstream_start))
+                            Ok(ChatAttempt::NonStream(
+                                Box::new(NonStreamAttempt {
+                                    ir: ir_resp,
+                                    resp: r,
+                                }),
+                                upstream_start,
+                            ))
                         }
                     }
                     .await;
@@ -400,6 +439,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 return build_streaming_response(
                     state,
                     stream,
+                    encode_chat_stream_event,
                     route_name,
                     provider_name,
                     &request.model,
@@ -415,9 +455,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     client_ip.clone(),
                 );
             }
-            ChatAttempt::NonStream(resp, upstream_start) => {
+            ChatAttempt::NonStream(att, upstream_start) => {
                 // Non-streaming responses are single-shot: TTFT equals the
-                // total upstream duration.
+                // total upstream duration. Usage comes from the IR view
+                // (same `Usage` type / values as the original response).
                 let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
                 let timing = Some(upstream_duration_ms);
                 state.collector.log(success_log(
@@ -427,7 +468,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     &real_model,
                     false,
                     start,
-                    resp.usage.as_ref(),
+                    att.ir.usage.as_ref(),
                     request.reasoning_effort.as_deref(),
                     timing,
                     timing,
@@ -452,9 +493,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             stream: false,
                             started_at,
                             completed_at: chrono::Utc::now(),
-                            usage: resp.usage.clone(),
-                            cached_tokens: resp.usage.as_ref().and_then(|u| u.cached_tokens),
-                            cache_creation_tokens: resp
+                            usage: att.ir.usage.clone(),
+                            cached_tokens: att.ir.usage.as_ref().and_then(|u| u.cached_tokens),
+                            cache_creation_tokens: att
+                                .ir
                                 .usage
                                 .as_ref()
                                 .and_then(|u| u.cache_creation_tokens),
@@ -465,7 +507,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     },
                 )
                 .await;
-                return (StatusCode::OK, Json(resp)).into_response();
+                // Egress uses the **original** ChatCompletionResponse —
+                // dual-hold guarantees byte-identical JSON vs pre-M4
+                // (`encode_response` is not byte-safe for null content etc.).
+                return (StatusCode::OK, Json(att.resp)).into_response();
             }
         }
     }

@@ -147,6 +147,7 @@ async fn chat_completions(
         sticky_token,
         route_name,
         started_at,
+        precheck_errors,
     } = match resolve_route(
         &state,
         &runtime,
@@ -164,7 +165,9 @@ async fn chat_completions(
         Err(response) => return response,
     };
 
-    let mut errors = Vec::new();
+    // Seed the dispatch `errors` channel with capability pre-check drops so
+    // a later all-exhausted terminal still reports "lacks capability …".
+    let mut errors = precheck_errors;
 
     if api_endpoint.ends_with("/images/generations") {
         return dispatch_image(DispatchCtx {
@@ -183,9 +186,17 @@ async fn chat_completions(
             sticky_token,
             user_agent,
             client_ip,
+            ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+            // Image path stays out of IR (plan § D8 / M4 hard constraint).
+            ir: None,
         })
         .await;
     }
+
+    // M4: decode the protocol-neutral request once after normalization;
+    // `dispatch_chat` orchestrates on IR while providers still receive the
+    // original `ChatCompletionRequest`.
+    let ir = sag_providers::ChatCompletionsCodec::decode_request(&request);
 
     dispatch_chat(DispatchCtx {
         state: &state,
@@ -203,6 +214,8 @@ async fn chat_completions(
         sticky_token,
         user_agent,
         client_ip,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: Some(&ir),
     })
     .await
 }

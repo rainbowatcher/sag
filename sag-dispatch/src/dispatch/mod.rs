@@ -36,6 +36,7 @@ use sag_core::RouteTargetKey;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+pub mod capability;
 pub mod chat;
 pub mod image;
 pub mod resolve;
@@ -62,6 +63,15 @@ pub struct ResolvedTarget {
     pub extra: HashMap<String, serde_json::Value>,
     pub retries: u32,
     pub timeout_secs: u64,
+    /// Effective upstream protocol: explicit target/provider declaration
+    /// when present, otherwise derived from `provider_type`.
+    pub upstream_protocol: sag_core::UpstreamProtocol,
+    /// Whether the effective protocol came from an explicit declaration
+    /// (target or provider). Only an explicit declaration can select
+    /// [`Lane::Native`] (§4.2).
+    pub upstream_protocol_explicit: bool,
+    /// Lane for this target under the request's ingress protocol.
+    pub lane: sag_core::Lane,
 }
 
 /// Resolved route data: ordered targets, configured `api_endpoint`,
@@ -81,6 +91,11 @@ pub struct ResolvedRoute {
     /// Wall-clock timestamp captured at route scheduling time, next to the
     /// `Instant` used for legacy duration timing.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Capability pre-check drops for this request (`"{provider}/{model}:
+    /// lacks capability X"`), surfaced when some but not all targets were
+    /// filtered. Callers seed the dispatch `errors` channel with these so
+    /// a later all-exhausted terminal still shows the capability detail.
+    pub precheck_errors: Vec<String>,
 }
 
 /// Bundled parameters for a single dispatch call. Replaces the 7–8
@@ -114,6 +129,13 @@ pub struct DispatchCtx<'a> {
     pub sticky_token: sag_state::StickyToken,
     pub user_agent: Option<String>,
     pub client_ip: Option<String>,
+    /// Ingress protocol of the current request (mount path → protocol).
+    pub ingress_protocol: sag_core::IngressProtocol,
+    /// Protocol-neutral request view for chat orchestration (empty/fact/lane).
+    /// Chat fills `Some`; the image path stays out of IR (§ D8) and passes
+    /// `None`. When `None`, `dispatch_chat` decodes from `request` as a
+    /// fallback so direct test constructions stay valid.
+    pub ir: Option<&'a sag_core::IrRequest>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1140,6 +1162,7 @@ mod tests {
             enabled_models: vec![],
             enabled: true,
             anthropic_cache_control: false,
+            upstream_protocol: None,
         }
     }
 

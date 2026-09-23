@@ -8,7 +8,7 @@ use axum::{body::Body, http::StatusCode, response::Response};
 use futures_util::{Stream, StreamExt, stream::unfold};
 use sag_analytics::{CallLogCollector, EventCollector, EventQueueError};
 use sag_core::{
-    CallLog, FailureReason, FinalStatus, RequestResultFact, StreamChunk, TargetAttemptFact,
+    CallLog, FailureReason, FinalStatus, IrStreamEvent, RequestResultFact, TargetAttemptFact,
     TargetStatus, Usage,
 };
 use std::sync::Mutex;
@@ -333,8 +333,12 @@ impl Drop for TerminalGuard {
 
 /// Per-response mutable state carried through the `unfold` loop of
 /// [`build_streaming_response`].
-struct StreamState<S> {
+struct StreamState<S, E> {
     stream: S,
+    /// Ingress-protocol encoder: event → client-visible SSE bytes.
+    /// `Raw` must pass through original bytes; structured events are
+    /// protocol-encoded (M5+).
+    encode: E,
     usage: Usage,
     error: Option<String>,
     done: bool,
@@ -395,8 +399,9 @@ fn make_stream_analytics(
 /// Construct the [`StreamState`] that seeds the `unfold` loop, wiring the
 /// client-disconnect [`TerminalGuard`].
 #[allow(clippy::too_many_arguments)]
-fn make_stream_state<S>(
+fn make_stream_state<S, E>(
     stream: S,
+    encode: E,
     collector: Arc<CallLogCollector>,
     analytics: Arc<StreamAnalytics>,
     start: Instant,
@@ -404,9 +409,10 @@ fn make_stream_state<S>(
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
-) -> StreamState<S> {
+) -> StreamState<S, E> {
     StreamState {
         stream,
+        encode,
         usage: Usage::default(),
         error: None,
         done: false,
@@ -464,7 +470,7 @@ fn merge_stream_usage(acc: &mut Usage, frame: &Usage) {
 /// an upstream error classifies as `stream_error_after_commit`,
 /// not `client_cancelled`, and the call_logs `error` column
 /// carries the upstream message.
-fn record_stream_error<S>(state: &mut StreamState<S>, msg: String) {
+fn record_stream_error<S, E>(state: &mut StreamState<S, E>, msg: String) {
     warn!(
         provider = %state.analytics.provider,
         error = %msg,
@@ -488,8 +494,8 @@ fn record_stream_error<S>(state: &mut StreamState<S>, msg: String) {
 /// latency coverage denominators or be mistaken for a success sample.
 /// `duration_ms` (route wall-clock) still carries the total request time
 /// for diagnostics.
-fn build_stream_call_log<S>(
-    state: &StreamState<S>,
+fn build_stream_call_log<S, E>(
+    state: &StreamState<S, E>,
     error: Option<String>,
     upstream_duration_ms: u64,
     ttft_ms: Option<u64>,
@@ -557,7 +563,7 @@ fn build_stream_call_log<S>(
 /// formal analytics terminal event for the normal `Done`/`None` path.
 /// Call order is load-bearing: mark `done` → `CallLog` → `terminal_event`
 /// → deliver → return.
-async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
+async fn finish_stream_terminal<S, E>(state: &mut StreamState<S, E>) {
     state.done = true;
     // Claim the terminal *before* writing the call_logs row
     // or delivering the event: if log construction panics or
@@ -645,14 +651,22 @@ async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
     }
 }
 
-/// Wrap a `StreamChunk` stream in an SSE `Response`, forwarding data chunks
-/// to the client verbatim and accumulating `Usage` / `Error` chunks into
-/// a final `CallLog` when the stream ends.
+/// Wrap an [`IrStreamEvent`] stream in an SSE `Response`, encoding each
+/// client-visible event via `encode` and accumulating `Usage` / `Error`
+/// events into a final `CallLog` when the stream ends.
+///
+/// `encode` maps one event to client-facing bytes. For the Chat ingress it
+/// must forward [`IrStreamEvent::Raw`] **byte-identically** (the original
+/// upstream SSE frame) and render structured events via the ingress codec.
+/// `Usage` / `Error` / `End` are handled inline by the loop (merge /
+/// record / finish) and are never re-encoded into the body — matching the
+/// legacy `StreamChunk` contract (only Data bytes reach the client;
+/// `[DONE]` itself arrives as a Raw Data frame).
 ///
 /// `upstream_start` is captured immediately before the provider call. It
 /// drives two timing fields on the final `CallLog`:
 /// - `upstream_duration_ms` — wall-clock from start to stream end.
-/// - `ttft_ms` — wall-clock to the first `StreamChunk::Data`, or `None`
+/// - `ttft_ms` — wall-clock to the first client-visible byte, or `None`
 ///   if the stream emitted only metadata.
 ///
 /// ## Formal analytics terminal event
@@ -661,10 +675,10 @@ async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
 /// (the EventWriter's `request_id` idempotency is the backstop against
 /// duplicates):
 ///
-/// - normal `Done`/`None` without a mid-stream error → `Success` with the
+/// - normal `End`/`None` without a mid-stream error → `Success` with the
 ///   final accumulated usage / cache / TTFT / upstream timing, plus a
 ///   `Success` target fact for this streamed target;
-/// - normal `Done`/`None` after a mid-stream `Error` → `ModelFailure` /
+/// - normal `End`/`None` after a mid-stream `Error` → `ModelFailure` /
 ///   `stream_error_after_commit` (no fallback after commit; the HTTP 200 /
 ///   truncated-SSE legacy protocol behavior is unchanged), with a
 ///   `Failure` target fact; tokens stay NULL;
@@ -688,9 +702,10 @@ async fn finish_stream_terminal<S>(state: &mut StreamState<S>) {
 /// `started_at` is the wall-clock start of this target's first provider
 /// call, and both facts share the same terminal `completed_at`.
 #[allow(clippy::too_many_arguments)]
-pub fn build_streaming_response<S>(
+pub fn build_streaming_response<S, E>(
     state: &AppState,
     chunk_stream: S,
+    encode: E,
     route_name: &str,
     provider_name: &str,
     model: &str,
@@ -711,7 +726,8 @@ where
     // `Pin<Box<dyn Stream + Send>>` (boxed at the provider boundary),
     // which satisfies this bound — non-`Unpin` streams would need to
     // be boxed by the caller first.
-    S: Stream<Item = StreamChunk> + Send + Unpin + 'static,
+    S: Stream<Item = IrStreamEvent> + Send + Unpin + 'static,
+    E: Fn(&IrStreamEvent) -> Vec<u8> + Send + 'static,
 {
     let analytics = make_stream_analytics(
         state,
@@ -730,6 +746,7 @@ where
     );
     let state = make_stream_state(
         chunk_stream,
+        encode,
         state.collector.clone(),
         analytics,
         start,
@@ -745,22 +762,35 @@ where
         }
         loop {
             match state.stream.next().await {
-                Some(StreamChunk::Data(raw)) => {
-                    // Stamp TTFT once on the first user-visible byte.
+                // Usage / Error / End are protocol-control events: merge /
+                // record / finish inline — never encoded into the client body
+                // (legacy StreamChunk contract: only Data bytes reach the
+                // client; [DONE] itself arrives as a Raw Data frame).
+                Some(IrStreamEvent::Usage(u)) => {
+                    merge_stream_usage(&mut state.usage, &u);
+                }
+                Some(IrStreamEvent::Error(msg)) => {
+                    record_stream_error(&mut state, msg);
+                }
+                Some(IrStreamEvent::End) | None => {
+                    finish_stream_terminal(&mut state).await;
+                    return None;
+                }
+                Some(ev) => {
+                    // Client-visible event (Raw / structured): encode and
+                    // stamp TTFT on the first non-empty yielded byte —
+                    // a 0-byte encode is not a first byte.
+                    let bytes = (state.encode)(&ev);
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     if state.first_byte_at.is_none() {
                         state.first_byte_at = Some(Instant::now());
                     }
-                    return Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(raw)), state));
-                }
-                Some(StreamChunk::Usage(u)) => {
-                    merge_stream_usage(&mut state.usage, &u);
-                }
-                Some(StreamChunk::Error(msg)) => {
-                    record_stream_error(&mut state, msg);
-                }
-                Some(StreamChunk::Done) | None => {
-                    finish_stream_terminal(&mut state).await;
-                    return None;
+                    return Some((
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes)),
+                        state,
+                    ));
                 }
             }
         }
@@ -782,7 +812,7 @@ mod tests {
     use futures_util::stream;
     use sag_analytics::{LogFilter, StatsFilter};
     use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig};
-    use sag_core::Usage;
+    use sag_core::{StreamChunk, Usage};
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -805,8 +835,30 @@ mod tests {
         crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
     }
 
+    #[allow(dead_code)]
     fn chunk_stream(chunks: Vec<StreamChunk>) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send>> {
         Box::pin(stream::iter(chunks))
+    }
+
+    /// Map legacy [`StreamChunk`] fixtures onto the IR event stream the
+    /// builder now consumes (`Data` → `Raw`, `Done` → `End`, …).
+    fn ir_stream(chunks: Vec<StreamChunk>) -> Pin<Box<dyn Stream<Item = IrStreamEvent> + Send>> {
+        Box::pin(stream::iter(
+            chunks
+                .into_iter()
+                .map(IrStreamEvent::from)
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Chat ingress encoder under test: Raw passes through; structured
+    /// events / control frames use the Chat codec. (`End` is never encoded
+    /// by the loop — it finishes the terminal — but the fn stays total.)
+    fn encode_chat(ev: &IrStreamEvent) -> Vec<u8> {
+        match ev {
+            IrStreamEvent::Raw(b) => b.clone(),
+            other => sag_providers::ChatCompletionsCodec::encode_stream_event(other),
+        }
     }
 
     /// Build a streaming response with default identity / timing args
@@ -822,7 +874,8 @@ mod tests {
     ) -> axum::response::Response<axum::body::Body> {
         build_streaming_response(
             state,
-            chunk_stream(chunks),
+            ir_stream(chunks),
+            encode_chat,
             "test-route",
             provider,
             model,
@@ -1105,7 +1158,8 @@ mod tests {
         ];
         let resp = build_streaming_response(
             &state,
-            chunk_stream(chunks),
+            ir_stream(chunks),
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1321,7 +1375,8 @@ mod tests {
         ];
         let resp = build_streaming_response(
             &state,
-            chunk_stream(chunks),
+            ir_stream(chunks),
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1442,7 +1497,8 @@ mod tests {
         ];
         let resp = build_streaming_response(
             &state,
-            chunk_stream(chunks),
+            ir_stream(chunks),
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1522,10 +1578,12 @@ mod tests {
                 reasoning_tokens: None,
             }),
         ])
+        .map(IrStreamEvent::from)
         .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1600,10 +1658,12 @@ mod tests {
             StreamChunk::Data(b"data: partial\n\n".to_vec()),
             StreamChunk::Error("upstream died".into()),
         ])
+        .map(IrStreamEvent::from)
         .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1686,10 +1746,12 @@ mod tests {
                 reasoning_tokens: None,
             }),
         ])
+        .map(IrStreamEvent::from)
         .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1763,10 +1825,12 @@ mod tests {
             StreamChunk::Data(b"data: partial\n\n".to_vec()),
             StreamChunk::Error("upstream burst error".into()),
         ])
+        .map(IrStreamEvent::from)
         .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1866,7 +1930,8 @@ mod tests {
         ];
         let resp = build_streaming_response(
             &state,
-            chunk_stream(chunks),
+            ir_stream(chunks),
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -1951,10 +2016,12 @@ mod tests {
         let (state, pool) = build_state_with_event_pool(vec![]).await;
         let trace_id = Uuid::new_v4();
         let stream = stream::iter(vec![StreamChunk::Data(b"data: partial\n\n".to_vec())])
+            .map(IrStreamEvent::from)
             .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -2023,10 +2090,12 @@ mod tests {
                 b"data: {\"error\":{\"message\":\"upstream burst error\"}}\n\n".to_vec(),
             ),
         ])
+        .map(IrStreamEvent::from)
         .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -2117,7 +2186,7 @@ mod tests {
         let trace_id = Uuid::new_v4();
         let resp = build_streaming_response(
             &state,
-            chunk_stream(vec![
+            ir_stream(vec![
                 StreamChunk::Data(b"data: partial\n\n".to_vec()),
                 StreamChunk::Usage(Usage {
                     prompt_tokens: 5,
@@ -2129,6 +2198,7 @@ mod tests {
                 }),
                 StreamChunk::Done,
             ]),
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -2215,7 +2285,7 @@ mod tests {
         let trace_id = Uuid::new_v4();
         let resp = build_streaming_response(
             &state,
-            chunk_stream(vec![
+            ir_stream(vec![
                 StreamChunk::Data(b"data: partial\n\n".to_vec()),
                 StreamChunk::Usage(Usage {
                     prompt_tokens: 5,
@@ -2228,6 +2298,7 @@ mod tests {
                 StreamChunk::Error("upstream died".into()),
                 StreamChunk::Done,
             ]),
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",
@@ -2303,10 +2374,12 @@ mod tests {
 
         let trace_id = Uuid::new_v4();
         let stream = stream::iter(vec![StreamChunk::Data(b"data: partial\n\n".to_vec())])
+            .map(IrStreamEvent::from)
             .chain(stream::pending());
         let resp = build_streaming_response(
             &state,
             stream,
+            encode_chat,
             "test-route",
             "openai",
             "gpt-4o",

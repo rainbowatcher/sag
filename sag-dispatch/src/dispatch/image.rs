@@ -56,6 +56,8 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         sticky_token,
         user_agent,
         client_ip,
+        ingress_protocol: _,
+        ir: _,
     } = ctx;
 
     // Client-disconnect terminal (image dispatch is non-streaming, so this
@@ -1023,6 +1025,8 @@ mod tests {
             sticky_token: sag_state::StickyToken::default(),
             user_agent: None,
             client_ip: None,
+            ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+            ir: None,
         }
     }
 

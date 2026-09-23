@@ -1,6 +1,8 @@
 //! Chat attempt types and fact conversion helpers.
 
-use sag_core::{ChatCompletionResponse, StreamChunk, TargetAttemptFact, TargetStatus};
+use sag_core::{
+    ChatCompletionResponse, IrResponse, IrStreamEvent, TargetAttemptFact, TargetStatus,
+};
 
 use crate::dispatch::retry::RetryOutcome;
 
@@ -10,10 +12,23 @@ use crate::dispatch::retry::RetryOutcome;
 /// overhead.
 pub(crate) enum ChatAttempt {
     Stream(
-        futures_util::stream::BoxStream<'static, StreamChunk>,
+        futures_util::stream::BoxStream<'static, IrStreamEvent>,
         std::time::Instant,
     ),
-    NonStream(ChatCompletionResponse, std::time::Instant),
+    /// Non-streaming success. Dual-holds the decoded [`IrResponse`] (empty
+    /// detection / usage facts) **and** the original [`ChatCompletionResponse`]
+    /// for client egress — `encode_response` is not guaranteed byte-identical
+    /// (e.g. `content: null` → `""`), so the original object is what
+    /// `Json(...)` serializes. Boxed to keep the enum size balanced.
+    NonStream(Box<NonStreamAttempt>, std::time::Instant),
+}
+
+/// Dual-hold payload of a successful non-streaming attempt.
+pub(crate) struct NonStreamAttempt {
+    /// Decoded IR view: drives empty detection and usage facts.
+    pub ir: IrResponse,
+    /// Original provider response: sole source for the client-facing body.
+    pub resp: ChatCompletionResponse,
 }
 
 /// Build the single [`TargetAttemptFact`] for an actually-issued target
@@ -39,7 +54,7 @@ pub(crate) fn build_target_attempt_fact(
     // practice — the retry loop always issues attempt 0).
     let started_at = started_at.unwrap_or(completed_at);
     match outcome {
-        RetryOutcome::Success(ChatAttempt::NonStream(resp, upstream_start)) => {
+        RetryOutcome::Success(ChatAttempt::NonStream(att, upstream_start)) => {
             let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
             Some(TargetAttemptFact {
                 provider: provider.to_string(),
@@ -48,8 +63,8 @@ pub(crate) fn build_target_attempt_fact(
                 failure_reason: None,
                 started_at,
                 completed_at,
-                usage: resp.usage.clone(),
-                cached_tokens: resp.usage.as_ref().and_then(|u| u.cached_tokens),
+                usage: att.ir.usage.clone(),
+                cached_tokens: att.ir.usage.as_ref().and_then(|u| u.cached_tokens),
                 ttft_ms: Some(upstream_duration_ms),
                 upstream_duration_ms: Some(upstream_duration_ms),
             })
