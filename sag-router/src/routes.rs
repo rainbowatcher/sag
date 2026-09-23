@@ -32,7 +32,7 @@ use crate::middleware::trace::trace_middleware;
 use sag_admin::build_admin_routes;
 use sag_dispatch::{
     AppState, DispatchCtx, DispatchRuntime, ResolvedRoute, dispatch_chat, dispatch_image,
-    resolve_route,
+    resolve_route, resolve_route_with_ingress,
 };
 
 /// Build the main Axum router with all routes and middleware.
@@ -52,6 +52,12 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
             "/v1/chat/completions",
             Router::new()
                 .route("/", post(chat_completions))
+                .layer(axum::Extension(runtime.clone())),
+        )
+        .nest(
+            "/v1/messages",
+            Router::new()
+                .route("/", post(anthropic_messages))
                 .layer(axum::Extension(runtime)),
         )
         .nest("/v1", Router::new().route("/models", get(list_models)))
@@ -218,6 +224,193 @@ async fn chat_completions(
         ir: Some(&ir),
     })
     .await
+}
+
+/// POST `/v1/messages` — Anthropic Messages ingress (M5).
+///
+/// Decodes the Anthropic SDK-shaped body to IR, resolves the route with
+/// `IngressProtocol::AnthropicMessages`, reuses `dispatch_chat`, and
+/// renders responses/errors in the Anthropic envelope (§8.2).
+#[instrument(skip_all, fields(request_id, model, stream))]
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    Extension(trace_id): Extension<uuid::Uuid>,
+    Extension(runtime): Extension<DispatchRuntime>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response<Body> {
+    let start = Instant::now();
+    let started_at = chrono::Utc::now();
+
+    let Json(raw_body) = match body {
+        Ok(json) => json,
+        Err(rejection) => {
+            emit_client_error_event(&state, trace_id, started_at, &rejection).await;
+            // Anthropic ingress uses the Anthropic error envelope.
+            let status = rejection.status();
+            let msg = rejection.body_text();
+            let error_type = match status.as_u16() {
+                401 => "authentication_error",
+                413 => "request_too_large",
+                _ => "invalid_request_error",
+            };
+            return (
+                status,
+                Json(serde_json::json!({
+                    "type": "error",
+                    "error": { "type": error_type, "message": msg },
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Decode Anthropic body → IR (structural drops recorded on ir.loss).
+    let ir = sag_providers::AnthropicMessagesCodec::decode_request(&raw_body);
+    // Synthesize a ChatCompletionRequest so resolve_route / cancel_guard /
+    // analytics have model / stream / reasoning_effort / tools (plan M5-C).
+    let (mut request, encode_loss) =
+        sag_providers::ChatCompletionsCodec::encode_request_with_loss(&ir);
+    if !encode_loss.is_empty() {
+        warn!(loss = ?encode_loss.entries, "chat encode recorded losses");
+    }
+    request.normalize_reasoning_effort();
+
+    let is_stream = request.stream.unwrap_or(false);
+    let span = tracing::Span::current();
+    span.record("request_id", trace_id.to_string());
+    span.record("model", request.model.as_str());
+    span.record("stream", is_stream);
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+
+    let ResolvedRoute {
+        targets,
+        api_endpoint,
+        strategy,
+        sticky_token,
+        route_name,
+        started_at,
+        precheck_errors,
+    } = match resolve_route_with_ingress(
+        &state,
+        &runtime,
+        &request,
+        trace_id,
+        start,
+        started_at,
+        is_stream,
+        user_agent.as_deref(),
+        client_ip.as_deref(),
+        sag_core::IngressProtocol::AnthropicMessages,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(response) => return render_anthropic_error(response).await,
+    };
+
+    let mut errors = precheck_errors;
+
+    if api_endpoint.ends_with("/images/generations") {
+        // Image path is Chat-only (plan D8); reject with Anthropic envelope.
+        let err = sag_core::AppError::BadRequest(
+            "image generation is not supported on /v1/messages".into(),
+        );
+        return err.into_anthropic_response();
+    }
+
+    let response = dispatch_chat(DispatchCtx {
+        state: &state,
+        runtime: &runtime,
+        request: &request,
+        targets: &targets,
+        api_endpoint: &api_endpoint,
+        is_stream,
+        trace_id,
+        start,
+        route_name: &route_name,
+        started_at,
+        errors: &mut errors,
+        strategy,
+        sticky_token,
+        user_agent,
+        client_ip,
+        ingress_protocol: sag_core::IngressProtocol::AnthropicMessages,
+        ir: Some(&ir),
+    })
+    .await;
+
+    render_anthropic_error(response).await
+}
+
+/// Convert an error response (OpenAI `{"error":{...}}` envelope) into the
+/// Anthropic ingress envelope. Successful responses pass through unchanged.
+async fn render_anthropic_error(response: Response<Body>) -> Response<Body> {
+    if response.status().is_success() {
+        return response;
+    }
+    let status = response.status();
+    // Streaming / SSE bodies (post-commit) are left alone — only JSON
+    // error envelopes are re-rendered.
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.contains("application/json") {
+        return response;
+    }
+    let bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    // Already Anthropic-shaped?
+    if parsed.get("type").and_then(|t| t.as_str()) == Some("error") {
+        return (status, bytes).into_response();
+    }
+    let message = parsed
+        .pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("request failed")
+        .to_string();
+    let error_type = match status.as_u16() {
+        401 => "authentication_error",
+        400 | 422 => "invalid_request_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        403 => "permission_error",
+        s if (500..600).contains(&s) => "api_error",
+        _ => "api_error",
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "type": "error",
+            "error": { "type": error_type, "message": message },
+        })),
+    )
+        .into_response()
 }
 
 /// `requested_model` placeholder for requests whose JSON body never parsed

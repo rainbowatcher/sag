@@ -82,7 +82,10 @@ async fn bridge_complete<P: LlmProvider + ?Sized>(
     target: &UpstreamTargetCtx<'_>,
     lane: Lane,
 ) -> sag_core::Result<UpstreamOutcome> {
-    let encoded = ChatCompletionsCodec::encode_request(ir);
+    let (encoded, loss) = ChatCompletionsCodec::encode_request_with_loss(ir);
+    if !loss.is_empty() {
+        tracing::warn!(loss = ?loss.entries, "chat encode recorded losses");
+    }
     let resp = provider
         .chat(
             &encoded,
@@ -111,7 +114,10 @@ async fn bridge_complete_stream<P: LlmProvider + ?Sized>(
     target: &UpstreamTargetCtx<'_>,
     lane: Lane,
 ) -> sag_core::Result<Pin<Box<dyn Stream<Item = UpstreamStreamEvent> + Send>>> {
-    let encoded = ChatCompletionsCodec::encode_request(ir);
+    let (encoded, loss) = ChatCompletionsCodec::encode_request_with_loss(ir);
+    if !loss.is_empty() {
+        tracing::warn!(loss = ?loss.entries, "chat encode recorded losses");
+    }
     let upstream = provider
         .chat_stream(
             &encoded,

@@ -230,6 +230,61 @@ impl AppError {
     }
 }
 
+impl AppError {
+    /// Anthropic ingress error category (`error.type`) for this error.
+    ///
+    /// Mapping (plan §8.2): 401→authentication_error, 400/422→
+    /// invalid_request_error, 429→rate_limit_error, 404→not_found_error,
+    /// 5xx→api_error.
+    pub fn anthropic_error_type(&self) -> &'static str {
+        match self.status_code().as_u16() {
+            401 => "authentication_error",
+            400 | 422 => "invalid_request_error",
+            403 => "permission_error",
+            404 => "not_found_error",
+            413 => "request_too_large",
+            429 => "rate_limit_error",
+            s if (500..600).contains(&s) => "api_error",
+            _ => "api_error",
+        }
+    }
+
+    /// Render this error in the Anthropic ingress envelope:
+    /// `{"type":"error","error":{"type":"<category>","message":"..."}}`.
+    ///
+    /// The Chat/Responses `into_response` path is unchanged — only the
+    /// `/v1/messages` handler uses this renderer.
+    pub fn into_anthropic_response(self) -> Response {
+        let status = self.status_code();
+        let error_type = self.anthropic_error_type();
+        let message = match &self {
+            AppError::Config(msg) => msg.clone(),
+            AppError::Unauthorized(msg) => msg.clone(),
+            AppError::Upstream { body, .. } => body.clone(),
+            AppError::BadRequest(msg) => msg.clone(),
+            AppError::ModelNotFound(msg) => msg.clone(),
+            AppError::NotFound(msg) => msg.clone(),
+            AppError::Conflict(msg) => msg.clone(),
+            AppError::AllProvidersExhausted { reason, .. } => reason.clone(),
+            AppError::Network(e) => e.to_string(),
+            AppError::TtfbTimeout { .. } => self.to_string(),
+            AppError::EmptyResponse { .. } => self.to_string(),
+            AppError::Internal(msg) => msg.clone(),
+            AppError::Anyhow(e) => e.to_string(),
+        };
+
+        let body = json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message,
+            }
+        });
+
+        (status, Json(body)).into_response()
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
@@ -839,5 +894,150 @@ mod tests {
                 "final_status must follow the authoritative reason table"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod anthropic_envelope_tests {
+    use super::*;
+
+    async fn extract_anthropic(err: AppError) -> (StatusCode, serde_json::Value) {
+        let response: Response = err.into_anthropic_response();
+        let status = response.status();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn unauthorized_renders_authentication_error() {
+        let (status, body) = extract_anthropic(AppError::Unauthorized("bad key".into())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["message"], "bad key");
+    }
+
+    #[tokio::test]
+    async fn bad_request_renders_invalid_request_error() {
+        let (status, body) = extract_anthropic(AppError::BadRequest("bad param".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "bad param");
+    }
+
+    #[tokio::test]
+    async fn model_not_found_renders_not_found_error() {
+        let (status, body) = extract_anthropic(AppError::ModelNotFound("gpt-99".into())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["message"], "gpt-99");
+    }
+
+    #[tokio::test]
+    async fn upstream_429_renders_rate_limit_error() {
+        let (status, body) = extract_anthropic(AppError::Upstream {
+            provider: "openai".into(),
+            status: 429,
+            body: "rate limited".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "rate limited");
+    }
+
+    #[tokio::test]
+    async fn upstream_500_renders_api_error() {
+        let (status, body) = extract_anthropic(AppError::Upstream {
+            provider: "openai".into(),
+            status: 500,
+            body: "boom".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "boom");
+    }
+
+    #[tokio::test]
+    async fn all_providers_exhausted_renders_api_error_envelope() {
+        let (status, body) = extract_anthropic(AppError::AllProvidersExhausted {
+            model: "m".into(),
+            reason: "all failed".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "all failed");
+    }
+
+    #[tokio::test]
+    async fn chat_into_response_shape_unchanged() {
+        // M4 invariant: Chat envelope must remain `{"error":{"code","message"}}`.
+        let response: Response = AppError::Unauthorized("bad".into()).into_response();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        assert!(
+            body.get("type").is_none(),
+            "Chat envelope must not have type=error"
+        );
+    }
+
+    #[test]
+    fn anthropic_error_type_mapping() {
+        assert_eq!(
+            AppError::Unauthorized("x".into()).anthropic_error_type(),
+            "authentication_error"
+        );
+        assert_eq!(
+            AppError::BadRequest("x".into()).anthropic_error_type(),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            AppError::ModelNotFound("x".into()).anthropic_error_type(),
+            "not_found_error"
+        );
+        assert_eq!(
+            AppError::Upstream {
+                provider: "p".into(),
+                status: 429,
+                body: String::new(),
+            }
+            .anthropic_error_type(),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            AppError::Upstream {
+                provider: "p".into(),
+                status: 503,
+                body: String::new(),
+            }
+            .anthropic_error_type(),
+            "api_error"
+        );
+        assert_eq!(
+            AppError::Upstream {
+                provider: "p".into(),
+                status: 500,
+                body: String::new(),
+            }
+            .anthropic_error_type(),
+            "api_error"
+        );
+        assert_eq!(
+            AppError::Conflict("x".into()).anthropic_error_type(),
+            "api_error"
+        );
     }
 }

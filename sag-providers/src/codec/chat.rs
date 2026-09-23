@@ -184,7 +184,17 @@ impl ChatCompletionsCodec {
     }
 
     pub fn encode_request(ir: &IrRequest) -> ChatCompletionRequest {
+        Self::encode_request_with_loss(ir).0
+    }
+
+    /// Encode IR → Chat request, returning any encode-side loss entries
+    /// (non-text tool_result content drops). Production callers should use
+    /// this (or equivalent) so structural drops are never silent (B3).
+    pub fn encode_request_with_loss(
+        ir: &IrRequest,
+    ) -> (ChatCompletionRequest, sag_core::LossInventory) {
         let mut raw = ir.raw.clone();
+        let mut loss = ir.loss.clone();
 
         // tools: prefer original raw value (decode failure path); else rebuild.
         let tools = match raw.remove("tools") {
@@ -193,10 +203,17 @@ impl ChatCompletionsCodec {
             None => None,
         };
 
+        let messages: Vec<ChatMessage> = ir
+            .messages
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| encode_message(m, i, &mut loss))
+            .collect();
+
         // Restore typed non-IR fields from raw; remaining keys → extra.
-        ChatCompletionRequest {
+        let request = ChatCompletionRequest {
             model: ir.model.clone(),
-            messages: ir.messages.iter().map(encode_message).collect(),
+            messages,
             temperature: ir.sampling.temperature,
             top_p: ir.sampling.top_p,
             n: raw.remove("n").and_then(|v| v.as_u64()).map(|v| v as u32),
@@ -235,7 +252,8 @@ impl ChatCompletionsCodec {
             moderation: take_raw_value(&mut raw, "moderation"),
             web_search_options: take_raw_value(&mut raw, "web_search_options"),
             extra: raw,
-        }
+        };
+        (request, loss)
     }
 
     // ── response ───────────────────────────────────────────────────
@@ -368,7 +386,8 @@ impl ChatCompletionsCodec {
                 continue;
             };
 
-            // Top-level error object.
+            // Top-level error object. Emit Error + Raw (client-visible frame),
+            // aligned with the Anthropic codec (B4).
             if let Some(err) = val.get("error").filter(|e| !e.is_null()) {
                 let msg = err
                     .get("message")
@@ -376,6 +395,7 @@ impl ChatCompletionsCodec {
                     .unwrap_or_else(|| err.as_str().unwrap_or("upstream error"))
                     .to_string();
                 events.push(IrStreamEvent::Error(msg));
+                events.push(IrStreamEvent::Raw(frame.to_vec()));
                 continue;
             }
 
@@ -824,30 +844,158 @@ fn encode_tool_call(tc: &IrToolCall) -> Value {
     })
 }
 
-fn encode_message(msg: &IrMessage) -> ChatMessage {
+fn encode_message(
+    msg: &IrMessage,
+    idx: usize,
+    loss: &mut sag_core::LossInventory,
+) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
     let mut extra = msg.raw.clone();
 
-    if !msg.tool_calls.is_empty() {
-        let tcs: Vec<Value> = msg.tool_calls.iter().map(encode_tool_call).collect();
-        extra.insert("tool_calls".into(), Value::Array(tcs));
-    }
-    if let Some(id) = &msg.tool_call_id {
-        extra.insert("tool_call_id".into(), json!(id));
+    // tool role → OpenAI `role:"tool"` message (already carries tool_call_id).
+    if msg.role == IrRole::Tool {
+        if let Some(id) = &msg.tool_call_id {
+            extra.insert("tool_call_id".into(), json!(id));
+        }
+        if !msg.tool_calls.is_empty() {
+            let tcs: Vec<Value> = msg.tool_calls.iter().map(encode_tool_call).collect();
+            extra.insert("tool_calls".into(), Value::Array(tcs));
+        }
+        let content = encode_content_lossy(&msg.content, idx, 0, loss);
+        let role = serde_json::to_value(&msg.role)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "tool".into());
+        out.push(ChatMessage {
+            role,
+            content,
+            name: msg.name.clone(),
+            extra,
+        });
+        return out;
     }
 
-    let content = encode_content(&msg.content);
+    // Split content: ToolResult → independent tool messages (B2);
+    // ToolUse → message-level tool_calls only (never content array).
+    let mut content_blocks: Vec<IrContentBlock> = Vec::new();
+    let mut tool_results: Vec<(String, Map<String, Value>)> = Vec::new();
+    for (bi, block) in msg.content.iter().enumerate() {
+        match block {
+            IrContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                id: _,
+            } => {
+                let mut text = String::new();
+                for (ci, inner) in content.iter().enumerate() {
+                    match inner {
+                        IrContentBlock::Text { text: t } => text.push_str(t),
+                        other => {
+                            loss.push_loss(
+                                LossScope::ContentBlock,
+                                format!("messages[{idx}].content[{bi}].content[{ci}]"),
+                                LossReason::UnsupportedByIr,
+                                serde_json::to_value(other).unwrap_or(Value::Null),
+                            );
+                        }
+                    }
+                }
+                let mut tr_extra = Map::new();
+                tr_extra.insert("tool_call_id".into(), json!(tool_call_id));
+                if *is_error {
+                    tr_extra.insert("is_error".into(), json!(true));
+                }
+                tool_results.push((text, tr_extra));
+            }
+            IrContentBlock::ToolUse { .. } => {
+                // Not content — folded into tool_calls below (B2).
+            }
+            other => content_blocks.push(other.clone()),
+        }
+    }
+
+    // tool_calls = message-level mirror ∪ content ToolUse blocks (OpenAI shape).
+    let mut tool_calls: Vec<IrToolCall> = msg.tool_calls.clone();
+    for block in &msg.content {
+        if let IrContentBlock::ToolUse {
+            id,
+            name,
+            arguments,
+        } = block
+            && !tool_calls.iter().any(|tc| &tc.id == id)
+        {
+            tool_calls.push(IrToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                index: Some(tool_calls.len() as u32),
+            });
+        }
+    }
+
+    if !tool_calls.is_empty() {
+        let tcs: Vec<Value> = tool_calls.iter().map(encode_tool_call).collect();
+        extra.insert("tool_calls".into(), Value::Array(tcs));
+    }
+
+    let content = encode_content_lossy(&content_blocks, idx, 0, loss);
 
     let role = serde_json::to_value(&msg.role)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "user".into());
 
-    ChatMessage {
-        role,
-        content,
-        name: msg.name.clone(),
-        extra,
+    // Emit the primary message when it has content/tool_calls/name, or when
+    // there is nothing else to emit. Pure tool_result turns skip an empty
+    // wrapper. Assistant with tool_calls may keep null/empty content (B2).
+    let has_payload = !content_blocks.is_empty() || !tool_calls.is_empty() || msg.name.is_some();
+    if has_payload || tool_results.is_empty() {
+        out.push(ChatMessage {
+            role,
+            content,
+            name: msg.name.clone(),
+            extra,
+        });
     }
+
+    // ToolResult blocks → independent `role:"tool"` messages after the
+    // primary message (OpenAI requires them after the tool_calls turn).
+    for (text, tr_extra) in tool_results {
+        out.push(ChatMessage {
+            role: "tool".into(),
+            content: Value::String(text),
+            name: None,
+            extra: tr_extra,
+        });
+    }
+
+    out
+}
+
+/// Like [`encode_content`] but records loss for non-representable blocks
+/// that still reach the content path (defensive; ToolUse/ToolResult are
+/// split out before this in the request encode path).
+fn encode_content_lossy(
+    blocks: &[IrContentBlock],
+    msg_idx: usize,
+    block_idx: usize,
+    loss: &mut sag_core::LossInventory,
+) -> Value {
+    for (bi, b) in blocks.iter().enumerate() {
+        if matches!(
+            b,
+            IrContentBlock::ToolUse { .. } | IrContentBlock::ToolResult { .. }
+        ) {
+            loss.push_loss(
+                LossScope::ContentBlock,
+                format!("messages[{msg_idx}].content[{block_idx}][{bi}]"),
+                LossReason::UnsupportedByIr,
+                serde_json::to_value(b).unwrap_or(Value::Null),
+            );
+        }
+    }
+    encode_content(blocks)
 }
 
 fn encode_content(blocks: &[IrContentBlock]) -> Value {
@@ -862,16 +1010,21 @@ fn encode_content(blocks: &[IrContentBlock]) -> Value {
     }
     let parts: Vec<Value> = blocks
         .iter()
-        .map(|b| match b {
-            IrContentBlock::Text { text } => json!({"type": "text", "text": text}),
-            IrContentBlock::Image { data } => data.clone(),
-            IrContentBlock::Audio { data } => data.clone(),
-            IrContentBlock::Document { data } => data.clone(),
-            IrContentBlock::Raw(v) => v.clone(),
-            IrContentBlock::Reasoning { text } => json!({"type": "text", "text": text}),
-            other => json!(other),
+        .filter_map(|b| match b {
+            IrContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
+            IrContentBlock::Image { data } => Some(data.clone()),
+            IrContentBlock::Audio { data } => Some(data.clone()),
+            IrContentBlock::Document { data } => Some(data.clone()),
+            IrContentBlock::Raw(v) => Some(v.clone()),
+            IrContentBlock::Reasoning { text } => Some(json!({"type": "text", "text": text})),
+            // ToolUse / ToolResult never enter the OpenAI content array —
+            // they travel as message-level tool_calls / role:tool (B2).
+            IrContentBlock::ToolUse { .. } | IrContentBlock::ToolResult { .. } => None,
         })
         .collect();
+    if parts.is_empty() {
+        return Value::Null;
+    }
     Value::Array(parts)
 }
 
@@ -1230,6 +1383,73 @@ mod tests {
             normalize(serde_json::to_value(&back).unwrap()),
             normalize(body)
         );
+    }
+
+    /// B2: multi-turn Anthropic tool_use + tool_result → Chat encode must
+    /// produce a legal OpenAI body: `role:"tool"` + `tool_call_id`, assistant
+    /// `tool_calls` OpenAI shape, no tool blocks in content arrays.
+    #[test]
+    fn request_multiturn_anthropic_tools_encode_openai_shape() {
+        let anth = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 2048,
+            "messages": [
+                {"role": "user", "content": "weather in SF?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather",
+                     "input": {"city": "SF"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "72F"}
+                ]},
+                {"role": "assistant", "content": "It is 72F."}
+            ],
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get weather",
+                "input_schema": {"type": "object"}
+            }]
+        });
+        let ir = crate::codec::AnthropicMessagesCodec::decode_request(&anth);
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+        assert!(loss.is_empty(), "encode loss: {:?}", loss);
+        let body = serde_json::to_value(&req).expect("serialize chat request");
+        let msgs = body["messages"].as_array().expect("messages array");
+
+        // user
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "weather in SF?");
+        // assistant: OpenAI tool_calls shape, content has no tool_use block
+        assert_eq!(msgs[1]["role"], "assistant");
+        let tc = &msgs[1]["tool_calls"][0];
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["id"], "tu_1");
+        assert_eq!(tc["function"]["name"], "get_weather");
+        assert!(tc["function"]["arguments"].is_string());
+        let c1 = &msgs[1]["content"];
+        if let Some(arr) = c1.as_array() {
+            assert!(
+                arr.iter().all(|p| p["type"] != "tool_use"),
+                "tool_use must not sit in content: {arr:?}"
+            );
+        }
+        // tool result → independent role:"tool" message with tool_call_id
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "tu_1");
+        assert_eq!(msgs[2]["content"], "72F");
+        // closing assistant
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["content"], "It is 72F.");
+        // No content array anywhere carries tool_result either.
+        for m in msgs {
+            if let Some(arr) = m["content"].as_array() {
+                assert!(
+                    arr.iter().all(|p| p["type"] != "tool_result"),
+                    "tool_result must not sit in content: {m}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1983,7 +2203,14 @@ mod tests {
 
         let err = br#"data: {"error":{"message":"burst limit","code":429}}"#;
         let evs = ChatCompletionsCodec::decode_stream_frame(err);
-        assert_eq!(evs, vec![IrStreamEvent::Error("burst limit".into())]);
+        // B4: error frames surface Error + Raw so clients see the envelope.
+        assert_eq!(
+            evs,
+            vec![
+                IrStreamEvent::Error("burst limit".into()),
+                IrStreamEvent::Raw(err.to_vec()),
+            ]
+        );
         rt_event(IrStreamEvent::Error("burst limit".into()));
 
         // StreamChunk-shaped error also round-trips.

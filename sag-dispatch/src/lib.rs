@@ -27,6 +27,7 @@ pub mod testing;
 
 pub use dispatch::{
     DispatchCtx, ResolvedRoute, ResolvedTarget, dispatch_chat, dispatch_image, resolve_route,
+    resolve_route_with_ingress,
 };
 pub use order::order_targets;
 pub use sag_state::CachedOrder;

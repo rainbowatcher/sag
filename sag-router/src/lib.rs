@@ -10,7 +10,7 @@ pub use sag_state::{ActiveTargets, AppState, FillFirstOrders, testing::test_app_
 pub use sag_dispatch::testing::test_dispatch_runtime;
 pub use sag_dispatch::{
     CachedOrder, DispatchCtx, DispatchRuntime, dispatch_chat, dispatch_image, order_targets,
-    resolve_route, stale_probe_threshold_from_config,
+    resolve_route, resolve_route_with_ingress, stale_probe_threshold_from_config,
 };
 
 // ── 从 sag-core 重导出（熔断器原语直供） ────────────────────────

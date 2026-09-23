@@ -60,4 +60,35 @@ pub trait LlmProvider: Send + Sync {
             self.name()
         )))
     }
+
+    /// Native Anthropic Messages call (M5): send an Anthropic-shaped body
+    /// and return the raw JSON response.
+    ///
+    /// Default: unsupported. `AnthropicProvider` overrides this.
+    async fn anthropic_messages(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        Err(AppError::BadRequest(format!(
+            "provider '{}' does not support native Anthropic messages",
+            self.name()
+        )))
+    }
+
+    /// Native Anthropic Messages streaming: Anthropic-shaped body in, raw
+    /// Anthropic SSE frames as `StreamChunk::Data` out.
+    ///
+    /// Default: unsupported. `AnthropicProvider` overrides this.
+    async fn anthropic_messages_stream(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        Err(AppError::BadRequest(format!(
+            "provider '{}' does not support native Anthropic streaming",
+            self.name()
+        )))
+    }
 }

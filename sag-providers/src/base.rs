@@ -346,6 +346,11 @@ impl ProviderBase {
             }
         }
     }
+
+    /// Look up a single role mapping (native body path, B5).
+    pub fn role_mapping_for(&self, role: &str) -> Option<&String> {
+        self.role_mappings.get(role)
+    }
 }
 
 // ── 200-delivered upstream error detection ───────────────────────

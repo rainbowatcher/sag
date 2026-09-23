@@ -45,7 +45,7 @@ pub mod stream;
 
 pub use chat::dispatch_chat;
 pub use image::dispatch_image;
-pub use resolve::resolve_route;
+pub use resolve::{resolve_route, resolve_route_with_ingress};
 
 /// A single resolved fallback target with effective values after
 /// three-tier fallback resolution.
