@@ -93,13 +93,16 @@ export const useConnectionStore = defineStore("connection", () => {
       const healthApi = axios.create({ baseURL: normalizedUrl })
       let healthOk = false
       try {
-        const { data } = await healthApi.get<{ status: string; version: string }>("/health", {
+        const { data } = await healthApi.get<{ status: string; version?: string }>("/health", {
           timeout: 5000,
         })
         healthOk = data.status === "ok"
         if (healthOk) {
           const { useHealthStore } = await import("./health")
-          useHealthStore().$patch({ gatewayVersion: data.version, gatewayOnline: true })
+          useHealthStore().$patch({
+            gatewayVersion: data.version ?? useHealthStore().gatewayVersion,
+            gatewayOnline: true,
+          })
         }
       } catch {
         // continue
@@ -163,13 +166,15 @@ export const useConnectionStore = defineStore("connection", () => {
   async function validateConnection(): Promise<boolean> {
     validating.value = true
     try {
-      const { data } = await api.get<{ status: string }>("/health", { timeout: 3000 })
+      const { data } = await api.get<{ status: string; version?: string }>("/health", {
+        timeout: 3000,
+      })
       if (data.status === "ok") {
         validated.value = true
         const { useHealthStore } = await import("./health")
         useHealthStore().$patch({
           gatewayOnline: true,
-          gatewayVersion: (data as any).version ?? useHealthStore().gatewayVersion,
+          gatewayVersion: data.version ?? useHealthStore().gatewayVersion,
         })
         return true
       }

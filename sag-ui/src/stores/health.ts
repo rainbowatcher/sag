@@ -8,9 +8,9 @@ export const useHealthStore = defineStore("health", () => {
 
   async function checkHealth() {
     try {
-      const { data } = await api.get<{ status: string; version: string }>("/health")
+      const { data } = await api.get<{ status: string; version?: string }>("/health")
       gatewayOnline.value = data.status === "ok"
-      gatewayVersion.value = data.version
+      gatewayVersion.value = data.version ?? gatewayVersion.value
     } catch {
       gatewayOnline.value = false
     }

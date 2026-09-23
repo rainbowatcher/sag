@@ -732,6 +732,8 @@ impl RollupSchedulerHandle {
 /// Both shapes are accepted so existing invocations like
 /// `./target/release/sag /etc/sag/gateway.toml` keep working, while
 /// container / docker flows can use `./sag --config /etc/sag/gateway.toml`.
+/// Unknown flag-like tokens are warned about on stderr and ignored (not a
+/// hard error) so future flag additions don't break older invocations.
 fn resolve_config_path() -> anyhow::Result<String> {
     let mut explicit: Option<String> = None;
     let mut positional: Option<String> = None;
@@ -747,8 +749,10 @@ fn resolve_config_path() -> anyhow::Result<String> {
             // `--config=<path>` form (handy for `docker run` / systemd units).
             explicit = Some(value.to_string());
         } else if arg.starts_with('-') {
-            // Unknown flag-like token: skip silently so future flag additions
+            // Unknown flag-like token: warn and ignore so future flag additions
             // don't break older invocations. Examples: `--verbose`, `-v`.
+            // Tracing is not initialized yet at this point — use stderr.
+            eprintln!("warning: unknown flag '{arg}' ignored");
             continue;
         } else if positional.is_none() {
             positional = Some(arg);

@@ -32,8 +32,11 @@ interface KvPair {
   value: string
 }
 
+const UNLABELED = "—"
+
 function modelLabel(item: Record<string, unknown>): string {
-  return (item.id ?? item.name ?? item.model ?? Object.values(item)[0]) as string
+  const raw = item.id ?? item.name ?? item.model ?? Object.values(item)[0]
+  return typeof raw === "string" && raw !== "" ? raw : UNLABELED
 }
 
 export interface ModelTestState {
@@ -131,7 +134,10 @@ const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
 const expandedOverride = ref<string | undefined>(undefined)
 const customModel = ref("")
 
-const upstreamModelNames = computed(() => new Set(props.upstreamModels.map((m) => modelLabel(m))))
+const upstreamModelNames = computed(
+  () =>
+    new Set(props.upstreamModels.map((m) => modelLabel(m)).filter((label) => label !== UNLABELED)),
+)
 const hasFetchedUpstream = computed(() => props.upstreamModels.length > 0)
 
 function isModelMissingFromUpstream(model: string): boolean {
@@ -152,10 +158,13 @@ watch(
 )
 
 const comboboxOptions = computed(() => {
-  const upstreamList = props.upstreamModels.map((m) => {
+  const upstreamList: { value: string; label: string }[] = []
+  for (const m of props.upstreamModels) {
     const val = modelLabel(m)
-    return { value: val, label: val }
-  })
+    // Skip unlabeled placeholders — they must not become selectable keys.
+    if (val === UNLABELED) continue
+    upstreamList.push({ value: val, label: val })
+  }
   const existingSet = new Set(upstreamList.map((o) => o.value))
 
   const missingList: { value: string; label: string; warning?: boolean }[] = []

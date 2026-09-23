@@ -460,7 +460,7 @@ const table = useVueTable({
                   v-for="header in headerGroup.headers"
                   :key="header.id"
                   :class="[
-                    (header.column.columnDef.meta as any)?.class,
+                    header.column.columnDef.meta?.class,
                     header.column.getCanSort()
                       ? 'hover:text-foreground cursor-pointer transition-colors select-none'
                       : '',
@@ -500,7 +500,7 @@ const table = useVueTable({
                 <TableCell
                   v-for="cell in row.getVisibleCells()"
                   :key="cell.id"
-                  :class="(cell.column.columnDef.meta as any)?.class"
+                  :class="cell.column.columnDef.meta?.class"
                 >
                   <FlexRender :render="cell.column.columnDef.cell!" :props="cell.getContext()" />
                 </TableCell>

@@ -58,7 +58,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (provider) params.set("provider", provider)
       if (model) params.set("model", model)
       const { data } = await api.get<{ data: StatsRow[] }>(`/v1/analytics/stats?${params}`)
-      stats.value = data.data
+      stats.value = data.data ?? []
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       statsError.value = getErrorMessage(e, "Failed to load statistics")
@@ -166,7 +166,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (provider) params.set("provider", provider)
       if (model) params.set("model", model)
       const { data } = await api.get<{ data: CacheStatsRow[] }>(`/v1/analytics/cache?${params}`)
-      cache.value = data.data
+      cache.value = data.data ?? []
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       cacheError.value = getErrorMessage(e, "Failed to load cache statistics")
@@ -195,7 +195,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (toMs != null) params.set("to", String(toMs))
       if (provider) params.set("provider", provider)
       const { data } = await api.get<{ data: TrendRow[] }>(`/v1/analytics/trend?${params}`)
-      trend.value = data.data
+      trend.value = data.data ?? []
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       trendError.value = getErrorMessage(e, "Failed to load trend")
@@ -219,7 +219,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       const { data } = await api.get<{ data: DistributionRow[] }>(
         `/v1/analytics/distribution?${params}`,
       )
-      distribution.value = data.data
+      distribution.value = data.data ?? []
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       distError.value = getErrorMessage(e, "Failed to load distribution")
