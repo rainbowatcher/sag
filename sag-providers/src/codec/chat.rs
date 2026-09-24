@@ -1720,6 +1720,9 @@ mod tests {
 
     #[test]
     fn request_n2_records_loss_and_does_not_panic() {
+        // Codec-side defense only: production rejects `n > 1` with HTTP 422
+        // at the `/v1/chat/completions` entry (`routes.rs`) before dispatch;
+        // this records the loss and round-trips for any direct codec caller.
         let body = json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hi"}],

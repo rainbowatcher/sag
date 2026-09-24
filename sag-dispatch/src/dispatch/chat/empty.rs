@@ -1,7 +1,9 @@
 //! Empty-response detection and first-chunk validation for chat completions.
 
 use futures_util::StreamExt;
-use sag_core::{AppError, ChatCompletionResponse, IrOutputItem, IrResponse, IrStreamEvent};
+use sag_core::{
+    AppError, ChatCompletionResponse, IrOutputItem, IrResponse, IrStreamEvent, UpstreamProtocol,
+};
 
 /// Quick byte search for `b"usage"` in a raw SSE data frame. Used as a
 /// cheap pre-filter to avoid JSON parsing on content-only frames.
@@ -198,6 +200,212 @@ pub(crate) fn is_empty_ir_response(r: &IrResponse) -> bool {
     !(r.output.iter().any(ir_item_has_content) || raw_choices_have_content(r))
 }
 
+/// Verdict for one Raw SSE frame while peeking the first meaningful event.
+enum RawVerdict {
+    /// Frame is bookkeeping (no content signal) — keep peeking.
+    Continue,
+    /// Frame carries content — non-empty; unshift and stop peeking.
+    Content,
+    /// Frame proves an empty response.
+    Empty,
+    /// Frame carries an upstream error — map to `Upstream` 502.
+    UpstreamError(String),
+}
+
+/// Extract the first `data:` JSON payload from an SSE frame (tolerating a
+/// preceding `event:` line). Returns `None` when no parseable JSON data line
+/// is present (including the `[DONE]` marker, handled by the caller).
+fn sse_data_json(raw: &[u8]) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("data:") {
+            let json_str = rest.trim();
+            if json_str.is_empty() || json_str == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Anthropic Messages SSE frame verdict (native lane Raw frames).
+///
+/// `saw_input_tokens` tracks `input_tokens > 0` observed on earlier
+/// bookkeeping frames (typically `message_start`) so a later
+/// `message_delta` with only `output_tokens` can still apply the
+/// `ot==0 && it>0` empty rule.
+fn anthropic_raw_verdict(val: &serde_json::Value, saw_input_tokens: &mut bool) -> RawVerdict {
+    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    // Upstream error frame → same as the structured Error branch (502).
+    if event_type == "error" || val.get("error").is_some_and(|e| !e.is_null()) {
+        let msg = val
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(val).unwrap_or_default());
+        return RawVerdict::UpstreamError(msg);
+    }
+
+    match event_type {
+        // Bookkeeping — keep peeking past it.
+        "message_start" | "ping" | "content_block_stop" => {
+            if let Some(it) = val
+                .pointer("/message/usage/input_tokens")
+                .and_then(|v| v.as_u64())
+                && it > 0
+            {
+                *saw_input_tokens = true;
+            }
+            RawVerdict::Continue
+        }
+
+        // Content-bearing blocks (text / thinking / tool_use / input_json).
+        "content_block_start" | "content_block_delta" => RawVerdict::Content,
+
+        "message_delta" => {
+            let usage = val.get("usage");
+            let ot = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64());
+            let it = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if it > 0 {
+                *saw_input_tokens = true;
+            }
+            // ot==0 with observed input tokens and no content so far → empty.
+            if ot == Some(0) && (*saw_input_tokens || it > 0) {
+                return RawVerdict::Empty;
+            }
+            // stop_reason with no content signal → empty (still peeking =
+            // no content-bearing frame was seen yet).
+            let has_stop = val
+                .pointer("/delta/stop_reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+            if has_stop {
+                return RawVerdict::Empty;
+            }
+            RawVerdict::Continue
+        }
+
+        // Peek reached the end of the message with no content → empty.
+        "message_stop" => RawVerdict::Empty,
+
+        // Unknown frame → conservative non-empty (pass through).
+        _ => RawVerdict::Content,
+    }
+}
+
+/// Responses SSE frame verdict (native lane Raw frames).
+fn responses_raw_verdict(val: &serde_json::Value) -> RawVerdict {
+    // Top-level error object → Upstream 502.
+    if let Some(err) = val.get("error").filter(|e| !e.is_null()) {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(val).unwrap_or_default());
+        return RawVerdict::UpstreamError(msg);
+    }
+
+    let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let response_has_output = |v: &serde_json::Value| -> bool {
+        v.pointer("/response/output")
+            .and_then(|o| o.as_array())
+            .is_some_and(|a| !a.is_empty())
+    };
+
+    match event_type {
+        "response.created" | "response.in_progress" => RawVerdict::Continue,
+
+        // Item / content deltas — real content signals.
+        "response.output_item.added"
+        | "response.content_part.delta"
+        | "response.output_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta" => RawVerdict::Content,
+
+        "response.completed" => {
+            if response_has_output(val) {
+                return RawVerdict::Content;
+            }
+            // Empty (or missing) output + usage ot==0 && it > 0 → empty.
+            let usage = val.pointer("/response/usage");
+            let ot = usage
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64());
+            let it = usage
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if ot == Some(0) && it > 0 {
+                return RawVerdict::Empty;
+            }
+            // Usage does not prove emptiness — conservative non-empty.
+            RawVerdict::Content
+        }
+
+        "response.failed" => {
+            let msg = val
+                .pointer("/response/error/message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "response.failed".into());
+            RawVerdict::UpstreamError(msg)
+        }
+
+        "response.incomplete" => {
+            if response_has_output(val) {
+                RawVerdict::Content
+            } else {
+                RawVerdict::Empty
+            }
+        }
+
+        // Unknown frame → conservative non-empty (pass through).
+        _ => RawVerdict::Content,
+    }
+}
+
+/// Classify one Raw SSE frame for the given upstream protocol.
+fn classify_raw_frame(
+    raw: &[u8],
+    upstream: UpstreamProtocol,
+    saw_input_tokens: &mut bool,
+) -> RawVerdict {
+    // [DONE] is Chat's terminal empty marker (also tolerated on other lanes).
+    if raw.starts_with(b"data: [DONE]") {
+        return RawVerdict::Empty;
+    }
+    match upstream {
+        UpstreamProtocol::ChatCompletions => {
+            if is_empty_response_data(raw) {
+                RawVerdict::Empty
+            } else {
+                // Chat has no bookkeeping-only Data frames in the peek path:
+                // any non-empty first frame ends the peek (existing behavior).
+                RawVerdict::Content
+            }
+        }
+        UpstreamProtocol::AnthropicMessages => match sse_data_json(raw) {
+            Some(val) => anthropic_raw_verdict(&val, saw_input_tokens),
+            // Unparseable data → conservative non-empty.
+            None => RawVerdict::Content,
+        },
+        UpstreamProtocol::Responses => match sse_data_json(raw) {
+            Some(val) => responses_raw_verdict(&val),
+            None => RawVerdict::Content,
+        },
+    }
+}
+
 /// Peek at the first meaningful event of a streaming response. If the upstream
 /// returned an empty response (zero `completion_tokens`, no content),
 /// return [`AppError::EmptyResponse`] so the retry loop retries the same
@@ -205,6 +413,15 @@ pub(crate) fn is_empty_ir_response(r: &IrResponse) -> bool {
 /// retry budget is exhausted. Otherwise, prepend the consumed events and
 /// return the stream for normal forwarding — **the original events are
 /// unshifted unchanged** (raw bytes are never rewritten on peek).
+///
+/// `upstream` selects how Raw SSE frames are interpreted:
+/// - [`UpstreamProtocol::ChatCompletions`] — Chat `data:` JSON + `[DONE]`;
+/// - [`UpstreamProtocol::AnthropicMessages`] — Anthropic event lifecycle
+///   (`message_start` / `ping` bookkeeping, content blocks non-empty,
+///   `message_delta` / `message_stop` empty rules, `error` → 502);
+/// - [`UpstreamProtocol::Responses`] — Responses event lifecycle
+///   (`response.created` / `in_progress` bookkeeping, output deltas
+///   non-empty, `completed` / `incomplete` empty rules, `failed` → 502).
 ///
 /// A structured [`IrStreamEvent::Start`] that carries no metadata (id /
 /// created / model all `None`) is not itself a content signal: keep peeking
@@ -214,10 +431,14 @@ pub(crate) fn is_empty_ir_response(r: &IrResponse) -> bool {
 pub(crate) async fn validate_stream_first_chunk(
     mut stream: futures_util::stream::BoxStream<'static, IrStreamEvent>,
     provider: &str,
+    upstream: UpstreamProtocol,
 ) -> Result<futures_util::stream::BoxStream<'static, IrStreamEvent>, AppError> {
-    // Events consumed before the first meaningful one (empty Starts) —
-    // unshifted in order on success so nothing is dropped.
+    // Events consumed before the first meaningful one (empty Starts /
+    // bookkeeping Raw frames) — unshifted in order on success so nothing
+    // is dropped.
     let mut pending: Vec<IrStreamEvent> = Vec::new();
+    // Anthropic `message_start` input_tokens observed so far (empty rule).
+    let mut saw_input_tokens = false;
     loop {
         let ev = stream.next().await;
         match ev {
@@ -253,15 +474,31 @@ pub(crate) async fn validate_stream_first_chunk(
                 break;
             }
 
-            // Raw SSE frame — check for the [DONE] marker or an empty usage frame.
+            // Raw SSE frame — dispatch by upstream protocol.
             Some(IrStreamEvent::Raw(raw)) => {
-                if raw.starts_with(b"data: [DONE]") || is_empty_response_data(&raw) {
-                    return Err(AppError::EmptyResponse {
-                        provider: provider.into(),
-                    });
+                match classify_raw_frame(&raw, upstream, &mut saw_input_tokens) {
+                    RawVerdict::Empty => {
+                        return Err(AppError::EmptyResponse {
+                            provider: provider.into(),
+                        });
+                    }
+                    RawVerdict::UpstreamError(msg) => {
+                        return Err(AppError::Upstream {
+                            provider: provider.into(),
+                            status: 502,
+                            body: msg,
+                        });
+                    }
+                    RawVerdict::Continue => {
+                        // Bookkeeping (Anthropic message_start/ping, Responses
+                        // created/in_progress, …) — keep peeking; unshift later.
+                        pending.push(IrStreamEvent::Raw(raw));
+                    }
+                    RawVerdict::Content => {
+                        pending.push(IrStreamEvent::Raw(raw));
+                        break;
+                    }
                 }
-                pending.push(IrStreamEvent::Raw(raw));
-                break;
             }
 
             // Metadata-free Start is not content — keep peeking (unshift later).
@@ -567,7 +804,9 @@ mod tests {
         let stream = futures_util::stream::iter(vec![IrStreamEvent::Raw(
             b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"total_tokens\":100}}\n\n".to_vec(),
         )]);
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -579,9 +818,10 @@ mod tests {
             ),
             IrStreamEvent::End,
         ]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("content frame should pass through");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("content frame should pass through");
         let first = s.next().await.unwrap();
         assert!(matches!(first, IrStreamEvent::Raw(_)));
         let second = s.next().await.unwrap();
@@ -592,7 +832,9 @@ mod tests {
     async fn validate_stream_done_marker_returns_error() {
         let stream =
             futures_util::stream::iter(vec![IrStreamEvent::Raw(b"data: [DONE]\n\n".to_vec())]);
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -606,7 +848,9 @@ mod tests {
             cache_creation_tokens: None,
             reasoning_tokens: None,
         })]);
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -620,30 +864,37 @@ mod tests {
             cache_creation_tokens: None,
             reasoning_tokens: None,
         })]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("ct>0 should pass through");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("ct>0 should pass through");
         assert!(matches!(s.next().await, Some(IrStreamEvent::Usage(_))));
     }
 
     #[tokio::test]
     async fn validate_stream_empty_stream_returns_error() {
         let stream = futures_util::stream::empty::<IrStreamEvent>();
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
     #[tokio::test]
     async fn validate_stream_end_returns_empty() {
         let stream = futures_util::stream::iter(vec![IrStreamEvent::End]);
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
     #[tokio::test]
     async fn validate_stream_error_returns_upstream_502() {
         let stream = futures_util::stream::iter(vec![IrStreamEvent::Error("boom".into())]);
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         match result {
             Err(AppError::Upstream { status, body, .. }) => {
                 assert_eq!(status, 502);
@@ -660,9 +911,10 @@ mod tests {
             text: "hi".into(),
         };
         let stream = futures_util::stream::iter(vec![ev.clone(), IrStreamEvent::End]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("structured event is non-empty");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("structured event is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
         assert!(matches!(s.next().await, Some(IrStreamEvent::End)));
     }
@@ -675,9 +927,10 @@ mod tests {
             name: Some("fn".into()),
         };
         let stream = futures_util::stream::iter(vec![ev.clone()]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("tool call start is non-empty");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("tool call start is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
     }
 
@@ -688,9 +941,10 @@ mod tests {
             text: "think".into(),
         };
         let stream = futures_util::stream::iter(vec![ev.clone()]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("reasoning delta is non-empty");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("reasoning delta is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
     }
 
@@ -702,9 +956,10 @@ mod tests {
             model: Some("gpt-4o".into()),
         });
         let stream = futures_util::stream::iter(vec![ev.clone()]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("start with id is non-empty");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("start with id is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
     }
 
@@ -713,9 +968,10 @@ mod tests {
         let raw = b"data: {\"choices\":[{\"delta\":{\"content\":\"exact\"}}]}\n\n".to_vec();
         let expected = raw.clone();
         let stream = futures_util::stream::iter(vec![IrStreamEvent::Raw(raw)]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("content raw passes");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("content raw passes");
         match s.next().await.unwrap() {
             IrStreamEvent::Raw(got) => assert_eq!(got, expected, "peek must not rewrite raw"),
             other => panic!("expected Raw, got {other:?}"),
@@ -734,9 +990,10 @@ mod tests {
             text: "hi".into(),
         };
         let stream = futures_util::stream::iter(vec![empty_start.clone(), delta.clone()]);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa")
-            .await
-            .expect("empty Start followed by content is non-empty");
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await
+                .expect("empty Start followed by content is non-empty");
         // Both events unshifted in order — peek must not drop the empty Start.
         assert_eq!(s.next().await.unwrap(), empty_start);
         assert_eq!(s.next().await.unwrap(), delta);
@@ -750,11 +1007,163 @@ mod tests {
             model: None,
         });
         let stream = futures_util::stream::iter(vec![empty_start, IrStreamEvent::End]);
-        let result = validate_stream_first_chunk(stream.boxed(), "cpa").await;
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
+                .await;
         assert!(
             matches!(result, Err(AppError::EmptyResponse { .. })),
             "metadata-free Start carries no content — End after it is empty"
         );
+    }
+
+    // ── Anthropic native Raw dispatch ─────────────────────────────
+
+    #[tokio::test]
+    async fn validate_stream_anthropic_message_start_delta_ct0_stop_is_empty() {
+        // message_start + message_delta(ct0 + stop_reason) + message_stop,
+        // no content blocks → EmptyResponse.
+        let frames = vec![
+            IrStreamEvent::Raw(
+                br#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-3","usage":{"input_tokens":10,"output_tokens":1}}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(br#"data: {"type":"message_stop"}"#.to_vec()),
+        ];
+        let stream = futures_util::stream::iter(frames);
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::AnthropicMessages)
+                .await;
+        assert!(
+            matches!(result, Err(AppError::EmptyResponse { .. })),
+            "Anthropic stream with only bookkeeping + ct0 delta + stop must be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_stream_anthropic_content_block_delta_is_nonempty() {
+        let frames = vec![
+            IrStreamEvent::Raw(
+                br#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-3","usage":{"input_tokens":10,"output_tokens":1}}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(br#"data: {"type":"message_stop"}"#.to_vec()),
+        ];
+        let stream = futures_util::stream::iter(frames);
+        let mut s =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::AnthropicMessages)
+                .await
+                .expect("content_block_delta is non-empty");
+        // message_start bookkeeping unshifted, then the content frame.
+        let first = s.next().await.unwrap();
+        assert!(
+            matches!(&first, IrStreamEvent::Raw(r) if r.windows(13).any(|w| w == b"message_start")),
+            "message_start must be unshifted: {first:?}"
+        );
+        let second = s.next().await.unwrap();
+        assert!(
+            matches!(&second, IrStreamEvent::Raw(r) if r.windows(19).any(|w| w == b"content_block_delta")),
+            "content frame must follow: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_stream_anthropic_error_frame_returns_upstream_502() {
+        let stream = futures_util::stream::iter(vec![IrStreamEvent::Raw(
+            br#"data: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#
+                .to_vec(),
+        )]);
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::AnthropicMessages)
+                .await;
+        match result {
+            Err(AppError::Upstream { status, body, .. }) => {
+                assert_eq!(status, 502);
+                assert!(body.contains("busy"), "body={body}");
+            }
+            Err(other) => panic!("expected Upstream 502, got {other:?}"),
+            Ok(_) => panic!("expected Upstream 502, got Ok stream"),
+        }
+    }
+
+    // ── Responses native Raw dispatch ─────────────────────────────
+
+    #[tokio::test]
+    async fn validate_stream_responses_completed_empty_output_is_empty() {
+        let frames = vec![
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":10,"output_tokens":0}}}"#
+                    .to_vec(),
+            ),
+        ];
+        let stream = futures_util::stream::iter(frames);
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::Responses).await;
+        assert!(
+            matches!(result, Err(AppError::EmptyResponse { .. })),
+            "response.completed with empty output + ot0/it>0 must be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_stream_responses_output_text_delta_is_nonempty() {
+        let frames = vec![
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.output_text.delta","output_index":0,"delta":"Hello"}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":10,"output_tokens":0}}}"#
+                    .to_vec(),
+            ),
+        ];
+        let stream = futures_util::stream::iter(frames);
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::Responses)
+            .await
+            .expect("output_text.delta is non-empty");
+        let first = s.next().await.unwrap();
+        assert!(
+            matches!(&first, IrStreamEvent::Raw(r) if r.windows(16).any(|w| w == b"response.created")),
+            "created bookkeeping unshifted: {first:?}"
+        );
+        let second = s.next().await.unwrap();
+        assert!(
+            matches!(&second, IrStreamEvent::Raw(r) if r.windows(17).any(|w| w == b"output_text.delta")),
+            "content delta must follow: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_stream_responses_failed_returns_upstream_502() {
+        let stream = futures_util::stream::iter(vec![IrStreamEvent::Raw(
+            br#"data: {"type":"response.failed","response":{"id":"resp_1","error":{"message":"boom"}}}"#
+                .to_vec(),
+        )]);
+        let result =
+            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::Responses).await;
+        match result {
+            Err(AppError::Upstream { status, body, .. }) => {
+                assert_eq!(status, 502);
+                assert!(body.contains("boom"), "body={body}");
+            }
+            Err(other) => panic!("expected Upstream 502, got {other:?}"),
+            Ok(_) => panic!("expected Upstream 502, got Ok stream"),
+        }
     }
 
     // ── is_empty_ir_response ─────────────────────────────────────

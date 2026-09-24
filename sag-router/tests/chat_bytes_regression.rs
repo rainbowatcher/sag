@@ -188,6 +188,61 @@ async fn chat_non_stream_body_is_byte_identical_to_upstream_json() {
     );
 }
 
+// ── n > 1 entry rejection (plan §3.1) ────────────────────────────
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn chat_n2_rejected_422_with_openai_envelope() {
+    // No upstream needed — the entry rejects before route resolution.
+    let state = build_state("http://127.0.0.1:1").await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let resp = app
+        .oneshot(chat_request(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"n":2}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    assert!(
+        json.get("type").is_none(),
+        "must be OpenAI envelope, not Anthropic: {json}"
+    );
+    assert_eq!(json["error"]["code"], "UNPROCESSABLE_ENTITY");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("n > 1 is not supported"),
+        "message must name the reject reason: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn chat_n1_and_absent_n_pass_entry_gate() {
+    // n:1 and omitted n must pass the entry check and reach route
+    // resolution (unknown model → 404 no_route proves the gate passed).
+    let state = build_state("http://127.0.0.1:1").await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    for body in [
+        r#"{"model":"does-not-exist","messages":[{"role":"user","content":"hi"}],"n":1}"#,
+        r#"{"model":"does-not-exist","messages":[{"role":"user","content":"hi"}]}"#,
+    ] {
+        let resp = app.clone().oneshot(chat_request(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "n<=1 / absent must pass entry and hit no_route: {body}"
+        );
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "MODEL_NOT_FOUND");
+    }
+}
+
 // ── stream byte gate ─────────────────────────────────────────────
 
 #[tokio::test]

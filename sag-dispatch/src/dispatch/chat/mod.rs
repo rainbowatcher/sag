@@ -337,13 +337,28 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             } else {
                                 s.map(sag_core::IrStreamEvent::from).boxed()
                             };
+                            // Frame protocol for empty-peek: native arms pass
+                            // the target protocol's SSE; the Chat bridge
+                            // (`chat_stream`) always re-encodes to Chat-shaped
+                            // Data frames regardless of provider_type-derived
+                            // upstream_protocol, so translated arms peek as
+                            // ChatCompletions.
+                            let frame_upstream = if use_native_anthropic {
+                                UpstreamProtocol::AnthropicMessages
+                            } else if use_native_responses {
+                                UpstreamProtocol::Responses
+                            } else {
+                                UpstreamProtocol::ChatCompletions
+                            };
                             if retry_on_empty {
                                 // Peek at the first chunk before committing the HTTP
                                 // 200 response.  If the upstream returned an empty
                                 // response (ct=0, no content), surface an
                                 // `EmptyResponse` error so the retry loop retries the
                                 // same target with backoff.
-                                let s = validate_stream_first_chunk(s, &provider_name).await?;
+                                let s =
+                                    validate_stream_first_chunk(s, &provider_name, frame_upstream)
+                                        .await?;
                                 Ok(ChatAttempt::Stream(s, upstream_start))
                             } else {
                                 Ok(ChatAttempt::Stream(s, upstream_start))
@@ -374,16 +389,18 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     provider: provider_name.clone(),
                                 });
                             }
-                            // Dual-hold: IR for empty/usage + a Chat-shaped
-                            // placeholder (Anthropic ingress egress encodes
-                            // from IR; Chat egress never reaches this arm
-                            // because native requires Anthropic ingress).
+                            // Dual-hold: IR for empty/usage + the original
+                            // Anthropic JSON (Anthropic ingress egress
+                            // prefers raw passthrough; Chat egress never
+                            // reaches this arm because native requires
+                            // Anthropic ingress). Chat-shaped placeholder in
+                            // `resp` for any accidental Chat egress.
                             let resp = ChatCompletionsCodec::encode_response(&ir_resp);
                             Ok(ChatAttempt::NonStream(
                                 Box::new(NonStreamAttempt {
                                     ir: ir_resp,
                                     resp,
-                                    raw_responses: None,
+                                    raw_responses: Some(raw),
                                 }),
                                 upstream_start,
                             ))
@@ -805,13 +822,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 // - Chat ingress uses the **original** ChatCompletionResponse —
                 //   dual-hold guarantees byte-identical JSON vs pre-M4
                 //   (`encode_response` is not byte-safe for null content etc.).
-                // - Anthropic ingress encodes from IR (semantic round-trip;
-                //   tool_use / thinking / usage preserved by the codec).
+                // - Anthropic ingress: native arm returns the **original**
+                //   upstream JSON (structure fidelity — unknown fields / ids
+                //   survive); translated arms encode from IR (semantic
+                //   round-trip; tool_use / thinking / usage preserved by the
+                //   codec).
                 // - Responses ingress: native arm returns the **original**
                 //   upstream JSON (B1 plan A — IR round-trip drops
                 //   instructions/tools/temperature/text/item id/annotations);
                 //   translated arms still encode from IR (stateless subset).
                 if is_anthropic_ingress {
+                    if let Some(raw) = att.raw_responses.as_ref() {
+                        return (StatusCode::OK, Json(raw.clone())).into_response();
+                    }
                     let body = AnthropicMessagesCodec::encode_response(&att.ir);
                     return (StatusCode::OK, Json(body)).into_response();
                 }

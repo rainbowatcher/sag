@@ -31,9 +31,11 @@ pub(crate) struct NonStreamAttempt {
     /// (Chat-shaped re-encode of IR) on the Anthropic/Responses native arms
     /// — those arms never egress via Chat.
     pub resp: ChatCompletionResponse,
-    /// Original Responses JSON on the Responses-native arm — sole source
-    /// for Responses-ingress egress (B1 plan A: never `decode`→`encode`).
-    /// `None` on Chat/Anthropic arms (Responses ingress re-encodes from IR).
+    /// Original Anthropic/Responses native JSON — sole source for
+    /// native-arm ingress egress (never `decode`→`encode` on the native
+    /// path, which would drop unknown fields / non-standard ids).
+    /// `None` on Chat arms and Anthropic/Responses **translated** arms
+    /// (those egress re-encode from IR / hold the original Chat response).
     pub raw_responses: Option<serde_json::Value>,
 }
 

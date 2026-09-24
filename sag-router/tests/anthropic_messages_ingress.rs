@@ -679,3 +679,74 @@ async fn anthropic_ingress_multiturn_tool_history_reaches_native_upstream() {
         "tool_result content block must appear exactly once: {req_body}"
     );
 }
+
+// ── B2: native non-stream raw passthrough (structure fidelity) ───
+
+/// Canonicalize JSON for semantic equality (key order / whitespace insensitive).
+fn normalize(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            serde_json::Value::Object(m.into_iter().map(|(k, val)| (k, normalize(val))).collect())
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.into_iter().map(normalize).collect())
+        }
+        other => other,
+    }
+}
+
+#[tokio::test]
+async fn anthropic_ingress_native_nonstream_structure_fidelity() {
+    // Unknown fields + non-standard id must survive verbatim (raw egress,
+    // aligned with responses_ingress_native_responses_nonstream_structure_fidelity).
+    let anthropic_resp = r#"{
+        "id": "msg_weird_非标准",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "fidelity"}],
+        "usage": {"input_tokens": 11, "output_tokens": 4},
+        "unknown_vendor_field": {"nested": [1, 2, {"keep": true}]},
+        "service_tier": "priority"
+    }"#;
+    let expected = anthropic_resp.to_string();
+    let base_url = spawn_server(move |mut stream| async move {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            expected.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(expected.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let _ = stream.shutdown().await;
+    })
+    .await;
+
+    let state = build_state_anthropic_native(&base_url, "msg-key").await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{
+        "model": "claude-native",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}]
+    }"#;
+    let resp = app
+        .oneshot(messages_request_x_api_key(body, "msg-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "native path must succeed");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let upstream: serde_json::Value = serde_json::from_str(anthropic_resp).unwrap();
+
+    assert_eq!(
+        normalize(json.clone()),
+        normalize(upstream.clone()),
+        "native Anthropic non-stream must pass through the upstream body verbatim (semantic)"
+    );
+    // Explicit spot-checks for fields an IR round-trip would drop/rewrite.
+    assert_eq!(json["id"], "msg_weird_非标准");
+    assert_eq!(json["unknown_vendor_field"]["nested"][2]["keep"], true);
+    assert_eq!(json["service_tier"], "priority");
+}

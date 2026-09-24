@@ -124,6 +124,13 @@ async fn chat_completions(
             return rejection.into_response();
         }
     };
+    // Plan §3.1: multi-choice (`n > 1`) is unsupported — hard-reject at the
+    // entry with HTTP 422 + OpenAI envelope before dispatch (`AppError::
+    // BadRequest` would be 400; use the shared `unprocessable` helper).
+    // The codec still records n>1 as a loss for defense-in-depth.
+    if request.n.unwrap_or(1) > 1 {
+        return unprocessable("n > 1 is not supported");
+    }
     request.normalize_reasoning_effort();
     let is_stream = request.stream.unwrap_or(false);
     let span = tracing::Span::current();
