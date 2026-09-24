@@ -91,4 +91,40 @@ pub trait LlmProvider: Send + Sync {
             self.name()
         )))
     }
+
+    /// Native Responses call (M6): send a Responses-shaped body to
+    /// `api_endpoint` (typically `/responses`) and return the raw JSON.
+    ///
+    /// Default: unsupported. `OpenAiProvider` overrides this.
+    async fn responses_native(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _api_endpoint: &str,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        // Align with D1 rejects on /v1/responses (rendered as 422).
+        Err(AppError::BadRequest(format!(
+            "native Responses is not supported (provider '{}')",
+            self.name()
+        )))
+    }
+
+    /// Native Responses streaming: Responses-shaped body in, raw Responses
+    /// SSE frames as `StreamChunk::Data` out (usage side-channeled from
+    /// `response.completed`).
+    ///
+    /// Default: unsupported. `OpenAiProvider` overrides this.
+    async fn responses_stream_native(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _api_endpoint: &str,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        // Align with D1 rejects on /v1/responses (rendered as 422).
+        Err(AppError::BadRequest(format!(
+            "native Responses streaming is not supported (provider '{}')",
+            self.name()
+        )))
+    }
 }

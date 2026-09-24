@@ -58,6 +58,12 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
             "/v1/messages",
             Router::new()
                 .route("/", post(anthropic_messages))
+                .layer(axum::Extension(runtime.clone())),
+        )
+        .nest(
+            "/v1/responses",
+            Router::new()
+                .route("/", post(responses))
                 .layer(axum::Extension(runtime)),
         )
         .nest("/v1", Router::new().route("/models", get(list_models)))
@@ -356,6 +362,149 @@ async fn anthropic_messages(
     .await;
 
     render_anthropic_error(response).await
+}
+
+/// Build an HTTP 422 response with the OpenAI error envelope (§8.2)
+/// used by the Responses (and Chat) ingress paths.
+fn unprocessable(message: impl Into<String>) -> Response<Body> {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": {
+                "code": "UNPROCESSABLE_ENTITY",
+                "message": message.into(),
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// POST `/v1/responses` — OpenAI Responses ingress, stateless subset (M6).
+///
+/// Decodes the Responses-shaped body to IR (rejecting D1-unsupported
+/// stateful/background features with 422 before dispatch), resolves the
+/// route with `IngressProtocol::Responses`, reuses `dispatch_chat`, and
+/// renders responses/errors in the OpenAI error envelope (§8.2).
+///
+/// Auth: Bearer only (x-api-key stays Anthropic-`/v1/messages`-only).
+#[instrument(skip_all, fields(request_id, model, stream))]
+async fn responses(
+    State(state): State<AppState>,
+    Extension(trace_id): Extension<uuid::Uuid>,
+    Extension(runtime): Extension<DispatchRuntime>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response<Body> {
+    let start = Instant::now();
+    let started_at = chrono::Utc::now();
+
+    let Json(raw_body) = match body {
+        Ok(json) => json,
+        Err(rejection) => {
+            emit_client_error_event(&state, trace_id, started_at, &rejection).await;
+            // Responses uses the OpenAI error envelope (§8.2).
+            return rejection.into_response();
+        }
+    };
+
+    // Decode Responses body → IR. D1-unsupported features (and other
+    // capability rejects) return BadRequest — surface as 422 **before**
+    // entering dispatch (never capability-precheck drops).
+    let ir = match sag_providers::ResponsesCodec::decode_request(&raw_body) {
+        Ok(ir) => ir,
+        Err(err) => {
+            let message = match &err {
+                sag_core::AppError::BadRequest(m) => m.clone(),
+                other => other.to_string(),
+            };
+            return unprocessable(message);
+        }
+    };
+    // Synthesize a ChatCompletionRequest so resolve_route / cancel_guard /
+    // analytics have model / stream / reasoning_effort / tools (plan M5-C).
+    let (mut request, encode_loss) =
+        sag_providers::ChatCompletionsCodec::encode_request_with_loss(&ir);
+    if !encode_loss.is_empty() {
+        warn!(loss = ?encode_loss.entries, "chat encode recorded losses");
+    }
+    request.normalize_reasoning_effort();
+
+    let is_stream = request.stream.unwrap_or(false);
+    let span = tracing::Span::current();
+    span.record("request_id", trace_id.to_string());
+    span.record("model", request.model.as_str());
+    span.record("stream", is_stream);
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+
+    let ResolvedRoute {
+        targets,
+        api_endpoint,
+        strategy,
+        sticky_token,
+        route_name,
+        started_at,
+        precheck_errors,
+    } = match resolve_route_with_ingress(
+        &state,
+        &runtime,
+        &request,
+        trace_id,
+        start,
+        started_at,
+        is_stream,
+        user_agent.as_deref(),
+        client_ip.as_deref(),
+        sag_core::IngressProtocol::Responses,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        // Resolution failures already use the OpenAI error envelope — pass through.
+        Err(response) => return response,
+    };
+
+    let mut errors = precheck_errors;
+
+    if api_endpoint.ends_with("/images/generations") {
+        // Image path is Chat-only (D8); reject with the OpenAI envelope.
+        return unprocessable("image generation is not supported on /v1/responses");
+    }
+
+    dispatch_chat(DispatchCtx {
+        state: &state,
+        runtime: &runtime,
+        request: &request,
+        targets: &targets,
+        api_endpoint: &api_endpoint,
+        is_stream,
+        trace_id,
+        start,
+        route_name: &route_name,
+        started_at,
+        errors: &mut errors,
+        strategy,
+        sticky_token,
+        user_agent,
+        client_ip,
+        ingress_protocol: sag_core::IngressProtocol::Responses,
+        ir: Some(&ir),
+    })
+    .await
 }
 
 /// Convert an error response (OpenAI `{"error":{...}}` envelope) into the

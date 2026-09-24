@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use sag_analytics::AnalyticsEvent;
 use sag_core::{AppError, FailureReason, FinalStatus, RequestResultFact, TargetAttemptFact};
 use sag_core::{IngressProtocol, Lane, UpstreamProtocol};
-use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec};
+use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, ResponsesCodec};
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
@@ -45,6 +45,12 @@ fn encode_chat_stream_event(ev: &sag_core::IrStreamEvent) -> Vec<u8> {
 /// `Fn(&IrStreamEvent) -> Vec<u8> + Send + 'static`.
 fn anthropic_stream_encoder() -> impl Fn(&sag_core::IrStreamEvent) -> Vec<u8> + Send + 'static {
     AnthropicMessagesCodec::stream_encoder()
+}
+
+/// Build a per-response Responses stream encoder with output-item /
+/// content-part lifecycle state + Raw passthrough.
+fn responses_stream_encoder() -> impl Fn(&sag_core::IrStreamEvent) -> Vec<u8> + Send + 'static {
+    ResponsesCodec::stream_encoder()
 }
 
 /// Try each target in order. On a retryable error, retry the same target with
@@ -92,6 +98,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         }
     };
     let is_anthropic_ingress = matches!(ingress_protocol, IngressProtocol::AnthropicMessages);
+    let is_responses_ingress = matches!(ingress_protocol, IngressProtocol::Responses);
 
     // Client-disconnect terminal: if the handler future is dropped before
     // any normal terminal (non-streaming request, or a streaming request
@@ -205,6 +212,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     let use_native_anthropic = is_anthropic_ingress
                         && target.lane == Lane::Native
                         && target.upstream_protocol == UpstreamProtocol::AnthropicMessages;
+                    // M6 native: Responses ingress × explicitly declared
+                    // Responses target → call upstream with the Responses
+                    // body (never translate through Chat).
+                    let use_native_responses = is_responses_ingress
+                        && target.lane == Lane::Native
+                        && target.upstream_protocol == UpstreamProtocol::Responses;
                     let result = async {
                         // Capture the upstream start time immediately before the
                         // provider call so retry/circuit overhead is excluded.
@@ -224,6 +237,18 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 provider
                                     .anthropic_messages_stream(body, &target_extra)
                                     .await?
+                            } else if use_native_responses {
+                                let (body, loss) =
+                                    ResponsesCodec::encode_request_with_loss(ir, &real_model);
+                                if !loss.is_empty() {
+                                    tracing::warn!(
+                                        loss = ?loss.entries,
+                                        "native responses encode recorded losses"
+                                    );
+                                }
+                                provider
+                                    .responses_stream_native(body, &target_extra, &api_endpoint)
+                                    .await?
                             } else {
                                 provider
                                     .chat_stream(
@@ -238,13 +263,16 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             // Dispatch-boundary mapping depends on ingress/lane:
                             // - Chat ingress: Data → Raw (original bytes, no
                             //   re-parse) — M4 byte-fidelity invariant.
-                            // - Anthropic native: Data is already Anthropic SSE
-                            //   frames → Raw passthrough.
-                            // - Anthropic translated: Data is OpenAI-shaped →
-                            //   decode to IR events so the Anthropic stream
-                            //   encoder can re-render them.
+                            // - Anthropic/Responses native: Data is already the
+                            //   target protocol's SSE frames → Raw passthrough.
+                            // - Anthropic/Responses translated: Data is
+                            //   OpenAI-shaped → decode to IR events so the
+                            //   ingress stream encoder can re-render them.
                             // Usage/Error/Done → IR 1:1 in all cases.
-                            let s = if is_anthropic_ingress && !use_native_anthropic {
+                            let needs_ir_decode = (is_anthropic_ingress || is_responses_ingress)
+                                && !use_native_anthropic
+                                && !use_native_responses;
+                            let s = if needs_ir_decode {
                                 s.flat_map(|chunk| match chunk {
                                     sag_core::StreamChunk::Data(bytes) => {
                                         futures_util::stream::iter(
@@ -294,7 +322,46 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             // because native requires Anthropic ingress).
                             let resp = ChatCompletionsCodec::encode_response(&ir_resp);
                             Ok(ChatAttempt::NonStream(
-                                Box::new(NonStreamAttempt { ir: ir_resp, resp }),
+                                Box::new(NonStreamAttempt {
+                                    ir: ir_resp,
+                                    resp,
+                                    raw_responses: None,
+                                }),
+                                upstream_start,
+                            ))
+                        } else if use_native_responses {
+                            let (body, loss) =
+                                ResponsesCodec::encode_request_with_loss(ir, &real_model);
+                            if !loss.is_empty() {
+                                tracing::warn!(
+                                    loss = ?loss.entries,
+                                    "native responses encode recorded losses"
+                                );
+                            }
+                            let raw = provider
+                                .responses_native(body, &target_extra, &api_endpoint, timeout_secs)
+                                .await?;
+                            // Decode only for empty/usage/CallLog — the raw
+                            // JSON is the sole egress source (B1 plan A:
+                            // never decode→encode round-trip on Responses
+                            // ingress, which drops instructions/tools/
+                            // temperature/text/item ids/annotations).
+                            let ir_resp = ResponsesCodec::decode_response(&raw);
+                            if retry_on_empty && is_empty_ir_response(&ir_resp) {
+                                return Err(AppError::EmptyResponse {
+                                    provider: provider_name.clone(),
+                                });
+                            }
+                            // Chat-shaped placeholder (Chat egress never
+                            // reaches this arm — native requires Responses
+                            // ingress).
+                            let resp = ChatCompletionsCodec::encode_response(&ir_resp);
+                            Ok(ChatAttempt::NonStream(
+                                Box::new(NonStreamAttempt {
+                                    ir: ir_resp,
+                                    resp,
+                                    raw_responses: Some(raw),
+                                }),
                                 upstream_start,
                             ))
                         } else {
@@ -319,6 +386,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 Box::new(NonStreamAttempt {
                                     ir: ir_resp,
                                     resp: r,
+                                    raw_responses: None,
                                 }),
                                 upstream_start,
                             ))
@@ -514,12 +582,34 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 cancel_guard.mark_done();
                 // Ingress stream encoder: Chat → Chat codec (Raw passthrough);
                 // Anthropic → per-response stateful Anthropic SSE encoder
-                // (Raw passthrough, block lifecycle, [DONE] suppressed).
+                // (Raw passthrough, block lifecycle, [DONE] suppressed);
+                // Responses → per-response stateful Responses SSE encoder
+                // (Raw passthrough, output-item lifecycle, no [DONE]).
                 if is_anthropic_ingress {
                     return build_streaming_response(
                         state,
                         stream,
                         anthropic_stream_encoder(),
+                        route_name,
+                        provider_name,
+                        &request.model,
+                        &real_model,
+                        trace_id,
+                        start,
+                        upstream_start,
+                        started_at,
+                        target_started_at.unwrap_or(chrono::Utc::now()),
+                        target_facts,
+                        request.reasoning_effort.clone(),
+                        user_agent.clone(),
+                        client_ip.clone(),
+                    );
+                }
+                if is_responses_ingress {
+                    return build_streaming_response(
+                        state,
+                        stream,
+                        responses_stream_encoder(),
                         route_name,
                         provider_name,
                         &request.model,
@@ -612,8 +702,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 //   (`encode_response` is not byte-safe for null content etc.).
                 // - Anthropic ingress encodes from IR (semantic round-trip;
                 //   tool_use / thinking / usage preserved by the codec).
+                // - Responses ingress: native arm returns the **original**
+                //   upstream JSON (B1 plan A — IR round-trip drops
+                //   instructions/tools/temperature/text/item id/annotations);
+                //   translated arms still encode from IR (stateless subset).
                 if is_anthropic_ingress {
                     let body = AnthropicMessagesCodec::encode_response(&att.ir);
+                    return (StatusCode::OK, Json(body)).into_response();
+                }
+                if is_responses_ingress {
+                    if let Some(raw) = att.raw_responses.as_ref() {
+                        return (StatusCode::OK, Json(raw.clone())).into_response();
+                    }
+                    let body = ResponsesCodec::encode_response(&att.ir);
                     return (StatusCode::OK, Json(body)).into_response();
                 }
                 return (StatusCode::OK, Json(att.resp)).into_response();

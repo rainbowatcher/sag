@@ -27,8 +27,14 @@ pub(crate) enum ChatAttempt {
 pub(crate) struct NonStreamAttempt {
     /// Decoded IR view: drives empty detection and usage facts.
     pub ir: IrResponse,
-    /// Original provider response: sole source for the client-facing body.
+    /// Original Chat provider response (Chat egress source). Placeholder
+    /// (Chat-shaped re-encode of IR) on the Anthropic/Responses native arms
+    /// — those arms never egress via Chat.
     pub resp: ChatCompletionResponse,
+    /// Original Responses JSON on the Responses-native arm — sole source
+    /// for Responses-ingress egress (B1 plan A: never `decode`→`encode`).
+    /// `None` on Chat/Anthropic arms (Responses ingress re-encodes from IR).
+    pub raw_responses: Option<serde_json::Value>,
 }
 
 /// Build the single [`TargetAttemptFact`] for an actually-issued target

@@ -297,6 +297,301 @@ impl LlmProvider for OpenAiProvider {
             AppError::Internal(format!("failed to parse image generation response: {e}"))
         })
     }
+
+    async fn responses_native(
+        &self,
+        body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        api_endpoint: &str,
+        timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        self.responses_native_inner(body, target_extra, api_endpoint, timeout_secs)
+            .await
+    }
+
+    async fn responses_stream_native(
+        &self,
+        body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        api_endpoint: &str,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        self.responses_stream_native_inner(body, target_extra, api_endpoint)
+            .await
+    }
+}
+
+impl OpenAiProvider {
+    /// Native Responses call (M6): send a Responses-shaped body to
+    /// `api_endpoint` (default `/responses`) and return the raw JSON.
+    ///
+    /// Never translates through Chat — the body is the caller's
+    /// Responses-shaped payload after the three-tier override chain.
+    pub async fn responses_native_inner(
+        &self,
+        mut body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        api_endpoint: &str,
+        timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        let path = if api_endpoint.trim().is_empty() {
+            "/responses"
+        } else {
+            api_endpoint
+        };
+        // role_mappings on input messages (best-effort, native shape).
+        if self.base.has_role_mappings()
+            && let Some(items) = body.get_mut("input").and_then(|v| v.as_array_mut())
+        {
+            for item in items.iter_mut() {
+                if let Some(role) = item.get("role").and_then(|r| r.as_str()).map(String::from)
+                    && let Some(mapped) = self.base.role_mapping_for(&role)
+                {
+                    item["role"] = serde_json::json!(mapped);
+                }
+            }
+        }
+        let url = self.base.build_url(path);
+        let (auth_name, auth_value) = self.auth_header();
+        let body_text = self
+            .base
+            .send_json(
+                &url,
+                body,
+                target_extra,
+                &[(auth_name, &auth_value)],
+                Some(timeout_secs),
+            )
+            .await?;
+
+        // 200-delivered error object (same convention as chat()).
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+            && crate::base::body_has_error_object(&raw)
+        {
+            let err_obj = raw.get("error").expect("checked error object");
+            let msg = crate::base::body_error_message(err_obj);
+            let status = if crate::base::body_error_is_rate_limited(err_obj) {
+                429
+            } else {
+                502
+            };
+            warn!(status = 200, %body_text, "upstream returned error");
+            return Err(AppError::Upstream {
+                provider: self.base.name.clone(),
+                status,
+                body: msg,
+            });
+        }
+
+        serde_json::from_str(&body_text)
+            .map_err(|e| AppError::Internal(format!("failed to parse responses body: {e}")))
+    }
+
+    /// Native Responses streaming: Responses body in, raw Responses SSE
+    /// frames as `StreamChunk::Data` out; usage side-channeled from
+    /// `response.completed`.
+    pub async fn responses_stream_native_inner(
+        &self,
+        mut body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        api_endpoint: &str,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        let path = if api_endpoint.trim().is_empty() {
+            "/responses"
+        } else {
+            api_endpoint
+        };
+        body["stream"] = serde_json::json!(true);
+        let url = self.base.build_url(path);
+        let (auth_name, auth_value) = self.auth_header();
+        let response = self
+            .base
+            .send_json_stream(&url, body, target_extra, &[(auth_name, &auth_value)])
+            .await?;
+
+        let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let chunk_timeout = self
+            .base
+            .chunk_timeout_secs()
+            .map(std::time::Duration::from_secs);
+
+        tokio::spawn(async move {
+            use crate::util::find_sse_boundary;
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut had_error = false;
+
+            // Returns true when the frame carried an in-stream error.
+            let extract_side_channel = |frame: &[u8]| -> bool {
+                let mut saw = false;
+                let text = String::from_utf8_lossy(frame);
+                for line in text.lines() {
+                    let Some(rest) = line.trim().strip_prefix("data:") else {
+                        continue;
+                    };
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(rest.trim_start())
+                    else {
+                        continue;
+                    };
+                    match val.get("type").and_then(|t| t.as_str()) {
+                        Some("response.completed") | Some("response.incomplete") => {
+                            if let Some(u) = val.pointer("/response/usage").filter(|u| !u.is_null())
+                            {
+                                emit_responses_usage(u, &tx);
+                            }
+                        }
+                        Some("response.failed") => {
+                            saw = true;
+                            let msg = val
+                                .pointer("/response/error/message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("upstream response failed")
+                                .to_string();
+                            warn!(status = 200, %msg, "upstream returned error");
+                            if !tx.is_closed() {
+                                let _ = tx.send(StreamChunk::Error(msg));
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Top-level error object inside a data frame.
+                    if let Some(err) = val.get("error").filter(|e| !e.is_null()) {
+                        saw = true;
+                        let msg = crate::base::body_error_message(err);
+                        warn!(status = 200, %msg, "upstream returned error");
+                        if !tx.is_closed() {
+                            let _ = tx.send(StreamChunk::Error(msg));
+                        }
+                    }
+                }
+                saw
+            };
+
+            loop {
+                if tx.is_closed() {
+                    break;
+                }
+                let chunk_result: Result<_, tokio::time::error::Elapsed> = match &chunk_timeout {
+                    Some(dur) => tokio::time::timeout(*dur, byte_stream.next()).await,
+                    None => Ok(byte_stream.next().await),
+                };
+                match chunk_result {
+                    Ok(Some(Ok(chunk))) => {
+                        trace!(received_bytes = chunk.len(), "received responses SSE chunk");
+                        buffer.extend_from_slice(&chunk);
+                        while let Some(end) = find_sse_boundary(&buffer) {
+                            let frame: Vec<u8> = buffer.drain(..end).collect();
+                            let delim_len = if buffer.starts_with(b"\r\n\r\n") {
+                                4
+                            } else {
+                                2
+                            };
+                            buffer.drain(..delim_len);
+                            if extract_side_channel(&frame) {
+                                had_error = true;
+                            }
+                            // Forward the raw Responses frame (native lane).
+                            let data =
+                                if frame.starts_with(b"data:") || frame.starts_with(b"event:") {
+                                    let mut data = frame;
+                                    if !data.ends_with(b"\n\n") {
+                                        data.extend_from_slice(b"\n\n");
+                                    }
+                                    data
+                                } else {
+                                    let mut data = b"data: ".to_vec();
+                                    data.extend_from_slice(&frame);
+                                    data.extend_from_slice(b"\n\n");
+                                    data
+                                };
+                            if !tx.is_closed() {
+                                let _ = tx.send(StreamChunk::Data(data));
+                            }
+                            if had_error {
+                                buffer.clear();
+                                break;
+                            }
+                        }
+                        if had_error {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        error!(?e, "error reading responses stream chunk");
+                        if !tx.is_closed() {
+                            let _ = tx.send(StreamChunk::Error(e.to_string()));
+                        }
+                        had_error = true;
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(_elapsed) => {
+                        had_error = emit_idle_timeout(&tx, "openai-responses", &chunk_timeout);
+                        break;
+                    }
+                }
+            }
+
+            if !buffer.is_empty() && !had_error {
+                if extract_side_channel(&buffer) {
+                    had_error = true;
+                }
+                let mut data = buffer.clone();
+                if !data.ends_with(b"\n\n") {
+                    data.extend_from_slice(b"\n\n");
+                }
+                if !tx.is_closed() {
+                    let _ = tx.send(StreamChunk::Data(data));
+                }
+                buffer.clear();
+            }
+
+            if !had_error {
+                let _ = tx.send(StreamChunk::Done);
+            }
+        });
+
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Emit a Usage chunk from a Responses usage object (native stream path).
+fn emit_responses_usage(usage: &serde_json::Value, tx: &mpsc::UnboundedSender<StreamChunk>) {
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let output = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    if input == 0 && output == 0 {
+        return;
+    }
+    let total = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or_else(|| input.saturating_add(output));
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .or((input > 0).then_some(0));
+    let reasoning = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let _ = tx.send(StreamChunk::Usage(sag_core::Usage {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: total,
+        cached_tokens: cached,
+        cache_creation_tokens: None,
+        reasoning_tokens: reasoning,
+    }));
 }
 
 #[cfg(test)]
