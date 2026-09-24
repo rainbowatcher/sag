@@ -490,8 +490,8 @@ impl AnthropicMessagesCodec {
         if !ir.metadata.is_null() {
             body.insert("metadata".into(), ir.metadata.clone());
         }
-        if !ir.tool_choice.is_null() {
-            body.insert("tool_choice".into(), ir.tool_choice.clone());
+        if let Some(v) = encode_tool_choice_for_anthropic(&ir.tool_choice, loss) {
+            body.insert("tool_choice".into(), v);
         }
 
         // tools: prefer original raw when present (decode failure path);
@@ -512,8 +512,9 @@ impl AnthropicMessagesCodec {
 
         // Unknown raw fields round-trip (do not overwrite known keys).
         for (k, v) in &ir.raw {
-            if k == "max_tokens" {
-                // Consumed above (or loss-recorded); do not double-write.
+            // Consumed above (mapped / loss-recorded / intentionally
+            // omitted); never re-inject a foreign shape from raw.
+            if k == "max_tokens" || k == "tool_choice" {
                 continue;
             }
             body.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1653,6 +1654,86 @@ fn encode_content_block(
     }
 }
 
+/// Map `ir.tool_choice` onto Anthropic's native `tool_choice` shapes (C6).
+///
+/// Anthropic `ToolChoice` is an object union only — never a bare string.
+/// Native objects pass through silently: `{"type":"auto"|"any"|"none"}`
+/// and `{"type":"tool","name":…}` (each optionally with
+/// `disable_parallel_tool_use`).
+///
+/// Bare strings `"auto"` / `"any"` / `"none"` are pure wire adaptation
+/// → `{"type":"<same>"}` with no loss. Non-native shapes record an
+/// `UnsupportedByTarget` loss, then best-effort map: `"required"` (bare
+/// or `{"type":"required"}`) → `{"type":"any"}`; a tool name
+/// (`function.name` or top-level `name`) → `{"type":"tool","name":…}`;
+/// any other unmappable value is omitted (returns `None`) so a foreign
+/// shape never reaches Anthropic.
+fn encode_tool_choice_for_anthropic(
+    tool_choice: &Value,
+    loss: &mut sag_core::LossInventory,
+) -> Option<Value> {
+    match tool_choice {
+        Value::Null => None,
+        Value::String(s) => match s.as_str() {
+            "auto" | "any" | "none" => Some(json!({ "type": s.as_str() })),
+            _ => {
+                loss.push_loss(
+                    LossScope::Request,
+                    "tool_choice",
+                    LossReason::UnsupportedByTarget,
+                    tool_choice.clone(),
+                );
+                if s == "required" {
+                    Some(json!({"type": "any"}))
+                } else {
+                    None
+                }
+            }
+        },
+        Value::Object(obj) => {
+            let ty = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if matches!(ty, "auto" | "any" | "none") {
+                return Some(tool_choice.clone());
+            }
+            if ty == "tool"
+                && let Some(name) = obj.get("name").and_then(|n| n.as_str())
+                && !name.is_empty()
+            {
+                return Some(tool_choice.clone());
+            }
+            // Non-native object: record loss, then map `required` →
+            // `any`, extract a name if present, else omit.
+            loss.push_loss(
+                LossScope::Request,
+                "tool_choice",
+                LossReason::UnsupportedByTarget,
+                tool_choice.clone(),
+            );
+            if ty == "required" {
+                return Some(json!({"type": "any"}));
+            }
+            let name = obj
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .or_else(|| obj.get("name").and_then(|n| n.as_str()))
+                .filter(|n| !n.is_empty());
+            name.map(|n| json!({"type": "tool", "name": n}))
+        }
+        // Illegal JSON types (number / array / bool) — record the drop
+        // and omit rather than forward a foreign shape.
+        other => {
+            loss.push_loss(
+                LossScope::Request,
+                "tool_choice",
+                LossReason::UnsupportedByTarget,
+                other.clone(),
+            );
+            None
+        }
+    }
+}
+
 fn encode_tools(tools: &[IrTool]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
@@ -2146,6 +2227,145 @@ mod tests {
         assert_eq!(entry.reason, LossReason::DroppedByTargetFeature);
         assert_eq!(entry.value["nominal"], 8192);
         assert_eq!(entry.value["actual"], 2048);
+    }
+
+    // ── encode_tool_choice_for_anthropic (C6) ──────────────────
+
+    #[test]
+    fn tool_choice_native_object_shapes_pass_without_loss() {
+        for tc in [
+            json!({"type": "auto"}),
+            json!({"type": "any"}),
+            json!({"type": "none"}),
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+            json!({"type": "tool", "name": "f"}),
+            json!({"type": "tool", "name": "f", "disable_parallel_tool_use": true}),
+        ] {
+            let mut loss = sag_core::LossInventory::default();
+            let out = encode_tool_choice_for_anthropic(&tc, &mut loss);
+            assert_eq!(out, Some(tc.clone()), "native {tc} must pass through");
+            assert!(loss.is_empty(), "native {tc} must not record loss");
+        }
+    }
+
+    #[test]
+    fn tool_choice_bare_auto_any_none_adapt_to_object_without_loss() {
+        for s in ["auto", "any", "none"] {
+            let mut loss = sag_core::LossInventory::default();
+            let out = encode_tool_choice_for_anthropic(&json!(s), &mut loss);
+            assert_eq!(
+                out,
+                Some(json!({"type": s})),
+                "bare {s:?} must be adapted to object form"
+            );
+            assert!(loss.is_empty(), "wire adaptation of {s:?} is not a loss");
+        }
+    }
+
+    #[test]
+    fn tool_choice_chat_function_shape_maps_to_tool_with_loss() {
+        let tc = json!({"type": "function", "function": {"name": "f"}});
+        let mut loss = sag_core::LossInventory::default();
+        let out = encode_tool_choice_for_anthropic(&tc, &mut loss);
+        assert_eq!(out, Some(json!({"type": "tool", "name": "f"})));
+        assert_eq!(loss.len(), 1);
+        assert_eq!(loss.entries[0].field, "tool_choice");
+        assert_eq!(loss.entries[0].reason, LossReason::UnsupportedByTarget);
+        assert_eq!(loss.entries[0].value, tc);
+    }
+
+    #[test]
+    fn tool_choice_responses_function_shape_maps_to_tool_with_loss() {
+        let tc = json!({"type": "function", "name": "f"});
+        let mut loss = sag_core::LossInventory::default();
+        let out = encode_tool_choice_for_anthropic(&tc, &mut loss);
+        assert_eq!(out, Some(json!({"type": "tool", "name": "f"})));
+        assert_eq!(loss.len(), 1);
+        assert_eq!(loss.entries[0].reason, LossReason::UnsupportedByTarget);
+    }
+
+    #[test]
+    fn tool_choice_required_maps_to_any_object_with_loss() {
+        for tc in [json!("required"), json!({"type": "required"})] {
+            let mut loss = sag_core::LossInventory::default();
+            let out = encode_tool_choice_for_anthropic(&tc, &mut loss);
+            assert_eq!(out, Some(json!({"type": "any"})), "{tc} → any object");
+            assert_eq!(loss.len(), 1, "{tc} must record loss");
+            assert_eq!(loss.entries[0].field, "tool_choice");
+            assert_eq!(loss.entries[0].reason, LossReason::UnsupportedByTarget);
+            assert_eq!(loss.entries[0].value, tc);
+        }
+    }
+
+    #[test]
+    fn tool_choice_unmappable_object_omitted_with_loss() {
+        // Hosted / unknown object without a usable tool name.
+        for tc in [
+            json!({"type": "web_search"}),
+            json!({"type": "custom", "foo": 1}),
+            json!({"type": "function"}),
+        ] {
+            let mut loss = sag_core::LossInventory::default();
+            let out = encode_tool_choice_for_anthropic(&tc, &mut loss);
+            assert_eq!(out, None, "{tc} must be omitted");
+            assert_eq!(loss.len(), 1, "{tc} must record loss");
+            assert_eq!(loss.entries[0].field, "tool_choice");
+            assert_eq!(loss.entries[0].value, tc);
+        }
+    }
+
+    #[test]
+    fn tool_choice_illegal_types_omitted_with_loss() {
+        for tc in [json!(1), json!(true), json!(["auto"]), json!("banana")] {
+            let mut loss = sag_core::LossInventory::default();
+            let out = encode_tool_choice_for_anthropic(&tc, &mut loss);
+            assert_eq!(out, None, "{tc} must be omitted");
+            assert_eq!(loss.len(), 1, "{tc} must record loss");
+        }
+        // Null → no field, no loss.
+        let mut loss = sag_core::LossInventory::default();
+        assert_eq!(
+            encode_tool_choice_for_anthropic(&Value::Null, &mut loss),
+            None
+        );
+        assert!(loss.is_empty());
+    }
+
+    #[test]
+    fn encode_request_tool_choice_wins_over_raw_roundtrip() {
+        // Explicit mapped tool_choice must win; raw must not re-inject
+        // a foreign shape when the value was intentionally omitted.
+        let ir = IrRequest {
+            model: "m".into(),
+            max_tokens: Some(100),
+            tool_choice: json!({"type": "function", "function": {"name": "f"}}),
+            ..Default::default()
+        };
+        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "m");
+        assert_eq!(body["tool_choice"], json!({"type": "tool", "name": "f"}));
+        assert!(
+            loss.entries.iter().any(|e| e.field == "tool_choice"),
+            "mapped non-native shape must record loss"
+        );
+
+        let mut ir2 = IrRequest {
+            model: "m".into(),
+            max_tokens: Some(100),
+            tool_choice: json!({"type": "web_search"}),
+            ..Default::default()
+        };
+        ir2.raw
+            .insert("tool_choice".into(), json!({"type": "web_search"}));
+        let (body2, loss2) = AnthropicMessagesCodec::encode_request_with_loss(&ir2, "m");
+        assert!(
+            body2.get("tool_choice").is_none(),
+            "omitted shape must not re-enter via raw; got {:?}",
+            body2.get("tool_choice")
+        );
+        assert!(
+            loss2.entries.iter().any(|e| e.field == "tool_choice"),
+            "omitted shape must record loss"
+        );
     }
 
     // ── response round-trips ────────────────────────────────────

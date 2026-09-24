@@ -8,9 +8,12 @@
 //!   for chat and image generation respectively.
 //! - [`retry::run_with_retries`] — generic per-target retry loop shared by both
 //!   dispatch paths.
-//! - [`stream::build_streaming_response`] — SSE response builder that forwards
-//!   `StreamChunk::Data` to the client and accumulates `Usage` / `Error`
-//!   chunks into a final `CallLog`.
+//! - [`stream::build_streaming_response`] — SSE response builder that loops
+//!   over [`sag_core::IrStreamEvent`]: structured events (`Start` /
+//!   `TextDelta` / …) are rendered via the ingress `encode` fn; `Raw`
+//!   frames are forwarded byte-identically; `Usage` / `Error` / `End`
+//!   are handled inline (merge / record / finish) and are never
+//!   re-encoded into the body.
 //!
 //! Target-ordering helpers (FillFirst / RoundRobin) live in [`crate::order`].
 

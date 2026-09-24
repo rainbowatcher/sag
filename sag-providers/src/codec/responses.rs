@@ -8,9 +8,10 @@
 //! Upstream side: `encode_request` / `decode_response` / `decode_stream_frame`.
 //!
 //! Hard rejects (D1, plan §4.4): `previous_response_id` / `store=true` /
-//! `background` / unsupported tools / complex `tool_choice` return
-//! [`AppError::BadRequest`], rendered as HTTP 422 by the `/v1/responses`
-//! handler — never capability-precheck drops.
+//! `background` / unsupported tools return [`AppError::BadRequest`],
+//! rendered as HTTP 422 by the `/v1/responses` handler — never
+//! capability-precheck drops. Complex `tool_choice` shapes are opaque
+//! raw passthrough into `ir.tool_choice` (C6), not hard rejects.
 //!
 //! M8 stateful subset: `decode_request_allow_stateful` permits
 //! `previous_response_id` / `store=true` into `IrRequest.raw` so the
@@ -201,23 +202,16 @@ fn status_to_finish(
     }
 }
 
-/// Map a tool_choice value; complex `function:{…}` shapes are rejected (422).
+/// Opaque-passthrough `tool_choice` validation (C6): any string or object
+/// shape is kept byte-identical in `ir.tool_choice`; only illegal JSON
+/// types (number / array / bool) are rejected (422).
 fn decode_tool_choice(v: &Value) -> Result<Value, AppError> {
     match v {
         Value::Null => Ok(Value::Null),
-        Value::String(_) => Ok(v.clone()),
-        Value::Object(obj) => {
-            let ty = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if ty == "function" || obj.contains_key("function") {
-                return Err(reject(
-                    "tool_choice complex function shape is not supported (stateless Responses only)",
-                ));
-            }
-            Ok(v.clone())
-        }
-        // numbers / arrays are not legal simple shapes — reject loudly.
+        Value::String(_) | Value::Object(_) => Ok(v.clone()),
+        // numbers / arrays / bools are not legal tool_choice shapes — reject loudly.
         _ => Err(reject(
-            "tool_choice must be a simple shape (auto/none/required)",
+            "tool_choice must be a string or object (auto/none/required/function/…)",
         )),
     }
 }
@@ -2184,20 +2178,46 @@ mod tests {
     }
 
     #[test]
-    fn reject_complex_tool_choice() {
-        let err = ResponsesCodec::decode_request(&json!({
+    fn accepts_complex_tool_choice_passthrough() {
+        let complex = json!({"type": "function", "function": {"name": "f"}});
+        let ir = decode(json!({
             "model": "m",
             "input": [],
-            "tool_choice": {"type": "function", "function": {"name": "f"}}
-        }))
-        .unwrap_err();
-        assert!(err.to_string().contains("tool_choice"));
-        // simple shapes pass
+            "tool_choice": complex
+        }));
+        assert_eq!(ir.tool_choice, complex, "complex shape kept opaque");
+        let back = ResponsesCodec::encode_request(&ir);
+        assert_eq!(back["tool_choice"], complex, "re-emitted unchanged");
+
+        // flat Responses-style function shape also passes through.
+        let flat = json!({"type": "function", "name": "f"});
+        let ir = decode(json!({
+            "model": "m",
+            "input": [],
+            "tool_choice": flat
+        }));
+        assert_eq!(ir.tool_choice, flat, "flat shape kept opaque");
+        let back = ResponsesCodec::encode_request(&ir);
+        assert_eq!(back["tool_choice"], flat, "flat re-emitted unchanged");
+
+        // strings and simple objects still pass.
         for tc in [json!("auto"), json!("required"), json!({"type": "none"})] {
             ResponsesCodec::decode_request(&json!({
                 "model": "m", "input": [], "tool_choice": tc
             }))
-            .unwrap_or_else(|e| panic!("simple tool_choice {tc} must pass: {e}"));
+            .unwrap_or_else(|e| panic!("tool_choice {tc} must pass: {e}"));
+        }
+
+        // illegal JSON types still reject.
+        for tc in [json!(1), json!(true), json!(["auto"])] {
+            let err = ResponsesCodec::decode_request(&json!({
+                "model": "m", "input": [], "tool_choice": tc
+            }))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("tool_choice"),
+                "type {tc} must reject: {err}"
+            );
         }
     }
 
