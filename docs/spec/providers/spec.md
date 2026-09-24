@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-07-23
 ---
 
 # 供应商 — 规格
@@ -35,24 +35,52 @@ flowchart TD
 ```rust
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    async fn chat(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse>;
-    async fn chat_stream(&self, request: ChatCompletionRequest) -> Result<SseResponse>;
-    async fn chat_image(&self, request: ImageGenerationRequest) -> Result<ImageGenerationResponse>;
+    fn name(&self) -> &str;
+
+    async fn chat(
+        &self,
+        request: &ChatCompletionRequest,
+        real_model: &str,
+        api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<ChatCompletionResponse>;
+
+    async fn chat_stream(
+        &self,
+        request: &ChatCompletionRequest,
+        real_model: &str,
+        api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
+
+    async fn chat_image(
+        &self,
+        _request: &ImageGenerationRequest,
+        _real_model: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<ImageGenerationResponse>; // 默认 BadRequest
+
+    // 可选原生扩展（均有默认「不支持」实现）：
+    // anthropic_messages / anthropic_messages_stream
+    // responses_native / responses_stream_native
 }
 ```
 
-所有方法接收 OpenAI 格式的 request，返回 OpenAI 格式的 response。翻译逻辑内聚在各实现中。
+核心三方法 `chat` / `chat_stream` / `chat_image` 接收 OpenAI 格式 request，返回 OpenAI 格式 response；`chat` / `chat_stream` 必须实现，`chat_image` 默认返回 BadRequest。翻译逻辑内聚在各实现中。另提供可选原生扩展方法（`anthropic_messages`、`anthropic_messages_stream`、`responses_native`、`responses_stream_native`），默认「不支持」，由对应适配器覆盖。
 
 ## 关键决策
 
 ### 统一 trait vs 每个供应商独立接口
 
-选择统一 `LlmProvider` trait，每个供应商实现同样的三个方法。
+选择统一 `LlmProvider` trait：核心三方法（`chat` / `chat_stream` / `chat_image`）保证统一调用面，另有可选原生扩展方法供需要原生协议的适配器覆盖。
 
 **Trade-off**:
 - ✅ 调用方（dispatch）不需要知道供应商类型，统一调用
 - ✅ 添加新供应商只需实现 trait，dispatch 代码零改动
-- ❌ 不是所有供应商都支持所有端点（如图像生成），不支持的方法返回 `AppError::UnsupportedEndpoint`
+- ❌ 不是所有供应商都支持所有端点（如图像生成、原生协议），不支持的方法走默认实现并返回 `AppError::BadRequest`
 - ❌ 翻译逻辑完全内聚，跨供应商的共享逻辑（如 body_overrides 合并）需要提取到 base.rs 中
 
 ### Anthropic 翻译的复杂度
@@ -85,9 +113,9 @@ RoundRobin 计数器通过 `DispatchRuntime` 中的 `Arc<AtomicUsize>` 维护，
 
 ### Body Overrides 合并顺序
 
-客户端请求体 → provider `body_overrides` → target `extra`，后覆盖前。
+客户端请求体 → provider `body_overrides` → `model_overrides[real_model]` → target `extra` → strip（`strip_fields` / `model_strip_fields` 最终净化），后覆盖前；strip 为硬性移除，优先于一切 override。
 
-**Trade-off**: 这个顺序允许 provider 设置默认参数，target 可以覆盖特定目标。但也意味着 target 无法"恢复"被 provider overrides 覆盖的客户端字段。
+**Trade-off**: 这个顺序允许 provider 设置默认参数，target 可以覆盖特定目标。但也意味着 target 无法"恢复"被 provider overrides 覆盖的客户端字段；若字段被 strip 列出，则无论哪层 override 写入都会被移除。
 
 ### Anthropic reasoning_effort → thinking 翻译
 

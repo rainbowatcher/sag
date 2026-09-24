@@ -8,9 +8,12 @@
 
 | 字段 | 说明 |
 |------|------|
+| `provider_type` | 供应商适配器类型（`openai` / `anthropic`），默认 `openai` |
 | `api_keys` | API 密钥列表 |
 | `key_strategy` | 多密钥选择策略（`fill_first` / `round_robin`） |
 | `base_url` | 供应商 API 基础 URL |
+| `proxy_mode` | 出站代理三态：`inherit`（默认，跟随顶层 `proxy_url`）/ `enabled`（强制走全局代理，无全局代理则配置错误）/ `disabled`（强制直连）。SAG **不读**系统代理环境变量 |
+| `models_endpoint` | 管理面板拉取模型列表的端点路径，拼接在 `base_url` 后，默认 `models` |
 | `timeout_secs` | 上游请求超时（秒），默认 600。流式请求不受此约束（见「流式超时」），仅作为非流式请求的整体安全网 |
 | `chunk_timeout_secs` | 流式 chunk 间最大空闲时间（秒），省略则无限等待 |
 | `ttfb_timeout_secs` | 流式请求等待上游响应头（首字节）的最大时间（秒），默认 60。收到响应头后停止计时，不约束后续 body 流 |
@@ -18,8 +21,12 @@
 | `enabled_models` | 模型白名单，空列表 = 全部允许 |
 | `headers` | 附加到上游请求的自定义 HTTP 头 |
 | `body_overrides` | 合并到上游请求体的字段覆盖，对该供应商**所有模型**生效。优先级低于 `model_overrides` 和路由 target 的 `extra` |
+| `strip_fields` | 在三层 body override **之后**硬性移除的顶层字段（最终净化），空列表 no-op |
+| `model_strip_fields` | 逐模型的字段剥离表，以 `real_model` 为 key。与 `strip_fields` 取并集后在 override 之后统一剥离 |
 | `model_overrides` | 逐模型 body 字段覆盖，以 `real_model` 为 key。优先级高于 `body_overrides`，低于路由 target 的 `extra`。推荐用于避免在多个路由中重复配置同一模型的参数 |
 | `role_mappings` | 角色名映射表（如 `{ "developer" = "system" }`） |
+| `anthropic_cache_control` | 是否向 Anthropic 请求注入 `cache_control` 断点，默认 `true`（仅对 `provider_type = "anthropic"` 有效，详见下文） |
+| `upstream_protocol` | 可选的上游协议声明。省略时由 `provider_type` 推导（openai→`chat_completions`，anthropic→`anthropic_messages`）；Native 模式需显式声明且等于 ingress 协议 |
 
 ## 内置供应商
 
@@ -31,6 +38,7 @@
 - **流式**：SSE 流式透传
 - **图像**：`POST /v1/images/generations`
 - **模型列表**：管理面板默认请求 `models`，可通过 provider 的 `models_endpoint` 配置覆盖路径。
+- **Responses 原生协议**：支持 OpenAI Responses 原生路径（`responses_native` / `responses_stream_native`），需通过 `upstream_protocol` 显式声明。
 
 ### Anthropic
 
@@ -39,6 +47,22 @@
 - 系统提示从 `messages` 中提取，作为 `system` 参数发送
 - 内容块转换为 Anthropic 的格式
 - 认证使用 `x-api-key` 请求头
+
+#### Extended Thinking 翻译
+
+客户端 `reasoning_effort` 经 7 档映射为 Anthropic 的 `thinking: {type:"enabled", budget_tokens:N}`：
+
+| 档位 | `budget_tokens` |
+|------|-----------------|
+| `none` | 省略 `thinking` |
+| `minimal` | 1024 |
+| `low` | 2048 |
+| `medium` | 4096 |
+| `high` | 8192 |
+| `xhigh` | 16384 |
+| `max` | 32768 |
+
+约束为 `budget_tokens ≤ max_tokens - 1024`（预留输出余量）。目标档位放不下时向下递归降级到第一个满足约束的档位；连 `minimal(1024)` 都塞不下则放弃 thinking。不悄悄抬高 `max_tokens`。未知档位不启用 thinking，不报错。
 
 #### Anthropic 缓存控制
 
@@ -54,11 +78,21 @@ anthropic_cache_control = false   # 关闭缓存控制
 
 ## Body Override
 
-SAG 提供三层 body override 机制，让你在不同粒度上控制上游请求参数。优先级从低到高：
+SAG 提供分层 body override 机制，让你在不同粒度上控制上游请求参数。优先级从低到高：
 
 1. **`body_overrides`** — 供应商全局默认值，影响该供应商的所有模型
 2. **`model_overrides.<real_model>`** — 模型专属覆盖，仅对匹配的 `real_model` 生效
-3. **`RouteTarget.extra`** — 路由目标级覆盖，最高优先级
+3. **`RouteTarget.extra`** — 路由目标级覆盖，override 链最高优先级
+4. **`strip_fields` / `model_strip_fields`** — 最终净化：在上述三层 override **之后**硬性移除顶层字段
+
+完整优先级链（从低到高）：`body_overrides` < `model_overrides[real_model]` < `RouteTarget.extra` < `strip_fields`/`model_strip_fields`（剥离）。
+
+剥离层语义：
+
+- 不是替换字段值，而是从最终 body 顶层**删除**字段
+- 即使前几层覆盖插入了同名字段，strip 也优先将其移除（配置矛盾时 strip 胜出）
+- 空列表 no-op；`model_strip_fields` 按最终 `body.model`（即 `real_model`）匹配，与 provider 级 `strip_fields` 取并集
+- 典型用途：上游严格 schema 校验（如 pydantic `extra=forbid`）拒绝客户端透传的无关字段
 
 ### body_overrides vs model_overrides
 
@@ -66,10 +100,15 @@ SAG 提供三层 body override 机制，让你在不同粒度上控制上游请�
 |------|------------------|-------------------|
 | 作用范围 | 供应商的所有模型 | 指定的 `real_model` |
 | 典型用途 | 全局默认参数（如统一 `max_tokens`） | 避免在多个路由中重复配置同一模型的参数 |
-| 优先级 | 低（可被 `model_overrides` 和 `extra` 覆盖） | 中（覆盖 `body_overrides`，可被 `extra` 覆盖） |
+| 优先级 | 低（可被 `model_overrides` 和 `extra` 覆盖） | 中（覆盖 `body_overrides`，可被 `extra` 覆盖；最终仍可能被 strip 移除） |
 | TOML 格式 | 扁平 key-value | 两级 map，以模型名为 key |
 
 ```toml
+[providers.openai]
+# strip_fields：override 之后硬性移除，优先级最高
+strip_fields = ["chat_template_kwargs"]
+model_strip_fields = { "glm-5.2" = ["chat_template_kwargs"] }
+
 # body_overrides：所有 openai 请求都带 max_tokens=4096
 [providers.openai.body_overrides]
 max_tokens = 4096
@@ -124,8 +163,39 @@ gpt-4o-mini = { max_tokens = 2048 }  # 覆盖全局的 max_tokens
 ```rust
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    async fn chat(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse>;
-    async fn chat_stream(&self, request: ChatCompletionRequest) -> Result<SseResponse>;
-    async fn chat_image(&self, request: ImageGenerationRequest) -> Result<ImageGenerationResponse>;
+    fn name(&self) -> &str;
+
+    async fn chat(
+        &self,
+        request: &ChatCompletionRequest,
+        real_model: &str,
+        api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<ChatCompletionResponse>;
+
+    async fn chat_stream(
+        &self,
+        request: &ChatCompletionRequest,
+        real_model: &str,
+        api_endpoint: &str,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
+
+    // 默认实现返回 BadRequest，支持图像生成的供应商可覆盖
+    async fn chat_image(
+        &self,
+        _request: &ImageGenerationRequest,
+        _real_model: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<ImageGenerationResponse> { /* ... */ }
+
+    // 可选原生扩展方法（均有默认「不支持」实现）：
+    // anthropic_messages / anthropic_messages_stream
+    // responses_native / responses_stream_native
 }
 ```
+
+核心三方法 `chat` / `chat_stream` / `chat_image` 中，前两者必须实现；`chat_image` 有默认实现（不支持则返回 BadRequest）。原生扩展方法默认返回「不支持」，由对应适配器按需覆盖。

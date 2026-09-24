@@ -74,9 +74,11 @@ provider_type = "openai"
 api_keys = ["${OPENAI_API_KEY}"]
 base_url = "https://api.openai.com/v1"
 models_endpoint = "models"
+proxy_mode = "inherit"     # inherit（默认）/ enabled / disabled；不读系统代理环境变量
 timeout_secs = 600         # 非流式整体超时安全网
 ttfb_timeout_secs = 60     # 流式：等待首字节（响应头）的超时
 chunk_timeout_secs = 30    # 流式：chunk 间空闲超时
+# strip_fields = ["chat_template_kwargs"]  # override 之后硬性剥离的顶层字段
 
 [providers.anthropic]
 provider_type = "anthropic"
@@ -119,6 +121,7 @@ targets = [
 | `api_keys` | array | `[]` | API 密钥列表 |
 | `key_strategy` | string | `"fill_first"` | 多密钥选择策略：`"fill_first"`（顺序使用，失败后切换）或 `"round_robin"`（轮询分发） |
 | `base_url` | string | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
+| `proxy_mode` | string | `"inherit"` | 出站代理三态：`"inherit"`（默认，跟随顶层 `proxy_url`）/ `"enabled"`（强制走全局代理，无全局代理则配置错误）/ `"disabled"`（强制直连）。SAG **不读**系统代理环境变量 |
 | `models_endpoint` | string | `"models"` | 模型列表端点路径（拼接在 `base_url` 后） |
 | `timeout_secs` | integer | `600` | 上游请求超时（秒）。流式请求不受此约束，仅作为非流式请求的整体安全网 |
 | `chunk_timeout_secs` | integer (可选) | — | 流式请求中 chunk 间的最大空闲时间（秒），超时则断开连接。省略时无限等待 |
@@ -127,9 +130,12 @@ targets = [
 | `enabled_models` | array | `[]` | 允许使用的模型 ID 列表。非空时仅此列表中的模型可使用此供应商。默认空（允许所有模型） |
 | `headers` | object | `{}` | 附加到上游请求的自定义 HTTP 头，应用于供应商默认头之后，可覆盖认证、Content-Type 等 |
 | `body_overrides` | object | `{}` | 合并到上游请求体顶层的字段覆盖（如 `max_tokens`、`temperature`），对该供应商的**所有模型**生效。优先级低于 `model_overrides` 和目标级别的 `extra` |
+| `strip_fields` | array | `[]` | 在三层 body override **之后**硬性移除的顶层字段（最终净化）。配置矛盾时 strip 胜出；空列表 no-op |
+| `model_strip_fields` | object | `{}` | 逐模型字段剥离表，以 `real_model`（最终 `body.model`）为 key。与 `strip_fields` 取并集后在 override 之后统一剥离 |
 | `model_overrides` | object | `{}` | 逐模型的 body 字段覆盖，以 `real_model` 名称为 key。仅对匹配的模型生效，优先级高于 `body_overrides`，低于目标级别的 `extra`。用于避免在多个路由 target 中重复配置同一 `(provider, real_model)` 的参数 |
 | `role_mappings` | object | `{}` | 角色映射表：将请求中的角色名映射为上游支持的角色。例如 `{ "developer" = "system" }` 将 developer 消息转为 system 消息。大小写敏感 |
 | `anthropic_cache_control` | boolean | `true` | 是否对 Anthropic 请求注入 `cache_control: {\"type\": \"ephemeral\"}` 断点。仅对 `provider_type = "anthropic"` 有效，可显著降低重复前缀请求的成本 |
+| `upstream_protocol` | string (可选) | — | 显式上游协议。省略时由 `provider_type` 推导（openai→`chat_completions`，anthropic→`anthropic_messages`）；Native 模式需显式声明且等于 ingress 协议 |
 
 #### headers 示例
 
@@ -166,7 +172,7 @@ developer = "system"
 
 ## Body Override 优先级详解
 
-SAG 提供三层 body override 机制，按以下优先级从低到高排列：
+SAG 提供分层 body override 机制，按以下优先级从低到高排列：
 
 ```
 客户端原始请求体
@@ -175,7 +181,9 @@ Provider body_overrides（全局，所有模型）
     ↓ 被覆盖
 Provider model_overrides[real_model]（该模型专属）
     ↓ 被覆盖
-RouteTarget extra（该路由目标最高优先级）
+RouteTarget extra（该路由目标，override 链最高优先级）
+    ↓ 被剥离
+Provider strip_fields / model_strip_fields（最终净化，硬性移除）
 ```
 
 ### 设计原则
@@ -185,12 +193,15 @@ RouteTarget extra（该路由目标最高优先级）
 | `body_overrides` | `[providers.<name>]` | 设置供应商级别的**全局默认值**，影响该供应商的所有模型 |
 | `model_overrides` | `[providers.<name>.model_overrides]` | 设置**模型专属参数**，避免在多个路由 target 中重复配置 `extra` |
 | `extra` | `[[routes]].targets[]` | **路由级微调**，仅在特定路由目标需要与 `model_overrides` 不同的参数时使用 |
+| `strip_fields` / `model_strip_fields` | `[providers.<name>]` | **最终净化**：在以上三层 override 之后硬性移除顶层字段（配置矛盾时 strip 胜出）。`model_strip_fields` 按最终 `body.model`（即 `real_model`）匹配并与 `strip_fields` 取并集；空列表 no-op |
 
 ### 示例
 
 ```toml
 [providers.openai]
 api_keys = ["${OPENAI_API_KEY}"]
+# 最终净化：override 之后硬性剥离（可选）
+strip_fields = ["chat_template_kwargs"]
 
 # 全局默认：所有 openai 请求 max_tokens=4096
 [providers.openai.body_overrides]
@@ -203,7 +214,7 @@ gpt-4o = { temperature = 0.7 }
 [[routes]]
 model_name = "gpt-4o"
 targets = [
-    # 最终参数：max_tokens=4096 + temperature=0.7
+    # 最终参数：max_tokens=4096 + temperature=0.7（若在 strip_fields 中列出则被移除）
     { provider = "openai", real_model = "gpt-4o", priority = 10 },
 ]
 
