@@ -58,6 +58,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         client_ip,
         ingress_protocol: _,
         ir: _,
+        entry_loss: _,
     } = ctx;
 
     // Client-disconnect terminal (image dispatch is non-streaming, so this
@@ -1094,6 +1095,7 @@ mod tests {
             client_ip: None,
             ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
             ir: None,
+            entry_loss: Default::default(),
         }
     }
 

@@ -290,6 +290,7 @@ fn make_ctx_with_strategy<'a>(
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     }
 }
 
@@ -323,6 +324,7 @@ fn make_ctx_with_token<'a>(
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     }
 }
 
@@ -2590,6 +2592,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2661,6 +2664,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2750,6 +2754,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2850,6 +2855,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2902,6 +2908,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     };
     let resp2 = dispatch_chat(ctx2).await;
     assert_eq!(resp2.status(), StatusCode::OK);
@@ -2998,6 +3005,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         client_ip: None,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
+        entry_loss: Default::default(),
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -3390,5 +3398,53 @@ async fn dispatch_chat_call_log_carries_nonempty_loss_summary() {
     assert!(
         summary.contains("n:unsupported_by_ir"),
         "summary must include the request loss field: {summary}"
+    );
+}
+
+/// Entry-route encode loss (`DispatchCtx.entry_loss`) must seed the
+/// dispatch encode accumulator so CallLog `loss_summary` carries the
+/// corresponding field/reason even when no attempt-side encode runs.
+#[tokio::test]
+async fn dispatch_chat_call_log_carries_entry_loss_seed() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let mut entry_loss = sag_core::LossInventory::default();
+    entry_loss.push_loss(
+        sag_core::LossScope::Request,
+        "entry_field",
+        sag_core::LossReason::UnsupportedByIr,
+        json!("seed"),
+    );
+    ctx.entry_loss = entry_loss;
+    assert!(!ctx.entry_loss.is_empty());
+
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    state.collector.flush().await;
+    let logs = state
+        .collector
+        .store()
+        .query_logs(sag_analytics::LogFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1, "success must write one CallLog row");
+    let summary = logs[0]
+        .loss_summary
+        .as_deref()
+        .expect("loss_summary must be non-empty when entry_loss is seeded");
+    assert!(
+        summary.contains("entry_field:unsupported_by_ir"),
+        "summary must include the entry_loss field/reason: {summary}"
     );
 }

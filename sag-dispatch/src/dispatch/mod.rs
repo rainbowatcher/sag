@@ -136,6 +136,11 @@ pub struct DispatchCtx<'a> {
     /// `None`. When `None`, `dispatch_chat` decodes from `request` as a
     /// fallback so direct test constructions stay valid.
     pub ir: Option<&'a sag_core::IrRequest>,
+    /// Entry-side encode losses captured in `routes.rs` (e.g. the
+    /// `ChatCompletionsCodec::encode_request_with_loss` synthesis for
+    /// Anthropic/Responses ingress). Seeds the dispatch-side encode
+    /// accumulator so `CallLog.loss_summary` carries them.
+    pub entry_loss: sag_core::LossInventory,
 }
 
 // ═══════════════════════════════════════════════════════════════════

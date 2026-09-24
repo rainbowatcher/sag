@@ -35,7 +35,7 @@ pub enum IrStreamEvent {
     /// 流结束（对应 `[DONE]` / message_stop / response.completed）
     End,
     /// 未知/未映射的上游事件原样携带（translated lane）；
-    /// native 直通不经 IR，走独立 NativeBytes 通道。
+    /// native 原始帧以 `Raw` 透传（不经结构化 IR 解析）。
     Raw(Vec<u8>),
 }
 

@@ -82,6 +82,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         client_ip,
         ingress_protocol,
         ir,
+        entry_loss,
     } = ctx;
 
     // IR orchestration view: routes.rs decodes once after
@@ -103,9 +104,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     // Encode-side losses are collected per-attempt into this cell and
     // merged (append unique entries — never overwrite) with response
     // losses at every terminal: non-stream success, stream commit,
-    // per-target failure, and fallback.
-    let encode_losses =
-        std::sync::Arc::new(std::sync::Mutex::new(sag_core::LossInventory::default()));
+    // per-target failure, and fallback. Seeded with the entry-route
+    // encode loss (`routes.rs` synthesis) so it is never dropped when
+    // attempts produce no further encode loss.
+    let encode_losses = std::sync::Arc::new(std::sync::Mutex::new(entry_loss));
     let loss_summary = sag_core::summarize_losses(&[&ir.loss], 5);
     // Snapshot encode-side losses + request losses into one summary.
     // When the encode cell is non-empty it already carries `ir.loss` as

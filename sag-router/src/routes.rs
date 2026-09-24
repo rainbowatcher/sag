@@ -208,6 +208,7 @@ async fn chat_completions(
             ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
             // Image path stays out of IR (plan § D8 / M4 hard constraint).
             ir: None,
+            entry_loss: Default::default(),
         })
         .await;
     }
@@ -235,6 +236,7 @@ async fn chat_completions(
         client_ip,
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: Some(&ir),
+        entry_loss: Default::default(),
     })
     .await
 }
@@ -365,6 +367,7 @@ async fn anthropic_messages(
         client_ip,
         ingress_protocol: sag_core::IngressProtocol::AnthropicMessages,
         ir: Some(&ir),
+        entry_loss: encode_loss,
     })
     .await;
 
@@ -540,6 +543,7 @@ async fn responses(
         client_ip,
         ingress_protocol: sag_core::IngressProtocol::Responses,
         ir: Some(&ir),
+        entry_loss: encode_loss,
     })
     .await
 }
