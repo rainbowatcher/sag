@@ -29,30 +29,36 @@ use tower::ServiceExt;
 
 async fn build_protected_state() -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "openai".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        },
-    );
+    for name in ["openai", "anthropic"] {
+        providers.insert(
+            name.to_string(),
+            ProviderConfig {
+                provider_type: if name == "openai" {
+                    ProviderType::OpenAI
+                } else {
+                    ProviderType::Anthropic
+                },
+                api_keys: vec![format!("sk-{name}")],
+                key_strategy: KeyStrategy::FillFirst,
+                base_url: "https://api.openai.com/v1".into(),
+                proxy_mode: ProxyMode::default(),
+                models_endpoint: "models".into(),
+                timeout_secs: 120,
+                headers: HashMap::new(),
+                body_overrides: HashMap::new(),
+                strip_fields: vec![],
+                model_strip_fields: HashMap::new(),
+                model_overrides: HashMap::new(),
+                role_mappings: HashMap::new(),
+                enabled_models: vec![],
+                enabled: true,
+                anthropic_cache_control: true,
+                chunk_timeout_secs: None,
+                ttfb_timeout_secs: None,
+                upstream_protocol: None,
+            },
+        );
+    }
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec!["regression-key".into()],
@@ -72,6 +78,7 @@ async fn build_protected_state() -> AppState {
                 real_model: Some("gpt-4o".into()),
                 priority: 1,
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }],
         ..sag_config::gateway_config_base!()
@@ -147,7 +154,9 @@ async fn auth_regression_add_provider_completes_through_auth_middleware() {
                 .header("Authorization", "Bearer regression-key")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"name":"anthropic","api_keys":["sk-ant"],"provider_type":"anthropic"}"#,
+                    // Fixture already has openai + anthropic; add a third
+                    // so the create path is exercised without a 409 conflict.
+                    r#"{"name":"mistral","api_keys":["sk-mistral"],"provider_type":"openai","base_url":"https://api.mistral.ai/v1"}"#,
                 ))
                 .unwrap(),
         )

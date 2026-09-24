@@ -115,6 +115,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         route_name,
         &request.model,
         is_stream,
+        ingress_protocol,
         started_at,
         start,
         request.reasoning_effort.clone(),
@@ -205,7 +206,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     // Cancels during backoff sleeps or between targets have
                     // no marker → 0 target attempts (spec: 退避/fallback
                     // 间隙 → 0 条).
-                    cancel.begin_attempt(&provider_name, &real_model);
+                    cancel.begin_attempt(
+                        &provider_name,
+                        &real_model,
+                        Some(target.upstream_protocol.as_str()),
+                        Some(target.lane.as_str()),
+                    );
                     // M5 native: Anthropic ingress × explicitly declared
                     // AnthropicMessages target → call upstream with the
                     // Anthropic body (never translate through Chat).
@@ -441,6 +447,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 &outcome,
                 target_started_at,
                 chrono::Utc::now(),
+                Some(target.upstream_protocol.as_str()),
+                Some(target.lane.as_str()),
             )
         {
             // Mirror the fact into the cancel guard *before* continuing to
@@ -488,6 +496,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 request.reasoning_effort.as_deref(),
                 user_agent.as_deref(),
                 client_ip.as_deref(),
+                Some(ingress_protocol.as_str().to_string()),
+                Some(target.upstream_protocol.as_str().to_string()),
+                Some(target.lane.as_str().to_string()),
             );
             if let Some(err) = client_error {
                 // Client-attributed 4xx: return to the client directly — no
@@ -524,6 +535,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         cache_creation_tokens: None,
                         ttft_ms: None,
                         upstream_duration_ms: None,
+                        ingress_protocol: Some(ingress_protocol.as_str().to_string()),
+                        lane: None,
                     }),
                 )
                 .await;
@@ -603,6 +616,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         request.reasoning_effort.clone(),
                         user_agent.clone(),
                         client_ip.clone(),
+                        Some(ingress_protocol.as_str().to_string()),
+                        Some(target.upstream_protocol.as_str().to_string()),
+                        Some(target.lane.as_str().to_string()),
                     );
                 }
                 if is_responses_ingress {
@@ -623,6 +639,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         request.reasoning_effort.clone(),
                         user_agent.clone(),
                         client_ip.clone(),
+                        Some(ingress_protocol.as_str().to_string()),
+                        Some(target.upstream_protocol.as_str().to_string()),
+                        Some(target.lane.as_str().to_string()),
                     );
                 }
                 return build_streaming_response(
@@ -642,6 +661,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     request.reasoning_effort.clone(),
                     user_agent.clone(),
                     client_ip.clone(),
+                    Some(ingress_protocol.as_str().to_string()),
+                    Some(target.upstream_protocol.as_str().to_string()),
+                    Some(target.lane.as_str().to_string()),
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {
@@ -663,6 +685,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     timing,
                     user_agent.clone(),
                     client_ip.clone(),
+                    Some(ingress_protocol.as_str().to_string()),
+                    Some(target.upstream_protocol.as_str().to_string()),
+                    Some(target.lane.as_str().to_string()),
                 ));
                 // Formal analytics event: the request completed successfully.
                 // The writer derives `actual_model` from the final
@@ -691,6 +716,11 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 .and_then(|u| u.cache_creation_tokens),
                             ttft_ms: timing,
                             upstream_duration_ms: timing,
+                            ingress_protocol: Some(ingress_protocol.as_str().to_string()),
+                            // Request-level lane: lane of the successful target
+                            // (first successful attempt; the loop only reaches
+                            // here with `target` still in scope).
+                            lane: Some(target.lane.as_str().to_string()),
                         },
                         targets: target_facts,
                     },
@@ -732,6 +762,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         request.reasoning_effort.as_deref(),
         user_agent.as_deref(),
         client_ip.as_deref(),
+        Some(ingress_protocol.as_str().to_string()),
+        None,
+        None,
     );
     // Formal analytics event: every target exhausted → `model_failure`
     // with `all_exhausted` and one failure fact per actually-issued
@@ -757,6 +790,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 cache_creation_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                ingress_protocol: Some(ingress_protocol.as_str().to_string()),
+                // All-exhausted: lane of the first actually-issued attempt
+                // (target_facts non-empty ⇒ at least one attempt carried a lane).
+                lane: target_facts.first().and_then(|f| f.lane.clone()),
             },
             targets: target_facts,
         },

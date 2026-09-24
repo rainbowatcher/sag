@@ -84,7 +84,15 @@ pub async fn resolve_route_with_ingress(
     let route = sag_config::resolve_model_route(&config_guard.routes, &request.model);
     let Some(route) = route else {
         return Err(emit_no_route_failure(
-            state, request, trace_id, is_stream, start, started_at, user_agent, client_ip,
+            state,
+            request,
+            trace_id,
+            is_stream,
+            start,
+            started_at,
+            user_agent,
+            client_ip,
+            ingress_protocol,
         )
         .await);
     };
@@ -104,6 +112,7 @@ pub async fn resolve_route_with_ingress(
             user_agent,
             client_ip,
             &[],
+            ingress_protocol,
         )
         .await);
     }
@@ -128,6 +137,7 @@ pub async fn resolve_route_with_ingress(
             user_agent,
             client_ip,
             &cap_errors,
+            ingress_protocol,
         )
         .await);
     }
@@ -237,6 +247,7 @@ async fn emit_no_route_failure(
     started_at: chrono::DateTime<chrono::Utc>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    ingress_protocol: sag_core::IngressProtocol,
 ) -> Response<Body> {
     let response = failure_response(
         state,
@@ -251,6 +262,9 @@ async fn emit_no_route_failure(
         request.reasoning_effort.as_deref(),
         user_agent,
         client_ip,
+        Some(ingress_protocol.as_str().to_string()),
+        None,
+        None,
     );
     // Formal analytics fact: no route matched → no route identity, no
     // target attempts. The sentinel `__no_route__` CallLog row above is
@@ -265,6 +279,7 @@ async fn emit_no_route_failure(
             FailureReason::ModelNotFound,
             is_stream,
             started_at,
+            Some(ingress_protocol),
         ),
     )
     .await;
@@ -292,6 +307,7 @@ async fn emit_all_disabled_failure(
     user_agent: Option<&str>,
     client_ip: Option<&str>,
     capability_errors: &[String],
+    ingress_protocol: sag_core::IngressProtocol,
 ) -> Response<Body> {
     let reason = if capability_errors.is_empty() {
         format!(
@@ -320,6 +336,9 @@ async fn emit_all_disabled_failure(
         request.reasoning_effort.as_deref(),
         user_agent,
         client_ip,
+        Some(ingress_protocol.as_str().to_string()),
+        None,
+        None,
     );
     // Formal analytics fact: the route matched but every target is
     // disabled → carry the real matched route name (never the
@@ -336,6 +355,7 @@ async fn emit_all_disabled_failure(
             FailureReason::AllDisabled,
             is_stream,
             started_at,
+            Some(ingress_protocol),
         ),
     )
     .await;
@@ -409,6 +429,7 @@ fn map_resolved_targets(
 ///
 /// Both cases carry zero target attempts. `completed_at` is captured at
 /// completion time (UTC); `request_id` is the caller's `trace_id`.
+#[allow(clippy::too_many_arguments)]
 fn route_failure_event(
     trace_id: uuid::Uuid,
     requested_model: &str,
@@ -417,6 +438,7 @@ fn route_failure_event(
     failure_reason: FailureReason,
     stream: bool,
     started_at: chrono::DateTime<chrono::Utc>,
+    ingress_protocol: Option<sag_core::IngressProtocol>,
 ) -> AnalyticsEvent {
     AnalyticsEvent::new(RequestResultFact {
         request_id: trace_id,
@@ -432,6 +454,10 @@ fn route_failure_event(
         cache_creation_tokens: None,
         ttft_ms: None,
         upstream_duration_ms: None,
+        // no_route / all_disabled: ingress known from the mount path, lane
+        // stays None (no target attempted).
+        ingress_protocol: ingress_protocol.map(|p| p.as_str().to_string()),
+        lane: None,
     })
 }
 
@@ -544,6 +570,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "off".into(),
@@ -553,6 +580,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
 
@@ -581,6 +609,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "openai".into(),
@@ -590,6 +619,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
 
@@ -606,6 +636,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::new(),
             upstream_protocol: None,
+            capabilities: None,
         }];
         let filtered_pass = filter_enabled_targets(&providers, &passthrough_targets, "gpt-4o-mini");
         assert_eq!(filtered_pass.len(), 1);
@@ -627,6 +658,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::new(),
             upstream_protocol: None,
+            capabilities: None,
         }];
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");
         assert_eq!(filtered.len(), 1);
@@ -660,6 +692,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }];
 
@@ -865,6 +898,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             });
             state.config.bump_routes_version();
@@ -953,6 +987,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             });
             state.config.bump_routes_version();
@@ -993,6 +1028,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }];
         let config = sag_config::GatewayConfig {
@@ -1045,6 +1081,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }];
 
@@ -1156,6 +1193,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
                 sag_config::RouteTarget {
                     provider: "good".into(),
@@ -1165,6 +1203,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
             ],
         }];
@@ -1242,6 +1281,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }];
         let config = sag_config::GatewayConfig {
@@ -1467,6 +1507,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }];
 

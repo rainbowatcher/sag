@@ -243,10 +243,24 @@ async fn update_settings_normalizes_blank_proxy_to_none() {
 
 /// Even with an empty provider set the settings mutation validates the URL
 /// up front (the provider sync only resolves proxies for configured
-/// providers, so the up-front check is what catches this case).
+/// providers, so the up-front check is what catches this case). The
+/// success path seeds one provider so full `GatewayConfig::validate`
+/// (run by every mutate) accepts the committed config.
 #[tokio::test]
 async fn update_settings_validates_even_with_empty_provider_set() {
+    let mut providers_map = HashMap::new();
+    providers_map.insert(
+        "p1".to_string(),
+        sag_config::ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            // Disabled so setting the global proxy does not rebuild it —
+            // this test pins URL validation, not proxy hot-rebuild.
+            proxy_mode: sag_config::ProxyMode::Disabled,
+            ..Default::default()
+        },
+    );
     let handle = sag_config::ConfigHandle::from_config(sag_config::GatewayConfig {
+        providers: providers_map,
         ..sag_config::gateway_config_base!()
     });
     let providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>> =
@@ -256,7 +270,7 @@ async fn update_settings_validates_even_with_empty_provider_set() {
     let err = coord
         .update_settings(Some("http://user:pass@proxy.example:8080".into()), None)
         .await
-        .expect_err("malformed URL must be rejected even with no providers");
+        .expect_err("malformed URL must be rejected");
     assert!(err.to_string().contains("userinfo"));
 
     // A valid value is accepted (in-memory config: no file to persist).
@@ -425,7 +439,18 @@ async fn update_settings_manages_gateway_auth_api_keys() {
 /// part of the credential.
 #[tokio::test]
 async fn update_settings_trims_api_keys() {
+    // Seed one provider so full `GatewayConfig::validate` (run by every
+    // mutate) accepts the committed config.
+    let mut providers_map = HashMap::new();
+    providers_map.insert(
+        "p1".to_string(),
+        sag_config::ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            ..Default::default()
+        },
+    );
     let handle = sag_config::ConfigHandle::from_config(sag_config::GatewayConfig {
+        providers: providers_map,
         ..sag_config::gateway_config_base!()
     });
     let providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>> =

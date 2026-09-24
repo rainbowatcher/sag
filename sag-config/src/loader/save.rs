@@ -635,6 +635,61 @@ fn write_target_fields(
     } else {
         existing.remove("upstream_protocol");
     }
+
+    // capabilities — nested inline table of present keys only; drop the
+    // field entirely when None / empty (mirrors skip_serializing_if).
+    match &target.capabilities {
+        Some(caps) => {
+            let table = ensure_nested_inline_table(existing, "capabilities");
+            // Known keys: write present Some(_) values, remove absent ones.
+            for (key, val) in [
+                ("streaming", caps.streaming),
+                ("reasoning", caps.reasoning),
+                ("tools", caps.tools),
+                ("images", caps.images),
+                ("documents", caps.documents),
+                ("stateful", caps.stateful),
+                ("hosted_tools", caps.hosted_tools),
+                ("background", caps.background),
+            ] {
+                match val {
+                    Some(b) => {
+                        table.insert(key, toml_edit::Value::from(b));
+                    }
+                    None => {
+                        table.remove(key);
+                    }
+                }
+            }
+            // Unknown keys are rejected by validate() and never reach save
+            // on a valid config; still strip them defensively.
+            let known = [
+                "streaming",
+                "reasoning",
+                "tools",
+                "images",
+                "documents",
+                "stateful",
+                "hosted_tools",
+                "background",
+            ];
+            let stale: Vec<String> = table
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .filter(|k| !known.contains(&k.as_str()))
+                .collect();
+            for k in stale {
+                table.remove(&k);
+            }
+            // Fully-empty override: drop the nested table too.
+            if table.is_empty() {
+                existing.remove("capabilities");
+            }
+        }
+        None => {
+            existing.remove("capabilities");
+        }
+    }
     Ok(())
 }
 
@@ -833,6 +888,7 @@ base_url = "https://api.anthropic.com"
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1132,6 +1188,7 @@ targets = [
                         serde_json::json!({ "temperature": null }),
                     )]),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1198,6 +1255,7 @@ targets = [
                     timeout_secs: None,
                     extra: HashMap::from([("list".into(), serde_json::json!([1, null, 3]))]),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1261,6 +1319,7 @@ targets = [
                     timeout_secs: None,
                     extra: HashMap::from([("temperature".into(), serde_json::Value::Null)]),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             }],
             ..crate::gateway_config_base!()
@@ -1553,6 +1612,7 @@ targets = [
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         });
 
@@ -3372,14 +3432,16 @@ targets = [
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Set Some on provider and target.
+        // Set Some on provider and target (legal openai combos only:
+        // chat_completions / responses — anthropic_messages on openai is
+        // now a validate error).
         config
             .providers
             .get_mut("openai")
             .unwrap()
             .upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
         config.routes[0].targets[0].upstream_protocol =
-            Some(sag_core::UpstreamProtocol::AnthropicMessages);
+            Some(sag_core::UpstreamProtocol::ChatCompletions);
 
         save_config_to_file(&config, &path).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
@@ -3388,7 +3450,7 @@ targets = [
             "provider upstream_protocol must be written, got:\n{saved}"
         );
         assert!(
-            saved.contains("upstream_protocol = \"anthropic_messages\""),
+            saved.contains("upstream_protocol = \"chat_completions\""),
             "target upstream_protocol must be written, got:\n{saved}"
         );
 
@@ -3400,7 +3462,7 @@ targets = [
         );
         assert_eq!(
             reloaded.routes[0].targets[0].upstream_protocol,
-            Some(sag_core::UpstreamProtocol::AnthropicMessages)
+            Some(sag_core::UpstreamProtocol::ChatCompletions)
         );
         drop(reloaded);
 

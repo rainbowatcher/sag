@@ -881,6 +881,8 @@ mod tests {
             cache_creation_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            ingress_protocol: None,
+            lane: None,
         })
     }
 

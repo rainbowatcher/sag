@@ -43,6 +43,30 @@ pub(crate) async fn build_state_with_proxy(
     sag_state::testing::test_app_state(handle, provider_registry).await
 }
 
+/// Build an `AppState` whose config handle is **file-backed** at `path`
+/// (so `mutate` takes the persist/conflict path). Seeds a minimal but
+/// fully-valid TOML document (`[server]` + providers + routes) that
+/// `load_config` accepts — `save_config_to_file` alone cannot create
+/// `[server]` on a blank path.
+pub(crate) async fn build_file_backed_state(
+    path: &std::path::Path,
+    providers: HashMap<String, ProviderConfig>,
+    routes: Vec<RouteConfig>,
+) -> AppState {
+    let config = GatewayConfig {
+        providers,
+        routes,
+        ..sag_config::gateway_config_base!()
+    };
+    // `toml` re-serializes the whole struct (fine for a seed file; the
+    // in-place `toml_edit` save path is not exercised here).
+    let seed = toml::to_string(&config).expect("config must serialize to TOML");
+    std::fs::write(path, seed).expect("seed config must write");
+    let handle = sag_config::load_config(path).expect("config must load from path");
+    let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+    sag_state::testing::test_app_state(handle, provider_registry).await
+}
+
 /// Build a test Axum app mounting admin routes without auth middleware.
 pub(crate) fn test_app(state: AppState) -> Router {
     Router::new()
@@ -97,6 +121,7 @@ pub(crate) fn one_provider_config(
                 priority: prio,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         })
         .collect();

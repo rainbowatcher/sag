@@ -59,17 +59,25 @@ fn route(model_name: &str, targets: &[(&str, Option<&str>)]) -> RouteConfig {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             })
             .collect(),
     }
 }
 
 /// Build an in-memory coordinator; `registry: None` keeps the legacy
-/// registry-free behavior.
+/// registry-free behavior. Seeds the providers the route fixtures
+/// reference so full `GatewayConfig::validate` (run by every mutate)
+/// accepts the resulting configs.
 fn make_coordinator(
     registry: Option<Arc<IdentityRegistry>>,
 ) -> (Arc<ConfigMutationCoordinator>, ConfigHandle) {
+    let mut providers_map = HashMap::new();
+    for name in ["openai", "anthropic"] {
+        providers_map.insert(name.to_string(), base_provider());
+    }
     let config = ConfigHandle::from_config(GatewayConfig {
+        providers: providers_map,
         ..gateway_config_base!()
     });
     let providers: Arc<RwLock<HashMap<String, Arc<dyn LlmProvider>>>> =

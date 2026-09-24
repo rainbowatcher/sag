@@ -107,6 +107,7 @@ async fn build_state(base_url: &str, key: &str) -> AppState {
                 real_model: Some("gpt-4o".into()),
                 priority: 1,
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }],
         ..sag_config::gateway_config_base!()
@@ -418,6 +419,7 @@ async fn build_state_anthropic_native(base_url: &str, key: &str) -> AppState {
                 real_model: Some("claude-sonnet-4".into()),
                 priority: 1,
                 upstream_protocol: Some(sag_core::UpstreamProtocol::AnthropicMessages),
+                capabilities: None,
             }],
         }],
         ..sag_config::gateway_config_base!()

@@ -376,6 +376,18 @@ pub struct CallLog {
     /// call. Same visibility rules as [`CallLog::route_id`].
     #[serde(default, skip_serializing, skip_deserializing)]
     pub target_id: Option<uuid::Uuid>,
+    /// Ingress protocol of the request that produced this call (e.g.
+    /// `"chat_completions"`). Omitted from legacy serialization when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_protocol: Option<String>,
+    /// Effective upstream protocol of the attempted target. Omitted when
+    /// `None` (legacy records / no target identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<String>,
+    /// Lane taken for this attempt (`"native"` / `"translated"`). Omitted
+    /// when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -522,6 +534,15 @@ pub struct RequestResultFact {
     pub cache_creation_tokens: Option<u32>,
     pub ttft_ms: Option<u64>,
     pub upstream_duration_ms: Option<u64>,
+    /// Ingress protocol of the request (`"chat_completions"` / `"responses"` /
+    /// `"anthropic_messages"`). `None` only for facts built before M7 or
+    /// when the ingress was never resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_protocol: Option<String>,
+    /// Request-level lane: lane of the first successful (or first attempted)
+    /// target. `None` for `client_error` / `no_route` / `all_disabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
 }
 
 /// Target-level fact for one actual upstream attempt.
@@ -542,6 +563,13 @@ pub struct TargetAttemptFact {
     pub cached_tokens: Option<u32>,
     pub ttft_ms: Option<u64>,
     pub upstream_duration_ms: Option<u64>,
+    /// Effective upstream protocol of this attempt's target. `None` when the
+    /// attempt never reached protocol resolution (legacy / pre-M7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<String>,
+    /// Lane of this attempt (`"native"` / `"translated"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
 }
 
 /// Generate a new UUID v7 (time-ordered, millisecond precision).
@@ -677,6 +705,9 @@ mod tests {
             error_category: None,
             route_id: None,
             target_id: None,
+            ingress_protocol: None,
+            upstream_protocol: None,
+            lane: None,
         }
     }
 

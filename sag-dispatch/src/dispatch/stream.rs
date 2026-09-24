@@ -26,6 +26,12 @@ struct StreamAnalytics {
     requested_model: String,
     provider: String,
     real_model: String,
+    /// Ingress protocol of the request (mount path → protocol).
+    ingress_protocol: Option<String>,
+    /// Effective upstream protocol of the streaming target.
+    upstream_protocol: Option<String>,
+    /// Lane of the streaming target (`"native"` / `"translated"`).
+    lane: Option<String>,
     /// Wall-clock route start captured at dispatch time (fact timestamp).
     started_at: chrono::DateTime<chrono::Utc>,
     /// Wall-clock start of this target's first actual provider call.
@@ -95,6 +101,10 @@ fn terminal_event(
             cache_creation_tokens: usage.as_ref().and_then(|u| u.cache_creation_tokens),
             ttft_ms,
             upstream_duration_ms,
+            ingress_protocol: analytics.ingress_protocol.clone(),
+            // Stream success: lane of this target; failure: same lane (the
+            // attempt was issued on this target).
+            lane: analytics.lane.clone(),
         },
         targets: {
             let mut targets = analytics.prior_target_facts.clone();
@@ -109,6 +119,8 @@ fn terminal_event(
                 cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
                 ttft_ms,
                 upstream_duration_ms,
+                upstream_protocol: analytics.upstream_protocol.clone(),
+                lane: analytics.lane.clone(),
             });
             targets
         },
@@ -324,9 +336,13 @@ impl Drop for TerminalGuard {
             client_ip: self.analytics.client_ip.clone(),
             error_category: Some(error_category),
             // Legacy call_logs keeps its diagnostic role: formal identity
-            // columns stay NULL here, matching the normal terminal's row.
+            // columns stay NULL here; M7 protocol/lane dimensions come
+            // from the shared stream analytics when dispatch wired them.
             route_id: None,
             target_id: None,
+            ingress_protocol: self.analytics.ingress_protocol.clone(),
+            upstream_protocol: self.analytics.upstream_protocol.clone(),
+            lane: self.analytics.lane.clone(),
         });
     }
 }
@@ -374,6 +390,9 @@ fn make_stream_analytics(
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) -> Arc<StreamAnalytics> {
     Arc::new(StreamAnalytics {
         event_collector: state.event_collector.clone(),
@@ -382,6 +401,9 @@ fn make_stream_analytics(
         requested_model: model.to_string(),
         provider: provider_name.to_string(),
         real_model: real_model.to_string(),
+        ingress_protocol,
+        upstream_protocol,
+        lane,
         started_at,
         target_started_at,
         prior_target_facts: target_facts,
@@ -554,8 +576,13 @@ fn build_stream_call_log<S, E>(
         // formal identity columns stay NULL here; the
         // request_results / target_attempts facts resolve
         // identity via route_name / provider / real_model.
+        // M7 protocol/lane dimensions come from the shared
+        // stream analytics (present whenever dispatch wired them).
         route_id: None,
         target_id: None,
+        ingress_protocol: state.analytics.ingress_protocol.clone(),
+        upstream_protocol: state.analytics.upstream_protocol.clone(),
+        lane: state.analytics.lane.clone(),
     }
 }
 
@@ -719,6 +746,9 @@ pub fn build_streaming_response<S, E>(
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -743,6 +773,9 @@ where
         reasoning_effort.clone(),
         user_agent.clone(),
         client_ip.clone(),
+        ingress_protocol,
+        upstream_protocol,
+        lane,
     );
     let state = make_stream_state(
         chunk_stream,
@@ -889,6 +922,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -928,6 +964,8 @@ mod tests {
                 cache_creation_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                ingress_protocol: None,
+                lane: None,
             },
             targets: vec![TargetAttemptFact {
                 provider: "openai".into(),
@@ -940,6 +978,8 @@ mod tests {
                 cached_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                upstream_protocol: None,
+                lane: None,
             }],
         }
     }
@@ -1175,6 +1215,9 @@ mod tests {
             Some("medium".into()),
             None,
             None,
+            None,
+            None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1360,6 +1403,8 @@ mod tests {
             cached_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            upstream_protocol: None,
+            lane: None,
         };
         let chunks = vec![
             StreamChunk::Data(b"data: hello\n\n".to_vec()),
@@ -1387,6 +1432,9 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             vec![prior_failure],
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1512,6 +1560,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1597,6 +1648,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         // The disconnect: drop the response without polling the body. The
@@ -1674,6 +1728,9 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1765,6 +1822,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         drop(resp);
@@ -1841,6 +1901,9 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1945,6 +2008,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2035,6 +2101,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -2106,6 +2175,9 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -2212,6 +2284,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2312,6 +2387,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -2390,6 +2468,9 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -2482,6 +2563,9 @@ mod tests {
                     requested_model: "gpt-4o".to_string(),
                     provider: "openai".to_string(),
                     real_model: "gpt-4o".to_string(),
+                    ingress_protocol: None,
+                    upstream_protocol: None,
+                    lane: None,
                     started_at: chrono::Utc::now(),
                     target_started_at: chrono::Utc::now(),
                     prior_target_facts: Vec::new(),

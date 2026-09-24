@@ -505,6 +505,8 @@ pub(crate) struct InFlightAttempt {
     provider: String,
     real_model: String,
     started_at: chrono::DateTime<chrono::Utc>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 }
 
 /// Shared state of one dispatch: the request-identity facts needed to
@@ -518,6 +520,8 @@ pub(crate) struct DispatchAnalytics {
     /// The model the client requested (route-level identity).
     requested_model: String,
     is_stream: bool,
+    /// Ingress protocol of the request (mount path → protocol).
+    ingress_protocol: sag_core::IngressProtocol,
     /// Wall-clock route start captured at dispatch time (fact timestamp).
     started_at: chrono::DateTime<chrono::Utc>,
     /// Wall-clock route start (`Instant`) for the `duration_ms` column of
@@ -597,12 +601,20 @@ impl DispatchAnalytics {
     /// Poisoned-lock recovery: a panic while holding the lock would only
     /// happen on a fatal bug; `into_inner` keeps the guard functional
     /// instead of dropping the event.
-    fn begin_attempt(&self, provider: &str, real_model: &str) {
+    fn begin_attempt(
+        &self,
+        provider: &str,
+        real_model: &str,
+        upstream_protocol: Option<&str>,
+        lane: Option<&str>,
+    ) {
         let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         *slot = Some(InFlightAttempt {
             provider: provider.to_string(),
             real_model: real_model.to_string(),
             started_at: chrono::Utc::now(),
+            upstream_protocol: upstream_protocol.map(str::to_string),
+            lane: lane.map(str::to_string),
         });
     }
 
@@ -643,6 +655,7 @@ impl DispatchCancelGuard {
         route_name: &str,
         requested_model: &str,
         is_stream: bool,
+        ingress_protocol: sag_core::IngressProtocol,
         started_at: chrono::DateTime<chrono::Utc>,
         start: Instant,
         reasoning_effort: Option<String>,
@@ -657,6 +670,7 @@ impl DispatchCancelGuard {
                 route_name: route_name.to_string(),
                 requested_model: requested_model.to_string(),
                 is_stream,
+                ingress_protocol,
                 started_at,
                 start,
                 reasoning_effort,
@@ -716,10 +730,21 @@ impl Drop for DispatchCancelGuard {
         // Provider / real-model identity for the legacy `call_logs` row:
         // the in-flight attempt when there was one, else a sentinel (a
         // pre-commit cancel during resolve/backoff/handshake has no target
-        // identity to report).
-        let (provider, real_model) = match &in_flight {
-            Some(att) => (att.provider.clone(), att.real_model.clone()),
-            None => ("__cancelled__".to_string(), "__cancelled__".to_string()),
+        // identity to report). Protocol / lane follow the same rule —
+        // filled only when an attempt was actually in flight.
+        let (provider, real_model, cancel_upstream_protocol, cancel_lane) = match &in_flight {
+            Some(att) => (
+                att.provider.clone(),
+                att.real_model.clone(),
+                att.upstream_protocol.clone(),
+                att.lane.clone(),
+            ),
+            None => (
+                "__cancelled__".to_string(),
+                "__cancelled__".to_string(),
+                None,
+                None,
+            ),
         };
         // Facts of targets that already completed (failed) before the
         // in-flight one — a multi-target fallback cancelled on a later
@@ -745,6 +770,8 @@ impl Drop for DispatchCancelGuard {
                 cached_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                upstream_protocol: att.upstream_protocol,
+                lane: att.lane,
             });
         }
         let event = sag_analytics::AnalyticsEvent {
@@ -762,6 +789,10 @@ impl Drop for DispatchCancelGuard {
                 cache_creation_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                ingress_protocol: Some(analytics.ingress_protocol.as_str().to_string()),
+                // Cancel between targets / during backoff: lane of the first
+                // completed attempt if any, else None.
+                lane: targets.first().and_then(|f| f.lane.clone()),
             },
             targets,
         };
@@ -803,9 +834,14 @@ impl Drop for DispatchCancelGuard {
             client_ip: analytics.client_ip.clone(),
             error_category: Some("client_cancelled".to_string()),
             // Legacy call_logs keeps its diagnostic role: formal identity
-            // columns stay NULL here, matching the other dispatch rows.
+            // columns stay NULL here. M7 dimensions: ingress always known
+            // from the mount path; upstream/lane only when an attempt was
+            // in flight (matching the provider/real_model sentinel rule).
             route_id: None,
             target_id: None,
+            ingress_protocol: Some(analytics.ingress_protocol.as_str().to_string()),
+            upstream_protocol: cancel_upstream_protocol,
+            lane: cancel_lane,
         });
         warn!(
             request_id = %request_id,
@@ -818,6 +854,10 @@ impl Drop for DispatchCancelGuard {
 // Logging / response helpers — shared across the dispatch submodules.
 
 /// Build a `CallLog` for a successful response.
+///
+/// `ingress_protocol` / `upstream_protocol` / `lane` are optional M7
+/// dimensions: callers with request/target context fill them; callers
+/// without (sentinels, pre-resolve failures) pass `None`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn success_log(
     request_id: uuid::Uuid,
@@ -832,6 +872,9 @@ pub(in crate::dispatch) fn success_log(
     ttft_ms: Option<u64>,
     user_agent: Option<String>,
     client_ip: Option<String>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) -> CallLog {
     let usage = usage.cloned();
     CallLog {
@@ -858,10 +901,16 @@ pub(in crate::dispatch) fn success_log(
         // wiring is a later phase); kept None for now.
         route_id: None,
         target_id: None,
+        ingress_protocol,
+        upstream_protocol,
+        lane,
     }
 }
 
 /// Build a `CallLog` for a non-success response.
+///
+/// Same optional M7 dimensions as [`success_log`]: fill when the caller
+/// has context, `None` otherwise.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn failure_log(
     request_id: uuid::Uuid,
@@ -875,6 +924,9 @@ pub(in crate::dispatch) fn failure_log(
     reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) -> CallLog {
     CallLog {
         request_id,
@@ -900,6 +952,9 @@ pub(in crate::dispatch) fn failure_log(
         // wiring is a later phase); kept None for now.
         route_id: None,
         target_id: None,
+        ingress_protocol,
+        upstream_protocol,
+        lane,
     }
 }
 
@@ -916,6 +971,10 @@ pub(in crate::dispatch) fn failure_log(
 /// (e.g. `"provider_error"` for upstream failures, `"network_error"` for
 /// transport errors, etc.) because the wrapped `AppError::Internal(...)` would
 /// otherwise lose the original error classification.
+///
+/// Optional M7 dimensions (`ingress_protocol` / `upstream_protocol` /
+/// `lane`) are forwarded to the underlying [`failure_log`] when the
+/// caller has them; otherwise `None`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn log_per_target_failure(
     state: &AppState,
@@ -931,6 +990,9 @@ pub(in crate::dispatch) fn log_per_target_failure(
     reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) {
     let last_err = errors
         .last()
@@ -948,6 +1010,9 @@ pub(in crate::dispatch) fn log_per_target_failure(
         reasoning_effort,
         user_agent,
         client_ip,
+        ingress_protocol,
+        upstream_protocol,
+        lane,
     );
     // Override the error_category that `failure_log` derived from
     // `AppError::Internal` with the caller-supplied category so the
@@ -957,6 +1022,9 @@ pub(in crate::dispatch) fn log_per_target_failure(
 }
 
 /// Log a non-success entry and return the matching JSON error response.
+///
+/// Optional M7 dimensions: fill when the caller has request/target
+/// context (e.g. known ingress), `None` for pre-resolve sentinels.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn failure_response(
     state: &AppState,
@@ -971,6 +1039,9 @@ pub(in crate::dispatch) fn failure_response(
     reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) -> Response<Body> {
     state.collector.log(failure_log(
         trace_id,
@@ -984,11 +1055,17 @@ pub(in crate::dispatch) fn failure_response(
         reasoning_effort,
         user_agent,
         client_ip,
+        ingress_protocol,
+        upstream_protocol,
+        lane,
     ));
     err.into_response()
 }
 
 /// Log a final "all providers exhausted" entry and return its response.
+///
+/// Optional M7 dimensions: request-level ingress may be known even when
+/// no single target succeeded; upstream/lane are usually `None` here.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dispatch) fn fallback_exhausted_response(
     state: &AppState,
@@ -1000,6 +1077,9 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
     reasoning_effort: Option<&str>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 ) -> Response<Body> {
     let reason = errors.join("; ");
     let err = AppError::AllProvidersExhausted {
@@ -1024,6 +1104,9 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         reasoning_effort,
         user_agent,
         client_ip,
+        ingress_protocol,
+        upstream_protocol,
+        lane,
     ));
     err.into_response()
 }
@@ -1288,6 +1371,9 @@ mod tests {
             Some("high"),
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1306,6 +1392,9 @@ mod tests {
             Instant::now(),
             &["openai: 500".into()],
             Some("high"),
+            None,
+            None,
+            None,
             None,
             None,
         );
@@ -1351,6 +1440,9 @@ mod tests {
             Some("medium"),
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         state.collector.flush().await;
@@ -1392,6 +1484,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
 
         state.collector.flush().await;
@@ -1430,6 +1525,7 @@ mod tests {
             "test-route",
             "gpt-4o",
             false,
+            sag_core::IngressProtocol::ChatCompletions,
             started_at,
             Instant::now(),
             None,
@@ -1485,13 +1581,19 @@ mod tests {
             "test-route",
             "gpt-4o",
             true, // streaming
+            sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
             None,
             None,
             None,
         );
-        guard.analytics().begin_attempt("openai", "gpt-4o");
+        guard.analytics().begin_attempt(
+            "openai",
+            "gpt-4o",
+            Some("chat_completions"),
+            Some("translated"),
+        );
         drop(guard);
 
         state.event_collector.shutdown().await;
@@ -1534,6 +1636,7 @@ mod tests {
             "test-route",
             "gpt-4o",
             false,
+            sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
             None,
@@ -1541,7 +1644,12 @@ mod tests {
             None,
         );
         guard.mark_done();
-        guard.analytics().begin_attempt("openai", "gpt-4o");
+        guard.analytics().begin_attempt(
+            "openai",
+            "gpt-4o",
+            Some("chat_completions"),
+            Some("translated"),
+        );
         drop(guard);
 
         state.event_collector.shutdown().await;
@@ -1571,13 +1679,19 @@ mod tests {
             "test-route",
             "gpt-4o",
             true, // streaming — cancelled before `build_streaming_response` commits
+            sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
             None,
             None,
             None,
         );
-        guard.analytics().begin_attempt("openai", "gpt-4o");
+        guard.analytics().begin_attempt(
+            "openai",
+            "gpt-4o",
+            Some("chat_completions"),
+            Some("translated"),
+        );
         drop(guard);
 
         state.event_collector.shutdown().await;
@@ -1644,6 +1758,7 @@ mod tests {
             "test-route",
             "gpt-4o",
             false,
+            sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
             None,
@@ -1689,6 +1804,7 @@ mod tests {
             "test-route",
             "gpt-4o",
             false,
+            sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
             None,
@@ -1708,9 +1824,13 @@ mod tests {
             cached_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            upstream_protocol: None,
+            lane: None,
         });
         // …then the next target's call is in flight when the client leaves.
-        guard.analytics().begin_attempt("second", "gpt-4o");
+        guard
+            .analytics()
+            .begin_attempt("second", "gpt-4o", None, None);
         drop(guard);
 
         state.event_collector.shutdown().await;
@@ -1757,6 +1877,7 @@ mod tests {
             "test-route",
             "gpt-4o",
             false,
+            sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
             None,
@@ -1775,6 +1896,8 @@ mod tests {
             cached_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            upstream_protocol: None,
+            lane: None,
         });
         // No `begin_attempt` — the drop lands in a backoff/fallback gap.
         drop(guard);

@@ -26,6 +26,15 @@ pub struct RouteTargetInput {
     pub retries: Option<u32>,
     #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
+    /// Optional explicit upstream protocol for this target (overrides the
+    /// provider-level declaration). Unknown *fields* are tolerated; an
+    /// unknown enum *value* fails deserialization (axum 422).
+    #[serde(default)]
+    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
+    /// Optional fixed-key capability override. Unknown keys are rejected
+    /// by `GatewayConfig::validate` on commit (400 via config error path).
+    #[serde(default)]
+    pub capabilities: Option<sag_config::CapabilitiesOverride>,
 }
 
 impl From<RouteTargetInput> for RouteTarget {
@@ -37,7 +46,8 @@ impl From<RouteTargetInput> for RouteTarget {
             timeout_secs: None,
             priority: t.priority,
             extra: t.extra,
-            upstream_protocol: None,
+            upstream_protocol: t.upstream_protocol,
+            capabilities: t.capabilities,
         }
     }
 }
@@ -213,6 +223,10 @@ pub async fn create_route(
             )
                 .into_response()
         }
+        // Full-config validation failures (unknown capability keys,
+        // illegal upstream_protocol × provider_type, …) surface as
+        // `AppError::Config` from the coordinator; report 400 not 500.
+        Err(AppError::Config(msg)) => AppError::BadRequest(msg).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -281,6 +295,8 @@ pub async fn update_route(
             )
                 .into_response()
         }
+        // Same Config→400 remap as create_route (see above).
+        Err(AppError::Config(msg)) => AppError::BadRequest(msg).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -566,6 +582,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }];
         let state = build_state(providers, routes).await;
@@ -659,6 +676,7 @@ mod tests {
                 priority: 1,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         };
         let state = build_state(providers, vec![route]).await;
@@ -765,6 +783,7 @@ mod tests {
                 priority: 1,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         }
     }
@@ -779,6 +798,7 @@ mod tests {
                 priority: 1,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }]),
             created_at: std::time::Instant::now(),
             routes_version: Some(1),
@@ -868,6 +888,152 @@ mod tests {
         assert!(
             orders.contains_key("gpt-4.1"),
             "wildcard concrete request key keeps its cache"
+        );
+    }
+
+    // ── M7: target upstream_protocol / capabilities round-trip ──
+
+    #[tokio::test]
+    async fn create_route_round_trips_target_upstream_protocol() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model_name": "route-proto",
+                            "targets": [{
+                                "provider": "openai",
+                                "real_model": "gpt-4o",
+                                "priority": 1,
+                                "upstream_protocol": "responses",
+                                "capabilities": {"streaming": true, "tools": false},
+                            }],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let route = body["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model_name"] == "route-proto")
+            .expect("route present");
+        let target = &route["targets"][0];
+        assert_eq!(target["upstream_protocol"], serde_json::json!("responses"));
+        assert_eq!(target["capabilities"]["streaming"], serde_json::json!(true));
+        assert_eq!(target["capabilities"]["tools"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn create_route_illegal_upstream_protocol_is_422() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model_name": "bad",
+                            "targets": [{
+                                "provider": "openai",
+                                "upstream_protocol": "nope",
+                            }],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// B1: target `capabilities` with an unknown key (`teleport`) is
+    /// captured into `CapabilitiesOverride::unknown` at deserialize time
+    /// and rejected by `GatewayConfig::validate` on commit → 4xx.
+    #[tokio::test]
+    async fn create_route_unknown_capabilities_key_is_4xx() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model_name": "teleport-route",
+                            "targets": [{
+                                "provider": "openai",
+                                "real_model": "gpt-4o",
+                                "capabilities": {"teleport": true},
+                            }],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "unknown capability key must be 4xx, got {}",
+            resp.status()
+        );
+
+        // Must not have committed the route either.
+        let cfg = state.config.read().await;
+        assert!(
+            !cfg.routes.iter().any(|r| r.model_name == "teleport-route"),
+            "route with unknown capability key must not commit"
         );
     }
 }

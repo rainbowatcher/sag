@@ -62,6 +62,12 @@ pub struct AddProviderRequest {
     /// List of model IDs enabled for this provider (optional).
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    /// Optional explicit upstream protocol. Omitted/`null` derives from
+    /// `provider_type`. Unknown *fields* are tolerated; an unknown
+    /// `upstream_protocol` *value* fails deserialization (axum 422) — same
+    /// strictness as the config loader's typed enums.
+    #[serde(default)]
+    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -89,6 +95,25 @@ pub struct UpdateProviderRequest {
     pub enabled_models: Option<Vec<String>>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Optional upstream_protocol patch. Field **absent** keeps the current
+    /// value; field present as JSON `null` clears it (back to derive);
+    /// field present with a value sets it.
+    #[serde(default, deserialize_with = "double_option_upstream_protocol")]
+    pub upstream_protocol: Option<Option<sag_core::UpstreamProtocol>>,
+}
+
+/// Serde helper for the triple-state `upstream_protocol` patch: missing →
+/// `None` (keep — uses `#[serde(default)]`), JSON `null` →
+/// `Some(None)` (clear to derive), value → `Some(Some(v))` (set).
+fn double_option_upstream_protocol<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<sag_core::UpstreamProtocol>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value: Option<sag_core::UpstreamProtocol> = Option::deserialize(deserializer)?;
+    Ok(Some(value))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -118,6 +143,15 @@ pub struct ProviderInfo {
     pub role_mappings: HashMap<String, String>,
     pub enabled_models: Vec<String>,
     pub enabled: bool,
+    /// Explicit upstream protocol declaration, or `null` when derived from
+    /// `provider_type` (always present in JSON — null means "not declared").
+    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
+    /// Effective upstream protocol: explicit declaration when present,
+    /// otherwise the value derived from `provider_type`.
+    pub effective_upstream_protocol: String,
+    /// Derived capability bitmap for this provider (provider_type +
+    /// effective upstream protocol), as a JSON object — read-only UI aid.
+    pub capabilities: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -172,6 +206,61 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         role_mappings: cfg.role_mappings.clone(),
         enabled_models: cfg.enabled_models.clone(),
         enabled: cfg.enabled,
+        upstream_protocol: cfg.upstream_protocol,
+        effective_upstream_protocol: {
+            let derived = sag_core::derive_upstream_protocol(cfg.provider_type.as_str());
+            sag_core::effective_upstream_protocol(cfg.upstream_protocol, derived)
+                .as_str()
+                .to_string()
+        },
+        capabilities: {
+            let derived = sag_core::derive_upstream_protocol(cfg.provider_type.as_str());
+            let effective = sag_core::effective_upstream_protocol(cfg.upstream_protocol, derived);
+            // Mirror the dispatch capability table for the effective pair.
+            let caps = match (cfg.provider_type.as_str(), effective) {
+                ("openai", sag_core::UpstreamProtocol::ChatCompletions) => sag_core::Capabilities {
+                    streaming: true,
+                    reasoning: true,
+                    tools: true,
+                    images: true,
+                    documents: true,
+                    stateful: false,
+                    hosted_tools: false,
+                    background: false,
+                },
+                ("anthropic", _) => sag_core::Capabilities {
+                    streaming: true,
+                    reasoning: true,
+                    tools: true,
+                    images: true,
+                    documents: true,
+                    stateful: false,
+                    hosted_tools: false,
+                    background: false,
+                },
+                (_, sag_core::UpstreamProtocol::Responses) => sag_core::Capabilities {
+                    streaming: true,
+                    reasoning: true,
+                    tools: true,
+                    images: true,
+                    documents: false,
+                    stateful: false,
+                    hosted_tools: false,
+                    background: false,
+                },
+                _ => sag_core::Capabilities {
+                    streaming: true,
+                    reasoning: false,
+                    tools: false,
+                    images: false,
+                    documents: false,
+                    stateful: false,
+                    hosted_tools: false,
+                    background: false,
+                },
+            };
+            serde_json::to_value(caps).unwrap_or(serde_json::Value::Null)
+        },
     }
 }
 
@@ -232,7 +321,7 @@ pub async fn add_provider(
         anthropic_cache_control: true,
         chunk_timeout_secs: None,
         ttfb_timeout_secs: None,
-        upstream_protocol: None,
+        upstream_protocol: req.upstream_protocol,
     };
 
     // Delegate to the coordinator which atomically writes config + provider
@@ -325,6 +414,9 @@ pub async fn update_provider(
         if let Some(v) = req.enabled {
             pc.enabled = v;
         }
+        if let Some(patch) = req.upstream_protocol {
+            pc.upstream_protocol = patch;
+        }
 
         pc
     };
@@ -400,6 +492,10 @@ pub async fn delete_provider(
             })),
         )
             .into_response(),
+        // Post-delete full-config validation (e.g. deleting the last
+        // provider leaves an invalid empty set) surfaces as
+        // `AppError::Config`; report 400 not 500.
+        Err(AppError::Config(msg)) => AppError::BadRequest(msg).into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -431,10 +527,13 @@ mod tests {
             .collect()
     }
 
-    // 1. Happy path
+    // 1. Happy path — keep a second provider so the post-delete config
+    // still satisfies `GatewayConfig::validate` (at least one provider).
     #[tokio::test]
     async fn delete_provider_success() {
-        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let (mut providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let (extra, _) = one_provider_config("anthropic", vec![]);
+        providers.extend(extra);
         let state = build_state(providers, routes).await;
         let app = test_app(state.clone());
         let _ = &state; // keep state alive
@@ -459,6 +558,7 @@ mod tests {
 
         let cfg = state.config.read().await;
         assert!(!cfg.providers.contains_key("openai"));
+        assert!(cfg.providers.contains_key("anthropic"));
         assert!(cfg.routes.is_empty());
         let reg = state.providers.read().await;
         assert!(!reg.contains_key("openai"));
@@ -548,6 +648,7 @@ mod tests {
                         timeout_secs: None,
                         extra: HashMap::new(),
                         upstream_protocol: None,
+                        capabilities: None,
                     },
                     RouteTarget {
                         provider: "anthropic".into(),
@@ -557,6 +658,7 @@ mod tests {
                         extra: HashMap::new(),
                         priority: 2,
                         upstream_protocol: None,
+                        capabilities: None,
                     },
                 ],
             },
@@ -574,6 +676,7 @@ mod tests {
                     real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             },
         ];
@@ -1330,4 +1433,220 @@ targets = [
         let cfg = state.config.read().await;
         assert_eq!(cfg.providers["openai"].proxy_mode, ProxyMode::Inherit);
     }
+
+    // ── M7: upstream_protocol admin round-trip + illegal enum ──
+
+    #[tokio::test]
+    async fn add_and_list_provider_round_trips_upstream_protocol() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "oa-responses",
+                    "api_keys": ["sk-test"],
+                    "provider_type": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "upstream_protocol": "responses",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let p = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "oa-responses")
+            .expect("provider present");
+        assert_eq!(p["upstream_protocol"], serde_json::json!("responses"));
+        assert_eq!(
+            p["effective_upstream_protocol"],
+            serde_json::json!("responses")
+        );
+        assert!(p["capabilities"].is_object());
+    }
+
+    #[tokio::test]
+    async fn update_provider_clears_upstream_protocol_with_null() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let mut providers = providers;
+        let pc = providers.get_mut("openai").unwrap();
+        pc.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "openai",
+                            "upstream_protocol": null,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let config = state.config.read().await;
+        assert_eq!(
+            config.providers["openai"].upstream_protocol, None,
+            "null patch must clear to derive"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_provider_illegal_upstream_protocol_value_is_422() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "bad",
+                            "api_keys": ["sk"],
+                            "upstream_protocol": "nope",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown enum value must be 422"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_provider_unknown_fields_are_tolerated() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "tolerant",
+                            "api_keys": ["sk"],
+                            "some_future_field": {"nested": true},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── M7 rework: mutate() full validate rejects illegal protocol × type ──
+
+    /// B1: an anthropic provider declaring `upstream_protocol =
+    /// "chat_completions"` fails `GatewayConfig::validate` on the
+    /// coordinator's post-mutation check. Must surface as 4xx and must
+    /// NOT rewrite the on-disk config file.
+    #[tokio::test]
+    async fn add_provider_illegal_protocol_combo_is_4xx_and_config_file_unchanged() {
+        use crate::test_utils::build_file_backed_state;
+
+        let path = std::env::temp_dir().join(format!(
+            "sag_admin_illegal_proto_{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_file_backed_state(&path, providers, routes).await;
+        let app = test_app(state.clone());
+
+        let bytes_before = std::fs::read(&path).expect("config file must exist after setup");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "ant-bad",
+                            "provider_type": "anthropic",
+                            "api_keys": ["sk-ant"],
+                            "base_url": "https://api.anthropic.com/v1",
+                            "upstream_protocol": "chat_completions",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "illegal protocol combo must be 4xx, got {}",
+            resp.status()
+        );
+
+        // Config file must be byte-identical (mutation never persisted).
+        let bytes_after = std::fs::read(&path).expect("config file still readable");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "config file must not be rewritten on validate failure"
+        );
+
+        // In-memory config must also be unchanged.
+        let cfg = state.config.read().await;
+        assert!(
+            !cfg.providers.contains_key("ant-bad"),
+            "invalid provider must not commit in-memory either"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── end M7 ──
 }

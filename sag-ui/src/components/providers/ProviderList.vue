@@ -197,6 +197,27 @@ const columns = [
     cell: (info) =>
       h(Badge, { variant: "outline", class: "uppercase text-xs" }, () => info.getValue()),
   }),
+  columnHelper.display({
+    id: "upstream",
+    header: "Upstream",
+    cell: (info) => {
+      const p = info.row.original
+      const effective = p.effective_upstream_protocol
+      if (!effective) return null
+      const explicit = !!p.upstream_protocol
+      return h(
+        Badge,
+        {
+          variant: "outline",
+          class: `text-[10px] font-mono ${explicit ? "" : "text-muted-foreground"}`,
+          title: explicit
+            ? `Explicit upstream_protocol=${p.upstream_protocol}`
+            : `Derived from provider_type (${effective})`,
+        },
+        () => effective,
+      )
+    },
+  }),
   columnHelper.accessor("api_keys", {
     header: "Keys",
     cell: (info) => h("span", { class: "tabular-nums" }, String(info.getValue().length)),

@@ -39,7 +39,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { Provider, ProxyMode } from "@/types/api"
+import type { Provider, ProxyMode, UpstreamProtocol } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
@@ -87,6 +87,19 @@ const timeoutSecs = ref(props.provider.timeout_secs)
 // Initialize from the saved provider; the current in-memory selection is
 // always what gets sent (explicitly, so switching back to inherit works).
 const proxyMode = ref<ProxyMode>(props.provider.proxy_mode ?? "inherit")
+
+// ── Upstream protocol ────────────────────────────────────────
+// "" = derive (send null to clear); otherwise the explicit value.
+const upstreamProtocol = ref<UpstreamProtocol | "">(props.provider.upstream_protocol ?? "")
+function deriveProtocol(type: string): string {
+  return type === "anthropic" ? "anthropic_messages" : "chat_completions"
+}
+const providerEffectiveProtocol = computed(
+  () =>
+    upstreamProtocol.value ||
+    props.provider.effective_upstream_protocol ||
+    deriveProtocol(providerType.value),
+)
 
 // ── API keys ─────────────────────────────────────────────────
 const apiKeys = ref<string[]>([...props.provider.api_keys])
@@ -250,6 +263,10 @@ async function handleSubmit() {
     // to reset a provider that was saved as enabled/disabled.
     payload.proxy_mode = proxyMode.value
 
+    // Always send upstream_protocol: null clears back to derive; a value
+    // sets the explicit declaration. Omitting would leave the old value.
+    payload.upstream_protocol = upstreamProtocol.value || null
+
     await store.updateProvider(props.provider.name, payload)
     toast.success(`Provider "${props.provider.name}" updated`)
     emit("updated")
@@ -358,6 +375,28 @@ async function handleSubmit() {
                 proxy URL.
               </p>
             </div>
+
+            <div class="space-y-1">
+              <FieldLabel>Upstream Protocol</FieldLabel>
+              <Select
+                :model-value="upstreamProtocol"
+                @update:model-value="(v) => (upstreamProtocol = v as UpstreamProtocol | '')"
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Derived from type" />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="">Derived from type</SelectItem>
+                  <SelectItem value="chat_completions">Chat Completions</SelectItem>
+                  <SelectItem value="responses">Responses</SelectItem>
+                  <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-muted-foreground text-xs">
+                Explicit upstream protocol. Derived = follow provider type (openai → Chat
+                Completions, anthropic → Anthropic Messages).
+              </p>
+            </div>
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
@@ -371,6 +410,7 @@ async function handleSubmit() {
               :model-test-states="store.testModelState.states"
               v-model:models-endpoint="modelsEndpoint"
               v-model:model-overrides="modelOverridesMap"
+              :upstream-protocol="providerEffectiveProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"

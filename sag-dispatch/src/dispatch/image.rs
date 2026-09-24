@@ -73,6 +73,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         route_name,
         &request.model,
         false, // image generation is always non-streaming
+        sag_core::IngressProtocol::ChatCompletions,
         started_at,
         start,
         None, // image requests carry no reasoning_effort
@@ -172,6 +173,13 @@ async fn finish_image_success(
         None, // ttft_ms — image generation is single-shot, conceptually non-streaming
         attempt_ctx.user_agent.map(str::to_string),
         attempt_ctx.client_ip.map(str::to_string),
+        Some(
+            sag_core::IngressProtocol::ChatCompletions
+                .as_str()
+                .to_string(),
+        ),
+        Some(target.upstream_protocol.as_str().to_string()),
+        Some(target.lane.as_str().to_string()),
     ));
     emit_image_success_event(
         attempt_ctx.state,
@@ -231,6 +239,13 @@ async fn finish_image_exhausted(
         None, // reasoning_effort — not applicable for image generation
         attempt_ctx.user_agent,
         attempt_ctx.client_ip,
+        Some(
+            sag_core::IngressProtocol::ChatCompletions
+                .as_str()
+                .to_string(),
+        ),
+        None,
+        None,
     );
     emit_image_model_failure_event(
         attempt_ctx.state,
@@ -301,6 +316,8 @@ async fn attempt_one_image_target(
         &outcome,
         started_at,
         target_facts,
+        Some(prepared.upstream_protocol),
+        Some(prepared.lane),
     );
 
     apply_image_outcome(
@@ -326,6 +343,8 @@ struct PreparedAttempt<'a> {
     img_request: ImageGenerationRequest,
     retries: u32,
     timeout_secs: u64,
+    upstream_protocol: &'static str,
+    lane: &'static str,
 }
 
 /// Stage 1 — circuit gate → provider resolve → cloned per-attempt
@@ -382,6 +401,8 @@ async fn prepare_image_attempt<'a>(
         img_request: ctx.img_request.clone(),
         retries: target.retries,
         timeout_secs: target.timeout_secs,
+        upstream_protocol: target.upstream_protocol.as_str(),
+        lane: target.lane.as_str(),
     })
 }
 
@@ -424,7 +445,12 @@ async fn send_image_attempt(
                 // during this window is persisted as a `cancelled`
                 // attempt by the dispatch cancel guard (spec scenario
                 // 11).
-                cancel.begin_attempt(provider_name, &real_model);
+                cancel.begin_attempt(
+                    provider_name,
+                    &real_model,
+                    Some(prepared.upstream_protocol),
+                    Some(prepared.lane),
+                );
                 let result = provider
                     .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
                     .await;
@@ -463,6 +489,7 @@ fn image_failure_log_fields(
 /// client-caused 4xx path is excluded: per the writer's validation
 /// contract a `client_error` event can carry no target attempts, so
 /// that attempt is recorded only in call_logs.
+#[allow(clippy::too_many_arguments)]
 fn record_image_attempt(
     cancel_guard: &DispatchCancelGuard,
     provider_name: &str,
@@ -470,6 +497,8 @@ fn record_image_attempt(
     outcome: &RetryOutcome<ImageGenerationResponse>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     target_facts: &mut Vec<TargetAttemptFact>,
+    upstream_protocol: Option<&str>,
+    lane: Option<&str>,
 ) {
     let is_client_error_path =
         matches!(outcome, RetryOutcome::NonRetryable(e) if is_client_caused_4xx(e));
@@ -480,6 +509,8 @@ fn record_image_attempt(
             outcome,
             started_at,
             chrono::Utc::now(),
+            upstream_protocol,
+            lane,
         )
     {
         // Mirror the fact into the cancel guard *before* continuing to
@@ -546,6 +577,13 @@ async fn apply_image_outcome<'a>(
             None, // reasoning_effort — not applicable for image generation
             ctx.user_agent,
             ctx.client_ip,
+            Some(
+                sag_core::IngressProtocol::ChatCompletions
+                    .as_str()
+                    .to_string(),
+            ),
+            Some(target.upstream_protocol.as_str().to_string()),
+            Some(target.lane.as_str().to_string()),
         );
         if let Some(err) = client_error {
             return TargetOutcome::ClientError(err);
@@ -631,6 +669,12 @@ async fn emit_image_success_event(
                 cache_creation_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                ingress_protocol: Some(
+                    sag_core::IngressProtocol::ChatCompletions
+                        .as_str()
+                        .to_string(),
+                ),
+                lane: None,
             },
             targets: target_facts,
         },
@@ -667,6 +711,12 @@ async fn emit_image_client_error_event(
             cache_creation_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            ingress_protocol: Some(
+                sag_core::IngressProtocol::ChatCompletions
+                    .as_str()
+                    .to_string(),
+            ),
+            lane: None,
         }),
     )
     .await;
@@ -703,6 +753,12 @@ async fn emit_image_model_failure_event(
                 cache_creation_tokens: None,
                 ttft_ms: None,
                 upstream_duration_ms: None,
+                ingress_protocol: Some(
+                    sag_core::IngressProtocol::ChatCompletions
+                        .as_str()
+                        .to_string(),
+                ),
+                lane: None,
             },
             targets: target_facts,
         },
@@ -723,11 +779,15 @@ fn build_target_attempt_fact(
     outcome: &RetryOutcome<ImageGenerationResponse>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     completed_at: chrono::DateTime<chrono::Utc>,
+    upstream_protocol: Option<&str>,
+    lane: Option<&str>,
 ) -> Option<TargetAttemptFact> {
     // `started_at` is captured at the first actual provider call; fall back
     // to `completed_at` only if the closure never ran (cannot happen in
     // practice — the retry loop always issues attempt 0).
     let started_at = started_at.unwrap_or(completed_at);
+    let upstream_protocol = upstream_protocol.map(str::to_string);
+    let lane = lane.map(str::to_string);
     match outcome {
         RetryOutcome::Success(_) => Some(TargetAttemptFact {
             provider: provider.to_string(),
@@ -741,6 +801,8 @@ fn build_target_attempt_fact(
             cached_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            upstream_protocol,
+            lane,
         }),
         RetryOutcome::Exhausted(err) | RetryOutcome::NonRetryable(err) => Some(TargetAttemptFact {
             provider: provider.to_string(),
@@ -753,6 +815,8 @@ fn build_target_attempt_fact(
             cached_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            upstream_protocol,
+            lane,
         }),
     }
 }

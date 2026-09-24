@@ -385,6 +385,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::new(),
             upstream_protocol: None,
+            capabilities: None,
         }
     }
 
@@ -408,6 +409,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             })
             .collect();
 
@@ -442,6 +444,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             })
             .collect();
 
@@ -507,6 +510,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
             upstream_protocol: None,
+            capabilities: None,
         }];
         let targets_b: Vec<RouteTarget> = vec![RouteTarget {
             provider: "a".into(),
@@ -516,6 +520,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
             upstream_protocol: None,
+            capabilities: None,
         }];
 
         let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
@@ -544,6 +549,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::new(),
             upstream_protocol: None,
+            capabilities: None,
         }];
         let targets_b: Vec<RouteTarget> = vec![RouteTarget {
             provider: "a".into(),
@@ -553,6 +559,7 @@ mod tests {
             timeout_secs: None,
             extra: HashMap::new(),
             upstream_protocol: None,
+            capabilities: None,
         }];
 
         let a1 = order_fill_first(targets_a.clone(), "m", &orders, ttl, Instant::now(), 1).await;
@@ -597,6 +604,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
         let entry =
@@ -824,6 +832,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "openai".into(),
@@ -833,6 +842,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
 
@@ -1104,6 +1114,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "b".into(),
@@ -1113,6 +1124,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
         let targets_b = vec![
@@ -1124,6 +1136,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "b".into(),
@@ -1133,6 +1146,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
 
@@ -1215,6 +1229,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "b".into(),
@@ -1224,6 +1239,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
         let targets_b = vec![
@@ -1235,6 +1251,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
             RouteTarget {
                 provider: "b".into(),
@@ -1244,6 +1261,7 @@ mod tests {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             },
         ];
 

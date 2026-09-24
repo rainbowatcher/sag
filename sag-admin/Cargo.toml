@@ -25,3 +25,4 @@ sag-state = { path = "../sag-state" }
 
 [dev-dependencies]
 http-body-util = { workspace = true }
+toml = { workspace = true }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { onMounted, ref, watch } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
@@ -21,7 +21,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { ProxyMode } from "@/types/api"
+import type { ProxyMode, UpstreamProtocol } from "@/types/api"
 
 const store = useProviderStore()
 
@@ -86,6 +86,16 @@ function onTestModel(model: string) {
 // Inherit (default) follows the gateway-level proxy_url; never reuse a
 // saved value — the form's current selection is always what gets sent.
 const proxyMode = ref<ProxyMode>("inherit")
+
+// ── Upstream protocol ────────────────────────────────────────
+// "" = derive from provider_type (field omitted from the payload).
+const upstreamProtocol = ref<UpstreamProtocol | "">("")
+function deriveProtocol(type: string): string {
+  return type === "anthropic" ? "anthropic_messages" : "chat_completions"
+}
+const providerEffectiveProtocol = computed(
+  () => upstreamProtocol.value || deriveProtocol(form.state.values.provider_type),
+)
 
 // ── KV pairs ─────────────────────────────────────────────────
 const headers = ref<{ key: string; value: string }[]>([])
@@ -190,6 +200,7 @@ const form = useForm({
             ? modelsEndpoint.value
             : undefined,
         proxy_mode: proxyMode.value,
+        upstream_protocol: upstreamProtocol.value || undefined,
       })
 
       emit("created")
@@ -348,6 +359,28 @@ async function handleSubmit(event: Event) {
                 proxy URL.
               </p>
             </div>
+
+            <div class="space-y-1">
+              <FieldLabel>Upstream Protocol</FieldLabel>
+              <Select
+                :model-value="upstreamProtocol"
+                @update:model-value="(v) => (upstreamProtocol = v as UpstreamProtocol | '')"
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Derived from type" />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="">Derived from type</SelectItem>
+                  <SelectItem value="chat_completions">Chat Completions</SelectItem>
+                  <SelectItem value="responses">Responses</SelectItem>
+                  <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-muted-foreground text-xs">
+                Explicit upstream protocol. Leave as derive unless the endpoint natively speaks a
+                different protocol (e.g. Responses on an OpenAI-compatible base).
+              </p>
+            </div>
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
@@ -361,6 +394,7 @@ async function handleSubmit(event: Event) {
               :model-test-states="store.testModelState.states"
               v-model:models-endpoint="modelsEndpoint"
               v-model:model-overrides="modelOverridesMap"
+              :upstream-protocol="providerEffectiveProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"

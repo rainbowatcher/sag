@@ -95,6 +95,11 @@ base_url = "https://api.anthropic.com/v1"
 timeout_secs = 120
 # 角色映射：将不支持的角色映射为兼容角色
 # role_mappings = { "developer" = "system" }
+# Optional explicit upstream wire protocol (M7). Omitted → derived from
+# provider_type (anthropic → "anthropic_messages", openai → "chat_completions").
+# Legal combos: anthropic accepts only "anthropic_messages"; openai accepts
+# "chat_completions" or "responses". An illegal combo fails config validation.
+# upstream_protocol = "anthropic_messages"
 
 # Custom headers override or add to the default request headers.
 # [providers.my-custom.headers]
@@ -127,6 +132,18 @@ targets = [
 # Per-target extra fields have the highest priority among body overrides.
 # Use it for route-level tweaks; for model-level defaults prefer model_overrides.
 # Example: { provider = "openai", extra = { temperature = 0.7, max_tokens = 4096 } }
+#
+# M7 per-target protocol / capability overrides (all optional):
+#   upstream_protocol — force a wire protocol for this target only
+#                       (overrides the provider-level declaration).
+#   capabilities      — fixed-key capability override. Allowed keys:
+#                       streaming, reasoning, tools, images, documents,
+#                       stateful, hosted_tools, background. Unknown keys
+#                       fail config validation (admin API → 400).
+# Example:
+#   { provider = "openai", real_model = "gpt-4o", priority = 10,
+#     upstream_protocol = "responses",
+#     capabilities = { streaming = true, tools = false } }
 
 [[routes]]
 model_name = "gpt-4o-mini"

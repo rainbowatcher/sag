@@ -301,6 +301,31 @@ impl GatewayConfig {
             if provider.api_keys.is_empty() {
                 errors.push(format!("provider '{name}': api_keys must not be empty"));
             }
+            // Legal upstream_protocol × provider_type combinations (§7.1.5).
+            // Anthropic adapters only speak the Anthropic Messages wire format
+            // for their native path; Chat Completions / Responses declarations
+            // on an anthropic provider would silently select a mismatched
+            // encoder and are rejected as unknown combinations (strict-enum
+            // style, same as typed config enums).
+            if let Some(up) = provider.upstream_protocol {
+                match (provider.provider_type, up) {
+                    (ProviderType::Anthropic, sag_core::UpstreamProtocol::ChatCompletions)
+                    | (ProviderType::Anthropic, sag_core::UpstreamProtocol::Responses) => {
+                        errors.push(format!(
+                            "provider '{name}': upstream_protocol='{}' is not valid for provider_type='anthropic' (expected 'anthropic_messages')",
+                            up.as_str()
+                        ));
+                    }
+                    (ProviderType::OpenAI, sag_core::UpstreamProtocol::AnthropicMessages) => {
+                        errors.push(format!(
+                            "provider '{name}': upstream_protocol='anthropic_messages' is not valid for provider_type='openai' (expected 'chat_completions' or 'responses')"
+                        ));
+                    }
+                    // openai + chat_completions / responses, anthropic +
+                    // anthropic_messages: legal (explicit or derived).
+                    _ => {}
+                }
+            }
             // `proxy_mode = "enabled"` forces the top-level `proxy_url`;
             // without one it cannot be satisfied and is a config error.
             // The check runs against the *normalized* global proxy so a
@@ -450,6 +475,79 @@ impl GatewayConfig {
                         "routes[{i}] (model='{}'): target[{j}] timeout_secs must be greater than 0",
                         route.model_name
                     ));
+                }
+                // ── upstream_protocol × provider_type (target-level) ──
+                let target_provider = self.providers.get(&target.provider);
+                if let (Some(up), Some(pc)) = (target.upstream_protocol, target_provider) {
+                    match (pc.provider_type, up) {
+                        (ProviderType::Anthropic, sag_core::UpstreamProtocol::ChatCompletions)
+                        | (ProviderType::Anthropic, sag_core::UpstreamProtocol::Responses) => {
+                            errors.push(format!(
+                                "routes[{i}] (model='{}'): target[{j}] upstream_protocol='{}' is not valid for provider_type='anthropic' (expected 'anthropic_messages')",
+                                route.model_name,
+                                up.as_str()
+                            ));
+                        }
+                        (ProviderType::OpenAI, sag_core::UpstreamProtocol::AnthropicMessages) => {
+                            errors.push(format!(
+                                "routes[{i}] (model='{}'): target[{j}] upstream_protocol='anthropic_messages' is not valid for provider_type='openai' (expected 'chat_completions' or 'responses')",
+                                route.model_name
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                // ── capabilities unknown keys (fixed key set, §7.1.5) ──
+                if let Some(caps) = &target.capabilities
+                    && let Some(unknown) = caps.unknown_keys_error()
+                {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): target[{j}] capabilities: {unknown}",
+                        route.model_name
+                    ));
+                }
+                // ── api_endpoint vs protocol (D11 / §7.5 pin) ──
+                //
+                // `api_endpoint` is only an upstream URL path — it never
+                // declares a protocol. Two rules:
+                // 1. provider_type=anthropic ignores `api_endpoint` (path is
+                //    fixed `/messages`); a non-default value is an error when
+                //    an explicit non-derived `upstream_protocol` also mismatches
+                //    the path, otherwise a warning that the field has no effect.
+                // 2. For any other explicit declaration whose effective path
+                //    does not match `api_endpoint`, only warn — the endpoint
+                //    remains a free path string for OpenAI-compatible bases.
+                if let Some(pc) = target_provider {
+                    let derived = sag_core::derive_upstream_protocol(pc.provider_type.as_str());
+                    let explicit = target.upstream_protocol.or(pc.upstream_protocol);
+                    let endpoint_default = route.uses_default_api_endpoint();
+                    if pc.provider_type == ProviderType::Anthropic && !endpoint_default {
+                        let protocol_mismatch = explicit.is_some_and(|up| up != derived);
+                        if protocol_mismatch {
+                            errors.push(format!(
+                                "routes[{i}] (model='{}'): target[{j}] provider_type='anthropic' ignores api_endpoint='{}' (path is fixed '/messages'); remove api_endpoint or align upstream_protocol",
+                                route.model_name,
+                                route.api_endpoint
+                            ));
+                        } else {
+                            warnings.push(format!(
+                                "routes[{i}] (model='{}'): target[{j}] provider_type='anthropic' ignores api_endpoint='{}' (path is fixed '/messages')",
+                                route.model_name,
+                                route.api_endpoint
+                            ));
+                        }
+                    } else if explicit.is_some_and(|up| up != derived)
+                        && !endpoint_matches_protocol(
+                            &route.api_endpoint,
+                            explicit.unwrap_or(derived),
+                        )
+                    {
+                        warnings.push(format!(
+                            "routes[{i}] (model='{}'): target[{j}] api_endpoint='{}' does not match upstream_protocol — api_endpoint is only a URL path and never declares a protocol; set upstream_protocol explicitly if needed",
+                            route.model_name,
+                            route.api_endpoint
+                        ));
+                    }
                 }
             }
 
@@ -603,6 +701,106 @@ impl ProviderType {
         match self {
             ProviderType::OpenAI => "openai",
             ProviderType::Anthropic => "anthropic",
+        }
+    }
+}
+
+/// Fixed-key capability override for a route target (§7.1.3 / D3).
+///
+/// Every field is optional: an omitted key leaves the derived capability
+/// (from `provider_type` + effective `upstream_protocol`) untouched. The
+/// key set is fixed — unknown keys are captured during deserialize and
+/// rejected by [`GatewayConfig::validate`] (same strictness as typed
+/// config enums; `capabilities` is a closed set, not an open map).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CapabilitiesOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    /// thinking / reasoning_content support
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documents: Option<bool>,
+    /// Responses store / previous_response_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stateful: Option<bool>,
+    /// Responses hosted tool types
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_tools: Option<bool>,
+    /// Responses background execution
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    /// Unknown keys captured by a flatten so `validate()` can reject them
+    /// with a clear error instead of silently dropping them at parse time.
+    /// Never written back to disk (empty after a successful validate).
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub unknown: HashMap<String, serde_json::Value>,
+}
+
+impl CapabilitiesOverride {
+    /// Returns `Some(message)` when `unknown` holds at least one key.
+    pub fn unknown_keys_error(&self) -> Option<String> {
+        if self.unknown.is_empty() {
+            return None;
+        }
+        let mut keys: Vec<&str> = self.unknown.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        Some(format!(
+            "unknown capability key(s) [{}] — allowed keys: streaming, reasoning, tools, images, documents, stateful, hosted_tools, background",
+            keys.join(", ")
+        ))
+    }
+
+    /// Apply this override on top of a derived capability bitmap.
+    pub fn apply_to(&self, base: &mut sag_core::Capabilities) {
+        if let Some(v) = self.streaming {
+            base.streaming = v;
+        }
+        if let Some(v) = self.reasoning {
+            base.reasoning = v;
+        }
+        if let Some(v) = self.tools {
+            base.tools = v;
+        }
+        if let Some(v) = self.images {
+            base.images = v;
+        }
+        if let Some(v) = self.documents {
+            base.documents = v;
+        }
+        if let Some(v) = self.stateful {
+            base.stateful = v;
+        }
+        if let Some(v) = self.hosted_tools {
+            base.hosted_tools = v;
+        }
+        if let Some(v) = self.background {
+            base.background = v;
+        }
+    }
+}
+
+/// Whether `api_endpoint` is a plausible path for the given upstream
+/// protocol. Used only for warnings — `api_endpoint` never *declares* a
+/// protocol (§7.5); this just flags likely misconfiguration.
+fn endpoint_matches_protocol(endpoint: &str, protocol: sag_core::UpstreamProtocol) -> bool {
+    match protocol {
+        sag_core::UpstreamProtocol::ChatCompletions => {
+            endpoint.ends_with("/chat/completions") || endpoint == "/chat/completions"
+        }
+        sag_core::UpstreamProtocol::Responses => {
+            endpoint.ends_with("/responses") || endpoint == "/responses"
+        }
+        // Anthropic path is fixed `/messages` (D11) — any non-default
+        // endpoint already produced an error/warning above for anthropic
+        // providers; treat default chat path as mismatched for completeness.
+        sag_core::UpstreamProtocol::AnthropicMessages => {
+            endpoint.ends_with("/messages") || endpoint == "/messages"
         }
     }
 }
@@ -1221,7 +1419,7 @@ impl RouteConfig {
 /// Multiple targets in a route are grouped by priority and tried based on the
 /// route's `strategy`. Targets with the same priority are shuffled once then
 /// cached when strategy is `FillFirst`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RouteTarget {
     /// Provider name (must match a key in `providers`).
     pub provider: String,
@@ -1264,6 +1462,11 @@ pub struct RouteTarget {
     /// (effective) explicit declaration equals the ingress protocol (§4.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
+    /// Per-target capability overrides (fixed key set; unknown keys fail
+    /// `GatewayConfig::validate`). Applied on top of the derived capability
+    /// table after provider_type + effective upstream_protocol resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<CapabilitiesOverride>,
 }
 
 #[cfg(test)]
@@ -2394,6 +2597,7 @@ api_keys = ["sk-test"]
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
                 RouteTarget {
                     provider: "openai".into(),
@@ -2403,6 +2607,7 @@ api_keys = ["sk-test"]
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
             ];
             let err = config.validate().unwrap_err();
@@ -2430,6 +2635,7 @@ api_keys = ["sk-test"]
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
                 RouteTarget {
                     provider: "openai".into(),
@@ -2439,6 +2645,7 @@ api_keys = ["sk-test"]
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
             ];
             assert!(
@@ -2583,6 +2790,308 @@ targets = [
             .unwrap();
             assert!(config.validate().is_ok());
         }
+
+        // ── M7: upstream_protocol × provider_type / capabilities / api_endpoint ──
+
+        #[test]
+        fn rejects_anthropic_provider_with_chat_completions_protocol() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-test"]
+upstream_protocol = "chat_completions"
+
+[[routes]]
+model_name = "claude"
+targets = [{ provider = "anthropic" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("upstream_protocol='chat_completions'")
+                        && e.contains("anthropic")),
+                "expected illegal combo error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_anthropic_provider_with_responses_protocol() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-test"]
+upstream_protocol = "responses"
+
+[[routes]]
+model_name = "claude"
+targets = [{ provider = "anthropic" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("upstream_protocol='responses")),
+                "expected responses-on-anthropic error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_openai_provider_with_responses_protocol() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+upstream_protocol = "responses"
+
+[[routes]]
+model_name = "gpt-5"
+targets = [{ provider = "openai", upstream_protocol = "responses" }]
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_target_upstream_protocol_mismatched_with_provider_type() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "claude"
+targets = [{ provider = "anthropic", upstream_protocol = "chat_completions" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("target[0]") && e.contains("chat_completions")),
+                "expected target-level combo error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_capabilities_key() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", capabilities = { streaming = true, teleport = true } },
+]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("capabilities") && e.contains("teleport")),
+                "expected unknown capability key error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_known_capabilities_keys() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", capabilities = { streaming = true, tools = false, reasoning = true } },
+]
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok());
+            let caps = config.routes[0].targets[0].capabilities.as_ref().unwrap();
+            assert_eq!(caps.streaming, Some(true));
+            assert_eq!(caps.tools, Some(false));
+            assert_eq!(caps.reasoning, Some(true));
+            assert!(caps.unknown.is_empty());
+        }
+
+        /// Pin (§7.5): anthropic + **non-default** api_endpoint + explicit
+        /// non-derived upstream_protocol → **error** on the endpoint rule
+        /// (the illegal-combo branch is covered by
+        /// `rejects_anthropic_provider_with_chat_completions_protocol`).
+        /// Both branches fire for this shape; this test pins the endpoint
+        /// message specifically. Without the protocol mismatch the same
+        /// endpoint is only a warning (D11).
+        #[test]
+        fn anthropic_non_default_endpoint_with_mismatched_protocol_is_error() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "claude"
+api_endpoint = "/v1/completions"
+targets = [{ provider = "anthropic", upstream_protocol = "chat_completions" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("api_endpoint") && e.contains("anthropic")),
+                "expected anthropic api_endpoint error branch, got {err:?}"
+            );
+        }
+
+        /// Pin (§7.5) pure endpoint form: legal explicit protocol
+        /// (`anthropic_messages` == derived) + non-default endpoint → Ok
+        /// (warning only). The endpoint never declares a protocol.
+        #[test]
+        fn anthropic_explicit_protocol_non_default_endpoint_warns_not_errors() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-test"]
+upstream_protocol = "anthropic_messages"
+
+[[routes]]
+model_name = "claude"
+api_endpoint = "/v1/messages-extra"
+targets = [{ provider = "anthropic", upstream_protocol = "anthropic_messages" }]
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok(), "got err");
+        }
+
+        #[test]
+        fn anthropic_non_default_endpoint_without_protocol_mismatch_is_ok_with_warning_path() {
+            // Default path /chat/completions is non-default for anthropic's
+            // fixed /messages — but with no explicit non-derived protocol
+            // this is only a warning (validate still returns Ok).
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.anthropic]
+provider_type = "anthropic"
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "claude"
+api_endpoint = "/v1/chat"
+targets = [{ provider = "anthropic" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "anthropic non-default endpoint alone must only warn"
+            );
+        }
+
+        /// Pin (§7.5): openai + explicit protocol whose path does not match
+        /// api_endpoint → warning only ("api_endpoint is only a path"), not
+        /// an error — config still validates.
+        #[test]
+        fn openai_protocol_endpoint_mismatch_is_warning_not_error() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+upstream_protocol = "responses"
+
+[[routes]]
+model_name = "gpt-5"
+api_endpoint = "/chat/completions"
+targets = [{ provider = "openai", upstream_protocol = "responses" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "openai path/protocol mismatch must only warn"
+            );
+        }
+
+        #[test]
+        fn capabilities_roundtrip_through_toml() {
+            let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [
+    { provider = "openai", upstream_protocol = "responses", capabilities = { streaming = true, stateful = false } },
+]
+"#;
+            let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+            assert_eq!(
+                config.routes[0].targets[0].upstream_protocol,
+                Some(sag_core::UpstreamProtocol::Responses)
+            );
+            let caps = config.routes[0].targets[0].capabilities.as_ref().unwrap();
+            assert_eq!(caps.streaming, Some(true));
+            assert_eq!(caps.stateful, Some(false));
+        }
+
+        // ── end M7 ──
     }
 
     #[test]
@@ -2696,6 +3205,7 @@ upstream_protocol = "nope"
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }
         }
 

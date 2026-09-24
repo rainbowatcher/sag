@@ -604,6 +604,8 @@ async fn emit_client_error_event(
         cache_creation_tokens: None,
         ttft_ms: None,
         upstream_duration_ms: None,
+        ingress_protocol: None,
+        lane: None,
     });
     if let Err(e) = state.event_collector.emit(event.clone()).await {
         warn!(

@@ -91,12 +91,42 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
                 .first()
                 .map(|t| t.provider.as_str())
                 .unwrap_or("sag");
-            json!({
+            let mut model = json!({
                 "id": route.model_name,
                 "object": "model",
                 "created": 0,
                 "owned_by": owned_by,
-            })
+            });
+            // Optional lane metadata (M7 / §7.5): only emitted when at least
+            // one target (or its provider) explicitly declares
+            // `upstream_protocol` — omit the keys entirely otherwise so
+            // default OpenAI-compatible clients see an unchanged payload.
+            // Key name is `ingress_protocols` per plan §7.5 (not
+            // the raw field name `upstream_protocol`); values are the
+            // explicit protocol declarations that gate native-lane eligibility.
+            let mut explicit_protocols: Vec<&'static str> = Vec::new();
+            let mut any_explicit = false;
+            for target in &route.targets {
+                let pc = config.providers.get(&target.provider);
+                let declared = target
+                    .upstream_protocol
+                    .or_else(|| pc.and_then(|p| p.upstream_protocol));
+                if let Some(up) = declared {
+                    any_explicit = true;
+                    let s = up.as_str();
+                    if !explicit_protocols.contains(&s) {
+                        explicit_protocols.push(s);
+                    }
+                }
+            }
+            if any_explicit {
+                model["ingress_protocols"] = json!(explicit_protocols);
+                // Conservative lane surface: a declared protocol is
+                // native-capable against a matching ingress; derived-only
+                // targets stay translated and are never advertised as native.
+                model["lanes"] = json!(["native", "translated"]);
+            }
+            model
         })
         .collect();
 
@@ -228,6 +258,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             },
             RouteConfig {
@@ -244,6 +275,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             },
             RouteConfig {
@@ -261,6 +293,7 @@ mod tests {
                         timeout_secs: None,
                         extra: HashMap::new(),
                         upstream_protocol: None,
+                        capabilities: None,
                     },
                     RouteTarget {
                         provider: "openai-enabled".into(),
@@ -270,6 +303,7 @@ mod tests {
                         timeout_secs: None,
                         extra: HashMap::new(),
                         upstream_protocol: None,
+                        capabilities: None,
                     },
                 ],
             },
@@ -323,6 +357,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             },
             RouteConfig {
@@ -339,6 +374,7 @@ mod tests {
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 }],
             },
         ];

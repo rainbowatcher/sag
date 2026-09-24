@@ -11,9 +11,10 @@ use crate::store::{
 };
 
 /// Stage-0.4 extension columns added to `call_logs` beyond the original
-/// 13-column schema. Each entry is `(column_name, sqlite_type_declaration)`.
-/// Kept in one place so `ensure_schema_consistency` and its tests share
-/// the same list and a rename cannot silently drift out of sync.
+/// 13-column schema, plus the M7 protocol/lane dimensions. Each entry is
+/// `(column_name, sqlite_type_declaration)`. Kept in one place so
+/// `ensure_schema_consistency` and its tests share the same list and a
+/// rename cannot silently drift out of sync.
 const STAGE_04_COLUMNS: &[(&str, &str)] = &[
     ("reasoning_effort", "TEXT"),
     ("upstream_duration_ms", "INTEGER"),
@@ -21,6 +22,12 @@ const STAGE_04_COLUMNS: &[(&str, &str)] = &[
     ("cached_tokens", "INTEGER"),
     ("cache_creation_tokens", "INTEGER"),
     ("reasoning_tokens", "INTEGER"),
+    // M7 (also covered by migrations/20260814…; listed here so a
+    // schema-drift database that already recorded the migration still
+    // gets the columns repaired).
+    ("ingress_protocol", "TEXT"),
+    ("upstream_protocol", "TEXT"),
+    ("lane", "TEXT"),
 ];
 
 /// Maximum page size for `query_logs`. Shared with the admin API layer
@@ -175,11 +182,13 @@ impl LogStore for SqliteLogStore {
                      upstream_duration_ms, ttft_ms,
                      cached_tokens, cache_creation_tokens, reasoning_tokens,
                      user_agent, client_ip,
-                     error_category)
+                     error_category,
+                     ingress_protocol, upstream_protocol, lane)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?,
                         ?, ?,
-                        ?)
+                        ?,
+                        ?, ?, ?)
                 "#,
             )
             .bind(log.request_id.to_string())
@@ -204,6 +213,10 @@ impl LogStore for SqliteLogStore {
             .bind(log.user_agent.as_ref())
             .bind(log.client_ip.as_ref())
             .bind(log.error_category.as_ref())
+            // M7 protocol / lane dimensions.
+            .bind(log.ingress_protocol.as_ref())
+            .bind(log.upstream_protocol.as_ref())
+            .bind(log.lane.as_ref())
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert call log: {e}")))?;
@@ -299,7 +312,8 @@ impl LogStore for SqliteLogStore {
                 upstream_duration_ms, ttft_ms,
                 cached_tokens, cache_creation_tokens, reasoning_tokens,
                 user_agent, client_ip,
-                error_category
+                error_category,
+                ingress_protocol, upstream_protocol, lane
             FROM call_logs
             "#,
         );
@@ -575,6 +589,9 @@ struct LogRow {
     user_agent: Option<String>,
     client_ip: Option<String>,
     error_category: Option<String>,
+    ingress_protocol: Option<String>,
+    upstream_protocol: Option<String>,
+    lane: Option<String>,
 }
 
 impl LogRow {
@@ -637,9 +654,13 @@ impl LogRow {
             client_ip: self.client_ip,
             error_category: self.error_category,
             // Identity columns are not persisted yet; legacy rows stay NULL
-            // (no retroactive backfill, per the analytics spec).
+            // (no retroactive backfill, per the analytics spec). M7
+            // protocol/lane dimensions round-trip when present.
             route_id: None,
             target_id: None,
+            ingress_protocol: self.ingress_protocol,
+            upstream_protocol: self.upstream_protocol,
+            lane: self.lane,
         }
     }
 }
@@ -685,6 +706,9 @@ mod tests {
             // Internal analytics identity fields: not populated in tests.
             route_id: None,
             target_id: None,
+            ingress_protocol: None,
+            upstream_protocol: None,
+            lane: None,
         }
     }
 
@@ -777,6 +801,9 @@ mod tests {
         let log = CallLog {
             usage: None,
             error_category: None,
+            ingress_protocol: None,
+            upstream_protocol: None,
+            lane: None,
             ..make_log("openai", "gpt-4o", "gpt-4o")
         };
         store.insert_batch(&[log]).await.unwrap();
@@ -906,6 +933,10 @@ mod tests {
             // Internal analytics identity fields: not populated in tests.
             route_id: None,
             target_id: None,
+            // M7 dimensions must round-trip through insert/query.
+            ingress_protocol: Some("chat_completions".into()),
+            upstream_protocol: Some("responses".into()),
+            lane: Some("native".into()),
         };
         store
             .insert_batch(std::slice::from_ref(&log))
@@ -921,7 +952,6 @@ mod tests {
             .unwrap();
         assert_eq!(logs.len(), 1);
         let fetched = &logs[0];
-
         assert_eq!(fetched.request_id, log.request_id);
         assert_eq!(fetched.real_model, "o1-mini");
         assert_eq!(fetched.reasoning_effort.as_deref(), Some("medium"));
@@ -932,6 +962,13 @@ mod tests {
         assert_eq!(fetched.reasoning_tokens, Some(20));
         assert_eq!(fetched.user_agent.as_deref(), Some("curl/8.0.1"));
         assert_eq!(fetched.client_ip.as_deref(), Some("203.0.113.7"));
+        // M7 protocol/lane dimensions must round-trip through insert/query.
+        assert_eq!(
+            fetched.ingress_protocol.as_deref(),
+            Some("chat_completions")
+        );
+        assert_eq!(fetched.upstream_protocol.as_deref(), Some("responses"));
+        assert_eq!(fetched.lane.as_deref(), Some("native"));
 
         let u = fetched.usage.as_ref().expect("usage round-trip");
         assert_eq!(u.prompt_tokens, 100);
@@ -1381,6 +1418,138 @@ mod tests {
             .await
             .unwrap_err();
         assert_database_error(err, "FOREIGN KEY constraint failed");
+    }
+
+    /// M7 true upgrade: apply only the first N-1 migrations → insert an
+    /// old-schema row (new columns do not exist yet) → apply the final
+    /// migration → assert the pre-existing row lands on NULL for the new
+    /// columns and accepts writes into them.
+    ///
+    /// Uses sqlx's `Migrate` trait to apply migrations one-by-one so the
+    /// intermediate (pre-final) schema is real, not simulated by
+    /// hand-written NULLs on an already-migrated table.
+    #[tokio::test]
+    async fn migration_adds_protocol_lane_columns_null_for_old_rows() {
+        use sqlx::migrate::{Migrate, Migrator};
+
+        let path = tmp_db_path("true-upgrade");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        let migrator =
+            Migrator::new(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+                .await
+                .unwrap();
+        let migrations: Vec<_> = migrator.iter().collect();
+        // Stop BEFORE the fact-table protocol/lane migration
+        // (20260813000001) so `request_results.ingress_protocol` does not
+        // exist yet; the call_logs companion (20260814…) lands after it.
+        let stop_before: i64 = 20260813000001;
+        assert!(
+            migrations.iter().any(|m| m.version == stop_before),
+            "protocol/lane migration must be present"
+        );
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            conn.ensure_migrations_table().await.unwrap();
+            for m in &migrations {
+                if m.version >= stop_before {
+                    break;
+                }
+                if m.migration_type.is_down_migration() {
+                    continue;
+                }
+                conn.apply(m).await.unwrap();
+            }
+        }
+
+        // Pre-final schema: the protocol/lane columns must NOT exist yet.
+        let has_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('request_results') WHERE name = 'ingress_protocol'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(has_before, 0, "pre-condition: column must not exist yet");
+
+        // Insert an old-schema row (no protocol/lane columns available).
+        let route_id = Uuid::new_v4().to_string();
+        let request_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO analytics_routes (route_id, route_name, first_seen, last_seen)
+             VALUES (?, 'm7-upgrade-route', 1000, 1000)",
+        )
+        .bind(&route_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO request_results
+                 (request_id, route_id, final_status, started_at, completed_at, duration_ms)
+             VALUES (?, ?, 'success', 1000, 2000, 1000)",
+        )
+        .bind(&request_id)
+        .bind(&route_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Apply the remaining migrations (protocol/lane on facts +
+        // call_logs companion).
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            for m in &migrations {
+                if m.version < stop_before {
+                    continue;
+                }
+                if m.migration_type.is_down_migration() {
+                    continue;
+                }
+                conn.apply(m).await.unwrap();
+            }
+        }
+
+        // Old row → new columns NULL.
+        let (ingress, lane): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT ingress_protocol, lane FROM request_results WHERE request_id = ?",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            ingress.is_none(),
+            "pre-existing row must have NULL ingress_protocol"
+        );
+        assert!(lane.is_none(), "pre-existing row must have NULL lane");
+
+        // New write with values works.
+        sqlx::query(
+            "UPDATE request_results SET ingress_protocol = 'chat_completions', lane = 'native'
+             WHERE request_id = ?",
+        )
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (ingress, lane): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT ingress_protocol, lane FROM request_results WHERE request_id = ?",
+        )
+        .bind(&request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ingress.as_deref(), Some("chat_completions"));
+        assert_eq!(lane.as_deref(), Some("native"));
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Major regression: the rollup tables must carry the status-count

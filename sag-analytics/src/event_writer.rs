@@ -221,9 +221,10 @@ async fn insert_request_result(
             request_id, route_id, final_status, failure_reason, requested_model,
             actual_model, stream, started_at, completed_at, duration_ms,
             prompt_tokens, completion_tokens, total_tokens,
-            cached_tokens, cache_creation_tokens, ttft_ms, upstream_duration_ms
+            cached_tokens, cache_creation_tokens, ttft_ms, upstream_duration_ms,
+            ingress_protocol, lane
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(request_id) DO NOTHING
         "#,
     )
@@ -259,6 +260,8 @@ async fn insert_request_result(
     )
     .bind(event.result.ttft_ms.map(|v| v as i64))
     .bind(event.result.upstream_duration_ms.map(|v| v as i64))
+    .bind(event.result.ingress_protocol.as_deref())
+    .bind(event.result.lane.as_deref())
     .execute(&mut **tx)
     .await
     .map_err(|e| AppError::Internal(format!("event write request_results: {e}")))?;
@@ -306,9 +309,10 @@ async fn insert_target_attempts(
                 failure_reason, stream,
                 started_at, completed_at, duration_ms,
                 prompt_tokens, completion_tokens, total_tokens,
-                cached_tokens, ttft_ms, upstream_duration_ms
+                cached_tokens, ttft_ms, upstream_duration_ms,
+                upstream_protocol, lane
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(request_id, target_id) DO NOTHING
             "#,
         )
@@ -333,6 +337,8 @@ async fn insert_target_attempts(
         )
         .bind(attempt.ttft_ms.map(|v| v as i64))
         .bind(attempt.upstream_duration_ms.map(|v| v as i64))
+        .bind(attempt.upstream_protocol.as_deref())
+        .bind(attempt.lane.as_deref())
         .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Internal(format!("event write target_attempts: {e}")))?;

@@ -56,11 +56,14 @@ const props = withDefaults(
     modelsEndpoint?: string
     modelTestStates?: Record<string, ModelTestState | undefined>
     disabled?: boolean
+    /** Effective upstream protocol badge (hide when absent). */
+    upstreamProtocol?: string
   }>(),
   {
     providerName: "",
     modelTestStates: undefined,
     disabled: false,
+    upstreamProtocol: undefined,
   },
 )
 
@@ -276,6 +279,14 @@ function onModelsEndpointChange(value: string | number) {
               >
                 {{ model }}
               </span>
+              <Badge
+                v-if="upstreamProtocol"
+                variant="outline"
+                class="px-1 py-0 font-mono text-[10px]"
+                :title="`Effective upstream protocol: ${upstreamProtocol}`"
+              >
+                {{ upstreamProtocol }}
+              </Badge>
               <Badge
                 v-if="overrideCount(model) > 0"
                 variant="secondary"

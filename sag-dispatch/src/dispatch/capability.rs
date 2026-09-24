@@ -167,7 +167,10 @@ pub fn filter_capable_targets(
             // the effective protocol (explicit else derived).
             let derived = derive_upstream_protocol(provider_type);
             let effective = effective_upstream_protocol(explicit, derived);
-            let provided = target_capabilities(provider_type, effective);
+            let mut provided = target_capabilities(provider_type, effective);
+            if let Some(ov) = &t.capabilities {
+                ov.apply_to(&mut provided);
+            }
             if let Some(cap) = missing_capability(required, provided) {
                 let model = t.real_model.as_deref().unwrap_or(&req.model);
                 info!(
@@ -207,6 +210,7 @@ mod tests {
     fn target(provider: &str) -> RouteTarget {
         RouteTarget {
             provider: provider.into(),
+            capabilities: None,
             ..RouteTarget::default()
         }
     }

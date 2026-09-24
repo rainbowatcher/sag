@@ -2380,6 +2380,8 @@ mod tests {
             cache_creation_tokens: None,
             ttft_ms,
             upstream_duration_ms: upstream_ms,
+            ingress_protocol: None,
+            lane: None,
         }
     }
 
@@ -2406,6 +2408,8 @@ mod tests {
             cached_tokens,
             ttft_ms,
             upstream_duration_ms: upstream_ms,
+            upstream_protocol: None,
+            lane: None,
         }
     }
 

@@ -148,6 +148,9 @@ mod tests {
             // Internal analytics identity fields: not populated in tests.
             route_id: None,
             target_id: None,
+            ingress_protocol: None,
+            upstream_protocol: None,
+            lane: None,
         }
     }
 

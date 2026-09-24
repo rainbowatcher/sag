@@ -54,11 +54,15 @@ pub(crate) fn build_target_attempt_fact(
     outcome: &RetryOutcome<ChatAttempt>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     completed_at: chrono::DateTime<chrono::Utc>,
+    upstream_protocol: Option<&str>,
+    lane: Option<&str>,
 ) -> Option<TargetAttemptFact> {
     // `started_at` is captured at the first actual provider call; fall back
     // to `completed_at` only if the closure never ran (cannot happen in
     // practice — the retry loop always issues attempt 0).
     let started_at = started_at.unwrap_or(completed_at);
+    let upstream_protocol = upstream_protocol.map(str::to_string);
+    let lane = lane.map(str::to_string);
     match outcome {
         RetryOutcome::Success(ChatAttempt::NonStream(att, upstream_start)) => {
             let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
@@ -73,6 +77,8 @@ pub(crate) fn build_target_attempt_fact(
                 cached_tokens: att.ir.usage.as_ref().and_then(|u| u.cached_tokens),
                 ttft_ms: Some(upstream_duration_ms),
                 upstream_duration_ms: Some(upstream_duration_ms),
+                upstream_protocol,
+                lane,
             })
         }
         RetryOutcome::Success(ChatAttempt::Stream(_, _)) => None,
@@ -87,6 +93,8 @@ pub(crate) fn build_target_attempt_fact(
             cached_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            upstream_protocol,
+            lane,
         }),
     }
 }

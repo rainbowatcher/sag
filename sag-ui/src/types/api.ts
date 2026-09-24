@@ -6,6 +6,21 @@
  */
 export type ProxyMode = "inherit" | "enabled" | "disabled"
 
+/** Explicit upstream protocol declaration (config / admin DTO enum). */
+export type UpstreamProtocol = "chat_completions" | "responses" | "anthropic_messages"
+
+/** Fixed-key capability override on a route target (all keys optional). */
+export interface CapabilitiesOverride {
+  streaming?: boolean
+  reasoning?: boolean
+  tools?: boolean
+  images?: boolean
+  documents?: boolean
+  stateful?: boolean
+  hosted_tools?: boolean
+  background?: boolean
+}
+
 export interface Provider {
   name: string
   api_keys: string[]
@@ -22,6 +37,12 @@ export interface Provider {
   enabled: boolean
   /** How this provider resolves the upstream HTTP proxy. */
   proxy_mode: ProxyMode
+  /** Explicit upstream protocol, or null when derived from provider_type. */
+  upstream_protocol?: UpstreamProtocol | null
+  /** Effective protocol after derive (always present when API returns it). */
+  effective_upstream_protocol?: string
+  /** Derived capability bitmap (read-only). */
+  capabilities?: Record<string, boolean>
 }
 
 /** Gateway-level settings returned by `GET /api/settings`. */
@@ -58,6 +79,8 @@ export interface RouteTarget {
   priority: number
   retries?: number
   extra?: Record<string, any>
+  upstream_protocol?: UpstreamProtocol | null
+  capabilities?: CapabilitiesOverride | null
 }
 
 export interface TargetItem {
@@ -67,6 +90,8 @@ export interface TargetItem {
   priority: number
   retries: number
   extra: string
+  /** Empty string = derive (omit field). */
+  upstream_protocol?: UpstreamProtocol | ""
 }
 
 export interface RouteConfig {
@@ -90,6 +115,8 @@ export interface CreateRoutePayload {
     priority?: number
     retries?: number
     extra?: Record<string, any>
+    upstream_protocol?: UpstreamProtocol
+    capabilities?: CapabilitiesOverride
   }>
 }
 
@@ -104,7 +131,20 @@ export interface UpdateRoutePayload {
     priority?: number
     retries?: number
     extra?: Record<string, any>
+    upstream_protocol?: UpstreamProtocol
+    capabilities?: CapabilitiesOverride
   }>
+}
+
+/** Optional model list metadata entry extras (`GET /v1/models`). */
+export interface ModelListEntry {
+  id: string
+  object: "model"
+  created: number
+  owned_by: string
+  /** Present only when some target explicitly declares upstream_protocol. Key name per plan §7.5. */
+  ingress_protocols?: string[]
+  lanes?: string[]
 }
 
 export interface StatsRow {
@@ -167,6 +207,12 @@ export interface CallLog {
   client_ip?: string
   /** Machine-readable error category (e.g. "model_not_found", "provider_error", "timeout"). */
   error_category?: string
+  /** Ingress protocol of the request (e.g. "chat_completions"). */
+  ingress_protocol?: string
+  /** Effective upstream protocol of the attempted target. */
+  upstream_protocol?: string
+  /** Lane of the attempt ("native" | "translated"). */
+  lane?: string
 }
 
 /** Time-bucketed trend row returned by `GET /v1/analytics/trend`. */

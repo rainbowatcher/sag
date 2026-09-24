@@ -138,6 +138,7 @@ export const useProviderStore = defineStore("providers", () => {
     enabled_models?: string[]
     models_endpoint?: string
     proxy_mode?: ProxyMode
+    upstream_protocol?: import("@/types/api").UpstreamProtocol | null
   }) {
     try {
       await api.post("/api/providers", payload)
@@ -184,6 +185,7 @@ export const useProviderStore = defineStore("providers", () => {
       enabled_models?: string[]
       enabled?: boolean
       proxy_mode?: ProxyMode
+      upstream_protocol?: import("@/types/api").UpstreamProtocol | null
     },
   ) {
     try {

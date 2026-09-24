@@ -30,7 +30,15 @@ const adding = ref(false)
 const apiError = ref("")
 
 const targets = ref<TargetItem[]>([
-  { id: 1, provider: "", real_model: "", priority: 0, retries: 0, extra: "" },
+  {
+    id: 1,
+    provider: "",
+    real_model: "",
+    priority: 0,
+    retries: 0,
+    extra: "",
+    upstream_protocol: "",
+  },
 ])
 
 const endpointPresets = [
@@ -92,6 +100,9 @@ const form = useForm({
               )
             }
             entry.extra = JSON.parse(t.extra)
+          }
+          if (t.upstream_protocol) {
+            entry.upstream_protocol = t.upstream_protocol
           }
           return entry
         }),

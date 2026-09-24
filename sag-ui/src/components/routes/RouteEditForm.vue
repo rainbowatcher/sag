@@ -12,7 +12,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
-import type { RouteConfig, Strategy, TargetItem } from "@/types/api"
+import type { RouteConfig, Strategy, TargetItem, UpstreamProtocol } from "@/types/api"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
@@ -37,6 +37,7 @@ const targets = ref<TargetItem[]>(
     priority: t.priority,
     retries: t.retries ?? 0,
     extra: t.extra ? JSON.stringify(t.extra) : "",
+    upstream_protocol: t.upstream_protocol ?? "",
   })),
 )
 
@@ -94,6 +95,7 @@ const form = useForm({
             priority?: number
             retries?: number
             extra?: Record<string, any>
+            upstream_protocol?: UpstreamProtocol
           } = {
             provider: t.provider,
             real_model: t.real_model || undefined,
@@ -108,6 +110,9 @@ const form = useForm({
               )
             }
             entry.extra = JSON.parse(t.extra)
+          }
+          if (t.upstream_protocol) {
+            entry.upstream_protocol = t.upstream_protocol
           }
           return entry
         }),

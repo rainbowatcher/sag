@@ -159,6 +159,7 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
                 real_model: Some("real-model".into()),
                 priority: 1,
                 upstream_protocol: target_proto,
+                capabilities: None,
             }],
         }],
         ..sag_config::gateway_config_base!()

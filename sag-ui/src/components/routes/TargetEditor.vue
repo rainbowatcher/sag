@@ -7,6 +7,13 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
   Table,
   TableBody,
   TableCell,
@@ -17,7 +24,7 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import { validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
-import type { Provider, TargetItem } from "@/types/api"
+import type { Provider, TargetItem, UpstreamProtocol } from "@/types/api"
 
 const routeStore = useRouteStore()
 
@@ -150,7 +157,15 @@ function updateTarget(index: number, patch: Partial<TargetItem>) {
 function addTarget() {
   updateTargets([
     ...props.modelValue,
-    { id: nextId.value, provider: "", real_model: "", priority: 0, retries: 0, extra: "" },
+    {
+      id: nextId.value,
+      provider: "",
+      real_model: "",
+      priority: 0,
+      retries: 0,
+      extra: "",
+      upstream_protocol: "",
+    },
   ])
 }
 
@@ -307,6 +322,32 @@ function onProviderChange(index: number, value: string) {
                       "
                     >
                       {{ validateExtraJson(t.extra) ?? "Valid JSON" }}
+                    </p>
+                  </div>
+                  <div class="w-48">
+                    <Label class="text-xs">Upstream Protocol</Label>
+                    <Select
+                      :model-value="t.upstream_protocol ?? ''"
+                      @update:model-value="
+                        (v) =>
+                          updateTarget(modelValue.indexOf(t), {
+                            upstream_protocol: v as UpstreamProtocol | '',
+                          })
+                      "
+                    >
+                      <SelectTrigger class="w-full">
+                        <SelectValue placeholder="Derived (advanced)" />
+                      </SelectTrigger>
+                      <SelectContent class="w-(--reka-select-trigger-width)">
+                        <SelectItem value="">Derived (default)</SelectItem>
+                        <SelectItem value="chat_completions">Chat Completions</SelectItem>
+                        <SelectItem value="responses">Responses</SelectItem>
+                        <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p class="text-muted-foreground mt-1 text-[10px]">
+                      Advanced: explicit per-target protocol (enables native lane when it matches
+                      ingress).
                     </p>
                   </div>
                 </div>

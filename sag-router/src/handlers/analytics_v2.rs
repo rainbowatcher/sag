@@ -316,6 +316,8 @@ mod tests {
             cache_creation_tokens: None,
             ttft_ms: None,
             upstream_duration_ms: None,
+            ingress_protocol: None,
+            lane: None,
         }
     }
 
@@ -350,6 +352,8 @@ mod tests {
                     cached_tokens: None,
                     ttft_ms: None,
                     upstream_duration_ms: None,
+                    upstream_protocol: None,
+                    lane: None,
                 })
                 .collect(),
         }

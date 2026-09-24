@@ -2455,13 +2455,24 @@ async fn build_state_with_strategy(
     strategy: Strategy,
 ) -> AppState {
     let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+    let mut config_providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
     for p in providers {
+        config_providers.insert(p.name().to_string(), crate::testing::provider_config(true));
         registry.insert(p.name().to_string(), p);
+    }
+    // Routes may reference a fixed pair (first/second) even when the
+    // fixture only registered one provider — seed the other so full
+    // `GatewayConfig::validate` (run by coordinator mutations) passes.
+    for name in ["first", "second"] {
+        config_providers
+            .entry(name.to_string())
+            .or_insert_with(|| crate::testing::provider_config(true));
     }
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec!["k".into()],
         }),
+        providers: config_providers,
         routes: vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
             api_endpoint: "/chat/completions".into(),
@@ -2475,6 +2486,7 @@ async fn build_state_with_strategy(
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
                 sag_config::RouteTarget {
                     provider: "second".into(),
@@ -2484,6 +2496,7 @@ async fn build_state_with_strategy(
                     timeout_secs: None,
                     extra: HashMap::new(),
                     upstream_protocol: None,
+                    capabilities: None,
                 },
             ],
             retries: None,
@@ -2810,6 +2823,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
                 timeout_secs: None,
                 extra: HashMap::new(),
                 upstream_protocol: None,
+                capabilities: None,
             }],
         });
         state.config.bump_routes_version();

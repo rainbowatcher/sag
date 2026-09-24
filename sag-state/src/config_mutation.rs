@@ -116,11 +116,33 @@ fn adapter_config_changed(old: &ProviderConfig, new: &ProviderConfig) -> bool {
 }
 
 /// Count routes whose model_name differs between old and new configs
-/// (symmetric difference of model-name sets).
+/// (symmetric difference of model-name sets), **or** — when the name set is
+/// unchanged — any route whose lane-relevant target fields
+/// (`upstream_protocol` / `capabilities`) changed. Those field edits leave
+/// model_name alone but must still mark routes as changed so identity sync
+/// / routes_version consumers observe the mutation (M7 / §7.2).
 fn compute_routes_changed(old: &GatewayConfig, new: &GatewayConfig) -> usize {
     let old_names: HashSet<&str> = old.routes.iter().map(|r| r.model_name.as_str()).collect();
     let new_names: HashSet<&str> = new.routes.iter().map(|r| r.model_name.as_str()).collect();
-    old_names.symmetric_difference(&new_names).count()
+    let name_diff = old_names.symmetric_difference(&new_names).count();
+    if name_diff > 0 {
+        return name_diff;
+    }
+    // Same name set: detect in-place lane-field edits on matching routes.
+    let lane_fields_differ = old.routes.iter().any(|or| {
+        new.routes
+            .iter()
+            .find(|nr| nr.model_name == or.model_name)
+            .is_some_and(|nr| {
+                or.targets.iter().enumerate().any(|(i, ot)| {
+                    nr.targets.get(i).is_some_and(|nt| {
+                        ot.upstream_protocol != nt.upstream_protocol
+                            || ot.capabilities != nt.capabilities
+                    })
+                }) || or.targets.len() != nr.targets.len()
+            })
+    });
+    if lane_fields_differ { 1 } else { 0 }
 }
 
 /// Unified coordinator that serialises all production `GatewayConfig` writes
@@ -223,6 +245,15 @@ impl ConfigMutationCoordinator {
 
         // Step 3: Apply the caller's mutation to the candidate.
         f(&mut candidate)?;
+
+        // Step 3b: Full semantic validation of the post-mutation candidate.
+        // Without this, admin CRUD could commit configs that `reload_from_path`
+        // would reject (illegal upstream_protocol × provider_type combos,
+        // unknown capability keys, empty api_keys, …). Mapped to
+        // `AppError::Config` so admin handlers surface it as 400.
+        candidate
+            .validate()
+            .map_err(|errs| AppError::Config(errs.join("; ")))?;
 
         // Step 4: Pre-build adapters (all RwLock guards are dropped).
         let sync = self.prepare_provider_sync(&old_config, &candidate)?;
@@ -1069,6 +1100,61 @@ mod tests {
         assert_eq!(compute_routes_changed(&old, &new), 2);
     }
 
+    #[test]
+    fn routes_changed_target_upstream_protocol_edit_counts() {
+        fn route_with(protocol: Option<sag_core::UpstreamProtocol>) -> GatewayConfig {
+            GatewayConfig {
+                routes: vec![RouteConfig {
+                    model_name: "gpt-4o".into(),
+                    api_endpoint: "/chat/completions".into(),
+                    strategy: Strategy::FillFirst,
+                    retries: None,
+                    timeout_secs: None,
+                    targets: vec![sag_config::RouteTarget {
+                        provider: "openai".into(),
+                        upstream_protocol: protocol,
+                        ..sag_config::RouteTarget::default()
+                    }],
+                }],
+                ..gateway_config_base!()
+            }
+        }
+        let a = route_with(None);
+        assert_eq!(compute_routes_changed(&a, &a), 0);
+        let b = route_with(Some(sag_core::UpstreamProtocol::Responses));
+        // Same names, but lane field changed → must count as 1.
+        assert_eq!(compute_routes_changed(&a, &b), 1);
+    }
+
+    #[test]
+    fn routes_changed_target_capabilities_edit_counts() {
+        use sag_config::{CapabilitiesOverride, RouteTarget};
+        fn route_with(caps: Option<CapabilitiesOverride>) -> GatewayConfig {
+            GatewayConfig {
+                routes: vec![RouteConfig {
+                    model_name: "gpt-4o".into(),
+                    api_endpoint: "/chat/completions".into(),
+                    strategy: Strategy::FillFirst,
+                    retries: None,
+                    timeout_secs: None,
+                    targets: vec![RouteTarget {
+                        provider: "openai".into(),
+                        capabilities: caps,
+                        ..RouteTarget::default()
+                    }],
+                }],
+                ..gateway_config_base!()
+            }
+        }
+        let a = route_with(None);
+        assert_eq!(compute_routes_changed(&a, &a), 0);
+        let b = route_with(Some(CapabilitiesOverride {
+            streaming: Some(true),
+            ..CapabilitiesOverride::default()
+        }));
+        assert_eq!(compute_routes_changed(&a, &b), 1);
+    }
+
     // ── prepare_provider_sync tests ───────────────────────────────────
 
     fn make_coordinator() -> (ConfigMutationCoordinator, ConfigHandle) {
@@ -1388,7 +1474,12 @@ mod tests {
     // under `config.write()`.
 
     fn make_arc_coordinator() -> (Arc<ConfigMutationCoordinator>, ConfigHandle) {
+        // Seed a provider so full `validate` (run by every mutate) accepts
+        // the config after `new_route` lands a target that references it.
+        let mut providers_map = HashMap::new();
+        providers_map.insert("openai".to_string(), base_provider());
         let config = ConfigHandle::from_config(GatewayConfig {
+            providers: providers_map,
             ..gateway_config_base!()
         });
         let providers: ProviderRegistry = Arc::new(RwLock::new(HashMap::new()));
@@ -1403,7 +1494,18 @@ mod tests {
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
-            targets: vec![],
+            // Full validate requires ≥1 target; empty-target routes are
+            // rejected as config errors.
+            targets: vec![sag_config::RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 1,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                upstream_protocol: None,
+                capabilities: None,
+            }],
         }
     }
 
@@ -1486,7 +1588,12 @@ mod tests {
         // The providers registry must be the SAME Arc the coordinator was
         // built with — the mutation's `providers.write()` parks only on
         // that registry.
+        // Seed a provider so full `validate` (run by every mutate) accepts
+        // the config after `new_route` lands a target that references it.
+        let mut providers_map = HashMap::new();
+        providers_map.insert("openai".to_string(), base_provider());
         let config = ConfigHandle::from_config(GatewayConfig {
+            providers: providers_map,
             ..gateway_config_base!()
         });
         let providers: ProviderRegistry = Arc::new(RwLock::new(HashMap::new()));

@@ -1319,6 +1319,8 @@ mod tests {
             cache_creation_tokens: cache_creation,
             ttft_ms: ttft,
             upstream_duration_ms: upstream,
+            ingress_protocol: None,
+            lane: None,
         }
     }
 
@@ -1348,6 +1350,8 @@ mod tests {
             cached_tokens: cached,
             ttft_ms: ttft,
             upstream_duration_ms: upstream,
+            upstream_protocol: None,
+            lane: None,
         }
     }
 
