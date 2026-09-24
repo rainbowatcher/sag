@@ -842,6 +842,7 @@ impl Drop for DispatchCancelGuard {
             ingress_protocol: Some(analytics.ingress_protocol.as_str().to_string()),
             upstream_protocol: cancel_upstream_protocol,
             lane: cancel_lane,
+            loss_summary: None,
         });
         warn!(
             request_id = %request_id,
@@ -875,6 +876,7 @@ pub(in crate::dispatch) fn success_log(
     ingress_protocol: Option<String>,
     upstream_protocol: Option<String>,
     lane: Option<String>,
+    loss_summary: Option<String>,
 ) -> CallLog {
     let usage = usage.cloned();
     CallLog {
@@ -904,6 +906,7 @@ pub(in crate::dispatch) fn success_log(
         ingress_protocol,
         upstream_protocol,
         lane,
+        loss_summary,
     }
 }
 
@@ -927,6 +930,7 @@ pub(in crate::dispatch) fn failure_log(
     ingress_protocol: Option<String>,
     upstream_protocol: Option<String>,
     lane: Option<String>,
+    loss_summary: Option<String>,
 ) -> CallLog {
     CallLog {
         request_id,
@@ -955,6 +959,7 @@ pub(in crate::dispatch) fn failure_log(
         ingress_protocol,
         upstream_protocol,
         lane,
+        loss_summary,
     }
 }
 
@@ -993,6 +998,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
     ingress_protocol: Option<String>,
     upstream_protocol: Option<String>,
     lane: Option<String>,
+    loss_summary: Option<String>,
 ) {
     let last_err = errors
         .last()
@@ -1013,6 +1019,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
         ingress_protocol,
         upstream_protocol,
         lane,
+        loss_summary,
     );
     // Override the error_category that `failure_log` derived from
     // `AppError::Internal` with the caller-supplied category so the
@@ -1042,6 +1049,7 @@ pub(in crate::dispatch) fn failure_response(
     ingress_protocol: Option<String>,
     upstream_protocol: Option<String>,
     lane: Option<String>,
+    loss_summary: Option<String>,
 ) -> Response<Body> {
     state.collector.log(failure_log(
         trace_id,
@@ -1058,6 +1066,7 @@ pub(in crate::dispatch) fn failure_response(
         ingress_protocol,
         upstream_protocol,
         lane,
+        loss_summary,
     ));
     err.into_response()
 }
@@ -1080,6 +1089,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
     ingress_protocol: Option<String>,
     upstream_protocol: Option<String>,
     lane: Option<String>,
+    loss_summary: Option<String>,
 ) -> Response<Body> {
     let reason = errors.join("; ");
     let err = AppError::AllProvidersExhausted {
@@ -1107,6 +1117,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         ingress_protocol,
         upstream_protocol,
         lane,
+        loss_summary,
     ));
     err.into_response()
 }
@@ -1374,6 +1385,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1392,6 +1404,7 @@ mod tests {
             Instant::now(),
             &["openai: 500".into()],
             Some("high"),
+            None,
             None,
             None,
             None,
@@ -1443,6 +1456,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         state.collector.flush().await;
@@ -1481,6 +1495,7 @@ mod tests {
             &["upstream 429".into()],
             "provider_error",
             429,
+            None,
             None,
             None,
             None,

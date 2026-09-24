@@ -388,6 +388,10 @@ pub struct CallLog {
     /// when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    /// Compact LossInventory summary (count + first N `field:reason`
+    /// entries). Omitted when `None` (no losses / legacy records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_summary: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -708,6 +712,7 @@ mod tests {
             ingress_protocol: None,
             upstream_protocol: None,
             lane: None,
+            loss_summary: None,
         }
     }
 
@@ -749,6 +754,45 @@ mod tests {
         let log: CallLog = serde_json::from_value(legacy_json).unwrap();
         assert!(log.route_id.is_none());
         assert!(log.target_id.is_none());
+    }
+
+    #[test]
+    fn call_log_deserialization_missing_extended_fields_defaults_none() {
+        // S4: old CallLog JSON that predates M7/M8 extension columns
+        // (ingress_protocol / upstream_protocol / lane / loss_summary /
+        // error_category / …) must deserialize with those fields as None
+        // rather than failing.
+        let old_json = json!({
+            "request_id": uuid::Uuid::new_v4(),
+            "provider": "openai",
+            "model": "gpt-4o",
+            "real_model": "gpt-4o",
+            "stream": true,
+            "status_code": 502,
+            "duration_ms": 42,
+            "usage": null,
+            "error": "boom",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "user_agent": "curl/8",
+            // deliberately omit: reasoning_effort, upstream_duration_ms,
+            // ttft_ms, cached_tokens, cache_creation_tokens,
+            // reasoning_tokens, client_ip, error_category,
+            // ingress_protocol, upstream_protocol, lane, loss_summary
+        });
+        let log: CallLog = serde_json::from_value(old_json).unwrap();
+        assert!(log.reasoning_effort.is_none());
+        assert!(log.upstream_duration_ms.is_none());
+        assert!(log.ttft_ms.is_none());
+        assert!(log.cached_tokens.is_none());
+        assert!(log.cache_creation_tokens.is_none());
+        assert!(log.reasoning_tokens.is_none());
+        assert!(log.client_ip.is_none());
+        assert!(log.error_category.is_none());
+        assert!(log.ingress_protocol.is_none());
+        assert!(log.upstream_protocol.is_none());
+        assert!(log.lane.is_none());
+        assert!(log.loss_summary.is_none());
+        assert_eq!(log.user_agent.as_deref(), Some("curl/8"));
     }
 
     #[test]

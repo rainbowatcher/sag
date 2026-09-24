@@ -3333,3 +3333,62 @@ fn m4_chat_stream_encoder_raw_passthrough_and_structured() {
         b"data: [DONE]\n\n"
     );
 }
+
+/// S4: dispatch-level CallLog must carry a non-empty `loss_summary` when
+/// the request-side IR already holds encode/decode loss entries.
+#[tokio::test]
+async fn dispatch_chat_call_log_carries_nonempty_loss_summary() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+
+    // Seed request-side losses on the IR view so the dispatch summary
+    // must surface them on the CallLog row.
+    let mut ir = ChatCompletionsCodec::decode_request(&req);
+    ir.loss.push_loss(
+        sag_core::LossScope::Request,
+        "n",
+        sag_core::LossReason::UnsupportedByIr,
+        json!(2),
+    );
+    ir.loss.push_loss(
+        sag_core::LossScope::ContentBlock,
+        "messages[0].content[1]",
+        sag_core::LossReason::UnsupportedByTarget,
+        json!({"type": "input_audio"}),
+    );
+    assert!(!ir.loss.is_empty(), "test IR must carry losses");
+
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    ctx.ir = Some(&ir);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    state.collector.flush().await;
+    let logs = state
+        .collector
+        .store()
+        .query_logs(sag_analytics::LogFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1, "success must write one CallLog row");
+    let summary = logs[0]
+        .loss_summary
+        .as_deref()
+        .expect("loss_summary must be non-empty when ir.loss is non-empty");
+    assert!(
+        summary.contains("2 entries"),
+        "summary must report the loss count: {summary}"
+    );
+    assert!(
+        summary.contains("n:unsupported_by_ir"),
+        "summary must include the request loss field: {summary}"
+    );
+}

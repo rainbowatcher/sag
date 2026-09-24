@@ -410,7 +410,37 @@ async fn responses(
     // Decode Responses body → IR. D1-unsupported features (and other
     // capability rejects) return BadRequest — surface as 422 **before**
     // entering dispatch (never capability-precheck drops).
-    let ir = match sag_providers::ResponsesCodec::decode_request(&raw_body) {
+    //
+    // M8 stateful: Allow only when **every** target on the matched route
+    // declares an explicit `upstream_protocol = responses`. A mixed route
+    // (native + translated Chat) could fall back to a translated target
+    // that would receive `previous_response_id` as a Chat `extra` field —
+    // silent semantic loss. Option A: any non-explicit-Responses target →
+    // Reject (422) when the request carries stateful fields.
+    let stateful_mode = {
+        let model = raw_body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let cfg = state.config.read().await;
+        let all_native = sag_config::resolve_model_route(&cfg.routes, model).is_some_and(|route| {
+            !route.targets.is_empty()
+                && route.targets.iter().all(|t| {
+                    let pc = cfg.providers.get(&t.provider);
+                    let explicit = t
+                        .upstream_protocol
+                        .or_else(|| pc.and_then(|p| p.upstream_protocol));
+                    explicit == Some(sag_core::UpstreamProtocol::Responses)
+                })
+        });
+        if all_native {
+            sag_providers::StatefulMode::Allow
+        } else {
+            sag_providers::StatefulMode::Reject
+        }
+    };
+    let ir = match sag_providers::ResponsesCodec::decode_request_with_mode(&raw_body, stateful_mode)
+    {
         Ok(ir) => ir,
         Err(err) => {
             let message = match &err {

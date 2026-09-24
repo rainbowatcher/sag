@@ -65,6 +65,72 @@ impl LossInventory {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Compact single-line summary for `CallLog.loss_summary`:
+    /// `"{len} entries; field:reason; field:reason; …"` with at most
+    /// `max` detail entries. Returns `None` when empty.
+    pub fn summarize(&self, max: usize) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let shown = self.entries.len().min(max.max(1));
+        let mut parts: Vec<String> = Vec::with_capacity(shown + 1);
+        for e in self.entries.iter().take(shown) {
+            let reason = match e.reason {
+                LossReason::UnsupportedByIr => "unsupported_by_ir",
+                LossReason::UnsupportedByTarget => "unsupported_by_target",
+                LossReason::DroppedByTargetFeature => "dropped_by_target_feature",
+            };
+            parts.push(format!("{}:{}", e.field, reason));
+        }
+        let mut out = format!("{} entries", self.entries.len());
+        if !parts.is_empty() {
+            out.push_str("; ");
+            out.push_str(&parts.join("; "));
+            if self.entries.len() > shown {
+                out.push_str("; …");
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Merge several inventories (request decode + encode + response) into one
+/// summary string for `CallLog.loss_summary`.
+pub fn summarize_losses(inventories: &[&LossInventory], max: usize) -> Option<String> {
+    let total: usize = inventories.iter().map(|i| i.len()).sum();
+    if total == 0 {
+        return None;
+    }
+    // Flatten the first `max` entries across inventories in order.
+    let mut parts: Vec<String> = Vec::new();
+    let mut remaining = max.max(1);
+    for inv in inventories {
+        for e in inv.entries.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let reason = match e.reason {
+                LossReason::UnsupportedByIr => "unsupported_by_ir",
+                LossReason::UnsupportedByTarget => "unsupported_by_target",
+                LossReason::DroppedByTargetFeature => "dropped_by_target_feature",
+            };
+            parts.push(format!("{}:{}", e.field, reason));
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    let mut out = format!("{total} entries");
+    if !parts.is_empty() {
+        out.push_str("; ");
+        out.push_str(&parts.join("; "));
+        if total > parts.len() {
+            out.push_str("; …");
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -158,5 +224,77 @@ mod tests {
         let json = serde_json::to_value(&inv).unwrap();
         let back: LossInventory = serde_json::from_value(json).unwrap();
         assert_eq!(back, inv);
+    }
+
+    #[test]
+    fn summarize_empty_is_none() {
+        let inv = LossInventory::default();
+        assert_eq!(inv.summarize(5), None);
+        assert_eq!(summarize_losses(&[&inv], 5), None);
+    }
+
+    #[test]
+    fn summarize_format_count_and_field_reason() {
+        let mut inv = LossInventory::default();
+        inv.push_loss(
+            LossScope::Request,
+            "tools[0]",
+            LossReason::UnsupportedByIr,
+            serde_json::json!({"type": "custom"}),
+        );
+        inv.push_loss(
+            LossScope::ContentBlock,
+            "messages[1].content[2]",
+            LossReason::UnsupportedByTarget,
+            serde_json::json!({"type": "input_audio"}),
+        );
+        let s = inv.summarize(5).expect("summary");
+        assert!(s.starts_with("2 entries"), "got: {s}");
+        assert!(s.contains("tools[0]:unsupported_by_ir"), "got: {s}");
+        assert!(
+            s.contains("messages[1].content[2]:unsupported_by_target"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn summarize_truncates_to_max() {
+        let mut inv = LossInventory::default();
+        for i in 0..10 {
+            inv.push_loss(
+                LossScope::Request,
+                format!("f{i}"),
+                LossReason::UnsupportedByIr,
+                serde_json::json!(i),
+            );
+        }
+        let s = inv.summarize(3).expect("summary");
+        assert!(s.starts_with("10 entries"), "got: {s}");
+        assert!(s.contains("f0:"), "got: {s}");
+        assert!(s.contains("f2:"), "got: {s}");
+        assert!(!s.contains("f3:"), "got: {s}");
+        assert!(s.contains("…"), "got: {s}");
+    }
+
+    #[test]
+    fn summarize_losses_merges_inventories() {
+        let mut a = LossInventory::default();
+        a.push_loss(
+            LossScope::Request,
+            "a",
+            LossReason::UnsupportedByIr,
+            serde_json::json!(1),
+        );
+        let mut b = LossInventory::default();
+        b.push_loss(
+            LossScope::Response,
+            "b",
+            LossReason::UnsupportedByTarget,
+            serde_json::json!(2),
+        );
+        let s = summarize_losses(&[&a, &b], 5).expect("summary");
+        assert!(s.starts_with("2 entries"), "got: {s}");
+        assert!(s.contains("a:unsupported_by_ir"), "got: {s}");
+        assert!(s.contains("b:unsupported_by_target"), "got: {s}");
     }
 }

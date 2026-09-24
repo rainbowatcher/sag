@@ -8,7 +8,7 @@ mod request;
 mod response;
 mod stream;
 
-pub use loss::{LossEntry, LossInventory, LossReason, LossScope};
+pub use loss::{LossEntry, LossInventory, LossReason, LossScope, summarize_losses};
 pub use request::{
     IrContentBlock, IrMessage, IrRequest, IrRole, IrTool, IrToolCall, Reasoning, Sampling,
 };

@@ -15,8 +15,11 @@ use tracing::info;
 
 /// Extract hard capability requirements from a Chat-completion request.
 ///
-/// Chat path: streaming / tools / images / documents / reasoning only;
-/// stateful / hosted_tools / background stay `false`.
+/// - `hosted_tools`: set when any tool has `type == "web_search"` (or
+///   `type == "hosted"` with `name == "web_search"`).
+/// - `stateful`: set when `previous_response_id` rides in `extra`
+///   (Responses ingress synthesis) or `store == Some(true)`.
+/// - `background`: always `false` (background execution is globally 422).
 pub fn request_hard_requirements(req: &ChatCompletionRequest) -> Capabilities {
     Capabilities {
         streaming: req.stream.unwrap_or(false),
@@ -29,8 +32,21 @@ pub fn request_hard_requirements(req: &ChatCompletionRequest) -> Capabilities {
         images: message_content_has_type(req, "image_url"),
         documents: message_content_has_type(req, "file")
             || message_content_has_type(req, "document"),
-        stateful: false,
-        hosted_tools: false,
+        // Stateful: previous_response_id rides in Chat extra (Responses
+        // ingress synthesis) or store=true on the typed field.
+        stateful: req.extra.contains_key("previous_response_id") || req.store == Some(true),
+        hosted_tools: req
+            .tools
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|t| {
+                    let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                    ty == "web_search"
+                        || (ty == "hosted"
+                            && t.get("name").and_then(|n| n.as_str()) == Some("web_search"))
+                })
+            }),
         background: false,
     }
 }
@@ -63,6 +79,8 @@ pub fn target_capabilities(
             // endpoints — do not hard-drop them at pre-check.
             documents: true,
             stateful: false,
+            // Chat Completions has no hosted `web_search` tool type
+            // (only `web_search_options` on the request body).
             hosted_tools: false,
             background: false,
         },
@@ -73,18 +91,20 @@ pub fn target_capabilities(
             images: true,
             documents: true,
             stateful: false,
-            hosted_tools: false,
+            // Anthropic supports the hosted `web_search` tool (M8).
+            hosted_tools: true,
             background: false,
         },
-        // OpenAI-compatible Responses / unknown combos: conservative.
+        // OpenAI-compatible Responses: native Responses supports hosted
+        // tools (web_search) and stateful fields when explicitly declared.
         (_, UpstreamProtocol::Responses) => Capabilities {
             streaming: true,
             reasoning: true,
             tools: true,
             images: true,
             documents: false,
-            stateful: false,
-            hosted_tools: false,
+            stateful: true,
+            hosted_tools: true,
             background: false,
         },
         _ => Capabilities {
@@ -387,5 +407,73 @@ mod tests {
         let out = filter_capable_targets(&r, &providers, vec![target("bare")], &mut errors);
         assert!(out.is_empty());
         assert!(errors[0].contains("lacks capability tools"));
+    }
+
+    #[test]
+    fn hosted_tools_override_keeps_target() {
+        // Baseline openai+chat has hosted_tools=false; a target override
+        // `hosted_tools = true` must satisfy a hosted_tools requirement.
+        use sag_config::CapabilitiesOverride;
+        let r = req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search"}]
+        }));
+        assert!(
+            request_hard_requirements(&r).hosted_tools,
+            "web_search tool must require hosted_tools"
+        );
+
+        let mut providers = HashMap::new();
+        providers.insert("oa".into(), provider(ProviderType::OpenAI));
+        let mut t = target("oa");
+        t.capabilities = Some(CapabilitiesOverride {
+            hosted_tools: Some(true),
+            ..Default::default()
+        });
+        let mut errors = Vec::new();
+        let out = filter_capable_targets(&r, &providers, vec![t], &mut errors);
+        assert_eq!(
+            out.len(),
+            1,
+            "hosted_tools=true override must keep target; errors: {errors:?}"
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn tools_false_override_drops_target_for_tools_request() {
+        use sag_config::CapabilitiesOverride;
+        let r = req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        }));
+        assert!(request_hard_requirements(&r).tools);
+
+        let mut providers = HashMap::new();
+        providers.insert("oa".into(), provider(ProviderType::OpenAI));
+        let mut t = target("oa");
+        t.capabilities = Some(CapabilitiesOverride {
+            tools: Some(false),
+            ..Default::default()
+        });
+        let mut errors = Vec::new();
+        let out = filter_capable_targets(&r, &providers, vec![t], &mut errors);
+        assert!(out.is_empty(), "tools=false must drop target");
+        assert!(
+            errors.iter().any(|e| e.contains("lacks capability tools")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn anthropic_and_responses_claim_hosted_tools() {
+        let a = target_capabilities("anthropic", UpstreamProtocol::AnthropicMessages);
+        assert!(a.hosted_tools, "anthropic must claim hosted_tools");
+        let r = target_capabilities("openai", UpstreamProtocol::Responses);
+        assert!(r.hosted_tools, "openai+responses must claim hosted_tools");
+        let c = target_capabilities("openai", UpstreamProtocol::ChatCompletions);
+        assert!(!c.hosted_tools, "openai+chat must NOT claim hosted_tools");
     }
 }

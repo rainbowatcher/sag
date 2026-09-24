@@ -260,16 +260,21 @@ impl AnthropicMessagesCodec {
             }
         }
 
-        // tools (input_schema) → IrTool.
+        // tools (input_schema) → IrTool. M8: Anthropic hosted
+        // `web_search` tools (`type: "web_search_20250305"`) keep their
+        // type in `raw` for round-trip.
         let tools = match body.get("tools") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(arr)) => arr
                 .iter()
                 .enumerate()
                 .filter_map(|(i, t)| {
+                    let tool_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_web_search = tool_type.starts_with("web_search");
                     let name = t.get("name").and_then(|v| v.as_str()).map(String::from);
                     let name = match name {
                         Some(n) => n,
+                        None if is_web_search => "web_search".to_string(),
                         None => {
                             loss.push_loss(
                                 LossScope::Request,
@@ -284,11 +289,14 @@ impl AnthropicMessagesCodec {
                         .get("description")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    let input_schema = t
-                        .get("input_schema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type": "object"}));
-                    // Tool-level extras (cache_control, etc.) for round-trip.
+                    let input_schema = if is_web_search {
+                        Value::Null
+                    } else {
+                        t.get("input_schema")
+                            .cloned()
+                            .unwrap_or_else(|| json!({"type": "object"}))
+                    };
+                    // Tool-level extras (cache_control, type, …) for round-trip.
                     let mut tool_raw = Map::new();
                     if let Some(obj) = t.as_object() {
                         for (k, v) in obj {
@@ -416,7 +424,8 @@ impl AnthropicMessagesCodec {
             let blocks: Vec<Value> = system_msgs
                 .iter()
                 .flat_map(|m| m.content.iter())
-                .map(encode_content_block)
+                .enumerate()
+                .map(|(bi, b)| encode_content_block(b, &format!("system.content[{bi}]"), loss))
                 .collect();
             // Single pure-text block → bare string (Anthropic accepts both).
             if blocks.len() == 1 && blocks[0].get("type").and_then(|t| t.as_str()) == Some("text") {
@@ -433,7 +442,7 @@ impl AnthropicMessagesCodec {
         // messages: non-system → Anthropic user/assistant turns.
         // Tool-role messages and ToolResult blocks collapse into the
         // adjacent user turn as `tool_result` blocks (Anthropic shape).
-        let anthropic_messages = encode_messages(&chat_msgs);
+        let anthropic_messages = encode_messages(&chat_msgs, loss);
         body.insert("messages".into(), Value::Array(anthropic_messages));
 
         // max_tokens: IR → raw → documented default (always with loss).
@@ -1412,12 +1421,13 @@ fn decode_request_block(
 ///   the following/adjacent user turn as `tool_result` blocks.
 /// - Assistant `ToolUse` blocks / `tool_calls` become `tool_use` blocks.
 /// - Non-user/assistant roles default to `user` (Anthropic has only two).
-fn encode_messages(msgs: &[&IrMessage]) -> Vec<Value> {
+/// - Unsupported blocks (e.g. Audio) record a loss entry in `loss`.
+fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> Vec<Value> {
     // First pass: collect pending tool_results to merge into user turns.
     let mut out: Vec<Value> = Vec::new();
     let mut pending_tool_results: Vec<Value> = Vec::new();
 
-    for msg in msgs {
+    for (mi, msg) in msgs.iter().enumerate() {
         // Tool-role message → tool_result block (merge into next user).
         if msg.role == IrRole::Tool {
             let tool_call_id = msg.tool_call_id.clone().unwrap_or_default();
@@ -1478,7 +1488,11 @@ fn encode_messages(msgs: &[&IrMessage]) -> Vec<Value> {
                 }
                 blocks.push(Value::Object(tr));
             } else {
-                blocks.push(encode_content_block(block));
+                blocks.push(encode_content_block(
+                    block,
+                    &format!("messages[{mi}].content"),
+                    loss,
+                ));
             }
         }
 
@@ -1544,7 +1558,11 @@ fn encode_messages(msgs: &[&IrMessage]) -> Vec<Value> {
     out
 }
 
-fn encode_content_block(block: &IrContentBlock) -> Value {
+fn encode_content_block(
+    block: &IrContentBlock,
+    path: &str,
+    loss: &mut sag_core::LossInventory,
+) -> Value {
     match block {
         IrContentBlock::Text { text } => json!({"type": "text", "text": text}),
         IrContentBlock::Reasoning { text } => json!({"type": "thinking", "thinking": text}),
@@ -1586,7 +1604,19 @@ fn encode_content_block(block: &IrContentBlock) -> Value {
                 json!({"type": "document", "source": data})
             }
         }
-        IrContentBlock::Audio { data } => data.clone(),
+        // Anthropic Messages has no first-class audio content block —
+        // record an explicit loss and keep the original payload as a
+        // Raw-style passthrough so the upstream can reject loudly
+        // rather than silently dropping the block.
+        IrContentBlock::Audio { data } => {
+            loss.push_loss(
+                LossScope::ContentBlock,
+                path.to_string(),
+                LossReason::UnsupportedByTarget,
+                data.clone(),
+            );
+            data.clone()
+        }
         IrContentBlock::ToolUse {
             id,
             name,
@@ -1627,6 +1657,28 @@ fn encode_tools(tools: &[IrTool]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
         .map(|t| {
+            // M8 hosted web_search: official Anthropic shape is
+            // `{"type":"web_search_20250305","name":"web_search",...}`.
+            // Only treat as hosted when `raw.type` **starts with**
+            // `web_search` — a same-named function tool (type absent /
+            // `"function"`) must not be misclassified.
+            let raw_type = t.raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if raw_type.starts_with("web_search") {
+                let mut tool = Map::new();
+                tool.insert("type".into(), json!("web_search_20250305"));
+                tool.insert("name".into(), json!(t.name));
+                if let Some(d) = &t.description {
+                    tool.insert("description".into(), json!(d));
+                }
+                // Preserve extras (max_uses, cache_control, …) but never
+                // the original type (pinned above) or input_schema.
+                for (k, v) in &t.raw {
+                    if k != "type" && k != "input_schema" {
+                        tool.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                return Value::Object(tool);
+            }
             let mut tool = Map::new();
             tool.insert("name".into(), json!(t.name));
             if let Some(d) = &t.description {
@@ -2346,6 +2398,188 @@ mod tests {
                 .get("content")
                 .and_then(|c| c.get("cache_control"))
                 .is_none()
+        );
+    }
+
+    // ── M8 hosted web_search tool mapping ─────────────────────────
+
+    #[test]
+    fn encode_web_search_tool_uses_official_anthropic_shape() {
+        let mut ir = IrRequest {
+            model: "claude".into(),
+            ..Default::default()
+        };
+        ir.messages.push(IrMessage {
+            role: IrRole::User,
+            content: vec![IrContentBlock::Text {
+                text: "news".into(),
+            }],
+            ..Default::default()
+        });
+        ir.tools.push(IrTool {
+            name: "web_search".into(),
+            description: None,
+            input_schema: Value::Null,
+            raw: {
+                let mut m = Map::new();
+                m.insert("type".into(), json!("web_search"));
+                m.insert("max_uses".into(), json!(5));
+                m
+            },
+        });
+        ir.max_tokens = Some(64);
+        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        assert_eq!(body["tools"][0]["type"], "web_search_20250305");
+        assert_eq!(body["tools"][0]["name"], "web_search");
+        assert_eq!(body["tools"][0]["max_uses"], 5);
+        assert!(
+            body["tools"][0].get("input_schema").is_none(),
+            "web_search has no input_schema: {}",
+            body["tools"][0]
+        );
+        // No unexpected tool losses.
+        let tool_losses: Vec<_> = loss
+            .entries
+            .iter()
+            .filter(|e| e.field.starts_with("tools"))
+            .collect();
+        assert!(tool_losses.is_empty(), "tool losses: {tool_losses:?}");
+    }
+
+    #[test]
+    fn decode_web_search_tool_preserves_raw_type() {
+        let body = json!({
+            "model": "claude",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+        });
+        let ir = AnthropicMessagesCodec::decode_request(&body);
+        assert_eq!(ir.tools.len(), 1);
+        assert_eq!(ir.tools[0].name, "web_search");
+        assert_eq!(
+            ir.tools[0].raw.get("type").and_then(|v| v.as_str()),
+            Some("web_search_20250305")
+        );
+        assert_eq!(ir.tools[0].raw.get("max_uses"), Some(&json!(3)));
+        let back = AnthropicMessagesCodec::encode_request(&ir);
+        assert_eq!(back["tools"][0]["type"], "web_search_20250305");
+        assert_eq!(back["tools"][0]["max_uses"], 3);
+    }
+
+    // ── M8 document / audio content ──────────────────────────────
+
+    #[test]
+    fn document_content_roundtrip() {
+        let body = json!({
+            "model": "claude",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "summarize"},
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AA=="}}
+                ]
+            }]
+        });
+        let ir = AnthropicMessagesCodec::decode_request(&body);
+        assert!(
+            matches!(ir.messages[0].content[1], IrContentBlock::Document { .. }),
+            "document block → Document"
+        );
+        let back = AnthropicMessagesCodec::encode_request(&ir);
+        assert_eq!(back["messages"][0]["content"][1]["type"], "document");
+        assert_eq!(
+            back["messages"][0]["content"][1]["source"]["media_type"],
+            "application/pdf"
+        );
+    }
+
+    #[test]
+    fn audio_content_records_loss_and_keeps_payload() {
+        // S3: Anthropic has no first-class audio block — encode must
+        // `loss.push` (never a silent passthrough that pretends it was
+        // recorded) while keeping the original payload for loud upstream
+        // rejection.
+        let audio = json!({
+            "type": "input_audio",
+            "input_audio": {"data": "AAAA", "format": "wav"}
+        });
+        let ir = IrRequest {
+            model: "claude".into(),
+            max_tokens: Some(64),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Audio {
+                    data: audio.clone(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (back, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        assert!(
+            !loss.is_empty(),
+            "audio encode must record a loss entry (got empty inventory)"
+        );
+        assert!(
+            loss.entries
+                .iter()
+                .any(|e| e.field.contains("messages[0].content")
+                    && matches!(e.reason, LossReason::UnsupportedByTarget)),
+            "loss must name the audio content block with UnsupportedByTarget: {:?}",
+            loss.entries
+        );
+        // Payload kept (Raw-style passthrough) so upstream rejects loudly.
+        let encoded = &back["messages"][0]["content"][0];
+        assert_eq!(
+            encoded.get("type").and_then(|t| t.as_str()),
+            Some("input_audio"),
+            "audio payload structure must be preserved: {encoded}"
+        );
+        assert_eq!(
+            encoded
+                .pointer("/input_audio/format")
+                .and_then(|t| t.as_str()),
+            Some("wav")
+        );
+    }
+
+    #[test]
+    fn function_tool_named_web_search_is_not_hosted() {
+        // Nit: only `raw.type` starting with `web_search` counts as the
+        // hosted family — a function tool merely **named** `web_search`
+        // must keep the function shape (input_schema etc.).
+        let mut ir = IrRequest {
+            model: "claude".into(),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        ir.messages.push(IrMessage {
+            role: IrRole::User,
+            content: vec![IrContentBlock::Text { text: "hi".into() }],
+            ..Default::default()
+        });
+        ir.tools.push(IrTool {
+            name: "web_search".into(),
+            description: Some("custom search".into()),
+            input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+            raw: {
+                let mut m = Map::new();
+                m.insert("type".into(), json!("function"));
+                m
+            },
+        });
+        let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        assert_eq!(
+            body["tools"][0]["type"], "function",
+            "same-named function tool must not be remapped to hosted web_search"
+        );
+        assert_eq!(body["tools"][0]["name"], "web_search");
+        assert!(
+            body["tools"][0].get("input_schema").is_some(),
+            "function tool keeps input_schema: {}",
+            body["tools"][0]
         );
     }
 }

@@ -2268,4 +2268,41 @@ mod tests {
         assert_eq!(u.completion_tokens, 50);
         assert_eq!(u.reasoning_tokens, Some(50));
     }
+
+    // ── M8 audio / file content round-trips ───────────────────────
+
+    #[test]
+    fn input_audio_and_file_roundtrip() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "file", "file": {"file_data": "data:application/pdf;base64,AA=="}},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }]
+        }))
+        .expect("valid chat request");
+        let ir = ChatCompletionsCodec::decode_request(&chat);
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        assert_eq!(ir.messages[0].content.len(), 3);
+        assert!(
+            matches!(ir.messages[0].content[1], IrContentBlock::Document { .. }),
+            "file → Document"
+        );
+        assert!(
+            matches!(ir.messages[0].content[2], IrContentBlock::Audio { .. }),
+            "input_audio → Audio"
+        );
+        let (back, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+        assert!(loss.is_empty(), "encode loss: {:?}", loss);
+        let parts = back.messages[0]
+            .content
+            .as_array()
+            .expect("content parts array");
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[2]["type"], "input_audio");
+    }
 }

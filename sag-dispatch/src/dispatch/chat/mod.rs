@@ -99,6 +99,29 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     };
     let is_anthropic_ingress = matches!(ingress_protocol, IngressProtocol::AnthropicMessages);
     let is_responses_ingress = matches!(ingress_protocol, IngressProtocol::Responses);
+    // M8: request-side LossInventory summary for CallLog terminals.
+    // Encode-side losses are collected per-attempt into this cell and
+    // merged (append unique entries — never overwrite) with response
+    // losses at every terminal: non-stream success, stream commit,
+    // per-target failure, and fallback.
+    let encode_losses =
+        std::sync::Arc::new(std::sync::Mutex::new(sag_core::LossInventory::default()));
+    let loss_summary = sag_core::summarize_losses(&[&ir.loss], 5);
+    // Snapshot encode-side losses + request losses into one summary.
+    // When the encode cell is non-empty it already carries `ir.loss` as
+    // its base (encode codecs seed from `ir.loss`), so prefer it alone.
+    let encode_aware_loss_summary = {
+        let encode_losses = encode_losses.clone();
+        let base_summary = loss_summary.clone();
+        move || {
+            let encode_snap = encode_losses.lock().map(|g| g.clone()).unwrap_or_default();
+            if encode_snap.is_empty() {
+                base_summary.clone()
+            } else {
+                sag_core::summarize_losses(&[&encode_snap], 5)
+            }
+        }
+    };
 
     // Client-disconnect terminal: if the handler future is dropped before
     // any normal terminal (non-streaming request, or a streaming request
@@ -175,6 +198,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             merge_model_overrides(&config.providers, provider_name, &real_model, &target.extra);
         let retries = target.retries;
         let timeout_secs = target.timeout_secs;
+        let encode_losses = encode_losses.clone();
 
         // Wall-clock start of this target's first actual provider call,
         // captured inside the retry closure on attempt 0. Retries of the
@@ -197,6 +221,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 let api_endpoint = api_endpoint.clone();
                 let provider_name = provider_name.to_string();
                 let cancel = cancel_guard.analytics();
+                let encode_losses = encode_losses.clone();
                 async move {
                     // An actual provider call is in flight from here until
                     // the attempt's future resolves. A client disconnect
@@ -239,6 +264,17 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                         loss = ?loss.entries,
                                         "native anthropic encode recorded losses"
                                     );
+
+                                    // Accumulate (append unique) — never overwrite:
+                                    // multi-attempt / multi-target encodes must not
+                                    // drop earlier encode-side losses.
+                                    if let Ok(mut acc) = encode_losses.lock() {
+                                        for e in loss.entries {
+                                            if !acc.entries.contains(&e) {
+                                                acc.entries.push(e);
+                                            }
+                                        }
+                                    }
                                 }
                                 provider
                                     .anthropic_messages_stream(body, &target_extra)
@@ -251,6 +287,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                         loss = ?loss.entries,
                                         "native responses encode recorded losses"
                                     );
+
+                                    if let Ok(mut acc) = encode_losses.lock() {
+                                        for e in loss.entries {
+                                            if !acc.entries.contains(&e) {
+                                                acc.entries.push(e);
+                                            }
+                                        }
+                                    }
                                 }
                                 provider
                                     .responses_stream_native(body, &target_extra, &api_endpoint)
@@ -312,6 +356,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     loss = ?loss.entries,
                                     "native anthropic encode recorded losses"
                                 );
+
+                                if let Ok(mut acc) = encode_losses.lock() {
+                                    for e in loss.entries {
+                                        if !acc.entries.contains(&e) {
+                                            acc.entries.push(e);
+                                        }
+                                    }
+                                }
                             }
                             let raw = provider
                                 .anthropic_messages(body, &target_extra, timeout_secs)
@@ -343,6 +395,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     loss = ?loss.entries,
                                     "native responses encode recorded losses"
                                 );
+
+                                if let Ok(mut acc) = encode_losses.lock() {
+                                    for e in loss.entries {
+                                        if !acc.entries.contains(&e) {
+                                            acc.entries.push(e);
+                                        }
+                                    }
+                                }
                             }
                             let raw = provider
                                 .responses_native(body, &target_extra, &api_endpoint, timeout_secs)
@@ -499,6 +559,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 Some(ingress_protocol.as_str().to_string()),
                 Some(target.upstream_protocol.as_str().to_string()),
                 Some(target.lane.as_str().to_string()),
+                encode_aware_loss_summary(),
             );
             if let Some(err) = client_error {
                 // Client-attributed 4xx: return to the client directly — no
@@ -619,6 +680,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(ingress_protocol.as_str().to_string()),
                         Some(target.upstream_protocol.as_str().to_string()),
                         Some(target.lane.as_str().to_string()),
+                        encode_aware_loss_summary(),
                     );
                 }
                 if is_responses_ingress {
@@ -642,6 +704,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(ingress_protocol.as_str().to_string()),
                         Some(target.upstream_protocol.as_str().to_string()),
                         Some(target.lane.as_str().to_string()),
+                        encode_aware_loss_summary(),
                     );
                 }
                 return build_streaming_response(
@@ -664,6 +727,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     Some(ingress_protocol.as_str().to_string()),
                     Some(target.upstream_protocol.as_str().to_string()),
                     Some(target.lane.as_str().to_string()),
+                    encode_aware_loss_summary(),
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {
@@ -672,6 +736,16 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 // (same `Usage` type / values as the original response).
                 let upstream_duration_ms = upstream_start.elapsed().as_millis() as u64;
                 let timing = Some(upstream_duration_ms);
+                // Merge request + encode + response losses into the CallLog.
+                // Encode inventory already starts from ir.loss, so prefer it
+                // over the bare request inventory when present.
+                let encode_snap = encode_losses.lock().map(|g| g.clone()).unwrap_or_default();
+                let request_snap: sag_core::LossInventory = if encode_snap.is_empty() {
+                    ir.loss.clone()
+                } else {
+                    encode_snap
+                };
+                let success_loss = sag_core::summarize_losses(&[&request_snap, &att.ir.loss], 5);
                 state.collector.log(success_log(
                     trace_id,
                     provider_name,
@@ -688,6 +762,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     Some(ingress_protocol.as_str().to_string()),
                     Some(target.upstream_protocol.as_str().to_string()),
                     Some(target.lane.as_str().to_string()),
+                    success_loss,
                 ));
                 // Formal analytics event: the request completed successfully.
                 // The writer derives `actual_model` from the final
@@ -765,6 +840,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         Some(ingress_protocol.as_str().to_string()),
         None,
         None,
+        {
+            let encode_snap = encode_losses.lock().map(|g| g.clone()).unwrap_or_default();
+            if encode_snap.is_empty() {
+                loss_summary.clone()
+            } else {
+                sag_core::summarize_losses(&[&encode_snap], 5)
+            }
+        },
     );
     // Formal analytics event: every target exhausted → `model_failure`
     // with `all_exhausted` and one failure fact per actually-issued

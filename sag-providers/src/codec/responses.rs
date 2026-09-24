@@ -1,14 +1,21 @@
-//! OpenAI Responses ↔ IR codec (M6, stateless subset — plan §5.2 / D1).
+//! OpenAI Responses ↔ IR codec (M6 stateless subset + M8 stateful native
+//! subset — plan §5.2 / D1 / M8).
 //!
 //! Pure mapping: Responses request/response/SSE ↔ IR types.
 //!
-//! Ingress side: `decode_request` / `encode_response` / `encode_stream_event`.
+//! Ingress side: `decode_request` / `decode_request_allow_stateful` /
+//! `encode_response` / `encode_stream_event`.
 //! Upstream side: `encode_request` / `decode_response` / `decode_stream_frame`.
 //!
 //! Hard rejects (D1, plan §4.4): `previous_response_id` / `store=true` /
-//! `background` / non-function tools / complex `tool_choice` return
+//! `background` / unsupported tools / complex `tool_choice` return
 //! [`AppError::BadRequest`], rendered as HTTP 422 by the `/v1/responses`
 //! handler — never capability-precheck drops.
+//!
+//! M8 stateful subset: `decode_request_allow_stateful` permits
+//! `previous_response_id` / `store=true` into `IrRequest.raw` so the
+//! **native** Responses lane re-emits them on encode. `background` is
+//! still always rejected (M8 does not implement background execution).
 
 use std::cell::RefCell;
 
@@ -25,25 +32,44 @@ use sag_core::{
 pub struct ResponsesCodec;
 
 // ═══════════════════════════════════════════════════════════════════
-// D1 capability rejects
+// D1 capability rejects / M8 stateful mode
 // ═══════════════════════════════════════════════════════════════════
 
 fn reject(msg: impl Into<String>) -> AppError {
     AppError::BadRequest(msg.into())
 }
 
-/// Reject stateful / background features **before** decode (D1).
-/// `store=false` and absent fields are allowed.
-pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
-    if body
-        .get("previous_response_id")
-        .is_some_and(|v| !v.is_null())
+/// Whether ingress decode permits stateful Responses fields
+/// (`previous_response_id` / `store=true`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatefulMode {
+    /// Translated-only route (or unknown): reject stateful fields (422).
+    Reject,
+    /// Route has at least one explicit `upstream_protocol=Responses`
+    /// target: allow stateful fields into `IrRequest.raw` for native
+    /// passthrough. `background` is still rejected.
+    Allow,
+}
+
+/// Reject stateful / background features **before** decode (D1 / M8).
+/// `store=false` and absent fields are always allowed.
+///
+/// `mode == Allow` skips the `previous_response_id` / `store=true` /
+/// bare-response-id-input rejects (M8 native passthrough) but still
+/// rejects `background`.
+pub fn reject_unsupported_mode(body: &Value, mode: StatefulMode) -> Result<(), AppError> {
+    if mode == StatefulMode::Reject
+        && body
+            .get("previous_response_id")
+            .is_some_and(|v| !v.is_null())
     {
         return Err(reject(
             "previous_response_id is not supported (stateless Responses only)",
         ));
     }
-    if let Some(store) = body.get("store") {
+    if mode == StatefulMode::Reject
+        && let Some(store) = body.get("store")
+    {
         // Reject bool true and the string form "true" (N1).
         let is_true = store.as_bool() == Some(true)
             || store
@@ -55,6 +81,7 @@ pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
             ));
         }
     }
+    // background is always rejected (M8 does not execute background work).
     if body
         .get("background")
         .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
@@ -63,8 +90,10 @@ pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
             "background is not supported (stateless Responses only)",
         ));
     }
-    // input as a bare response id string (stateful form).
-    if let Some(input) = body.get("input").filter(|v| !v.is_null())
+    // input as a bare response id string (stateful form) — only when
+    // stateful is not allowed for this route.
+    if mode == StatefulMode::Reject
+        && let Some(input) = body.get("input").filter(|v| !v.is_null())
         && let Value::String(s) = input
         && (s.starts_with("resp_") || s.starts_with("response_"))
         && !s.contains(char::is_whitespace)
@@ -74,13 +103,17 @@ pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
         // Real free-form short inputs contain spaces or are ordinary prose;
         // OpenAI response ids are `resp_[a-f0-9…]`. Only reject the clear
         // `resp_`/`response_` prefix without spaces to avoid false positives.
-        if s.starts_with("resp_") || s.starts_with("response_") {
-            return Err(reject(
-                "input as a previous response id is not supported (stateless Responses only)",
-            ));
-        }
+        return Err(reject(
+            "input as a previous response id is not supported (stateless Responses only)",
+        ));
     }
     Ok(())
+}
+
+/// Reject stateful / background features with [`StatefulMode::Reject`]
+/// (default ingress path for translated-only routes).
+pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
+    reject_unsupported_mode(body, StatefulMode::Reject)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -189,16 +222,24 @@ fn decode_tool_choice(v: &Value) -> Result<Value, AppError> {
     }
 }
 
-/// Validate a `tools[]` entry: only `type:"function"` is supported (M6).
+/// Validate a `tools[]` entry. M8: `type:"function"`, `type:"web_search"`
+/// and the `web_search_preview*` family are supported; everything else
+/// (`hosted` / `custom` / `file_search` / unknown) is rejected (422).
 fn tool_reject(t: &Value) -> Option<AppError> {
     let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    if ty != "function" && !ty.is_empty() {
-        return Some(reject(format!(
-            "tools[].type \"{ty}\" is not supported (only type \"function\" is supported on stateless Responses)"
-        )));
+    let is_web_search_family = ty.starts_with("web_search");
+    match ty {
+        "function" | "" => {}
+        _ if is_web_search_family => {}
+        other => {
+            return Some(reject(format!(
+                "tools[].type \"{other}\" is not supported (only \"function\" and \"web_search\" are supported on Responses)"
+            )));
+        }
     }
-    // Shape-less custom entries without name also unsupported.
-    if t.get("name").is_none() && t.get("function").is_none() {
+    // Shape-less custom entries without name also unsupported
+    // (web_search family may omit name — default filled at decode).
+    if !is_web_search_family && t.get("name").is_none() && t.get("function").is_none() {
         return Some(reject(
             "unsupported tools[] entry (only type \"function\" with name is supported)",
         ));
@@ -230,6 +271,7 @@ fn decode_content_part(
         },
         "input_image" | "image" => IrContentBlock::Image { data: part.clone() },
         "input_file" | "file" => IrContentBlock::Document { data: part.clone() },
+        "input_audio" | "audio" => IrContentBlock::Audio { data: part.clone() },
         "summary_text" | "reasoning_text" => IrContentBlock::Reasoning {
             text: part
                 .get("text")
@@ -257,9 +299,24 @@ impl ResponsesCodec {
     /// Decode a Responses request body into IR (stateless subset).
     ///
     /// Returns [`AppError::BadRequest`] (rendered as 422 by the handler)
-    /// for D1-unsupported features and non-function tools.
+    /// for D1-unsupported features and unsupported tools.
     pub fn decode_request(body: &Value) -> sag_core::Result<IrRequest> {
-        reject_unsupported(body)?;
+        Self::decode_request_with_mode(body, StatefulMode::Reject)
+    }
+
+    /// M8: decode allowing stateful fields (`previous_response_id` /
+    /// `store=true`) into `IrRequest.raw` for native Responses passthrough.
+    /// `background` is still rejected.
+    pub fn decode_request_allow_stateful(body: &Value) -> sag_core::Result<IrRequest> {
+        Self::decode_request_with_mode(body, StatefulMode::Allow)
+    }
+
+    /// Decode with an explicit [`StatefulMode`].
+    pub fn decode_request_with_mode(
+        body: &Value,
+        mode: StatefulMode,
+    ) -> sag_core::Result<IrRequest> {
+        reject_unsupported_mode(body, mode)?;
 
         let mut loss = sag_core::LossInventory::default();
         let mut raw = Map::new();
@@ -285,8 +342,13 @@ impl ResponsesCodec {
         ];
         if let Some(obj) = body.as_object() {
             for (k, v) in obj {
-                // Unknown fields and `store` (even when false) round-trip via raw.
-                if !KNOWN.contains(&k.as_str()) || k == "store" {
+                // Unknown fields and `store` (even when false) round-trip via
+                // raw. In Allow mode `previous_response_id` also lands in raw
+                // so encode_request re-emits it for the native lane.
+                let keep = !KNOWN.contains(&k.as_str())
+                    || k == "store"
+                    || (mode == StatefulMode::Allow && k == "previous_response_id");
+                if keep {
                     raw.insert(k.clone(), v.clone());
                 }
             }
@@ -366,7 +428,7 @@ impl ResponsesCodec {
             }
         }
 
-        // tools: only type:"function".
+        // tools: type:"function" and type:"web_search" (M8).
         let mut tools = Vec::new();
         if let Some(arr) = body
             .get("tools")
@@ -376,6 +438,40 @@ impl ResponsesCodec {
             for (i, t) in arr.iter().enumerate() {
                 if let Some(err) = tool_reject(t) {
                     return Err(err);
+                }
+                let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                if ty.starts_with("web_search") {
+                    // Hosted web_search / web_search_preview family: preserve
+                    // original shape in raw.
+                    let name = t
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("web_search")
+                        .to_string();
+                    let mut tool_raw = Map::new();
+                    if let Some(obj) = t.as_object() {
+                        for (k, v) in obj {
+                            if k != "name" {
+                                tool_raw.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    // Ensure type is always present for Anthropic/Responses
+                    // re-encode detection (keep the original type — may be
+                    // `web_search_preview*`).
+                    tool_raw
+                        .entry("type".to_string())
+                        .or_insert_with(|| json!("web_search"));
+                    tools.push(IrTool {
+                        name,
+                        description: t
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        input_schema: Value::Null,
+                        raw: tool_raw,
+                    });
+                    continue;
                 }
                 let name = t
                     .get("name")
@@ -1811,6 +1907,24 @@ fn encode_tools(tools: &[IrTool]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
         .map(|t| {
+            // M8 hosted web_search: emit Responses-hosted shape from raw
+            // (`{"type":"web_search", ...}` or `web_search_preview*`)
+            // rather than function shape.
+            let raw_ty = t.raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if raw_ty.starts_with("web_search") {
+                let mut tool = Map::new();
+                tool.insert("type".into(), json!(raw_ty));
+                tool.insert("name".into(), json!(t.name));
+                if let Some(d) = &t.description {
+                    tool.insert("description".into(), json!(d));
+                }
+                for (k, v) in &t.raw {
+                    if k != "name" {
+                        tool.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                return Value::Object(tool);
+            }
             let mut tool = Map::new();
             tool.insert("type".into(), json!("function"));
             tool.insert("name".into(), json!(t.name));
@@ -2012,7 +2126,7 @@ mod tests {
 
     #[test]
     fn reject_hosted_tool_types() {
-        for ty in ["hosted", "web_search", "custom", "file_search"] {
+        for ty in ["hosted", "custom", "file_search"] {
             let err = ResponsesCodec::decode_request(&json!({
                 "model": "m",
                 "input": [],
@@ -2027,6 +2141,45 @@ mod tests {
                 err.to_string().contains(ty) || ty == "custom",
                 "message should name the type: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn allow_web_search_tool_type() {
+        let ir = decode(json!({
+            "model": "m",
+            "input": [],
+            "tools": [{"type": "web_search"}]
+        }));
+        assert_eq!(ir.tools.len(), 1);
+        assert_eq!(ir.tools[0].name, "web_search");
+        assert_eq!(
+            ir.tools[0].raw.get("type").and_then(|v| v.as_str()),
+            Some("web_search")
+        );
+        let back = ResponsesCodec::encode_request(&ir);
+        assert_eq!(back["tools"][0]["type"], "web_search");
+        assert_eq!(back["tools"][0]["name"], "web_search");
+    }
+
+    #[test]
+    fn allow_web_search_preview_family() {
+        // Nit: `web_search_preview*` is part of the web_search family.
+        for ty in ["web_search_preview", "web_search_preview_20250305"] {
+            let ir = decode(json!({
+                "model": "m",
+                "input": [],
+                "tools": [{"type": ty, "name": "web_search"}]
+            }));
+            assert_eq!(ir.tools.len(), 1, "type {ty} must pass tool_reject");
+            assert_eq!(
+                ir.tools[0].raw.get("type").and_then(|v| v.as_str()),
+                Some(ty),
+                "raw type must round-trip: {ty}"
+            );
+            let back = ResponsesCodec::encode_request(&ir);
+            assert_eq!(back["tools"][0]["type"], ty);
+            assert_eq!(back["tools"][0]["name"], "web_search");
         }
     }
 
@@ -2448,5 +2601,100 @@ mod tests {
             1,
             "native Raw completed must suppress synthesized completed: {s}"
         );
+    }
+
+    // ── M8 stateful (native allow) ────────────────────────────────
+
+    #[test]
+    fn allow_stateful_previous_response_id_and_store() {
+        let body = json!({
+            "model": "m",
+            "previous_response_id": "resp_abc",
+            "store": true,
+            "input": "hi"
+        });
+        let ir = ResponsesCodec::decode_request_allow_stateful(&body)
+            .expect("Allow mode must accept previous_response_id/store=true");
+        assert_eq!(ir.raw.get("previous_response_id"), Some(&json!("resp_abc")));
+        assert_eq!(ir.raw.get("store"), Some(&json!(true)));
+        let back = ResponsesCodec::encode_request(&ir);
+        assert_eq!(back["previous_response_id"], "resp_abc");
+        assert_eq!(back["store"], true);
+    }
+
+    #[test]
+    fn allow_stateful_still_rejects_background() {
+        let err = ResponsesCodec::decode_request_allow_stateful(&json!({
+            "model": "m",
+            "background": true,
+            "input": "hi"
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("background is not supported"));
+    }
+
+    #[test]
+    fn reject_mode_still_rejects_stateful() {
+        let err = ResponsesCodec::decode_request(&json!({
+            "model": "m",
+            "previous_response_id": "resp_abc",
+            "input": "hi"
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("previous_response_id is not supported")
+        );
+    }
+
+    // ── M8 audio / file round-trips ──────────────────────────────
+
+    #[test]
+    fn audio_and_document_content_roundtrip() {
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "see this"},
+                    {"type": "input_file", "file_id": "file-1"},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }]
+        });
+        let ir = decode(body);
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        assert_eq!(ir.messages.len(), 1, "single user message");
+        assert_eq!(ir.messages[0].content.len(), 3);
+        assert!(
+            matches!(ir.messages[0].content[1], IrContentBlock::Document { .. }),
+            "file → Document"
+        );
+        assert!(
+            matches!(ir.messages[0].content[2], IrContentBlock::Audio { .. }),
+            "input_audio → Audio"
+        );
+        let back = ResponsesCodec::encode_request(&ir);
+        let parts = back["input"][0]["content"].as_array().expect("parts");
+        assert_eq!(parts[1]["type"], "input_file");
+        assert_eq!(parts[2]["type"], "input_audio");
+    }
+
+    #[test]
+    fn web_search_tool_maps_and_encodes_hosted_shape() {
+        let ir = decode(json!({
+            "model": "m",
+            "input": [],
+            "tools": [{"type": "web_search", "max_uses": 5}]
+        }));
+        assert_eq!(ir.tools.len(), 1);
+        assert_eq!(
+            ir.tools[0].raw.get("type").and_then(|v| v.as_str()),
+            Some("web_search")
+        );
+        let back = ResponsesCodec::encode_request(&ir);
+        assert_eq!(back["tools"][0]["type"], "web_search");
+        assert_eq!(back["tools"][0]["max_uses"], 5);
     }
 }

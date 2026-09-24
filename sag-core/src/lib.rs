@@ -25,7 +25,7 @@ pub use http_client::build_http_client;
 pub use ir::{
     IrContentBlock, IrFinishReason, IrMessage, IrOutputItem, IrRequest, IrResponse, IrResponseMeta,
     IrRole, IrStreamEvent, IrTool, IrToolCall, LossEntry, LossInventory, LossReason, LossScope,
-    Reasoning, Sampling,
+    Reasoning, Sampling, summarize_losses,
 };
 pub use protocol::{
     Capabilities, IngressProtocol, Lane, UpstreamProtocol, derive_upstream_protocol,

@@ -180,6 +180,7 @@ async fn finish_image_success(
         ),
         Some(target.upstream_protocol.as_str().to_string()),
         Some(target.lane.as_str().to_string()),
+        None, // image path has no IR LossInventory
     ));
     emit_image_success_event(
         attempt_ctx.state,
@@ -244,6 +245,7 @@ async fn finish_image_exhausted(
                 .as_str()
                 .to_string(),
         ),
+        None,
         None,
         None,
     );
@@ -584,6 +586,7 @@ async fn apply_image_outcome<'a>(
             ),
             Some(target.upstream_protocol.as_str().to_string()),
             Some(target.lane.as_str().to_string()),
+            None,
         );
         if let Some(err) = client_error {
             return TargetOutcome::ClientError(err);

@@ -28,6 +28,8 @@ const STAGE_04_COLUMNS: &[(&str, &str)] = &[
     ("ingress_protocol", "TEXT"),
     ("upstream_protocol", "TEXT"),
     ("lane", "TEXT"),
+    // M8 LossInventory summary (also covered by migrations/20260815…).
+    ("loss_summary", "TEXT"),
 ];
 
 /// Maximum page size for `query_logs`. Shared with the admin API layer
@@ -183,12 +185,14 @@ impl LogStore for SqliteLogStore {
                      cached_tokens, cache_creation_tokens, reasoning_tokens,
                      user_agent, client_ip,
                      error_category,
-                     ingress_protocol, upstream_protocol, lane)
+                     ingress_protocol, upstream_protocol, lane,
+                     loss_summary)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?,
                         ?, ?,
                         ?,
-                        ?, ?, ?)
+                        ?, ?, ?,
+                        ?)
                 "#,
             )
             .bind(log.request_id.to_string())
@@ -217,6 +221,8 @@ impl LogStore for SqliteLogStore {
             .bind(log.ingress_protocol.as_ref())
             .bind(log.upstream_protocol.as_ref())
             .bind(log.lane.as_ref())
+            // M8 LossInventory summary.
+            .bind(log.loss_summary.as_ref())
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert call log: {e}")))?;
@@ -313,7 +319,8 @@ impl LogStore for SqliteLogStore {
                 cached_tokens, cache_creation_tokens, reasoning_tokens,
                 user_agent, client_ip,
                 error_category,
-                ingress_protocol, upstream_protocol, lane
+                ingress_protocol, upstream_protocol, lane,
+                loss_summary
             FROM call_logs
             "#,
         );
@@ -592,6 +599,7 @@ struct LogRow {
     ingress_protocol: Option<String>,
     upstream_protocol: Option<String>,
     lane: Option<String>,
+    loss_summary: Option<String>,
 }
 
 impl LogRow {
@@ -661,6 +669,7 @@ impl LogRow {
             ingress_protocol: self.ingress_protocol,
             upstream_protocol: self.upstream_protocol,
             lane: self.lane,
+            loss_summary: self.loss_summary,
         }
     }
 }
@@ -709,6 +718,7 @@ mod tests {
             ingress_protocol: None,
             upstream_protocol: None,
             lane: None,
+            loss_summary: None,
         }
     }
 
@@ -804,6 +814,7 @@ mod tests {
             ingress_protocol: None,
             upstream_protocol: None,
             lane: None,
+            loss_summary: None,
             ..make_log("openai", "gpt-4o", "gpt-4o")
         };
         store.insert_batch(&[log]).await.unwrap();
@@ -937,6 +948,10 @@ mod tests {
             ingress_protocol: Some("chat_completions".into()),
             upstream_protocol: Some("responses".into()),
             lane: Some("native".into()),
+            // M8 LossInventory summary must round-trip through insert/query.
+            loss_summary: Some(
+                "2 entries; tools[0]:unsupported_by_ir; n:>1:unsupported_by_ir".into(),
+            ),
         };
         store
             .insert_batch(std::slice::from_ref(&log))
@@ -969,6 +984,10 @@ mod tests {
         );
         assert_eq!(fetched.upstream_protocol.as_deref(), Some("responses"));
         assert_eq!(fetched.lane.as_deref(), Some("native"));
+        assert_eq!(
+            fetched.loss_summary.as_deref(),
+            Some("2 entries; tools[0]:unsupported_by_ir; n:>1:unsupported_by_ir")
+        );
 
         let u = fetched.usage.as_ref().expect("usage round-trip");
         assert_eq!(u.prompt_tokens, 100);

@@ -10,4 +10,4 @@ pub use anthropic::{
     AnthropicMessagesCodec, DEFAULT_MAX_TOKENS, inject_cache_control_value, resolve_budget,
 };
 pub use chat::ChatCompletionsCodec;
-pub use responses::ResponsesCodec;
+pub use responses::{ResponsesCodec, StatefulMode, reject_unsupported, reject_unsupported_mode};

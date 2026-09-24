@@ -151,6 +151,7 @@ mod tests {
             ingress_protocol: None,
             upstream_protocol: None,
             lane: None,
+            loss_summary: None,
         }
     }
 

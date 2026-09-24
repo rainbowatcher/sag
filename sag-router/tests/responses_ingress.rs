@@ -779,3 +779,249 @@ async fn responses_ingress_native_responses_stream_passthrough() {
         "native SSE event type sequence must match upstream"
     );
 }
+
+// ── M8 stateful: native previous_response_id / store passthrough ──
+
+#[tokio::test]
+async fn native_previous_response_id_and_store_passthrough() {
+    let responses_resp = r#"{
+        "id": "resp_stateful_1",
+        "object": "response",
+        "created_at": 1700000000,
+        "status": "completed",
+        "model": "real-model",
+        "previous_response_id": "resp_abc",
+        "store": true,
+        "output": [
+            {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+             "content": [{"type": "output_text", "text": "chained", "annotations": []}]}
+        ],
+        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    }"#;
+    let expected = responses_resp.to_string();
+    let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
+        let expected = expected.clone();
+        async move {
+            respond_json(&mut stream, &expected).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "resp-key", Upstream::ResponsesNative).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{
+        "model": "route-model",
+        "previous_response_id": "resp_abc",
+        "store": true,
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}]
+    }"#;
+    let resp = app
+        .oneshot(responses_request(body, "resp-key"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "native + previous_response_id must pass"
+    );
+    let json = body_json(resp).await;
+    assert_eq!(json["object"], "response");
+    assert_eq!(json["output"][0]["content"][0]["text"], "chained");
+
+    // Upstream body must carry previous_response_id / store.
+    let req = req_rx.await.expect("request bytes");
+    let req_text = String::from_utf8_lossy(&req);
+    let req_body = req_text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or(&req_text);
+    assert!(
+        req_body.contains("previous_response_id"),
+        "native body must carry previous_response_id: {req_body}"
+    );
+    assert!(
+        req_body.contains("\"resp_abc\""),
+        "native body must carry resp_abc: {req_body}"
+    );
+    assert!(
+        req_body.contains("\"store\":true") || req_body.contains("\"store\": true"),
+        "native body must carry store=true: {req_body}"
+    );
+}
+
+#[tokio::test]
+async fn translated_rejects_previous_response_id_even_with_store_false() {
+    // Chat-only (translated) route: previous_response_id → 422.
+    // (build_state Upstream::Chat has no explicit Responses target.)
+    let state = build_state("http://127.0.0.1:1", "resp-key", Upstream::Chat).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(
+            r#"{"model":"route-model","previous_response_id":"resp_x","store":false,"input":"hi"}"#,
+            "resp-key",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("previous_response_id") && msg.contains("not supported"),
+        "translated-only route must 422 stateful: {msg}"
+    );
+}
+
+/// Mixed route: one explicit Responses target + one Chat-translated target.
+/// S1 option A: stateful fields must still 422 — only an **all-native**
+/// route may Allow, otherwise a fallback to the translated target would
+/// silently drop `previous_response_id` into Chat `extra`.
+async fn build_mixed_state(base_url: &str, key: &str) -> AppState {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-native".to_string(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenAI,
+            api_keys: vec!["sk-test".into()],
+            key_strategy: KeyStrategy::FillFirst,
+            base_url: base_url.to_string(),
+            proxy_mode: ProxyMode::default(),
+            models_endpoint: "models".into(),
+            timeout_secs: 10,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
+            model_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
+            enabled_models: vec![],
+            enabled: true,
+            anthropic_cache_control: false,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+            upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
+        },
+    );
+    providers.insert(
+        "openai-chat".to_string(),
+        ProviderConfig {
+            provider_type: ProviderType::OpenAI,
+            api_keys: vec!["sk-test".into()],
+            key_strategy: KeyStrategy::FillFirst,
+            base_url: base_url.to_string(),
+            proxy_mode: ProxyMode::default(),
+            models_endpoint: "models".into(),
+            timeout_secs: 10,
+            headers: HashMap::new(),
+            body_overrides: HashMap::new(),
+            strip_fields: vec![],
+            model_strip_fields: HashMap::new(),
+            model_overrides: HashMap::new(),
+            role_mappings: HashMap::new(),
+            enabled_models: vec![],
+            enabled: true,
+            anthropic_cache_control: false,
+            chunk_timeout_secs: None,
+            ttfb_timeout_secs: None,
+            upstream_protocol: None,
+        },
+    );
+    let config = GatewayConfig {
+        gateway_auth: Some(GatewayAuthConfig {
+            api_keys: vec![key.to_string()],
+        }),
+        providers,
+        routes: vec![RouteConfig {
+            model_name: "route-model".into(),
+            api_endpoint: "/responses".into(),
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::FillFirst,
+            targets: vec![
+                RouteTarget {
+                    extra: HashMap::new(),
+                    retries: None,
+                    timeout_secs: None,
+                    provider: "openai-native".into(),
+                    real_model: Some("real-model".into()),
+                    priority: 1,
+                    upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
+                    capabilities: None,
+                },
+                RouteTarget {
+                    extra: HashMap::new(),
+                    retries: None,
+                    timeout_secs: None,
+                    provider: "openai-chat".into(),
+                    real_model: Some("real-model".into()),
+                    priority: 2,
+                    // Explicit Chat — translated lane, no native passthrough.
+                    upstream_protocol: Some(sag_core::UpstreamProtocol::ChatCompletions),
+                    capabilities: None,
+                },
+            ],
+        }],
+        ..sag_config::gateway_config_base!()
+    };
+    let handle = ConfigHandle::from_config(config);
+    let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+    let cfg_read = handle.read().await;
+    for (pname, pc) in cfg_read.providers.iter() {
+        let provider: Arc<dyn sag_providers::LlmProvider> = match pc.provider_type {
+            ProviderType::OpenAI => {
+                Arc::new(sag_providers::OpenAiProvider::new(pname.clone(), pc).unwrap())
+            }
+            ProviderType::Anthropic => {
+                Arc::new(sag_providers::AnthropicProvider::new(pname.clone(), pc).unwrap())
+            }
+        };
+        registry.insert(pname.clone(), provider);
+    }
+    drop(cfg_read);
+    test_app_state(handle, Arc::new(tokio::sync::RwLock::new(registry))).await
+}
+
+#[tokio::test]
+async fn mixed_route_rejects_previous_response_id_422() {
+    // S1 / S4: mixed (native Responses + Chat translated) route must
+    // 422 stateful fields — never Allow then silently drop them on a
+    // translated fallback.
+    let state = build_mixed_state("http://127.0.0.1:1", "resp-key").await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(
+            r#"{"model":"route-model","previous_response_id":"resp_mixed","store":true,"input":"hi"}"#,
+            "resp-key",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "mixed route must reject stateful (S1 option A)"
+    );
+    let json = body_json(resp).await;
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("previous_response_id") && msg.contains("not supported"),
+        "mixed route must 422 with previous_response_id message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn background_still_422_even_with_native_target() {
+    // background is globally rejected regardless of native capability.
+    let state = build_state("http://127.0.0.1:1", "resp-key", Upstream::ResponsesNative).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(
+            r#"{"model":"route-model","background":true,"input":"hi"}"#,
+            "resp-key",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("background"), "must name background: {msg}");
+}
