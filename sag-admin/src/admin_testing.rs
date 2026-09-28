@@ -233,7 +233,7 @@ async fn test_single_key(
 
     let body = serde_json::json!({
         "model": req.model,
-        "messages": [{"role": "user", "content": "say 'hi'"}],
+        "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 1
     });
 
