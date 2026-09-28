@@ -75,13 +75,17 @@ api_keys = [
 
 # ============================================================
 # LLM Provider configurations
+# Provider = credentials + a catalog of protocol APIs ([providers.<name>.apis.<key>]).
+# There is NO provider-level base_url — the address lives in each apis section.
 # ============================================================
 
 [providers.openai]
 api_keys = ["sk-your-openai-api-key"]
-base_url = "https://api.openai.com/v1"
 timeout_secs = 120
-# 角色映射：将不支持的角色映射为兼容角色
+# Fallback protocol (encoding target on the translated path). Optional when
+# `apis` declares exactly one protocol key; REQUIRED when it declares several.
+fallback = "chat_completions"
+# 角色映射：将不支持的角色映射为兼容角色（provider 级缺省；apis.<key> 可整段覆盖）
 # role_mappings = { "developer" = "system" }
 # Per-provider proxy mode (default: "inherit" — use the top-level proxy_url):
 #   "inherit"  — use top-level proxy_url if set, else direct
@@ -89,17 +93,36 @@ timeout_secs = 120
 #   "disabled" — force direct connection, ignoring any top-level proxy
 # proxy_mode = "inherit"
 
+# The protocol set = the protocol keys of `apis` (image is a non-protocol
+# entry). lane is derived automatically: ingress ∈ protocol keys → Native,
+# otherwise Translated through `fallback`.
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1"
+
+# Same-origin multi-protocol: each section carries its own base_url.
+# Remove this section if you only need chat_completions (then `fallback`
+# above becomes optional).
+[providers.openai.apis.responses]
+base_url = "https://api.openai.com/v1"
+# Relative to this section's base_url; used only by admin fetch-models.
+models_endpoint = "/models"
+
 [providers.anthropic]
 api_keys = ["sk-ant-your-anthropic-api-key"]
-base_url = "https://api.anthropic.com/v1"
 timeout_secs = 120
 # 角色映射：将不支持的角色映射为兼容角色
 # role_mappings = { "developer" = "system" }
-# Optional explicit upstream wire protocol (M7). Omitted → derived from
-# provider_type (anthropic → "anthropic_messages", openai → "chat_completions").
-# Legal combos: anthropic accepts only "anthropic_messages"; openai accepts
-# "chat_completions" or "responses". An illegal combo fails config validation.
-# upstream_protocol = "anthropic_messages"
+
+# Single protocol key → no `fallback` needed; /v1/messages ingress is
+# Native, other ingresses translate down to anthropic_messages.
+[providers.anthropic.apis.anthropic_messages]
+base_url = "https://api.anthropic.com/v1"
+models_endpoint = "/models"
+
+# Image is a non-protocol catalog entry (never part of lane matching).
+# The upstream URL = this base_url + the route's api_endpoint.
+# [providers.my-image.apis.image]
+# base_url = "https://api.openai.com/v1"
 
 # Custom headers override or add to the default request headers.
 # [providers.my-custom.headers]
@@ -133,17 +156,22 @@ targets = [
 # Use it for route-level tweaks; for model-level defaults prefer model_overrides.
 # Example: { provider = "openai", extra = { temperature = 0.7, max_tokens = 4096 } }
 #
-# M7 per-target protocol / capability overrides (all optional):
-#   upstream_protocol — force a wire protocol for this target only
-#                       (overrides the provider-level declaration).
-#   capabilities      — fixed-key capability override. Allowed keys:
-#                       streaming, reasoning, tools, images, documents,
-#                       stateful, hosted_tools, background. Unknown keys
-#                       fail config validation (admin API → 400).
+# Per-target capability overrides (optional):
+#   capabilities — fixed-key capability override. Allowed keys:
+#                  streaming, reasoning, tools, images, documents,
+#                  stateful, hosted_tools, background. Unknown keys
+#                  fail config validation (admin API → 400).
 # Example:
 #   { provider = "openai", real_model = "gpt-4o", priority = 10,
-#     upstream_protocol = "responses",
 #     capabilities = { streaming = true, tools = false } }
+#
+# Image routes are a different species — they must declare the pipeline and
+# carry the real upstream path (appended to the provider's apis.image base_url):
+# [[routes]]
+# model_name = "gpt-image-2"
+# pipeline = "image"
+# api_endpoint = "/images/generations"
+# targets = [{ provider = "my-image" }]
 
 [[routes]]
 model_name = "gpt-4o-mini"

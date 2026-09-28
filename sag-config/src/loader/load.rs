@@ -132,9 +132,10 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ConfigHandle, sag_core::App
         sag_core::AppError::Config(format!("failed to read config {}: {e}", path.display()))
     })?;
 
-    let config: GatewayConfig = deserialize_config(&content)
+    let mut config: GatewayConfig = deserialize_config(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
+    config.normalize();
     config
         .validate()
         .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
@@ -153,9 +154,10 @@ pub async fn reload_config(path: &std::path::Path) -> Result<GatewayConfig, sag_
         sag_core::AppError::Config(format!("failed to read config for reload: {e}"))
     })?;
 
-    let config: GatewayConfig = deserialize_config(&content)
+    let mut config: GatewayConfig = deserialize_config(&content)
         .map_err(|e| sag_core::AppError::Config(format!("failed to parse config: {e}")))?;
 
+    config.normalize();
     config
         .validate()
         .map_err(|errors| sag_core::AppError::Config(errors.join("; ")))?;
@@ -190,7 +192,29 @@ api_keys = ["test-key"]
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#
+    }
+
+    /// 加载时归一化：apis.*.base_url 尾部 `/` 被剥去（避免拼出 `//path`）。
+    #[test]
+    fn load_config_strips_trailing_slash_from_api_base_urls() {
+        let path = temp_toml(
+            r#"[server]
+host = "127.0.0.1"
+
+[providers.openai]
+api_keys = ["sk-test"]
+
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1/"
+"#,
+        );
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap();
+        let api = &config.providers["openai"].apis[&sag_core::ApiKind::ChatCompletions];
+        assert_eq!(api.base_url, "https://api.openai.com/v1");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -535,6 +559,7 @@ api_keys = ["test-key"]
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 max_tokens = 4096
 "#,
         );
@@ -616,6 +641,7 @@ bind = "0.0.0.0"
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 max_tokens = 4096
 "#;
         deserialize_config::<GatewayConfig>(content).expect("parse should succeed");
@@ -630,6 +656,7 @@ bind = "0.0.0.0"
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 max_tokens = 4096
 "#,
         );
@@ -664,6 +691,7 @@ bind = "0.0.0.0"
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 max_tokens = 4096
 "#,
         );

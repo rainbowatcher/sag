@@ -6,12 +6,12 @@ import { toast } from "vue-sonner"
 import { z } from "zod"
 import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
-import { Field, FieldLabel } from "@/components/ui/field"
+import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
-import type { Provider, Strategy, CreateRoutePayload, TargetItem } from "@/types/api"
+import type { Provider, Strategy, Pipeline, CreateRoutePayload, TargetItem } from "@/types/api"
 
 const props = defineProps<{
   providers: Provider[]
@@ -37,26 +37,26 @@ const targets = ref<TargetItem[]>([
     priority: 0,
     retries: 0,
     extra: "",
-    upstream_protocol: "",
   },
 ])
 
-const endpointPresets = [
-  { label: "Chat Completions", value: "/chat/completions" },
-  { label: "Responses (GPT-5)", value: "/responses" },
-  { label: "Image Generation", value: "/images/generations" },
-]
-
-const formSchema = z.object({
-  model_name: z.string(),
-  api_endpoint: z.string().min(1),
-  strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
-})
+const formSchema = z
+  .object({
+    model_name: z.string(),
+    pipeline: z.enum(["chat", "image"]),
+    api_endpoint: z.string(),
+    strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
+  })
+  .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
+    message: "API endpoint is required for image pipeline",
+    path: ["api_endpoint"],
+  })
 
 const form = useForm({
   defaultValues: {
     model_name: "",
-    api_endpoint: "/chat/completions",
+    pipeline: "chat" as Pipeline,
+    api_endpoint: "",
     strategy: "sticky_failover" as Strategy,
   },
   validators: {
@@ -83,7 +83,8 @@ const form = useForm({
 
       const payload: CreateRoutePayload = {
         model_name: routeName,
-        api_endpoint: value.api_endpoint,
+        pipeline: value.pipeline,
+        ...(value.pipeline === "image" ? { api_endpoint: value.api_endpoint.trim() } : {}),
         strategy: value.strategy,
         targets: targets.value.map((t) => {
           const entry: CreateRoutePayload["targets"][number] = {
@@ -100,9 +101,6 @@ const form = useForm({
               )
             }
             entry.extra = JSON.parse(t.extra)
-          }
-          if (t.upstream_protocol) {
-            entry.upstream_protocol = t.upstream_protocol
           }
           return entry
         }),
@@ -176,25 +174,46 @@ async function handleSubmit(event: Event) {
             </Field>
           </form.Field>
 
-          <div class="col-span-2">
-            <form.Field name="api_endpoint" #default="{ field }">
-              <Field>
-                <FieldLabel :for="field.name">API Endpoint</FieldLabel>
-                <ToggleGroup
-                  :model-value="field.state.value ?? '/chat/completions'"
-                  @update:model-value="(v) => field.handleChange(v as string)"
-                  type="single"
-                  variant="outline"
-                  size="sm"
-                  class="justify-start"
-                >
-                  <ToggleGroupItem v-for="ep in endpointPresets" :key="ep.value" :value="ep.value">
-                    {{ ep.label }}
-                  </ToggleGroupItem>
-                </ToggleGroup>
-              </Field>
-            </form.Field>
-          </div>
+          <form.Field name="pipeline" #default="{ field }">
+            <Field>
+              <FieldLabel :for="field.name">Pipeline</FieldLabel>
+              <ToggleGroup
+                :model-value="field.state.value ?? 'chat'"
+                @update:model-value="(v) => field.handleChange(v as Pipeline)"
+                type="single"
+                variant="outline"
+                size="sm"
+                class="justify-start"
+              >
+                <ToggleGroupItem value="chat">Chat</ToggleGroupItem>
+                <ToggleGroupItem value="image">Image</ToggleGroupItem>
+              </ToggleGroup>
+              <p class="text-muted-foreground text-[10px]">
+                Image routes send to the provider's image section with a per-route path.
+              </p>
+            </Field>
+          </form.Field>
+
+          <form.Field name="api_endpoint" #default="{ field }">
+            <Field v-if="form.state.values.pipeline === 'image'">
+              <FieldLabel :for="field.name">API Endpoint *</FieldLabel>
+              <Input
+                :id="field.name"
+                :model-value="field.state.value"
+                placeholder="/images/generations"
+                class="font-mono text-sm"
+                :aria-invalid="field.state.meta.errors.length > 0"
+                @blur="field.handleBlur"
+                @input="field.handleChange(($event.target as HTMLInputElement).value)"
+              />
+              <p class="text-muted-foreground text-[10px]">
+                Appended to the target provider's
+                <code>image</code> section base_url, e.g. <code>/images/generations</code> or
+                <code>/v1beta/models/{model}:generateContent</code>
+              </p>
+              <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
+            </Field>
+          </form.Field>
         </div>
 
         <TargetEditor

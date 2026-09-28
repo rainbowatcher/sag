@@ -2,48 +2,73 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reqwest::RequestBuilder;
-use sag_config::{KeyStrategy, ProviderConfig};
-use sag_core::{AppError, ChatMessage};
+use sag_config::{ApiConfig, KeyStrategy, ProviderConfig};
+use sag_core::{ApiKind, AppError, ChatMessage, protocol_path};
 use tracing::{debug, trace, warn};
 
-use crate::{apply_body_overrides, apply_body_strip, apply_headers};
+use crate::{apply_body_overrides, apply_body_strip, apply_headers, provider_auth_headers};
+
+/// Join an API base URL and a path with exactly one `/` between them,
+/// regardless of leading/trailing slashes on either side.
+fn join_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    format!("{}/{}", base, path)
+}
 
 /// Shared state and helper methods for all provider adapters.
 ///
-/// Each provider struct (e.g. `OpenAiProvider`, `AnthropicProvider`)
-/// composes this as a field and delegates common operations to it.
+/// Each provider struct (e.g. `OpenAiProvider`, `AnthropicProvider`,
+/// `CatalogProvider`) composes this as a field and delegates common
+/// operations to it.
+///
+/// Per-protocol addresses live in `apis` (`ApiKind` → [`ApiConfig`]).
+/// Protocol-related settings resolve through the `effective_*` helpers:
+/// an `apis.<key>` field declared (`Some`) replaces the provider-level
+/// default wholesale; `None` inherits it.
 pub struct ProviderBase {
     /// Human-readable provider name (e.g. `"openai"`, `"anthropic"`).
     pub name: String,
     api_keys: Vec<String>,
     key_strategy: KeyStrategy,
     key_counter: AtomicUsize,
-    /// The upstream base URL (without trailing slash).
-    base_url: String,
+    /// Per-protocol API nodes (address + optional protocol-level overrides).
+    apis: HashMap<ApiKind, ApiConfig>,
     /// Reusable HTTP client with **no** total request deadline. A healthy
     /// streaming request can outlive `config.timeout_secs`, so the client
     /// must not impose one. Non-streaming requests get their deadline via
     /// `RequestBuilder::timeout` in [`ProviderBase::send_json`].
     pub http_client: reqwest::Client,
+    /// Provider-level default headers (fallback for `effective_headers`).
     headers: HashMap<String, String>,
+    /// Provider-level default body overrides (fallback for
+    /// `effective_body_overrides`).
     body_overrides: HashMap<String, serde_json::Value>,
-    /// Top-level fields to strip from the upstream body before sending.
+    /// Top-level fields to strip from the upstream body before sending
+    /// (provider-level default; `apis.<key>.strip_fields` replaces it).
     /// Applied after all override layers, guaranteeing absence in the
     /// final body.
     strip_fields: Vec<String>,
-    /// Per-model strip fields keyed by real_model name.
+    /// Per-model strip fields keyed by real_model name (provider-level
+    /// default; `apis.<key>.model_strip_fields` replaces it).
     model_strip_fields: HashMap<String, Vec<String>>,
+    /// Provider-level default role mappings (fallback for
+    /// `effective_role_mappings`).
     role_mappings: HashMap<String, String>,
-    /// Whether to inject `cache_control` breakpoints for Anthropic providers.
-    pub anthropic_cache_control: bool,
-    /// Maximum idle time between stream chunks before the connection is
-    /// terminated. `None` = wait indefinitely.
+    /// Provider-level default for Anthropic cache_control injection
+    /// (`apis.anthropic_cache_control` overrides it).
+    anthropic_cache_control: bool,
+    /// Provider-level default: maximum idle time between stream chunks
+    /// before the connection is terminated. `None` = wait indefinitely.
     chunk_timeout_secs: Option<u64>,
-    /// Maximum time to wait for the upstream response headers
-    /// (time-to-first-byte) on streaming requests. `None` = use the
-    /// crate default. Only used by the streaming path; once headers
-    /// arrive this no longer applies.
+    /// Provider-level default: maximum time to wait for the upstream
+    /// response headers (time-to-first-byte) on streaming requests.
+    /// `None` = use the crate default. Only used by the streaming path;
+    /// once headers arrive this no longer applies.
     ttfb_timeout_secs: Option<u64>,
+    /// Fallback protocol (translated-lane encoding target), when the
+    /// provider declares multiple protocol keys.
+    fallback: Option<ApiKind>,
 }
 
 impl ProviderBase {
@@ -91,10 +116,10 @@ impl ProviderBase {
 
         Ok(Self {
             name,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
             api_keys,
             key_strategy: config.key_strategy,
             key_counter: AtomicUsize::new(0),
+            apis: config.apis.iter().map(|(k, v)| (*k, v.clone())).collect(),
             http_client,
             headers: config.headers.clone(),
             body_overrides: config.body_overrides.clone(),
@@ -104,6 +129,7 @@ impl ProviderBase {
             anthropic_cache_control: config.anthropic_cache_control,
             chunk_timeout_secs: config.chunk_timeout_secs,
             ttfb_timeout_secs: config.ttfb_timeout_secs,
+            fallback: config.fallback,
         })
     }
 
@@ -118,58 +144,190 @@ impl ProviderBase {
         }
     }
 
-    /// Build the full upstream URL from base URL and an API endpoint path.
-    ///
-    /// Ensures exactly one `/` between base and path, regardless of
-    /// whether either has a leading/trailing slash.
-    pub(crate) fn build_url(&self, api_endpoint: &str) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        let path = api_endpoint.trim_start_matches('/');
-        format!("{}/{}", base, path)
+    /// The configured fallback protocol (translated-lane encoding target).
+    pub fn fallback(&self) -> Option<ApiKind> {
+        self.fallback
     }
 
-    /// Return the configured stream-chunk idle timeout, if any.
-    pub fn chunk_timeout_secs(&self) -> Option<u64> {
-        self.chunk_timeout_secs
+    /// Whether the provider declares an API node for `kind`.
+    pub fn supports(&self, kind: ApiKind) -> bool {
+        self.apis.contains_key(&kind)
+    }
+
+    /// The raw API node for `kind`, if configured.
+    fn api(&self, kind: ApiKind) -> Option<&ApiConfig> {
+        self.apis.get(&kind)
+    }
+
+    // ── effective (per-API) configuration resolution ─────────────────
+    //
+    // `apis.<key>.<field> = Some(v)` replaces the provider-level default
+    // wholesale; `None` inherits it.
+
+    /// Effective headers for `kind` (per-API map replaces provider map).
+    pub fn effective_headers(&self, kind: ApiKind) -> HashMap<String, String> {
+        match self.api(kind).and_then(|a| a.headers.as_ref()) {
+            Some(h) => h.clone(),
+            None => self.headers.clone(),
+        }
+    }
+
+    /// Effective body overrides for `kind`.
+    pub fn effective_body_overrides(&self, kind: ApiKind) -> HashMap<String, serde_json::Value> {
+        match self.api(kind).and_then(|a| a.body_overrides.as_ref()) {
+            Some(b) => b.clone(),
+            None => self.body_overrides.clone(),
+        }
+    }
+
+    /// Effective non-streaming timeout for `kind`.
+    ///
+    /// `caller` is the timeout resolved by the caller's chain (target →
+    /// route → provider-level `timeout_secs`). A per-API `timeout_secs`
+    /// declaration replaces it wholesale.
+    pub fn effective_timeout(&self, kind: ApiKind, caller: u64) -> u64 {
+        self.api(kind)
+            .and_then(|a| a.timeout_secs)
+            .unwrap_or(caller)
+    }
+
+    /// Effective strip fields for `kind` (provider-level default unless
+    /// the API node replaces them).
+    pub fn effective_strip_fields(&self, kind: ApiKind) -> &[String] {
+        match self.api(kind).and_then(|a| a.strip_fields.as_ref()) {
+            Some(s) => s.as_slice(),
+            None => &self.strip_fields,
+        }
+    }
+
+    /// Effective per-model strip fields for `kind`.
+    pub fn effective_model_strip_fields(&self, kind: ApiKind) -> &HashMap<String, Vec<String>> {
+        match self.api(kind).and_then(|a| a.model_strip_fields.as_ref()) {
+            Some(m) => m,
+            None => &self.model_strip_fields,
+        }
+    }
+
+    /// Effective role mappings for `kind`.
+    pub fn effective_role_mappings(&self, kind: ApiKind) -> &HashMap<String, String> {
+        match self.api(kind).and_then(|a| a.role_mappings.as_ref()) {
+            Some(m) => m,
+            None => &self.role_mappings,
+        }
+    }
+
+    /// Effective Anthropic cache_control flag for `kind`.
+    pub fn effective_anthropic_cache_control(&self, kind: ApiKind) -> bool {
+        self.api(kind)
+            .and_then(|a| a.anthropic_cache_control)
+            .unwrap_or(self.anthropic_cache_control)
+    }
+
+    // ── URL resolution ───────────────────────────────────────────────
+
+    /// The base URL configured for `kind` (trailing `/` trimmed at load
+    /// time; trimmed again here for defensively constructed configs).
+    pub fn api_base_url(&self, kind: ApiKind) -> sag_core::Result<&str> {
+        self.api(kind)
+            .map(|a| a.base_url.trim_end_matches('/'))
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "provider '{}': apis.{} is not configured",
+                    self.name,
+                    kind.as_str()
+                ))
+            })
+    }
+
+    /// Full upstream URL for a protocol key: `apis.<kind>.base_url` +
+    /// the fixed protocol path (`sag_core::protocol_path`).
+    pub fn protocol_url(&self, kind: ApiKind) -> sag_core::Result<String> {
+        let path = protocol_path(kind).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "provider '{}': api kind '{}' has no fixed protocol path \
+                 (use image_url for image requests)",
+                self.name,
+                kind.as_str()
+            ))
+        })?;
+        Ok(join_url(self.api_base_url(kind)?, path))
+    }
+
+    /// Full upstream URL for an image generation request:
+    /// `apis.image.base_url` + `api_endpoint` (the route-declared path).
+    /// Falls back to `apis.chat_completions.base_url` when no `image`
+    /// node is declared (single-base configuration compatibility).
+    pub fn image_url(&self, api_endpoint: &str) -> sag_core::Result<String> {
+        let base = self
+            .api(ApiKind::Image)
+            .or_else(|| self.api(ApiKind::ChatCompletions))
+            .map(|a| a.base_url.trim_end_matches('/'))
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "provider '{}': image generation requires apis.image \
+                     (or apis.chat_completions) base_url",
+                    self.name
+                ))
+            })?;
+        Ok(join_url(base, api_endpoint))
+    }
+
+    // ── stream timeout accessors (per-API) ──────────────────────────
+
+    /// Return the configured stream-chunk idle timeout for `kind`, if any.
+    pub fn chunk_timeout_secs(&self, kind: ApiKind) -> Option<u64> {
+        self.api(kind)
+            .and_then(|a| a.chunk_timeout_secs)
+            .or(self.chunk_timeout_secs)
     }
 
     /// Return the effective time-to-first-byte timeout for streaming
-    /// requests, falling back to the crate default when unset.
-    pub fn ttfb_timeout_secs(&self) -> u64 {
-        self.ttfb_timeout_secs
+    /// requests to `kind`, falling back to the crate default when unset.
+    pub fn ttfb_timeout_secs(&self, kind: ApiKind) -> u64 {
+        self.api(kind)
+            .and_then(|a| a.ttfb_timeout_secs)
+            .or(self.ttfb_timeout_secs)
             .unwrap_or_else(sag_config::default_ttfb_timeout_secs)
     }
 
-    /// Build a reqwest POST request with default + custom headers and body
-    /// overrides applied.
+    /// Build a reqwest POST request for `kind` with per-kind auth,
+    /// effective headers, and effective body overrides applied.
     ///
     /// `Content-Type: application/json` is set automatically.
-    /// `extra_headers` are applied first, then `self.headers`, then
-    /// `self.body_overrides`, then `target_extra`.
+    /// Per-kind auth headers are applied first, then
+    /// `effective_headers(kind)` (so configured headers can override auth),
+    /// then `effective_body_overrides(kind)`, then `target_extra`.
     pub(crate) fn build_request(
         &self,
         url: &str,
+        kind: ApiKind,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
-        extra_headers: &[(&str, &str)],
     ) -> RequestBuilder {
         let req = self.http_client.post(url);
-        let req = apply_headers(req, extra_headers, &self.headers);
-        let body = apply_body_overrides(body, &self.body_overrides);
+        let auth = provider_auth_headers(kind, self.current_key());
+        let auth_refs: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let headers = self.effective_headers(kind);
+        let req = apply_headers(req, &auth_refs, &headers);
+        let body_overrides = self.effective_body_overrides(kind);
+        let body = apply_body_overrides(body, &body_overrides);
         let body = apply_body_overrides(body, target_extra);
 
-        // Union provider-level and model-level strip_fields (if real_model matches).
+        // Union effective (per-API or provider-level) strip_fields and
+        // model-level strip_fields (if real_model matches).
         // Note: By contract, body["model"] has already been substituted to real_model by the caller.
+        let provider_strip = self.effective_strip_fields(kind);
+        let model_strip = self.effective_model_strip_fields(kind);
         let effective_strip = if let Some(model_name) = body.get("model").and_then(|v| v.as_str()) {
-            if let Some(model_strips) = self.model_strip_fields.get(model_name) {
-                let mut combined = self.strip_fields.clone();
+            if let Some(model_strips) = model_strip.get(model_name) {
+                let mut combined = provider_strip.to_vec();
                 combined.extend(model_strips.clone());
                 combined
             } else {
-                self.strip_fields.clone()
+                provider_strip.to_vec()
             }
         } else {
-            self.strip_fields.clone()
+            provider_strip.to_vec()
         };
 
         let body = apply_body_strip(body, &effective_strip);
@@ -202,7 +360,8 @@ impl ProviderBase {
         Ok(body_text)
     }
 
-    /// Send a JSON POST request and return the response body text on success.
+    /// Send a JSON POST request for `kind` and return the response body
+    /// text on success.
     ///
     /// Combines `build_request` + `send` + `check_upstream_error`. Used by
     /// `chat()` and `chat_image()`.
@@ -214,12 +373,12 @@ impl ProviderBase {
     pub async fn send_json(
         &self,
         url: &str,
+        kind: ApiKind,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
-        extra_headers: &[(&str, &str)],
         timeout_secs: Option<u64>,
     ) -> sag_core::Result<String> {
-        let mut request = self.build_request(url, body, target_extra, extra_headers);
+        let mut request = self.build_request(url, kind, body, target_extra);
         if let Some(secs) = timeout_secs {
             request = request.timeout(std::time::Duration::from_secs(secs));
         }
@@ -229,7 +388,8 @@ impl ProviderBase {
         Ok(body_text)
     }
 
-    /// Send a JSON POST request for streaming and return the `Response`.
+    /// Send a JSON POST request for `kind` (streaming) and return the
+    /// `Response`.
     ///
     /// Combines `build_request` + `send` + `ensure_success`. Used by
     /// `chat_stream()`.
@@ -253,12 +413,12 @@ impl ProviderBase {
     pub async fn send_json_stream(
         &self,
         url: &str,
+        kind: ApiKind,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
-        extra_headers: &[(&str, &str)],
     ) -> sag_core::Result<reqwest::Response> {
-        let request = self.build_request(url, body, target_extra, extra_headers);
-        let ttfb = std::time::Duration::from_secs(self.ttfb_timeout_secs());
+        let request = self.build_request(url, kind, body, target_extra);
+        let ttfb = std::time::Duration::from_secs(self.ttfb_timeout_secs(kind));
         let response = match tokio::time::timeout(ttfb, request.send()).await {
             Ok(result) => result.map_err(AppError::from)?,
             Err(_elapsed) => {
@@ -272,7 +432,7 @@ impl ProviderBase {
                 });
             }
         };
-        let response = self.ensure_success(response).await?;
+        let response = self.ensure_success(response, kind).await?;
         trace!("upstream stream connection established");
         debug!(
             status = response.status().as_u16(),
@@ -296,10 +456,11 @@ impl ProviderBase {
     pub(crate) async fn ensure_success(
         &self,
         response: reqwest::Response,
+        kind: ApiKind,
     ) -> sag_core::Result<reqwest::Response> {
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let ttfb = std::time::Duration::from_secs(self.ttfb_timeout_secs());
+            let ttfb = std::time::Duration::from_secs(self.ttfb_timeout_secs(kind));
             let body = match tokio::time::timeout(ttfb, response.text()).await {
                 Ok(Ok(body)) => body,
                 Ok(Err(e)) => return Err(AppError::from(e)),
@@ -326,30 +487,32 @@ impl ProviderBase {
         Ok(response)
     }
 
-    /// Apply role mappings to a mutable slice of chat messages.
+    /// Apply role mappings for `kind` to a mutable slice of chat messages.
     ///
-    /// Messages whose role matches a key in `role_mappings` get their
-    /// role replaced with the corresponding value. Non-matching messages
-    /// are unchanged. Early-returns when role_mappings is empty.
-    /// Returns `true` if any role mappings are configured.
-    pub fn has_role_mappings(&self) -> bool {
-        !self.role_mappings.is_empty()
+    /// Messages whose role matches a key in the effective `role_mappings`
+    /// get their role replaced with the corresponding value. Non-matching
+    /// messages are unchanged. Early-returns when the effective mappings
+    /// are empty.
+    pub fn has_role_mappings(&self, kind: ApiKind) -> bool {
+        !self.effective_role_mappings(kind).is_empty()
     }
 
-    pub fn apply_role_mappings(&self, messages: &mut [ChatMessage]) {
-        if self.role_mappings.is_empty() {
+    pub fn apply_role_mappings(&self, kind: ApiKind, messages: &mut [ChatMessage]) {
+        let role_mappings = self.effective_role_mappings(kind);
+        if role_mappings.is_empty() {
             return;
         }
         for msg in messages.iter_mut() {
-            if let Some(new_role) = self.role_mappings.get(&msg.role) {
+            if let Some(new_role) = role_mappings.get(&msg.role) {
                 msg.role = new_role.clone();
             }
         }
     }
 
-    /// Look up a single role mapping (native body path, B5).
-    pub fn role_mapping_for(&self, role: &str) -> Option<&String> {
-        self.role_mappings.get(role)
+    /// Look up a single effective role mapping for `kind` (native body
+    /// path, B5).
+    pub fn role_mapping_for(&self, kind: ApiKind, role: &str) -> Option<&String> {
+        self.effective_role_mappings(kind).get(role)
     }
 }
 
@@ -418,27 +581,8 @@ mod tests {
     use crate::test_support::spawn_server;
 
     fn make_base(role_mappings: HashMap<String, String>) -> ProviderBase {
-        let config = ProviderConfig {
-            api_keys: vec!["sk-test".into()],
-            provider_type: sag_config::ProviderType::OpenAI,
-            key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://example.com".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 30,
-            proxy_mode: sag_config::ProxyMode::default(),
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            enabled: true,
-            enabled_models: Vec::new(),
-            role_mappings,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        };
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.role_mappings = role_mappings;
         ProviderBase::new("test".into(), &config).unwrap()
     }
 
@@ -476,27 +620,8 @@ mod tests {
     fn make_base_with_body_overrides(
         body_overrides: HashMap<String, serde_json::Value>,
     ) -> ProviderBase {
-        let config = ProviderConfig {
-            api_keys: vec!["sk-test".into()],
-            provider_type: sag_config::ProviderType::OpenAI,
-            key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://example.com".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 30,
-            proxy_mode: sag_config::ProxyMode::default(),
-            headers: HashMap::new(),
-            body_overrides,
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            enabled: true,
-            enabled_models: Vec::new(),
-            role_mappings: HashMap::new(),
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        };
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.body_overrides = body_overrides;
         ProviderBase::new("test".into(), &config).unwrap()
     }
 
@@ -508,9 +633,9 @@ mod tests {
     #[test]
     fn ttfb_timeout_secs_falls_back_to_default() {
         let base = make_base_with("https://example.com".into(), None);
-        assert_eq!(base.ttfb_timeout_secs(), 60);
+        assert_eq!(base.ttfb_timeout_secs(ApiKind::ChatCompletions), 60);
         let base = make_base_with("https://example.com".into(), Some(5));
-        assert_eq!(base.ttfb_timeout_secs(), 5);
+        assert_eq!(base.ttfb_timeout_secs(ApiKind::ChatCompletions), 5);
     }
 
     #[tokio::test]
@@ -524,10 +649,15 @@ mod tests {
         .await;
 
         let base = make_base_with(base_url.clone(), Some(1));
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let start = std::time::Instant::now();
         let result = base
-            .send_json_stream(&url, serde_json::json!({}), &HashMap::new(), &[])
+            .send_json_stream(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+            )
             .await;
         let elapsed = start.elapsed();
 
@@ -566,9 +696,14 @@ mod tests {
 
         // TTFB budget (1s) is shorter than the total body duration (~1.2s).
         let base = make_base_with(base_url.clone(), Some(1));
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let response = base
-            .send_json_stream(&url, serde_json::json!({}), &HashMap::new(), &[])
+            .send_json_stream(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+            )
             .await
             .expect("headers arrived within TTFB budget");
 
@@ -607,10 +742,15 @@ mod tests {
         .await;
 
         let base = make_base_with_timeouts(base_url.clone(), 1, Some(1), None);
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let start = std::time::Instant::now();
         let response = base
-            .send_json_stream(&url, serde_json::json!({}), &HashMap::new(), &[])
+            .send_json_stream(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+            )
             .await
             .expect("headers should arrive within the TTFB budget");
 
@@ -658,10 +798,16 @@ mod tests {
         .await;
 
         let base = make_base_with_timeouts(base_url.clone(), 30, None, None);
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let start = std::time::Instant::now();
         let result = base
-            .send_json(&url, serde_json::json!({}), &HashMap::new(), &[], Some(1))
+            .send_json(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+                Some(1),
+            )
             .await;
         let elapsed = start.elapsed();
 
@@ -699,10 +845,15 @@ mod tests {
         .await;
 
         let base = make_base_with_timeouts(base_url.clone(), 30, Some(1), None);
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let start = std::time::Instant::now();
         let result = base
-            .send_json_stream(&url, serde_json::json!({}), &HashMap::new(), &[])
+            .send_json_stream(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+            )
             .await;
         let elapsed = start.elapsed();
 
@@ -737,9 +888,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &target_extra,
-                &[],
             )
             .build()
             .unwrap();
@@ -767,9 +918,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &HashMap::new(),
-                &[],
             )
             .build()
             .unwrap();
@@ -794,9 +945,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &target_extra,
-                &[],
             )
             .build()
             .unwrap();
@@ -830,9 +981,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &target_extra,
-                &[],
             )
             .build()
             .unwrap();
@@ -860,9 +1011,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o" }),
                 &target_extra,
-                &[],
             )
             .build()
             .unwrap();
@@ -908,9 +1059,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o" }),
                 &target_extra,
-                &[],
             )
             .build()
             .unwrap();
@@ -938,9 +1089,9 @@ mod tests {
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 original.clone(),
                 &HashMap::new(),
-                &[],
             )
             .build()
             .unwrap();
@@ -962,34 +1113,16 @@ mod tests {
             serde_json::json!({ "enable_thinking": false }),
         );
 
-        let config = ProviderConfig {
-            api_keys: vec!["sk-test".into()],
-            provider_type: sag_config::ProviderType::OpenAI,
-            key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://example.com".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 30,
-            proxy_mode: sag_config::ProxyMode::default(),
-            headers: HashMap::new(),
-            body_overrides,
-            strip_fields: vec!["chat_template_kwargs".to_string()],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            enabled: true,
-            enabled_models: Vec::new(),
-            role_mappings: HashMap::new(),
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        };
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.body_overrides = body_overrides;
+        config.strip_fields = vec!["chat_template_kwargs".to_string()];
         let base = ProviderBase::new("test".into(), &config).unwrap();
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o" }),
                 &target_extra,
-                &[],
             )
             .build()
             .unwrap();
@@ -1017,33 +1150,16 @@ mod tests {
             vec!["chat_template_kwargs".to_string()],
         );
 
-        let config = ProviderConfig {
-            api_keys: vec!["sk-test".into()],
-            provider_type: sag_config::ProviderType::OpenAI,
-            key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://example.com".into(),
-            models_endpoint: "models".into(),
-            timeout_secs: 30,
-            proxy_mode: sag_config::ProxyMode::default(),
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec!["global_bad_field".to_string()],
-            model_strip_fields: model_strip,
-            model_overrides: HashMap::new(),
-            enabled: true,
-            enabled_models: Vec::new(),
-            role_mappings: HashMap::new(),
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        };
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.strip_fields = vec!["global_bad_field".to_string()];
+        config.model_strip_fields = model_strip;
         let base = ProviderBase::new("test".into(), &config).unwrap();
 
         // Request for glm-5.2 -> strips both global_bad_field and chat_template_kwargs
         let req = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({
                     "model": "glm-5.2",
                     "global_bad_field": 123,
@@ -1051,7 +1167,6 @@ mod tests {
                     "keep_me": "yes"
                 }),
                 &HashMap::new(),
-                &[],
             )
             .build()
             .unwrap();
@@ -1065,13 +1180,13 @@ mod tests {
         let req2 = base
             .build_request(
                 "https://example.com/v1/chat/completions",
+                ApiKind::ChatCompletions,
                 serde_json::json!({
                     "model": "gpt-4o",
                     "global_bad_field": 123,
                     "chat_template_kwargs": { "foo": "bar" },
                 }),
                 &HashMap::new(),
-                &[],
             )
             .build()
             .unwrap();
@@ -1085,7 +1200,7 @@ mod tests {
     fn empty_mappings_does_nothing() {
         let base = make_base(HashMap::new());
         let mut msgs = vec![msg("developer")];
-        base.apply_role_mappings(&mut msgs);
+        base.apply_role_mappings(ApiKind::ChatCompletions, &mut msgs);
         assert_eq!(msgs[0].role, "developer");
     }
 
@@ -1093,7 +1208,7 @@ mod tests {
     fn replaces_matching_role() {
         let base = make_base([("developer".into(), "system".into())].into());
         let mut msgs = vec![msg("developer")];
-        base.apply_role_mappings(&mut msgs);
+        base.apply_role_mappings(ApiKind::ChatCompletions, &mut msgs);
         assert_eq!(msgs[0].role, "system");
     }
 
@@ -1101,7 +1216,7 @@ mod tests {
     fn skips_non_matching_roles() {
         let base = make_base([("developer".into(), "system".into())].into());
         let mut msgs = vec![msg("user"), msg("assistant")];
-        base.apply_role_mappings(&mut msgs);
+        base.apply_role_mappings(ApiKind::ChatCompletions, &mut msgs);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
     }
@@ -1110,7 +1225,7 @@ mod tests {
     fn partial_map_leaves_others_unchanged() {
         let base = make_base([("developer".into(), "system".into())].into());
         let mut msgs = vec![msg("developer"), msg("user")];
-        base.apply_role_mappings(&mut msgs);
+        base.apply_role_mappings(ApiKind::ChatCompletions, &mut msgs);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
     }
@@ -1212,7 +1327,7 @@ mod tests {
         )
         .expect("direct construction succeeds");
         assert_eq!(
-            direct.build_url("chat/completions"),
+            direct.protocol_url(ApiKind::ChatCompletions).unwrap(),
             "https://example.com/chat/completions"
         );
 
@@ -1233,6 +1348,149 @@ mod tests {
         .expect("https proxy construction succeeds");
 
         let _ = (direct, http_proxy, https_proxy);
+    }
+
+    // ── per-API URL resolution ───────────────────────────────────────
+
+    #[test]
+    fn protocol_url_derives_from_apis_base_and_fixed_path() {
+        let base = make_base_with("https://example.com/v1".into(), None);
+        assert_eq!(
+            base.protocol_url(ApiKind::ChatCompletions).unwrap(),
+            "https://example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            base.protocol_url(ApiKind::Responses).unwrap(),
+            "https://example.com/v1/responses"
+        );
+        assert_eq!(
+            base.protocol_url(ApiKind::AnthropicMessages).unwrap(),
+            "https://example.com/v1/messages"
+        );
+        // Image has no fixed protocol path.
+        assert!(base.protocol_url(ApiKind::Image).is_err());
+    }
+
+    #[test]
+    fn protocol_url_missing_api_node_is_bad_request() {
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.apis.shift_remove(&ApiKind::AnthropicMessages);
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+        let err = base.protocol_url(ApiKind::AnthropicMessages).unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("apis.anthropic_messages")),
+            "expected missing-node BadRequest, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn image_url_prefers_image_node_then_chat_fallback() {
+        let mut config =
+            crate::test_support::test_config("https://chat.example.com", 30, None, None);
+        config.apis.insert(
+            ApiKind::Image,
+            sag_config::ApiConfig {
+                base_url: "https://images.example.com".into(),
+                ..Default::default()
+            },
+        );
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+        assert_eq!(
+            base.image_url("/images/generations").unwrap(),
+            "https://images.example.com/images/generations"
+        );
+
+        // No image node → chat_completions base.
+        let chat_only =
+            crate::test_support::test_config("https://chat.example.com", 30, None, None);
+        let base = ProviderBase::new("test".into(), &chat_only).unwrap();
+        assert_eq!(
+            base.image_url("/images/generations").unwrap(),
+            "https://chat.example.com/images/generations"
+        );
+    }
+
+    // ── effective (per-API override) resolution ──────────────────────
+
+    #[test]
+    fn effective_headers_api_node_replaces_provider_level() {
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.headers.insert("X-Provider".into(), "p".into());
+        config.headers.insert("X-Shared".into(), "provider".into());
+        config.apis.get_mut(&ApiKind::Responses).unwrap().headers =
+            Some(HashMap::from([("X-Shared".into(), "api".into())]));
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+
+        // Chat inherits the provider map untouched.
+        let chat_headers = base.effective_headers(ApiKind::ChatCompletions);
+        assert_eq!(chat_headers.get("X-Shared").unwrap(), "provider");
+        assert_eq!(chat_headers.get("X-Provider").unwrap(), "p");
+
+        // Responses replaces the whole map (no merge).
+        let resp_headers = base.effective_headers(ApiKind::Responses);
+        assert_eq!(resp_headers.get("X-Shared").unwrap(), "api");
+        assert!(!resp_headers.contains_key("X-Provider"));
+    }
+
+    #[test]
+    fn effective_timeout_api_override_replaces_caller_value() {
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config
+            .apis
+            .get_mut(&ApiKind::ChatCompletions)
+            .unwrap()
+            .timeout_secs = Some(7);
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+        // Declared per-API value wins over the caller-resolved chain.
+        assert_eq!(base.effective_timeout(ApiKind::ChatCompletions, 600), 7);
+        // Undeclared kind keeps the caller-resolved value.
+        assert_eq!(base.effective_timeout(ApiKind::Responses, 600), 600);
+    }
+
+    #[test]
+    fn build_request_auth_is_per_kind_and_headers_override_auth() {
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        // Configured Authorization header must win over the constructed Bearer.
+        config
+            .headers
+            .insert("authorization".into(), "override".into());
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+
+        // Chat → Bearer auth (overridden by the configured header).
+        let req = base
+            .build_request(
+                "https://example.com/chat/completions",
+                ApiKind::ChatCompletions,
+                serde_json::json!({"model": "m"}),
+                &HashMap::new(),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "override",
+            "effective_headers must be applied after auth"
+        );
+
+        // Anthropic → x-api-key + anthropic-version, no Authorization override here.
+        let mut config2 = crate::test_support::test_config("https://example.com", 30, None, None);
+        config2.headers.clear();
+        let base2 = ProviderBase::new("test".into(), &config2).unwrap();
+        let req = base2
+            .build_request(
+                "https://example.com/messages",
+                ApiKind::AnthropicMessages,
+                serde_json::json!({"model": "m"}),
+                &HashMap::new(),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(req.headers().get("x-api-key").unwrap(), "sk-test");
+        assert_eq!(
+            req.headers().get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
+        assert!(req.headers().get("authorization").is_none());
     }
 
     #[test]
@@ -1286,9 +1544,15 @@ mod tests {
         // be contacted here. Asserting the body and the hit count only after
         // the request completes ensures a (wrong) proxied connection cannot
         // slip past either check.
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let body = base
-            .send_json(&url, serde_json::json!({}), &HashMap::new(), &[], None)
+            .send_json(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+                None,
+            )
             .await
             .expect("direct request succeeds");
         assert_eq!(
@@ -1327,9 +1591,15 @@ mod tests {
         )
         .expect("explicit http proxy construction succeeds");
 
-        let url = base.build_url("chat/completions");
+        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
         let body = base
-            .send_json(&url, serde_json::json!({}), &HashMap::new(), &[], None)
+            .send_json(
+                &url,
+                ApiKind::ChatCompletions,
+                serde_json::json!({}),
+                &HashMap::new(),
+                None,
+            )
             .await
             .expect("request routed through the explicit proxy succeeds");
 

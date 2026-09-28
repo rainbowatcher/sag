@@ -7,13 +7,6 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import {
   Table,
   TableBody,
   TableCell,
@@ -24,7 +17,7 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import { validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
-import type { Provider, TargetItem, UpstreamProtocol } from "@/types/api"
+import type { Provider, TargetItem } from "@/types/api"
 
 const routeStore = useRouteStore()
 
@@ -97,10 +90,22 @@ function toggleExpand(id: number) {
 }
 
 // --- Provider & Model Options Helpers ---
+const API_KIND_SHORT: Record<string, string> = {
+  chat_completions: "chat",
+  responses: "responses",
+  anthropic_messages: "anthropic",
+  image: "image",
+}
+
+function providerApiSummary(p: Provider): string {
+  const kinds = Object.keys(p.apis ?? {})
+  return kinds.length > 0 ? kinds.map((k) => API_KIND_SHORT[k] ?? k).join("/") : "no apis"
+}
+
 function getProviderOptions(target: TargetItem): ComboboxOption[] {
   const list: ComboboxOption[] = props.providers.map((p) => ({
     value: p.name,
-    label: `${p.name} (${p.provider_type})${!p.enabled ? " — Disabled" : ""}`,
+    label: `${p.name} (${providerApiSummary(p)})${!p.enabled ? " — Disabled" : ""}`,
     warning: !p.enabled,
   }))
   if (target.provider && !props.providers.some((p) => p.name === target.provider)) {
@@ -164,7 +169,6 @@ function addTarget() {
       priority: 0,
       retries: 0,
       extra: "",
-      upstream_protocol: "",
     },
   ])
 }
@@ -322,32 +326,6 @@ function onProviderChange(index: number, value: string) {
                       "
                     >
                       {{ validateExtraJson(t.extra) ?? "Valid JSON" }}
-                    </p>
-                  </div>
-                  <div class="w-48">
-                    <Label class="text-xs">Upstream Protocol</Label>
-                    <Select
-                      :model-value="t.upstream_protocol ?? ''"
-                      @update:model-value="
-                        (v) =>
-                          updateTarget(modelValue.indexOf(t), {
-                            upstream_protocol: v as UpstreamProtocol | '',
-                          })
-                      "
-                    >
-                      <SelectTrigger class="w-full">
-                        <SelectValue placeholder="Derived (advanced)" />
-                      </SelectTrigger>
-                      <SelectContent class="w-(--reka-select-trigger-width)">
-                        <SelectItem value="">Derived (default)</SelectItem>
-                        <SelectItem value="chat_completions">Chat Completions</SelectItem>
-                        <SelectItem value="responses">Responses</SelectItem>
-                        <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p class="text-muted-foreground mt-1 text-[10px]">
-                      Advanced: explicit per-target protocol (enables native lane when it matches
-                      ingress).
                     </p>
                   </div>
                 </div>

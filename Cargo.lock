@@ -1029,6 +1029,8 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1888,10 +1890,12 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
+ "indexmap",
  "reqwest",
  "sag-analytics",
  "sag-config",
  "sag-core",
+ "sag-dispatch",
  "sag-providers",
  "sag-state",
  "serde",
@@ -1924,6 +1928,7 @@ name = "sag-config"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "indexmap",
  "notify",
  "sag-core",
  "serde",
@@ -2009,6 +2014,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "indexmap",
  "reqwest",
  "sag-config",
  "sag-core",

@@ -551,8 +551,28 @@ impl AppState {
     /// clearing a non-existent sticky entry is a no-op — so calling this
     /// against a healthy target is a safe way to reset sticky routing.
     pub async fn force_close_circuit(&self, model: &str, provider: &str, real_model: &str) {
-        let key = RouteTargetKey::new(model, provider, real_model);
-        self.circuit_breaker.write().await.close(&key);
+        // The circuit key folds in the upstream base address
+        // (`apis.<key>.base_url`). Close the target under every base the
+        // provider declares — the force-close request carries no protocol
+        // hint, and a hit under any address fully closes the target.
+        let urls: Vec<String> = {
+            let cfg = self.config.read().await;
+            cfg.providers
+                .get(provider)
+                .map(|pc| {
+                    pc.apis
+                        .values()
+                        .map(|api| api.base_url.trim_end_matches('/').to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        {
+            let mut breaker = self.circuit_breaker.write().await;
+            for url in &urls {
+                breaker.close(&RouteTargetKey::new(model, provider, real_model, url));
+            }
+        }
         self.active_targets.write().await.clear(model);
     }
 }
@@ -857,7 +877,8 @@ mod tests {
         fn route(model: &str, strategy: Strategy) -> RouteConfig {
             RouteConfig {
                 model_name: model.into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Default::default(),
+                api_endpoint: None,
                 strategy,
                 retries: None,
                 timeout_secs: None,
@@ -908,7 +929,8 @@ mod tests {
         fn route(model: &str, strategy: Strategy) -> RouteConfig {
             RouteConfig {
                 model_name: model.into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Default::default(),
+                api_endpoint: None,
                 strategy,
                 retries: None,
                 timeout_secs: None,
@@ -996,7 +1018,8 @@ mod tests {
         fn route(model: &str) -> RouteConfig {
             RouteConfig {
                 model_name: model.into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Default::default(),
+                api_endpoint: None,
                 strategy: Strategy::StickyFailover,
                 retries: None,
                 timeout_secs: None,

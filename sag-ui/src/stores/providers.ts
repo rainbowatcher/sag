@@ -2,12 +2,20 @@ import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api } from "@/lib/client"
 import { getErrorMessage } from "@/lib/utils"
-import type { ModelTestResult, Provider, ProxyMode } from "@/types/api"
+import type {
+  AddProviderPayload,
+  ApiKind,
+  ModelTestResult,
+  ProxyMode,
+  Provider,
+  UpdateProviderPayload,
+} from "@/types/api"
 import { useConnectionStore } from "./connection"
 
 export interface FetchProvidersParams {
   model_name?: string
-  provider_type?: string
+  /** Only keep providers that declare this `apis` section. */
+  apis?: ApiKind
   sort?: string
 }
 
@@ -48,7 +56,7 @@ export const useProviderStore = defineStore("providers", () => {
     try {
       const queryParams = new URLSearchParams()
       if (params.model_name?.trim()) queryParams.set("model_name", params.model_name.trim())
-      if (params.provider_type) queryParams.set("provider_type", params.provider_type)
+      if (params.apis) queryParams.set("apis", params.apis)
       if (params.sort) queryParams.set("sort", params.sort)
       const query = queryParams.toString()
       const { data } = await api.get<{ providers: Provider[] }>(
@@ -63,10 +71,12 @@ export const useProviderStore = defineStore("providers", () => {
   }
 
   async function fetchUpstreamModels(payload: {
+    /** Probe address: the `base_url` of the `apis.<api_kind>` section under test. */
     base_url: string
     api_keys: string[]
     headers?: Record<string, string>
-    provider_type?: string
+    /** API section whose auth style applies (default `chat_completions`). */
+    api_kind?: ApiKind
     models_endpoint?: string
     proxy_mode?: ProxyMode
   }) {
@@ -110,8 +120,9 @@ export const useProviderStore = defineStore("providers", () => {
     payload: {
       model: string
       api_keys: string[]
+      /** Probe address: the `base_url` of the `apis.<api_kind>` section under test. */
       base_url: string
-      provider_type?: string
+      api_kind?: ApiKind
       headers?: Record<string, string>
       proxy_mode?: ProxyMode
     },
@@ -122,25 +133,7 @@ export const useProviderStore = defineStore("providers", () => {
     })
   }
 
-  async function addProvider(payload: {
-    name: string
-    api_keys: string[]
-    key_strategy?: string
-    provider_type: string
-    base_url?: string
-    priority?: number
-    max_retries?: number
-    timeout_secs?: number
-    headers?: Record<string, string>
-    role_mappings?: Record<string, string>
-    body_overrides?: Record<string, unknown>
-    model_overrides?: Record<string, Record<string, unknown>>
-    strip_fields?: string[]
-    enabled_models?: string[]
-    models_endpoint?: string
-    proxy_mode?: ProxyMode
-    upstream_protocol?: import("@/types/api").UpstreamProtocol | null
-  }) {
+  async function addProvider(payload: AddProviderPayload) {
     try {
       await api.post("/api/providers", payload)
       await fetchProviders()
@@ -168,28 +161,7 @@ export const useProviderStore = defineStore("providers", () => {
     }
   }
 
-  async function updateProvider(
-    name: string,
-    payload: {
-      api_keys?: string[]
-      key_strategy?: string
-      provider_type?: string
-      base_url?: string
-      models_endpoint?: string
-      priority?: number
-      max_retries?: number
-      timeout_secs?: number
-      headers?: Record<string, string>
-      role_mappings?: Record<string, string>
-      body_overrides?: Record<string, unknown>
-      model_overrides?: Record<string, Record<string, unknown>>
-      strip_fields?: string[]
-      enabled_models?: string[]
-      enabled?: boolean
-      proxy_mode?: ProxyMode
-      upstream_protocol?: import("@/types/api").UpstreamProtocol | null
-    },
-  ) {
+  async function updateProvider(name: string, payload: Omit<UpdateProviderPayload, "name">) {
     try {
       await api.put("/api/providers", { name, ...payload })
       await fetchProviders()

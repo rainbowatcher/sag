@@ -19,7 +19,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+    ApiConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
     ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_core::ChatCompletionResponse;
@@ -53,30 +53,23 @@ where
 
 async fn build_state(base_url: &str) -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "openai".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
+    providers.insert("openai".to_string(), {
+        let mut pc = ProviderConfig {
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
-            base_url: base_url.to_string(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        },
-    );
+            ..ProviderConfig::default()
+        };
+        pc.apis.insert(
+            sag_core::ApiKind::ChatCompletions,
+            ApiConfig {
+                base_url: base_url.to_string(),
+                ..ApiConfig::default()
+            },
+        );
+        pc
+    });
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec!["bytes-key".into()],
@@ -84,7 +77,8 @@ async fn build_state(base_url: &str) -> AppState {
         providers,
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -95,7 +89,6 @@ async fn build_state(base_url: &str) -> AppState {
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 1,
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }],
@@ -105,8 +98,7 @@ async fn build_state(base_url: &str) -> AppState {
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (name, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> =
-            Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
+        let provider = sag_providers::create_provider(name.clone(), pc).unwrap();
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);

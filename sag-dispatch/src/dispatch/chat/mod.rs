@@ -8,8 +8,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use sag_analytics::AnalyticsEvent;
+use sag_core::{ApiKind, IngressProtocol, Lane};
 use sag_core::{AppError, FailureReason, FinalStatus, RequestResultFact, TargetAttemptFact};
-use sag_core::{IngressProtocol, Lane, UpstreamProtocol};
 use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, ResponsesCodec};
 
 use crate::dispatch::resolve::resolve_provider;
@@ -20,7 +20,7 @@ use crate::dispatch::stream::build_streaming_response;
 use crate::dispatch::{
     CircuitPermit, DispatchCancelGuard, DispatchCtx, apply_circuit_outcome, circuit_allows_target,
     client_error_failure_reason, emit_analytics_event, fallback_exhausted_response,
-    log_per_target_failure, merge_model_overrides, success_log,
+    log_per_target_failure, merge_model_overrides, success_log, target_base_url,
 };
 
 mod attempt;
@@ -168,11 +168,16 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         let provider_name = &target.provider;
         let real_model = &target.real_model;
 
+        // The circuit key folds in the upstream base address, so targets
+        // on different addresses (同址多协议 excluded) have isolated health.
+        let circuit_url =
+            target_base_url(&config.providers, provider_name, target.upstream_protocol);
         let Some(permit) = circuit_allows_target(
             runtime,
             &request.model,
             provider_name,
             real_model,
+            &circuit_url,
             &circuit_breaker_cfg,
         )
         .await
@@ -239,18 +244,20 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(target.upstream_protocol.as_str()),
                         Some(target.lane.as_str()),
                     );
-                    // M5 native: Anthropic ingress × explicitly declared
-                    // AnthropicMessages target → call upstream with the
+                    // M5 native: Anthropic ingress whose lane resolves
+                    // Native — the actually-used protocol is necessarily the
+                    // ingress's AnthropicMessages, so call upstream with the
                     // Anthropic body (never translate through Chat).
-                    let use_native_anthropic = is_anthropic_ingress
-                        && target.lane == Lane::Native
-                        && target.upstream_protocol == UpstreamProtocol::AnthropicMessages;
-                    // M6 native: Responses ingress × explicitly declared
-                    // Responses target → call upstream with the Responses
-                    // body (never translate through Chat).
-                    let use_native_responses = is_responses_ingress
-                        && target.lane == Lane::Native
-                        && target.upstream_protocol == UpstreamProtocol::Responses;
+                    let use_native_anthropic = is_anthropic_ingress && target.lane == Lane::Native;
+                    // M6 native: same for the Responses ingress — a native
+                    // lane means the upstream speaks Responses natively.
+                    let use_native_responses = is_responses_ingress && target.lane == Lane::Native;
+                    // Translated lane whose fallback is `responses`: encode
+                    // IR down to the Responses protocol (the Chat bridge
+                    // cannot serve a responses-only provider — the plan's
+                    // "translate down to the fallback protocol").
+                    // `used == Responses` already covers the native arm.
+                    let use_responses = target.upstream_protocol == sag_core::ApiKind::Responses;
                     let result = async {
                         // Capture the upstream start time immediately before the
                         // provider call so retry/circuit overhead is excluded.
@@ -281,7 +288,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 provider
                                     .anthropic_messages_stream(body, &target_extra)
                                     .await?
-                            } else if use_native_responses {
+                            } else if use_responses {
                                 let (body, loss) =
                                     ResponsesCodec::encode_request_with_loss(ir, &real_model);
                                 if !loss.is_empty() {
@@ -346,11 +353,11 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             // upstream_protocol, so translated arms peek as
                             // ChatCompletions.
                             let frame_upstream = if use_native_anthropic {
-                                UpstreamProtocol::AnthropicMessages
-                            } else if use_native_responses {
-                                UpstreamProtocol::Responses
+                                ApiKind::AnthropicMessages
+                            } else if use_responses {
+                                ApiKind::Responses
                             } else {
-                                UpstreamProtocol::ChatCompletions
+                                ApiKind::ChatCompletions
                             };
                             if retry_on_empty {
                                 // Peek at the first chunk before committing the HTTP
@@ -406,7 +413,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 }),
                                 upstream_start,
                             ))
-                        } else if use_native_responses {
+                        } else if use_responses {
                             let (body, loss) =
                                 ResponsesCodec::encode_request_with_loss(ir, &real_model);
                             if !loss.is_empty() {
@@ -445,7 +452,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 Box::new(NonStreamAttempt {
                                     ir: ir_resp,
                                     resp,
-                                    raw_responses: Some(raw),
+                                    // Plan B1: only the native arm egresses the
+                                    // original upstream JSON; a translated
+                                    // Responses fallback re-encodes from IR.
+                                    raw_responses: use_native_responses.then_some(raw),
                                 }),
                                 upstream_start,
                             ))

@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use sag_analytics::IdentityRegistry;
 use sag_config::{
-    ConfigHandle, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, RouteConfig,
-    RouteTarget, Strategy, gateway_config_base,
+    ConfigHandle, GatewayConfig, KeyStrategy, ProviderConfig, RouteConfig, RouteTarget, Strategy,
+    gateway_config_base,
 };
 use sag_providers::LlmProvider;
 use sag_state::ConfigMutationCoordinator;
@@ -20,32 +20,28 @@ use tokio::sync::RwLock;
 
 fn base_provider() -> ProviderConfig {
     ProviderConfig {
-        provider_type: ProviderType::OpenAI,
         api_keys: vec!["sk-test".into()],
         key_strategy: KeyStrategy::FillFirst,
-        base_url: "https://api.openai.com/v1".into(),
         proxy_mode: sag_config::ProxyMode::default(),
-        models_endpoint: "models".into(),
         timeout_secs: 600,
-        chunk_timeout_secs: None,
-        ttfb_timeout_secs: None,
-        headers: HashMap::new(),
-        body_overrides: HashMap::new(),
-        strip_fields: vec![],
-        model_strip_fields: HashMap::new(),
-        model_overrides: HashMap::new(),
-        role_mappings: HashMap::new(),
-        enabled: true,
-        enabled_models: vec![],
         anthropic_cache_control: false,
-        upstream_protocol: None,
+        apis: std::iter::once((
+            sag_core::ApiKind::ChatCompletions,
+            sag_config::ApiConfig {
+                base_url: "https://api.openai.com/v1".into(),
+                ..Default::default()
+            },
+        ))
+        .collect(),
+        ..Default::default()
     }
 }
 
 fn route(model_name: &str, targets: &[(&str, Option<&str>)]) -> RouteConfig {
     RouteConfig {
         model_name: model_name.into(),
-        api_endpoint: "/chat/completions".into(),
+        pipeline: Default::default(),
+        api_endpoint: None,
         strategy: Strategy::FillFirst,
         retries: None,
         timeout_secs: None,
@@ -58,7 +54,6 @@ fn route(model_name: &str, targets: &[(&str, Option<&str>)]) -> RouteConfig {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             })
             .collect(),
@@ -435,8 +430,10 @@ async fn hot_reload_commit_path_syncs_route_identities() {
             listen = "127.0.0.1:37210"
 
             [providers.p1]
-            type = "openai"
             api_keys = ["sk-test"]
+
+            [providers.p1.apis.chat_completions]
+            base_url = "https://api.openai.com/v1"
             {routes_toml}
             "#
             ),
@@ -514,8 +511,10 @@ async fn failed_reload_sync_is_retried_by_same_path_reload() {
             listen = "127.0.0.1:37210"
 
             [providers.p1]
-            type = "openai"
             api_keys = ["sk-test"]
+
+            [providers.p1.apis.chat_completions]
+            base_url = "https://api.openai.com/v1"
             {routes_toml}
             "#
             ),

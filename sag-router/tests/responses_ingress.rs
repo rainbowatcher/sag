@@ -15,7 +15,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+    ApiConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
     ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::{AppState, DispatchRuntime, build_router, test_app_state};
@@ -91,55 +91,31 @@ enum Upstream {
 }
 
 async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState {
-    let (name, ptype, provider_proto, target_proto, api_endpoint) = match upstream {
-        Upstream::Chat => (
-            "openai",
-            ProviderType::OpenAI,
-            None,
-            None,
-            "/chat/completions",
-        ),
-        Upstream::Anthropic => (
-            "anthropic",
-            ProviderType::Anthropic,
-            None,
-            None,
-            "/messages",
-        ),
-        Upstream::ResponsesNative => (
-            "openai",
-            ProviderType::OpenAI,
-            Some(sag_core::UpstreamProtocol::Responses),
-            Some(sag_core::UpstreamProtocol::Responses),
-            "/responses",
-        ),
+    // The declared `apis` key is the whole protocol story now: it picks
+    // the lane (set membership) and the upstream path (fixed derivation).
+    let (name, api_key) = match upstream {
+        Upstream::Chat => ("openai", sag_core::ApiKind::ChatCompletions),
+        Upstream::Anthropic => ("anthropic", sag_core::ApiKind::AnthropicMessages),
+        Upstream::ResponsesNative => ("openai", sag_core::ApiKind::Responses),
     };
 
     let mut providers = HashMap::new();
-    providers.insert(
-        name.to_string(),
-        ProviderConfig {
-            provider_type: ptype,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
+    let mut pc = ProviderConfig {
+        api_keys: vec!["sk-test".into()],
+        key_strategy: KeyStrategy::FillFirst,
+        proxy_mode: ProxyMode::default(),
+        timeout_secs: 10,
+        anthropic_cache_control: false,
+        ..ProviderConfig::default()
+    };
+    pc.apis.insert(
+        api_key,
+        ApiConfig {
             base_url: base_url.to_string(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: provider_proto,
+            ..ApiConfig::default()
         },
     );
+    providers.insert(name.to_string(), pc);
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -147,7 +123,8 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
         providers,
         routes: vec![RouteConfig {
             model_name: "route-model".into(),
-            api_endpoint: api_endpoint.into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -158,7 +135,6 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
                 provider: name.into(),
                 real_model: Some("real-model".into()),
                 priority: 1,
-                upstream_protocol: target_proto,
                 capabilities: None,
             }],
         }],
@@ -168,14 +144,7 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (pname, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match pc.provider_type {
-            ProviderType::OpenAI => {
-                Arc::new(sag_providers::OpenAiProvider::new(pname.clone(), pc).unwrap())
-            }
-            ProviderType::Anthropic => {
-                Arc::new(sag_providers::AnthropicProvider::new(pname.clone(), pc).unwrap())
-            }
-        };
+        let provider = sag_providers::create_provider(pname.clone(), pc).unwrap();
         registry.insert(pname.clone(), provider);
     }
     drop(cfg_read);
@@ -878,54 +847,27 @@ async fn translated_rejects_previous_response_id_even_with_store_false() {
 /// silently drop `previous_response_id` into Chat `extra`.
 async fn build_mixed_state(base_url: &str, key: &str) -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "openai-native".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
+    for (pname, api_key) in [
+        ("openai-native", sag_core::ApiKind::Responses),
+        ("openai-chat", sag_core::ApiKind::ChatCompletions),
+    ] {
+        let mut pc = ProviderConfig {
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
-            base_url: base_url.to_string(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
             anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
-        },
-    );
-    providers.insert(
-        "openai-chat".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            base_url: base_url.to_string(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        },
-    );
+            ..ProviderConfig::default()
+        };
+        pc.apis.insert(
+            api_key,
+            ApiConfig {
+                base_url: base_url.to_string(),
+                ..ApiConfig::default()
+            },
+        );
+        providers.insert(pname.to_string(), pc);
+    }
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -933,7 +875,8 @@ async fn build_mixed_state(base_url: &str, key: &str) -> AppState {
         providers,
         routes: vec![RouteConfig {
             model_name: "route-model".into(),
-            api_endpoint: "/responses".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -945,7 +888,6 @@ async fn build_mixed_state(base_url: &str, key: &str) -> AppState {
                     provider: "openai-native".into(),
                     real_model: Some("real-model".into()),
                     priority: 1,
-                    upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
                     capabilities: None,
                 },
                 RouteTarget {
@@ -955,8 +897,8 @@ async fn build_mixed_state(base_url: &str, key: &str) -> AppState {
                     provider: "openai-chat".into(),
                     real_model: Some("real-model".into()),
                     priority: 2,
-                    // Explicit Chat — translated lane, no native passthrough.
-                    upstream_protocol: Some(sag_core::UpstreamProtocol::ChatCompletions),
+                    // Chat-only provider — translated lane on the Responses
+                    // ingress, no native passthrough.
                     capabilities: None,
                 },
             ],
@@ -967,14 +909,7 @@ async fn build_mixed_state(base_url: &str, key: &str) -> AppState {
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (pname, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match pc.provider_type {
-            ProviderType::OpenAI => {
-                Arc::new(sag_providers::OpenAiProvider::new(pname.clone(), pc).unwrap())
-            }
-            ProviderType::Anthropic => {
-                Arc::new(sag_providers::AnthropicProvider::new(pname.clone(), pc).unwrap())
-            }
-        };
+        let provider = sag_providers::create_provider(pname.clone(), pc).unwrap();
         registry.insert(pname.clone(), provider);
     }
     drop(cfg_read);

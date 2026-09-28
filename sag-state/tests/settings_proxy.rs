@@ -35,9 +35,15 @@ fn initial_toml() -> &'static str {
         [providers.p1]
         api_keys = ["sk-test"]
 
+        [providers.p1.apis.chat_completions]
+        base_url = "https://api.openai.com/v1"
+
         [providers.p2]
         api_keys = ["sk-test"]
         proxy_mode = "disabled"
+
+        [providers.p2.apis.chat_completions]
+        base_url = "https://api.openai.com/v1"
     "#
 }
 
@@ -180,6 +186,9 @@ async fn update_settings_rejects_clearing_global_while_enabled_provider_exists()
             [providers.p1]
             api_keys = ["sk-test"]
             proxy_mode = "enabled"
+
+            [providers.p1.apis.chat_completions]
+            base_url = "https://api.openai.com/v1"
         "#,
     )
     .unwrap();
@@ -256,6 +265,14 @@ async fn update_settings_validates_even_with_empty_provider_set() {
             // Disabled so setting the global proxy does not rebuild it —
             // this test pins URL validation, not proxy hot-rebuild.
             proxy_mode: sag_config::ProxyMode::Disabled,
+            apis: std::iter::once((
+                sag_core::ApiKind::ChatCompletions,
+                sag_config::ApiConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
             ..Default::default()
         },
     );
@@ -302,9 +319,15 @@ async fn reload_from_path_rebuilds_only_affected_providers() {
         [providers.p1]
         api_keys = ["sk-test"]
 
+        [providers.p1.apis.chat_completions]
+        base_url = "https://api.openai.com/v1"
+
         [providers.p2]
         api_keys = ["sk-test"]
         proxy_mode = "disabled"
+
+        [providers.p2.apis.chat_completions]
+        base_url = "https://api.openai.com/v1"
     "#;
     std::fs::write(&path, initial).unwrap();
 
@@ -446,6 +469,14 @@ async fn update_settings_trims_api_keys() {
         "p1".to_string(),
         sag_config::ProviderConfig {
             api_keys: vec!["sk-test".into()],
+            apis: std::iter::once((
+                sag_core::ApiKind::ChatCompletions,
+                sag_config::ApiConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
             ..Default::default()
         },
     );

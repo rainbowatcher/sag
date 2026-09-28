@@ -14,6 +14,26 @@ use sag_providers::LlmProvider;
 use sag_state::ConfigMutationCoordinator;
 use tokio::sync::RwLock;
 
+/// Minimal provider config with a `chat_completions` API node.
+fn provider_config(api_keys: Vec<String>) -> sag_config::ProviderConfig {
+    sag_config::ProviderConfig {
+        api_keys,
+        key_strategy: sag_config::KeyStrategy::FillFirst,
+        proxy_mode: sag_config::ProxyMode::default(),
+        timeout_secs: 600,
+        anthropic_cache_control: false,
+        apis: std::iter::once((
+            sag_core::ApiKind::ChatCompletions,
+            sag_config::ApiConfig {
+                base_url: "https://api.openai.com/v1".into(),
+                ..Default::default()
+            },
+        ))
+        .collect(),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn sequential_mutations_with_persistence_succeed() {
     let file_path = std::env::temp_dir().join(format!("sag_seq_test_{}.toml", std::process::id()));
@@ -25,8 +45,10 @@ async fn sequential_mutations_with_persistence_succeed() {
             listen = "127.0.0.1:37210"
 
             [providers.p1]
-            type = "openai"
             api_keys = ["sk-test"]
+
+            [providers.p1.apis.chat_completions]
+            base_url = "https://api.openai.com/v1"
 
             [[routes]]
             model_name = "gpt-4"
@@ -43,27 +65,7 @@ async fn sequential_mutations_with_persistence_succeed() {
     let coord = ConfigMutationCoordinator::new(handle, providers);
 
     // Mutation 1: update provider p1's api_keys
-    let cfg1 = sag_config::ProviderConfig {
-        provider_type: sag_config::ProviderType::OpenAI,
-        api_keys: vec!["sk-test-1".to_string()],
-        key_strategy: sag_config::KeyStrategy::FillFirst,
-        base_url: "https://api.openai.com/v1".into(),
-        proxy_mode: sag_config::ProxyMode::default(),
-        models_endpoint: "models".into(),
-        timeout_secs: 600,
-        chunk_timeout_secs: None,
-        ttfb_timeout_secs: None,
-        headers: HashMap::new(),
-        body_overrides: HashMap::new(),
-        strip_fields: vec![],
-        model_strip_fields: HashMap::new(),
-        model_overrides: HashMap::new(),
-        role_mappings: HashMap::new(),
-        enabled: true,
-        enabled_models: vec![],
-        anthropic_cache_control: false,
-        upstream_protocol: None,
-    };
+    let cfg1 = provider_config(vec!["sk-test-1".to_string()]);
     let report1 = coord
         .update_provider("p1", cfg1)
         .await
@@ -74,27 +76,7 @@ async fn sequential_mutations_with_persistence_succeed() {
     // This tests that `accepted_file_revision` was correctly updated to
     // the post-write revision by the first mutation, so the second
     // mutation does not falsely detect an external conflict.
-    let cfg2 = sag_config::ProviderConfig {
-        provider_type: sag_config::ProviderType::OpenAI,
-        api_keys: vec!["sk-test-2".to_string()],
-        key_strategy: sag_config::KeyStrategy::FillFirst,
-        base_url: "https://api.openai.com/v1".into(),
-        proxy_mode: sag_config::ProxyMode::default(),
-        models_endpoint: "models".into(),
-        timeout_secs: 600,
-        chunk_timeout_secs: None,
-        ttfb_timeout_secs: None,
-        headers: HashMap::new(),
-        body_overrides: HashMap::new(),
-        strip_fields: vec![],
-        model_strip_fields: HashMap::new(),
-        model_overrides: HashMap::new(),
-        role_mappings: HashMap::new(),
-        enabled: true,
-        enabled_models: vec![],
-        anthropic_cache_control: false,
-        upstream_protocol: None,
-    };
+    let cfg2 = provider_config(vec!["sk-test-2".to_string()]);
     let report2 = coord
         .update_provider("p1", cfg2)
         .await

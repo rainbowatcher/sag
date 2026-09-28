@@ -261,7 +261,8 @@ mod tests {
         fn route(model: &str) -> RouteConfig {
             RouteConfig {
                 model_name: model.into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 strategy: Strategy::StickyFailover,
                 retries: None,
                 timeout_secs: None,
@@ -272,7 +273,6 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             }
@@ -415,7 +415,8 @@ mod tests {
         let routes = vec![
             sag_config::RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 strategy: sag_config::Strategy::StickyFailover,
                 retries: None,
                 timeout_secs: None,
@@ -423,7 +424,8 @@ mod tests {
             },
             sag_config::RouteConfig {
                 model_name: "*".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 strategy: sag_config::Strategy::StickyFailover,
                 retries: None,
                 timeout_secs: None,
@@ -471,7 +473,8 @@ mod tests {
 
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             strategy: sag_config::Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -555,39 +558,26 @@ mod tests {
     // ── stale_probe_threshold_from_config tests ────────────────────
 
     use sag_config::{
-        BackoffConfig, GatewayConfig, ProviderConfig, ProviderType, ProxyMode, RouteConfig,
-        RouteTarget, Strategy,
+        BackoffConfig, GatewayConfig, ProviderConfig, ProxyMode, RouteConfig, RouteTarget, Strategy,
     };
 
     /// Minimal provider config with a custom `timeout_secs` and optional ttfb.
     fn prov(timeout_secs: u64, ttfb: Option<u64>) -> ProviderConfig {
         ProviderConfig {
-            provider_type: ProviderType::OpenAI,
             api_keys: vec!["sk-test".into()],
             key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
             ttfb_timeout_secs: ttfb,
-            upstream_protocol: None,
+            ..ProviderConfig::default()
         }
     }
 
     fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
         RouteConfig {
             model_name: model.into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -603,7 +593,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }
     }

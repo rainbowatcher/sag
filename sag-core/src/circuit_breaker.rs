@@ -93,19 +93,27 @@ struct CircuitEntry {
 /// `model` is the client-requested model for this dispatch. `real_model` is the
 /// concrete upstream model after route resolution. Keeping both avoids sharing
 /// circuit state between two logical routes that happen to use the same provider.
+///
+/// `url` is the upstream API base address the target dispatches to (the
+/// `apis.<key>.base_url`, without the protocol path). Folding the address
+/// into the key isolates health between targets that point at different
+/// addresses, while targets on the **same** address (同址多协议) naturally
+/// share one breaker.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteTargetKey {
     pub model: String,
     pub provider: String,
     pub real_model: String,
+    pub url: String,
 }
 
 impl RouteTargetKey {
-    pub fn new(model: &str, provider: &str, real_model: &str) -> Self {
+    pub fn new(model: &str, provider: &str, real_model: &str, url: &str) -> Self {
         Self {
             model: model.to_string(),
             provider: provider.to_string(),
             real_model: real_model.to_string(),
+            url: url.to_string(),
         }
     }
 }
@@ -130,6 +138,10 @@ pub struct CircuitBreakerEntry {
     pub model: String,
     pub provider: String,
     pub real_model: String,
+    /// Upstream API base address this target dispatches to (part of the
+    /// breaker key — same address shares health, different addresses are
+    /// isolated).
+    pub url: String,
     pub state: CircuitStateKind,
     /// UNIX timestamp (seconds) of the hard cooldown lower bound.
     /// For entries whose cooldown has already elapsed (but not yet pruned),
@@ -400,6 +412,7 @@ impl RouteCircuitBreaker {
                 model: k.model.clone(),
                 provider: k.provider.clone(),
                 real_model: k.real_model.clone(),
+                url: k.url.clone(),
                 state: match e.state {
                     CircuitState::Open { .. } => CircuitStateKind::Open,
                     CircuitState::HalfOpen => CircuitStateKind::HalfOpen,
@@ -418,6 +431,7 @@ impl RouteCircuitBreaker {
                 .cmp(&b.model)
                 .then(a.provider.cmp(&b.provider))
                 .then(a.real_model.cmp(&b.real_model))
+                .then(a.url.cmp(&b.url))
         });
         entries
     }
@@ -493,8 +507,31 @@ fn jittered_interval(interval_secs: u64) -> Duration {
 mod tests {
     use super::*;
 
+    const TEST_URL: &str = "https://api.example.com/v1";
+
     fn key(provider: &str, real_model: &str) -> RouteTargetKey {
-        RouteTargetKey::new("gpt-4o", provider, real_model)
+        RouteTargetKey::new("gpt-4o", provider, real_model, TEST_URL)
+    }
+
+    /// 不同地址 → 不同 key（健康隔离）；同址多协议 → 同一 key（共享）。
+    #[test]
+    fn key_url_dimension_isolates_by_address() {
+        let a = RouteTargetKey::new("m", "p", "rm", "https://a.example.com/v1");
+        let b = RouteTargetKey::new("m", "p", "rm", "https://b.example.com/v1");
+        assert_ne!(a, b, "different addresses must be distinct keys");
+
+        // 同址多协议：地址相同、协议不同（key 无协议维度）→ 共享 breaker。
+        let same_addr_1 = RouteTargetKey::new("m", "p", "rm", "https://a.example.com/v1");
+        let same_addr_2 = RouteTargetKey::new("m", "p", "rm", "https://a.example.com/v1");
+        assert_eq!(same_addr_1, same_addr_2);
+
+        let mut breaker = RouteCircuitBreaker::default();
+        breaker.open(a.clone(), 3600, 60);
+        assert!(
+            !breaker.is_closed(&same_addr_1),
+            "same address shares the breaker"
+        );
+        assert!(breaker.is_closed(&b), "different address stays isolated");
     }
 
     #[test]
@@ -693,6 +730,7 @@ mod tests {
         assert_eq!(entry.model, "gpt-4o");
         assert_eq!(entry.provider, "openai");
         assert_eq!(entry.real_model, "gpt-4o");
+        assert_eq!(entry.url, TEST_URL);
         assert_eq!(entry.state, CircuitStateKind::Open);
         assert!(
             entry.next_probe_at_secs.is_some(),

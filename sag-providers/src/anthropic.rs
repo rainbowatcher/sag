@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use sag_core::{
-    AppError, ChatCompletionRequest, ChatCompletionResponse, IrStreamEvent, StreamChunk,
+    ApiKind, AppError, ChatCompletionRequest, ChatCompletionResponse, IrStreamEvent, StreamChunk,
 };
 use tokio::sync::mpsc;
 use tracing::{error, instrument, trace, warn};
@@ -204,8 +205,11 @@ fn process_anthropic_sse_frame(
 // ── Provider ─────────────────────────────────────────────────────
 
 /// Anthropic Messages API provider adapter.
+///
+/// URLs resolve from `ProviderConfig::apis` per protocol key
+/// (`anthropic_messages`).
 pub struct AnthropicProvider {
-    base: ProviderBase,
+    base: Arc<ProviderBase>,
 }
 
 impl AnthropicProvider {
@@ -220,9 +224,14 @@ impl AnthropicProvider {
         config: &sag_config::ProviderConfig,
         proxy: Option<&sag_config::ProxyConfig>,
     ) -> sag_core::Result<Self> {
-        Ok(Self {
-            base: ProviderBase::new_with_proxy(name, config, proxy)?,
-        })
+        Ok(Self::from_base(Arc::new(ProviderBase::new_with_proxy(
+            name, config, proxy,
+        )?)))
+    }
+
+    /// Wrap an existing (possibly shared) provider base.
+    pub(crate) fn from_base(base: Arc<ProviderBase>) -> Self {
+        Self { base }
     }
 
     /// Convert an OpenAI-format request to an Anthropic Messages body
@@ -269,12 +278,16 @@ impl AnthropicProvider {
         real_model: &str,
         force_stream: bool,
     ) -> serde_json::Value {
-        let effective = if self.base.has_role_mappings() {
+        let cache_control = self
+            .base
+            .effective_anthropic_cache_control(ApiKind::AnthropicMessages);
+        let effective = if self.base.has_role_mappings(ApiKind::AnthropicMessages) {
             let mut req = request.clone();
-            self.base.apply_role_mappings(&mut req.messages);
-            Self::to_anthropic_request(&req, real_model, self.base.anthropic_cache_control)
+            self.base
+                .apply_role_mappings(ApiKind::AnthropicMessages, &mut req.messages);
+            Self::to_anthropic_request(&req, real_model, cache_control)
         } else {
-            Self::to_anthropic_request(request, real_model, self.base.anthropic_cache_control)
+            Self::to_anthropic_request(request, real_model, cache_control)
         };
         let mut body = effective;
         if force_stream {
@@ -318,16 +331,18 @@ impl AnthropicProvider {
         timeout_secs: u64,
     ) -> sag_core::Result<serde_json::Value> {
         let body = self.prepare_native_body(body);
-        let url = self.base.build_url("/messages");
-        let key = self.base.current_key();
+        let url = self.base.protocol_url(ApiKind::AnthropicMessages)?;
+        let timeout = self
+            .base
+            .effective_timeout(ApiKind::AnthropicMessages, timeout_secs);
         let body_text = self
             .base
             .send_json(
                 &url,
+                ApiKind::AnthropicMessages,
                 body,
                 target_extra,
-                &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
-                Some(timeout_secs),
+                Some(timeout),
             )
             .await?;
         self.check_200_error(&body_text)?;
@@ -338,18 +353,23 @@ impl AnthropicProvider {
     /// Apply role mappings and optional cache_control to a native
     /// Anthropic-shaped body before it is sent upstream (B5).
     fn prepare_native_body(&self, mut body: serde_json::Value) -> serde_json::Value {
-        if self.base.has_role_mappings()
+        if self.base.has_role_mappings(ApiKind::AnthropicMessages)
             && let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut())
         {
             for msg in msgs.iter_mut() {
                 if let Some(role) = msg.get("role").and_then(|r| r.as_str()).map(String::from)
-                    && let Some(mapped) = self.base.role_mapping_for(&role)
+                    && let Some(mapped) = self
+                        .base
+                        .role_mapping_for(ApiKind::AnthropicMessages, &role)
                 {
                     msg["role"] = serde_json::json!(mapped);
                 }
             }
         }
-        if self.base.anthropic_cache_control {
+        if self
+            .base
+            .effective_anthropic_cache_control(ApiKind::AnthropicMessages)
+        {
             inject_cache_control_value(&mut body);
         }
         body
@@ -368,22 +388,16 @@ impl AnthropicProvider {
             body["stream"] = serde_json::json!(true);
             body
         };
-        let url = self.base.build_url("/messages");
-        let key = self.base.current_key();
+        let url = self.base.protocol_url(ApiKind::AnthropicMessages)?;
         let response = self
             .base
-            .send_json_stream(
-                &url,
-                body,
-                target_extra,
-                &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
-            )
+            .send_json_stream(&url, ApiKind::AnthropicMessages, body, target_extra)
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
         let chunk_timeout = self
             .base
-            .chunk_timeout_secs()
+            .chunk_timeout_secs(ApiKind::AnthropicMessages)
             .map(std::time::Duration::from_secs);
 
         tokio::spawn(async move {
@@ -584,17 +598,19 @@ impl LlmProvider for AnthropicProvider {
             trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
-        // Path fixed to /messages (D11); api_endpoint ignored.
-        let url = self.base.build_url("/messages");
-        let key = self.base.current_key();
+        // Path fixed to apis.anthropic_messages (D11); api_endpoint ignored.
+        let url = self.base.protocol_url(ApiKind::AnthropicMessages)?;
+        let timeout = self
+            .base
+            .effective_timeout(ApiKind::AnthropicMessages, timeout_secs);
         let body_text = self
             .base
             .send_json(
                 &url,
+                ApiKind::AnthropicMessages,
                 body,
                 target_extra,
-                &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
-                Some(timeout_secs),
+                Some(timeout),
             )
             .await?;
 
@@ -622,22 +638,16 @@ impl LlmProvider for AnthropicProvider {
             trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
-        let url = self.base.build_url("/messages");
-        let key = self.base.current_key();
+        let url = self.base.protocol_url(ApiKind::AnthropicMessages)?;
         let response = self
             .base
-            .send_json_stream(
-                &url,
-                body,
-                target_extra,
-                &[("x-api-key", key), ("anthropic-version", "2023-06-01")],
-            )
+            .send_json_stream(&url, ApiKind::AnthropicMessages, body, target_extra)
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
         let chunk_timeout = self
             .base
-            .chunk_timeout_secs()
+            .chunk_timeout_secs(ApiKind::AnthropicMessages)
             .map(std::time::Duration::from_secs);
 
         tokio::spawn(async move {

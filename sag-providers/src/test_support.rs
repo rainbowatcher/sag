@@ -4,8 +4,6 @@
 //! plus small config/request builders used by the `base`, `openai`, and
 //! `anthropic` test modules. No external network dependency.
 
-use std::collections::HashMap;
-
 use sag_config::ProviderConfig;
 use sag_core::{ChatCompletionRequest, ChatMessage};
 
@@ -31,34 +29,39 @@ where
 }
 
 /// Build a minimal `ProviderConfig` pointing at `base_url` with the given
-/// timeout settings. `provider_type` is left at OpenAI — construction does
-/// not depend on it.
+/// timeout settings. Every API kind (`chat_completions` / `responses` /
+/// `anthropic_messages` / `image`) shares the same `base_url` so any
+/// protocol path resolves in tests.
 pub(crate) fn test_config(
     base_url: &str,
     timeout_secs: u64,
     ttfb_timeout_secs: Option<u64>,
     chunk_timeout_secs: Option<u64>,
 ) -> ProviderConfig {
+    let mut apis = indexmap::IndexMap::new();
+    for kind in [
+        sag_core::ApiKind::ChatCompletions,
+        sag_core::ApiKind::Responses,
+        sag_core::ApiKind::AnthropicMessages,
+        sag_core::ApiKind::Image,
+    ] {
+        apis.insert(
+            kind,
+            sag_config::ApiConfig {
+                base_url: base_url.into(),
+                ..Default::default()
+            },
+        );
+    }
     ProviderConfig {
         api_keys: vec!["sk-test".into()],
-        provider_type: sag_config::ProviderType::OpenAI,
         key_strategy: sag_config::KeyStrategy::FillFirst,
-        base_url: base_url.into(),
-        models_endpoint: "models".into(),
         timeout_secs,
-        proxy_mode: sag_config::ProxyMode::default(),
-        headers: HashMap::new(),
-        body_overrides: HashMap::new(),
-        strip_fields: vec![],
-        model_strip_fields: HashMap::new(),
-        model_overrides: HashMap::new(),
-        enabled: true,
-        enabled_models: Vec::new(),
-        role_mappings: HashMap::new(),
-        anthropic_cache_control: true,
         chunk_timeout_secs,
         ttfb_timeout_secs,
-        upstream_protocol: None,
+        anthropic_cache_control: true,
+        apis,
+        ..Default::default()
     }
 }
 

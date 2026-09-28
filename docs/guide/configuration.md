@@ -70,22 +70,26 @@ api_keys = [
 ]
 
 [providers.openai]
-provider_type = "openai"
 api_keys = ["${OPENAI_API_KEY}"]
-base_url = "https://api.openai.com/v1"
-models_endpoint = "models"
 proxy_mode = "inherit"     # inherit（默认）/ enabled / disabled；不读系统代理环境变量
 timeout_secs = 600         # 非流式整体超时安全网
 ttfb_timeout_secs = 60     # 流式：等待首字节（响应头）的超时
 chunk_timeout_secs = 30    # 流式：chunk 间空闲超时
 # strip_fields = ["chat_template_kwargs"]  # override 之后硬性剥离的顶层字段
 
+# Provider 没有 provider 级 base_url —— 地址唯一来源是各 apis 节的 base_url。
+# 协议集 = apis 的协议 key 集；lane 自动判定（ingress ∈ 协议集 → Native）。
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1"
+models_endpoint = "models"
+
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["${ANTHROPIC_API_KEY}"]
+timeout_secs = 600
+
+[providers.anthropic.apis.anthropic_messages]
 base_url = "https://api.anthropic.com/v1"
 models_endpoint = "models"
-timeout_secs = 600
 
 [[routes]]
 model_name = "gpt-4o"
@@ -111,19 +115,18 @@ targets = [
 ]
 ```
 
-`models_endpoint` 是 provider 级配置，用于管理面板刷新上游模型列表。默认值为 `models`，会拼接到 `base_url` 后；支持 `models`、`/models`、`v1/models` 等写法，保存时会规范化为相对路径。
+`models_endpoint` 是 per-API 配置（`[providers.<name>.apis.<key>]` 节），用于管理面板刷新上游模型列表。默认值为 `models`，相对本节的 `base_url` 拼接；支持 `models`、`/models`、`v1/models` 等写法，保存时会规范化为相对路径。
 
 ### Provider 完整字段
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `provider_type` | string | `"openai"` | 供应商适配器类型：`"openai"` / `"anthropic"` |
-| `api_keys` | array | `[]` | API 密钥列表 |
+| `apis` | table | — | 协议 API 目录（**必填，至少一个协议 key**）。`[providers.<name>.apis.<kind>]`，`kind` ∈ `chat_completions` / `responses` / `anthropic_messages` / `image`。每节携带自己的 `base_url`（地址唯一来源）与可选的协议相关覆盖字段；`image` 是非协议条目，不参与 lane 判定 |
+| `fallback` | string (可选) | — | 降级协议（translated 路径的编码目标）。`apis` 恰好一个协议 key 时可省略（自动取之）；多个协议 key 时必填，值必须 ∈ apis 协议 key 集 |
+| `api_keys` | array | `[]` | API 密钥列表（所有 API 共享的凭据池） |
 | `key_strategy` | string | `"fill_first"` | 多密钥选择策略：`"fill_first"`（顺序使用，失败后切换）或 `"round_robin"`（轮询分发） |
-| `base_url` | string | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
 | `proxy_mode` | string | `"inherit"` | 出站代理三态：`"inherit"`（默认，跟随顶层 `proxy_url`）/ `"enabled"`（强制走全局代理，无全局代理则配置错误）/ `"disabled"`（强制直连）。SAG **不读**系统代理环境变量 |
-| `models_endpoint` | string | `"models"` | 模型列表端点路径（拼接在 `base_url` 后） |
-| `timeout_secs` | integer | `600` | 上游请求超时（秒）。流式请求不受此约束，仅作为非流式请求的整体安全网 |
+| `timeout_secs` | integer | `600` | 上游请求超时（秒）。流式请求不受此约束，仅作为非流式请求的整体安全网。provider 级为缺省值，`apis.<key>.timeout_secs` 整段覆盖 |
 | `chunk_timeout_secs` | integer (可选) | — | 流式请求中 chunk 间的最大空闲时间（秒），超时则断开连接。省略时无限等待 |
 | `ttfb_timeout_secs` | integer (可选) | `60` | 流式请求等待上游响应头（首字节）的最大时间（秒）。收到响应头后停止计时，不约束 body 流；超时可重试并 fallback。省略时使用默认 60 秒 |
 | `enabled` | boolean | `true` | 是否启用此供应商。`false` 时在路由中跳过并在管理面板中显示为禁用 |
@@ -134,8 +137,7 @@ targets = [
 | `model_strip_fields` | object | `{}` | 逐模型字段剥离表，以 `real_model`（最终 `body.model`）为 key。与 `strip_fields` 取并集后在 override 之后统一剥离 |
 | `model_overrides` | object | `{}` | 逐模型的 body 字段覆盖，以 `real_model` 名称为 key。仅对匹配的模型生效，优先级高于 `body_overrides`，低于目标级别的 `extra`。用于避免在多个路由 target 中重复配置同一 `(provider, real_model)` 的参数 |
 | `role_mappings` | object | `{}` | 角色映射表：将请求中的角色名映射为上游支持的角色。例如 `{ "developer" = "system" }` 将 developer 消息转为 system 消息。大小写敏感 |
-| `anthropic_cache_control` | boolean | `true` | 是否对 Anthropic 请求注入 `cache_control: {\"type\": \"ephemeral\"}` 断点。仅对 `provider_type = "anthropic"` 有效，可显著降低重复前缀请求的成本 |
-| `upstream_protocol` | string (可选) | — | 显式上游协议。省略时由 `provider_type` 推导（openai→`chat_completions`，anthropic→`anthropic_messages`）；Native 模式需显式声明且等于 ingress 协议 |
+| `anthropic_cache_control` | boolean | `true` | 是否对 Anthropic Messages 请求注入 `cache_control: {\"type\": \"ephemeral\"}` 断点。仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖），可显著降低重复前缀请求的成本 |
 
 #### headers 示例
 

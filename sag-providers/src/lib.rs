@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod base;
+pub mod catalog;
 pub mod codec;
 pub mod openai;
 pub mod traits;
@@ -10,17 +11,19 @@ mod test_support;
 
 pub use anthropic::*;
 pub use base::*;
+pub use catalog::*;
 pub use codec::*;
 pub use openai::*;
 pub use traits::*;
 pub use util::*;
 
-/// Create a provider adapter from its type and configuration.
+/// Create a provider adapter from its configuration.
 ///
 /// Returns a type-erased `Arc<dyn LlmProvider>` ready for the runtime
-/// registry.  This keeps the `ProviderType` → adapter dispatch in one
-/// place so adding a new provider only touches two files (the new
-/// adapter module + this function).
+/// registry. Construction is driven purely by the `apis` catalog in
+/// [`sag_config::ProviderConfig`] (no `provider_type` dispatch): a
+/// [`CatalogProvider`] serves every protocol key the provider declares,
+/// within a single instance.
 ///
 /// Connects **directly**: the system proxy environment variables are
 /// explicitly ignored, never inherited. Use
@@ -48,13 +51,7 @@ pub fn create_provider_with_proxy(
     config: &sag_config::ProviderConfig,
     proxy: Option<&sag_config::ProxyConfig>,
 ) -> sag_core::Result<std::sync::Arc<dyn LlmProvider>> {
-    let provider: std::sync::Arc<dyn LlmProvider> = match config.provider_type {
-        sag_config::ProviderType::OpenAI => {
-            std::sync::Arc::new(OpenAiProvider::new_with_proxy(name, config, proxy)?)
-        }
-        sag_config::ProviderType::Anthropic => {
-            std::sync::Arc::new(AnthropicProvider::new_with_proxy(name, config, proxy)?)
-        }
-    };
+    let provider: std::sync::Arc<dyn LlmProvider> =
+        std::sync::Arc::new(CatalogProvider::new_with_proxy(name, config, proxy)?);
     Ok(provider)
 }

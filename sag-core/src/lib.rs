@@ -27,10 +27,7 @@ pub use ir::{
     IrRole, IrStreamEvent, IrTool, IrToolCall, LossEntry, LossInventory, LossReason, LossScope,
     Reasoning, Sampling, summarize_losses,
 };
-pub use protocol::{
-    Capabilities, IngressProtocol, Lane, UpstreamProtocol, derive_upstream_protocol,
-    effective_upstream_protocol, resolve_lane,
-};
+pub use protocol::{ApiKind, Capabilities, IngressProtocol, Lane, protocol_path, resolve_lane};
 pub use types::{
     CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FailureReason,
     FinalStatus, ImageData, ImageGenerationRequest, ImageGenerationResponse, RequestResultFact,

@@ -261,10 +261,23 @@ const columns = [
         h("span", { class: "font-mono text-sm font-medium" }, info.getValue()),
       ]),
   }),
-  columnHelper.accessor("api_endpoint", {
-    header: "Endpoint",
-    cell: (info) =>
-      h(Badge, { variant: "outline", class: "text-xs font-normal" }, () => info.getValue()),
+  columnHelper.display({
+    id: "pipeline",
+    header: "Pipeline",
+    cell: (info) => {
+      const r = info.row.original
+      const isImage = (r.pipeline ?? "chat") === "image"
+      const label = isImage && r.api_endpoint ? `image · ${r.api_endpoint}` : (r.pipeline ?? "chat")
+      return h(
+        Badge,
+        {
+          variant: "outline",
+          class: "text-xs font-normal",
+          title: r.api_endpoint ?? undefined,
+        },
+        () => label,
+      )
+    },
   }),
   columnHelper.accessor("strategy", {
     header: "Strategy",

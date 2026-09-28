@@ -11,12 +11,30 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use sag_config::{KeyStrategy, ProviderConfig, ProviderType, ProxyMode};
+use indexmap::IndexMap;
+use sag_config::{ApiConfig, ApiKind, KeyStrategy, ProviderConfig, ProxyMode};
 use sag_core::AppError;
 use serde_json::json;
 use tracing::instrument;
 
 use sag_state::AppState;
+
+/// Apply load-time normalization to an incoming `apis` map: trim each
+/// `base_url`'s trailing `/` (mirrors `GatewayConfig::normalize`) and
+/// normalize a present `models_endpoint` (empty → `"models"`). The
+/// coordinator's `mutate` path validates but does not normalize, so the
+/// admin entry point does it here to match what `load_config` produces.
+fn normalize_apis(apis: &mut IndexMap<ApiKind, ApiConfig>) {
+    for api in apis.values_mut() {
+        let trimmed = api.base_url.trim_end_matches('/');
+        if trimmed != api.base_url {
+            api.base_url = trimmed.to_string();
+        }
+        if let Some(endpoint) = api.models_endpoint.take() {
+            api.models_endpoint = Some(sag_config::normalize_models_endpoint(&endpoint));
+        }
+    }
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AddProviderRequest {
@@ -26,12 +44,16 @@ pub struct AddProviderRequest {
     pub api_keys: Vec<String>,
     #[serde(default)]
     pub key_strategy: KeyStrategy,
+    /// 协议 API 目录：每节携带自己的 `base_url`（地址唯一来源）+ 可选
+    /// `models_endpoint` 与协议覆盖字段。空目录在 handler 内 400；空 /
+    /// 未知 apis key 反序列化即报错（axum 422，枚举严格），其余未知
+    /// 字段照例容忍。
     #[serde(default)]
-    pub provider_type: ProviderType,
-    #[serde(default = "sag_config::default_base_url")]
-    pub base_url: String,
-    #[serde(default = "sag_config::default_models_endpoint")]
-    pub models_endpoint: String,
+    pub apis: IndexMap<ApiKind, ApiConfig>,
+    /// 降级协议（translated 路径的编码目标）。`apis` 恰好一个协议 key
+    /// 时可省略；多个协议 key 时必填（由提交时的全量校验兜底）。
+    #[serde(default)]
+    pub fallback: Option<ApiKind>,
     /// How this provider resolves the upstream proxy: `inherit` (default),
     /// `enabled`, or `disabled`. Unknown *fields* on the request body are
     /// tolerated as elsewhere in the admin DTOs, but an unknown
@@ -62,12 +84,6 @@ pub struct AddProviderRequest {
     /// List of model IDs enabled for this provider (optional).
     #[serde(default)]
     pub enabled_models: Vec<String>,
-    /// Optional explicit upstream protocol. Omitted/`null` derives from
-    /// `provider_type`. Unknown *fields* are tolerated; an unknown
-    /// `upstream_protocol` *value* fails deserialization (axum 422) — same
-    /// strictness as the config loader's typed enums.
-    #[serde(default)]
-    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -82,9 +98,16 @@ pub struct UpdateProviderRequest {
     /// mirrors the other `Option<...>` patch fields.
     #[serde(default)]
     pub proxy_mode: Option<ProxyMode>,
-    pub provider_type: Option<ProviderType>,
-    pub base_url: Option<String>,
-    pub models_endpoint: Option<String>,
+    /// Whole-directory patch for `apis`: **absent** keeps the current
+    /// sections; **present** (including `{}`) replaces the entire map
+    /// (sections not repeated are dropped). Per-section overrides are not
+    /// merged field-by-field — send the full desired directory.
+    #[serde(default)]
+    pub apis: Option<IndexMap<ApiKind, ApiConfig>>,
+    /// Triple-state `fallback` patch: absent → keep, JSON `null` → clear
+    /// (back to the single-protocol-key default), value → set.
+    #[serde(default, deserialize_with = "double_option_api_kind")]
+    pub fallback: Option<Option<ApiKind>>,
     pub timeout_secs: Option<u64>,
     pub headers: Option<HashMap<String, String>>,
     pub body_overrides: Option<HashMap<String, serde_json::Value>>,
@@ -95,24 +118,17 @@ pub struct UpdateProviderRequest {
     pub enabled_models: Option<Vec<String>>,
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Optional upstream_protocol patch. Field **absent** keeps the current
-    /// value; field present as JSON `null` clears it (back to derive);
-    /// field present with a value sets it.
-    #[serde(default, deserialize_with = "double_option_upstream_protocol")]
-    pub upstream_protocol: Option<Option<sag_core::UpstreamProtocol>>,
 }
 
-/// Serde helper for the triple-state `upstream_protocol` patch: missing →
+/// Serde helper for the triple-state `fallback` patch: missing →
 /// `None` (keep — uses `#[serde(default)]`), JSON `null` →
-/// `Some(None)` (clear to derive), value → `Some(Some(v))` (set).
-fn double_option_upstream_protocol<'de, D>(
-    deserializer: D,
-) -> Result<Option<Option<sag_core::UpstreamProtocol>>, D::Error>
+/// `Some(None)` (clear), value → `Some(Some(v))` (set).
+fn double_option_api_kind<'de, D>(deserializer: D) -> Result<Option<Option<ApiKind>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    let value: Option<sag_core::UpstreamProtocol> = Option::deserialize(deserializer)?;
+    let value: Option<ApiKind> = Option::deserialize(deserializer)?;
     Ok(Some(value))
 }
 
@@ -126,9 +142,13 @@ pub struct ProviderInfo {
     pub name: String,
     pub api_keys: Vec<String>,
     pub key_strategy: KeyStrategy,
-    pub provider_type: String,
-    pub base_url: String,
-    pub models_endpoint: String,
+    /// Protocol API catalog: one section per declared [`ApiKind`], each
+    /// carrying its own `base_url` (the only address source) plus the
+    /// optional `models_endpoint` / protocol override fields.
+    pub apis: IndexMap<ApiKind, ApiConfig>,
+    /// Downgrade protocol for translated-lane dispatch (`null` when the
+    /// single protocol key makes it implicit).
+    pub fallback: Option<ApiKind>,
     pub proxy_mode: ProxyMode,
     pub timeout_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,14 +163,13 @@ pub struct ProviderInfo {
     pub role_mappings: HashMap<String, String>,
     pub enabled_models: Vec<String>,
     pub enabled: bool,
-    /// Explicit upstream protocol declaration, or `null` when derived from
-    /// `provider_type` (always present in JSON — null means "not declared").
-    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
-    /// Effective upstream protocol: explicit declaration when present,
-    /// otherwise the value derived from `provider_type`.
-    pub effective_upstream_protocol: String,
-    /// Derived capability bitmap for this provider (provider_type +
-    /// effective upstream protocol), as a JSON object — read-only UI aid.
+    /// Per-API capability bitmap keyed by `ApiKind` — a JSON object of
+    /// `{ "<api_kind>": { ...capabilities } }`, read-only UI aid.
+    ///
+    /// Values come from `sag_dispatch::dispatch::capability::
+    /// target_capabilities`, the single source of truth for the protocol
+    /// capability matrix (anthropic / responses claim `hosted_tools`,
+    /// responses claims `stateful`, chat claims neither).
     pub capabilities: serde_json::Value,
 }
 
@@ -158,8 +177,11 @@ pub struct ProviderInfo {
 pub struct ListProvidersQuery {
     #[serde(default)]
     pub model_name: Option<String>,
+    /// Only keep providers that declare this API section (e.g.
+    /// `apis=anthropic_messages`). Replaces the deleted `provider_type`
+    /// filter — unknown query fields are tolerated by serde_urlencoded.
     #[serde(default)]
-    pub provider_type: Option<ProviderType>,
+    pub apis: Option<ApiKind>,
     #[serde(default)]
     pub sort: Option<String>,
 }
@@ -178,12 +200,31 @@ fn provider_matches_filters(cfg: &ProviderConfig, query: &ListProvidersQuery) ->
         None => true,
     };
 
-    let matches_type = query
-        .provider_type
-        .map(|provider_type| cfg.provider_type == provider_type)
+    let matches_api = query
+        .apis
+        .map(|kind| cfg.apis.contains_key(&kind))
         .unwrap_or(true);
 
-    matches_model && matches_type
+    matches_model && matches_api
+}
+
+/// Capability JSON for the provider's declared API sections, keyed by
+/// [`ApiKind`]. Values are [`sag_dispatch::dispatch::capability::target_capabilities`]
+/// — the dispatch pre-check table — so the admin UI and the router always
+/// agree on what each protocol supports.
+fn provider_capabilities(cfg: &ProviderConfig) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = cfg
+        .apis
+        .keys()
+        .map(|kind| {
+            let caps = sag_dispatch::dispatch::capability::target_capabilities(*kind);
+            (
+                kind.as_str().to_string(),
+                serde_json::to_value(caps).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(map)
 }
 
 fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
@@ -191,9 +232,8 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         name: name.to_string(),
         api_keys: cfg.api_keys.clone(),
         key_strategy: cfg.key_strategy,
-        provider_type: cfg.provider_type.as_str().to_string(),
-        base_url: cfg.base_url.clone(),
-        models_endpoint: cfg.models_endpoint.clone(),
+        apis: cfg.apis.clone(),
+        fallback: cfg.fallback,
         proxy_mode: cfg.proxy_mode,
         timeout_secs: cfg.timeout_secs,
         chunk_timeout_secs: cfg.chunk_timeout_secs,
@@ -206,61 +246,7 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         role_mappings: cfg.role_mappings.clone(),
         enabled_models: cfg.enabled_models.clone(),
         enabled: cfg.enabled,
-        upstream_protocol: cfg.upstream_protocol,
-        effective_upstream_protocol: {
-            let derived = sag_core::derive_upstream_protocol(cfg.provider_type.as_str());
-            sag_core::effective_upstream_protocol(cfg.upstream_protocol, derived)
-                .as_str()
-                .to_string()
-        },
-        capabilities: {
-            let derived = sag_core::derive_upstream_protocol(cfg.provider_type.as_str());
-            let effective = sag_core::effective_upstream_protocol(cfg.upstream_protocol, derived);
-            // Mirror the dispatch capability table for the effective pair.
-            let caps = match (cfg.provider_type.as_str(), effective) {
-                ("openai", sag_core::UpstreamProtocol::ChatCompletions) => sag_core::Capabilities {
-                    streaming: true,
-                    reasoning: true,
-                    tools: true,
-                    images: true,
-                    documents: true,
-                    stateful: false,
-                    hosted_tools: false,
-                    background: false,
-                },
-                ("anthropic", _) => sag_core::Capabilities {
-                    streaming: true,
-                    reasoning: true,
-                    tools: true,
-                    images: true,
-                    documents: true,
-                    stateful: false,
-                    hosted_tools: false,
-                    background: false,
-                },
-                (_, sag_core::UpstreamProtocol::Responses) => sag_core::Capabilities {
-                    streaming: true,
-                    reasoning: true,
-                    tools: true,
-                    images: true,
-                    documents: false,
-                    stateful: false,
-                    hosted_tools: false,
-                    background: false,
-                },
-                _ => sag_core::Capabilities {
-                    streaming: true,
-                    reasoning: false,
-                    tools: false,
-                    images: false,
-                    documents: false,
-                    stateful: false,
-                    hosted_tools: false,
-                    background: false,
-                },
-            };
-            serde_json::to_value(caps).unwrap_or(serde_json::Value::Null)
-        },
+        capabilities: provider_capabilities(cfg),
     }
 }
 
@@ -289,26 +275,37 @@ pub async fn list_providers(
 }
 
 /// POST /api/providers — add a new provider and register it in the runtime registry.
-#[instrument(skip(state), fields(provider_name, provider_type))]
+#[instrument(skip(state), fields(provider_name))]
 pub async fn add_provider(
     State(state): State<AppState>,
     Json(req): Json<AddProviderRequest>,
 ) -> impl IntoResponse {
     tracing::Span::current().record("provider_name", &req.name);
-    tracing::Span::current().record("provider_type", req.provider_type.as_str());
 
     // Validate: at least one API key is required (early check).
     if req.api_keys.is_empty() {
         return AppError::BadRequest("at least one api_key required".into()).into_response();
     }
+    // Validate: the `apis` catalog must not be empty (the coordinator's
+    // full validate additionally requires a protocol key + fallback rules).
+    if req.apis.is_empty() {
+        return AppError::BadRequest(
+            "at least one api section required, e.g. apis.chat_completions with its base_url"
+                .into(),
+        )
+        .into_response();
+    }
+
+    let mut apis = req.apis;
+    normalize_apis(&mut apis);
+    let echo_apis = apis.clone();
 
     let pc = ProviderConfig {
-        provider_type: req.provider_type,
         api_keys: req.api_keys.clone(),
         key_strategy: req.key_strategy,
-        base_url: req.base_url.clone(),
+        apis,
+        fallback: req.fallback,
         proxy_mode: req.proxy_mode,
-        models_endpoint: sag_config::normalize_models_endpoint(&req.models_endpoint),
         timeout_secs: req.timeout_secs,
         headers: req.headers.clone(),
         body_overrides: req.body_overrides.clone(),
@@ -321,7 +318,6 @@ pub async fn add_provider(
         anthropic_cache_control: true,
         chunk_timeout_secs: None,
         ttfb_timeout_secs: None,
-        upstream_protocol: req.upstream_protocol,
     };
 
     // Delegate to the coordinator which atomically writes config + provider
@@ -331,9 +327,8 @@ pub async fn add_provider(
             StatusCode::CREATED,
             Json(json!({
                 "name": req.name,
-                "provider_type": req.provider_type.as_str(),
-                "base_url": req.base_url,
-                "models_endpoint": sag_config::normalize_models_endpoint(&req.models_endpoint),
+                "apis": echo_apis,
+                "fallback": req.fallback,
             })),
         )
             .into_response(),
@@ -378,14 +373,12 @@ pub async fn update_provider(
         if let Some(v) = req.proxy_mode {
             pc.proxy_mode = v;
         }
-        if let Some(v) = req.provider_type {
-            pc.provider_type = v;
+        if let Some(apis) = req.apis {
+            pc.apis = apis;
+            normalize_apis(&mut pc.apis);
         }
-        if let Some(v) = req.base_url {
-            pc.base_url = v;
-        }
-        if let Some(v) = req.models_endpoint {
-            pc.models_endpoint = sag_config::normalize_models_endpoint(&v);
+        if let Some(patch) = req.fallback {
+            pc.fallback = patch;
         }
         if let Some(v) = req.timeout_secs {
             pc.timeout_secs = v;
@@ -413,9 +406,6 @@ pub async fn update_provider(
         }
         if let Some(v) = req.enabled {
             pc.enabled = v;
-        }
-        if let Some(patch) = req.upstream_protocol {
-            pc.upstream_protocol = patch;
         }
 
         pc
@@ -503,12 +493,14 @@ pub async fn delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{build_state, build_state_with_proxy, one_provider_config, test_app};
+    use crate::test_utils::{
+        build_state, build_state_with_proxy, one_provider_config, test_app, test_provider,
+    };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
-    use sag_config::{ProviderConfig, ProviderType, ProxyMode, RouteConfig, RouteTarget, Strategy};
+    use sag_config::{ApiKind, Pipeline, ProxyMode, RouteConfig, RouteTarget, Strategy};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -601,41 +593,26 @@ mod tests {
     #[tokio::test]
     async fn delete_provider_cascades_routes() {
         let mut providers = HashMap::new();
-        for name in ["openai", "anthropic"] {
+        for (name, kind) in [
+            ("openai", ApiKind::ChatCompletions),
+            ("anthropic", ApiKind::AnthropicMessages),
+        ] {
             providers.insert(
                 name.to_string(),
-                ProviderConfig {
-                    provider_type: if name == "openai" {
-                        ProviderType::OpenAI
-                    } else {
-                        ProviderType::Anthropic
-                    },
-                    api_keys: vec![format!("sk-{name}")],
-                    key_strategy: KeyStrategy::FillFirst,
-                    base_url: "https://example.com".into(),
-                    proxy_mode: ProxyMode::default(),
-                    models_endpoint: "models".into(),
-                    timeout_secs: 120,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled_models: vec![],
-                    enabled: true,
-                    anthropic_cache_control: true,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    upstream_protocol: None,
-                },
+                test_provider(
+                    kind,
+                    "https://example.com",
+                    vec![format!("sk-{name}")],
+                    vec![],
+                ),
             );
         }
 
         let routes = vec![
             RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -647,7 +624,6 @@ mod tests {
                         retries: None,
                         timeout_secs: None,
                         extra: HashMap::new(),
-                        upstream_protocol: None,
                         capabilities: None,
                     },
                     RouteTarget {
@@ -657,14 +633,14 @@ mod tests {
                         timeout_secs: None,
                         extra: HashMap::new(),
                         priority: 2,
-                        upstream_protocol: None,
                         capabilities: None,
                     },
                 ],
             },
             RouteConfig {
                 model_name: "claude-sonnet".into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -675,7 +651,6 @@ mod tests {
                     timeout_secs: None,
                     real_model: Some("claude-3-5-sonnet".into()),
                     priority: 1,
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             },
@@ -744,11 +719,12 @@ api_keys = ["test-key"]
 
 [providers.openai]
 api_keys = ["sk-test"]
+[providers.openai.apis.chat_completions]
 base_url = "https://api.openai.com/v1"
 
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["sk-ant"]
+[providers.anthropic.apis.anthropic_messages]
 base_url = "https://api.anthropic.com"
 
 [[routes]]
@@ -800,8 +776,8 @@ targets = [
             "anthropic provider section should be preserved: {content}"
         );
         assert!(
-            content.contains("provider_type = \"anthropic\""),
-            "anthropic provider_type should be present: {content}"
+            content.contains("base_url = \"https://api.anthropic.com\""),
+            "anthropic apis section base_url should be preserved: {content}"
         );
 
         assert!(
@@ -838,91 +814,51 @@ targets = [
         let arr = body["providers"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], "openai");
-        assert_eq!(arr[0]["models_endpoint"], "models");
+        assert_eq!(
+            arr[0]["apis"]["chat_completions"]["base_url"],
+            "https://api.openai.com/v1"
+        );
     }
 
     #[tokio::test]
-    async fn list_providers_filters_by_model_and_type_and_sorts_by_name() {
+    async fn list_providers_filters_by_model_and_api_and_sorts_by_name() {
         let mut providers = HashMap::new();
         providers.insert(
             "z-openai".into(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-z".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-z".into()],
+                vec!["gpt-4o".into()],
+            ),
         );
         providers.insert(
             "a-anthropic".into(),
-            ProviderConfig {
-                provider_type: ProviderType::Anthropic,
-                api_keys: vec!["sk-a".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.anthropic.com".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::AnthropicMessages,
+                "https://api.anthropic.com",
+                vec!["sk-a".into()],
+                vec!["gpt-4o".into()],
+            ),
         );
         providers.insert(
             "m-openai".into(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-m".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://example.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into(), "gpt-4.1".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://example.com/v1",
+                vec!["sk-m".into()],
+                vec!["gpt-4o".into(), "gpt-4.1".into()],
+            ),
         );
 
         let state = build_state(providers, vec![]).await;
         let app = test_app(state);
 
+        // `apis=chat_completions` replaces the deleted `provider_type`
+        // filter: the anthropic-only provider drops out.
         let req = Request::builder()
             .method("GET")
-            .uri("/api/providers?model_name=gpt-4o&provider_type=openai&sort=name")
+            .uri("/api/providers?model_name=gpt-4o&apis=chat_completions&sort=name")
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -937,51 +873,21 @@ targets = [
         let mut providers = HashMap::new();
         providers.insert(
             "openai".into(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-openai".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec![],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-openai".into()],
+                vec![],
+            ),
         );
         providers.insert(
             "restricted".into(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-restricted".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://example.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["other-model".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://example.com/v1",
+                vec!["sk-restricted".into()],
+                vec!["other-model".into()],
+            ),
         );
 
         let state = build_state(providers, vec![]).await;
@@ -1007,12 +913,15 @@ targets = [
         let app = test_app(state.clone());
         let _ = &state;
 
+        // `apis` replaces the whole directory (single section here, so the
+        // provider stays valid); `models_endpoint` is per-section now and
+        // normalized (`/v1/models/` → `v1/models`).
         let req = Request::builder()
             .method("PUT")
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"openai","base_url":"https://custom.com/v1","timeout_secs":60,"models_endpoint":"/v1/models/"}"#,
+                r#"{"name":"openai","timeout_secs":60,"apis":{"chat_completions":{"base_url":"https://custom.com/v1/","models_endpoint":"/v1/models/"}}}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -1020,12 +929,14 @@ targets = [
 
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
-        assert_eq!(p.base_url, "https://custom.com/v1");
-        assert_eq!(p.models_endpoint, "v1/models");
+        assert_eq!(p.apis.len(), 1);
+        let chat = &p.apis[&ApiKind::ChatCompletions];
+        assert_eq!(chat.base_url, "https://custom.com/v1");
+        assert_eq!(chat.models_endpoint.as_deref(), Some("v1/models"));
         assert_eq!(p.timeout_secs, 60);
         // Fields not in the update should keep their original values
         assert_eq!(p.api_keys, vec!["sk-test"]);
-        assert_eq!(p.provider_type, ProviderType::OpenAI);
+        assert_eq!(p.key_strategy, KeyStrategy::FillFirst);
     }
 
     #[tokio::test]
@@ -1039,14 +950,19 @@ targets = [
             .method("PUT")
             .uri("/api/providers")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"openai","models_endpoint":""}"#))
+            .body(Body::from(
+                r#"{"name":"openai","apis":{"chat_completions":{"base_url":"https://api.openai.com/v1","models_endpoint":""}}}"#,
+            ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
-        assert_eq!(p.models_endpoint, "models");
+        assert_eq!(
+            p.apis[&ApiKind::ChatCompletions].models_endpoint.as_deref(),
+            Some("models")
+        );
     }
 
     // 7. Update provider — 404
@@ -1062,16 +978,16 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"nonexistent","base_url":"https://x.com"}"#,
+                r#"{"name":"nonexistent","apis":{"chat_completions":{"base_url":"https://x.com"}}}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // 8. Update provider — update api_key and provider_type
+    // 8. Update provider — update api_keys and swap the apis directory
     #[tokio::test]
-    async fn update_provider_key_and_type() {
+    async fn update_provider_key_and_api() {
         let (providers, routes) = one_provider_config("openai", vec![]);
         let state = build_state(providers, routes).await;
         let app = test_app(state.clone());
@@ -1082,7 +998,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"openai","api_keys":["sk-updated"],"provider_type":"anthropic","base_url":"https://api.anthropic.com"}"#,
+                r#"{"name":"openai","api_keys":["sk-updated"],"apis":{"anthropic_messages":{"base_url":"https://api.anthropic.com"}}}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -1091,9 +1007,14 @@ targets = [
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.api_keys, vec!["sk-updated"]);
-        assert_eq!(p.provider_type, ProviderType::Anthropic);
-        assert_eq!(p.base_url, "https://api.anthropic.com");
-        assert_eq!(p.models_endpoint, "models");
+        assert_eq!(p.apis.len(), 1, "apis patch replaces the directory");
+        assert!(
+            !p.apis.contains_key(&ApiKind::ChatCompletions),
+            "the previous chat section must be dropped by the directory patch"
+        );
+        let ant = &p.apis[&ApiKind::AnthropicMessages];
+        assert_eq!(ant.base_url, "https://api.anthropic.com");
+        assert_eq!(ant.models_endpoint, None, "provider default behavior");
 
         // Ensure the runtime registry was updated
         let reg = state.providers.read().await;
@@ -1109,9 +1030,8 @@ targets = [
         // 1. Add provider with model_strip_fields
         let add_payload = serde_json::json!({
             "name": "new_provider",
-            "provider_type": "openai",
             "api_keys": ["sk-new"],
-            "base_url": "https://api.example.com/v1",
+            "apis": {"chat_completions": {"base_url": "https://api.example.com/v1"}},
             "model_strip_fields": {
                 "glm-5.2": ["chat_template_kwargs"],
                 "qwen-2.5": ["extra_a"]
@@ -1218,7 +1138,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1"}"#,
+                r#"{"name":"new_provider","api_keys":["sk-new"],"apis":{"chat_completions":{"base_url":"https://api.example.com/v1"}}}"#,
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -1242,7 +1162,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1","proxy_mode":"disabled"}"#,
+                r#"{"name":"new_provider","api_keys":["sk-new"],"apis":{"chat_completions":{"base_url":"https://api.example.com/v1"}},"proxy_mode":"disabled"}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -1293,7 +1213,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"openai","base_url":"https://custom.com/v1"}"#,
+                r#"{"name":"openai","apis":{"chat_completions":{"base_url":"https://custom.com/v1"}}}"#,
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -1302,7 +1222,10 @@ targets = [
         let cfg = state.config.read().await;
         let p = cfg.providers.get("openai").unwrap();
         assert_eq!(p.proxy_mode, ProxyMode::Disabled);
-        assert_eq!(p.base_url, "https://custom.com/v1");
+        assert_eq!(
+            p.apis[&ApiKind::ChatCompletions].base_url,
+            "https://custom.com/v1"
+        );
     }
 
     #[tokio::test]
@@ -1362,7 +1285,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1","proxy_mode":"enabled"}"#,
+                r#"{"name":"new_provider","api_keys":["sk-new"],"apis":{"chat_completions":{"base_url":"https://api.example.com/v1"}},"proxy_mode":"enabled"}"#,
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -1396,7 +1319,7 @@ targets = [
             .uri("/api/providers")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"name":"new_provider","provider_type":"openai","api_keys":["sk-new"],"base_url":"https://api.example.com/v1","proxy_mode":"enabled"}"#,
+                r#"{"name":"new_provider","api_keys":["sk-new"],"apis":{"chat_completions":{"base_url":"https://api.example.com/v1"}},"proxy_mode":"enabled"}"#,
             ))
             .unwrap();
         let response = app.oneshot(req).await.unwrap();
@@ -1434,10 +1357,14 @@ targets = [
         assert_eq!(cfg.providers["openai"].proxy_mode, ProxyMode::Inherit);
     }
 
-    // ── M7: upstream_protocol admin round-trip + illegal enum ──
+    // ── M7 rework: apis / fallback admin round-trip + illegal enum ──
 
+    /// Round-trip an `apis` directory with all three protocol sections plus
+    /// a `fallback`, and assert the read-side capability matrix is keyed by
+    /// [`ApiKind`] with values taken from
+    /// `sag_dispatch::dispatch::capability::target_capabilities`.
     #[tokio::test]
-    async fn add_and_list_provider_round_trips_upstream_protocol() {
+    async fn add_and_list_provider_round_trips_apis_fallback_and_capabilities() {
         let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
         let state = build_state(providers, routes).await;
         let app = test_app(state.clone());
@@ -1448,11 +1375,14 @@ targets = [
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
-                    "name": "oa-responses",
+                    "name": "oa-multi",
                     "api_keys": ["sk-test"],
-                    "provider_type": "openai",
-                    "base_url": "https://api.openai.com/v1",
-                    "upstream_protocol": "responses",
+                    "apis": {
+                        "chat_completions": {"base_url": "https://api.openai.com/v1"},
+                        "responses": {"base_url": "https://api.openai.com/v1"},
+                        "anthropic_messages": {"base_url": "https://api.anthropic.com"},
+                    },
+                    "fallback": "responses",
                 })
                 .to_string(),
             ))
@@ -1479,22 +1409,60 @@ targets = [
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["name"] == "oa-responses")
+            .find(|p| p["name"] == "oa-multi")
             .expect("provider present");
-        assert_eq!(p["upstream_protocol"], serde_json::json!("responses"));
+        assert_eq!(p["fallback"], serde_json::json!("responses"));
         assert_eq!(
-            p["effective_upstream_protocol"],
-            serde_json::json!("responses")
+            p["apis"]["chat_completions"]["base_url"],
+            "https://api.openai.com/v1"
         );
-        assert!(p["capabilities"].is_object());
+        assert_eq!(
+            p["apis"]["responses"]["base_url"],
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            p["apis"]["anthropic_messages"]["base_url"],
+            "https://api.anthropic.com"
+        );
+
+        // Capability matrix: keyed by ApiKind, values aligned with the
+        // dispatch `target_capabilities` table (anthropic claims
+        // hosted_tools; responses claims stateful + hosted_tools; chat
+        // claims neither).
+        let caps = &p["capabilities"];
+        assert!(caps.is_object());
+        assert_eq!(
+            caps["chat_completions"]["hosted_tools"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            caps["chat_completions"]["stateful"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            caps["anthropic_messages"]["hosted_tools"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            caps["anthropic_messages"]["stateful"],
+            serde_json::json!(false)
+        );
+        assert_eq!(caps["responses"]["hosted_tools"], serde_json::json!(true));
+        assert_eq!(caps["responses"]["stateful"], serde_json::json!(true));
+        assert_eq!(
+            caps["responses"]["documents"],
+            serde_json::json!(false),
+            "responses input schema takes no file parts"
+        );
     }
 
     #[tokio::test]
-    async fn update_provider_clears_upstream_protocol_with_null() {
+    async fn update_provider_clears_fallback_with_null() {
         let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
         let mut providers = providers;
-        let pc = providers.get_mut("openai").unwrap();
-        pc.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
+        // A single-protocol provider may still declare an explicit fallback
+        // (it must be one of the configured protocol keys).
+        providers.get_mut("openai").unwrap().fallback = Some(ApiKind::ChatCompletions);
         let state = build_state(providers, routes).await;
         let app = test_app(state.clone());
 
@@ -1508,7 +1476,7 @@ targets = [
                     .body(Body::from(
                         serde_json::json!({
                             "name": "openai",
-                            "upstream_protocol": null,
+                            "fallback": null,
                         })
                         .to_string(),
                     ))
@@ -1520,13 +1488,16 @@ targets = [
 
         let config = state.config.read().await;
         assert_eq!(
-            config.providers["openai"].upstream_protocol, None,
-            "null patch must clear to derive"
+            config.providers["openai"].fallback, None,
+            "null patch must clear fallback back to the implicit default"
         );
     }
 
+    /// The `apis` table key is a typed enum: an unknown key must fail
+    /// deserialization (422), same strictness as every other typed config
+    /// enum — while unknown *fields* stay tolerated.
     #[tokio::test]
-    async fn add_provider_illegal_upstream_protocol_value_is_422() {
+    async fn add_provider_illegal_apis_key_is_422() {
         let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
         let state = build_state(providers, routes).await;
         let app = test_app(state);
@@ -1541,7 +1512,7 @@ targets = [
                         serde_json::json!({
                             "name": "bad",
                             "api_keys": ["sk"],
-                            "upstream_protocol": "nope",
+                            "apis": {"teleport": {"base_url": "https://x.com"}},
                         })
                         .to_string(),
                     ))
@@ -1552,7 +1523,7 @@ targets = [
         assert_eq!(
             resp.status(),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "unknown enum value must be 422"
+            "unknown apis key must be 422"
         );
     }
 
@@ -1572,6 +1543,7 @@ targets = [
                         serde_json::json!({
                             "name": "tolerant",
                             "api_keys": ["sk"],
+                            "apis": {"chat_completions": {"base_url": "https://x.com/v1"}},
                             "some_future_field": {"nested": true},
                         })
                         .to_string(),
@@ -1583,18 +1555,18 @@ targets = [
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
-    // ── M7 rework: mutate() full validate rejects illegal protocol × type ──
+    // ── M7 rework: mutate() full validate rejects a bad fallback ──────
 
-    /// B1: an anthropic provider declaring `upstream_protocol =
-    /// "chat_completions"` fails `GatewayConfig::validate` on the
-    /// coordinator's post-mutation check. Must surface as 4xx and must
-    /// NOT rewrite the on-disk config file.
+    /// B1: a provider declaring `fallback = "responses"` without a
+    /// `responses` section in `apis` fails `GatewayConfig::validate` on the
+    /// coordinator's post-mutation check. Must surface as 4xx and must NOT
+    /// rewrite the on-disk config file.
     #[tokio::test]
-    async fn add_provider_illegal_protocol_combo_is_4xx_and_config_file_unchanged() {
+    async fn add_provider_illegal_fallback_is_4xx_and_config_file_unchanged() {
         use crate::test_utils::build_file_backed_state;
 
         let path = std::env::temp_dir().join(format!(
-            "sag_admin_illegal_proto_{}.toml",
+            "sag_admin_illegal_fallback_{}.toml",
             uuid::Uuid::new_v4()
         ));
         let _ = std::fs::remove_file(&path);
@@ -1613,11 +1585,10 @@ targets = [
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "name": "ant-bad",
-                            "provider_type": "anthropic",
-                            "api_keys": ["sk-ant"],
-                            "base_url": "https://api.anthropic.com/v1",
-                            "upstream_protocol": "chat_completions",
+                            "name": "oa-bad",
+                            "api_keys": ["sk"],
+                            "apis": {"chat_completions": {"base_url": "https://api.openai.com/v1"}},
+                            "fallback": "responses",
                         })
                         .to_string(),
                     ))
@@ -1627,7 +1598,7 @@ targets = [
             .unwrap();
         assert!(
             resp.status().is_client_error(),
-            "illegal protocol combo must be 4xx, got {}",
+            "fallback outside the apis protocol keys must be 4xx, got {}",
             resp.status()
         );
 
@@ -1641,7 +1612,7 @@ targets = [
         // In-memory config must also be unchanged.
         let cfg = state.config.read().await;
         assert!(
-            !cfg.providers.contains_key("ant-bad"),
+            !cfg.providers.contains_key("oa-bad"),
             "invalid provider must not commit in-memory either"
         );
 

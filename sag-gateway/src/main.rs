@@ -353,7 +353,17 @@ async fn build_provider_registry(
             effective.as_ref(),
         ) {
             Ok(provider) => {
-                info!(name, provider_type = %provider_config.provider_type.as_str(), base_url = %provider_config.base_url, "provider registered");
+                // Catalog form: the protocol keys the provider declares plus
+                // one representative node address (no credentials ever).
+                let apis_keys: Vec<&str> =
+                    provider_config.apis.keys().map(|k| k.as_str()).collect();
+                let base_url = provider_config
+                    .apis
+                    .values()
+                    .next()
+                    .map(|api| api.base_url.as_str())
+                    .unwrap_or_default();
+                info!(name, apis = ?apis_keys, base_url, "provider registered");
                 providers.insert(name.clone(), provider);
             }
             Err(e) => {

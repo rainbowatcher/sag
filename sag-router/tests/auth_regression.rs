@@ -18,7 +18,7 @@ use axum::{
     middleware,
 };
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+    ApiConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
     ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::AppState;
@@ -30,34 +30,23 @@ use tower::ServiceExt;
 async fn build_protected_state() -> AppState {
     let mut providers = HashMap::new();
     for name in ["openai", "anthropic"] {
-        providers.insert(
-            name.to_string(),
-            ProviderConfig {
-                provider_type: if name == "openai" {
-                    ProviderType::OpenAI
-                } else {
-                    ProviderType::Anthropic
-                },
+        providers.insert(name.to_string(), {
+            let mut pc = ProviderConfig {
                 api_keys: vec![format!("sk-{name}")],
                 key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
                 proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
                 timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec![],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
-        );
+                ..ProviderConfig::default()
+            };
+            pc.apis.insert(
+                sag_core::ApiKind::ChatCompletions,
+                ApiConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    ..ApiConfig::default()
+                },
+            );
+            pc
+        });
     }
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
@@ -66,7 +55,8 @@ async fn build_protected_state() -> AppState {
         providers,
         routes: vec![RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -77,7 +67,6 @@ async fn build_protected_state() -> AppState {
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 1,
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }],
@@ -87,8 +76,7 @@ async fn build_protected_state() -> AppState {
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (name, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> =
-            Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
+        let provider = sag_providers::create_provider(name.clone(), pc).unwrap();
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);
@@ -156,7 +144,7 @@ async fn auth_regression_add_provider_completes_through_auth_middleware() {
                 .body(Body::from(
                     // Fixture already has openai + anthropic; add a third
                     // so the create path is exercised without a 409 conflict.
-                    r#"{"name":"mistral","api_keys":["sk-mistral"],"provider_type":"openai","base_url":"https://api.mistral.ai/v1"}"#,
+                    r#"{"name":"mistral","api_keys":["sk-mistral"],"apis":{"chat_completions":{"base_url":"https://api.mistral.ai/v1"}}}"#,
                 ))
                 .unwrap(),
         )
@@ -221,9 +209,7 @@ async fn auth_regression_update_provider_completes_through_auth_middleware() {
                 .uri("/api/providers")
                 .header("Authorization", "Bearer regression-key")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"name":"openai","base_url":"https://updated.com/v1"}"#,
-                ))
+                .body(Body::from(r#"{"name":"openai","api_keys":["sk-openai"]}"#))
                 .unwrap(),
         )
         .await

@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import ModelManager from "@/components/ModelManager.vue"
+import ApisEditor from "@/components/providers/ApisEditor.vue"
 import { Button } from "@/components/ui/button"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
@@ -21,7 +22,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { ProxyMode, UpstreamProtocol } from "@/types/api"
+import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
 
 const store = useProviderStore()
 
@@ -42,13 +43,30 @@ onMounted(() => {
 const apiKeys = ref<string[]>([""])
 const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
 
+// ── API sections (protocol catalog) ──────────────────────────
+const apis = ref<Partial<Record<ApiKind, ApiConfig>>>({})
+const fallback = ref<ApiKind | null>(null)
+const apisEditor = ref<{ validate: () => string | null } | null>(null)
+
+/** The section model listing / model tests probe: chat_completions, else the first declared. */
+const primaryKind = computed<ApiKind | null>(() => {
+  const keys = Object.keys(apis.value) as ApiKind[]
+  if (keys.includes("chat_completions")) return "chat_completions"
+  return keys[0] ?? null
+})
+const primaryApi = computed<ApiConfig | null>(() =>
+  primaryKind.value ? (apis.value[primaryKind.value] ?? null) : null,
+)
+
+/** Translated-lane protocol badge shown next to models. */
+const defaultProtocol = computed<ApiKind | undefined>(() => {
+  const protocols = (Object.keys(apis.value) as ApiKind[]).filter((k) => k !== "image")
+  if (fallback.value) return fallback.value
+  return protocols.length === 1 ? protocols[0] : undefined
+})
+
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
-const modelsEndpoint = ref("models")
-
-function defaultModelsEndpoint(providerType?: string) {
-  return providerType === "anthropic" ? "v1/models" : "models"
-}
 
 function parsedHeadersValue(): Record<string, string> {
   return headers.value.reduce(
@@ -58,6 +76,11 @@ function parsedHeadersValue(): Record<string, string> {
     },
     {} as Record<string, string>,
   )
+}
+
+/** Effective probe headers: section overrides fully replace provider-level defaults. */
+function effectiveHeaders(): Record<string, string> {
+  return primaryApi.value?.headers ?? parsedHeadersValue()
 }
 
 function roleMappingsMap(): Record<string, string> {
@@ -70,24 +93,34 @@ function roleMappingsMap(): Record<string, string> {
   )
 }
 
-function onFetchModels(endpoint: string) {
+function onFetchModels() {
+  const primary = primaryApi.value
+  if (!primary) {
+    store.upstreamModelsError = "Declare an API section first (APIs tab)"
+    return
+  }
   store.fetchUpstreamModels({
-    base_url: form.state.values.base_url,
+    base_url: primary.base_url,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    headers: parsedHeadersValue(),
-    provider_type: form.state.values.provider_type,
-    models_endpoint: endpoint,
+    headers: effectiveHeaders(),
+    api_kind: primaryKind.value ?? undefined,
+    models_endpoint: primary.models_endpoint,
     proxy_mode: proxyMode.value,
   })
 }
 
 function onTestModel(model: string) {
+  const primary = primaryApi.value
+  if (!primary) {
+    store.upstreamModelsError = "Declare an API section first (APIs tab)"
+    return
+  }
   store.testModelWithState(model, {
     model,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    base_url: form.state.values.base_url,
-    provider_type: form.state.values.provider_type,
-    headers: parsedHeadersValue(),
+    base_url: primary.base_url,
+    api_kind: primaryKind.value ?? undefined,
+    headers: effectiveHeaders(),
     proxy_mode: proxyMode.value,
   })
 }
@@ -96,16 +129,6 @@ function onTestModel(model: string) {
 // Inherit (default) follows the gateway-level proxy_url; never reuse a
 // saved value — the form's current selection is always what gets sent.
 const proxyMode = ref<ProxyMode>("inherit")
-
-// ── Upstream protocol ────────────────────────────────────────
-// "" = derive from provider_type (field omitted from the payload).
-const upstreamProtocol = ref<UpstreamProtocol | "">("")
-function deriveProtocol(type: string): string {
-  return type === "anthropic" ? "anthropic_messages" : "chat_completions"
-}
-const providerEffectiveProtocol = computed(
-  () => upstreamProtocol.value || deriveProtocol(form.state.values.provider_type),
-)
 
 // ── KV pairs ─────────────────────────────────────────────────
 const headers = ref<{ key: string; value: string }[]>([])
@@ -117,25 +140,15 @@ const stripFields = ref<string[]>([])
 // Cleanup of stale entries is handled by ModelOverrideEditor internally.
 const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>({})
 
-// ── Base URL defaults per provider type ──────────────────────
-const DEFAULT_BASE_URLS: Record<string, string> = {
-  openai: "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com",
-}
-
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
-  provider_type: z.string(),
-  base_url: z.string(),
   timeout_secs: z.union([z.number(), z.undefined()]),
 })
 
 const form = useForm({
   defaultValues: {
     name: "",
-    provider_type: "openai",
-    base_url: "https://api.openai.com/v1",
     timeout_secs: undefined as number | undefined,
   },
   validators: {
@@ -147,6 +160,12 @@ const form = useForm({
     const validKeys = apiKeys.value.filter((k) => k.trim().length > 0)
     if (validKeys.length === 0) {
       apiError.value = "At least one API key is required"
+      return
+    }
+
+    const apisError = apisEditor.value?.validate()
+    if (apisError) {
+      apiError.value = apisError
       return
     }
 
@@ -195,10 +214,10 @@ const form = useForm({
     try {
       await store.addProvider({
         name: value.name,
-        provider_type: value.provider_type,
-        base_url: value.base_url,
         api_keys: validKeys,
         key_strategy: keyStrategy.value,
+        apis: apis.value as Record<ApiKind, ApiConfig>,
+        ...(fallback.value ? { fallback: fallback.value } : {}),
         enabled_models: enabledModels.value,
         headers: Object.keys(parsedHeaders).length > 0 ? parsedHeaders : undefined,
         role_mappings: Object.keys(parsedRoleMappings).length > 0 ? parsedRoleMappings : undefined,
@@ -207,13 +226,7 @@ const form = useForm({
           Object.keys(parsedModelOverrides).length > 0 ? parsedModelOverrides : undefined,
         strip_fields: filteredStrip.length > 0 ? filteredStrip : undefined,
         timeout_secs: value.timeout_secs,
-        models_endpoint:
-          modelsEndpoint.value &&
-          modelsEndpoint.value !== defaultModelsEndpoint(value.provider_type)
-            ? modelsEndpoint.value
-            : undefined,
         proxy_mode: proxyMode.value,
-        upstream_protocol: upstreamProtocol.value || undefined,
       })
 
       emit("created")
@@ -223,16 +236,6 @@ const form = useForm({
     }
   },
 })
-
-// Auto-fill base_url when provider_type changes
-watch(
-  () => form.state.values.provider_type,
-  (newType) => {
-    if (newType && DEFAULT_BASE_URLS[newType]) {
-      form.setFieldValue("base_url", DEFAULT_BASE_URLS[newType])
-    }
-  },
-)
 
 function isInvalid(field: any): boolean {
   return field.state.meta.isTouched && field.state.meta.errors.length > 0
@@ -263,6 +266,7 @@ async function handleSubmit(event: Event) {
         <Tabs default-value="basic">
           <TabsList class="mb-4">
             <TabsTrigger value="basic">Basic</TabsTrigger>
+            <TabsTrigger value="apis">APIs</TabsTrigger>
             <TabsTrigger value="models">Models</TabsTrigger>
             <TabsTrigger value="advanced">Advanced</TabsTrigger>
           </TabsList>
@@ -283,50 +287,6 @@ async function handleSubmit(event: Event) {
                 <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
               </Field>
             </form.Field>
-
-            <form.Field name="provider_type" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Type</FieldLabel>
-                <Select
-                  :model-value="field.state.value"
-                  @update:model-value="(v) => field.handleChange(v as string)"
-                >
-                  <SelectTrigger :id="field.name">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent class="w-(--reka-select-trigger-width)">
-                    <SelectItem value="openai">OpenAI</SelectItem>
-                    <SelectItem value="anthropic">Anthropic</SelectItem>
-                  </SelectContent>
-                </Select>
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
-
-            <div class="col-span-2">
-              <ApiKeyEditor
-                :api-keys="apiKeys"
-                :key-strategy="keyStrategy"
-                @update:api-keys="apiKeys = $event"
-                @update:key-strategy="keyStrategy = $event"
-              />
-            </div>
-
-            <div class="col-span-2">
-              <form.Field name="base_url" #default="{ field }">
-                <Field :data-invalid="isInvalid(field)">
-                  <FieldLabel :for="field.name">Base URL</FieldLabel>
-                  <Input
-                    :id="field.name"
-                    :model-value="field.state.value"
-                    :aria-invalid="isInvalid(field)"
-                    @blur="field.handleBlur"
-                    @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                  />
-                  <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-                </Field>
-              </form.Field>
-            </div>
 
             <div class="space-y-1">
               <form.Field name="timeout_secs" #default="{ field }">
@@ -352,6 +312,15 @@ async function handleSubmit(event: Event) {
               </form.Field>
             </div>
 
+            <div class="col-span-2">
+              <ApiKeyEditor
+                :api-keys="apiKeys"
+                :key-strategy="keyStrategy"
+                @update:api-keys="apiKeys = $event"
+                @update:key-strategy="keyStrategy = $event"
+              />
+            </div>
+
             <div class="space-y-1">
               <FieldLabel>Proxy Mode</FieldLabel>
               <Select
@@ -372,32 +341,24 @@ async function handleSubmit(event: Event) {
                 proxy URL.
               </p>
             </div>
+          </TabsContent>
 
-            <div class="space-y-1">
-              <FieldLabel>Upstream Protocol</FieldLabel>
-              <Select
-                :model-value="upstreamProtocol"
-                @update:model-value="(v) => (upstreamProtocol = v as UpstreamProtocol | '')"
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Derived from type" />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="">Derived from type</SelectItem>
-                  <SelectItem value="chat_completions">Chat Completions</SelectItem>
-                  <SelectItem value="responses">Responses</SelectItem>
-                  <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
-                </SelectContent>
-              </Select>
-              <p class="text-muted-foreground text-xs">
-                Explicit upstream protocol. Leave as derive unless the endpoint natively speaks a
-                different protocol (e.g. Responses on an OpenAI-compatible base).
-              </p>
-            </div>
+          <!-- ─── Tab: APIs ───────────────────────────────────── -->
+          <TabsContent value="apis" class="space-y-4">
+            <ApisEditor ref="apisEditor" v-model="apis" v-model:fallback="fallback" />
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
           <TabsContent value="models" class="space-y-3">
+            <p v-if="primaryApi" class="text-muted-foreground text-xs">
+              Model listing probes
+              <code>{{ primaryKind }}</code>
+              → <code>{{ primaryApi.base_url }}</code
+              ><template v-if="primaryApi.models_endpoint"
+                >/{{ primaryApi.models_endpoint }}</template
+              ><template v-else>/models</template>
+              (edit on the APIs tab).
+            </p>
             <ModelManager
               :provider-name="form.state.values.name"
               :enabled-models="enabledModels"
@@ -405,9 +366,8 @@ async function handleSubmit(event: Event) {
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
-              v-model:models-endpoint="modelsEndpoint"
               v-model:model-overrides="modelOverridesMap"
-              :upstream-protocol="providerEffectiveProtocol"
+              :upstream-protocol="defaultProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"
@@ -416,6 +376,12 @@ async function handleSubmit(event: Event) {
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->
           <TabsContent value="advanced" class="space-y-4">
+            <p class="text-muted-foreground text-xs">
+              Provider-level defaults below apply to every API section. A field declared inside an
+              <strong>APIs</strong> section <strong>fully replaces</strong> the default of the same
+              name for that section (maps are not merged, arrays not unioned).
+            </p>
+
             <KvEditor
               v-model="headers"
               title="Headers"

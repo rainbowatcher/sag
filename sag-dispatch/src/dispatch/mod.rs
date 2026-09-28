@@ -66,23 +66,27 @@ pub struct ResolvedTarget {
     pub extra: HashMap<String, serde_json::Value>,
     pub retries: u32,
     pub timeout_secs: u64,
-    /// Effective upstream protocol: explicit target/provider declaration
-    /// when present, otherwise derived from `provider_type`.
-    pub upstream_protocol: sag_core::UpstreamProtocol,
-    /// Whether the effective protocol came from an explicit declaration
-    /// (target or provider). Only an explicit declaration can select
-    /// [`Lane::Native`] (§4.2).
-    pub upstream_protocol_explicit: bool,
+    /// The protocol this request actually talks to upstream: the ingress
+    /// protocol on a native lane, the provider's `fallback` on a translated
+    /// one, or [`ApiKind::Image`] on an image-pipeline route.
+    pub upstream_protocol: sag_core::ApiKind,
     /// Lane for this target under the request's ingress protocol.
     pub lane: sag_core::Lane,
 }
 
-/// Resolved route data: ordered targets, configured `api_endpoint`,
-/// strategy, sticky-failover token captured at decision time, plus the
-/// route-identity facts (`route_name`, wall-clock `started_at`) that the
-/// upcoming analytics route-start event consumes.
+/// Resolved route data: ordered targets, dispatch pipeline, the image
+/// route's `api_endpoint`, strategy, sticky-failover token captured at
+/// decision time, plus the route-identity facts (`route_name`, wall-clock
+/// `started_at`) that the upcoming analytics route-start event consumes.
 pub struct ResolvedRoute {
     pub targets: Vec<ResolvedTarget>,
+    /// The route's dispatch pipeline. Routes with [`Pipeline::Image`] are
+    /// dispatched by [`dispatch_image`], chat routes by [`dispatch_chat`].
+    pub pipeline: sag_config::Pipeline,
+    /// Real upstream path for the image pipeline
+    /// (`route.api_endpoint`, defaulting to `/images/generations`).
+    /// Always empty on the chat pipeline — chat paths are derived from the
+    /// actually-used protocol inside the provider.
     pub api_endpoint: String,
     pub strategy: Strategy,
     pub sticky_token: sag_state::StickyToken,
@@ -149,6 +153,23 @@ pub struct DispatchCtx<'a> {
 // ═══════════════════════════════════════════════════════════════════
 // Circuit breaker helpers — shared across the dispatch submodules.
 // ═══════════════════════════════════════════════════════════════════
+
+/// Base address a target dispatches to: `apis.<actually-used-protocol>.
+/// base_url`, trailing `/` trimmed (the normalization the circuit key's
+/// address dimension uses). A missing provider or API node yields an empty
+/// string rather than an invented address — such targets all share one
+/// degenerate circuit key.
+pub(in crate::dispatch) fn target_base_url(
+    providers: &HashMap<String, ProviderConfig>,
+    provider_name: &str,
+    kind: sag_core::ApiKind,
+) -> String {
+    providers
+        .get(provider_name)
+        .and_then(|pc| pc.apis.get(&kind))
+        .map(|api| api.base_url.trim_end_matches('/').to_string())
+        .unwrap_or_default()
+}
 
 /// Circuit-gate permit (RAII guard). `'a` only borrows the
 /// [`DispatchRuntime`] snapshot fields — it never carries a
@@ -265,6 +286,11 @@ impl Drop for ProbeGuard<'_> {
 
 /// Check whether a target's circuit allows a try.
 ///
+/// `url` is the upstream base address this target dispatches to (the
+/// `apis.<actually-used-protocol>.base_url`, trimmed of trailing `/`) —
+/// it is part of the circuit key so targets on different addresses have
+/// isolated health while 同址多协议 targets share one breaker.
+///
 /// Returns `None` if the target is `Open` (cooling down) or is `HalfOpen`
 /// with a probe already in flight — in both cases the caller should skip to
 /// the next target. Returns `Some(CircuitPermit)` when the target may be
@@ -276,9 +302,10 @@ pub(in crate::dispatch) async fn circuit_allows_target<'a>(
     model: &str,
     provider_name: &str,
     real_model: &str,
+    url: &str,
     circuit_breaker_cfg: &sag_config::CircuitBreakerConfig,
 ) -> Option<CircuitPermit<'a>> {
-    let circuit_key = RouteTargetKey::new(model, provider_name, real_model);
+    let circuit_key = RouteTargetKey::new(model, provider_name, real_model, url);
 
     // Single read pass. `can_probe_now` returns true for a healthy (Closed)
     // target as well as a due `Open`/`HalfOpen` one.
@@ -1133,7 +1160,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, ProxyMode};
+    use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1246,25 +1273,12 @@ mod tests {
         model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
     ) -> ProviderConfig {
         ProviderConfig {
-            provider_type: sag_config::ProviderType::OpenAI,
             api_keys: vec!["sk-test".into()],
             key_strategy: sag_config::KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs: 120,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
             model_overrides,
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
             anthropic_cache_control: false,
-            upstream_protocol: None,
+            ..ProviderConfig::default()
         }
     }
 
@@ -1962,7 +1976,7 @@ mod tests {
     #[test]
     fn probe_guard_drop_without_runtime_does_not_panic() {
         let rt = crate::testing::test_dispatch_runtime();
-        let guard = ProbeGuard::new(&rt, RouteTargetKey::new("m", "p", "rm"), 60);
+        let guard = ProbeGuard::new(&rt, RouteTargetKey::new("m", "p", "rm", "u"), 60);
         drop(guard); // must not panic
     }
 
@@ -1972,7 +1986,7 @@ mod tests {
     #[test]
     fn probe_guard_marked_completed_drop_is_noop() {
         let rt = crate::testing::test_dispatch_runtime();
-        let mut guard = ProbeGuard::new(&rt, RouteTargetKey::new("m", "p", "rm"), 60);
+        let mut guard = ProbeGuard::new(&rt, RouteTargetKey::new("m", "p", "rm", "u"), 60);
         guard.mark_completed();
         drop(guard); // no-op — must not panic even without a runtime
     }
@@ -1988,9 +2002,9 @@ mod tests {
         rt.circuit_breaker
             .write()
             .await
-            .open(RouteTargetKey::new("m", "p", "rm"), 3600, 0);
+            .open(RouteTargetKey::new("m", "p", "rm", "u"), 3600, 0);
 
-        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", "u", &cfg)
             .await
             .expect("half-open probe should be granted");
         let CircuitPermit::Probe(guard) = permit else {
@@ -2004,8 +2018,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let mut breaker = rt.circuit_breaker.write().await;
-            if breaker.to_half_open_if_due(&RouteTargetKey::new("m", "p", "rm"))
-                && breaker.try_acquire_probe(&RouteTargetKey::new("m", "p", "rm"))
+            if breaker.to_half_open_if_due(&RouteTargetKey::new("m", "p", "rm", "u"))
+                && breaker.try_acquire_probe(&RouteTargetKey::new("m", "p", "rm", "u"))
             {
                 break;
             }
@@ -2026,10 +2040,10 @@ mod tests {
     async fn apply_circuit_outcome_consumed_probe_failure_reschedules_once() {
         let rt = crate::testing::test_dispatch_runtime();
         let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "p", "rm");
+        let key = RouteTargetKey::new("m", "p", "rm", "u");
         rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
 
-        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", "u", &cfg)
             .await
             .expect("probe should be granted");
         assert!(
@@ -2080,7 +2094,7 @@ mod tests {
     async fn apply_circuit_outcome_success_closes_healthy_and_probe() {
         let rt = crate::testing::test_dispatch_runtime();
         let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "p", "rm");
+        let key = RouteTargetKey::new("m", "p", "rm", "u");
 
         // Healthy (Allowed) + Success: no entry is created, stays closed.
         let out = apply_circuit_outcome(
@@ -2098,7 +2112,7 @@ mod tests {
 
         // Probe + Success: the half-open entry is closed (recovery).
         rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
-        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", "u", &cfg)
             .await
             .expect("probe should be granted");
         let out = apply_circuit_outcome(&rt, permit, RetryOutcome::Success(7u32), &cfg).await;
@@ -2115,7 +2129,7 @@ mod tests {
     async fn apply_circuit_outcome_exhausted_opens_healthy_with_duration() {
         let rt = crate::testing::test_dispatch_runtime();
         let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "p", "rm");
+        let key = RouteTargetKey::new("m", "p", "rm", "u");
 
         let out = apply_circuit_outcome(
             &rt,
@@ -2150,7 +2164,7 @@ mod tests {
     async fn apply_circuit_outcome_non_retryable_healthy_does_not_open() {
         let rt = crate::testing::test_dispatch_runtime();
         let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "p", "rm");
+        let key = RouteTargetKey::new("m", "p", "rm", "u");
 
         let out = apply_circuit_outcome(
             &rt,
@@ -2173,10 +2187,10 @@ mod tests {
     async fn apply_circuit_outcome_non_retryable_probe_reschedules_not_cooldown() {
         let rt = crate::testing::test_dispatch_runtime();
         let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "p", "rm");
+        let key = RouteTargetKey::new("m", "p", "rm", "u");
         rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
 
-        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", "u", &cfg)
             .await
             .expect("probe should be granted");
         let out = apply_circuit_outcome(
@@ -2212,10 +2226,10 @@ mod tests {
     async fn probe_guard_release_probe_slot_releases_once() {
         let rt = crate::testing::test_dispatch_runtime();
         let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "p", "rm");
+        let key = RouteTargetKey::new("m", "p", "rm", "u");
         rt.circuit_breaker.write().await.open(key.clone(), 3600, 0);
 
-        let permit = circuit_allows_target(&rt, "m", "p", "rm", &cfg)
+        let permit = circuit_allows_target(&rt, "m", "p", "rm", "u", &cfg)
             .await
             .expect("probe should be granted");
         let CircuitPermit::Probe(guard) = permit else {

@@ -119,12 +119,12 @@ pub async fn update_settings(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_utils::{build_state_with_proxy, one_provider_config, test_app};
+    use crate::test_utils::{build_state_with_proxy, one_provider_config, test_app, test_provider};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
-    use sag_config::{KeyStrategy, ProviderConfig, ProviderType, ProxyMode};
+    use sag_config::{ApiKind, ProviderConfig, ProxyMode};
     use std::collections::HashMap;
     use tower::ServiceExt;
 
@@ -146,27 +146,14 @@ mod tests {
     }
 
     fn enabled_provider() -> ProviderConfig {
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            proxy_mode: ProxyMode::Enabled,
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        }
+        let mut pc = test_provider(
+            ApiKind::ChatCompletions,
+            "https://api.openai.com/v1",
+            vec!["sk-test".into()],
+            vec![],
+        );
+        pc.proxy_mode = ProxyMode::Enabled;
+        pc
     }
 
     #[tokio::test]

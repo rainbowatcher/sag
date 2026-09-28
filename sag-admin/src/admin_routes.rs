@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use sag_config::{GatewayConfig, RouteConfig, RouteTarget, Strategy};
+use sag_config::{GatewayConfig, Pipeline, RouteConfig, RouteTarget, Strategy};
 use sag_core::AppError;
 use serde::Serialize;
 use serde_json::json;
@@ -26,11 +26,6 @@ pub struct RouteTargetInput {
     pub retries: Option<u32>,
     #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
-    /// Optional explicit upstream protocol for this target (overrides the
-    /// provider-level declaration). Unknown *fields* are tolerated; an
-    /// unknown enum *value* fails deserialization (axum 422).
-    #[serde(default)]
-    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
     /// Optional fixed-key capability override. Unknown keys are rejected
     /// by `GatewayConfig::validate` on commit (400 via config error path).
     #[serde(default)]
@@ -46,7 +41,6 @@ impl From<RouteTargetInput> for RouteTarget {
             timeout_secs: None,
             priority: t.priority,
             extra: t.extra,
-            upstream_protocol: t.upstream_protocol,
             capabilities: t.capabilities,
         }
     }
@@ -55,8 +49,14 @@ impl From<RouteTargetInput> for RouteTarget {
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateRouteRequest {
     pub model_name: String,
-    #[serde(default = "default_api_endpoint")]
-    pub api_endpoint: String,
+    /// Dispatch pipeline (default `chat`). `image` routes additionally
+    /// require `api_endpoint`; chat routes must not set it.
+    #[serde(default)]
+    pub pipeline: Pipeline,
+    /// Real upstream path appended to `apis.image.base_url` — only legal
+    /// when `pipeline = "image"` (omitted/`null` for chat routes).
+    #[serde(default)]
+    pub api_endpoint: Option<String>,
     #[serde(default)]
     pub strategy: Option<Strategy>,
     /// Per-target retry count override for this entire route.
@@ -68,8 +68,14 @@ pub struct CreateRouteRequest {
 #[derive(Debug, serde::Deserialize)]
 pub struct UpdateRouteRequest {
     pub model_name: String,
+    /// Omitted/`null` keeps the current pipeline.
     #[serde(default)]
-    pub api_endpoint: Option<String>,
+    pub pipeline: Option<Pipeline>,
+    /// Triple-state `api_endpoint` patch: absent → keep, JSON `null` →
+    /// clear (required when switching an image route back to chat), value
+    /// → set.
+    #[serde(default, deserialize_with = "double_option_api_endpoint")]
+    pub api_endpoint: Option<Option<String>>,
     #[serde(default)]
     pub strategy: Option<Strategy>,
     /// Per-target retry count override for this route.
@@ -79,21 +85,31 @@ pub struct UpdateRouteRequest {
     pub targets: Option<Vec<RouteTargetInput>>,
 }
 
+/// Serde helper for the triple-state `api_endpoint` patch: missing →
+/// `None` (keep), JSON `null` → `Some(None)` (clear), value →
+/// `Some(Some(v))` (set).
+fn double_option_api_endpoint<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    Ok(Some(value))
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct DeleteRouteRequest {
     pub model_name: String,
 }
 
-fn default_api_endpoint() -> String {
-    "/chat/completions".into()
-}
-
-/// Borrowing response item for `GET /api/routes` that ensures `api_endpoint`
-/// always appears in the JSON response, even when it equals the default value.
+/// Borrowing response item for `GET /api/routes` that ensures `pipeline`
+/// and `api_endpoint` always appear in the JSON response, even when they
+/// equal the defaults (`chat` / `null`).
 #[derive(Serialize)]
 pub struct RouteResponseItem<'a> {
     model_name: &'a str,
-    api_endpoint: &'a str,
+    pipeline: Pipeline,
+    api_endpoint: Option<&'a str>,
     strategy: Strategy,
     #[serde(skip_serializing_if = "Option::is_none")]
     retries: Option<u32>,
@@ -176,7 +192,8 @@ pub async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
         .iter()
         .map(|r| RouteResponseItem {
             model_name: &r.model_name,
-            api_endpoint: &r.api_endpoint,
+            pipeline: r.pipeline,
+            api_endpoint: r.api_endpoint.as_deref(),
             strategy: r.strategy,
             retries: r.retries,
             targets: &r.targets,
@@ -205,6 +222,7 @@ pub async fn create_route(
 
     let route = RouteConfig {
         model_name: req.model_name.clone(),
+        pipeline: req.pipeline,
         api_endpoint: req.api_endpoint,
         retries: req.retries,
         timeout_secs: None,
@@ -224,8 +242,9 @@ pub async fn create_route(
                 .into_response()
         }
         // Full-config validation failures (unknown capability keys,
-        // illegal upstream_protocol × provider_type, …) surface as
-        // `AppError::Config` from the coordinator; report 400 not 500.
+        // chat route carrying `api_endpoint`, image route without one, …)
+        // surface as `AppError::Config` from the coordinator; report 400
+        // not 500.
         Err(AppError::Config(msg)) => AppError::BadRequest(msg).into_response(),
         Err(e) => e.into_response(),
     }
@@ -264,6 +283,9 @@ pub async fn update_route(
         };
 
         let mut route = existing.clone();
+        if let Some(pipeline) = req.pipeline {
+            route.pipeline = pipeline;
+        }
         if let Some(endpoint) = req.api_endpoint {
             route.api_endpoint = endpoint;
         }
@@ -327,14 +349,13 @@ pub async fn delete_route(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::test_provider;
     use crate::test_utils::{build_state, one_provider_config, test_app};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
     };
-    use sag_config::{
-        KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig, RouteTarget, Strategy,
-    };
+    use sag_config::{ApiKind, Pipeline, RouteConfig, RouteTarget, Strategy};
     use std::collections::HashMap;
     use tower::ServiceExt;
 
@@ -400,27 +421,12 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "openai".to_string(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-test".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-test".into()],
+                vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+            ),
         );
         let state = build_state(providers, vec![]).await;
         let app = test_app(state.clone());
@@ -455,27 +461,12 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "openai".to_string(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-test".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-test".into()],
+                vec!["gpt-4o".into(), "gpt-4o-mini".into()],
+            ),
         );
         let state = build_state(providers, vec![]).await;
         let app = test_app(state.clone());
@@ -502,27 +493,12 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "openai".to_string(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-test".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-test".into()],
+                vec!["gpt-4o".into()],
+            ),
         );
         let state = build_state(providers, vec![]).await;
         let app = test_app(state.clone());
@@ -546,31 +522,17 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "openai".to_string(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-test".into()],
-                key_strategy: KeyStrategy::FillFirst,
-                base_url: "https://api.openai.com/v1".into(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 120,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec!["gpt-4o".into()],
-                enabled: true,
-                anthropic_cache_control: true,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: None,
-            },
+            test_provider(
+                ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-test".into()],
+                vec!["gpt-4o".into()],
+            ),
         );
         let routes = vec![RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -581,7 +543,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }];
@@ -639,7 +600,7 @@ mod tests {
             .uri("/api/routes")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"model_name":"gpt-4o","api_endpoint":"/responses","targets":[{"provider":"openai","real_model":"gpt-4o-updated","priority":5}]}"#,
+                r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-4o-updated","priority":5}]}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -651,9 +612,123 @@ mod tests {
             .iter()
             .find(|r| r.model_name == "gpt-4o")
             .unwrap();
-        assert_eq!(r.api_endpoint, "/responses");
+        // `api_endpoint` is image-only in the new config model: an update
+        // that does not mention it leaves the chat route's `None` alone.
+        assert_eq!(r.pipeline, Pipeline::Chat);
+        assert_eq!(r.api_endpoint, None);
         assert_eq!(r.targets[0].real_model.as_deref(), Some("gpt-4o-updated"));
         assert_eq!(r.targets[0].priority, 5);
+    }
+
+    /// Create an image-pipeline route: `pipeline = "image"` +
+    /// `api_endpoint` round-trip through GET /api/routes.
+    #[tokio::test]
+    async fn create_image_route_round_trips_pipeline_and_api_endpoint() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"dall-e-3","pipeline":"image","api_endpoint":"/images/generations","targets":[{"provider":"openai","real_model":"dall-e-3"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let route = body["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model_name"] == "dall-e-3")
+            .expect("image route present");
+        assert_eq!(route["pipeline"], serde_json::json!("image"));
+        assert_eq!(
+            route["api_endpoint"],
+            serde_json::json!("/images/generations")
+        );
+        // Chat routes still report the default pipeline + null endpoint.
+        let chat = body["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model_name"] == "gpt-4o")
+            .expect("chat route present");
+        assert_eq!(chat["pipeline"], serde_json::json!("chat"));
+        assert_eq!(chat["api_endpoint"], serde_json::json!(null));
+    }
+
+    /// An image route switched back to chat must drop its `api_endpoint`
+    /// (validation rejects a chat route carrying one) — the triple-state
+    /// `api_endpoint: null` patch is the way to clear it.
+    #[tokio::test]
+    async fn update_route_clears_api_endpoint_with_null() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"dall-e-3","pipeline":"image","api_endpoint":"/images/generations","targets":[{"provider":"openai","real_model":"dall-e-3"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"dall-e-3","pipeline":"chat","api_endpoint":null}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let r = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "dall-e-3")
+            .unwrap();
+        assert_eq!(r.pipeline, Pipeline::Chat);
+        assert_eq!(r.api_endpoint, None, "null patch must clear the endpoint");
     }
 
     #[tokio::test]
@@ -664,7 +739,8 @@ mod tests {
         let (providers, _) = one_provider_config("openai", vec![]);
         let route = RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::StickyFailover,
@@ -675,7 +751,6 @@ mod tests {
                 timeout_secs: None,
                 priority: 1,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         };
@@ -771,7 +846,8 @@ mod tests {
     fn fill_first_route(model: &str) -> RouteConfig {
         RouteConfig {
             model_name: model.into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -782,7 +858,6 @@ mod tests {
                 timeout_secs: None,
                 priority: 1,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }
@@ -797,7 +872,6 @@ mod tests {
                 timeout_secs: None,
                 priority: 1,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }]),
             created_at: std::time::Instant::now(),
@@ -891,10 +965,10 @@ mod tests {
         );
     }
 
-    // ── M7: target upstream_protocol / capabilities round-trip ──
+    // ── M7 rework: target capabilities round-trip + illegal enum ──
 
     #[tokio::test]
-    async fn create_route_round_trips_target_upstream_protocol() {
+    async fn create_route_round_trips_target_capabilities() {
         use axum::{
             body::Body,
             http::{Request, StatusCode},
@@ -914,12 +988,11 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "model_name": "route-proto",
+                            "model_name": "route-caps",
                             "targets": [{
                                 "provider": "openai",
                                 "real_model": "gpt-4o",
                                 "priority": 1,
-                                "upstream_protocol": "responses",
                                 "capabilities": {"streaming": true, "tools": false},
                             }],
                         })
@@ -935,7 +1008,6 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("GET")
                     .uri("/api/routes")
                     .body(Body::empty())
                     .unwrap(),
@@ -950,16 +1022,20 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["model_name"] == "route-proto")
+            .find(|r| r["model_name"] == "route-caps")
             .expect("route present");
         let target = &route["targets"][0];
-        assert_eq!(target["upstream_protocol"], serde_json::json!("responses"));
+        // `upstream_protocol` is gone from RouteTarget — the protocol comes
+        // from the provider's `apis` keys now.
+        assert!(target.get("upstream_protocol").is_none());
         assert_eq!(target["capabilities"]["streaming"], serde_json::json!(true));
         assert_eq!(target["capabilities"]["tools"], serde_json::json!(false));
     }
 
+    /// Typed config enums stay strict: an unknown `pipeline` value fails
+    /// deserialization (422).
     #[tokio::test]
-    async fn create_route_illegal_upstream_protocol_is_422() {
+    async fn create_route_illegal_pipeline_value_is_422() {
         use axum::{
             body::Body,
             http::{Request, StatusCode},
@@ -979,9 +1055,9 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "model_name": "bad",
+                            "pipeline": "video",
                             "targets": [{
                                 "provider": "openai",
-                                "upstream_protocol": "nope",
                             }],
                         })
                         .to_string(),

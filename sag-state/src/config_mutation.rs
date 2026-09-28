@@ -97,12 +97,34 @@ pub fn effective_proxy_for(
 
 /// Compare only the fields that `ProviderBase::new()` captures, so that
 /// purely scheduling/display changes (`enabled`, `enabled_models`,
-/// `models_endpoint`, `model_overrides`) do not trigger an adapter rebuild.
+/// per-API `models_endpoint`, `model_overrides`) do not trigger an adapter
+/// rebuild.
 fn adapter_config_changed(old: &ProviderConfig, new: &ProviderConfig) -> bool {
-    old.provider_type != new.provider_type
-        || old.api_keys != new.api_keys
+    // Per-API comparison: only the fields the adapter captures count.
+    // `models_endpoint` / `model_overrides` are excluded (admin fetch-models
+    // and dispatch respectively read them from config, not the adapter).
+    fn apis_differ(old: &ProviderConfig, new: &ProviderConfig) -> bool {
+        old.apis.len() != new.apis.len()
+            || old.apis.iter().any(|(kind, oa)| {
+                new.apis.get(kind).is_none_or(|na| {
+                    oa.base_url != na.base_url
+                        || oa.headers != na.headers
+                        || oa.body_overrides != na.body_overrides
+                        || oa.strip_fields != na.strip_fields
+                        || oa.model_strip_fields != na.model_strip_fields
+                        || oa.role_mappings != na.role_mappings
+                        || oa.anthropic_cache_control != na.anthropic_cache_control
+                        || oa.timeout_secs != na.timeout_secs
+                        || oa.chunk_timeout_secs != na.chunk_timeout_secs
+                        || oa.ttfb_timeout_secs != na.ttfb_timeout_secs
+                })
+            })
+    }
+
+    old.api_keys != new.api_keys
         || old.key_strategy != new.key_strategy
-        || old.base_url != new.base_url
+        || apis_differ(old, new)
+        || old.fallback != new.fallback
         || old.timeout_secs != new.timeout_secs
         || old.chunk_timeout_secs != new.chunk_timeout_secs
         || old.ttfb_timeout_secs != new.ttfb_timeout_secs
@@ -112,15 +134,16 @@ fn adapter_config_changed(old: &ProviderConfig, new: &ProviderConfig) -> bool {
         || old.model_strip_fields != new.model_strip_fields
         || old.role_mappings != new.role_mappings
         || old.anthropic_cache_control != new.anthropic_cache_control
-        || old.upstream_protocol != new.upstream_protocol
 }
 
 /// Count routes whose model_name differs between old and new configs
 /// (symmetric difference of model-name sets), **or** — when the name set is
-/// unchanged — any route whose lane-relevant target fields
-/// (`upstream_protocol` / `capabilities`) changed. Those field edits leave
-/// model_name alone but must still mark routes as changed so identity sync
-/// / routes_version consumers observe the mutation (M7 / §7.2).
+/// unchanged — any route whose lane-relevant target field
+/// (`capabilities`) changed. Those field edits leave model_name alone but
+/// must still mark routes as changed so identity sync / routes_version
+/// consumers observe the mutation (M7 / §7.2). Protocol/lane membership is
+/// provider-level (`providers.<name>.apis`) and covered by
+/// [`adapter_config_changed`].
 fn compute_routes_changed(old: &GatewayConfig, new: &GatewayConfig) -> usize {
     let old_names: HashSet<&str> = old.routes.iter().map(|r| r.model_name.as_str()).collect();
     let new_names: HashSet<&str> = new.routes.iter().map(|r| r.model_name.as_str()).collect();
@@ -135,10 +158,9 @@ fn compute_routes_changed(old: &GatewayConfig, new: &GatewayConfig) -> usize {
             .find(|nr| nr.model_name == or.model_name)
             .is_some_and(|nr| {
                 or.targets.iter().enumerate().any(|(i, ot)| {
-                    nr.targets.get(i).is_some_and(|nt| {
-                        ot.upstream_protocol != nt.upstream_protocol
-                            || ot.capabilities != nt.capabilities
-                    })
+                    nr.targets
+                        .get(i)
+                        .is_some_and(|nt| ot.capabilities != nt.capabilities)
                 }) || or.targets.len() != nr.targets.len()
             })
     });
@@ -804,7 +826,7 @@ mod tests {
     use std::collections::HashMap;
 
     use sag_config::{
-        GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig, Strategy,
+        GatewayConfig, KeyStrategy, ProviderConfig, ProxyMode, RouteConfig, Strategy,
         gateway_config_base,
     };
     use sag_core::AppError;
@@ -835,12 +857,9 @@ mod tests {
 
     fn base_provider() -> ProviderConfig {
         ProviderConfig {
-            provider_type: ProviderType::OpenAI,
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs: 600,
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
@@ -853,7 +872,15 @@ mod tests {
             enabled: true,
             enabled_models: vec![],
             anthropic_cache_control: false,
-            upstream_protocol: None,
+            apis: std::iter::once((
+                sag_core::ApiKind::ChatCompletions,
+                sag_config::ApiConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
         }
     }
 
@@ -864,10 +891,17 @@ mod tests {
     }
 
     #[test]
-    fn provider_type_change_triggers_rebuild() {
+    fn apis_protocol_set_change_triggers_rebuild() {
         let mut a = base_provider();
         let b = base_provider();
-        a.provider_type = ProviderType::Anthropic;
+        a.apis.insert(
+            sag_core::ApiKind::Responses,
+            sag_config::ApiConfig {
+                base_url: "https://api.openai.com/v1".into(),
+                ..Default::default()
+            },
+        );
+        a.fallback = Some(sag_core::ApiKind::ChatCompletions);
         assert!(adapter_config_changed(&a, &b));
     }
 
@@ -883,7 +917,10 @@ mod tests {
     fn base_url_change_triggers_rebuild() {
         let mut a = base_provider();
         let b = base_provider();
-        a.base_url = "https://different.example.com".into();
+        a.apis
+            .get_mut(&sag_core::ApiKind::ChatCompletions)
+            .unwrap()
+            .base_url = "https://different.example.com".into();
         assert!(adapter_config_changed(&a, &b));
     }
 
@@ -962,28 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn upstream_protocol_change_triggers_rebuild() {
-        let mut a = base_provider();
-        let b = base_provider();
-        a.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
-        assert!(adapter_config_changed(&a, &b));
-        // None → Some and Some → None must also rebuild.
-        let mut with_explicit = base_provider();
-        with_explicit.upstream_protocol = Some(sag_core::UpstreamProtocol::ChatCompletions);
-        assert!(adapter_config_changed(&with_explicit, &b));
-        assert!(adapter_config_changed(&b, &with_explicit));
-    }
-
-    #[test]
-    fn same_upstream_protocol_does_not_trigger_rebuild() {
-        let mut a = base_provider();
-        let mut b = base_provider();
-        a.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
-        b.upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
-        assert!(!adapter_config_changed(&a, &b));
-    }
-
-    #[test]
     fn key_strategy_change_triggers_rebuild() {
         let mut a = base_provider();
         let b = base_provider();
@@ -1012,7 +1027,10 @@ mod tests {
     fn models_endpoint_change_does_not_trigger_rebuild() {
         let mut a = base_provider();
         let b = base_provider();
-        a.models_endpoint = "v1/models".into();
+        a.apis
+            .get_mut(&sag_core::ApiKind::ChatCompletions)
+            .unwrap()
+            .models_endpoint = Some("v1/models".into());
         assert!(!adapter_config_changed(&a, &b));
     }
 
@@ -1045,7 +1063,8 @@ mod tests {
         let mut new = old.clone();
         new.routes.push(RouteConfig {
             model_name: "gpt-4".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Default::default(),
+            api_endpoint: None,
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -1061,7 +1080,8 @@ mod tests {
         };
         old.routes.push(RouteConfig {
             model_name: "gpt-4".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Default::default(),
+            api_endpoint: None,
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -1080,7 +1100,8 @@ mod tests {
         };
         old.routes.push(RouteConfig {
             model_name: "gpt-4".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Default::default(),
+            api_endpoint: None,
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -1091,7 +1112,8 @@ mod tests {
         };
         new.routes.push(RouteConfig {
             model_name: "claude".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Default::default(),
+            api_endpoint: None,
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -1101,39 +1123,14 @@ mod tests {
     }
 
     #[test]
-    fn routes_changed_target_upstream_protocol_edit_counts() {
-        fn route_with(protocol: Option<sag_core::UpstreamProtocol>) -> GatewayConfig {
-            GatewayConfig {
-                routes: vec![RouteConfig {
-                    model_name: "gpt-4o".into(),
-                    api_endpoint: "/chat/completions".into(),
-                    strategy: Strategy::FillFirst,
-                    retries: None,
-                    timeout_secs: None,
-                    targets: vec![sag_config::RouteTarget {
-                        provider: "openai".into(),
-                        upstream_protocol: protocol,
-                        ..sag_config::RouteTarget::default()
-                    }],
-                }],
-                ..gateway_config_base!()
-            }
-        }
-        let a = route_with(None);
-        assert_eq!(compute_routes_changed(&a, &a), 0);
-        let b = route_with(Some(sag_core::UpstreamProtocol::Responses));
-        // Same names, but lane field changed → must count as 1.
-        assert_eq!(compute_routes_changed(&a, &b), 1);
-    }
-
-    #[test]
     fn routes_changed_target_capabilities_edit_counts() {
         use sag_config::{CapabilitiesOverride, RouteTarget};
         fn route_with(caps: Option<CapabilitiesOverride>) -> GatewayConfig {
             GatewayConfig {
                 routes: vec![RouteConfig {
                     model_name: "gpt-4o".into(),
-                    api_endpoint: "/chat/completions".into(),
+                    pipeline: Default::default(),
+                    api_endpoint: None,
                     strategy: Strategy::FillFirst,
                     retries: None,
                     timeout_secs: None,
@@ -1243,7 +1240,11 @@ mod tests {
         old.providers.insert("openai".into(), base_provider());
         let mut new = cfg(None, HashMap::new());
         let mut changed = base_provider();
-        changed.base_url = "https://new.example.com".into();
+        changed
+            .apis
+            .get_mut(&sag_core::ApiKind::ChatCompletions)
+            .unwrap()
+            .base_url = "https://new.example.com".into();
         new.providers.insert("openai".into(), changed);
 
         let sync = coord.prepare_provider_sync(&old, &new).unwrap();
@@ -1490,7 +1491,8 @@ mod tests {
     fn new_route() -> RouteConfig {
         RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Default::default(),
+            api_endpoint: None,
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -1503,7 +1505,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }

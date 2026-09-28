@@ -160,6 +160,7 @@ async fn chat_completions(
     // identity facts (`route_name`, wall-clock `started_at`) for the
     // analytics route-start event.
     let ResolvedRoute {
+        pipeline,
         targets,
         api_endpoint,
         strategy,
@@ -188,7 +189,7 @@ async fn chat_completions(
     // a later all-exhausted terminal still reports "lacks capability …".
     let mut errors = precheck_errors;
 
-    if api_endpoint.ends_with("/images/generations") {
+    if pipeline == sag_config::Pipeline::Image {
         return dispatch_image(DispatchCtx {
             state: &state,
             runtime: &runtime,
@@ -314,6 +315,7 @@ async fn anthropic_messages(
         });
 
     let ResolvedRoute {
+        pipeline,
         targets,
         api_endpoint,
         strategy,
@@ -341,7 +343,7 @@ async fn anthropic_messages(
 
     let mut errors = precheck_errors;
 
-    if api_endpoint.ends_with("/images/generations") {
+    if pipeline == sag_config::Pipeline::Image {
         // Image path is Chat-only (plan D8); reject with Anthropic envelope.
         let err = sag_core::AppError::BadRequest(
             "image generation is not supported on /v1/messages".into(),
@@ -422,10 +424,12 @@ async fn responses(
     // entering dispatch (never capability-precheck drops).
     //
     // M8 stateful: Allow only when **every** target on the matched route
-    // declares an explicit `upstream_protocol = responses`. A mixed route
-    // (native + translated Chat) could fall back to a translated target
-    // that would receive `previous_response_id` as a Chat `extra` field —
-    // silent semantic loss. Option A: any non-explicit-Responses target →
+    // can serve Responses natively (its provider declares an `apis.
+    // responses` node — which is exactly what puts the target on the
+    // native lane for this ingress). A route mixing in a provider without
+    // a `responses` node could fall back to a translated target that
+    // would receive `previous_response_id` as a Chat `extra` field —
+    // silent semantic loss. Option A: any non-Responses target →
     // Reject (422) when the request carries stateful fields.
     let stateful_mode = {
         let model = raw_body
@@ -436,11 +440,9 @@ async fn responses(
         let all_native = sag_config::resolve_model_route(&cfg.routes, model).is_some_and(|route| {
             !route.targets.is_empty()
                 && route.targets.iter().all(|t| {
-                    let pc = cfg.providers.get(&t.provider);
-                    let explicit = t
-                        .upstream_protocol
-                        .or_else(|| pc.and_then(|p| p.upstream_protocol));
-                    explicit == Some(sag_core::UpstreamProtocol::Responses)
+                    cfg.providers
+                        .get(&t.provider)
+                        .is_some_and(|pc| pc.apis.contains_key(&sag_core::ApiKind::Responses))
                 })
         });
         if all_native {
@@ -492,6 +494,7 @@ async fn responses(
         });
 
     let ResolvedRoute {
+        pipeline,
         targets,
         api_endpoint,
         strategy,
@@ -520,7 +523,7 @@ async fn responses(
 
     let mut errors = precheck_errors;
 
-    if api_endpoint.ends_with("/images/generations") {
+    if pipeline == sag_config::Pipeline::Image {
         // Image path is Chat-only (D8); reject with the OpenAI envelope.
         return unprocessable("image generation is not supported on /v1/responses");
     }

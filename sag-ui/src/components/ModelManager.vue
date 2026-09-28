@@ -53,7 +53,6 @@ const props = withDefaults(
     upstreamModels: Record<string, unknown>[]
     upstreamModelsLoading: boolean
     upstreamModelsError: string
-    modelsEndpoint?: string
     modelTestStates?: Record<string, ModelTestState | undefined>
     disabled?: boolean
     /** Effective upstream protocol badge (hide when absent). */
@@ -70,8 +69,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   "update:enabledModels": [value: string[]]
   "update:modelOverrides": [value: Record<string, KvPair[]>]
-  "update:modelsEndpoint": [value: string]
-  fetchModels: [modelsEndpoint: string]
+  fetchModels: []
   testModel: [model: string]
 }>()
 
@@ -111,7 +109,6 @@ async function confirmCreateRoute() {
   try {
     const payload: CreateRoutePayload = {
       model_name: routeName,
-      api_endpoint: "/chat/completions",
       strategy: "sticky_failover",
       targets: [
         {
@@ -133,7 +130,6 @@ async function confirmCreateRoute() {
 }
 
 // ── Internal state ─────────────────────────────────
-const modelsEndpoint = computed(() => props.modelsEndpoint ?? "models")
 const expandedOverride = ref<string | undefined>(undefined)
 const customModel = ref("")
 
@@ -148,10 +144,6 @@ function isModelMissingFromUpstream(model: string): boolean {
 }
 
 const hasFetched = ref(false)
-
-watch(modelsEndpoint, () => {
-  hasFetched.value = false
-})
 
 watch(
   () => props.upstreamModels,
@@ -189,13 +181,13 @@ const comboboxOptions = computed(() => {
 function onComboboxOpen() {
   if (!hasFetched.value && !props.upstreamModelsLoading && props.upstreamModels.length === 0) {
     hasFetched.value = true
-    emit("fetchModels", modelsEndpoint.value)
+    emit("fetchModels")
   }
 }
 
 function handleManualRefresh() {
   hasFetched.value = true
-  emit("fetchModels", modelsEndpoint.value)
+  emit("fetchModels")
 }
 
 function addCustomModel() {
@@ -236,10 +228,6 @@ function removeModel(name: string) {
     "update:enabledModels",
     props.enabledModels.filter((m) => m !== name),
   )
-}
-
-function onModelsEndpointChange(value: string | number) {
-  emit("update:modelsEndpoint", String(value))
 }
 </script>
 
@@ -428,19 +416,6 @@ function onModelsEndpointChange(value: string | number) {
 
     <div v-if="upstreamModelsError" class="rounded-md bg-red-50 px-2 py-1 text-xs text-red-500">
       {{ upstreamModelsError }}
-    </div>
-
-    <!-- Models endpoint path -->
-    <div class="space-y-1">
-      <FieldLabel>Models Endpoint Path</FieldLabel>
-      <p class="text-muted-foreground text-xs">
-        Path appended to base_url for fetching models (default: models).
-      </p>
-      <Input
-        :model-value="modelsEndpoint"
-        :disabled="disabled"
-        @update:model-value="onModelsEndpointChange"
-      />
     </div>
 
     <!-- ── Quick Create Route Confirmation Dialog ──────────── -->

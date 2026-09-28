@@ -384,7 +384,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }
     }
@@ -408,7 +407,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             })
             .collect();
@@ -443,7 +441,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             })
             .collect();
@@ -509,7 +506,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
-            upstream_protocol: None,
             capabilities: None,
         }];
         let targets_b: Vec<RouteTarget> = vec![RouteTarget {
@@ -519,7 +515,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
-            upstream_protocol: None,
             capabilities: None,
         }];
 
@@ -548,7 +543,6 @@ mod tests {
             retries: Some(1),
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }];
         let targets_b: Vec<RouteTarget> = vec![RouteTarget {
@@ -558,7 +552,6 @@ mod tests {
             retries: Some(3),
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }];
 
@@ -603,7 +596,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -831,7 +823,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -841,7 +832,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -1113,7 +1103,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::from([("temperature".into(), serde_json::json!(0.7))]),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -1123,7 +1112,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -1135,7 +1123,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::from([("temperature".into(), serde_json::json!(0.9))]),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -1145,7 +1132,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -1228,7 +1214,6 @@ mod tests {
                 retries: Some(1),
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -1238,7 +1223,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -1250,7 +1234,6 @@ mod tests {
                 retries: Some(5),
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -1260,7 +1243,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];

@@ -36,7 +36,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { getErrorMessage } from "@/lib/utils"
 import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useProviderStore } from "@/stores/providers"
-import type { CircuitBreakerEntry, Provider } from "@/types/api"
+import type { ApiKind, CircuitBreakerEntry, Provider } from "@/types/api"
 
 const store = useProviderStore()
 const cbStore = useCircuitBreakerStore()
@@ -63,7 +63,7 @@ const breakersByProvider = computed(() => {
 
 // ── Filters ───────────────────────────────────────────────────────
 const searchInput = ref("")
-const filterProviderType = ref("all")
+const filterApi = ref<"all" | ApiKind>("all")
 const sortByName = ref(true)
 
 // Client-side filter: split search by spaces, all keywords must match a model in enabled_models.
@@ -91,12 +91,12 @@ const togglingProvider = ref<string | null>(null)
 // ── Data fetching ─────────────────────────────────────────────────
 async function fetchProviders() {
   await store.fetchProviders({
-    provider_type: filterProviderType.value === "all" ? undefined : filterProviderType.value,
+    apis: filterApi.value === "all" ? undefined : filterApi.value,
     sort: sortByName.value ? "name" : undefined,
   })
 }
 
-watch([filterProviderType, sortByName], () => {
+watch([filterApi, sortByName], () => {
   fetchProviders()
 })
 
@@ -176,47 +176,32 @@ const columns = [
     header: "Name",
     cell: (info) => info.getValue(),
   }),
-  columnHelper.accessor("base_url", {
-    header: "Base URL",
-    cell: (info) =>
-      h(
-        "span",
-        { class: "font-mono text-xs text-muted-foreground", title: info.getValue() },
-        info.getValue(),
-      ),
-    meta: { class: "min-w-[200px] max-w-[12rem] overflow-hidden truncate" },
-  }),
-  columnHelper.accessor("models_endpoint", {
-    header: "Models Endpoint",
-    cell: (info) =>
-      h("span", { class: "font-mono text-xs text-muted-foreground" }, info.getValue()),
-    meta: { class: "min-w-[80px]" },
-  }),
-  columnHelper.accessor("provider_type", {
-    header: "Type",
-    cell: (info) =>
-      h(Badge, { variant: "outline", class: "uppercase text-xs" }, () => info.getValue()),
-  }),
   columnHelper.display({
-    id: "upstream",
-    header: "Upstream",
+    id: "apis",
+    header: "APIs",
     cell: (info) => {
       const p = info.row.original
-      const effective = p.effective_upstream_protocol
-      if (!effective) return null
-      const explicit = !!p.upstream_protocol
+      const kinds = Object.keys(p.apis ?? {}) as ApiKind[]
+      if (kinds.length === 0) {
+        return h("span", { class: "text-muted-foreground text-xs" }, "—")
+      }
+      const fallbackNote = p.fallback ? `fallback: ${p.fallback}` : "fallback: auto"
       return h(
-        Badge,
-        {
-          variant: "outline",
-          class: `text-[10px] font-mono ${explicit ? "" : "text-muted-foreground"}`,
-          title: explicit
-            ? `Explicit upstream_protocol=${p.upstream_protocol}`
-            : `Derived from provider_type (${effective})`,
-        },
-        () => effective,
+        "div",
+        { class: "flex flex-wrap gap-1", title: fallbackNote },
+        kinds.map((kind) =>
+          h(
+            Badge,
+            {
+              variant: "outline",
+              class: "font-mono text-[10px] uppercase",
+            },
+            () => kind,
+          ),
+        ),
       )
     },
+    meta: { class: "min-w-[160px]" },
   }),
   columnHelper.accessor("api_keys", {
     header: "Keys",
@@ -359,16 +344,18 @@ const table = useVueTable({
         </div>
         <div class="hidden md:block">
           <Select
-            :model-value="filterProviderType"
-            @update:model-value="(value) => (filterProviderType = value as string)"
+            :model-value="filterApi"
+            @update:model-value="(value) => (filterApi = value as 'all' | ApiKind)"
           >
-            <SelectTrigger class="h-8 w-[200px]">
+            <SelectTrigger class="h-8 w-[220px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All types</SelectItem>
-              <SelectItem value="openai">OpenAI</SelectItem>
-              <SelectItem value="anthropic">Anthropic</SelectItem>
+              <SelectItem value="all">All API sections</SelectItem>
+              <SelectItem value="chat_completions">chat_completions</SelectItem>
+              <SelectItem value="responses">responses</SelectItem>
+              <SelectItem value="anthropic_messages">anthropic_messages</SelectItem>
+              <SelectItem value="image">image</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -422,7 +409,7 @@ const table = useVueTable({
       class="text-muted-foreground py-12 text-center text-sm"
     >
       {{
-        searchInput || filterProviderType !== "all"
+        searchInput || filterApi !== "all"
           ? "No providers match the current filters."
           : 'No providers configured. Click "Add Provider" to get started.'
       }}

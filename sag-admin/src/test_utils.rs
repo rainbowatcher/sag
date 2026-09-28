@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use axum::Router;
 use sag_config::{
-    ConfigHandle, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig,
-    RouteTarget, Strategy,
+    ApiConfig, ApiKind, ConfigHandle, GatewayConfig, KeyStrategy, Pipeline, ProviderConfig,
+    ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_state::AppState;
 
@@ -74,8 +74,42 @@ pub(crate) fn test_app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Build a provider declaring exactly one API section `kind` at `base_url`.
+///
+/// Everything else is `ProviderConfig::default()` plus the shared test
+/// defaults (FillFirst key strategy, default proxy mode, 120s timeout).
+/// Tests that need a second section or an override patch the returned
+/// `apis` map themselves.
+pub(crate) fn test_provider(
+    kind: ApiKind,
+    base_url: &str,
+    api_keys: Vec<String>,
+    enabled_models: Vec<String>,
+) -> ProviderConfig {
+    let mut pc = ProviderConfig {
+        api_keys,
+        key_strategy: KeyStrategy::FillFirst,
+        proxy_mode: ProxyMode::default(),
+        timeout_secs: 120,
+        enabled_models,
+        ..ProviderConfig::default()
+    };
+    pc.apis.insert(
+        kind,
+        ApiConfig {
+            base_url: base_url.into(),
+            ..ApiConfig::default()
+        },
+    );
+    pc
+}
+
 /// Convenience: create a single-provider config with optional routes.
 /// Returns `(providers, routes)` ready for [`build_state`].
+///
+/// The provider declares a `chat_completions` section; the routes are
+/// chat-pipeline routes (no `api_endpoint` — that field is image-only in
+/// the new config model).
 pub(crate) fn one_provider_config(
     name: &str,
     routes: Vec<(&str, &str, u32)>,
@@ -83,33 +117,19 @@ pub(crate) fn one_provider_config(
     let mut providers = HashMap::new();
     providers.insert(
         name.to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            base_url: "https://api.openai.com/v1".into(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        },
+        test_provider(
+            ApiKind::ChatCompletions,
+            "https://api.openai.com/v1",
+            vec!["sk-test".into()],
+            vec![],
+        ),
     );
     let routes = routes
         .into_iter()
         .map(|(model, real_model, prio)| RouteConfig {
             model_name: model.into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -120,7 +140,6 @@ pub(crate) fn one_provider_config(
                 timeout_secs: None,
                 priority: prio,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         })

@@ -26,36 +26,31 @@ pub fn target(provider: &str, real_model: &str, retries: u32) -> ResolvedTarget 
         extra: std::collections::HashMap::new(),
         retries,
         timeout_secs: 120,
-        upstream_protocol: sag_core::UpstreamProtocol::ChatCompletions,
-        upstream_protocol_explicit: false,
+        upstream_protocol: sag_core::ApiKind::ChatCompletions,
         lane: sag_core::Lane::Translated,
     }
 }
 
 /// Shared `ProviderConfig` builder for unit tests. Returns a minimal
-/// enabled OpenAI provider config.
+/// enabled OpenAI-compatible provider declaring a single
+/// `chat_completions` API node.
 pub fn provider_config(enabled: bool) -> sag_config::ProviderConfig {
-    sag_config::ProviderConfig {
-        provider_type: sag_config::ProviderType::OpenAI,
+    let mut pc = sag_config::ProviderConfig {
         api_keys: vec!["sk-test".into()],
         key_strategy: sag_config::KeyStrategy::FillFirst,
-        base_url: "https://api.openai.com/v1".into(),
         proxy_mode: sag_config::ProxyMode::default(),
-        models_endpoint: "models".into(),
         timeout_secs: 120,
-        headers: std::collections::HashMap::new(),
-        body_overrides: std::collections::HashMap::new(),
-        strip_fields: vec![],
-        model_strip_fields: std::collections::HashMap::new(),
-        model_overrides: std::collections::HashMap::new(),
-        role_mappings: std::collections::HashMap::new(),
-        enabled_models: vec![],
         enabled,
-        anthropic_cache_control: true,
-        chunk_timeout_secs: None,
-        ttfb_timeout_secs: None,
-        upstream_protocol: None,
-    }
+        ..sag_config::ProviderConfig::default()
+    };
+    pc.apis.insert(
+        sag_core::ApiKind::ChatCompletions,
+        sag_config::ApiConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            ..sag_config::ApiConfig::default()
+        },
+    );
+    pc
 }
 
 /// Build a fresh [`DispatchRuntime`] with empty circuit-breaker / ordering

@@ -5,8 +5,8 @@ use std::path::Path;
 use tracing::info;
 
 use crate::config::{
-    GatewayConfig, KeyStrategy, ProviderConfig, ProviderType, ProxyMode, RouteConfig, RouteTarget,
-    Strategy,
+    ApiConfig, GatewayConfig, KeyStrategy, Pipeline, ProviderConfig, ProxyMode, RouteConfig,
+    RouteTarget, Strategy,
 };
 use crate::loader::json_util::{check_json_map, json_to_toml_value};
 use crate::toml_edit_util::{
@@ -75,6 +75,17 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
                 &format!("providers.{name}.model_overrides.{model}"),
             )?;
         }
+        for (kind, api) in &provider.apis {
+            let scope = format!("providers.{name}.apis.{}", kind.as_str());
+            if let Some(body_overrides) = &api.body_overrides {
+                check_json_map(body_overrides, &format!("{scope}.body_overrides"))?;
+            }
+            if let Some(model_overrides) = &api.model_overrides {
+                for (model, overrides) in model_overrides {
+                    check_json_map(overrides, &format!("{scope}.model_overrides.{model}"))?;
+                }
+            }
+        }
     }
     for (i, route) in config.routes.iter().enumerate() {
         for (j, target) in route.targets.iter().enumerate() {
@@ -103,13 +114,16 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
                     ))
                 })?;
                 let mut table = (*pd).clone();
-                // Strip anthropic_cache_control unless this is an Anthropic provider
-                // with an explicit opt-out (false). Same predicate as the update path.
-                if !(matches!(provider.provider_type, ProviderType::Anthropic)
-                    && !provider.anthropic_cache_control)
-                {
+                // anthropic_cache_control — 默认 `true` 不落盘（create 路径
+                // 的 skip_serializing_if 已省略；此处防御性移除）；显式
+                // `false`（opt-out）保留。与 update 路径同规则。
+                if provider.anthropic_cache_control {
                     table.remove("anthropic_cache_control");
                 }
+                // apis — to_document 可能把 map 序列化为 inline 形态；
+                // 统一改写为嵌套子表 [providers.<name>.apis.<key>]。
+                table.remove("apis");
+                write_apis_field(&mut table, provider)?;
                 Ok(toml_edit::Item::Table(table))
             },
             |item| update_existing_provider(item, provider),
@@ -321,22 +335,17 @@ fn update_existing_provider(
         sync_string_array_in_place(arr, &provider.enabled_models);
     }
     // scalars
-    table["base_url"] = toml_edit::value(provider.base_url.as_str());
-    table["models_endpoint"] = toml_edit::value(provider.models_endpoint.as_str());
     table["timeout_secs"] = toml_edit::value(provider.timeout_secs as i64);
-    // provider_type — skip if default (mirrors `skip_serializing_if =
-    // "is_default_provider_type"` on `ProviderConfig::provider_type`). Without
-    // this guard the update path would force-write `provider_type = "openai"`
-    // for every minimal user-authored provider block that omits the field,
-    // contradicting both the load-time default semantics and what the
-    // create path (`to_document`) emits.
-    if provider.provider_type != ProviderType::default() {
-        table["provider_type"] = toml_edit::value(provider.provider_type.as_str());
-    } else {
-        table.remove("provider_type");
-    }
+    // 迁移清理：provider 级 base_url / models_endpoint / provider_type /
+    // upstream_protocol 已删除（地址下沉各 apis 节；协议由 apis keys 声明）。
+    // 更新路径显式移除旧键，避免旧配置文件残留幽灵字段。
+    table.remove("base_url");
+    table.remove("models_endpoint");
+    table.remove("provider_type");
+    table.remove("upstream_protocol");
     // key_strategy — skip if default (mirrors `skip_serializing_if =
-    // "is_default_key_strategy"`). Same rationale as `provider_type` above.
+    // "is_default_key_strategy"`). Same rationale as the removed
+    // `provider_type` guard above.
     if provider.key_strategy != KeyStrategy::default() {
         table["key_strategy"] = toml_edit::value(match provider.key_strategy {
             KeyStrategy::FillFirst => "fill_first",
@@ -463,21 +472,219 @@ fn update_existing_provider(
             Ok(toml_edit::Value::from(v.as_str()))
         })?;
     }
-    // anthropic_cache_control — only meaningful for Anthropic providers.
-    // Keep only the explicit opt-out (false); default `true` and any value
-    // on non-Anthropic providers are stripped so config files stay clean.
-    if matches!(provider.provider_type, ProviderType::Anthropic)
-        && !provider.anthropic_cache_control
-    {
+    // anthropic_cache_control — 默认 `true` 不落盘；显式 opt-out（false）
+    // 无论挂载哪种协议都持久化（provider_type 已删除，apis 可在任意 base
+    // 上挂 anthropic_messages）。与 create 路径同规则。
+    if provider.anthropic_cache_control {
+        table.remove("anthropic_cache_control");
+    } else {
         table["anthropic_cache_control"] = toml_edit::value(false);
+    }
+    // fallback — skip if None（单协议 key 缺省取之，无需落盘）。
+    if let Some(fb) = provider.fallback {
+        table["fallback"] = toml_edit::value(fb.as_str());
+    } else {
+        table.remove("fallback");
+    }
+    // apis — 嵌套子表同步（保留已有节的注释与字段顺序）。
+    write_apis_field(table, provider)?;
+    Ok(())
+}
+
+/// Ensure `table["apis"]` is a real (non-inline) sub-table; replaces an
+/// inline/dotted rendering with a fresh table so callers get a
+/// `&mut toml_edit::Table` either way.
+fn ensure_apis_table(table: &mut toml_edit::Table) -> &mut toml_edit::Table {
+    if !table.contains_key("apis") {
+        let mut apis = toml_edit::Table::new();
+        // Intermediate table: suppress the empty `[providers.<name>.apis]`
+        // header — children render with their full dotted paths.
+        apis.set_implicit(true);
+        table.insert("apis", toml_edit::Item::Table(apis));
+    }
+    let item = table.get_mut("apis").expect("just inserted or existed");
+    if item.as_table_mut().is_none() {
+        // Inline rendering (`apis = { ... }`) — rebuild as nested tables.
+        let mut fresh = toml_edit::Table::new();
+        fresh.set_implicit(true);
+        *item = toml_edit::Item::Table(fresh);
+    }
+    item.as_table_mut().expect("apis is now a table")
+}
+
+/// Write the `apis` sub-table of a provider: one nested table per
+/// `[providers.<name>.apis.<key>]` section. Creates missing sections,
+/// updates existing ones in place (preserving comments), and removes
+/// sections that no longer exist in memory.
+fn write_apis_field(
+    table: &mut toml_edit::Table,
+    provider: &ProviderConfig,
+) -> Result<(), sag_core::AppError> {
+    if provider.apis.is_empty() {
+        table.remove("apis");
+        return Ok(());
+    }
+    let apis = ensure_apis_table(table);
+
+    // Remove stale keys not present in memory.
+    let stale: Vec<String> = apis
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .filter(|k| !provider.apis.keys().any(|kind| kind.as_str() == k))
+        .collect();
+    for k in stale {
+        apis.remove(&k);
+    }
+
+    for (kind, api) in &provider.apis {
+        let key = kind.as_str();
+        if !apis.contains_key(key) {
+            apis.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let item = apis.get_mut(key).expect("just inserted or existed");
+        if item.as_table_mut().is_none() {
+            // Inline rendering (`key = { ... }`) — rebuild as a real table.
+            *item = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let t = item.as_table_mut().expect("api section is now a table");
+        write_api_fields(t, api)?;
+    }
+    Ok(())
+}
+
+/// Update the fields of one `apis.<key>` sub-table in place. Mirrors the
+/// `skip_serializing_if` rules on [`ApiConfig`]: `None` removes the key
+/// (so the provider-level default applies), `Some` writes the value.
+fn write_api_fields(
+    table: &mut toml_edit::Table,
+    api: &ApiConfig,
+) -> Result<(), sag_core::AppError> {
+    // base_url — always written (the only source of address).
+    table["base_url"] = toml_edit::value(api.base_url.as_str());
+    // models_endpoint — skip if None.
+    if let Some(endpoint) = &api.models_endpoint {
+        table["models_endpoint"] = toml_edit::value(endpoint.as_str());
+    } else {
+        table.remove("models_endpoint");
+    }
+    // headers — inline table; None removes the key (inherit provider
+    // default), Some writes even when empty (整段覆盖语义).
+    match &api.headers {
+        Some(headers) => {
+            let h = ensure_inline_table_field(table, "headers");
+            sync_inline_table_in_place(h, headers, |v| Ok(toml_edit::Value::from(v.as_str())))?;
+        }
+        None => {
+            table.remove("headers");
+        }
+    }
+    // body_overrides — inline table of JSON values.
+    match &api.body_overrides {
+        Some(body) => {
+            let b = ensure_inline_table_field(table, "body_overrides");
+            sync_inline_table_in_place(b, body, json_to_toml_value)?;
+        }
+        None => {
+            table.remove("body_overrides");
+        }
+    }
+    // strip_fields — string array.
+    match &api.strip_fields {
+        Some(fields) => {
+            let arr = ensure_array_field(table, "strip_fields");
+            sync_string_array_in_place(arr, fields);
+        }
+        None => {
+            table.remove("strip_fields");
+        }
+    }
+    // model_strip_fields — inline table keyed by model → string array.
+    match &api.model_strip_fields {
+        Some(map) => {
+            let msf = ensure_inline_table_field(table, "model_strip_fields");
+            let stale: Vec<String> = msf
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .filter(|k| !map.contains_key(k.as_str()))
+                .collect();
+            for k in stale {
+                msf.remove(&k);
+            }
+            for (model, fields) in map {
+                if fields.is_empty() {
+                    msf.remove(model);
+                } else {
+                    let array_val = toml_edit::Value::Array(
+                        fields
+                            .iter()
+                            .map(|s| toml_edit::Value::from(s.as_str()))
+                            .collect(),
+                    );
+                    msf.insert(model, array_val);
+                }
+            }
+        }
+        None => {
+            table.remove("model_strip_fields");
+        }
+    }
+    // model_overrides — inline table keyed by model → nested inline table.
+    match &api.model_overrides {
+        Some(map) => {
+            let mo = ensure_inline_table_field(table, "model_overrides");
+            let stale: Vec<String> = mo
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .filter(|k| !map.contains_key(k.as_str()))
+                .collect();
+            for k in stale {
+                mo.remove(&k);
+            }
+            for (model, overrides) in map {
+                if overrides.is_empty() {
+                    mo.remove(model);
+                } else {
+                    let model_table = ensure_nested_inline_table(mo, model);
+                    sync_inline_table_in_place(model_table, overrides, json_to_toml_value)?;
+                }
+            }
+        }
+        None => {
+            table.remove("model_overrides");
+        }
+    }
+    // role_mappings — inline table of strings.
+    match &api.role_mappings {
+        Some(map) => {
+            let rm = ensure_inline_table_field(table, "role_mappings");
+            sync_inline_table_in_place(rm, map, |v| Ok(toml_edit::Value::from(v.as_str())))?;
+        }
+        None => {
+            table.remove("role_mappings");
+        }
+    }
+    // anthropic_cache_control — write whenever declared (Some); None removes
+    // so the provider-level default applies.
+    if let Some(v) = api.anthropic_cache_control {
+        table["anthropic_cache_control"] = toml_edit::value(v);
     } else {
         table.remove("anthropic_cache_control");
     }
-    // upstream_protocol — skip if None (mirrors skip_serializing_if).
-    if let Some(up) = provider.upstream_protocol {
-        table["upstream_protocol"] = toml_edit::value(up.as_str());
+    // timeouts — scalar replaces.
+    if let Some(secs) = api.timeout_secs {
+        table["timeout_secs"] = toml_edit::value(secs as i64);
     } else {
-        table.remove("upstream_protocol");
+        table.remove("timeout_secs");
+    }
+    if let Some(secs) = api.chunk_timeout_secs {
+        table["chunk_timeout_secs"] = toml_edit::value(secs as i64);
+    } else {
+        table.remove("chunk_timeout_secs");
+    }
+    if let Some(secs) = api.ttfb_timeout_secs {
+        table["ttfb_timeout_secs"] = toml_edit::value(secs as i64);
+    } else {
+        table.remove("ttfb_timeout_secs");
     }
     Ok(())
 }
@@ -504,11 +711,16 @@ fn write_route_fields(
     // model_name — always written
     existing["model_name"] = toml_edit::value(route.model_name.as_str());
 
-    // api_endpoint — skip if default (use the encapsulated predicate so
-    // that "what counts as the default" stays a private detail of the
-    // config module).
-    if !route.uses_default_api_endpoint() {
-        existing["api_endpoint"] = toml_edit::value(route.api_endpoint.as_str());
+    // pipeline — skip if default (`chat`).
+    if route.pipeline != Pipeline::default() {
+        existing["pipeline"] = toml_edit::value(route.pipeline.as_str());
+    } else {
+        existing.remove("pipeline");
+    }
+
+    // api_endpoint — skip if None (only image-pipeline routes carry it).
+    if let Some(endpoint) = &route.api_endpoint {
+        existing["api_endpoint"] = toml_edit::value(endpoint.as_str());
     } else {
         existing.remove("api_endpoint");
     }
@@ -629,12 +841,9 @@ fn write_target_fields(
         sync_inline_table_in_place(extra_table, &target.extra, json_to_toml_value)?;
     }
 
-    // upstream_protocol — skip if None (mirrors skip_serializing_if).
-    if let Some(up) = target.upstream_protocol {
-        existing.insert("upstream_protocol", toml_edit::Value::from(up.as_str()));
-    } else {
-        existing.remove("upstream_protocol");
-    }
+    // upstream_protocol — 字段已删除（协议由 provider apis keys 声明），
+    // 更新路径显式移除旧键。
+    existing.remove("upstream_protocol");
 
     // capabilities — nested inline table of present keys only; drop the
     // field entirely when None / empty (mirrors skip_serializing_if).
@@ -696,6 +905,7 @@ fn write_target_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use std::io::Write;
 
     use crate::config::*;
@@ -714,25 +924,16 @@ mod tests {
 
     fn minimal_provider() -> ProviderConfig {
         ProviderConfig {
-            provider_type: ProviderType::OpenAI,
             api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
-            proxy_mode: ProxyMode::Inherit,
-            base_url: "https://api.openai.com/v1".into(),
-            models_endpoint: "models".into(),
             timeout_secs: 120,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled: true,
-            enabled_models: vec![],
-            anthropic_cache_control: true,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
+            apis: IndexMap::from([(
+                ApiKind::ChatCompletions,
+                ApiConfig {
+                    base_url: "https://api.openai.com/v1".into(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
         }
     }
 
@@ -758,6 +959,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -783,9 +985,9 @@ port = 9090
 
 [providers.openai]
 # This is a user comment
-api_keys = ["sk-test"]
 # Another comment
-base_url = "https://custom.url"
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://custom.url" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -815,11 +1017,11 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -853,30 +1055,22 @@ base_url = "https://api.anthropic.com"
             providers: HashMap::from([(
                 "openai".into(),
                 ProviderConfig {
-                    provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
-                    key_strategy: KeyStrategy::FillFirst,
-                    proxy_mode: ProxyMode::Inherit,
-                    base_url: "https://api.openai.com/v1".into(),
-                    models_endpoint: "models".into(),
                     timeout_secs: 120,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled: true,
-                    enabled_models: vec![],
-                    anthropic_cache_control: true,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    upstream_protocol: None,
+                    apis: IndexMap::from([(
+                        ApiKind::ChatCompletions,
+                        ApiConfig {
+                            base_url: "https://api.openai.com/v1".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
                 },
             )]),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 strategy: Strategy::FillFirst,
                 retries: None,
                 timeout_secs: None,
@@ -887,7 +1081,6 @@ base_url = "https://api.anthropic.com"
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             }],
@@ -931,7 +1124,7 @@ base_url = "https://api.anthropic.com"
     }
 
     #[test]
-    fn save_skips_default_provider_type_and_key_strategy_on_roundtrip() {
+    fn save_never_reintroduces_removed_provider_type_and_skips_default_key_strategy_on_roundtrip() {
         let content = r#"
 [server]
 host = "127.0.0.1"
@@ -939,6 +1132,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -961,16 +1155,15 @@ api_keys = ["sk-test"]
     }
 
     #[test]
-    fn save_writes_non_default_provider_type_and_key_strategy() {
+    fn save_writes_non_default_key_strategy() {
         let content = r#"
 [server]
 host = "127.0.0.1"
 port = 9090
 
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 key_strategy = "round_robin"
 "#;
         let path = temp_toml(content);
@@ -982,12 +1175,12 @@ key_strategy = "round_robin"
 
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
-            saved.contains("provider_type = \"anthropic\""),
-            "non-default provider_type should be written, got:\n{saved}"
-        );
-        assert!(
             saved.contains("key_strategy = \"round_robin\""),
             "non-default key_strategy should be written, got:\n{saved}"
+        );
+        assert!(
+            !saved.contains("provider_type"),
+            "provider_type no longer exists and must not reappear, got:\n{saved}"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -1005,25 +1198,16 @@ key_strategy = "round_robin"
             providers: HashMap::from([(
                 "openai".into(),
                 ProviderConfig {
-                    provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
-                    key_strategy: KeyStrategy::FillFirst,
-                    proxy_mode: ProxyMode::Inherit,
-                    base_url: "https://api.openai.com/v1".into(),
-                    models_endpoint: "models".into(),
                     timeout_secs: 120,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled: true,
-                    enabled_models: vec![],
-                    anthropic_cache_control: true,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    upstream_protocol: None,
+                    apis: IndexMap::from([(
+                        ApiKind::ChatCompletions,
+                        ApiConfig {
+                            base_url: "https://api.openai.com/v1".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
                 },
             )]),
             ..crate::gateway_config_base!()
@@ -1057,8 +1241,12 @@ key_strategy = "round_robin"
             "default anthropic_cache_control (OpenAI + true) should not be written, got:\n{saved}"
         );
         assert!(
-            saved.contains("models_endpoint = \"models\""),
-            "models_endpoint should be written even when default, got:\n{saved}"
+            !saved.contains("models_endpoint"),
+            "provider-level models_endpoint is gone; per-API None must not be written, got:\n{saved}"
+        );
+        assert!(
+            saved.contains("[providers.openai.apis.chat_completions]"),
+            "apis should be written as a nested table on create, got:\n{saved}"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -1075,13 +1263,11 @@ api_keys = ["key1"]
 
 [providers.openai]
 api_keys = ["sk-test"]
-models_endpoint = "models"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
-models_endpoint = "v1/models"
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 timeout_secs = 60
 
 [[routes]]
@@ -1105,11 +1291,10 @@ targets = [
         assert_eq!(reloaded.providers.len(), config.providers.len());
         for (name, p1) in &config.providers {
             let p2 = reloaded.providers.get(name).unwrap();
-            assert_eq!(p1.provider_type, p2.provider_type);
             assert_eq!(p1.api_keys, p2.api_keys);
             assert_eq!(p1.key_strategy, p2.key_strategy);
-            assert_eq!(p1.base_url, p2.base_url);
-            assert_eq!(p1.models_endpoint, p2.models_endpoint);
+            assert_eq!(p1.apis, p2.apis, "apis catalog must survive round-trip");
+            assert_eq!(p1.fallback, p2.fallback);
             assert_eq!(p1.timeout_secs, p2.timeout_secs);
             assert_eq!(p1.headers, p2.headers);
             assert_eq!(p1.body_overrides, p2.body_overrides);
@@ -1150,30 +1335,22 @@ targets = [
             providers: HashMap::from([(
                 "openai".into(),
                 ProviderConfig {
-                    provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
-                    key_strategy: KeyStrategy::FillFirst,
-                    proxy_mode: ProxyMode::Inherit,
-                    base_url: "https://api.openai.com/v1".into(),
-                    models_endpoint: "models".into(),
                     timeout_secs: 120,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled: true,
-                    enabled_models: vec![],
-                    anthropic_cache_control: true,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    upstream_protocol: None,
+                    apis: IndexMap::from([(
+                        ApiKind::ChatCompletions,
+                        ApiConfig {
+                            base_url: "https://api.openai.com/v1".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
                 },
             )]),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 strategy: Strategy::FillFirst,
                 retries: None,
                 timeout_secs: None,
@@ -1187,7 +1364,6 @@ targets = [
                         "nested".into(),
                         serde_json::json!({ "temperature": null }),
                     )]),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             }],
@@ -1220,30 +1396,22 @@ targets = [
             providers: HashMap::from([(
                 "openai".into(),
                 ProviderConfig {
-                    provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
-                    key_strategy: KeyStrategy::FillFirst,
-                    proxy_mode: ProxyMode::Inherit,
-                    base_url: "https://api.openai.com/v1".into(),
-                    models_endpoint: "models".into(),
                     timeout_secs: 120,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled: true,
-                    enabled_models: vec![],
-                    anthropic_cache_control: true,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    upstream_protocol: None,
+                    apis: IndexMap::from([(
+                        ApiKind::ChatCompletions,
+                        ApiConfig {
+                            base_url: "https://api.openai.com/v1".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
                 },
             )]),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 strategy: Strategy::FillFirst,
                 retries: None,
                 timeout_secs: None,
@@ -1254,7 +1422,6 @@ targets = [
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::from([("list".into(), serde_json::json!([1, null, 3]))]),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             }],
@@ -1284,30 +1451,22 @@ targets = [
             providers: HashMap::from([(
                 "openai".into(),
                 ProviderConfig {
-                    provider_type: ProviderType::OpenAI,
                     api_keys: vec!["sk-test".into()],
-                    key_strategy: KeyStrategy::FillFirst,
-                    proxy_mode: ProxyMode::Inherit,
-                    base_url: "https://api.openai.com/v1".into(),
-                    models_endpoint: "models".into(),
                     timeout_secs: 120,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled: true,
-                    enabled_models: vec![],
-                    anthropic_cache_control: true,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    upstream_protocol: None,
+                    apis: IndexMap::from([(
+                        ApiKind::ChatCompletions,
+                        ApiConfig {
+                            base_url: "https://api.openai.com/v1".into(),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
                 },
             )]),
             routes: vec![RouteConfig {
                 model_name: "gpt-4".into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 strategy: Strategy::FillFirst,
                 retries: None,
                 timeout_secs: None,
@@ -1318,7 +1477,6 @@ targets = [
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::from([("temperature".into(), serde_json::Value::Null)]),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             }],
@@ -1348,6 +1506,7 @@ port = 9090
 [providers]
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -1398,6 +1557,7 @@ port = 9090
 [providers]
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "multi"
@@ -1507,6 +1667,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 # User-authored backoff config
 [backoff]
@@ -1544,6 +1705,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 # GPT-4 route section
 [[routes]]
@@ -1584,6 +1746,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 # Keep me
@@ -1600,7 +1763,8 @@ targets = [
 
         config.routes.push(RouteConfig {
             model_name: "claude".into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             strategy: Strategy::FillFirst,
             retries: None,
             timeout_secs: None,
@@ -1611,7 +1775,6 @@ targets = [
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         });
@@ -1637,10 +1800,11 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.anthropic]
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -1675,6 +1839,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1713,6 +1878,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1750,6 +1916,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1782,6 +1949,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1819,6 +1987,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1861,9 +2030,11 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.anthropic]
 api_keys = ["sk-ant"]
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1900,9 +2071,11 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.anthropic]
 api_keys = ["sk-ant"]
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -1947,12 +2120,15 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.kimchi]
 api_keys = ["sk-kimchi"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.jx]
 api_keys = ["sk-jx"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "kimi-k2.6"
@@ -1994,6 +2170,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-3", "sk-1", "sk-2"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2023,6 +2200,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-1", "sk-2", "sk-3"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2053,6 +2231,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-1"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2080,6 +2259,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-1"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2108,6 +2288,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 enabled_models = ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
 "#;
         let path = temp_toml(content);
@@ -2138,6 +2319,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 headers = { X-Trace = "on", X-Request-Id = "abc", Authorization = "Bearer t" }
 "#;
         let path = temp_toml(content);
@@ -2168,6 +2350,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 headers = { X-Trace = "on", X-Request-Id = "abc" }
 "#;
         let path = temp_toml(content);
@@ -2233,6 +2416,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.openai.model_overrides]
 gpt-4o = { max_tokens = 4096 }
@@ -2274,6 +2458,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [providers.openai.model_overrides]
 gpt-4o = { max_tokens = 4096 }
@@ -2310,6 +2495,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 body_overrides = { max_tokens = 4096, temperature = 0.8, top_p = 0.9 }
 "#;
         let path = temp_toml(content);
@@ -2343,6 +2529,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2388,6 +2575,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 chunk_timeout_secs = 30
 ttfb_timeout_secs = 45
 "#;
@@ -2431,6 +2619,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2463,6 +2652,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 role_mappings = { developer = "system" }
 "#;
         let path = temp_toml(content);
@@ -2501,6 +2691,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -2539,6 +2730,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -2580,6 +2772,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -2618,6 +2811,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4"
@@ -2663,6 +2857,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2686,25 +2881,29 @@ api_keys = ["sk-test"]
         config.providers.insert(
             "openai".into(),
             ProviderConfig {
-                provider_type: ProviderType::Anthropic,
                 api_keys: vec!["sk-a".into(), "sk-b".into()],
                 key_strategy: KeyStrategy::RoundRobin,
                 proxy_mode: ProxyMode::Disabled,
-                base_url: "https://custom.example.com/v1".into(),
-                models_endpoint: "v1/list".into(),
                 timeout_secs: 300,
                 chunk_timeout_secs: Some(30),
                 ttfb_timeout_secs: Some(45),
                 headers,
                 body_overrides,
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
                 model_overrides,
                 role_mappings,
                 enabled: false,
                 enabled_models: vec!["gpt-4o".into()],
                 anthropic_cache_control: false,
-                upstream_protocol: None,
+                fallback: Some(ApiKind::ChatCompletions),
+                apis: IndexMap::from([(
+                    ApiKind::ChatCompletions,
+                    ApiConfig {
+                        base_url: "https://custom.example.com/v1".into(),
+                        models_endpoint: Some("v1/list".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
             },
         );
 
@@ -2714,12 +2913,13 @@ api_keys = ["sk-test"]
         let reloaded = reloaded_handle.inner.try_read().unwrap();
         let p = reloaded.providers.get("openai").unwrap();
 
-        assert_eq!(p.provider_type, ProviderType::Anthropic);
         assert_eq!(p.api_keys, vec!["sk-a", "sk-b"]);
         assert_eq!(p.key_strategy, KeyStrategy::RoundRobin);
         assert_eq!(p.proxy_mode, ProxyMode::Disabled);
-        assert_eq!(p.base_url, "https://custom.example.com/v1");
-        assert_eq!(p.models_endpoint, "v1/list");
+        assert_eq!(p.fallback, Some(ApiKind::ChatCompletions));
+        let api = &p.apis[&ApiKind::ChatCompletions];
+        assert_eq!(api.base_url, "https://custom.example.com/v1");
+        assert_eq!(api.models_endpoint.as_deref(), Some("v1/list"));
         assert_eq!(p.timeout_secs, 300);
         assert_eq!(p.chunk_timeout_secs, Some(30));
         assert_eq!(p.ttfb_timeout_secs, Some(45));
@@ -2762,9 +2962,8 @@ host = "127.0.0.1"
 port = 9090
 
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -2803,8 +3002,6 @@ base_url = "https://api.anthropic.com"
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let mut config = openai_only_config();
         let mut p = minimal_provider();
-        p.provider_type = ProviderType::Anthropic;
-        p.base_url = "https://api.anthropic.com".into();
         p.anthropic_cache_control = true;
         config.providers.insert("anthropic".into(), p);
 
@@ -2832,46 +3029,12 @@ base_url = "https://api.anthropic.com"
     }
 
     #[test]
-    fn openai_never_writes_anthropic_cache_control() {
-        // OpenAI + false: key must still not be written (predicate
-        // requires Anthropic type regardless of value).
-        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
-        let mut config = openai_only_config();
-        config
-            .providers
-            .get_mut("openai")
-            .unwrap()
-            .anthropic_cache_control = false;
-
-        save_config_to_file(&config, &path).unwrap();
-
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !saved.contains("anthropic_cache_control"),
-            "non-Anthropic provider must never write the key, got:\n{saved}"
-        );
-
-        let reloaded = load_config(&path).unwrap();
-        let c = reloaded.inner.try_read().unwrap();
-        assert!(
-            c.providers.get("openai").unwrap().anthropic_cache_control,
-            "reload without the key should default to true"
-        );
-        drop(c);
-        drop(reloaded);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
     fn create_path_keeps_anthropic_cache_control_false() {
         // New provider (create path via to_document): Anthropic + false
         // must survive serialization and be written as `= false`.
         let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
         let mut config = openai_only_config();
         let mut p = minimal_provider();
-        p.provider_type = ProviderType::Anthropic;
-        p.base_url = "https://api.anthropic.com".into();
         p.anthropic_cache_control = false;
         config.providers.insert("anthropic".into(), p);
 
@@ -2908,9 +3071,8 @@ host = "127.0.0.1"
 port = 9090
 
 [providers.anthropic]
-provider_type = "anthropic"
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
 anthropic_cache_control = false
 "#;
         let path = temp_toml(content);
@@ -2947,45 +3109,6 @@ anthropic_cache_control = false
         );
         drop(c);
         drop(reloaded);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn provider_type_switch_to_openai_strips_cache_control() {
-        // Anthropic + false persisted, then provider_type switched to
-        // OpenAI in the same process → save strips the key (acceptable
-        // edge: the false is lost after a restart in this state).
-        let content = r#"
-[server]
-host = "127.0.0.1"
-port = 9090
-
-[providers.anthropic]
-provider_type = "anthropic"
-api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
-anthropic_cache_control = false
-"#;
-        let path = temp_toml(content);
-        let handle = load_config(&path).unwrap();
-        let mut config = handle.inner.try_read().unwrap().clone();
-        drop(handle);
-
-        assert!(
-            !config.providers["anthropic"].anthropic_cache_control,
-            "fixture should load as false"
-        );
-        // Switch type to OpenAI while the in-memory value stays false.
-        config.providers.get_mut("anthropic").unwrap().provider_type = ProviderType::OpenAI;
-
-        save_config_to_file(&config, &path).unwrap();
-
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !saved.contains("anthropic_cache_control"),
-            "switching to OpenAI must strip the key even when value is false, got:\n{saved}"
-        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3149,6 +3272,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -3204,6 +3328,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -3266,6 +3391,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
 
@@ -3329,6 +3455,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let path = temp_toml(content);
         let handle = load_config(&path).unwrap();
@@ -3387,6 +3514,7 @@ port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 proxy_mode = "enabled"
 "#;
         let path = temp_toml(content);
@@ -3413,13 +3541,14 @@ proxy_mode = "enabled"
     }
 
     #[test]
-    fn save_upstream_protocol_roundtrip_some_and_none() {
+    fn save_fallback_roundtrip_some_and_none() {
         let content = r#"[server]
 host = "127.0.0.1"
 port = 9090
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -3432,63 +3561,46 @@ targets = [
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
 
-        // Set Some on provider and target (legal openai combos only:
-        // chat_completions / responses — anthropic_messages on openai is
-        // now a validate error).
-        config
-            .providers
-            .get_mut("openai")
-            .unwrap()
-            .upstream_protocol = Some(sag_core::UpstreamProtocol::Responses);
-        config.routes[0].targets[0].upstream_protocol =
-            Some(sag_core::UpstreamProtocol::ChatCompletions);
-
+        // 单协议 key、未写 fallback → 落盘不写 fallback。
         save_config_to_file(&config, &path).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
-            saved.contains("upstream_protocol = \"responses\""),
-            "provider upstream_protocol must be written, got:\n{saved}"
-        );
-        assert!(
-            saved.contains("upstream_protocol = \"chat_completions\""),
-            "target upstream_protocol must be written, got:\n{saved}"
+            !saved.contains("fallback"),
+            "omitted fallback must not be written, got:\n{saved}"
         );
 
+        // 显式写 fallback（必须 ∈ apis 协议 key 集）→ 写盘 + 回读。
+        config.providers.get_mut("openai").unwrap().fallback =
+            Some(sag_core::ApiKind::ChatCompletions);
+        save_config_to_file(&config, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("fallback = \"chat_completions\""),
+            "fallback must be written, got:\n{saved}"
+        );
         let reloaded_handle = load_config(&path).unwrap();
         let reloaded = reloaded_handle.inner.try_read().unwrap();
         assert_eq!(
-            reloaded.providers.get("openai").unwrap().upstream_protocol,
-            Some(sag_core::UpstreamProtocol::Responses)
-        );
-        assert_eq!(
-            reloaded.routes[0].targets[0].upstream_protocol,
-            Some(sag_core::UpstreamProtocol::ChatCompletions)
+            reloaded.providers.get("openai").unwrap().fallback,
+            Some(sag_core::ApiKind::ChatCompletions)
         );
         drop(reloaded);
+        drop(reloaded_handle);
 
-        // Clear back to None → keys removed.
+        // 清回 None → 键从磁盘移除。
         let handle = load_config(&path).unwrap();
         let mut config = handle.inner.try_read().unwrap().clone();
         drop(handle);
-        config
-            .providers
-            .get_mut("openai")
-            .unwrap()
-            .upstream_protocol = None;
-        config.routes[0].targets[0].upstream_protocol = None;
+        config.providers.get_mut("openai").unwrap().fallback = None;
         save_config_to_file(&config, &path).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !saved.contains("upstream_protocol"),
-            "None must omit the key, got:\n{saved}"
+            !saved.contains("fallback"),
+            "None must remove the fallback key, got:\n{saved}"
         );
         let reloaded_handle = load_config(&path).unwrap();
         let reloaded = reloaded_handle.inner.try_read().unwrap();
-        assert_eq!(
-            reloaded.providers.get("openai").unwrap().upstream_protocol,
-            None
-        );
-        assert_eq!(reloaded.routes[0].targets[0].upstream_protocol, None);
+        assert_eq!(reloaded.providers.get("openai").unwrap().fallback, None);
 
         let _ = std::fs::remove_file(&path);
     }

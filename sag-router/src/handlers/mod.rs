@@ -97,35 +97,25 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
                 "created": 0,
                 "owned_by": owned_by,
             });
-            // Optional lane metadata (M7 / §7.5): only emitted when at least
-            // one target (or its provider) explicitly declares
-            // `upstream_protocol` — omit the keys entirely otherwise so
-            // default OpenAI-compatible clients see an unchanged payload.
-            // Key name is `ingress_protocols` per plan §7.5 (not
-            // the raw field name `upstream_protocol`); values are the
-            // explicit protocol declarations that gate native-lane eligibility.
-            let mut explicit_protocols: Vec<&'static str> = Vec::new();
-            let mut any_explicit = false;
-            for target in &route.targets {
-                let pc = config.providers.get(&target.provider);
-                let declared = target
-                    .upstream_protocol
-                    .or_else(|| pc.and_then(|p| p.upstream_protocol));
-                if let Some(up) = declared {
-                    any_explicit = true;
-                    let s = up.as_str();
-                    if !explicit_protocols.contains(&s) {
-                        explicit_protocols.push(s);
-                    }
+            // Lane metadata (plan §7.5): both keys are always emitted —
+            // the explicit-only gate went away with `upstream_protocol`.
+            // `ingress_protocols` is the union of the `apis` protocol keys
+            // of every target's provider, in canonical protocol order so
+            // the payload is stable regardless of target ordering.
+            let mut ingress_protocols: Vec<&'static str> = Vec::new();
+            for kind in sag_core::ApiKind::protocols() {
+                let declared = route.targets.iter().any(|t| {
+                    config
+                        .providers
+                        .get(&t.provider)
+                        .is_some_and(|pc| pc.apis.contains_key(&kind))
+                });
+                if declared {
+                    ingress_protocols.push(kind.as_str());
                 }
             }
-            if any_explicit {
-                model["ingress_protocols"] = json!(explicit_protocols);
-                // Conservative lane surface: a declared protocol is
-                // native-capable against a matching ingress; derived-only
-                // targets stay translated and are never advertised as native.
-                model["lanes"] = json!(["native", "translated"]);
-            }
+            model["ingress_protocols"] = json!(ingress_protocols);
+            model["lanes"] = json!(["native", "translated"]);
             model
         })
         .collect();
@@ -246,7 +236,8 @@ mod tests {
         let routes = vec![
             RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -257,13 +248,13 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             },
             RouteConfig {
                 model_name: "claude-opus".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -274,13 +265,13 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             },
             RouteConfig {
                 model_name: "gpt-4o-mini".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -292,7 +283,6 @@ mod tests {
                         retries: None,
                         timeout_secs: None,
                         extra: HashMap::new(),
-                        upstream_protocol: None,
                         capabilities: None,
                     },
                     RouteTarget {
@@ -302,7 +292,6 @@ mod tests {
                         retries: None,
                         timeout_secs: None,
                         extra: HashMap::new(),
-                        upstream_protocol: None,
                         capabilities: None,
                     },
                 ],
@@ -345,7 +334,8 @@ mod tests {
         let routes = vec![
             RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -356,13 +346,13 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             },
             RouteConfig {
                 model_name: "deleted-model".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: Strategy::FillFirst,
@@ -373,7 +363,6 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             },

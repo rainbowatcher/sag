@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
+pub use sag_core::ApiKind;
 use serde::{Deserialize, Serialize};
 
 /// Macro: produce a minimal `GatewayConfig` with sensible defaults for
@@ -162,6 +164,20 @@ impl GatewayConfig {
         normalize_proxy_url(self.proxy_url.as_deref())
     }
 
+    /// Load-time normalization（`load_config` / `reload_config` 在校验前调用）：
+    /// 剥去每个 `apis.<key>.base_url` 的尾部 `/`，避免「base_url + 固定协议
+    /// path」拼接出 `//path`（参照 [`normalize_models_endpoint`] 的裁剪语义）。
+    pub fn normalize(&mut self) {
+        for provider in self.providers.values_mut() {
+            for api in provider.apis.values_mut() {
+                let trimmed = api.base_url.trim_end_matches('/');
+                if trimmed != api.base_url {
+                    api.base_url = trimmed.to_string();
+                }
+            }
+        }
+    }
+
     /// Validate the configuration, returning all semantic errors found.
     /// Returns `Ok(())` if no errors, `Err(Vec<String>)` with all error messages.
     pub fn validate(&self) -> std::result::Result<(), Vec<String>> {
@@ -301,29 +317,99 @@ impl GatewayConfig {
             if provider.api_keys.is_empty() {
                 errors.push(format!("provider '{name}': api_keys must not be empty"));
             }
-            // Legal upstream_protocol × provider_type combinations (§7.1.5).
-            // Anthropic adapters only speak the Anthropic Messages wire format
-            // for their native path; Chat Completions / Responses declarations
-            // on an anthropic provider would silently select a mismatched
-            // encoder and are rejected as unknown combinations (strict-enum
-            // style, same as typed config enums).
-            if let Some(up) = provider.upstream_protocol {
-                match (provider.provider_type, up) {
-                    (ProviderType::Anthropic, sag_core::UpstreamProtocol::ChatCompletions)
-                    | (ProviderType::Anthropic, sag_core::UpstreamProtocol::Responses) => {
+            // ── apis 目录：非空、至少一个协议 key、fallback 规则 ──
+            let protocol_keys: Vec<ApiKind> = provider
+                .apis
+                .keys()
+                .copied()
+                .filter(|k| k.is_protocol())
+                .collect();
+            if provider.apis.is_empty() {
+                errors.push(format!(
+                    "provider '{name}': apis must not be empty — declare at least one protocol API, e.g. [providers.{name}.apis.chat_completions]"
+                ));
+            } else if protocol_keys.is_empty() {
+                errors.push(format!(
+                    "provider '{name}': apis must declare at least one protocol key (chat_completions, responses, or anthropic_messages); 'image' alone is not a protocol"
+                ));
+            } else {
+                let key_list: Vec<&str> = protocol_keys.iter().map(|k| k.as_str()).collect();
+                match provider.fallback {
+                    Some(fb) if !protocol_keys.contains(&fb) => {
                         errors.push(format!(
-                            "provider '{name}': upstream_protocol='{}' is not valid for provider_type='anthropic' (expected 'anthropic_messages')",
-                            up.as_str()
+                            "provider '{name}': fallback='{}' must be one of the configured apis protocol keys [{}]",
+                            fb.as_str(),
+                            key_list.join(", ")
                         ));
                     }
-                    (ProviderType::OpenAI, sag_core::UpstreamProtocol::AnthropicMessages) => {
+                    Some(_) => {}
+                    None if protocol_keys.len() > 1 => {
+                        // 多协议 key 未写 fallback → 报错并给出建议值
+                        // （apis 中第一个协议 key，IndexMap 表序）。
                         errors.push(format!(
-                            "provider '{name}': upstream_protocol='anthropic_messages' is not valid for provider_type='openai' (expected 'chat_completions' or 'responses')"
+                            "provider '{name}': fallback is required when apis declares multiple protocol keys [{}]; suggested value: fallback = \"{}\"",
+                            key_list.join(", "),
+                            protocol_keys[0].as_str()
                         ));
                     }
-                    // openai + chat_completions / responses, anthropic +
-                    // anthropic_messages: legal (explicit or derived).
-                    _ => {}
+                    // 单协议 key：降级目标唯一，未写则自动取之 —— 校验通过。
+                    None => {}
+                }
+            }
+            // ── 每个 apis 节的 base_url / models_endpoint / 超时 ──
+            if !provider.apis.is_empty() {
+                for (kind, api) in &provider.apis {
+                    match url::Url::parse(&api.base_url) {
+                        Ok(u) => {
+                            if u.scheme() != "http" && u.scheme() != "https" {
+                                errors.push(format!(
+                                    "provider '{name}': apis.{}.base_url '{}' has unsupported scheme '{}', expected 'http' or 'https'",
+                                    kind.as_str(),
+                                    api.base_url,
+                                    u.scheme()
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            errors.push(format!(
+                                "provider '{name}': apis.{}.base_url '{}' is not a valid URL: {e}",
+                                kind.as_str(),
+                                api.base_url
+                            ));
+                        }
+                    }
+                    if let Some(endpoint) = &api.models_endpoint
+                        && (endpoint.contains("://")
+                            || endpoint.contains('?')
+                            || endpoint.contains('#')
+                            || endpoint
+                                .split('/')
+                                .any(|segment| segment.contains(char::is_whitespace)))
+                    {
+                        errors.push(format!(
+                            "provider '{name}': apis.{}.models_endpoint '{}' must be a relative path without scheme, query, fragment, or whitespace",
+                            kind.as_str(),
+                            endpoint
+                        ));
+                    }
+                    if api.timeout_secs == Some(0) {
+                        errors.push(format!(
+                            "provider '{name}': apis.{}.timeout_secs must be greater than 0",
+                            kind.as_str()
+                        ));
+                    }
+                    if api.chunk_timeout_secs == Some(0) {
+                        errors.push(format!(
+                            "provider '{name}': apis.{}.chunk_timeout_secs must be greater than 0",
+                            kind.as_str()
+                        ));
+                    }
+                    if api.ttfb_timeout_secs == Some(0) {
+                        errors.push(format!(
+                            "provider '{name}': apis.{}.ttfb_timeout_secs must be greater than 0",
+                            kind.as_str()
+                        ));
+                    }
                 }
             }
             // `proxy_mode = "enabled"` forces the top-level `proxy_url`;
@@ -334,35 +420,6 @@ impl GatewayConfig {
             if provider.proxy_mode == ProxyMode::Enabled && normalized_global_proxy.is_none() {
                 errors.push(format!(
                     "provider '{name}': proxy_mode='enabled' requires a top-level proxy_url to be configured"
-                ));
-            }
-            match url::Url::parse(&provider.base_url) {
-                Ok(url) => {
-                    if url.scheme() != "http" && url.scheme() != "https" {
-                        errors.push(format!(
-                            "provider '{name}': base_url '{}' has unsupported scheme '{}', expected 'http' or 'https'",
-                            provider.base_url, url.scheme()
-                        ));
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!(
-                        "provider '{name}': base_url '{}' is not a valid URL: {e}",
-                        provider.base_url
-                    ));
-                }
-            }
-            if provider.models_endpoint.contains("://")
-                || provider.models_endpoint.contains('?')
-                || provider.models_endpoint.contains('#')
-                || provider
-                    .models_endpoint
-                    .split('/')
-                    .any(|segment| segment.contains(char::is_whitespace))
-            {
-                errors.push(format!(
-                    "provider '{name}': models_endpoint '{}' must be a relative path without scheme, query, fragment, or whitespace",
-                    provider.models_endpoint
                 ));
             }
             if provider.timeout_secs == 0 {
@@ -421,11 +478,29 @@ impl GatewayConfig {
                 }
             }
 
-            if !route.api_endpoint.starts_with('/') {
-                errors.push(format!(
-                    "routes[{i}] (model='{}'): api_endpoint must start with '/'",
-                    route.model_name
-                ));
+            // ── api_endpoint × pipeline ──
+            // `api_endpoint` 是 image 路线的真实上游路径（D3/D8），
+            // chat 族 route 不允许出现该字段。
+            match (&route.pipeline, &route.api_endpoint) {
+                (Pipeline::Chat, Some(endpoint)) => {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): api_endpoint='{endpoint}' is only valid when pipeline = \"image\"; remove api_endpoint from a chat-pipeline route",
+                        route.model_name
+                    ));
+                }
+                (Pipeline::Image, None) => {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): pipeline = \"image\" requires api_endpoint (the real upstream path appended to apis.image.base_url)",
+                        route.model_name
+                    ));
+                }
+                (_, Some(endpoint)) if !endpoint.starts_with('/') => {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): api_endpoint must start with '/'",
+                        route.model_name
+                    ));
+                }
+                _ => {}
             }
 
             if let Some(retries) = route.retries
@@ -476,27 +551,6 @@ impl GatewayConfig {
                         route.model_name
                     ));
                 }
-                // ── upstream_protocol × provider_type (target-level) ──
-                let target_provider = self.providers.get(&target.provider);
-                if let (Some(up), Some(pc)) = (target.upstream_protocol, target_provider) {
-                    match (pc.provider_type, up) {
-                        (ProviderType::Anthropic, sag_core::UpstreamProtocol::ChatCompletions)
-                        | (ProviderType::Anthropic, sag_core::UpstreamProtocol::Responses) => {
-                            errors.push(format!(
-                                "routes[{i}] (model='{}'): target[{j}] upstream_protocol='{}' is not valid for provider_type='anthropic' (expected 'anthropic_messages')",
-                                route.model_name,
-                                up.as_str()
-                            ));
-                        }
-                        (ProviderType::OpenAI, sag_core::UpstreamProtocol::AnthropicMessages) => {
-                            errors.push(format!(
-                                "routes[{i}] (model='{}'): target[{j}] upstream_protocol='anthropic_messages' is not valid for provider_type='openai' (expected 'chat_completions' or 'responses')",
-                                route.model_name
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
                 // ── capabilities unknown keys (fixed key set, §7.1.5) ──
                 if let Some(caps) = &target.capabilities
                     && let Some(unknown) = caps.unknown_keys_error()
@@ -505,49 +559,6 @@ impl GatewayConfig {
                         "routes[{i}] (model='{}'): target[{j}] capabilities: {unknown}",
                         route.model_name
                     ));
-                }
-                // ── api_endpoint vs protocol (D11 / §7.5 pin) ──
-                //
-                // `api_endpoint` is only an upstream URL path — it never
-                // declares a protocol. Two rules:
-                // 1. provider_type=anthropic ignores `api_endpoint` (path is
-                //    fixed `/messages`); a non-default value is an error when
-                //    an explicit non-derived `upstream_protocol` also mismatches
-                //    the path, otherwise a warning that the field has no effect.
-                // 2. For any other explicit declaration whose effective path
-                //    does not match `api_endpoint`, only warn — the endpoint
-                //    remains a free path string for OpenAI-compatible bases.
-                if let Some(pc) = target_provider {
-                    let derived = sag_core::derive_upstream_protocol(pc.provider_type.as_str());
-                    let explicit = target.upstream_protocol.or(pc.upstream_protocol);
-                    let endpoint_default = route.uses_default_api_endpoint();
-                    if pc.provider_type == ProviderType::Anthropic && !endpoint_default {
-                        let protocol_mismatch = explicit.is_some_and(|up| up != derived);
-                        if protocol_mismatch {
-                            errors.push(format!(
-                                "routes[{i}] (model='{}'): target[{j}] provider_type='anthropic' ignores api_endpoint='{}' (path is fixed '/messages'); remove api_endpoint or align upstream_protocol",
-                                route.model_name,
-                                route.api_endpoint
-                            ));
-                        } else {
-                            warnings.push(format!(
-                                "routes[{i}] (model='{}'): target[{j}] provider_type='anthropic' ignores api_endpoint='{}' (path is fixed '/messages')",
-                                route.model_name,
-                                route.api_endpoint
-                            ));
-                        }
-                    } else if explicit.is_some_and(|up| up != derived)
-                        && !endpoint_matches_protocol(
-                            &route.api_endpoint,
-                            explicit.unwrap_or(derived),
-                        )
-                    {
-                        warnings.push(format!(
-                            "routes[{i}] (model='{}'): target[{j}] api_endpoint='{}' does not match upstream_protocol — api_endpoint is only a URL path and never declares a protocol; set upstream_protocol explicitly if needed",
-                            route.model_name,
-                            route.api_endpoint
-                        ));
-                    }
                 }
             }
 
@@ -683,32 +694,10 @@ pub struct GatewayAuthConfig {
     pub api_keys: Vec<String>,
 }
 
-/// Supported LLM provider adapter type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderType {
-    /// OpenAI-compatible API (also used for any OpenAI-drop-in replacement).
-    #[default]
-    #[serde(rename = "openai")]
-    OpenAI,
-    /// Anthropic Messages API.
-    Anthropic,
-}
-
-impl ProviderType {
-    /// Return the canonical lowercase string for this provider type.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ProviderType::OpenAI => "openai",
-            ProviderType::Anthropic => "anthropic",
-        }
-    }
-}
-
 /// Fixed-key capability override for a route target (§7.1.3 / D3).
 ///
 /// Every field is optional: an omitted key leaves the derived capability
-/// (from `provider_type` + effective `upstream_protocol`) untouched. The
+/// (keyed by the actually-used protocol) untouched. The
 /// key set is fixed — unknown keys are captured during deserialize and
 /// rejected by [`GatewayConfig::validate`] (same strictness as typed
 /// config enums; `capabilities` is a closed set, not an open map).
@@ -785,26 +774,6 @@ impl CapabilitiesOverride {
     }
 }
 
-/// Whether `api_endpoint` is a plausible path for the given upstream
-/// protocol. Used only for warnings — `api_endpoint` never *declares* a
-/// protocol (§7.5); this just flags likely misconfiguration.
-fn endpoint_matches_protocol(endpoint: &str, protocol: sag_core::UpstreamProtocol) -> bool {
-    match protocol {
-        sag_core::UpstreamProtocol::ChatCompletions => {
-            endpoint.ends_with("/chat/completions") || endpoint == "/chat/completions"
-        }
-        sag_core::UpstreamProtocol::Responses => {
-            endpoint.ends_with("/responses") || endpoint == "/responses"
-        }
-        // Anthropic path is fixed `/messages` (D11) — any non-default
-        // endpoint already produced an error/warning above for anthropic
-        // providers; treat default chat path as mismatched for completeness.
-        sag_core::UpstreamProtocol::AnthropicMessages => {
-            endpoint.ends_with("/messages") || endpoint == "/messages"
-        }
-    }
-}
-
 /// API key selection strategy for providers with multiple keys.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -821,7 +790,7 @@ pub enum KeyStrategy {
 ///
 /// Serde values are `inherit` / `enabled` / `disabled`. Unknown values
 /// follow the same strict pattern as the other config enums
-/// ([`Strategy`], [`KeyStrategy`], [`ProviderType`]) — they fail config
+/// ([`Strategy`], [`KeyStrategy`]) — they fail config
 /// parsing rather than silently guessing, and there is no lenient
 /// fallback for unknown enum values anywhere in the loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -968,24 +937,75 @@ pub fn resolve_effective_proxy(
     }
 }
 
-/// Upstream LLM provider configuration.
+/// 单个上游 API 节（`[providers.<name>.apis.<key>]`）：地址 + 协议相关覆盖。
+///
+/// - `base_url` **必填**：host + API 根前缀，不含协议 path（path 由协议 key
+///   固定推导，见 `sag_core::protocol_path`；image 的路径来自 route.`api_endpoint`）。
+/// - `models_endpoint` 与全部协议相关字段为 `Option`：`None` → 继承 provider
+///   级缺省；`Some` → **整段覆盖** provider 级同名字段（map 不合并、数组不并集）。
+/// - 未知字段被容忍（warn），未知 apis key 在反序列化层报错（枚举严格）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Upstream API root (host + root prefix, no protocol path).
+    pub base_url: String,
+    /// Relative path used only by admin fetch-models (URL = this node's
+    /// `base_url` + `models_endpoint`). `None` → provider-level default
+    /// behavior (`"models"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_endpoint: Option<String>,
+    /// 覆盖 provider 级 `headers`（整段替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    /// 覆盖 provider 级 `body_overrides`（整段替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_overrides: Option<HashMap<String, serde_json::Value>>,
+    /// 覆盖 provider 级 `strip_fields`（整段替换，数组不并集）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_fields: Option<Vec<String>>,
+    /// 覆盖 provider 级 `model_strip_fields`（整段替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_strip_fields: Option<HashMap<String, Vec<String>>>,
+    /// 覆盖 provider 级 `model_overrides`（整段替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_overrides: Option<HashMap<String, HashMap<String, serde_json::Value>>>,
+    /// 覆盖 provider 级 `role_mappings`（整段替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_mappings: Option<HashMap<String, String>>,
+    /// 覆盖 provider 级 `anthropic_cache_control`（整段替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_cache_control: Option<bool>,
+    /// 覆盖 provider 级 `timeout_secs`（标量直接替换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// 覆盖 provider 级 `chunk_timeout_secs`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_timeout_secs: Option<u64>,
+    /// 覆盖 provider 级 `ttfb_timeout_secs`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_timeout_secs: Option<u64>,
+}
+
+/// Upstream LLM provider configuration: 凭据 + 协议 API 目录。
+///
+/// 字段归属三层（见计划「字段归属与覆盖语义」）：
+/// - 全局（协议无关）：`api_keys`、`key_strategy`、`proxy_mode`、`enabled`、
+///   `enabled_models`、`fallback`；
+/// - 协议相关：provider 级写**缺省**，`apis.<key>` 同名字段整段覆盖；
+/// - per-API 独有：`apis.<key>.base_url`（必填）、`models_endpoint`。
+///
+/// provider 级**没有** `base_url` —— 地址唯一来源是各 `apis` 节。
+/// `apis` 为 `IndexMap`（TOML 表序 = 迭代序），未知 key 反序列化报错。
 ///
 /// Provider-level priority is not part of routing selection. Target ordering is
 /// controlled by `RouteTarget.priority` inside each route.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// Provider adapter type (default: `openai`).
-    #[serde(default, skip_serializing_if = "is_default_provider_type")]
-    pub provider_type: ProviderType,
-    /// API keys for this provider.
+    /// API keys for this provider（所有 API 共享的凭据池）.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// How to select among multiple `api_keys`.
     #[serde(default, skip_serializing_if = "is_default_key_strategy")]
     pub key_strategy: KeyStrategy,
-    /// Base URL for the provider's API.
-    #[serde(default = "default_base_url")]
-    pub base_url: String,
     /// How this provider resolves the upstream HTTP proxy.
     ///
     /// - `inherit` (default): use the gateway-level `proxy_url` if one is
@@ -996,22 +1016,28 @@ pub struct ProviderConfig {
     ///   proxy.
     #[serde(default, skip_serializing_if = "is_default_proxy_mode")]
     pub proxy_mode: ProxyMode,
-    /// Upstream endpoint path used by admin APIs to fetch available models.
-    /// Defaults to `models`, appended to `base_url`.
-    ///
-    /// Deliberately has **no** `skip_serializing_if` — this field is always
-    /// written to disk even when equal to the default. The create path
-    /// (`to_document`) and the update path (`update_existing_provider`)
-    /// both write it unconditionally. Do not add `skip_serializing_if`
-    /// without also updating the update path to mirror the skip rule.
-    #[serde(default = "default_models_endpoint")]
-    pub models_endpoint: String,
+    /// Whether this provider is enabled. When `false`, the provider is skipped
+    /// during routing and shown as disabled in the admin UI.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// List of model IDs enabled for this provider.
+    /// When non-empty, only these models may be used with this provider.
+    /// When empty (default), all models are allowed (backward compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_models: Vec<String>,
+    /// 降级协议（translated 路径的编码目标）。
+    /// - `apis` 恰好一个协议 key → 可省略（自动取之）；
+    /// - 多个协议 key → 必填（不静默猜测），值必须 ∈ apis 协议 key 集。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<ApiKind>,
     /// Timeout in seconds for the full round-trip of **non-streaming**
     /// requests to this provider (applied as a per-request
     /// `RequestBuilder::timeout`). Streaming requests are **not** bounded
     /// by this total: they use `ttfb_timeout_secs` for header arrival and
     /// `chunk_timeout_secs` for inter-chunk idle time, so a healthy
     /// long-lived stream can outlive `timeout_secs`.
+    ///
+    /// Provider 级缺省；`apis.<key>.timeout_secs` 整段覆盖。
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Maximum idle time in seconds between stream chunks before the
@@ -1035,6 +1061,8 @@ pub struct ProviderConfig {
     /// Custom headers to add to or override in upstream requests.
     /// These are applied after the provider's default headers,
     /// so they can override auth, content-type, etc.
+    ///
+    /// Provider 级缺省；`apis.<headers>` 声明时整段替换（map 不合并）。
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     /// Provider-wide request body field overrides merged into the upstream
@@ -1088,39 +1116,29 @@ pub struct ProviderConfig {
     /// Empty by default — no mapping applied.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub role_mappings: HashMap<String, String>,
-    /// Whether this provider is enabled. When `false`, the provider is skipped
-    /// during routing and shown as disabled in the admin UI.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// List of model IDs enabled for this provider.
-    /// When non-empty, only these models may be used with this provider.
-    /// When empty (default), all models are allowed (backward compatible).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub enabled_models: Vec<String>,
     /// Whether to inject `cache_control: {"type": "ephemeral"}` breakpoints
-    /// into Anthropic requests. Only meaningful for `provider_type = "anthropic"`.
-    /// When enabled, the gateway marks the system prompt, tools, and conversation
-    /// history for caching, which can significantly reduce costs for requests
-    /// with stable prefixes.
-    #[serde(default = "default_true")]
+    /// into Anthropic Messages requests（仅当实际使用协议为
+    /// `anthropic_messages` 时生效；`apis.anthropic_messages` 可覆盖）。
+    #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
     pub anthropic_cache_control: bool,
-    /// Optional explicit upstream protocol. `None` derives from
-    /// `provider_type` (openai→chat_completions, anthropic→anthropic_messages).
-    /// The derived value only selects the translated-lane encoder; Native
-    /// requires an explicit declaration equal to the ingress protocol (§4.2).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
+    /// 协议 API 目录：协议集 = 此表的**协议** key 集（`image` 不计入）。
+    ///
+    /// 每节携带自己的 `base_url`（地址唯一来源）与可选覆盖字段。
+    /// 声明在最后：TOML 表必须排在标量之后，create 路径的
+    /// `toml_edit::ser::to_document` 依赖此顺序。
+    #[serde(default)]
+    pub apis: IndexMap<ApiKind, ApiConfig>,
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            provider_type: ProviderType::default(),
             api_keys: Vec::new(),
             key_strategy: KeyStrategy::default(),
-            base_url: default_base_url(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: default_models_endpoint(),
+            enabled: default_true(),
+            enabled_models: Vec::new(),
+            fallback: None,
             timeout_secs: default_timeout_secs(),
             chunk_timeout_secs: None,
             ttfb_timeout_secs: None,
@@ -1130,16 +1148,11 @@ impl Default for ProviderConfig {
             model_strip_fields: HashMap::new(),
             model_overrides: HashMap::new(),
             role_mappings: HashMap::new(),
-            enabled: default_true(),
-            enabled_models: Vec::new(),
             anthropic_cache_control: default_true(),
-            upstream_protocol: None,
+            // 无默认 base_url —— apis 为空，须显式配置至少一个协议 API。
+            apis: IndexMap::new(),
         }
     }
-}
-
-pub fn default_base_url() -> String {
-    "https://api.openai.com/v1".into()
 }
 pub fn default_models_endpoint() -> String {
     "models".into()
@@ -1288,9 +1301,6 @@ fn default_true() -> bool {
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
-fn is_default_provider_type(v: &ProviderType) -> bool {
-    *v == ProviderType::default()
-}
 fn is_default_key_strategy(v: &KeyStrategy) -> bool {
     *v == KeyStrategy::default()
 }
@@ -1300,8 +1310,10 @@ fn is_default_proxy_mode(v: &ProxyMode) -> bool {
 fn is_default_strategy(v: &Strategy) -> bool {
     *v == Strategy::default()
 }
-fn is_default_api_endpoint(v: &str) -> bool {
-    v == default_api_endpoint()
+/// `anthropic_cache_control` 的 skip 判定：默认值 `true` 不写盘，
+/// 显式 `false`（opt-out）持久化。与 update 路径的写入规则一致。
+fn is_true_bool(v: &bool) -> bool {
+    *v
 }
 
 /// Target selection strategy for a route.
@@ -1358,13 +1370,15 @@ pub struct RouteConfig {
     /// The model name as requested by the client.
     /// Use `"*"` as a wildcard to match any model not matched by an exact route.
     pub model_name: String,
-    /// Upstream API endpoint path for this model.
-    /// Examples: `/chat/completions`, `/images/generations`, `/responses`.
-    #[serde(
-        default = "default_api_endpoint",
-        skip_serializing_if = "is_default_api_endpoint"
-    )]
-    pub api_endpoint: String,
+    /// 请求分派管线（`chat`（缺省）/ `image`）。image 是不同物种：无协议
+    /// 匹配语义、路径随模型变，须显式声明 `pipeline = "image"`。
+    #[serde(default, skip_serializing_if = "is_default_pipeline")]
+    pub pipeline: Pipeline,
+    /// Real upstream path appended to `apis.image.base_url` —
+    /// **only legal when `pipeline = "image"`**（chat 族 route 出现即 error）。
+    /// Examples: `/v1beta/models/gemini:generateContent`, `/images/generations`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_endpoint: Option<String>,
     /// Target selection strategy (default: `StickyFailover`).
     #[serde(default, skip_serializing_if = "is_default_strategy")]
     pub strategy: Strategy,
@@ -1382,8 +1396,30 @@ pub struct RouteConfig {
     pub targets: Vec<RouteTarget>,
 }
 
-fn default_api_endpoint() -> String {
-    "/chat/completions".into()
+/// Route 分派管线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pipeline {
+    /// Chat 协议族（chat_completions / responses / anthropic_messages）。
+    #[default]
+    Chat,
+    /// 图像生成管线：上游 URL = `apis.image.base_url` + route.`api_endpoint`。
+    Image,
+}
+
+impl Pipeline {
+    /// Stable snake_case identifier matching the serde representation,
+    /// used by the save path to write the value without a serde round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Pipeline::Chat => "chat",
+            Pipeline::Image => "image",
+        }
+    }
+}
+
+fn is_default_pipeline(v: &Pipeline) -> bool {
+    *v == Pipeline::default()
 }
 
 /// Resolve a request `model` against a route table: an exact `model_name`
@@ -1398,20 +1434,6 @@ pub fn resolve_model_route<'a>(routes: &'a [RouteConfig], model: &str) -> Option
         .iter()
         .find(|r| r.model_name == model)
         .or_else(|| routes.iter().find(|r| r.model_name == "*"))
-}
-
-impl RouteConfig {
-    /// Returns `true` if this route's `api_endpoint` is the built-in default
-    /// (`"/chat/completions"`). Save logic uses this to mirror the
-    /// `skip_serializing_if = "is_default_api_endpoint"` rule on
-    /// [`RouteConfig::api_endpoint`]: the field is dropped from the file
-    /// when the value is the default, and written otherwise. Calling
-    /// `default_api_endpoint` directly would leak an implementation detail
-    /// of "what counts as a default" into the public API; this method
-    /// encapsulates that comparison.
-    pub fn uses_default_api_endpoint(&self) -> bool {
-        is_default_api_endpoint(&self.api_endpoint)
-    }
 }
 
 /// A routing target: maps a logical model to a specific provider + real model name.
@@ -1456,15 +1478,9 @@ pub struct RouteTarget {
     /// the on-disk key order preserved.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
-    /// Per-target explicit upstream protocol override (priority over the
-    /// provider-level field). `None` falls back to the provider's value,
-    /// then to derivation from `provider_type`. Native only when this
-    /// (effective) explicit declaration equals the ingress protocol (§4.2).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_protocol: Option<sag_core::UpstreamProtocol>,
     /// Per-target capability overrides (fixed key set; unknown keys fail
-    /// `GatewayConfig::validate`). Applied on top of the derived capability
-    /// table after provider_type + effective upstream_protocol resolution.
+    /// `GatewayConfig::validate`). Applied on top of the capability table
+    /// derived from the actually-used protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilitiesOverride>,
 }
@@ -1488,6 +1504,9 @@ enabled = true
 
 [providers.openai]
 api_keys = ["sk-test"]
+
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1"
 
 [[routes]]
 model_name = "gpt-4o"
@@ -1513,14 +1532,23 @@ targets = [
 
         let openai = config.providers.get("openai").unwrap();
         assert_eq!(openai.api_keys, vec!["sk-test"]);
-        assert_eq!(openai.base_url, "https://api.openai.com/v1");
-        assert_eq!(openai.models_endpoint, "models");
+        assert_eq!(openai.apis.len(), 1);
+        assert_eq!(
+            openai.apis[&ApiKind::ChatCompletions].base_url,
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            openai.fallback, None,
+            "single protocol key auto-fills fallback"
+        );
         assert_eq!(openai.timeout_secs, 600);
         assert_eq!(config.backoff.retries, 2);
 
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
         assert_eq!(route.model_name, "gpt-4o");
+        assert_eq!(route.pipeline, Pipeline::Chat);
+        assert_eq!(route.api_endpoint, None, "chat route has no api_endpoint");
         assert_eq!(route.targets.len(), 1);
         assert_eq!(route.targets[0].provider, "openai");
         assert_eq!(route.targets[0].real_model.as_deref(), Some("gpt-4o"));
@@ -1646,7 +1674,6 @@ targets = [
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
-base_url = "https://api.openai.com/v1"
 
 retries = 5
 "#;
@@ -1660,6 +1687,7 @@ retries = 5
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 ttfb_timeout_secs = 0
 
 [[routes]]
@@ -1705,11 +1733,10 @@ targets = [{ provider = "openai", real_model = "gpt-4o" }]
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
-base_url = "https://api.openai.com/v1"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
-api_endpoint = "/chat/completions"
 timeout_secs = 0
 targets = [
     { provider = "openai", real_model = "gpt-4o", priority = 10, timeout_secs = 0 },
@@ -1735,9 +1762,11 @@ targets = [
 
 [providers.anthropic]
 api_keys = ["sk-ant"]
-base_url = "https://api.anthropic.com"
-models_endpoint = "v1/models"
 timeout_secs = 60
+
+[providers.anthropic.apis.anthropic_messages]
+base_url = "https://api.anthropic.com/v1"
+models_endpoint = "v1/models"
 
 [providers.anthropic.headers]
 Authorization = "Bearer custom-token"
@@ -1750,8 +1779,9 @@ temperature = 0.8
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         let p = config.providers.get("anthropic").unwrap();
         assert_eq!(p.api_keys, vec!["sk-ant"]);
-        assert_eq!(p.base_url, "https://api.anthropic.com");
-        assert_eq!(p.models_endpoint, "v1/models");
+        let api = &p.apis[&ApiKind::AnthropicMessages];
+        assert_eq!(api.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(api.models_endpoint.as_deref(), Some("v1/models"));
         assert_eq!(p.timeout_secs, 60);
         assert_eq!(
             p.headers.get("Authorization").unwrap(),
@@ -1784,6 +1814,9 @@ temperature = 0.8
 
 [providers.openai]
 api_keys = ["sk-test"]
+
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1"
 models_endpoint = "https://example.com/models"
 
 [[routes]]
@@ -1878,14 +1911,17 @@ role_mappings = { "developer" = "system", "user" = "assistant" }
         let config: ProviderConfig = toml::from_str(
             r#"
 api_keys = ["sk-test"]
-base_url = "https://custom.example.com/v1"
+apis = { chat_completions = { base_url = "https://custom.example.com/v1" } }
 timeout_secs = 60
 enabled = false
 "#,
         )
         .unwrap();
         assert!(config.role_mappings.is_empty());
-        assert_eq!(config.base_url, "https://custom.example.com/v1");
+        assert_eq!(
+            config.apis[&ApiKind::ChatCompletions].base_url,
+            "https://custom.example.com/v1"
+        );
         assert!(!config.enabled);
     }
 
@@ -1907,6 +1943,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -1933,6 +1970,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 proxy_mode = "disabled"
 "#,
             )
@@ -1975,8 +2013,8 @@ proxy_mode = "disabled"
         #[test]
         fn proxy_mode_unknown_value_fails_parse() {
             // There is no lenient fallback for unknown enum values anywhere
-            // in the loader (same as `strategy` / `key_strategy` /
-            // `provider_type`): an unknown `proxy_mode` value is a hard
+            // in the loader (same as `strategy` / `key_strategy`): an
+            // unknown `proxy_mode` value is a hard
             // parse error, never silently coerced to `Inherit`. This is the
             // established strict-value-validation pattern the loader relies
             // on; a forward-compatible *field* is tolerated via
@@ -2141,12 +2179,9 @@ proxy_mode = "auto"
             // `ProviderConfig::default()` is exactly what a minimal TOML
             // block deserializes to.
             let p = ProviderConfig::default();
-            assert_eq!(p.provider_type, ProviderType::default());
             assert!(p.api_keys.is_empty());
             assert_eq!(p.key_strategy, KeyStrategy::default());
-            assert_eq!(p.base_url, default_base_url());
             assert_eq!(p.proxy_mode, ProxyMode::default());
-            assert_eq!(p.models_endpoint, default_models_endpoint());
             assert_eq!(p.timeout_secs, default_timeout_secs());
             assert!(p.chunk_timeout_secs.is_none());
             assert!(p.ttfb_timeout_secs.is_none());
@@ -2159,6 +2194,8 @@ proxy_mode = "auto"
             assert!(p.enabled);
             assert!(p.enabled_models.is_empty());
             assert!(p.anthropic_cache_control);
+            assert!(p.fallback.is_none());
+            assert!(p.apis.is_empty(), "no default base_url — apis starts empty");
         }
 
         #[test]
@@ -2198,6 +2235,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -2252,6 +2290,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 proxy_mode = "enabled"
 "#,
             )
@@ -2414,7 +2453,14 @@ targets = [
         #[test]
         fn rejects_invalid_base_url() {
             let mut config = valid_config();
-            config.providers.get_mut("openai").unwrap().base_url = "not-a-url".into();
+            config
+                .providers
+                .get_mut("openai")
+                .unwrap()
+                .apis
+                .get_mut(&ApiKind::ChatCompletions)
+                .unwrap()
+                .base_url = "not-a-url".into();
             let err = config.validate().unwrap_err();
             assert!(err.iter().any(|e| e.contains("not a valid URL")));
         }
@@ -2460,10 +2506,12 @@ targets = [
 [server]
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, image = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
-model_name = "gpt-4o"
-api_endpoint = "chat/completions"
+model_name = "dall-e-3"
+pipeline = "image"
+api_endpoint = "images/generations"
 targets = [
     { provider = "openai" },
 ]
@@ -2541,6 +2589,7 @@ enabled = true
 storage_dsn = ":memory:"
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#,
             )
             .unwrap();
@@ -2559,24 +2608,36 @@ api_keys = ["sk-test"]
         }
 
         #[test]
-        fn uses_default_api_endpoint_matches_serde_skip_rule() {
-            // The new predicate must agree with the same comparison that
-            // serde uses (via `is_default_api_endpoint`) — otherwise the save
-            // path could drop a non-default field or keep a default one.
-            let mut route = RouteConfig {
-                model_name: "gpt-4o".into(),
-                api_endpoint: default_api_endpoint(),
-                strategy: Strategy::FillFirst,
-                retries: None,
-                timeout_secs: None,
-                targets: vec![],
-            };
-            assert!(route.uses_default_api_endpoint());
-            assert!(is_default_api_endpoint(&route.api_endpoint));
+        fn pipeline_and_api_endpoint_serde_rules() {
+            // `pipeline` defaults to `chat` and is skipped when default;
+            // `api_endpoint` is `None` unless explicitly declared (image).
+            let route: RouteConfig = toml::from_str(
+                r#"model_name = "gpt-4o"
+targets = []"#,
+            )
+            .unwrap();
+            assert_eq!(route.pipeline, Pipeline::Chat);
+            assert!(route.api_endpoint.is_none());
+            assert!(is_default_pipeline(&route.pipeline));
 
-            route.api_endpoint = "/images/generations".into();
-            assert!(!route.uses_default_api_endpoint());
-            assert!(!is_default_api_endpoint(&route.api_endpoint));
+            let image: RouteConfig = toml::from_str(
+                r#"model_name = "img"
+pipeline = "image"
+api_endpoint = "/images/generations"
+targets = []"#,
+            )
+            .unwrap();
+            assert_eq!(image.pipeline, Pipeline::Image);
+            assert_eq!(image.api_endpoint.as_deref(), Some("/images/generations"));
+            assert!(!is_default_pipeline(&image.pipeline));
+
+            // 未知 pipeline 枚举值 → 反序列化报错（枚举严格）。
+            let bad: Result<RouteConfig, _> = toml::from_str(
+                r#"model_name = "x"
+pipeline = "video"
+targets = []"#,
+            );
+            assert!(bad.is_err(), "unknown pipeline value must fail parse");
         }
 
         #[test]
@@ -2596,7 +2657,6 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
                 RouteTarget {
@@ -2606,7 +2666,6 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
             ];
@@ -2634,7 +2693,6 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
                 RouteTarget {
@@ -2644,7 +2702,6 @@ api_keys = ["sk-test"]
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
             ];
@@ -2701,7 +2758,14 @@ api_keys = ["sk-test"]
         #[test]
         fn rejects_invalid_base_url_scheme() {
             let mut config = valid_config();
-            config.providers.get_mut("openai").unwrap().base_url = "ftp://api.openai.com/v1".into();
+            config
+                .providers
+                .get_mut("openai")
+                .unwrap()
+                .apis
+                .get_mut(&ApiKind::ChatCompletions)
+                .unwrap()
+                .base_url = "ftp://api.openai.com/v1".into();
             let err = config.validate().unwrap_err();
             assert!(
                 err.iter().any(|e| e.contains("unsupported scheme")),
@@ -2767,6 +2831,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -2791,65 +2856,10 @@ targets = [
             assert!(config.validate().is_ok());
         }
 
-        // ── M7: upstream_protocol × provider_type / capabilities / api_endpoint ──
+        // ── apis / fallback / pipeline 校验 ──
 
         #[test]
-        fn rejects_anthropic_provider_with_chat_completions_protocol() {
-            let config: GatewayConfig = toml::from_str(
-                r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.anthropic]
-provider_type = "anthropic"
-api_keys = ["sk-test"]
-upstream_protocol = "chat_completions"
-
-[[routes]]
-model_name = "claude"
-targets = [{ provider = "anthropic" }]
-"#,
-            )
-            .unwrap();
-            let err = config.validate().unwrap_err();
-            assert!(
-                err.iter()
-                    .any(|e| e.contains("upstream_protocol='chat_completions'")
-                        && e.contains("anthropic")),
-                "expected illegal combo error, got {err:?}"
-            );
-        }
-
-        #[test]
-        fn rejects_anthropic_provider_with_responses_protocol() {
-            let config: GatewayConfig = toml::from_str(
-                r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.anthropic]
-provider_type = "anthropic"
-api_keys = ["sk-test"]
-upstream_protocol = "responses"
-
-[[routes]]
-model_name = "claude"
-targets = [{ provider = "anthropic" }]
-"#,
-            )
-            .unwrap();
-            let err = config.validate().unwrap_err();
-            assert!(
-                err.iter()
-                    .any(|e| e.contains("upstream_protocol='responses")),
-                "expected responses-on-anthropic error, got {err:?}"
-            );
-        }
-
-        #[test]
-        fn accepts_openai_provider_with_responses_protocol() {
+        fn rejects_empty_apis() {
             let config: GatewayConfig = toml::from_str(
                 r#"
 [server]
@@ -2858,40 +2868,263 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
-upstream_protocol = "responses"
 
 [[routes]]
-model_name = "gpt-5"
-targets = [{ provider = "openai", upstream_protocol = "responses" }]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
 "#,
             )
             .unwrap();
-            assert!(config.validate().is_ok());
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("apis must not be empty")),
+                "expected empty-apis error, got {err:?}"
+            );
         }
 
         #[test]
-        fn rejects_target_upstream_protocol_mismatched_with_provider_type() {
+        fn rejects_image_only_apis() {
+            // image 不是协议：仅有 image 的 apis 同样报错。
             let config: GatewayConfig = toml::from_str(
                 r#"
 [server]
 host = "127.0.0.1"
 port = 8080
 
-[providers.anthropic]
-provider_type = "anthropic"
+[providers.openai]
 api_keys = ["sk-test"]
+apis = { image = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
-model_name = "claude"
-targets = [{ provider = "anthropic", upstream_protocol = "chat_completions" }]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("at least one protocol key")),
+                "image-only apis must be rejected, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn single_protocol_key_without_fallback_validates() {
+            // 单协议 key：未写 fallback → 自动取之，校验通过。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "single protocol key without fallback must validate"
+            );
+            assert_eq!(
+                config.providers["openai"].fallback, None,
+                "fallback stays None in memory (auto-fill happens at consumption)"
+            );
+        }
+
+        #[test]
+        fn rejects_multiple_protocol_keys_without_fallback() {
+            // 多协议 key 未写 fallback → 报错，建议值 = 第一个协议 key（表序）。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { responses = { base_url = "https://api.openai.com/v1" }, chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("fallback is required")
+                    && e.contains("suggested value: fallback = \"responses\"")),
+                "expected multi-key-missing-fallback error with first-key suggestion, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_fallback_not_in_apis_protocol_keys() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+fallback = "responses"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("fallback='responses'")
+                    && e.contains("must be one of the configured apis protocol keys")),
+                "fallback outside the apis protocol key set must be rejected, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_fallback_image() {
+            // image 不是协议 key：fallback = "image" 必须报错。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+fallback = "image"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, image = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("fallback='image'")),
+                "image fallback must be rejected, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_apis_key() {
+            // 未知 apis key 在反序列化层报错（枚举严格），非 validate 阶段。
+            let result = toml::from_str::<GatewayConfig>(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+            );
+            assert!(result.is_err(), "unknown apis key must fail parsing");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("completions") || err.contains("unknown"),
+                "got: {err}"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_fallback_value() {
+            let result = toml::from_str::<GatewayConfig>(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+fallback = "nope"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+            );
+            assert!(result.is_err(), "unknown fallback value must fail parsing");
+        }
+
+        #[test]
+        fn rejects_chat_route_with_api_endpoint() {
+            // chat 族 route 出现 api_endpoint 即 error。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+api_endpoint = "/chat/completions"
+targets = [{ provider = "openai" }]
 "#,
             )
             .unwrap();
             let err = config.validate().unwrap_err();
             assert!(
                 err.iter()
-                    .any(|e| e.contains("target[0]") && e.contains("chat_completions")),
-                "expected target-level combo error, got {err:?}"
+                    .any(|e| e.contains("only valid when pipeline = \"image\"")),
+                "chat route with api_endpoint must error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn image_route_requires_api_endpoint() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, image = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "dall-e-3"
+pipeline = "image"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("pipeline = \"image\" requires api_endpoint")),
+                "image route without api_endpoint must error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_image_route_with_pipeline_and_endpoint() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, image = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "dall-e-3"
+pipeline = "image"
+api_endpoint = "/images/generations"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "image route with endpoint must validate"
+            );
+            assert_eq!(config.routes[0].pipeline, Pipeline::Image);
+            assert_eq!(
+                config.routes[0].api_endpoint.as_deref(),
+                Some("/images/generations")
             );
         }
 
@@ -2905,6 +3138,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -2932,6 +3166,7 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
@@ -2949,122 +3184,6 @@ targets = [
             assert!(caps.unknown.is_empty());
         }
 
-        /// Pin (§7.5): anthropic + **non-default** api_endpoint + explicit
-        /// non-derived upstream_protocol → **error** on the endpoint rule
-        /// (the illegal-combo branch is covered by
-        /// `rejects_anthropic_provider_with_chat_completions_protocol`).
-        /// Both branches fire for this shape; this test pins the endpoint
-        /// message specifically. Without the protocol mismatch the same
-        /// endpoint is only a warning (D11).
-        #[test]
-        fn anthropic_non_default_endpoint_with_mismatched_protocol_is_error() {
-            let config: GatewayConfig = toml::from_str(
-                r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.anthropic]
-provider_type = "anthropic"
-api_keys = ["sk-test"]
-
-[[routes]]
-model_name = "claude"
-api_endpoint = "/v1/completions"
-targets = [{ provider = "anthropic", upstream_protocol = "chat_completions" }]
-"#,
-            )
-            .unwrap();
-            let err = config.validate().unwrap_err();
-            assert!(
-                err.iter()
-                    .any(|e| e.contains("api_endpoint") && e.contains("anthropic")),
-                "expected anthropic api_endpoint error branch, got {err:?}"
-            );
-        }
-
-        /// Pin (§7.5) pure endpoint form: legal explicit protocol
-        /// (`anthropic_messages` == derived) + non-default endpoint → Ok
-        /// (warning only). The endpoint never declares a protocol.
-        #[test]
-        fn anthropic_explicit_protocol_non_default_endpoint_warns_not_errors() {
-            let config: GatewayConfig = toml::from_str(
-                r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.anthropic]
-provider_type = "anthropic"
-api_keys = ["sk-test"]
-upstream_protocol = "anthropic_messages"
-
-[[routes]]
-model_name = "claude"
-api_endpoint = "/v1/messages-extra"
-targets = [{ provider = "anthropic", upstream_protocol = "anthropic_messages" }]
-"#,
-            )
-            .unwrap();
-            assert!(config.validate().is_ok(), "got err");
-        }
-
-        #[test]
-        fn anthropic_non_default_endpoint_without_protocol_mismatch_is_ok_with_warning_path() {
-            // Default path /chat/completions is non-default for anthropic's
-            // fixed /messages — but with no explicit non-derived protocol
-            // this is only a warning (validate still returns Ok).
-            let config: GatewayConfig = toml::from_str(
-                r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.anthropic]
-provider_type = "anthropic"
-api_keys = ["sk-test"]
-
-[[routes]]
-model_name = "claude"
-api_endpoint = "/v1/chat"
-targets = [{ provider = "anthropic" }]
-"#,
-            )
-            .unwrap();
-            assert!(
-                config.validate().is_ok(),
-                "anthropic non-default endpoint alone must only warn"
-            );
-        }
-
-        /// Pin (§7.5): openai + explicit protocol whose path does not match
-        /// api_endpoint → warning only ("api_endpoint is only a path"), not
-        /// an error — config still validates.
-        #[test]
-        fn openai_protocol_endpoint_mismatch_is_warning_not_error() {
-            let config: GatewayConfig = toml::from_str(
-                r#"
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[providers.openai]
-api_keys = ["sk-test"]
-upstream_protocol = "responses"
-
-[[routes]]
-model_name = "gpt-5"
-api_endpoint = "/chat/completions"
-targets = [{ provider = "openai", upstream_protocol = "responses" }]
-"#,
-            )
-            .unwrap();
-            assert!(
-                config.validate().is_ok(),
-                "openai path/protocol mismatch must only warn"
-            );
-        }
-
         #[test]
         fn capabilities_roundtrip_through_toml() {
             let toml_str = r#"
@@ -3074,28 +3193,29 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, responses = { base_url = "https://api.openai.com/v1" } }
+fallback = "responses"
 
 [[routes]]
 model_name = "gpt-4o"
 targets = [
-    { provider = "openai", upstream_protocol = "responses", capabilities = { streaming = true, stateful = false } },
+    { provider = "openai", capabilities = { streaming = true, stateful = false } },
 ]
 "#;
             let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_ok());
             assert_eq!(
-                config.routes[0].targets[0].upstream_protocol,
-                Some(sag_core::UpstreamProtocol::Responses)
+                config.providers["openai"].fallback,
+                Some(ApiKind::Responses)
             );
             let caps = config.routes[0].targets[0].capabilities.as_ref().unwrap();
             assert_eq!(caps.streaming, Some(true));
             assert_eq!(caps.stateful, Some(false));
         }
-
-        // ── end M7 ──
     }
 
     #[test]
-    fn parse_upstream_protocol_on_provider_and_target() {
+    fn parse_fallback_on_provider() {
         let toml_str = r#"
 [server]
 host = "127.0.0.1"
@@ -3103,54 +3223,42 @@ port = 8080
 
 [providers.openai]
 api_keys = ["sk-test"]
-upstream_protocol = "responses"
+fallback = "responses"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, responses = { base_url = "https://api.openai.com/v1" } }
 
 [[routes]]
 model_name = "gpt-4o"
 targets = [
-    { provider = "openai", real_model = "gpt-4o", upstream_protocol = "responses" },
+    { provider = "openai", real_model = "gpt-4o" },
 ]
 "#;
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         let p = config.providers.get("openai").unwrap();
-        assert_eq!(
-            p.upstream_protocol,
-            Some(sag_core::UpstreamProtocol::Responses)
-        );
-        assert_eq!(
-            config.routes[0].targets[0].upstream_protocol,
-            Some(sag_core::UpstreamProtocol::Responses)
-        );
+        assert_eq!(p.fallback, Some(ApiKind::Responses));
+        // apis 保持 TOML 表序（IndexMap）。
+        let keys: Vec<ApiKind> = p.apis.keys().copied().collect();
+        assert_eq!(keys, vec![ApiKind::ChatCompletions, ApiKind::Responses]);
     }
 
     #[test]
-    fn parse_upstream_protocol_rejects_unknown_value() {
+    fn parse_fallback_rejects_unknown_value() {
         let toml_str = r#"
 [server]
-host = "127.0.0.1"
-port = 8080
-
 [providers.openai]
 api_keys = ["sk-test"]
-upstream_protocol = "nope"
+fallback = "nope"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 "#;
         let result = toml::from_str::<GatewayConfig>(toml_str);
-        assert!(result.is_err(), "unknown upstream_protocol must fail");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("upstream_protocol") || err.contains("nope"),
-            "got: {err}"
-        );
+        assert!(result.is_err(), "unknown fallback value must fail");
     }
 
     #[test]
-    fn upstream_protocol_defaults_to_none_when_omitted() {
+    fn fallback_defaults_to_none_when_omitted() {
         let config: GatewayConfig = toml::from_str(minimal_toml()).unwrap();
         let p = config.providers.get("openai").unwrap();
-        assert_eq!(p.upstream_protocol, None);
-        assert_eq!(config.routes[0].targets[0].upstream_protocol, None);
+        assert_eq!(p.fallback, None);
     }
-
     // ── remove_provider unit tests ──────────────────────────────────
     mod remove_provider {
         use super::*;
@@ -3169,28 +3277,22 @@ upstream_protocol = "nope"
 
         /// Helper: a bare-bones `ProviderConfig` for testing.
         fn test_provider(name: &str) -> (String, ProviderConfig) {
+            let mut apis = IndexMap::new();
+            apis.insert(
+                ApiKind::ChatCompletions,
+                ApiConfig {
+                    base_url: "https://example.com".into(),
+                    ..Default::default()
+                },
+            );
             (
                 name.into(),
                 ProviderConfig {
-                    provider_type: ProviderType::OpenAI,
                     api_keys: vec![format!("sk-{name}")],
-                    key_strategy: KeyStrategy::FillFirst,
-                    base_url: "https://example.com".into(),
-                    proxy_mode: ProxyMode::Inherit,
-                    models_endpoint: "models".into(),
                     timeout_secs: 120,
-                    chunk_timeout_secs: None,
-                    ttfb_timeout_secs: None,
-                    headers: HashMap::new(),
-                    body_overrides: HashMap::new(),
-                    strip_fields: vec![],
-                    model_strip_fields: HashMap::new(),
-                    model_overrides: HashMap::new(),
-                    role_mappings: HashMap::new(),
-                    enabled_models: vec![],
-                    enabled: true,
                     anthropic_cache_control: false,
-                    upstream_protocol: None,
+                    apis,
+                    ..Default::default()
                 },
             )
         }
@@ -3204,7 +3306,6 @@ upstream_protocol = "nope"
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }
         }
@@ -3213,7 +3314,8 @@ upstream_protocol = "nope"
         fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
             RouteConfig {
                 model_name: model.into(),
-                api_endpoint: "/chat/completions".into(),
+                pipeline: Pipeline::Chat,
+                api_endpoint: None,
                 strategy: Strategy::FillFirst,
                 retries: None,
                 timeout_secs: None,

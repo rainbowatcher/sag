@@ -450,7 +450,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }
     }
@@ -458,7 +457,8 @@ mod tests {
     fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
         RouteConfig {
             model_name: model.into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: sag_config::Pipeline::Chat,
+            api_endpoint: None,
             strategy: sag_config::Strategy::StickyFailover,
             retries: None,
             timeout_secs: None,
@@ -473,7 +473,8 @@ mod tests {
     ) -> RouteConfig {
         RouteConfig {
             model_name: model.into(),
-            api_endpoint: "/chat/completions".into(),
+            pipeline: sag_config::Pipeline::Chat,
+            api_endpoint: None,
             strategy,
             retries: None,
             timeout_secs: None,

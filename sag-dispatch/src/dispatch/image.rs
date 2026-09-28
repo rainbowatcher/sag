@@ -26,23 +26,24 @@ use crate::dispatch::{
     CircuitPermit, DispatchCancelGuard, DispatchCtx, ResolvedTarget, apply_circuit_outcome,
     circuit_allows_target, client_error_failure_reason, emit_analytics_event,
     fallback_exhausted_response, log_per_target_failure, merge_model_overrides, success_log,
+    target_base_url,
 };
 use crate::state::{AppState, DispatchRuntime};
 
 /// Image generation fallback loop. Mirrors the chat dispatch shape but
 /// always non-streaming.
 ///
-/// `api_endpoint` and `is_stream` are unused here (image generation is
-/// always non-streaming and ignores the route's `api_endpoint`), but
-/// they're part of [`DispatchCtx`] so the call site can build the same
-/// context for both dispatch paths.
+/// `is_stream` is unused here (image generation is always non-streaming),
+/// but it's part of [`DispatchCtx`] so the call site can build the same
+/// context for both dispatch paths. `api_endpoint` is the route's real
+/// upstream path — the provider appends it to `apis.image.base_url`.
 pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     let DispatchCtx {
         state,
         runtime,
         request,
         targets,
-        api_endpoint: _,
+        api_endpoint,
         is_stream: _,
         trace_id,
         start,
@@ -94,6 +95,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         runtime,
         request_model: &request.model,
         img_request: &img_request,
+        api_endpoint,
         config: &config,
         cancel_guard: &cancel_guard,
         strategy,
@@ -284,6 +286,8 @@ struct ImageAttemptCtx<'a> {
     runtime: &'a DispatchRuntime,
     request_model: &'a str,
     img_request: &'a ImageGenerationRequest,
+    /// Route-declared upstream path appended to `apis.image.base_url`.
+    api_endpoint: &'a str,
     config: &'a GatewayConfig,
     cancel_guard: &'a DispatchCancelGuard,
     strategy: Strategy,
@@ -344,6 +348,8 @@ struct PreparedAttempt<'a> {
     real_model: String,
     target_extra: HashMap<String, serde_json::Value>,
     img_request: ImageGenerationRequest,
+    /// Route-declared upstream path appended to `apis.image.base_url`.
+    api_endpoint: &'a str,
     retries: u32,
     timeout_secs: u64,
     upstream_protocol: &'static str,
@@ -363,11 +369,19 @@ async fn prepare_image_attempt<'a>(
     let provider_name = &target.provider;
     let real_model = &target.real_model;
 
+    // The circuit key folds in the upstream base address; an image target
+    // dispatches to `apis.image` (its actually-used catalog entry).
+    let circuit_url = target_base_url(
+        &ctx.config.providers,
+        provider_name,
+        target.upstream_protocol,
+    );
     let Some(permit) = circuit_allows_target(
         ctx.runtime,
         ctx.request_model,
         provider_name,
         real_model,
+        &circuit_url,
         &ctx.config.circuit_breaker,
     )
     .await
@@ -402,6 +416,7 @@ async fn prepare_image_attempt<'a>(
         real_model,
         target_extra,
         img_request: ctx.img_request.clone(),
+        api_endpoint: ctx.api_endpoint,
         retries: target.retries,
         timeout_secs: target.timeout_secs,
         upstream_protocol: target.upstream_protocol.as_str(),
@@ -440,6 +455,7 @@ async fn send_image_attempt(
             let real_model = prepared.real_model.clone();
             let target_extra = prepared.target_extra.clone();
             let img_request = prepared.img_request.clone();
+            let api_endpoint = prepared.api_endpoint;
             let timeout_secs = prepared.timeout_secs;
             let cancel = ctx.cancel_guard.analytics();
             async move {
@@ -455,7 +471,13 @@ async fn send_image_attempt(
                     Some(prepared.lane),
                 );
                 let result = provider
-                    .chat_image(&img_request, &real_model, &target_extra, timeout_secs)
+                    .chat_image(
+                        &img_request,
+                        &real_model,
+                        api_endpoint,
+                        &target_extra,
+                        timeout_secs,
+                    )
                     .await;
                 cancel.end_attempt();
                 result
@@ -882,6 +904,9 @@ mod tests {
         name: String,
         image_queue: Mutex<VecDeque<ImageBehavior>>,
         image_calls: AtomicU32,
+        /// Route-declared path of the most recent `chat_image` call —
+        /// regression surface for the `api_endpoint` passthrough.
+        last_api_endpoint: Mutex<Option<String>>,
     }
 
     impl MockImageProvider {
@@ -890,6 +915,7 @@ mod tests {
                 name: name.to_string(),
                 image_queue: Mutex::new(VecDeque::new()),
                 image_calls: AtomicU32::new(0),
+                last_api_endpoint: Mutex::new(None),
             }
         }
 
@@ -899,6 +925,10 @@ mod tests {
 
         fn image_calls(&self) -> u32 {
             self.image_calls.load(Ordering::SeqCst)
+        }
+
+        fn last_api_endpoint(&self) -> Option<String> {
+            self.last_api_endpoint.lock().unwrap().clone()
         }
     }
 
@@ -934,10 +964,12 @@ mod tests {
             &self,
             _request: &ImageGenerationRequest,
             _real_model: &str,
+            api_endpoint: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
             _timeout_secs: u64,
         ) -> sag_core::Result<ImageGenerationResponse> {
             self.image_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_api_endpoint.lock().unwrap() = Some(api_endpoint.to_string());
             match self.image_queue.lock().unwrap().pop_front() {
                 Some(ImageBehavior::Ok(resp)) => Ok(resp),
                 Some(ImageBehavior::Retryable(err)) => Err(err),
@@ -993,6 +1025,7 @@ mod tests {
             &self,
             _request: &ImageGenerationRequest,
             _real_model: &str,
+            _api_endpoint: &str,
             _target_extra: &HashMap<String, serde_json::Value>,
             _timeout_secs: u64,
         ) -> sag_core::Result<ImageGenerationResponse> {
@@ -1506,7 +1539,7 @@ mod tests {
         ];
 
         rt.circuit_breaker.write().await.open(
-            sag_core::RouteTargetKey::new("dall-e-3", "first", "dall-e-3"),
+            sag_core::RouteTargetKey::new("dall-e-3", "first", "dall-e-3", ""),
             0,
             0,
         );
@@ -1519,13 +1552,13 @@ mod tests {
         let mut b = rt.circuit_breaker.write().await;
         assert!(
             b.to_half_open_if_due(&sag_core::RouteTargetKey::new(
-                "dall-e-3", "first", "dall-e-3"
+                "dall-e-3", "first", "dall-e-3", ""
             )),
             "after release, target should be probeable again"
         );
         assert!(
             b.try_acquire_probe(&sag_core::RouteTargetKey::new(
-                "dall-e-3", "first", "dall-e-3"
+                "dall-e-3", "first", "dall-e-3", ""
             )),
             "released probe slot should be claimable again"
         );

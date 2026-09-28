@@ -6,8 +6,38 @@
  */
 export type ProxyMode = "inherit" | "enabled" | "disabled"
 
-/** Explicit upstream protocol declaration (config / admin DTO enum). */
-export type UpstreamProtocol = "chat_completions" | "responses" | "anthropic_messages"
+/**
+ * Key of a provider `apis` section: the three chat-family protocols plus
+ * the non-protocol `image` entry (its path comes from route.`api_endpoint`).
+ * Unknown keys are rejected by the backend (strict enum).
+ */
+export type ApiKind = "chat_completions" | "responses" | "anthropic_messages" | "image"
+
+/** The three protocol keys of `ApiKind` (excludes `image`). */
+export type ProtocolApiKind = Exclude<ApiKind, "image">
+
+/**
+ * One `providers.<name>.apis.<key>` section. `base_url` is required (the
+ * only address source — there is no provider-level `base_url`); every other
+ * field is optional and, when set, **fully replaces** the provider-level
+ * default of the same name (maps are not merged, arrays not unioned).
+ */
+export interface ApiConfig {
+  /** Upstream API root (host + root prefix, no protocol path). */
+  base_url: string
+  /** Relative path for the models listing call (default `"models"`). */
+  models_endpoint?: string
+  headers?: Record<string, string>
+  body_overrides?: Record<string, any>
+  strip_fields?: string[]
+  model_strip_fields?: Record<string, string[]>
+  model_overrides?: Record<string, Record<string, any>>
+  role_mappings?: Record<string, string>
+  anthropic_cache_control?: boolean
+  timeout_secs?: number
+  chunk_timeout_secs?: number
+  ttfb_timeout_secs?: number
+}
 
 /** Fixed-key capability override on a route target (all keys optional). */
 export interface CapabilitiesOverride {
@@ -25,26 +55,69 @@ export interface Provider {
   name: string
   api_keys: string[]
   key_strategy: "fill_first" | "round_robin"
-  provider_type: string
-  base_url: string
-  models_endpoint: string
+  /** Protocol API catalog: one section per declared ApiKind. */
+  apis: Record<ApiKind, ApiConfig>
+  /**
+   * Downgrade protocol for translated-lane dispatch. Implicit (auto) when
+   * exactly one protocol key is declared; required when several are.
+   */
+  fallback?: ApiKind | null
   timeout_secs: number
+  chunk_timeout_secs?: number
+  ttfb_timeout_secs?: number
   headers: Record<string, string>
   /** Role mapping table: maps request roles to upstream-supported roles (e.g. developer -> system). */
   role_mappings: Record<string, string>
   body_overrides: Record<string, any>
   strip_fields: string[]
+  model_strip_fields: Record<string, string[]>
   model_overrides: Record<string, Record<string, any>>
   enabled_models: string[]
   enabled: boolean
   /** How this provider resolves the upstream HTTP proxy. */
   proxy_mode: ProxyMode
-  /** Explicit upstream protocol, or null when derived from provider_type. */
-  upstream_protocol?: UpstreamProtocol | null
-  /** Effective protocol after derive (always present when API returns it). */
-  effective_upstream_protocol?: string
-  /** Derived capability bitmap (read-only). */
-  capabilities?: Record<string, boolean>
+  /** Per-ApiKind capability bitmap (read-only): `{ "<api_kind>": { ...capabilities } }`. */
+  capabilities?: Record<string, Record<string, boolean>>
+}
+
+/** Payload of `POST /api/providers`. */
+export interface AddProviderPayload {
+  name: string
+  api_keys: string[]
+  key_strategy?: "fill_first" | "round_robin"
+  apis: Record<ApiKind, ApiConfig>
+  /** Required when `apis` declares more than one protocol key. */
+  fallback?: ApiKind
+  timeout_secs?: number
+  headers?: Record<string, string>
+  body_overrides?: Record<string, any>
+  strip_fields?: string[]
+  model_strip_fields?: Record<string, string[]>
+  model_overrides?: Record<string, Record<string, any>>
+  role_mappings?: Record<string, string>
+  enabled_models?: string[]
+  proxy_mode?: ProxyMode
+}
+
+/** Payload of `PUT /api/providers`. */
+export interface UpdateProviderPayload {
+  name: string
+  api_keys?: string[]
+  key_strategy?: "fill_first" | "round_robin"
+  /** Whole-directory replace: sections not repeated are dropped. */
+  apis?: Record<ApiKind, ApiConfig>
+  /** Triple-state: omit → keep, `null` → clear, value → set. */
+  fallback?: ApiKind | null
+  timeout_secs?: number
+  headers?: Record<string, string>
+  body_overrides?: Record<string, any>
+  strip_fields?: string[]
+  model_strip_fields?: Record<string, string[]>
+  model_overrides?: Record<string, Record<string, any>>
+  role_mappings?: Record<string, string>
+  enabled_models?: string[]
+  enabled?: boolean
+  proxy_mode?: ProxyMode
 }
 
 /** Gateway-level settings returned by `GET /api/settings`. */
@@ -81,7 +154,6 @@ export interface RouteTarget {
   priority: number
   retries?: number
   extra?: Record<string, any>
-  upstream_protocol?: UpstreamProtocol | null
   capabilities?: CapabilitiesOverride | null
 }
 
@@ -92,13 +164,16 @@ export interface TargetItem {
   priority: number
   retries: number
   extra: string
-  /** Empty string = derive (omit field). */
-  upstream_protocol?: UpstreamProtocol | ""
 }
+
+/** Dispatch pipeline of a route (default `chat`). */
+export type Pipeline = "chat" | "image"
 
 export interface RouteConfig {
   model_name: string
-  api_endpoint: string
+  pipeline: Pipeline
+  /** Real upstream path — only legal when `pipeline = "image"`; `null` otherwise. */
+  api_endpoint: string | null
   strategy: Strategy
   retries?: number
   targets: RouteTarget[]
@@ -108,6 +183,8 @@ export type Strategy = "sticky_failover" | "fill_first" | "round_robin"
 
 export interface CreateRoutePayload {
   model_name: string
+  pipeline?: Pipeline
+  /** Required when `pipeline = "image"`; must be omitted for chat routes. */
   api_endpoint?: string
   strategy?: Strategy
   retries?: number
@@ -117,14 +194,15 @@ export interface CreateRoutePayload {
     priority?: number
     retries?: number
     extra?: Record<string, any>
-    upstream_protocol?: UpstreamProtocol
     capabilities?: CapabilitiesOverride
   }>
 }
 
 export interface UpdateRoutePayload {
   model_name: string
-  api_endpoint?: string
+  pipeline?: Pipeline
+  /** Triple-state: omit → keep, `null` → clear, value → set. */
+  api_endpoint?: string | null
   strategy?: Strategy
   retries?: number
   targets?: Array<{
@@ -133,7 +211,6 @@ export interface UpdateRoutePayload {
     priority?: number
     retries?: number
     extra?: Record<string, any>
-    upstream_protocol?: UpstreamProtocol
     capabilities?: CapabilitiesOverride
   }>
 }
@@ -144,7 +221,7 @@ export interface ModelListEntry {
   object: "model"
   created: number
   owned_by: string
-  /** Present only when some target explicitly declares upstream_protocol. Key name per plan §7.5. */
+  /** Union of the `apis` protocol keys of every target's provider. Key name per plan §7.5. */
   ingress_protocols?: string[]
   lanes?: string[]
 }

@@ -46,12 +46,17 @@ pub trait LlmProvider: Send + Sync {
 
     /// Send an image generation request. Returns image URLs or base64 data.
     ///
+    /// `api_endpoint` is the route-declared upstream path (e.g.
+    /// `/images/generations`) appended to the provider's
+    /// `apis.image` (or `apis.chat_completions`) `base_url`.
+    ///
     /// Default implementation returns `BadRequest` — override for providers
     /// that support image generation (e.g. OpenAI).
     async fn chat_image(
         &self,
         _request: &ImageGenerationRequest,
         _real_model: &str,
+        _api_endpoint: &str,
         _target_extra: &HashMap<String, serde_json::Value>,
         _timeout_secs: u64,
     ) -> sag_core::Result<ImageGenerationResponse> {

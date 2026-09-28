@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use reqwest::header::CONTENT_TYPE;
-use sag_config::{ProviderType, ProxyMode};
+use sag_config::{ApiKind, ProxyMode};
 use sag_core::AppError;
 use sag_providers::{provider_auth_headers, provider_chat_endpoint};
 use serde_json::json;
@@ -17,16 +17,30 @@ use tracing::{instrument, warn};
 
 use sag_state::AppState;
 
+/// Which API section this temporary probe talks to — selects the auth
+/// header shape (`anthropic_messages` → `x-api-key`, everything else →
+/// `Authorization: Bearer`) and the chat endpoint path. Defaults to
+/// `chat_completions`, matching the old `provider_type` default of OpenAI.
+fn api_kind_of(kind: Option<ApiKind>) -> ApiKind {
+    kind.unwrap_or(ApiKind::ChatCompletions)
+}
+
 #[derive(serde::Deserialize)]
 pub struct FetchModelsRequest {
+    /// Temporary probe address: the `base_url` of whichever `apis.<kind>`
+    /// section the caller is testing (providers no longer carry a
+    /// provider-level `base_url`).
     pub base_url: String,
     #[serde(default)]
     pub api_keys: Vec<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
-    pub provider_type: Option<ProviderType>,
+    /// API section whose auth style applies (default `chat_completions`).
+    #[serde(default)]
+    pub api_kind: Option<ApiKind>,
     /// Custom endpoint path for listing models (default: `models`).
     /// When empty, falls back to `models` appended to `base_url`.
+    /// Equivalent to `apis.<kind>.models_endpoint` on a saved provider.
     #[serde(default)]
     pub models_endpoint: String,
     /// Proxy policy for this temporary request only (default `inherit`):
@@ -101,8 +115,8 @@ pub async fn fetch_models(
     };
     let http_req = client.get(&models_url);
 
-    let provider_type = req.provider_type.unwrap_or_default();
-    let auth_headers = provider_auth_headers(provider_type, api_key);
+    let api_kind = api_kind_of(req.api_kind);
+    let auth_headers = provider_auth_headers(api_kind, api_key);
     let extra_refs: Vec<(&str, &str)> =
         auth_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let http_req = sag_providers::apply_headers(http_req, &extra_refs, &req.headers);
@@ -167,8 +181,13 @@ pub struct ModelTestRequest {
     pub model: String,
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// Temporary probe address (the `base_url` of the `apis.<kind>`
+    /// section under test).
     pub base_url: String,
-    pub provider_type: Option<ProviderType>,
+    /// API section under test: picks the auth header shape and the chat
+    /// endpoint path (default `chat_completions`).
+    #[serde(default)]
+    pub api_kind: Option<ApiKind>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
     /// Proxy policy for this temporary request only (default `inherit`):
@@ -223,8 +242,8 @@ async fn test_single_key(
     req: &ModelTestRequest,
     api_key: &str,
 ) -> (bool, String) {
-    let provider_type = req.provider_type.unwrap_or_default();
-    let endpoint = provider_chat_endpoint(provider_type);
+    let api_kind = api_kind_of(req.api_kind);
+    let endpoint = provider_chat_endpoint(api_kind);
     let url = format!(
         "{}/{}",
         req.base_url.trim_end_matches('/'),
@@ -239,7 +258,7 @@ async fn test_single_key(
 
     let mut http_req = client.post(&url).header(CONTENT_TYPE, "application/json");
 
-    for (name, value) in provider_auth_headers(provider_type, api_key) {
+    for (name, value) in provider_auth_headers(api_kind, api_key) {
         http_req = http_req.header(name, value);
     }
 

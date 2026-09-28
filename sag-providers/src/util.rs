@@ -2,37 +2,38 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::RequestBuilder;
-use sag_config::ProviderType;
-use sag_core::{StreamChunk, Usage};
+use sag_core::{ApiKind, StreamChunk, Usage};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-/// Return the (name, value) pairs for auth headers that a provider type uses
-/// for chat and models API requests.
+/// Return the (name, value) pairs for auth headers used for a given API kind.
 ///
-/// - `OpenAI` → `Authorization: Bearer {key}`
-/// - `Anthropic` → `x-api-key: {key}` + `anthropic-version: 2023-06-01`
-pub fn provider_auth_headers(
-    provider_type: ProviderType,
-    api_key: &str,
-) -> Vec<(&'static str, String)> {
-    match provider_type {
-        ProviderType::OpenAI => vec![("Authorization", format!("Bearer {api_key}"))],
-        ProviderType::Anthropic => vec![
+/// - `AnthropicMessages` → `x-api-key: {key}` + `anthropic-version: 2023-06-01`
+/// - everything else (`ChatCompletions` / `Responses` / `Image`) →
+///   `Authorization: Bearer {key}`
+pub fn provider_auth_headers(kind: ApiKind, api_key: &str) -> Vec<(&'static str, String)> {
+    match kind {
+        ApiKind::AnthropicMessages => vec![
             ("x-api-key", api_key.to_string()),
             ("anthropic-version", "2023-06-01".to_string()),
         ],
+        _ => vec![("Authorization", format!("Bearer {api_key}"))],
     }
 }
 
-/// Return the canonical chat API endpoint path for a provider type.
+/// Return the canonical API endpoint path (with leading `/`) for an API kind.
 ///
-/// - `OpenAI`   → `/chat/completions`
-/// - `Anthropic` → `/messages`
-pub fn provider_chat_endpoint(provider_type: ProviderType) -> &'static str {
-    match provider_type {
-        ProviderType::OpenAI => "/chat/completions",
-        ProviderType::Anthropic => "/messages",
+/// - `ChatCompletions`  → `/chat/completions`
+/// - `AnthropicMessages` → `/messages`
+/// - `Responses`        → `/responses`
+/// - `Image`            → `/images/generations` (route `api_endpoint` is the
+///   authoritative source; this is a convenience default)
+pub fn provider_chat_endpoint(kind: ApiKind) -> &'static str {
+    match kind {
+        ApiKind::ChatCompletions => "/chat/completions",
+        ApiKind::AnthropicMessages => "/messages",
+        ApiKind::Responses => "/responses",
+        ApiKind::Image => "/images/generations",
     }
 }
 

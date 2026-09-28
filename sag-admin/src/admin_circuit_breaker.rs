@@ -78,7 +78,6 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use sag_core::RouteTargetKey;
-    use sag_state::testing::{build_provider_registry, test_app_state};
     use tower::ServiceExt;
 
     /// Build a test app with admin routes mounted (no auth middleware).
@@ -105,14 +104,31 @@ mod tests {
         (status, json)
     }
 
-    /// Build an AppState with an empty config (no providers/routes needed).
+    /// Build an AppState with the two providers the tests open breakers
+    /// against (no routes). The providers matter: `force_close_circuit`
+    /// resolves the breaker key's `url` from the provider's `apis` base
+    /// addresses, so an empty provider set could never close anything.
     async fn empty_state() -> AppState {
-        let config = sag_config::GatewayConfig {
-            ..sag_config::gateway_config_base!()
-        };
-        let handle = sag_config::ConfigHandle::from_config(config);
-        let registry = build_provider_registry(&handle, true).await;
-        test_app_state(handle, registry).await
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            crate::test_utils::test_provider(
+                sag_config::ApiKind::ChatCompletions,
+                "https://api.openai.com/v1",
+                vec!["sk-openai".into()],
+                vec![],
+            ),
+        );
+        providers.insert(
+            "anthropic".to_string(),
+            crate::test_utils::test_provider(
+                sag_config::ApiKind::AnthropicMessages,
+                "https://api.anthropic.com",
+                vec!["sk-ant".into()],
+                vec![],
+            ),
+        );
+        crate::test_utils::build_state(providers, Vec::new()).await
     }
 
     #[tokio::test]
@@ -130,7 +146,11 @@ mod tests {
         // Manually open a circuit breaker entry.
         {
             let mut guard = state.circuit_breaker.write().await;
-            guard.open(RouteTargetKey::new("gpt-4o", "openai", "gpt-4o"), 3600, 60);
+            guard.open(
+                RouteTargetKey::new("gpt-4o", "openai", "gpt-4o", "https://api.openai.com/v1"),
+                3600,
+                60,
+            );
         }
         let app = test_app(state);
         let (status, json) = fetch_breakers(app).await;
@@ -141,6 +161,8 @@ mod tests {
         assert_eq!(entry["model"], "gpt-4o");
         assert_eq!(entry["provider"], "openai");
         assert_eq!(entry["real_model"], "gpt-4o");
+        // The breaker key folds in the upstream address (`apis.<key>.base_url`).
+        assert_eq!(entry["url"], "https://api.openai.com/v1");
         assert_eq!(entry["state"], "open");
         assert!(entry["next_probe_at_secs"].is_number());
         assert_eq!(entry["probe_in_flight"], false);
@@ -153,11 +175,21 @@ mod tests {
             let mut guard = state.circuit_breaker.write().await;
             // interval=0 → first probe due immediately → can transition to HalfOpen
             guard.open(
-                RouteTargetKey::new("claude", "anthropic", "claude-3"),
+                RouteTargetKey::new(
+                    "claude",
+                    "anthropic",
+                    "claude-3",
+                    "https://api.anthropic.com",
+                ),
                 3600,
                 0,
             );
-            guard.to_half_open_if_due(&RouteTargetKey::new("claude", "anthropic", "claude-3"));
+            guard.to_half_open_if_due(&RouteTargetKey::new(
+                "claude",
+                "anthropic",
+                "claude-3",
+                "https://api.anthropic.com",
+            ));
         }
         let app = test_app(state);
         let (status, json) = fetch_breakers(app).await;
@@ -178,7 +210,11 @@ mod tests {
         let state = empty_state().await;
         {
             let mut guard = state.circuit_breaker.write().await;
-            guard.open(RouteTargetKey::new("gpt-4o", "openai", "gpt-4o"), 3600, 60);
+            guard.open(
+                RouteTargetKey::new("gpt-4o", "openai", "gpt-4o", "https://api.openai.com/v1"),
+                3600,
+                60,
+            );
         }
         let app = test_app(state);
         let (status, json) = fetch_breakers(app).await;
@@ -219,7 +255,11 @@ mod tests {
         let state = empty_state().await;
         {
             let mut guard = state.circuit_breaker.write().await;
-            guard.open(RouteTargetKey::new("gpt-4o", "openai", "gpt-4o"), 3600, 60);
+            guard.open(
+                RouteTargetKey::new("gpt-4o", "openai", "gpt-4o", "https://api.openai.com/v1"),
+                3600,
+                60,
+            );
         }
         let app = test_app(state.clone());
         let (status, json) = close_breaker(
@@ -264,9 +304,18 @@ mod tests {
         let state = empty_state().await;
         {
             let mut guard = state.circuit_breaker.write().await;
-            guard.open(RouteTargetKey::new("gpt-4o", "openai", "gpt-4o"), 3600, 60);
             guard.open(
-                RouteTargetKey::new("claude", "anthropic", "claude-3"),
+                RouteTargetKey::new("gpt-4o", "openai", "gpt-4o", "https://api.openai.com/v1"),
+                3600,
+                60,
+            );
+            guard.open(
+                RouteTargetKey::new(
+                    "claude",
+                    "anthropic",
+                    "claude-3",
+                    "https://api.anthropic.com",
+                ),
                 3600,
                 60,
             );
@@ -306,7 +355,11 @@ mod tests {
         // anthropic was recorded as the sticky active target for "gpt-4o".
         {
             let mut guard = state.circuit_breaker.write().await;
-            guard.open(RouteTargetKey::new("gpt-4o", "openai", "gpt-4o"), 3600, 60);
+            guard.open(
+                RouteTargetKey::new("gpt-4o", "openai", "gpt-4o", "https://api.openai.com/v1"),
+                3600,
+                60,
+            );
         }
         state.active_targets.write().await.insert(
             "gpt-4o".to_string(),

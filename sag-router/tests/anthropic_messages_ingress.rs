@@ -15,7 +15,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+    ApiConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
     ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::{AppState, DispatchRuntime, build_router, test_app_state};
@@ -64,30 +64,24 @@ where
 
 async fn build_state(base_url: &str, key: &str) -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "openai".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
+    providers.insert("openai".to_string(), {
+        let mut pc = ProviderConfig {
             api_keys: vec!["sk-test".into()],
             key_strategy: KeyStrategy::FillFirst,
-            base_url: base_url.to_string(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
             anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: None,
-        },
-    );
+            ..ProviderConfig::default()
+        };
+        pc.apis.insert(
+            sag_core::ApiKind::ChatCompletions,
+            ApiConfig {
+                base_url: base_url.to_string(),
+                ..ApiConfig::default()
+            },
+        );
+        pc
+    });
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -95,7 +89,8 @@ async fn build_state(base_url: &str, key: &str) -> AppState {
         providers,
         routes: vec![RouteConfig {
             model_name: "claude-test".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -106,7 +101,6 @@ async fn build_state(base_url: &str, key: &str) -> AppState {
                 provider: "openai".into(),
                 real_model: Some("gpt-4o".into()),
                 priority: 1,
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }],
@@ -116,8 +110,7 @@ async fn build_state(base_url: &str, key: &str) -> AppState {
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (name, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> =
-            Arc::new(sag_providers::OpenAiProvider::new(name.clone(), pc).unwrap());
+        let provider = sag_providers::create_provider(name.clone(), pc).unwrap();
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);
@@ -375,31 +368,26 @@ async fn x_api_key_does_not_unlock_api_paths_on_real_router() {
 
 async fn build_state_anthropic_native(base_url: &str, key: &str) -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "anthropic".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::Anthropic,
+    providers.insert("anthropic".to_string(), {
+        let mut pc = ProviderConfig {
             api_keys: vec!["sk-ant-test".into()],
             key_strategy: KeyStrategy::FillFirst,
-            base_url: base_url.to_string(),
             proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
             timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
             anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            // Explicit declaration triggers Native lane (§4.2).
-            upstream_protocol: Some(sag_core::UpstreamProtocol::AnthropicMessages),
-        },
-    );
+            ..ProviderConfig::default()
+        };
+        // Declaring `anthropic_messages` makes the Anthropic ingress
+        // resolve to the Native lane (protocol set membership).
+        pc.apis.insert(
+            sag_core::ApiKind::AnthropicMessages,
+            ApiConfig {
+                base_url: base_url.to_string(),
+                ..ApiConfig::default()
+            },
+        );
+        pc
+    });
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -407,7 +395,8 @@ async fn build_state_anthropic_native(base_url: &str, key: &str) -> AppState {
         providers,
         routes: vec![RouteConfig {
             model_name: "claude-native".into(),
-            api_endpoint: "/messages".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -418,7 +407,6 @@ async fn build_state_anthropic_native(base_url: &str, key: &str) -> AppState {
                 provider: "anthropic".into(),
                 real_model: Some("claude-sonnet-4".into()),
                 priority: 1,
-                upstream_protocol: Some(sag_core::UpstreamProtocol::AnthropicMessages),
                 capabilities: None,
             }],
         }],
@@ -428,8 +416,7 @@ async fn build_state_anthropic_native(base_url: &str, key: &str) -> AppState {
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (name, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> =
-            Arc::new(sag_providers::AnthropicProvider::new(name.clone(), pc).unwrap());
+        let provider = sag_providers::create_provider(name.clone(), pc).unwrap();
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);

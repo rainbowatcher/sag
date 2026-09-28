@@ -17,11 +17,15 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
+indexmap = { workspace = true }
 sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
 sag-state = { path = "../sag-state" }
+# `target_capabilities` (the protocol capability matrix) is owned by the
+# dispatch pre-check; the admin provider list mirrors it verbatim.
+sag-dispatch = { path = "../sag-dispatch" }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

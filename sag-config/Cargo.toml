@@ -16,3 +16,4 @@ notify = { workspace = true }
 async-trait = { workspace = true }
 sag-core = { path = "../sag-core" }
 url = { workspace = true }
+indexmap = { workspace = true }

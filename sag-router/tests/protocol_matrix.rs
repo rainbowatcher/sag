@@ -17,7 +17,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
+    ApiConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig,
     ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::{AppState, DispatchRuntime, build_router, test_app_state};
@@ -86,65 +86,42 @@ async fn respond_sse(stream: &mut tokio::net::TcpStream, body: &str) {
 /// Upstream target shape for the matrix state builder.
 #[derive(Clone, Copy)]
 enum Upstream {
-    /// OpenAI Chat, translated (no explicit protocol).
+    /// Only `chat_completions` declared → the Chat bridge.
     Chat,
-    /// OpenAI Responses, explicit declaration (path `/responses`).
+    /// Only `responses` declared → `/responses` (native on the Responses
+    /// ingress, translated down from the other two).
     ResponsesExplicit,
-    /// Anthropic Messages (translated from Chat ingress, or native from
-    /// Anthropic ingress when both declare the protocol).
+    /// Only `anthropic_messages` declared → the Chat bridge translates
+    /// through Anthropic's `/messages`.
     Anthropic,
 }
 
 async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState {
-    let (name, ptype, provider_proto, target_proto, api_endpoint) = match upstream {
-        Upstream::Chat => (
-            "openai",
-            ProviderType::OpenAI,
-            None,
-            None,
-            "/chat/completions",
-        ),
-        Upstream::ResponsesExplicit => (
-            "openai",
-            ProviderType::OpenAI,
-            Some(sag_core::UpstreamProtocol::Responses),
-            Some(sag_core::UpstreamProtocol::Responses),
-            "/responses",
-        ),
-        Upstream::Anthropic => (
-            "anthropic",
-            ProviderType::Anthropic,
-            None,
-            None,
-            "/chat/completions",
-        ),
+    // One declared `apis` key per upstream shape: it decides both the lane
+    // (set membership) and the upstream path (fixed derivation).
+    let (name, api_key) = match upstream {
+        Upstream::Chat => ("openai", sag_core::ApiKind::ChatCompletions),
+        Upstream::ResponsesExplicit => ("openai", sag_core::ApiKind::Responses),
+        Upstream::Anthropic => ("anthropic", sag_core::ApiKind::AnthropicMessages),
     };
 
     let mut providers = HashMap::new();
-    providers.insert(
-        name.to_string(),
-        ProviderConfig {
-            provider_type: ptype,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
+    let mut pc = ProviderConfig {
+        api_keys: vec!["sk-test".into()],
+        key_strategy: KeyStrategy::FillFirst,
+        proxy_mode: ProxyMode::default(),
+        timeout_secs: 10,
+        anthropic_cache_control: false,
+        ..ProviderConfig::default()
+    };
+    pc.apis.insert(
+        api_key,
+        ApiConfig {
             base_url: base_url.to_string(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: HashMap::new(),
-            strip_fields: vec![],
-            model_strip_fields: HashMap::new(),
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            upstream_protocol: provider_proto,
+            ..ApiConfig::default()
         },
     );
+    providers.insert(name.to_string(), pc);
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -152,7 +129,8 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
         providers,
         routes: vec![RouteConfig {
             model_name: "route-model".into(),
-            api_endpoint: api_endpoint.into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             // One-shot mocks: no retries (avoids a second accept).
             retries: Some(0),
             timeout_secs: None,
@@ -164,7 +142,6 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
                 provider: name.into(),
                 real_model: Some("real-model".into()),
                 priority: 1,
-                upstream_protocol: target_proto,
                 capabilities: None,
             }],
         }],
@@ -174,14 +151,7 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (pname, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match pc.provider_type {
-            ProviderType::OpenAI => {
-                Arc::new(sag_providers::OpenAiProvider::new(pname.clone(), pc).unwrap())
-            }
-            ProviderType::Anthropic => {
-                Arc::new(sag_providers::AnthropicProvider::new(pname.clone(), pc).unwrap())
-            }
-        };
+        let provider = sag_providers::create_provider(pname.clone(), pc).unwrap();
         registry.insert(pname.clone(), provider);
     }
     drop(cfg_read);
@@ -364,19 +334,25 @@ async fn chat_x_responses_native_nonstream() {
     // Chat-shaped body — but the route `api_endpoint = /responses` selects
     // the Responses path. Mock returns a Chat-shaped JSON the bridge can
     // parse (200 + Chat egress).
-    let chat_resp = r#"{
-        "id": "chatcmpl-cx",
-        "object": "chat.completion",
-        "created": 1700000000,
+    // The upstream speaks Responses (that is the declared apis key), so
+    // the translated lane posts a Responses-shaped body; the Chat egress
+    // is re-encoded from IR.
+    let resp_json = r#"{
+        "id": "resp_cx",
+        "object": "response",
+        "created_at": 1700000000,
         "model": "real-model",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Hello"},
-            "finish_reason": "stop"
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_cx",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hello", "annotations": []}]
         }],
-        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
     }"#;
-    let expected = chat_resp.to_string();
+    let expected = resp_json.to_string();
     let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
         let expected = expected.clone();
         async move {
@@ -473,19 +449,24 @@ async fn anthropic_x_responses_native_nonstream() {
     // (ingress ≠ upstream), Chat bridge posts to `/responses`. Mock returns
     // a Chat-shaped JSON the bridge parses; Anthropic egress re-encodes
     // from IR.
-    let chat_resp = r#"{
-        "id": "chatcmpl-ax",
-        "object": "chat.completion",
-        "created": 1700000000,
+    // Responses-shaped upstream (declared apis key); the Anthropic
+    // ingress re-encodes the IR into its own envelope.
+    let resp_json = r#"{
+        "id": "resp_ax",
+        "object": "response",
+        "created_at": 1700000000,
         "model": "real-model",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "Hello from responses lane"},
-            "finish_reason": "stop"
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_ax",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hello from responses lane", "annotations": []}]
         }],
-        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
     }"#;
-    let expected = chat_resp.to_string();
+    let expected = resp_json.to_string();
     let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
         let expected = expected.clone();
         async move {
@@ -691,38 +672,32 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
     let dead = "http://127.0.0.1:1";
 
     let mut providers = HashMap::new();
-    for (pname, purl, pproto) in [
+    // First target's provider speaks only `responses` (native lane on the
+    // Responses ingress); the second only `chat_completions` (translated).
+    for (pname, purl, api_key) in [
+        ("openai-native", dead, sag_core::ApiKind::Responses),
         (
-            "openai-native",
-            dead,
-            Some(sag_core::UpstreamProtocol::Responses),
+            "openai-chat",
+            base_url.as_str(),
+            sag_core::ApiKind::ChatCompletions,
         ),
-        ("openai-chat", base_url.as_str(), None),
     ] {
-        providers.insert(
-            pname.to_string(),
-            ProviderConfig {
-                provider_type: ProviderType::OpenAI,
-                api_keys: vec!["sk-test".into()],
-                key_strategy: KeyStrategy::FillFirst,
+        let mut pc = ProviderConfig {
+            api_keys: vec!["sk-test".into()],
+            key_strategy: KeyStrategy::FillFirst,
+            proxy_mode: ProxyMode::default(),
+            timeout_secs: 2,
+            anthropic_cache_control: false,
+            ..ProviderConfig::default()
+        };
+        pc.apis.insert(
+            api_key,
+            ApiConfig {
                 base_url: purl.to_string(),
-                proxy_mode: ProxyMode::default(),
-                models_endpoint: "models".into(),
-                timeout_secs: 2,
-                headers: HashMap::new(),
-                body_overrides: HashMap::new(),
-                strip_fields: vec![],
-                model_strip_fields: HashMap::new(),
-                model_overrides: HashMap::new(),
-                role_mappings: HashMap::new(),
-                enabled_models: vec![],
-                enabled: true,
-                anthropic_cache_control: false,
-                chunk_timeout_secs: None,
-                ttfb_timeout_secs: None,
-                upstream_protocol: pproto,
+                ..ApiConfig::default()
             },
         );
+        providers.insert(pname.to_string(), pc);
     }
     let backoff = BackoffConfig {
         retries: 0,
@@ -738,7 +713,8 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
         backoff,
         routes: vec![RouteConfig {
             model_name: "route-model".into(),
-            api_endpoint: "/responses".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: Some(0),
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -750,7 +726,6 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
                     provider: "openai-native".into(),
                     real_model: Some("real-model".into()),
                     priority: 1,
-                    upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
                     capabilities: None,
                 },
                 RouteTarget {
@@ -760,9 +735,8 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
                     provider: "openai-chat".into(),
                     real_model: Some("real-model".into()),
                     priority: 2,
-                    // Explicit Chat — translated lane (ingress is Responses,
-                    // so even an explicit Chat target is Translated).
-                    upstream_protocol: Some(sag_core::UpstreamProtocol::ChatCompletions),
+                    // Chat-only provider — translated lane (the Responses
+                    // ingress is not in its protocol set).
                     capabilities: None,
                 },
             ],
@@ -775,14 +749,7 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (pname, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match pc.provider_type {
-            ProviderType::OpenAI => {
-                Arc::new(sag_providers::OpenAiProvider::new(pname.clone(), pc).unwrap())
-            }
-            ProviderType::Anthropic => {
-                Arc::new(sag_providers::AnthropicProvider::new(pname.clone(), pc).unwrap())
-            }
-        };
+        let provider = sag_providers::create_provider(pname.clone(), pc).unwrap();
         registry.insert(pname.clone(), provider);
     }
     drop(cfg_read);

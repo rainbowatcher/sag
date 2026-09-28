@@ -2,7 +2,7 @@
 
 use futures_util::StreamExt;
 use sag_core::{
-    AppError, ChatCompletionResponse, IrOutputItem, IrResponse, IrStreamEvent, UpstreamProtocol,
+    ApiKind, AppError, ChatCompletionResponse, IrOutputItem, IrResponse, IrStreamEvent,
 };
 
 /// Quick byte search for `b"usage"` in a raw SSE data frame. Used as a
@@ -375,17 +375,13 @@ fn responses_raw_verdict(val: &serde_json::Value) -> RawVerdict {
 }
 
 /// Classify one Raw SSE frame for the given upstream protocol.
-fn classify_raw_frame(
-    raw: &[u8],
-    upstream: UpstreamProtocol,
-    saw_input_tokens: &mut bool,
-) -> RawVerdict {
+fn classify_raw_frame(raw: &[u8], upstream: ApiKind, saw_input_tokens: &mut bool) -> RawVerdict {
     // [DONE] is Chat's terminal empty marker (also tolerated on other lanes).
     if raw.starts_with(b"data: [DONE]") {
         return RawVerdict::Empty;
     }
     match upstream {
-        UpstreamProtocol::ChatCompletions => {
+        ApiKind::ChatCompletions => {
             if is_empty_response_data(raw) {
                 RawVerdict::Empty
             } else {
@@ -394,15 +390,17 @@ fn classify_raw_frame(
                 RawVerdict::Content
             }
         }
-        UpstreamProtocol::AnthropicMessages => match sse_data_json(raw) {
+        ApiKind::AnthropicMessages => match sse_data_json(raw) {
             Some(val) => anthropic_raw_verdict(&val, saw_input_tokens),
             // Unparseable data → conservative non-empty.
             None => RawVerdict::Content,
         },
-        UpstreamProtocol::Responses => match sse_data_json(raw) {
+        ApiKind::Responses => match sse_data_json(raw) {
             Some(val) => responses_raw_verdict(&val),
             None => RawVerdict::Content,
         },
+        // The image pipeline never reaches the chat empty-peek path.
+        ApiKind::Image => RawVerdict::Content,
     }
 }
 
@@ -415,11 +413,11 @@ fn classify_raw_frame(
 /// unshifted unchanged** (raw bytes are never rewritten on peek).
 ///
 /// `upstream` selects how Raw SSE frames are interpreted:
-/// - [`UpstreamProtocol::ChatCompletions`] — Chat `data:` JSON + `[DONE]`;
-/// - [`UpstreamProtocol::AnthropicMessages`] — Anthropic event lifecycle
+/// - [`ApiKind::ChatCompletions`] — Chat `data:` JSON + `[DONE]`;
+/// - [`ApiKind::AnthropicMessages`] — Anthropic event lifecycle
 ///   (`message_start` / `ping` bookkeeping, content blocks non-empty,
 ///   `message_delta` / `message_stop` empty rules, `error` → 502);
-/// - [`UpstreamProtocol::Responses`] — Responses event lifecycle
+/// - [`ApiKind::Responses`] — Responses event lifecycle
 ///   (`response.created` / `in_progress` bookkeeping, output deltas
 ///   non-empty, `completed` / `incomplete` empty rules, `failed` → 502).
 ///
@@ -431,7 +429,7 @@ fn classify_raw_frame(
 pub(crate) async fn validate_stream_first_chunk(
     mut stream: futures_util::stream::BoxStream<'static, IrStreamEvent>,
     provider: &str,
-    upstream: UpstreamProtocol,
+    upstream: ApiKind,
 ) -> Result<futures_util::stream::BoxStream<'static, IrStreamEvent>, AppError> {
     // Events consumed before the first meaningful one (empty Starts /
     // bookkeeping Raw frames) — unshifted in order on success so nothing
@@ -805,8 +803,7 @@ mod tests {
             b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"total_tokens\":100}}\n\n".to_vec(),
         )]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -818,10 +815,9 @@ mod tests {
             ),
             IrStreamEvent::End,
         ]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("content frame should pass through");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("content frame should pass through");
         let first = s.next().await.unwrap();
         assert!(matches!(first, IrStreamEvent::Raw(_)));
         let second = s.next().await.unwrap();
@@ -833,8 +829,7 @@ mod tests {
         let stream =
             futures_util::stream::iter(vec![IrStreamEvent::Raw(b"data: [DONE]\n\n".to_vec())]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -849,8 +844,7 @@ mod tests {
             reasoning_tokens: None,
         })]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -864,10 +858,9 @@ mod tests {
             cache_creation_tokens: None,
             reasoning_tokens: None,
         })]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("ct>0 should pass through");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("ct>0 should pass through");
         assert!(matches!(s.next().await, Some(IrStreamEvent::Usage(_))));
     }
 
@@ -875,8 +868,7 @@ mod tests {
     async fn validate_stream_empty_stream_returns_error() {
         let stream = futures_util::stream::empty::<IrStreamEvent>();
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -884,8 +876,7 @@ mod tests {
     async fn validate_stream_end_returns_empty() {
         let stream = futures_util::stream::iter(vec![IrStreamEvent::End]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         assert!(matches!(result, Err(AppError::EmptyResponse { .. })));
     }
 
@@ -893,8 +884,7 @@ mod tests {
     async fn validate_stream_error_returns_upstream_502() {
         let stream = futures_util::stream::iter(vec![IrStreamEvent::Error("boom".into())]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         match result {
             Err(AppError::Upstream { status, body, .. }) => {
                 assert_eq!(status, 502);
@@ -911,10 +901,9 @@ mod tests {
             text: "hi".into(),
         };
         let stream = futures_util::stream::iter(vec![ev.clone(), IrStreamEvent::End]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("structured event is non-empty");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("structured event is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
         assert!(matches!(s.next().await, Some(IrStreamEvent::End)));
     }
@@ -927,10 +916,9 @@ mod tests {
             name: Some("fn".into()),
         };
         let stream = futures_util::stream::iter(vec![ev.clone()]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("tool call start is non-empty");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("tool call start is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
     }
 
@@ -941,10 +929,9 @@ mod tests {
             text: "think".into(),
         };
         let stream = futures_util::stream::iter(vec![ev.clone()]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("reasoning delta is non-empty");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("reasoning delta is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
     }
 
@@ -956,10 +943,9 @@ mod tests {
             model: Some("gpt-4o".into()),
         });
         let stream = futures_util::stream::iter(vec![ev.clone()]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("start with id is non-empty");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("start with id is non-empty");
         assert_eq!(s.next().await.unwrap(), ev);
     }
 
@@ -968,10 +954,9 @@ mod tests {
         let raw = b"data: {\"choices\":[{\"delta\":{\"content\":\"exact\"}}]}\n\n".to_vec();
         let expected = raw.clone();
         let stream = futures_util::stream::iter(vec![IrStreamEvent::Raw(raw)]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("content raw passes");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("content raw passes");
         match s.next().await.unwrap() {
             IrStreamEvent::Raw(got) => assert_eq!(got, expected, "peek must not rewrite raw"),
             other => panic!("expected Raw, got {other:?}"),
@@ -990,10 +975,9 @@ mod tests {
             text: "hi".into(),
         };
         let stream = futures_util::stream::iter(vec![empty_start.clone(), delta.clone()]);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await
-                .expect("empty Start followed by content is non-empty");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions)
+            .await
+            .expect("empty Start followed by content is non-empty");
         // Both events unshifted in order — peek must not drop the empty Start.
         assert_eq!(s.next().await.unwrap(), empty_start);
         assert_eq!(s.next().await.unwrap(), delta);
@@ -1008,8 +992,7 @@ mod tests {
         });
         let stream = futures_util::stream::iter(vec![empty_start, IrStreamEvent::End]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::ChatCompletions)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::ChatCompletions).await;
         assert!(
             matches!(result, Err(AppError::EmptyResponse { .. })),
             "metadata-free Start carries no content — End after it is empty"
@@ -1035,8 +1018,7 @@ mod tests {
         ];
         let stream = futures_util::stream::iter(frames);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::AnthropicMessages)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::AnthropicMessages).await;
         assert!(
             matches!(result, Err(AppError::EmptyResponse { .. })),
             "Anthropic stream with only bookkeeping + ct0 delta + stop must be empty"
@@ -1057,10 +1039,9 @@ mod tests {
             IrStreamEvent::Raw(br#"data: {"type":"message_stop"}"#.to_vec()),
         ];
         let stream = futures_util::stream::iter(frames);
-        let mut s =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::AnthropicMessages)
-                .await
-                .expect("content_block_delta is non-empty");
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::AnthropicMessages)
+            .await
+            .expect("content_block_delta is non-empty");
         // message_start bookkeeping unshifted, then the content frame.
         let first = s.next().await.unwrap();
         assert!(
@@ -1081,8 +1062,7 @@ mod tests {
                 .to_vec(),
         )]);
         let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::AnthropicMessages)
-                .await;
+            validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::AnthropicMessages).await;
         match result {
             Err(AppError::Upstream { status, body, .. }) => {
                 assert_eq!(status, 502);
@@ -1108,8 +1088,7 @@ mod tests {
             ),
         ];
         let stream = futures_util::stream::iter(frames);
-        let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::Responses).await;
+        let result = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::Responses).await;
         assert!(
             matches!(result, Err(AppError::EmptyResponse { .. })),
             "response.completed with empty output + ot0/it>0 must be empty"
@@ -1133,7 +1112,7 @@ mod tests {
             ),
         ];
         let stream = futures_util::stream::iter(frames);
-        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::Responses)
+        let mut s = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::Responses)
             .await
             .expect("output_text.delta is non-empty");
         let first = s.next().await.unwrap();
@@ -1154,8 +1133,7 @@ mod tests {
             br#"data: {"type":"response.failed","response":{"id":"resp_1","error":{"message":"boom"}}}"#
                 .to_vec(),
         )]);
-        let result =
-            validate_stream_first_chunk(stream.boxed(), "cpa", UpstreamProtocol::Responses).await;
+        let result = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::Responses).await;
         match result {
             Err(AppError::Upstream { status, body, .. }) => {
                 assert_eq!(status, 502);

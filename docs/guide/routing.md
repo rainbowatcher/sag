@@ -21,7 +21,6 @@ SAG 通过 `routes` 配置来定义路由表。当请求到达时，按以下顺
 ```toml
 [[routes]]
 model_name = "gpt-4o"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -30,7 +29,6 @@ priority = 100
 
 [[routes]]
 model_name = "*"          # 兜底路由
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -45,7 +43,8 @@ priority = 10
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `model_name` | string | 客户端请求的模型名。支持精确匹配，或使用 `"*"` 作为通配符匹配所有模型 |
-| `api_endpoint` | string | 上游 API 端点路径，默认 `"/v1/chat/completions"` |
+| `pipeline` | string | 请求分派管线：`"chat"`（默认，chat 协议族）或 `"image"`（图像生成） |
+| `api_endpoint` | string (可选) | **仅 `pipeline = "image"` 合法**：真实上游路径，拼接在 provider 的 `apis.image.base_url` 之后（如 `/images/generations`）。chat 族 route 出现此字段即配置错误 |
 | `strategy` | string | 目标选择策略：`sticky_failover` (默认)、`fill_first` 或 `round_robin` |
 | `retries` | integer (可选) | 每个目标的重试次数，覆盖全局 `retries`。省略则使用全局默认值 |
 | `timeout_secs` | integer (可选) | 每个目标的超时时间（秒），覆盖 provider 的 `timeout_secs`。省略时三级回落：目标级 → 路由级 → provider `timeout_secs` |
@@ -62,12 +61,10 @@ priority = 10
 | `timeout_secs` | integer (可选) | 此目标的超时时间（秒），覆盖路由级别及 provider 的 `timeout_secs`。省略时三级回落：目标级 → 路由级 → provider `timeout_secs` |
 | `extra` | object (可选) | 针对该目标的额外 JSON 字段，合并到上游请求体中。**应用时机晚于 `body_overrides` 和 `model_overrides`**，因此目标级别的 key 具有最高优先级 |
 
-### `api_endpoint` 说明
+### `pipeline` 与 `api_endpoint` 说明
 
-`api_endpoint` 定义了该路由使用什么 API 端点。SAG 会据此选择处理逻辑：
-
-- `/v1/chat/completions` — 聊天补全请求
-- `/v1/images/generations` — 图片生成请求（需要对应端点含 `/images/generations`）
+- **chat 族 route**（`pipeline = "chat"`，默认）：上游路径由协议固定推导（`chat_completions` → `/chat/completions`、`responses` → `/responses`、`anthropic_messages` → `/messages`），无需也不能声明 `api_endpoint`。
+- **image route**：必须显式声明 `pipeline = "image"`，并用 `api_endpoint` 指定真实上游路径（SAG 据此选择图像处理逻辑并拼接上游 URL）。例如 `api_endpoint = "/images/generations"`。
 
 ## 目标选择策略
 
@@ -348,7 +345,6 @@ SAG 实行精细化的错误归因机制，确保不会因客户端输入问题�
 ```toml
 [[routes]]
 model_name = "gpt-4o"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -370,7 +366,6 @@ priority = 50
 ```toml
 [[routes]]
 model_name = "gpt-4o-mini"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -379,12 +374,13 @@ priority = 100                # real_model 省略，使用客户端原始模型�
 
 ### 3. 图片生成路由
 
-聊天和图片使用不同的端点：
+图片是不同的物种，需显式声明 `pipeline = "image"`，并用 `api_endpoint` 指定真实上游路径：
 
 ```toml
 [[routes]]
 model_name = "dall-e-3"
-api_endpoint = "/v1/images/generations"
+pipeline = "image"
+api_endpoint = "/images/generations"
 
 [[routes.targets]]
 provider = "openai"
@@ -399,7 +395,6 @@ priority = 100
 ```toml
 [[routes]]
 model_name = "*"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -412,19 +407,23 @@ priority = 10                 # 透传客户端原始模型名
 
 ```toml
 [providers.openai]
-type = "openai"
 api_keys = ["${OPENAI_API_KEY}"]
+
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1"
+
+[providers.openai.apis.image]
 base_url = "https://api.openai.com/v1"
 
 [providers.anthropic]
-type = "anthropic"
 api_keys = ["${ANTHROPIC_API_KEY}"]
+
+[providers.anthropic.apis.anthropic_messages]
 base_url = "https://api.anthropic.com"
 
 # 主模型 — OpenAI 优先，Anthropic 兜底
 [[routes]]
 model_name = "gpt-4o"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -441,7 +440,6 @@ extra = { max_tokens = 8192 }
 # 轻量模型 — 透传模型名（省略 real_model）
 [[routes]]
 model_name = "gpt-4o-mini"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -450,7 +448,8 @@ priority = 100
 # 图片生成
 [[routes]]
 model_name = "dall-e-3"
-api_endpoint = "/v1/images/generations"
+pipeline = "image"
+api_endpoint = "/images/generations"
 
 [[routes.targets]]
 provider = "openai"
@@ -460,7 +459,6 @@ priority = 100
 # 兜底路由（透传原始模型名）
 [[routes]]
 model_name = "*"
-api_endpoint = "/v1/chat/completions"
 
 [[routes.targets]]
 provider = "openai"
@@ -617,6 +615,8 @@ gpt-4o = { temperature = 0.7 }
 ```toml
 [providers.openai]
 api_keys = ["${OPENAI_API_KEY}"]
+
+[providers.openai.apis.chat_completions]
 base_url = "https://api.openai.com/v1"
 
 # 全局默认：所有 openai 请求都带 max_tokens=4096

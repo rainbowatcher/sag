@@ -1745,7 +1745,7 @@ async fn dispatch_chat_releases_probe_slot_when_provider_unresolved() {
     // Pre-open `first`'s circuit so the next request finds it probe-due
     // and claims the slot before `resolve_provider` fails.
     rt.circuit_breaker.write().await.open(
-        sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
+        sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", ""),
         0,
         0,
     );
@@ -1759,11 +1759,15 @@ async fn dispatch_chat_releases_probe_slot_when_provider_unresolved() {
     // the single probe slot can be claimed once more.
     let mut b = rt.circuit_breaker.write().await;
     assert!(
-        b.to_half_open_if_due(&sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o")),
+        b.to_half_open_if_due(&sag_core::RouteTargetKey::new(
+            "gpt-4o", "first", "gpt-4o", ""
+        )),
         "after release, target should be probeable again (not stuck half-open)"
     );
     assert!(
-        b.try_acquire_probe(&sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o")),
+        b.try_acquire_probe(&sag_core::RouteTargetKey::new(
+            "gpt-4o", "first", "gpt-4o", ""
+        )),
         "released probe slot should be claimable again"
     );
 }
@@ -1830,7 +1834,7 @@ async fn dispatch_chat_half_open_probe_in_flight_skips_others() {
     // Pre-open the circuit for `first` so the next concurrent requests
     // find it half-open and race for the single probe slot.
     rt.circuit_breaker.write().await.open(
-        sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o"),
+        sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", ""),
         0,
         0,
     );
@@ -2006,7 +2010,7 @@ async fn client_error_4xx_returns_to_client_without_failover() {
     );
 
     // Circuit stays closed.
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     assert!(
         rt.circuit_breaker.read().await.is_closed(&key),
         "client-caused 4xx must not open the circuit"
@@ -2116,7 +2120,7 @@ async fn client_error_bad_request_returns_to_client_without_failover() {
     );
 
     // Circuit stays closed.
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     assert!(
         rt.circuit_breaker.read().await.is_closed(&key),
         "client-caused BadRequest must not open the circuit"
@@ -2212,7 +2216,7 @@ async fn auth_401_failovers_and_moves_pin() {
     );
 
     // A's circuit stays closed (no open on non-retryable 4xx).
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     assert!(
         rt.circuit_breaker.read().await.is_closed(&key),
         "401 must not open the circuit"
@@ -2270,7 +2274,7 @@ async fn model_404_failovers_and_moves_pin() {
         "provider-persistent 404 should move the pin to the working backup"
     );
 
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     assert!(
         rt.circuit_breaker.read().await.is_closed(&key),
         "404 must not open the circuit"
@@ -2304,7 +2308,7 @@ async fn quota_403_opens_circuit() {
     assert_eq!(m2.chat_calls(), 1);
 
     // A's circuit opened with the quota cooldown (~3600s).
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     let breaker = rt.circuit_breaker.read().await;
     assert!(!breaker.is_closed(&key), "quota 403 must open the circuit");
     let snap = breaker.snapshot();
@@ -2374,7 +2378,7 @@ async fn non_quota_403_failovers_and_moves_pin() {
         "non-quota 403 should move the pin to the working backup"
     );
 
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     assert!(
         rt.circuit_breaker.read().await.is_closed(&key),
         "non-quota 403 must not open the circuit"
@@ -2424,7 +2428,7 @@ async fn unknown_4xx_returns_to_client() {
         "unknown 4xx must not move the pin"
     );
 
-    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o");
+    let key = sag_core::RouteTargetKey::new("gpt-4o", "first", "gpt-4o", "");
     assert!(
         rt.circuit_breaker.read().await.is_closed(&key),
         "unknown 4xx must not open the circuit"
@@ -2477,7 +2481,8 @@ async fn build_state_with_strategy(
         providers: config_providers,
         routes: vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             strategy,
             targets: vec![
                 sag_config::RouteTarget {
@@ -2487,7 +2492,6 @@ async fn build_state_with_strategy(
                     retries: Some(0),
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
                 sag_config::RouteTarget {
@@ -2497,7 +2501,6 @@ async fn build_state_with_strategy(
                     retries: Some(0),
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
             ],
@@ -2545,6 +2548,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
 
     // Resolve route (should place "second" first due to sticky active target)
     let ResolvedRoute {
+        pipeline: _,
         targets: resolved_targets,
         api_endpoint,
         strategy,
@@ -2623,6 +2627,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
 
     // Resolve route
     let ResolvedRoute {
+        pipeline: _,
         targets: resolved_targets,
         api_endpoint,
         strategy,
@@ -2704,6 +2709,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
 
     // Routing decision happens now: captures the current generation (0).
     let ResolvedRoute {
+        pipeline: _,
         targets: resolved_targets,
         api_endpoint,
         strategy,
@@ -2787,6 +2793,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
 
     // Routing decision happens now: captures (generation 0, version V).
     let ResolvedRoute {
+        pipeline: _,
         targets: resolved_targets,
         api_endpoint,
         strategy,
@@ -2816,7 +2823,8 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         cfg.routes.retain(|r| r.model_name != "gpt-4o");
         cfg.routes.push(sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::StickyFailover,
@@ -2827,7 +2835,6 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         });
@@ -2869,6 +2876,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
     // Sanity: a fresh decision after the mutation captures the new
     // version and pins normally.
     let ResolvedRoute {
+        pipeline: _,
         targets: resolved_targets2,
         api_endpoint: api_endpoint2,
         strategy: strategy2,
@@ -2941,6 +2949,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
 
     // Routing decision happens now: captures (generation 0, version V).
     let ResolvedRoute {
+        pipeline: _,
         targets: resolved_targets,
         api_endpoint,
         strategy,

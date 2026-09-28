@@ -11,7 +11,7 @@ use sag_core::{AppError, ChatCompletionRequest, FailureReason, FinalStatus, Requ
 use sag_providers::LlmProvider;
 use tracing::{info, warn};
 
-use crate::dispatch::capability::filter_capable_targets;
+use crate::dispatch::capability::{filter_capable_targets, used_protocol};
 use crate::dispatch::{ResolvedRoute, ResolvedTarget, failure_response};
 use crate::order::order_targets;
 use crate::state::{AppState, DispatchRuntime};
@@ -19,8 +19,12 @@ use crate::state::{AppState, DispatchRuntime};
 /// Snapshot of provider fields needed to fill `ResolvedTarget` lane fields.
 #[derive(Clone)]
 struct ProviderLaneMeta {
-    provider_type: String,
-    upstream_protocol: Option<sag_core::UpstreamProtocol>,
+    /// All `apis` keys (protocol keys plus the optional non-protocol
+    /// `image` entry); [`sag_core::resolve_lane`] ignores non-protocol keys.
+    apis_keys: Vec<sag_core::ApiKind>,
+    /// Translated-lane target protocol — config validation guarantees it
+    /// is one of the provider's protocol keys when set.
+    fallback: Option<sag_core::ApiKind>,
 }
 
 /// Resolve a chat request to an ordered list of fallback targets and the
@@ -122,9 +126,22 @@ pub async fn resolve_route_with_ingress(
     // Partial drops ride on `ResolvedRoute::precheck_errors` into the
     // dispatch `errors` channel; a full drop builds the 502 with the
     // capability reason inline (not the generic disabled wording).
+    //
+    // The image pipeline is a different species (no chat protocol
+    // semantics, see D3/D8) — the chat hard-requirement table does not
+    // apply to it, so it is never pre-checked here.
     let mut cap_errors = Vec::new();
-    let targets =
-        filter_capable_targets(request, &config_guard.providers, targets, &mut cap_errors);
+    let targets = if route.pipeline == sag_config::Pipeline::Image {
+        targets
+    } else {
+        filter_capable_targets(
+            request,
+            &config_guard.providers,
+            targets,
+            ingress_protocol,
+            &mut cap_errors,
+        )
+    };
     if targets.is_empty() {
         return Err(emit_all_disabled_failure(
             state,
@@ -145,7 +162,17 @@ pub async fn resolve_route_with_ingress(
     // Snapshot route + global settings so the config guard can be dropped
     // before the async `order_targets` call below.
     let strategy = route.strategy;
-    let api_endpoint = route.api_endpoint.clone();
+    let pipeline = route.pipeline;
+    // Chat routes carry no `api_endpoint` (the provider derives the path
+    // from the actually-used protocol); the image pipeline's real upstream
+    // path is appended to `apis.image.base_url` by `chat_image`.
+    let api_endpoint = match pipeline {
+        sag_config::Pipeline::Image => route
+            .api_endpoint
+            .clone()
+            .unwrap_or_else(|| "/images/generations".to_string()),
+        sag_config::Pipeline::Chat => String::new(),
+    };
     let route_retries = route.retries;
     let route_timeout = route.timeout_secs;
     let route_model_name = route.model_name.clone();
@@ -157,7 +184,8 @@ pub async fn resolve_route_with_ingress(
         .iter()
         .map(|(k, v)| (k.clone(), v.timeout_secs))
         .collect();
-    // provider_type + explicit upstream_protocol for lane / ResolvedTarget.
+    // `apis` keys + `fallback` for the lane / actually-used-protocol
+    // decision in `map_resolved_targets`.
     let provider_meta: HashMap<String, ProviderLaneMeta> = config_guard
         .providers
         .iter()
@@ -165,8 +193,8 @@ pub async fn resolve_route_with_ingress(
             (
                 k.clone(),
                 ProviderLaneMeta {
-                    provider_type: v.provider_type.as_str().to_string(),
-                    upstream_protocol: v.upstream_protocol,
+                    apis_keys: v.apis.keys().copied().collect(),
+                    fallback: v.fallback,
                 },
             )
         })
@@ -200,10 +228,12 @@ pub async fn resolve_route_with_ingress(
         &provider_timeouts,
         &provider_meta,
         ingress_protocol,
+        pipeline,
     );
 
     Ok(ResolvedRoute {
         targets: resolved,
+        pipeline,
         api_endpoint,
         strategy,
         sticky_token,
@@ -364,9 +394,15 @@ async fn emit_all_disabled_failure(
     response
 }
 
-/// Resolve effective retries and timeout per target:
-/// target → route → provider / global. Also fills lane / upstream protocol
-/// fields from explicit target declaration > provider declaration > derivation.
+/// Resolve effective retries and timeout per target: target → route →
+/// provider / global. Lane and the actually-used protocol come straight
+/// from the new catalog formula:
+///
+/// ```text
+/// lane             = (ingress ∈ provider 协议 key 集) ? Native : Translated
+/// 实际使用协议       = Native ? ingress : fallback（或唯一协议 key）
+/// ```
+/// with image-pipeline routes pinned to [`sag_core::ApiKind::Image`].
 #[allow(clippy::too_many_arguments)]
 fn map_resolved_targets(
     ordered: Vec<RouteTarget>,
@@ -378,6 +414,7 @@ fn map_resolved_targets(
     provider_timeouts: &HashMap<String, u64>,
     provider_meta: &HashMap<String, ProviderLaneMeta>,
     ingress_protocol: sag_core::IngressProtocol,
+    pipeline: sag_config::Pipeline,
 ) -> Vec<ResolvedTarget> {
     ordered
         .into_iter()
@@ -392,16 +429,22 @@ fn map_resolved_targets(
                 .unwrap_or(sag_config::default_timeout_secs());
 
             let meta = provider_meta.get(&t.provider);
-            let provider_type = meta.map(|m| m.provider_type.as_str()).unwrap_or("openai");
-            // Explicit: target wins over provider; missing → derived only.
-            let explicit = t
-                .upstream_protocol
-                .or_else(|| meta.and_then(|m| m.upstream_protocol));
-            let explicit_flag = explicit.is_some();
-            let derived = sag_core::derive_upstream_protocol(provider_type);
-            let upstream_protocol = sag_core::effective_upstream_protocol(explicit, derived);
-            // §4.2: Native only when explicit and == ingress.
-            let lane = sag_core::resolve_lane(explicit, ingress_protocol);
+            let lane = sag_core::resolve_lane(
+                meta.map(|m| m.apis_keys.as_slice()).unwrap_or_default(),
+                ingress_protocol,
+            );
+            let upstream_protocol = if pipeline == sag_config::Pipeline::Image {
+                // Image has no protocol-matching semantics — it is a
+                // non-protocol catalog entry, not a lane participant.
+                sag_core::ApiKind::Image
+            } else {
+                used_protocol(
+                    lane,
+                    ingress_protocol,
+                    meta.map(|m| m.apis_keys.as_slice()).unwrap_or_default(),
+                    meta.and_then(|m| m.fallback),
+                )
+            };
 
             ResolvedTarget {
                 provider: t.provider,
@@ -412,7 +455,6 @@ fn map_resolved_targets(
                 retries,
                 timeout_secs,
                 upstream_protocol,
-                upstream_protocol_explicit: explicit_flag,
                 lane,
             }
         })
@@ -571,7 +613,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -581,7 +622,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -610,7 +650,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
             RouteTarget {
@@ -620,7 +659,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             },
         ];
@@ -637,7 +675,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }];
         let filtered_pass = filter_enabled_targets(&providers, &passthrough_targets, "gpt-4o-mini");
@@ -659,7 +696,6 @@ mod tests {
             retries: None,
             timeout_secs: None,
             extra: HashMap::new(),
-            upstream_protocol: None,
             capabilities: None,
         }];
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");
@@ -682,7 +718,8 @@ mod tests {
 
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::StickyFailover,
@@ -693,7 +730,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }];
@@ -888,7 +924,8 @@ mod tests {
             cfg.routes.retain(|r| r.model_name != "gpt-4o");
             cfg.routes.push(sag_config::RouteConfig {
                 model_name: "gpt-4o".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: sag_config::Strategy::StickyFailover,
@@ -899,7 +936,6 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             });
@@ -977,7 +1013,8 @@ mod tests {
             let mut cfg = state.config.write().await;
             cfg.routes.push(sag_config::RouteConfig {
                 model_name: "*".into(),
-                api_endpoint: "/chat/completions".into(),
+                api_endpoint: None,
+                pipeline: sag_config::Pipeline::Chat,
                 retries: None,
                 timeout_secs: None,
                 strategy: sag_config::Strategy::FillFirst,
@@ -988,7 +1025,6 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 }],
             });
@@ -1018,7 +1054,8 @@ mod tests {
         providers.insert("openai".into(), crate::testing::provider_config(true));
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::StickyFailover,
@@ -1029,7 +1066,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }];
@@ -1071,7 +1107,8 @@ mod tests {
 
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::FillFirst,
@@ -1082,7 +1119,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }];
@@ -1168,21 +1204,19 @@ mod tests {
     // ── capability pre-check observability (B1) ─────────────────
 
     /// Build state with two targets for `gpt-4o`:
-    /// - `weird`: openai + explicit anthropic_messages → unknown combo,
-    ///   no `reasoning` capability;
-    /// - `good`: plain openai → has `reasoning`.
+    /// - `weird`: target-level capability override takes `reasoning` away;
+    /// - `good`: plain target on a chat-capable provider.
     ///
     /// A `reasoning_effort` request therefore partially drops only `weird`.
     async fn build_state_partial_capability() -> (AppState, DispatchRuntime) {
         let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
         providers.insert("good".into(), provider_config(true));
-        let mut weird = provider_config(true);
-        weird.upstream_protocol = Some(sag_core::UpstreamProtocol::AnthropicMessages);
-        providers.insert("weird".into(), weird);
+        providers.insert("weird".into(), provider_config(true));
 
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::FillFirst,
@@ -1194,8 +1228,10 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
-                    capabilities: None,
+                    capabilities: Some(sag_config::CapabilitiesOverride {
+                        reasoning: Some(false),
+                        ..Default::default()
+                    }),
                 },
                 sag_config::RouteTarget {
                     provider: "good".into(),
@@ -1204,7 +1240,6 @@ mod tests {
                     retries: None,
                     timeout_secs: None,
                     extra: HashMap::new(),
-                    upstream_protocol: None,
                     capabilities: None,
                 },
             ],
@@ -1266,12 +1301,11 @@ mod tests {
         // Only the incapable target — full capability drop → 502 with the
         // capability detail in the response body and the CallLog row.
         let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
-        let mut weird = provider_config(true);
-        weird.upstream_protocol = Some(sag_core::UpstreamProtocol::AnthropicMessages);
-        providers.insert("weird".into(), weird);
+        providers.insert("weird".into(), provider_config(true));
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::FillFirst,
@@ -1282,8 +1316,10 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
-                capabilities: None,
+                capabilities: Some(sag_config::CapabilitiesOverride {
+                    reasoning: Some(false),
+                    ..Default::default()
+                }),
             }],
         }];
         let config = sag_config::GatewayConfig {
@@ -1497,7 +1533,8 @@ mod tests {
 
         let routes = vec![sag_config::RouteConfig {
             model_name: "gpt-4o".into(),
-            api_endpoint: "/chat/completions".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
             retries: None,
             timeout_secs: None,
             strategy: sag_config::Strategy::FillFirst,
@@ -1508,7 +1545,6 @@ mod tests {
                 retries: None,
                 timeout_secs: None,
                 extra: HashMap::new(),
-                upstream_protocol: None,
                 capabilities: None,
             }],
         }];

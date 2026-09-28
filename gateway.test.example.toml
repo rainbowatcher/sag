@@ -75,27 +75,37 @@ storage_dsn = "sqlite://analytics-test.db"
 # ============================================================
 # LLM Provider configurations
 # Same set as gateway.example.toml; operators override keys per environment.
+# Provider = credentials + a catalog of protocol APIs ([providers.<name>.apis.<key>]).
+# There is NO provider-level base_url — the address lives in each apis section.
 # ============================================================
 
 [providers.openai]
 api_keys = ["sk-your-openai-api-key"]
-base_url = "https://api.openai.com/v1"
 timeout_secs = 120
+# Fallback protocol — required only when `apis` declares several protocol keys
+# (omitted here: apis has the single key chat_completions).
+# fallback = "chat_completions"
 # Per-provider proxy mode (default: "inherit" — use the top-level proxy_url):
 #   "inherit"  — use top-level proxy_url if set, else direct
 #   "enabled"  — force top-level proxy_url (config error if none is set)
 #   "disabled" — force direct connection, ignoring any top-level proxy
 # proxy_mode = "inherit"
 
-# Fields to strip from the upstream request body before forwarding.
+# Fields to strip from the upstream request body before forwarding (provider
+# level = default; apis.<key> declares the same field → whole-section replace).
 # Use for fields the upstream rejects with strict schema validation
 # (e.g. vLLM-specific `chat_template_kwargs` sent to OpenAI-compatible providers).
 # strip_fields = ["chat_template_kwargs"]
 
+[providers.openai.apis.chat_completions]
+base_url = "https://api.openai.com/v1"
+
 [providers.anthropic]
 api_keys = ["sk-ant-your-anthropic-api-key"]
-base_url = "https://api.anthropic.com/v1"
 timeout_secs = 120
+
+[providers.anthropic.apis.anthropic_messages]
+base_url = "https://api.anthropic.com/v1"
 
 # ============================================================
 # Model routing table — identical structure to prod.
@@ -137,9 +147,9 @@ targets = [
 # Q4 STUB — Agent-tool connection (operator fills per environment)
 # ============================================================
 # After the operator copies this template to gateway.test.toml, fill in the
-# `api_keys` placeholder values above (and any [providers.*].base_url overrides
-# you need for the upstream you're testing against) — values come from each
-# agent tool's local config:
+# `api_keys` placeholder values above (and any [providers.*.apis.*].base_url
+# overrides you need for the upstream you're testing against) — values come
+# from each agent tool's local config:
 #
 #   - .kilo/   : agent's provider base_url & api_key
 #   - .cline/  : ditto

@@ -23,8 +23,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use sag_config::{
-    ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, ProviderConfig, ProviderType,
-    ProxyMode, RouteConfig, RouteTarget, Strategy,
+    ApiConfig, ApiKind, ConfigHandle, GatewayAuthConfig, GatewayConfig, KeyStrategy, Pipeline,
+    ProviderConfig, ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use sag_router::{AppState, DispatchRuntime, build_router, test_app_state};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -118,31 +118,34 @@ async fn build_responses_native_state(
     cfg: ResponsesOverrideCfg,
 ) -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "openai".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::OpenAI,
-            api_keys: vec!["sk-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
+    let mut pc = ProviderConfig {
+        api_keys: vec!["sk-test".into()],
+        key_strategy: KeyStrategy::FillFirst,
+        proxy_mode: ProxyMode::default(),
+        timeout_secs: 10,
+        headers: HashMap::new(),
+        body_overrides: cfg.body_overrides,
+        strip_fields: cfg.strip_fields,
+        model_strip_fields: cfg.model_strip_fields,
+        model_overrides: HashMap::new(),
+        role_mappings: HashMap::new(),
+        enabled_models: vec![],
+        enabled: true,
+        anthropic_cache_control: false,
+        chunk_timeout_secs: None,
+        ttfb_timeout_secs: None,
+        ..ProviderConfig::default()
+    };
+    // Declaring `responses` → ingress ∈ protocol keys → Native lane on
+    // /v1/responses; the upstream path is derived (POST /responses).
+    pc.apis.insert(
+        ApiKind::Responses,
+        ApiConfig {
             base_url: base_url.to_string(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: cfg.body_overrides,
-            strip_fields: cfg.strip_fields,
-            model_strip_fields: cfg.model_strip_fields,
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            // Explicit declaration → Native lane on /v1/responses.
-            upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
+            ..ApiConfig::default()
         },
     );
+    providers.insert("openai".to_string(), pc);
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -150,7 +153,8 @@ async fn build_responses_native_state(
         providers,
         routes: vec![RouteConfig {
             model_name: "route-model".into(),
-            api_endpoint: "/responses".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             retries: Some(0),
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -161,7 +165,6 @@ async fn build_responses_native_state(
                 provider: "openai".into(),
                 real_model: Some(cfg.real_model),
                 priority: 1,
-                upstream_protocol: Some(sag_core::UpstreamProtocol::Responses),
                 capabilities: None,
             }],
         }],
@@ -171,14 +174,7 @@ async fn build_responses_native_state(
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (pname, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> = match pc.provider_type {
-            ProviderType::OpenAI => {
-                Arc::new(sag_providers::OpenAiProvider::new(pname.clone(), pc).unwrap())
-            }
-            ProviderType::Anthropic => {
-                Arc::new(sag_providers::AnthropicProvider::new(pname.clone(), pc).unwrap())
-            }
-        };
+        let provider = sag_providers::create_provider(pname.clone(), pc).unwrap();
         registry.insert(pname.clone(), provider);
     }
     drop(cfg_read);
@@ -201,31 +197,34 @@ async fn build_anthropic_native_state(
     cfg: AnthropicOverrideCfg,
 ) -> AppState {
     let mut providers = HashMap::new();
-    providers.insert(
-        "anthropic".to_string(),
-        ProviderConfig {
-            provider_type: ProviderType::Anthropic,
-            api_keys: vec!["sk-ant-test".into()],
-            key_strategy: KeyStrategy::FillFirst,
+    let mut pc = ProviderConfig {
+        api_keys: vec!["sk-ant-test".into()],
+        key_strategy: KeyStrategy::FillFirst,
+        proxy_mode: ProxyMode::default(),
+        timeout_secs: 10,
+        headers: HashMap::new(),
+        body_overrides: cfg.body_overrides,
+        strip_fields: cfg.strip_fields,
+        model_strip_fields: cfg.model_strip_fields,
+        model_overrides: HashMap::new(),
+        role_mappings: HashMap::new(),
+        enabled_models: vec![],
+        enabled: true,
+        anthropic_cache_control: false,
+        chunk_timeout_secs: None,
+        ttfb_timeout_secs: None,
+        ..ProviderConfig::default()
+    };
+    // Declaring `anthropic_messages` → ingress ∈ protocol keys → Native
+    // lane on /v1/messages; the upstream path is derived (POST /messages).
+    pc.apis.insert(
+        ApiKind::AnthropicMessages,
+        ApiConfig {
             base_url: base_url.to_string(),
-            proxy_mode: ProxyMode::default(),
-            models_endpoint: "models".into(),
-            timeout_secs: 10,
-            headers: HashMap::new(),
-            body_overrides: cfg.body_overrides,
-            strip_fields: cfg.strip_fields,
-            model_strip_fields: cfg.model_strip_fields,
-            model_overrides: HashMap::new(),
-            role_mappings: HashMap::new(),
-            enabled_models: vec![],
-            enabled: true,
-            anthropic_cache_control: false,
-            chunk_timeout_secs: None,
-            ttfb_timeout_secs: None,
-            // Explicit declaration → Native lane on /v1/messages.
-            upstream_protocol: Some(sag_core::UpstreamProtocol::AnthropicMessages),
+            ..ApiConfig::default()
         },
     );
+    providers.insert("anthropic".to_string(), pc);
     let config = GatewayConfig {
         gateway_auth: Some(GatewayAuthConfig {
             api_keys: vec![key.to_string()],
@@ -233,7 +232,8 @@ async fn build_anthropic_native_state(
         providers,
         routes: vec![RouteConfig {
             model_name: "claude-native".into(),
-            api_endpoint: "/messages".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
             retries: Some(0),
             timeout_secs: None,
             strategy: Strategy::FillFirst,
@@ -244,7 +244,6 @@ async fn build_anthropic_native_state(
                 provider: "anthropic".into(),
                 real_model: Some(cfg.real_model),
                 priority: 1,
-                upstream_protocol: Some(sag_core::UpstreamProtocol::AnthropicMessages),
                 capabilities: None,
             }],
         }],
@@ -254,8 +253,7 @@ async fn build_anthropic_native_state(
     let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
     let cfg_read = handle.read().await;
     for (name, pc) in cfg_read.providers.iter() {
-        let provider: Arc<dyn sag_providers::LlmProvider> =
-            Arc::new(sag_providers::AnthropicProvider::new(name.clone(), pc).unwrap());
+        let provider = sag_providers::create_provider(name.clone(), pc).unwrap();
         registry.insert(name.clone(), provider);
     }
     drop(cfg_read);

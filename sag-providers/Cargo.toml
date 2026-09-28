@@ -16,3 +16,6 @@ futures-util = { workspace = true }
 chrono = { workspace = true }
 sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
+
+[dev-dependencies]
+indexmap = { workspace = true }

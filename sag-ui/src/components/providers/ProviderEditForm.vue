@@ -6,6 +6,7 @@ import { toast } from "vue-sonner"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
 import ModelManager from "@/components/ModelManager.vue"
+import ApisEditor from "@/components/providers/ApisEditor.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -39,7 +40,7 @@ import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { Provider, ProxyMode, UpstreamProtocol } from "@/types/api"
+import type { ApiConfig, ApiKind, Provider, ProxyMode } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
@@ -79,8 +80,6 @@ function onOpenChange(v: boolean) {
 }
 
 // ── Basic fields ─────────────────────────────────────────────
-const providerType = ref(props.provider.provider_type)
-const baseUrl = ref(props.provider.base_url)
 const timeoutSecs = ref(props.provider.timeout_secs)
 
 // ── Proxy mode ───────────────────────────────────────────────
@@ -88,18 +87,29 @@ const timeoutSecs = ref(props.provider.timeout_secs)
 // always what gets sent (explicitly, so switching back to inherit works).
 const proxyMode = ref<ProxyMode>(props.provider.proxy_mode ?? "inherit")
 
-// ── Upstream protocol ────────────────────────────────────────
-// "" = derive (send null to clear); otherwise the explicit value.
-const upstreamProtocol = ref<UpstreamProtocol | "">(props.provider.upstream_protocol ?? "")
-function deriveProtocol(type: string): string {
-  return type === "anthropic" ? "anthropic_messages" : "chat_completions"
-}
-const providerEffectiveProtocol = computed(
-  () =>
-    upstreamProtocol.value ||
-    props.provider.effective_upstream_protocol ||
-    deriveProtocol(providerType.value),
+// ── API sections (protocol catalog) ──────────────────────────
+// The editor owns the whole directory: updates always send the full
+// `apis` map (whole-directory replace on the backend).
+const apis = ref<Partial<Record<ApiKind, ApiConfig>>>({ ...props.provider.apis })
+const fallback = ref<ApiKind | null>(props.provider.fallback ?? null)
+const apisEditor = ref<{ validate: () => string | null } | null>(null)
+
+/** The section model listing / model tests probe: chat_completions, else the first declared. */
+const primaryKind = computed<ApiKind | null>(() => {
+  const keys = Object.keys(apis.value) as ApiKind[]
+  if (keys.includes("chat_completions")) return "chat_completions"
+  return keys[0] ?? null
+})
+const primaryApi = computed<ApiConfig | null>(() =>
+  primaryKind.value ? (apis.value[primaryKind.value] ?? null) : null,
 )
+
+/** Translated-lane protocol badge shown next to models. */
+const defaultProtocol = computed<ApiKind | undefined>(() => {
+  const protocols = (Object.keys(apis.value) as ApiKind[]).filter((k) => k !== "image")
+  if (fallback.value) return fallback.value
+  return protocols.length === 1 ? protocols[0] : undefined
+})
 
 // ── API keys ─────────────────────────────────────────────────
 const apiKeys = ref<string[]>([...props.provider.api_keys])
@@ -107,19 +117,19 @@ const keyStrategy = ref<"fill_first" | "round_robin">(props.provider.key_strateg
 
 // ── Models ───────────────────────────────────────────────────
 const enabledModels = ref<string[]>([...props.provider.enabled_models])
-const modelsEndpoint = ref(props.provider.models_endpoint || "models")
-
-function defaultModelsEndpoint(providerType: string) {
-  return providerType === "anthropic" ? "v1/models" : "models"
-}
 
 function onTestModel(model: string) {
+  const primary = primaryApi.value
+  if (!primary) {
+    store.upstreamModelsError = "Declare an API section first (APIs tab)"
+    return
+  }
   store.testModelWithState(model, {
     model,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    base_url: baseUrl.value,
-    provider_type: providerType.value,
-    headers: headersMap(),
+    base_url: primary.base_url,
+    api_kind: primaryKind.value ?? undefined,
+    headers: primary.headers ?? headersMap(),
     proxy_mode: proxyMode.value,
   })
 }
@@ -169,13 +179,18 @@ function roleMappingsMap(): Record<string, string> {
 }
 
 // ── Fetch upstream models ────────────────────────────────────
-function onFetchModels(endpoint: string) {
+function onFetchModels() {
+  const primary = primaryApi.value
+  if (!primary) {
+    store.upstreamModelsError = "Declare an API section first (APIs tab)"
+    return
+  }
   store.fetchUpstreamModels({
-    base_url: baseUrl.value,
+    base_url: primary.base_url,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    headers: headersMap(),
-    provider_type: providerType.value,
-    models_endpoint: endpoint,
+    headers: primary.headers ?? headersMap(),
+    api_kind: primaryKind.value ?? undefined,
+    models_endpoint: primary.models_endpoint,
     proxy_mode: proxyMode.value,
   })
 }
@@ -188,25 +203,23 @@ async function handleSubmit() {
     const validKeys = apiKeys.value.filter((k) => k.trim())
     const payload: Record<string, any> = {}
 
+    const apisError = apisEditor.value?.validate()
+    if (apisError) {
+      apiError.value = apisError
+      return
+    }
+
     if (validKeys.length > 0) {
       payload.api_keys = validKeys
     }
     payload.key_strategy = keyStrategy.value
 
-    const oldModelsEndpoint = defaultModelsEndpoint(props.provider.provider_type)
-    if (
-      providerType.value !== props.provider.provider_type &&
-      modelsEndpoint.value === oldModelsEndpoint
-    ) {
-      modelsEndpoint.value = defaultModelsEndpoint(providerType.value)
-    }
+    // Whole-directory replace: send the full catalog on every save.
+    payload.apis = apis.value
+    // Triple-state fallback patch: a value sets, `null` clears (back to the
+    // single-protocol auto default) — both states are always explicit here.
+    payload.fallback = fallback.value
 
-    if (providerType.value !== props.provider.provider_type) {
-      payload.provider_type = providerType.value
-    }
-    if (baseUrl.value !== props.provider.base_url) {
-      payload.base_url = baseUrl.value
-    }
     if (timeoutSecs.value !== props.provider.timeout_secs) {
       payload.timeout_secs = timeoutSecs.value
     }
@@ -271,17 +284,9 @@ async function handleSubmit() {
       payload.enabled_models = enabledModels.value
     }
 
-    if (modelsEndpoint.value.trim() !== (props.provider.models_endpoint || "models")) {
-      payload.models_endpoint = modelsEndpoint.value.trim() || undefined
-    }
-
     // Always send the current proxy mode — an explicit "inherit" is required
     // to reset a provider that was saved as enabled/disabled.
     payload.proxy_mode = proxyMode.value
-
-    // Always send upstream_protocol: null clears back to derive; a value
-    // sets the explicit declaration. Omitting would leave the old value.
-    payload.upstream_protocol = upstreamProtocol.value || null
 
     await store.updateProvider(props.provider.name, payload)
     toast.success(`Provider "${props.provider.name}" updated`)
@@ -318,6 +323,7 @@ async function handleSubmit() {
         <Tabs default-value="basic">
           <TabsList class="mb-4">
             <TabsTrigger value="basic">Basic</TabsTrigger>
+            <TabsTrigger value="apis">APIs</TabsTrigger>
             <TabsTrigger value="models">Models</TabsTrigger>
             <TabsTrigger value="advanced">Advanced</TabsTrigger>
           </TabsList>
@@ -329,20 +335,13 @@ async function handleSubmit() {
               <Input :model-value="provider.name" disabled class="bg-muted text-muted-foreground" />
             </div>
 
-            <div>
-              <FieldLabel>Type</FieldLabel>
-              <Select
-                :model-value="providerType"
-                @update:model-value="(v) => (providerType = v as string)"
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="openai">OpenAI</SelectItem>
-                  <SelectItem value="anthropic">Anthropic</SelectItem>
-                </SelectContent>
-              </Select>
+            <div class="space-y-1">
+              <FieldLabel>Timeout (secs)</FieldLabel>
+              <Input
+                type="number"
+                :model-value="timeoutSecs"
+                @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
+              />
             </div>
 
             <div class="col-span-2">
@@ -351,23 +350,6 @@ async function handleSubmit() {
                 :key-strategy="keyStrategy"
                 @update:api-keys="apiKeys = $event"
                 @update:key-strategy="keyStrategy = $event"
-              />
-            </div>
-
-            <div class="col-span-2">
-              <FieldLabel>Base URL</FieldLabel>
-              <Input
-                :model-value="baseUrl"
-                @input="baseUrl = ($event.target as HTMLInputElement).value"
-              />
-            </div>
-
-            <div class="space-y-1">
-              <FieldLabel>Timeout (secs)</FieldLabel>
-              <Input
-                type="number"
-                :model-value="timeoutSecs"
-                @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
               />
             </div>
 
@@ -391,32 +373,24 @@ async function handleSubmit() {
                 proxy URL.
               </p>
             </div>
+          </TabsContent>
 
-            <div class="space-y-1">
-              <FieldLabel>Upstream Protocol</FieldLabel>
-              <Select
-                :model-value="upstreamProtocol"
-                @update:model-value="(v) => (upstreamProtocol = v as UpstreamProtocol | '')"
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Derived from type" />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="">Derived from type</SelectItem>
-                  <SelectItem value="chat_completions">Chat Completions</SelectItem>
-                  <SelectItem value="responses">Responses</SelectItem>
-                  <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
-                </SelectContent>
-              </Select>
-              <p class="text-muted-foreground text-xs">
-                Explicit upstream protocol. Derived = follow provider type (openai → Chat
-                Completions, anthropic → Anthropic Messages).
-              </p>
-            </div>
+          <!-- ─── Tab: APIs ───────────────────────────────────── -->
+          <TabsContent value="apis" class="space-y-4">
+            <ApisEditor ref="apisEditor" v-model="apis" v-model:fallback="fallback" />
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
           <TabsContent value="models" class="space-y-3">
+            <p v-if="primaryApi" class="text-muted-foreground text-xs">
+              Model listing probes
+              <code>{{ primaryKind }}</code>
+              → <code>{{ primaryApi.base_url }}</code
+              ><template v-if="primaryApi.models_endpoint"
+                >/{{ primaryApi.models_endpoint }}</template
+              ><template v-else>/models</template>
+              (edit on the APIs tab).
+            </p>
             <ModelManager
               :provider-name="provider.name"
               :enabled-models="enabledModels"
@@ -424,9 +398,8 @@ async function handleSubmit() {
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
-              v-model:models-endpoint="modelsEndpoint"
               v-model:model-overrides="modelOverridesMap"
-              :upstream-protocol="providerEffectiveProtocol"
+              :upstream-protocol="defaultProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"
@@ -435,6 +408,12 @@ async function handleSubmit() {
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->
           <TabsContent value="advanced" class="space-y-4">
+            <p class="text-muted-foreground text-xs">
+              Provider-level defaults below apply to every API section. A field declared inside an
+              <strong>APIs</strong> section <strong>fully replaces</strong> the default of the same
+              name for that section (maps are not merged, arrays not unioned).
+            </p>
+
             <KvEditor
               v-model="headersList"
               title="Headers"

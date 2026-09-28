@@ -8,25 +8,24 @@
 
 | 字段 | 说明 |
 |------|------|
-| `provider_type` | 供应商适配器类型（`openai` / `anthropic`），默认 `openai` |
+| `apis` | 协议 API 目录（必填，至少一个协议 key）：`[providers.<name>.apis.<kind>]` 各节携带自己的 `base_url`（地址唯一来源）与可选覆盖字段。协议集 = apis 的协议 key 集，lane 自动判定（ingress ∈ 协议集 → Native） |
+| `fallback` | 降级协议（translated 路径的编码目标）。单协议 key 可省略；多协议 key 必填 |
 | `api_keys` | API 密钥列表 |
 | `key_strategy` | 多密钥选择策略（`fill_first` / `round_robin`） |
-| `base_url` | 供应商 API 基础 URL |
 | `proxy_mode` | 出站代理三态：`inherit`（默认，跟随顶层 `proxy_url`）/ `enabled`（强制走全局代理，无全局代理则配置错误）/ `disabled`（强制直连）。SAG **不读**系统代理环境变量 |
-| `models_endpoint` | 管理面板拉取模型列表的端点路径，拼接在 `base_url` 后，默认 `models` |
+| `models_endpoint` | 管理面板拉取模型列表的端点路径（per-API，配置在 `[providers.<name>.apis.<key>]` 节），相对本节 `base_url`，默认 `models` |
 | `timeout_secs` | 上游请求超时（秒），默认 600。流式请求不受此约束（见「流式超时」），仅作为非流式请求的整体安全网 |
 | `chunk_timeout_secs` | 流式 chunk 间最大空闲时间（秒），省略则无限等待 |
 | `ttfb_timeout_secs` | 流式请求等待上游响应头（首字节）的最大时间（秒），默认 60。收到响应头后停止计时，不约束后续 body 流 |
 | `enabled` | 是否启用，默认 `true` |
 | `enabled_models` | 模型白名单，空列表 = 全部允许 |
-| `headers` | 附加到上游请求的自定义 HTTP 头 |
+| `headers` | 附加到上游请求的自定义 HTTP 头（provider 级为缺省；`apis.<key>.headers` 声明时整段替换） |
 | `body_overrides` | 合并到上游请求体的字段覆盖，对该供应商**所有模型**生效。优先级低于 `model_overrides` 和路由 target 的 `extra` |
 | `strip_fields` | 在三层 body override **之后**硬性移除的顶层字段（最终净化），空列表 no-op |
 | `model_strip_fields` | 逐模型的字段剥离表，以 `real_model` 为 key。与 `strip_fields` 取并集后在 override 之后统一剥离 |
 | `model_overrides` | 逐模型 body 字段覆盖，以 `real_model` 为 key。优先级高于 `body_overrides`，低于路由 target 的 `extra`。推荐用于避免在多个路由中重复配置同一模型的参数 |
 | `role_mappings` | 角色名映射表（如 `{ "developer" = "system" }`） |
-| `anthropic_cache_control` | 是否向 Anthropic 请求注入 `cache_control` 断点，默认 `true`（仅对 `provider_type = "anthropic"` 有效，详见下文） |
-| `upstream_protocol` | 可选的上游协议声明。省略时由 `provider_type` 推导（openai→`chat_completions`，anthropic→`anthropic_messages`）；Native 模式需显式声明且等于 ingress 协议 |
+| `anthropic_cache_control` | 是否向 Anthropic Messages 请求注入 `cache_control` 断点，默认 `true`。仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖），详见下文 |
 
 ## 内置供应商
 
@@ -36,9 +35,9 @@
 
 - **聊天**：`POST /v1/chat/completions`
 - **流式**：SSE 流式透传
-- **图像**：`POST /v1/images/generations`
-- **模型列表**：管理面板默认请求 `models`，可通过 provider 的 `models_endpoint` 配置覆盖路径。
-- **Responses 原生协议**：支持 OpenAI Responses 原生路径（`responses_native` / `responses_stream_native`），需通过 `upstream_protocol` 显式声明。
+- **图像**：`POST /v1/images/generations`（route 需 `pipeline = "image"` + `api_endpoint`）
+- **模型列表**：管理面板默认请求 `models`，可通过 `apis.<key>.models_endpoint` 配置覆盖路径。
+- **Responses 原生协议**：支持 OpenAI Responses 原生路径（`responses_native` / `responses_stream_native`）。在 `apis` 中声明 `responses` 节即可——`/v1/responses` 入口命中该协议 key 时自动走 Native 车道。
 
 ### Anthropic
 
@@ -68,11 +67,10 @@
 
 当 `anthropic_cache_control = true`（默认启用）时，SAG 自动在 Anthropic 请求的 system prompt、tools 和对话历史中注入 `cache_control: {"type": "ephemeral"}` 断点。这可以显著降低具有稳定前缀的重复请求的 API 成本——上游会缓存 system prompt 和 conversation history，后续请求只需为增量内容付费。
 
-此功能仅对 `provider_type = "anthropic"` 的供应商有效，其他供应商类型会忽略该字段。可在 provider 配置中显式设为 `false` 关闭：
+此功能仅在实际使用协议为 `anthropic_messages` 时生效（其他协议的请求会忽略该字段）。可在 provider 配置中显式设为 `false` 关闭：
 
 ```toml
 [providers.anthropic]
-provider_type = "anthropic"
 anthropic_cache_control = false   # 关闭缓存控制
 ```
 
@@ -183,11 +181,13 @@ pub trait LlmProvider: Send + Sync {
         timeout_secs: u64,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
 
-    // 默认实现返回 BadRequest，支持图像生成的供应商可覆盖
+    // 默认实现返回 BadRequest，支持图像生成的供应商可覆盖。
+    // api_endpoint 为 route 声明的真实上游路径（拼接到 apis.image base_url）
     async fn chat_image(
         &self,
         _request: &ImageGenerationRequest,
         _real_model: &str,
+        _api_endpoint: &str,
         _target_extra: &HashMap<String, serde_json::Value>,
         _timeout_secs: u64,
     ) -> sag_core::Result<ImageGenerationResponse> { /* ... */ }

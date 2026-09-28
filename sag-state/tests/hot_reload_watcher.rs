@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use sag_config::{ConfigHandle, KeyStrategy, ProviderConfig, ProviderType};
+use sag_config::{ConfigHandle, KeyStrategy, ProviderConfig};
 use sag_providers::LlmProvider;
 use sag_state::ConfigMutationCoordinator;
 use tokio::sync::RwLock;
@@ -44,25 +44,20 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
 
 fn base_provider() -> ProviderConfig {
     ProviderConfig {
-        provider_type: ProviderType::OpenAI,
         api_keys: vec!["sk-test".into()],
         key_strategy: KeyStrategy::FillFirst,
-        base_url: "https://api.openai.com/v1".into(),
         proxy_mode: sag_config::ProxyMode::default(),
-        models_endpoint: "models".into(),
         timeout_secs: 600,
-        chunk_timeout_secs: None,
-        ttfb_timeout_secs: None,
-        headers: HashMap::new(),
-        body_overrides: HashMap::new(),
-        strip_fields: vec![],
-        model_strip_fields: HashMap::new(),
-        model_overrides: HashMap::new(),
-        role_mappings: HashMap::new(),
-        enabled: true,
-        enabled_models: vec![],
         anthropic_cache_control: false,
-        upstream_protocol: None,
+        apis: std::iter::once((
+            sag_core::ApiKind::ChatCompletions,
+            sag_config::ApiConfig {
+                base_url: "https://api.openai.com/v1".into(),
+                ..Default::default()
+            },
+        ))
+        .collect(),
+        ..Default::default()
     }
 }
 
@@ -74,8 +69,10 @@ fn initial_toml() -> &'static str {
         port = 37210
 
         [providers.p1]
-        provider_type = "openai"
         api_keys = ["sk-test"]
+
+        [providers.p1.apis.chat_completions]
+        base_url = "https://api.openai.com/v1"
     "#
 }
 
@@ -89,9 +86,11 @@ fn toml_with_enabled_models(models: &[&str]) -> String {
         port = 37210
 
         [providers.p1]
-        provider_type = "openai"
         api_keys = ["sk-test"]
         enabled_models = [{}]
+
+        [providers.p1.apis.chat_completions]
+        base_url = "https://api.openai.com/v1"
     "#,
         quoted.join(", ")
     )

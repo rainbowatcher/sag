@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use sag_core::{
-    AppError, ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest,
+    ApiKind, AppError, ChatCompletionRequest, ChatCompletionResponse, ImageGenerationRequest,
     ImageGenerationResponse, StreamChunk,
 };
 use tokio::sync::mpsc;
@@ -15,8 +16,10 @@ use crate::{LlmProvider, ProviderBase, drain_sse_frames, emit_idle_timeout};
 /// OpenAI-compatible provider adapter.
 ///
 /// Uses the OpenAI Chat Completions API (and any drop-in compatible endpoints).
+/// URLs resolve from `ProviderConfig::apis` per protocol key
+/// (`chat_completions` / `responses` / `image`).
 pub struct OpenAiProvider {
-    base: ProviderBase,
+    base: Arc<ProviderBase>,
 }
 
 impl OpenAiProvider {
@@ -38,16 +41,14 @@ impl OpenAiProvider {
         config: &sag_config::ProviderConfig,
         proxy: Option<&sag_config::ProxyConfig>,
     ) -> sag_core::Result<Self> {
-        Ok(Self {
-            base: ProviderBase::new_with_proxy(name, config, proxy)?,
-        })
+        Ok(Self::from_base(Arc::new(ProviderBase::new_with_proxy(
+            name, config, proxy,
+        )?)))
     }
 
-    fn auth_header(&self) -> (&str, String) {
-        (
-            "Authorization",
-            format!("Bearer {}", self.base.current_key()),
-        )
+    /// Wrap an existing (possibly shared) provider base.
+    pub(crate) fn from_base(base: Arc<ProviderBase>) -> Self {
+        Self { base }
     }
 }
 
@@ -62,13 +63,13 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
-        api_endpoint: &str,
+        _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
         timeout_secs: u64,
     ) -> sag_core::Result<ChatCompletionResponse> {
         let mut upstream_request = request.clone();
         self.base
-            .apply_role_mappings(&mut upstream_request.messages);
+            .apply_role_mappings(ApiKind::ChatCompletions, &mut upstream_request.messages);
         upstream_request.model = real_model.to_string();
 
         if !request.extra.is_empty() {
@@ -76,19 +77,22 @@ impl LlmProvider for OpenAiProvider {
             trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
-        let url = self.base.build_url(api_endpoint);
+        // URL derives from apis.chat_completions.base_url + fixed protocol path.
+        let url = self.base.protocol_url(ApiKind::ChatCompletions)?;
+        let timeout = self
+            .base
+            .effective_timeout(ApiKind::ChatCompletions, timeout_secs);
 
         let body = serde_json::to_value(&upstream_request)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
-        let (auth_name, auth_value) = self.auth_header();
         let body_text = self
             .base
             .send_json(
                 &url,
+                ApiKind::ChatCompletions,
                 body,
                 target_extra,
-                &[(auth_name, &auth_value)],
-                Some(timeout_secs),
+                Some(timeout),
             )
             .await?;
 
@@ -161,13 +165,13 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: &ChatCompletionRequest,
         real_model: &str,
-        api_endpoint: &str,
+        _api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
         _timeout_secs: u64,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let mut upstream_request = request.clone();
         self.base
-            .apply_role_mappings(&mut upstream_request.messages);
+            .apply_role_mappings(ApiKind::ChatCompletions, &mut upstream_request.messages);
         upstream_request.model = real_model.to_string();
         upstream_request.stream = Some(true);
         // Force include_usage: SAG needs usage for CallLog stats; a client's
@@ -181,21 +185,20 @@ impl LlmProvider for OpenAiProvider {
             trace!(extra = ?keys, "forwarding non-standard extra parameters");
         }
 
-        let url = self.base.build_url(api_endpoint);
+        let url = self.base.protocol_url(ApiKind::ChatCompletions)?;
 
         let body = serde_json::to_value(&upstream_request)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
-        let (auth_name, auth_value) = self.auth_header();
         let response = self
             .base
-            .send_json_stream(&url, body, target_extra, &[(auth_name, &auth_value)])
+            .send_json_stream(&url, ApiKind::ChatCompletions, body, target_extra)
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
         let chunk_timeout = self
             .base
-            .chunk_timeout_secs()
+            .chunk_timeout_secs(ApiKind::ChatCompletions)
             .map(std::time::Duration::from_secs);
 
         tokio::spawn(async move {
@@ -270,27 +273,24 @@ impl LlmProvider for OpenAiProvider {
         &self,
         request: &ImageGenerationRequest,
         real_model: &str,
+        api_endpoint: &str,
         target_extra: &HashMap<String, serde_json::Value>,
         timeout_secs: u64,
     ) -> sag_core::Result<ImageGenerationResponse> {
         let mut upstream = request.clone();
         upstream.model = real_model.to_string();
 
-        let url = self.base.build_url("/images/generations");
+        // Route-declared path appended to apis.image (fallback:
+        // apis.chat_completions) base_url.
+        let url = self.base.image_url(api_endpoint)?;
+        let timeout = self.base.effective_timeout(ApiKind::Image, timeout_secs);
 
         let body = serde_json::to_value(&upstream)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
 
-        let (auth_name, auth_value) = self.auth_header();
         let body_text = self
             .base
-            .send_json(
-                &url,
-                body,
-                target_extra,
-                &[(auth_name, &auth_value)],
-                Some(timeout_secs),
-            )
+            .send_json(&url, ApiKind::Image, body, target_extra, Some(timeout))
             .await?;
 
         serde_json::from_str(&body_text).map_err(|e| {
@@ -321,8 +321,12 @@ impl LlmProvider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// Native Responses call (M6): send a Responses-shaped body to
-    /// `api_endpoint` (default `/responses`) and return the raw JSON.
+    /// Native Responses call (M6): send a Responses-shaped body to the
+    /// `responses` API node and return the raw JSON.
+    ///
+    /// The URL derives from `apis.responses.base_url` + the fixed
+    /// `responses` protocol path; `api_endpoint` is retained for
+    /// signature compatibility but no longer selects the path.
     ///
     /// Never translates through Chat — the body is the caller's
     /// Responses-shaped payload after the three-tier override chain.
@@ -330,37 +334,28 @@ impl OpenAiProvider {
         &self,
         mut body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
-        api_endpoint: &str,
+        _api_endpoint: &str,
         timeout_secs: u64,
     ) -> sag_core::Result<serde_json::Value> {
-        let path = if api_endpoint.trim().is_empty() {
-            "/responses"
-        } else {
-            api_endpoint
-        };
         // role_mappings on input messages (best-effort, native shape).
-        if self.base.has_role_mappings()
+        if self.base.has_role_mappings(ApiKind::Responses)
             && let Some(items) = body.get_mut("input").and_then(|v| v.as_array_mut())
         {
             for item in items.iter_mut() {
                 if let Some(role) = item.get("role").and_then(|r| r.as_str()).map(String::from)
-                    && let Some(mapped) = self.base.role_mapping_for(&role)
+                    && let Some(mapped) = self.base.role_mapping_for(ApiKind::Responses, &role)
                 {
                     item["role"] = serde_json::json!(mapped);
                 }
             }
         }
-        let url = self.base.build_url(path);
-        let (auth_name, auth_value) = self.auth_header();
+        let url = self.base.protocol_url(ApiKind::Responses)?;
+        let timeout = self
+            .base
+            .effective_timeout(ApiKind::Responses, timeout_secs);
         let body_text = self
             .base
-            .send_json(
-                &url,
-                body,
-                target_extra,
-                &[(auth_name, &auth_value)],
-                Some(timeout_secs),
-            )
+            .send_json(&url, ApiKind::Responses, body, target_extra, Some(timeout))
             .await?;
 
         // 200-delivered error object (same convention as chat()).
@@ -393,25 +388,19 @@ impl OpenAiProvider {
         &self,
         mut body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
-        api_endpoint: &str,
+        _api_endpoint: &str,
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
-        let path = if api_endpoint.trim().is_empty() {
-            "/responses"
-        } else {
-            api_endpoint
-        };
         body["stream"] = serde_json::json!(true);
-        let url = self.base.build_url(path);
-        let (auth_name, auth_value) = self.auth_header();
+        let url = self.base.protocol_url(ApiKind::Responses)?;
         let response = self
             .base
-            .send_json_stream(&url, body, target_extra, &[(auth_name, &auth_value)])
+            .send_json_stream(&url, ApiKind::Responses, body, target_extra)
             .await?;
 
         let (tx, rx) = mpsc::unbounded_channel::<StreamChunk>();
         let chunk_timeout = self
             .base
-            .chunk_timeout_secs()
+            .chunk_timeout_secs(ApiKind::Responses)
             .map(std::time::Duration::from_secs);
 
         tokio::spawn(async move {
