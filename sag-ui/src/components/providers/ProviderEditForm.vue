@@ -135,6 +135,9 @@ const bodyOverridesList = ref<{ key: string; value: string }[]>(
   })),
 )
 const stripFieldsList = ref<string[]>([...(props.provider.strip_fields ?? [])])
+const roleMappingsList = ref<{ key: string; value: string }[]>(
+  Object.entries(props.provider.role_mappings ?? {}).map(([k, v]) => ({ key: k, value: v })),
+)
 
 // ── Per-model body overrides ────────────────────────────────
 const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>(
@@ -152,6 +155,14 @@ const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>(
 function headersMap(): Record<string, string> {
   const m: Record<string, string> = {}
   for (const { key, value } of headersList.value) {
+    if (key.trim() && value.trim()) m[key.trim()] = value.trim()
+  }
+  return m
+}
+
+function roleMappingsMap(): Record<string, string> {
+  const m: Record<string, string> = {}
+  for (const { key, value } of roleMappingsList.value) {
     if (key.trim() && value.trim()) m[key.trim()] = value.trim()
   }
   return m
@@ -203,6 +214,11 @@ async function handleSubmit() {
     const parsedHeaders = headersMap()
     if (JSON.stringify(parsedHeaders) !== JSON.stringify(props.provider.headers ?? {})) {
       payload.headers = parsedHeaders
+    }
+
+    const parsedRoleMappings = roleMappingsMap()
+    if (JSON.stringify(parsedRoleMappings) !== JSON.stringify(props.provider.role_mappings ?? {})) {
+      payload.role_mappings = parsedRoleMappings
     }
 
     const parsedBodyOverrides: Record<string, any> = {}
@@ -474,6 +490,16 @@ async function handleSubmit() {
                 Add Field
               </Button>
             </div>
+
+            <Separator />
+
+            <KvEditor
+              v-model="roleMappingsList"
+              title="Role Mappings"
+              description="Map request role names to role names supported by the upstream (case-sensitive). Example: developer → system."
+              key-placeholder="developer"
+              value-placeholder="system"
+            />
           </TabsContent>
         </Tabs>
       </div>

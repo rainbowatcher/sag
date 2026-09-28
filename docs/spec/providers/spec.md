@@ -117,6 +117,14 @@ RoundRobin 计数器通过 `DispatchRuntime` 中的 `Arc<AtomicUsize>` 维护，
 
 **Trade-off**: 这个顺序允许 provider 设置默认参数，target 可以覆盖特定目标。但也意味着 target 无法"恢复"被 provider overrides 覆盖的客户端字段；若字段被 strip 列出，则无论哪层 override 写入都会被移除。
 
+### Provider 表单 role_mappings 编辑入口
+
+Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）在 Advanced tab 通过 `KvEditor` 暴露 `role_mappings`（`Record<string, string>`）编辑入口。管理 API 的 PUT 对缺省字段采用「保留旧值」语义，故编辑表单不能无条件发送解析结果：保存时对解析出的映射与服务端 `provider.role_mappings` 做 `JSON.stringify` 脏检查，仅在变化时携带该字段——未变化不发送（保留旧值），主动清空发送 `{}`（清空映射）。新增表单无旧值，仅当映射非空时放入 POST payload。
+
+**Trade-off**:
+- ✅ 同时满足「未触碰不覆盖」与「主动清空」两种用户意图
+- ❌ 以字符串比较判断语义变化，等价但键序不同的映射会被视为脏（编辑器内键序稳定，影响可忽略）
+
 ### Anthropic reasoning_effort → thinking 翻译
 
 客户端 `reasoning_effort` 经 7 档映射表 + 递归降级算法翻译为 Anthropic `thinking.budget_tokens`。
@@ -160,5 +168,6 @@ RoundRobin 计数器通过 `DispatchRuntime` 中的 `Arc<AtomicUsize>` 维护，
 - `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
 
 ## 变更记录
+- [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)

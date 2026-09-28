@@ -40,6 +40,7 @@ updated: 2026-06-03
 - 例如 `{ "developer" = "system" }` 将 developer 消息转为 system 消息
 - 大小写敏感
 - 空映射时零开销（不额外遍历）
+- 可在管理面板 Provider 新增/编辑表单的 Advanced tab 中通过 Role Mappings 键值编辑器维护（无需手工编辑配置文件）
 
 > **Anthropic 边界情况**：Anthropic 仅接受单条 system prompt。如果映射后产生多条 system 消息，只有第一条生效，其余被丢弃。
 
@@ -126,5 +127,6 @@ updated: 2026-06-03
 
 ## 变更记录
 
+- [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)

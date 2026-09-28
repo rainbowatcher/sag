@@ -30,6 +30,8 @@ export interface Provider {
   models_endpoint: string
   timeout_secs: number
   headers: Record<string, string>
+  /** Role mapping table: maps request roles to upstream-supported roles (e.g. developer -> system). */
+  role_mappings: Record<string, string>
   body_overrides: Record<string, any>
   strip_fields: string[]
   model_overrides: Record<string, Record<string, any>>

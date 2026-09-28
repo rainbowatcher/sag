@@ -132,6 +132,7 @@ export const useProviderStore = defineStore("providers", () => {
     max_retries?: number
     timeout_secs?: number
     headers?: Record<string, string>
+    role_mappings?: Record<string, string>
     body_overrides?: Record<string, unknown>
     model_overrides?: Record<string, Record<string, unknown>>
     strip_fields?: string[]
@@ -179,6 +180,7 @@ export const useProviderStore = defineStore("providers", () => {
       max_retries?: number
       timeout_secs?: number
       headers?: Record<string, string>
+      role_mappings?: Record<string, string>
       body_overrides?: Record<string, unknown>
       model_overrides?: Record<string, Record<string, unknown>>
       strip_fields?: string[]

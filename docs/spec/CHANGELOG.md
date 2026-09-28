@@ -7,6 +7,10 @@ updated: 2026-09-15
 
 按时间倒序列出所有模块的变更记录。
 
+## 2026-09-28
+
+- **供应商**：[0004 供应商 role_mappings 编辑入口](providers/changes/0004-role-mappings-editor.md) — Provider 新增/编辑表单 Advanced tab 新增 Role Mappings 键值编辑区；编辑表单以 `JSON.stringify` 脏检查实现 PUT「缺省字段保留旧值 / 传 `{}` 清空」语义，新增表单仅在非空时携带该字段
+
 ## 2026-09-17
 
 - **架构**：[0002 版本升级提交按实际变更文件过滤](architecture/changes/0002-version-bump-commit-files.md) — 版本升级脚本参考 `bumpp` 的 `updatedFiles` 语义，仅提交实际变更且已被 Git 跟踪的文件，避免被忽略的 `Cargo.lock` 触发无效 pathspec

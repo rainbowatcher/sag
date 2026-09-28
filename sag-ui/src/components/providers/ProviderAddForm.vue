@@ -60,6 +60,16 @@ function parsedHeadersValue(): Record<string, string> {
   )
 }
 
+function roleMappingsMap(): Record<string, string> {
+  return roleMappingsList.value.reduce(
+    (acc, m) => {
+      if (m.key.trim() && m.value.trim()) acc[m.key.trim()] = m.value.trim()
+      return acc
+    },
+    {} as Record<string, string>,
+  )
+}
+
 function onFetchModels(endpoint: string) {
   store.fetchUpstreamModels({
     base_url: form.state.values.base_url,
@@ -99,6 +109,7 @@ const providerEffectiveProtocol = computed(
 
 // ── KV pairs ─────────────────────────────────────────────────
 const headers = ref<{ key: string; value: string }[]>([])
+const roleMappingsList = ref<{ key: string; value: string }[]>([])
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
 const stripFields = ref<string[]>([])
 
@@ -140,6 +151,7 @@ const form = useForm({
     }
 
     const parsedHeaders = parsedHeadersValue()
+    const parsedRoleMappings = roleMappingsMap()
 
     const parsedOverrides = bodyOverrides.value.reduce(
       (acc, h) => {
@@ -189,6 +201,7 @@ const form = useForm({
         key_strategy: keyStrategy.value,
         enabled_models: enabledModels.value,
         headers: Object.keys(parsedHeaders).length > 0 ? parsedHeaders : undefined,
+        role_mappings: Object.keys(parsedRoleMappings).length > 0 ? parsedRoleMappings : undefined,
         body_overrides: Object.keys(parsedOverrides).length > 0 ? parsedOverrides : undefined,
         model_overrides:
           Object.keys(parsedModelOverrides).length > 0 ? parsedModelOverrides : undefined,
@@ -442,6 +455,16 @@ async function handleSubmit(event: Event) {
               </div>
               <Button variant="outline" size="sm" @click="stripFields.push('')"> Add Field </Button>
             </div>
+
+            <Separator />
+
+            <KvEditor
+              v-model="roleMappingsList"
+              title="Role Mappings"
+              description="Maps request role names to roles the upstream supports (case-sensitive). Example: developer → system."
+              key-placeholder="developer"
+              value-placeholder="system"
+            />
           </TabsContent>
         </Tabs>
       </form>
