@@ -1,6 +1,6 @@
 [package]
 name = "sag-analytics"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Usage analytics and call logging for SAG"
 
