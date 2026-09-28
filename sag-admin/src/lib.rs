@@ -8,8 +8,8 @@
 //! - [`admin_routes`] — `GET|POST|PUT|DELETE /api/routes`.
 //! - [`admin_logs`] — `GET /api/logs`.
 //! - [`admin_settings`] — `GET|PUT /api/settings`.
-//! - [`admin_testing`] — `POST /api/providers/fetch-models` and
-//!   `POST /api/model/test`.
+//! - [`admin_testing`] — `POST /api/providers/fetch-models`,
+//!   `POST /api/providers/probe-protocols` and `POST /api/model/test`.
 //! - [`admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`.
 //! - [`admin_active_targets`] — `GET|DELETE /api/sticky-targets`.

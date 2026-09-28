@@ -345,7 +345,14 @@ async function handleSubmit(event: Event) {
 
           <!-- ─── Tab: APIs ───────────────────────────────────── -->
           <TabsContent value="apis" class="space-y-4">
-            <ApisEditor ref="apisEditor" v-model="apis" v-model:fallback="fallback" />
+            <ApisEditor
+              ref="apisEditor"
+              v-model="apis"
+              v-model:fallback="fallback"
+              :api-keys="apiKeys"
+              :proxy-mode="proxyMode"
+              :provider-headers="parsedHeadersValue()"
+            />
           </TabsContent>
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->

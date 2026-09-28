@@ -6,6 +6,8 @@ import type {
   AddProviderPayload,
   ApiKind,
   ModelTestResult,
+  ProbeProtocolsPayload,
+  ProbeResult,
   ProxyMode,
   Provider,
   UpdateProviderPayload,
@@ -48,6 +50,9 @@ export const useProviderStore = defineStore("providers", () => {
 
   const allProviderModels = ref<string[]>([])
   const allProviderModelsLoading = ref(false)
+
+  const probeLoading = ref(false)
+  const probeError = ref("")
 
   const testModelState = createPerItemState<ModelTestResult[], string>()
 
@@ -133,6 +138,29 @@ export const useProviderStore = defineStore("providers", () => {
     })
   }
 
+  /**
+   * Probe which protocols each (base_url × key) actually serves. Read-only:
+   * results are returned for form backfill; gateway.toml is never written —
+   * persistence goes through the normal provider save path.
+   */
+  async function probeProtocols(payload: ProbeProtocolsPayload): Promise<ProbeResult[]> {
+    probeLoading.value = true
+    probeError.value = ""
+    try {
+      const { data } = await api.post<{ results: ProbeResult[] }>(
+        "/api/providers/probe-protocols",
+        payload,
+      )
+      return data.results
+    } catch (e: any) {
+      if (e.response?.status === 401) useConnectionStore().handle401()
+      probeError.value = getErrorMessage(e, String(e))
+      return []
+    } finally {
+      probeLoading.value = false
+    }
+  }
+
   async function addProvider(payload: AddProviderPayload) {
     try {
       await api.post("/api/providers", payload)
@@ -191,5 +219,8 @@ export const useProviderStore = defineStore("providers", () => {
     updateProvider,
     testModelState,
     testModelWithState,
+    probeLoading,
+    probeError,
+    probeProtocols,
   }
 })

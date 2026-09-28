@@ -148,6 +148,53 @@ export interface ModelTestResult {
   message: string
 }
 
+/**
+ * Verdict of one protocol probe attempt (`POST /api/providers/probe-protocols`).
+ * - `supported` — 2xx, endpoint accepted the minimal request.
+ * - `auth_failed` — 401/403: the path exists but auth was rejected (not "unsupported").
+ * - `uncertain` — 404 (model_not_found vs unknown route, see message) or other odd statuses.
+ * - `unsupported` — 405: the path does not serve this protocol.
+ * - `partial` — other 4xx: the path exists, the schema/params were rejected.
+ * - `error` — transport failure (connect/timeout), no HTTP verdict.
+ */
+export type ProbeVerdict =
+  | "supported"
+  | "auth_failed"
+  | "uncertain"
+  | "unsupported"
+  | "partial"
+  | "error"
+
+/** One probe target: a protocol plus the base_url to test it against. */
+export interface ProbeTarget {
+  protocol: ProtocolApiKind
+  base_url: string
+  /** Extra headers for this target (simulate `apis.<protocol>.headers`). */
+  headers?: Record<string, string>
+}
+
+/** Payload of `POST /api/providers/probe-protocols` (read-only, never persisted). */
+export interface ProbeProtocolsPayload {
+  api_keys: string[]
+  model: string
+  /** Fixed set of the three probeable protocols (image is rejected with 400). */
+  targets: ProbeTarget[]
+  /** Extra headers applied to every target. */
+  headers?: Record<string, string>
+  proxy_mode?: ProxyMode
+}
+
+/** One row of the probe support matrix returned by the probe endpoint. */
+export interface ProbeResult {
+  protocol: ProtocolApiKind
+  url: string
+  key_prefix: string
+  /** HTTP status; `null` on transport failure. */
+  status: number | null
+  message: string
+  verdict: ProbeVerdict
+}
+
 export interface RouteTarget {
   provider: string
   real_model: string | null

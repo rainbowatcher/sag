@@ -5,8 +5,8 @@
 //! - [`crate::admin_providers`] — `GET|POST|PUT|DELETE /api/providers` and
 //!   `GET /api/providers/{name}/models`
 //! - [`crate::admin_routes`] — `GET|POST|PUT|DELETE /api/routes`
-//! - [`crate::admin_testing`] — `POST /api/providers/fetch-models` and
-//!   `POST /api/model/test`
+//! - [`crate::admin_testing`] — `POST /api/providers/fetch-models`,
+//!   `POST /api/providers/probe-protocols` and `POST /api/model/test`
 //! - [`crate::admin_settings`] — `GET|PUT /api/settings`.
 //! - [`crate::admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`
@@ -25,7 +25,7 @@ use crate::admin_providers::{
 };
 use crate::admin_routes::{create_route, delete_route, list_routes, update_route};
 use crate::admin_settings::{get_settings, update_settings};
-use crate::admin_testing::{fetch_models, model_test};
+use crate::admin_testing::{fetch_models, model_test, probe_protocols};
 use sag_state::AppState;
 
 /// Build admin routes under `/api/*` (all auth-protected by the parent).
@@ -40,6 +40,7 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
         )
         .route("/providers/{name}/models", get(list_provider_models))
         .route("/providers/fetch-models", post(fetch_models))
+        .route("/providers/probe-protocols", post(probe_protocols))
         .route("/model/test", post(model_test))
         .route(
             "/routes",

@@ -2,6 +2,7 @@
 import { ChevronDown, ChevronRight, Plus, X } from "@lucide/vue"
 import { computed, ref } from "vue"
 import KvEditor from "@/components/KvEditor.vue"
+import ProtocolProbePanel from "@/components/providers/ProtocolProbePanel.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
@@ -14,7 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
-import type { ApiConfig, ApiKind } from "@/types/api"
+import type { ApiConfig, ApiKind, ProtocolApiKind, ProxyMode } from "@/types/api"
 
 interface KvPair {
   key: string
@@ -43,6 +44,12 @@ interface SectionDraft {
 const props = defineProps<{
   modelValue: Partial<Record<ApiKind, ApiConfig>>
   fallback: ApiKind | null
+  /** Provider API keys — used by the protocol probe only. */
+  apiKeys?: string[]
+  /** Provider proxy mode — forwarded to the protocol probe. */
+  proxyMode?: ProxyMode
+  /** Provider-level default headers — applied to every probe target. */
+  providerHeaders?: Record<string, string>
 }>()
 
 const emit = defineEmits<{
@@ -233,6 +240,47 @@ const availableKinds = computed(() =>
 const protocolKeys = computed(() =>
   sections.value.map((d) => d.kind).filter((k) => PROTOCOL_KINDS.has(k)),
 )
+
+/** Declared protocol sections' base_url — prefill source for the probe panel. */
+const filledBaseUrls = computed<Partial<Record<ProtocolApiKind, string>>>(() => {
+  const out: Partial<Record<ProtocolApiKind, string>> = {}
+  for (const d of sections.value) {
+    if (PROTOCOL_KINDS.has(d.kind) && d.base_url.trim()) {
+      out[d.kind as ProtocolApiKind] = d.base_url.trim()
+    }
+  }
+  return out
+})
+
+/** Declared protocol sections' headers — sent per probe target. */
+const sectionHeaders = computed<Partial<Record<ProtocolApiKind, Record<string, string>>>>(() => {
+  const out: Partial<Record<ProtocolApiKind, Record<string, string>>> = {}
+  for (const d of sections.value) {
+    if (PROTOCOL_KINDS.has(d.kind)) {
+      out[d.kind as ProtocolApiKind] = kvToObject(d.headers)
+    }
+  }
+  return out
+})
+
+/**
+ * One-click backfill from the probe matrix: write each probed base_url into
+ * its API section (creating the section when missing). Purely a form edit —
+ * persistence still goes through the parent form's normal save path.
+ */
+function onProbeBackfill(items: { protocol: ProtocolApiKind; base_url: string }[]) {
+  for (const { protocol, base_url } of items) {
+    const existing = sections.value.find((d) => d.kind === protocol)
+    if (existing) {
+      if (existing.base_url.trim() !== base_url) {
+        updateSection(existing.uid, { base_url })
+      }
+    } else {
+      sections.value.push(draftFrom(protocol, { base_url }))
+    }
+  }
+  emitAll()
+}
 
 const newKind = ref<ApiKind | "">("")
 
@@ -544,6 +592,17 @@ defineExpose({ validate })
         At least one API section is required.
       </p>
     </div>
+
+    <!-- ── Protocol probe ─────────────────────────────────────── -->
+    <Separator />
+    <ProtocolProbePanel
+      :filled-base-urls="filledBaseUrls"
+      :section-headers="sectionHeaders"
+      :api-keys="apiKeys ?? []"
+      :proxy-mode="proxyMode ?? 'inherit'"
+      :headers="providerHeaders ?? {}"
+      @backfill="onProbeBackfill"
+    />
 
     <!-- Fallback -->
     <div class="space-y-1">
