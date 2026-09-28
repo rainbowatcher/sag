@@ -30,11 +30,14 @@ Content-Type: application/json
 
 {
   "name": "my-provider",
-  "provider_type": "openai",
   "api_keys": ["..."],
   "key_strategy": "fill_first",
-  "base_url": "https://api.openai.com/v1",
-  "models_endpoint": "models",
+  "apis": {
+    "chat_completions": {
+      "base_url": "https://api.openai.com/v1",
+      "models_endpoint": "models"
+    }
+  },
   "timeout_secs": 600,
   "chunk_timeout_secs": null,
   "ttfb_timeout_secs": null,
@@ -52,12 +55,11 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `name` | string | 是 | — | 供应商唯一名称 |
-| `provider_type` | string | 否 | `"openai"` | 供应商适配器类型：`"openai"` / `"anthropic"` |
+| `apis` | object | 是 | — | 协议 API 目录（至少一个条目，且至少含一个协议 key）。key ∈ `chat_completions` / `responses` / `anthropic_messages` / `image`。每节携带自己的 `base_url`（必填，地址唯一来源）与可选 `models_endpoint`（默认 `models`，相对本节 `base_url`，传入 `/v1/models/` 会被规范化为 `v1/models`），还可声明 `headers` / `body_overrides` / `strip_fields` / `model_overrides` / `role_mappings` / `anthropic_cache_control` / `timeout_secs` / `chunk_timeout_secs` / `ttfb_timeout_secs`，声明时整段覆盖 provider 级同名缺省 |
+| `fallback` | string | 条件 | — | 降级协议（translated 路径的编码目标），值必须 ∈ `apis` 的协议 key 集（`image` 非法）。`apis` 恰好一个协议 key 时省略（自动取之）；声明多个协议 key 时必填 |
 | `api_keys` | array | 否 | `[]` | API 密钥列表 |
 | `key_strategy` | string | 否 | `"fill_first"` | 多密钥选择策略：`"fill_first"` / `"round_robin"` |
-| `base_url` | string | 否 | `"https://api.openai.com/v1"` | 供应商 API 基础 URL |
-| `models_endpoint` | string | 否 | `"models"` | 模型列表端点路径，传入 `/v1/models/` 会被规范化为 `v1/models` |
-| `timeout_secs` | integer | 否 | `600` | 上游请求超时（秒），仅约束非流式请求 |
+| `timeout_secs` | integer | 否 | `600` | 上游请求超时（秒），仅约束非流式请求；`apis.<key>.timeout_secs` 可整段覆盖 |
 | `chunk_timeout_secs` | integer \| null | 否 | `null` | 流式 chunk 间最大空闲时间（秒），`null` 表示无限等待 |
 | `ttfb_timeout_secs` | integer \| null | 否 | `null`（默认 60） | 流式等待上游响应头（首字节）的最大时间（秒），收到响应头后停止计时 |
 | `enabled` | boolean | 否 | `true` | 是否启用。`false` 时路由跳过且管理面板显示禁用 |
@@ -65,7 +67,7 @@ Content-Type: application/json
 | `headers` | object | 否 | `{}` | 附加自定义 HTTP 头 |
 | `body_overrides` | object | 否 | `{}` | 合并到上游请求体的字段覆盖 |
 | `role_mappings` | object | 否 | `{}` | 角色映射表，如 `{ "developer": "system" }` |
-| `anthropic_cache_control` | boolean | 否 | `true` | Anthropic 缓存控制注入，仅对 `"anthropic"` 类型有效 |
+| `anthropic_cache_control` | boolean | 否 | `true` | Anthropic 缓存控制注入，仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖） |
 
 ### 更新供应商
 
@@ -75,12 +77,18 @@ Content-Type: application/json
 
 {
   "name": "my-provider",
-  "base_url": "https://custom.com/v1",
-  "models_endpoint": "v1/models"
+  "apis": {
+    "chat_completions": {
+      "base_url": "https://custom.com/v1",
+      "models_endpoint": "v1/models"
+    }
+  }
 }
 ```
 
 只更新请求体中传入的字段，未传入的字段保持原值。支持更新所有[添加供应商](#添加供应商)中列出的字段。
+
+> `apis` 是例外的**整目录替换**：请求体中出现 `apis` 即整体替换现有目录（不按节合并），需发送完整目录。`fallback` 为三态 patch：省略保持原值，`null` 清除，给值则设置。
 
 > `priority` 不是供应商字段，不会参与路由排序。路由目标的优先级应在 `targets[].priority` 上配置。
 
@@ -125,7 +133,7 @@ Content-Type: application/json
   "model": "gpt-4o-mini",
   "api_keys": ["sk-xxx"],
   "base_url": "https://api.openai.com/v1",
-  "provider_type": "openai",
+  "api_kind": "chat_completions",
   "headers": {}
 }
 ```
@@ -137,8 +145,8 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 说明 |
 |------|------|------|------|
 | `model` | string | 是 | 要测试的模型名 |
-| `base_url` | string | 是 | 供应商 API 基础 URL |
-| `provider_type` | string | 否 | 供应商类型，`"openai"` 或 `"anthropic"`，默认 `"openai"` |
+| `base_url` | string | 是 | 临时探测地址（待测 `apis.<kind>` 节的 `base_url`，不读取已保存 provider 的地址） |
+| `api_kind` | string | 否 | 待测 API 节：`"chat_completions"`（默认）/ `"responses"` / `"anthropic_messages"`，决定认证头形状与聊天端点路径 |
 | `api_keys` | array | 是 | 要测试的 API Keys，会逐一测试每个 key |
 | `headers` | object | 否 | 附加的自定义请求头 |
 
@@ -169,7 +177,7 @@ Content-Type: application/json
 
 {
   "model_name": "gpt-4o",
-  "api_endpoint": "/chat/completions",
+  "pipeline": "chat",
   "targets": [
     {
       "provider": "openai",
@@ -186,7 +194,8 @@ Content-Type: application/json
 | 字段 | 类型 | 必需 | 说明 |
 |------|------|------|------|
 | `model_name` | string | 是 | 客户端请求的模型名，`"*"` 为兜底路由 |
-| `api_endpoint` | string | 否 | API 端点路径，默认 `"/chat/completions"` |
+| `pipeline` | string | 否 | 请求分派管线：`"chat"`（默认，chat 协议族）或 `"image"`（图像生成） |
+| `api_endpoint` | string | 否 | **仅 `pipeline = "image"` 合法**：真实上游路径（如 `/images/generations`），拼接在 `apis.image.base_url` 之后；chat 族路由携带此字段报 400 |
 | `strategy` | string | 否 | 目标选择策略（`sticky_failover` / `fill_first` / `round_robin`），默认 `sticky_failover` |
 | `targets` | array | 是 | 目标供应商列表 |
 
@@ -215,7 +224,6 @@ Content-Type: application/json
 
 {
   "model_name": "gpt-4o",
-  "api_endpoint": "/responses",
   "targets": [
     { "provider": "openai", "real_model": "gpt-4o", "priority": 5 }
   ]
