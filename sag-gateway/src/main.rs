@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use axum::serve::ListenerExt;
 use sag_config::ConfigReloadHandler;
 use sag_state::ConfigMutationCoordinator;
 use tokio::sync::RwLock;
@@ -185,6 +186,15 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
 
     // 13. Start server with graceful shutdown
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Disable Nagle's algorithm on every accepted downstream connection.
+    // `axum::serve` does not set TCP_NODELAY itself, and the default
+    // (Nagle enabled) adds avoidable latency to the small streaming
+    // SSE chunks produced by chat completions.
+    let listener = listener.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            tracing::warn!("failed to set TCP_NODELAY on incoming connection: {err:#}");
+        }
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
