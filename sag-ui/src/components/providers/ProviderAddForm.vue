@@ -296,12 +296,23 @@ async function handleSubmit(event: Event) {
             </div>
 
             <div class="col-span-2">
-              <ApiKeyEditor
-                :api-keys="apiKeys"
-                :key-strategy="keyStrategy"
-                @update:api-keys="apiKeys = $event"
-                @update:key-strategy="keyStrategy = $event"
-              />
+              <ApiKeyEditor :api-keys="apiKeys" @update:api-keys="apiKeys = $event" />
+            </div>
+
+            <div class="space-y-1">
+              <FieldLabel>Key Strategy</FieldLabel>
+              <Select
+                :model-value="keyStrategy"
+                @update:model-value="(v) => (keyStrategy = v as 'fill_first' | 'round_robin')"
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="fill_first">Fill First</SelectItem>
+                  <SelectItem value="round_robin">Round Robin</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
 
             <div class="space-y-1">

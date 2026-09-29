@@ -3,18 +3,10 @@ import { Plus, X } from "@lucide/vue"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 
 const props = withDefaults(
   defineProps<{
     apiKeys: string[]
-    keyStrategy: "fill_first" | "round_robin"
     disabled?: boolean
   }>(),
   {
@@ -24,7 +16,6 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   "update:apiKeys": [value: string[]]
-  "update:keyStrategy": [value: "fill_first" | "round_robin"]
 }>()
 
 function addApiKey() {
@@ -63,20 +54,5 @@ function updateApiKey(idx: number, value: string) {
       <Plus class="h-3.5 w-3.5" />
       Add Key
     </Button>
-
-    <FieldLabel>Key Strategy</FieldLabel>
-    <Select
-      :model-value="keyStrategy"
-      :disabled="disabled"
-      @update:model-value="(v) => emit('update:keyStrategy', v as 'fill_first' | 'round_robin')"
-    >
-      <SelectTrigger>
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent class="w-(--reka-select-trigger-width)">
-        <SelectItem value="fill_first">Fill First</SelectItem>
-        <SelectItem value="round_robin">Round Robin</SelectItem>
-      </SelectContent>
-    </Select>
   </div>
 </template>
