@@ -251,7 +251,7 @@ async function handleSubmit(event: Event) {
       {{ apiError }}
     </div>
 
-    <div class="min-h-0 flex-1 overflow-y-auto px-1 pb-4 sm:px-2">
+    <div class="min-h-0 min-w-0 flex-1 overflow-y-auto px-1 pb-4 sm:px-2">
       <form id="provider-add-form" @submit.prevent="handleSubmit">
         <Tabs default-value="basic">
           <TabsList class="mb-4">
@@ -334,7 +334,7 @@ async function handleSubmit(event: Event) {
           </TabsContent>
 
           <!-- ─── Tab: APIs ───────────────────────────────────── -->
-          <TabsContent value="apis" class="space-y-4">
+          <TabsContent value="apis" class="min-w-0 space-y-4">
             <ApisEditor
               ref="apisEditor"
               v-model="apis"

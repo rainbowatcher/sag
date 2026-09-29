@@ -96,13 +96,6 @@ watch(
   { immediate: true, deep: true },
 )
 
-function syncFromSections() {
-  for (const kind of PROTOCOL_KINDS) {
-    const v = props.filledBaseUrls[kind]?.trim()
-    if (v) targets.value[kind] = v
-  }
-}
-
 function applyBaseToAll(kind: ProtocolApiKind) {
   const v = targets.value[kind].trim()
   if (!v) return
@@ -154,21 +147,10 @@ function applyBackfill() {
   if (backfillItems.value.length === 0) return
   emit("backfill", backfillItems.value)
 }
-
-function statusText(r: ProbeResult): string {
-  return r.status === null ? "—" : String(r.status)
-}
 </script>
 
 <template>
-  <div class="space-y-3 rounded-md border p-3">
-    <div class="flex items-center justify-between gap-2">
-      <FieldLabel>Probe Protocol Support</FieldLabel>
-      <Button type="button" variant="outline" size="sm" @click="syncFromSections">
-        Use declared base URLs
-      </Button>
-    </div>
-
+  <div class="min-w-0 space-y-3 rounded-md border p-3">
     <p class="text-muted-foreground text-xs">
       Read-only probe: one minimal request per protocol × key. Nothing is saved until you backfill
       and store the provider.
@@ -235,43 +217,37 @@ function statusText(r: ProbeResult): string {
 
     <p v-if="store.probeError" class="text-destructive text-xs">{{ store.probeError }}</p>
 
-    <Alert v-if="results.length > 0" variant="default">
-      <AlertTitle>Support matrix</AlertTitle>
-      <AlertDescription>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Protocol</TableHead>
-              <TableHead>URL</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Verdict</TableHead>
-              <TableHead>Key</TableHead>
-              <TableHead>Message</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            <TableRow v-for="(r, i) in results" :key="i">
-              <TableCell class="font-mono text-xs">{{ r.protocol }}</TableCell>
-              <TableCell class="max-w-56 truncate font-mono text-xs" :title="r.url">
-                {{ r.url }}
-              </TableCell>
-              <TableCell class="font-mono text-xs">{{ statusText(r) }}</TableCell>
-              <TableCell>
-                <Badge
-                  variant="outline"
-                  class="font-mono text-xs"
-                  :class="VERDICT_CLASSES[r.verdict]"
-                >
-                  {{ VERDICT_LABELS[r.verdict] }}
-                </Badge>
-              </TableCell>
-              <TableCell class="font-mono text-xs">{{ r.key_prefix }}</TableCell>
-              <TableCell class="max-w-72 truncate text-xs" :title="r.message">
-                {{ r.message }}
-              </TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
+    <Alert v-if="results.length > 0" variant="default" class="min-w-0">
+      <AlertTitle>Probe results</AlertTitle>
+      <AlertDescription class="min-w-0">
+        <div class="w-full min-w-0 overflow-x-auto">
+          <Table class="w-max min-w-full">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Protocol</TableHead>
+                <TableHead>Verdict</TableHead>
+                <TableHead>Key</TableHead>
+                <TableHead>Message</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              <TableRow v-for="(r, i) in results" :key="i">
+                <TableCell class="font-mono text-xs">{{ r.protocol }}</TableCell>
+                <TableCell>
+                  <Badge
+                    variant="outline"
+                    class="font-mono text-xs"
+                    :class="VERDICT_CLASSES[r.verdict]"
+                  >
+                    {{ VERDICT_LABELS[r.verdict] }}
+                  </Badge>
+                </TableCell>
+                <TableCell class="font-mono text-xs">{{ r.key_prefix }}</TableCell>
+                <TableCell class="text-xs" :title="r.message">{{ r.message }}</TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+        </div>
         <p class="text-muted-foreground mt-2 text-xs">
           Backfill fills matching sections only (supported / auth failed / partial).
         </p>

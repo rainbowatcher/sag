@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import {
   Select,
   SelectContent,
@@ -15,6 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
+import { API_KIND_LABELS } from "@/lib/provider-probe"
 import type { ApiConfig, ApiKind, ProtocolApiKind, ProxyMode } from "@/types/api"
 
 interface KvPair {
@@ -51,13 +53,6 @@ const emit = defineEmits<{
   "update:modelValue": [value: Record<ApiKind, ApiConfig>]
   "update:fallback": [value: ApiKind | null]
 }>()
-
-const API_KIND_LABELS: Record<ApiKind, string> = {
-  chat_completions: "Chat Completions",
-  responses: "Responses",
-  anthropic_messages: "Anthropic Messages",
-  image: "Image",
-}
 
 const API_KIND_ORDER: ApiKind[] = ["chat_completions", "responses", "anthropic_messages", "image"]
 
@@ -118,6 +113,7 @@ const sections = ref<SectionDraft[]>(
   ),
 )
 const fallbackValue = ref<ApiKind | null>(props.fallback ?? null)
+const probeOpen = ref(false)
 
 function kvToObject(pairs: KvPair[]): Record<string, string> {
   const out: Record<string, string> = {}
@@ -276,9 +272,18 @@ function removeSection(uid: number) {
   emitAll()
 }
 
+/** Single protocol: auto-selected visual state; multi: explicit fallback choice. */
+const radioGroupValue = computed<ApiKind | undefined>(() => {
+  if (protocolKeys.value.length === 1) return protocolKeys.value[0]
+  return fallbackValue.value ?? undefined
+})
+
 function onFallbackChange(v: unknown) {
-  fallbackValue.value = (v as ApiKind) ?? null
-  emit("update:fallback", fallbackValue.value)
+  if (protocolKeys.value.length <= 1) return
+  const kind = (v as ApiKind) ?? null
+  if (!kind || !PROTOCOL_KINDS.has(kind)) return
+  fallbackValue.value = kind
+  emit("update:fallback", kind)
 }
 
 function updateSection(uid: number, patch: Partial<SectionDraft>) {
@@ -336,16 +341,44 @@ defineExpose({ validate })
 </script>
 
 <template>
-  <div class="space-y-4">
-    <div class="space-y-2">
-      <FieldLabel>API Sections *</FieldLabel>
+  <div class="min-w-0 space-y-4">
+    <div v-if="availableKinds.length > 0" class="flex items-center gap-2">
+      <Select v-model="newKind">
+        <SelectTrigger class="w-56">
+          <SelectValue placeholder="Add API section…" />
+        </SelectTrigger>
+        <SelectContent class="w-(--reka-select-trigger-width)">
+          <SelectItem v-for="kind in availableKinds" :key="kind" :value="kind">
+            {{ API_KIND_LABELS[kind] }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+      <Button type="button" variant="outline" size="sm" :disabled="!newKind" @click="addSection">
+        <Plus class="h-3.5 w-3.5" />
+        Add Section
+      </Button>
+    </div>
 
+    <RadioGroup
+      :model-value="radioGroupValue"
+      class="space-y-3"
+      @update:model-value="onFallbackChange"
+    >
       <div v-for="d in sections" :key="d.uid" class="space-y-3 rounded-md border p-3">
         <div class="flex items-center gap-2">
-          <Badge variant="outline" class="font-mono text-xs">
-            {{ API_KIND_LABELS[d.kind] }}
-          </Badge>
-          <span class="text-muted-foreground truncate font-mono text-xs">{{ d.base_url }}</span>
+          <RadioGroupItem
+            v-if="PROTOCOL_KINDS.has(d.kind)"
+            :id="`fallback-radio-${d.uid}`"
+            :value="d.kind"
+            :disabled="protocolKeys.length <= 1"
+            :aria-label="`Fallback: ${API_KIND_LABELS[d.kind]}`"
+          />
+          <div class="flex min-w-0 flex-1 items-center gap-2">
+            <Badge variant="outline" class="font-mono text-xs">
+              {{ API_KIND_LABELS[d.kind] }}
+            </Badge>
+            <span class="text-muted-foreground truncate font-mono text-xs">{{ d.base_url }}</span>
+          </div>
           <Button
             type="button"
             variant="ghost"
@@ -517,61 +550,37 @@ defineExpose({ validate })
           </div>
         </div>
       </div>
+    </RadioGroup>
 
-      <div v-if="availableKinds.length > 0" class="flex items-center gap-2">
-        <Select v-model="newKind">
-          <SelectTrigger class="w-56">
-            <SelectValue placeholder="Add API section…" />
-          </SelectTrigger>
-          <SelectContent class="w-(--reka-select-trigger-width)">
-            <SelectItem v-for="kind in availableKinds" :key="kind" :value="kind">
-              {{ API_KIND_LABELS[kind] }}
-            </SelectItem>
-          </SelectContent>
-        </Select>
-        <Button type="button" variant="outline" size="sm" :disabled="!newKind" @click="addSection">
-          <Plus class="h-3.5 w-3.5" />
-          Add Section
-        </Button>
-      </div>
-
-      <p v-if="sections.length === 0" class="text-destructive text-xs">
-        At least one API section is required.
-      </p>
-    </div>
+    <p v-if="sections.length === 0" class="text-destructive text-xs">
+      At least one API section is required.
+    </p>
+    <p v-else-if="protocolKeys.length > 1 && !fallbackValue" class="text-muted-foreground text-xs">
+      Select a fallback protocol (radio on a protocol API section).
+    </p>
 
     <Separator />
-    <ProtocolProbePanel
-      :filled-base-urls="filledBaseUrls"
-      :section-headers="sectionHeaders"
-      :api-keys="apiKeys ?? []"
-      :proxy-mode="proxyMode ?? 'inherit'"
-      :headers="providerHeaders ?? {}"
-      @backfill="onProbeBackfill"
-    />
 
-    <div class="space-y-1">
-      <FieldLabel>Fallback Protocol</FieldLabel>
-      <template v-if="protocolKeys.length === 1">
-        <p class="text-muted-foreground text-xs">
-          Auto: <code>{{ API_KIND_LABELS[protocolKeys[0]] }}</code>
-        </p>
-      </template>
-      <template v-else-if="protocolKeys.length > 1">
-        <Select :model-value="fallbackValue ?? undefined" @update:model-value="onFallbackChange">
-          <SelectTrigger class="w-56">
-            <SelectValue placeholder="Select fallback protocol *" />
-          </SelectTrigger>
-          <SelectContent class="w-(--reka-select-trigger-width)">
-            <SelectItem v-for="kind in protocolKeys" :key="kind" :value="kind">
-              {{ API_KIND_LABELS[kind] }}
-            </SelectItem>
-          </SelectContent>
-        </Select>
-      </template>
-      <template v-else>
-        <p class="text-muted-foreground text-xs">Add a protocol section first.</p>
-      </template>
+    <div class="space-y-2">
+      <Button
+        type="button"
+        variant="ghost"
+        class="w-full justify-between px-2"
+        @click="probeOpen = !probeOpen"
+      >
+        <span>Protocol Probe Support</span>
+        <ChevronDown v-if="probeOpen" class="h-3.5 w-3.5" />
+        <ChevronRight v-else class="h-3.5 w-3.5" />
+      </Button>
+      <ProtocolProbePanel
+        v-show="probeOpen"
+        :filled-base-urls="filledBaseUrls"
+        :section-headers="sectionHeaders"
+        :api-keys="apiKeys ?? []"
+        :proxy-mode="proxyMode ?? 'inherit'"
+        :headers="providerHeaders ?? {}"
+        @backfill="onProbeBackfill"
+      />
     </div>
   </div>
 </template>

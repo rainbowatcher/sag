@@ -302,7 +302,7 @@ async function handleSubmit() {
         {{ apiError }}
       </div>
 
-      <div class="flex-1 overflow-y-auto px-2 pb-4 sm:px-6">
+      <div class="min-w-0 flex-1 overflow-y-auto px-2 pb-4 sm:px-6">
         <Tabs default-value="basic">
           <TabsList class="mb-4">
             <TabsTrigger value="basic">Basic</TabsTrigger>
@@ -359,7 +359,7 @@ async function handleSubmit() {
           </TabsContent>
 
           <!-- ─── Tab: APIs ───────────────────────────────────── -->
-          <TabsContent value="apis" class="space-y-4">
+          <TabsContent value="apis" class="min-w-0 space-y-4">
             <ApisEditor
               ref="apisEditor"
               v-model="apis"
