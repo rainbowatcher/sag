@@ -439,4 +439,78 @@ mod tests {
         assert_eq!(cfg.max_ms, 5_000);
         assert!(cfg.jitter);
     }
+
+    /// Credential/token-endpoint failures (OAuth client_credentials).
+    ///
+    /// - 4xx (invalid_client / invalid_grant / …) → non-retryable and
+    ///   **not** client-caused: failover to the next target, never surface
+    ///   as a client error, never open the circuit (NonRetryable path —
+    ///   circuit open is Exhausted-only).
+    /// - 5xx / 429 / network (`status: None`) → transient → retryable
+    ///   (circuit may open after exhaustion).
+    #[test]
+    fn credential_fetch_classification_covers_retry_and_client_cause() {
+        let cf = |status: Option<u16>| AppError::CredentialFetch {
+            provider: "azure".into(),
+            status,
+            message: "token endpoint error".into(),
+        };
+
+        // 4xx → non-retryable, not client-caused (failover, not 4xx-to-client).
+        for status in [Some(400), Some(401), Some(403)] {
+            let err = cf(status);
+            assert!(
+                !is_retryable_error(&err),
+                "CredentialFetch status={status:?} must be non-retryable"
+            );
+            assert!(
+                !is_client_caused_4xx(&err),
+                "CredentialFetch status={status:?} must not be client-caused"
+            );
+        }
+
+        // 5xx / 429 / network → transient → retryable.
+        for status in [Some(500), Some(502), Some(503), Some(429), None] {
+            assert!(
+                is_retryable_error(&cf(status)),
+                "CredentialFetch status={status:?} must be retryable"
+            );
+        }
+    }
+
+    /// Circuit: NonRetryable (4xx CredentialFetch) never opens the
+    /// breaker — only Exhausted does. Assert the dispatch outcome is
+    /// NonRetryable so the circuit stays closed on this path.
+    #[tokio::test]
+    async fn credential_fetch_400_outcome_is_non_retryable_and_does_not_open_circuit() {
+        let cf = || AppError::CredentialFetch {
+            provider: "azure".into(),
+            status: Some(400),
+            message: "invalid_client".into(),
+        };
+        let mut errors = Vec::new();
+        let backoff = BackoffConfig::default();
+        let outcome: RetryOutcome<()> =
+            run_with_retries_outcome("azure", 0, &backoff, &mut errors, |_attempt| async move {
+                Err::<(), _>(cf())
+            })
+            .await;
+        match outcome {
+            RetryOutcome::NonRetryable(err) => {
+                assert!(matches!(
+                    err,
+                    AppError::CredentialFetch {
+                        status: Some(400),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("CredentialFetch 400 must be NonRetryable, got {other:?}"),
+        }
+        assert_eq!(
+            errors.len(),
+            1,
+            "no retry into the IdP for 4xx credential failures"
+        );
+    }
 }
