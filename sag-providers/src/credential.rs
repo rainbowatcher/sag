@@ -22,6 +22,11 @@ use tracing::{debug, warn};
 /// Seconds before actual expiry when a cached token is treated as stale.
 const TOKEN_EXPIRY_BUFFER: Duration = Duration::from_secs(60);
 
+/// Token-endpoint fetch budget, independent of the provider LLM timeout.
+/// The shared `http_client` has no total timeout (streaming adapters need
+/// that freedom); a hung IdP must not block the request path indefinitely.
+const TOKEN_FETCH_TIMEOUT_SECS: u64 = 10;
+
 /// A resolved upstream credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credential {
@@ -64,21 +69,31 @@ impl StaticKeys {
     }
 
     /// Select the current API key based on the configured strategy.
-    pub fn current_key(&self) -> &str {
-        match self.key_strategy {
+    /// Returns `None` when the key pool is empty (static providers must
+    /// ship ≥1 key; the request path surfaces this as [`AppError`]).
+    pub fn current_key(&self) -> Option<&str> {
+        if self.api_keys.is_empty() {
+            return None;
+        }
+        Some(match self.key_strategy {
             KeyStrategy::FillFirst => &self.api_keys[0],
             KeyStrategy::RoundRobin => {
                 let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
                 &self.api_keys[idx]
             }
-        }
+        })
     }
 }
 
 #[async_trait]
 impl CredentialProvider for StaticKeys {
     async fn get_credential(&self) -> Result<Credential> {
-        Ok(Credential::Static(self.current_key().to_string()))
+        let key = self.current_key().ok_or_else(|| {
+            AppError::Config(
+                "provider api_keys is empty (static mode requires at least one key)".into(),
+            )
+        })?;
+        Ok(Credential::Static(key.to_string()))
     }
 
     async fn invalidate(&self) {
@@ -122,8 +137,10 @@ impl OAuthClientCredentials {
     }
 
     async fn fetch_token(&self) -> Result<TokenResponse> {
-        // Prefer refresh_token grant when configured; fall back to
-        // client_credentials (RFC 6749).
+        // Grant is chosen once from config: `refresh_token` when a
+        // non-empty token is present, else `client_credentials`. A failed
+        // grant does **not** fall back to the other — it's one or the
+        // other, selected at config time (RFC 6749).
         let mut form: Vec<(&str, &str)> = Vec::new();
         if let Some(ref refresh_token) = self.config.refresh_token
             && !refresh_token.trim().is_empty()
@@ -146,10 +163,14 @@ impl OAuthClientCredentials {
             form.push(("audience", audience.as_str()));
         }
 
+        // Request-level timeout (not client-level): the shared client must
+        // stay timeout-free for streaming LLM traffic, while a hung IdP
+        // must not stall credential fetch for the full LLM budget.
         let response = self
             .http_client
             .post(&self.config.token_url)
             .form(&form)
+            .timeout(Duration::from_secs(TOKEN_FETCH_TIMEOUT_SECS))
             .send()
             .await
             .map_err(|e| AppError::CredentialFetch {
@@ -427,13 +448,23 @@ mod tests {
             vec!["sk-a".into(), "sk-b".into(), "sk-c".into()],
             KeyStrategy::FillFirst,
         );
-        assert_eq!(keys.current_key(), "sk-a");
-        assert_eq!(keys.current_key(), "sk-a");
+        assert_eq!(keys.current_key(), Some("sk-a"));
+        assert_eq!(keys.current_key(), Some("sk-a"));
 
         let keys = StaticKeys::new(vec!["sk-a".into(), "sk-b".into()], KeyStrategy::RoundRobin);
-        assert_eq!(keys.current_key(), "sk-a");
-        assert_eq!(keys.current_key(), "sk-b");
-        assert_eq!(keys.current_key(), "sk-a");
+        assert_eq!(keys.current_key(), Some("sk-a"));
+        assert_eq!(keys.current_key(), Some("sk-b"));
+        assert_eq!(keys.current_key(), Some("sk-a"));
+    }
+
+    #[tokio::test]
+    async fn static_keys_empty_pool_is_error_not_panic() {
+        let keys = StaticKeys::new(vec![], KeyStrategy::FillFirst);
+        assert!(keys.current_key().is_none());
+
+        let keys = StaticKeys::new(vec![], KeyStrategy::RoundRobin);
+        let err = keys.get_credential().await.unwrap_err();
+        assert!(matches!(err, AppError::Config(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -610,6 +641,44 @@ mod tests {
             }
             other => panic!("expected CredentialFetch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn hung_token_endpoint_fails_via_short_timeout() {
+        // Accept connections and hold them open without ever responding.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let oauth = oauth_config(&format!("http://{addr}/token"));
+        let provider = OAuthClientCredentials::new("azure".into(), oauth, client());
+        let started = Instant::now();
+        let err = provider.get_credential().await.unwrap_err();
+        let elapsed = started.elapsed();
+        match err {
+            AppError::CredentialFetch {
+                provider,
+                status,
+                message,
+            } => {
+                assert_eq!(provider, "azure");
+                assert_eq!(status, None, "timeout is transport-level, no HTTP status");
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected CredentialFetch, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(15),
+            "token fetch should hit TOKEN_FETCH_TIMEOUT_SECS≈10s, got {elapsed:?}"
+        );
     }
 
     #[tokio::test]

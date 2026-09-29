@@ -69,7 +69,7 @@ Content-Type: application/json
 | `api_keys` | array | 否 | `[]` | API 密钥列表。`auth_mode = "static"` 时至少一条；`auth_mode = "oauth"` 时允许为空（且忽略） |
 | `key_strategy` | string | 否 | `"fill_first"` | 多密钥选择策略：`"fill_first"` / `"round_robin"` |
 | `auth_mode` | string | 否 | `"static"` | 凭据模式：`"static"` 或 `"oauth"`。未知值 422。`"oauth"` 时必须同时提供 `oauth` 段；`"static"` 时 `api_keys` 非空校验生效 |
-| `oauth` | object \| null | 条件 | — | OAuth client credentials 段，`auth_mode = "oauth"` 时必填。字段：`token_url` / `client_id` / `client_secret`（均非空）、`scope` / `audience` / `refresh_token`（可选）。**secret 脱敏**：GET 出参中 `client_secret` 恒为 `"***"`，另有 `client_secret_set: bool`；更新时 `"***"` 表示保持原密钥，任意其他字符串为新密钥 |
+| `oauth` | object \| null | 条件 | — | OAuth client credentials 段，`auth_mode = "oauth"` 时必填。字段：`token_url` / `client_id` / `client_secret`（均非空）、`scope` / `audience` / `refresh_token`（可选）。**secret 脱敏**：GET 出参中 `client_secret` / `refresh_token` 有值时恒为 `"***"`（`refresh_token` 无值时省略），另有 `client_secret_set` / `refresh_token_set: bool`；更新时 `"***"` 表示保持原密钥/token，任意其他字符串为新值，`refresh_token` 缺省/`null` 表示清除 |
 | `timeout_secs` | integer | 否 | `600` | 上游请求超时（秒），仅约束非流式请求；`apis.<key>.timeout_secs` 可整段覆盖 |
 | `chunk_timeout_secs` | integer \| null | 否 | `null` | 流式 chunk 间最大空闲时间（秒），`null` 表示无限等待 |
 | `ttfb_timeout_secs` | integer \| null | 否 | `null`（默认 60） | 流式等待上游响应头（首字节）的最大时间（秒），收到响应头后停止计时 |
@@ -85,7 +85,7 @@ OAuth 相关约束（与配置加载校验一致）：
 - `auth_mode = "oauth"` 且缺 `oauth` 段 → 400
 - `auth_mode = "oauth"` 与 `apis.anthropic_messages` 组合 → 400（Phase 1 边界）
 - 创建时 `auth_mode = "static"` 且 `api_keys` 为空 → 400；`oauth` 为空 → 允许
-- GET 响应：`auth_mode` 始终返回；`oauth` 为 `null` 或脱敏后的对象（`client_secret: "***"` + `client_secret_set`）
+- GET 响应：`auth_mode` 始终返回；`oauth` 为 `null` 或脱敏后的对象（`client_secret` / `refresh_token` 恒为 `"***"` 或省略，`*_set` 报告存储状态）
 
 ### 更新供应商
 

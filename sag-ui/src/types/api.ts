@@ -26,12 +26,15 @@ export interface OAuthConfig {
 
 /**
  * OAuth section as returned by the admin API.
- * `client_secret` is always the mask `"***"`; `client_secret_set` reports
- * whether a secret is stored. Never returns plaintext.
+ * `client_secret` is always the mask `"***"`; `refresh_token` is `"***"`
+ * when set (absent otherwise). The `*_set` flags report storage. Never
+ * returns plaintext secrets.
  */
 export interface OAuthConfigOut extends OAuthConfig {
   client_secret: string
   client_secret_set: boolean
+  refresh_token?: string
+  refresh_token_set: boolean
 }
 
 /** Edit/add form state for OAuth fields (optional strings, not API types). */
@@ -60,7 +63,8 @@ export function oauthFormFromOut(oauth?: OAuthConfigOut): OAuthConfigForm {
   return {
     token_url: oauth.token_url ?? "",
     client_id: oauth.client_id ?? "",
-    // Out-path secret is always the mask; edit form shows `***`.
+    // Out-path secrets are always the mask; edit form shows `***` so a
+    // save without retyping keeps the stored values.
     client_secret: oauth.client_secret ?? "",
     scope: oauth.scope ?? "",
     audience: oauth.audience ?? "",
@@ -68,7 +72,11 @@ export function oauthFormFromOut(oauth?: OAuthConfigOut): OAuthConfigForm {
   }
 }
 
-/** Build the OAuth request payload from form state. Empty optional strings → omit. */
+/**
+ * Build the OAuth request payload from form state. Empty optional strings → omit
+ * (backend treats omitted `refresh_token` as clear). `"***"` is sent back as-is
+ * so the backend keep-semantics retain the stored value.
+ */
 export function oauthFormToPayload(form: OAuthConfigForm, secretIsMasked: boolean): OAuthConfig {
   const secret = form.client_secret.trim()
   return {
@@ -135,7 +143,8 @@ export interface Provider {
   auth_mode: AuthMode
   /**
    * OAuth settings when `auth_mode = "oauth"`.
-   * `client_secret` is always `"***"`; `client_secret_set` reports storage.
+   * `client_secret` / `refresh_token` are always `"***"` when set;
+   * the `*_set` flags report storage.
    */
   oauth?: OAuthConfigOut | null
   /** Protocol API catalog: one section per declared ApiKind. */
@@ -198,7 +207,8 @@ export interface UpdateProviderPayload {
   auth_mode?: AuthMode
   /**
    * Triple-state oauth patch: omit → keep, `null` → clear, value → replace
-   * the whole section. `client_secret: "***"` keeps the stored secret.
+   * the whole section. `"***"` on `client_secret` / `refresh_token` keeps
+   * the stored value; omitted `refresh_token` clears it.
    */
   oauth?: OAuthConfig | null
   /** Whole-directory replace: sections not repeated are dropped. */
