@@ -25,14 +25,13 @@ const PROTOCOL_LABELS: Record<ProtocolApiKind, string> = {
   anthropic_messages: "Anthropic Messages",
 }
 
-/** Fixed protocol path per kind — used to recover base_url from the probed URL. */
+/** Recover base_url from a probed URL by stripping the fixed protocol path. */
 const PROTOCOL_PATHS: Record<ProtocolApiKind, string> = {
   chat_completions: "/chat/completions",
   responses: "/responses",
   anthropic_messages: "/messages",
 }
 
-/** Verdicts eligible for one-click backfill into the apis form sections. */
 const BACKFILL_VERDICTS: ReadonlySet<ProbeVerdict> = new Set<ProbeVerdict>([
   "supported",
   "auth_failed",
@@ -64,24 +63,19 @@ const VERDICT_CLASSES: Record<ProbeVerdict, string> = {
 }
 
 const props = defineProps<{
-  /** base_url of each already-declared protocol section (prefill source). */
   filledBaseUrls: Partial<Record<ProtocolApiKind, string>>
-  /** Per-section headers of each declared protocol section. */
   sectionHeaders?: Partial<Record<ProtocolApiKind, Record<string, string>>>
   apiKeys: string[]
   proxyMode: ProxyMode
-  /** Provider-level default headers (applied to every target). */
   headers: Record<string, string>
 }>()
 
 const emit = defineEmits<{
-  /** One-click backfill: write these (protocol, base_url) pairs into the apis form sections. */
   backfill: [items: { protocol: ProtocolApiKind; base_url: string }[]]
 }>()
 
 const store = useProviderStore()
 
-// ── Probe inputs ──────────────────────────────────────────────
 const model = ref("gpt-4o-mini")
 const targets = ref<Record<ProtocolApiKind, string>>({
   chat_completions: "",
@@ -90,8 +84,7 @@ const targets = ref<Record<ProtocolApiKind, string>>({
 })
 const results = ref<ProbeResult[]>([])
 
-// Prefill empty inputs from the declared sections (never clobbers an
-// edited value).
+// Prefill empty inputs only — never clobber an edited value.
 watch(
   () => props.filledBaseUrls,
   (filled) => {
@@ -103,7 +96,6 @@ watch(
   { immediate: true, deep: true },
 )
 
-/** Copy every declared section base_url into empty probe inputs. */
 function syncFromSections() {
   for (const kind of PROTOCOL_KINDS) {
     const v = props.filledBaseUrls[kind]?.trim()
@@ -137,7 +129,6 @@ async function runProbe() {
   })
 }
 
-// ── Backfill ──────────────────────────────────────────────────
 const backfillItems = computed(() => {
   const seen = new Set<ProtocolApiKind>()
   const items: { protocol: ProtocolApiKind; base_url: string }[] = []
@@ -171,9 +162,8 @@ function statusText(r: ProbeResult): string {
     </div>
 
     <p class="text-muted-foreground text-xs">
-      Sends one minimal request per protocol × API key against each base URL (output tokens pinned
-      to the minimum) and reports whether the upstream actually serves that protocol. Probing is
-      read-only — nothing is written until you backfill and save.
+      Read-only probe: one minimal request per protocol × key. Nothing is saved until you backfill
+      and store the provider.
     </p>
 
     <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -185,10 +175,7 @@ function statusText(r: ProbeResult): string {
           placeholder="gpt-4o-mini"
           class="font-mono text-sm"
         />
-        <p class="text-muted-foreground text-xs">
-          Use a non-reasoning model: reasoning models may reject
-          <code>max_tokens: 1</code> with 400 (a false "partial").
-        </p>
+        <p class="text-muted-foreground text-xs">Prefer a non-reasoning model.</p>
       </div>
 
       <div class="space-y-1">
@@ -266,9 +253,7 @@ function statusText(r: ProbeResult): string {
           </TableBody>
         </Table>
         <p class="text-muted-foreground mt-2 text-xs">
-          Backfill writes <code>base_url</code> into the matching API sections of this form
-          (supported / auth failed / partial only). Nothing is persisted until you save the
-          provider.
+          Backfill fills matching sections only (supported / auth failed / partial).
         </p>
       </AlertDescription>
     </Alert>
