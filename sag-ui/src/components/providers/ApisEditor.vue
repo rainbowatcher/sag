@@ -339,11 +339,6 @@ defineExpose({ validate })
   <div class="space-y-4">
     <div class="space-y-2">
       <FieldLabel>API Sections *</FieldLabel>
-      <p class="text-muted-foreground text-xs">
-        One section per protocol. Each section carries its own
-        <code>base_url</code> (the only address source) plus optional overrides; a declared section
-        field <strong>fully replaces</strong> the provider-level default of the same name.
-      </p>
 
       <div v-for="d in sections" :key="d.uid" class="space-y-3 rounded-md border p-3">
         <div class="flex items-center gap-2">
@@ -373,9 +368,6 @@ defineExpose({ validate })
               class="font-mono text-sm"
               @input="updateSection(d.uid, { base_url: ($event.target as HTMLInputElement).value })"
             />
-            <p class="text-muted-foreground text-xs">
-              Host + root prefix; the protocol path is derived automatically.
-            </p>
           </div>
           <div class="space-y-1">
             <FieldLabel :for="`models-endpoint-${d.uid}`">Models Endpoint</FieldLabel>
@@ -388,11 +380,6 @@ defineExpose({ validate })
                 updateSection(d.uid, { models_endpoint: ($event.target as HTMLInputElement).value })
               "
             />
-            <p class="text-muted-foreground text-xs">
-              Relative path for model listing (empty =
-              <code>{{ DEFAULT_MODELS_ENDPOINT_HINTS[d.kind] }}</code
-              >).
-            </p>
           </div>
         </div>
 
@@ -403,15 +390,9 @@ defineExpose({ validate })
         </Button>
 
         <div v-if="d.advancedOpen" class="space-y-4">
-          <p class="text-muted-foreground text-xs">
-            Fields set here replace the provider-level defaults for this section only (maps are not
-            merged, arrays not unioned).
-          </p>
-
           <KvEditor
             :model-value="d.headers"
             title="Headers"
-            description="Custom headers for this section (plain text values)."
             key-placeholder="Header-Name"
             value-placeholder="Value"
             @update:model-value="(v) => updateSection(d.uid, { headers: v as KvPair[] })"
@@ -422,7 +403,6 @@ defineExpose({ validate })
           <KvEditor
             :model-value="d.body_overrides"
             title="Body Overrides"
-            description="Fields overridden in the upstream JSON body. Values are parsed as JSON (e.g. <code>4096</code>, <code>true</code>)."
             key-placeholder="max_tokens"
             value-placeholder="4096"
             @update:model-value="(v) => updateSection(d.uid, { body_overrides: v as KvPair[] })"
@@ -432,9 +412,6 @@ defineExpose({ validate })
 
           <div>
             <FieldLabel>Strip Fields</FieldLabel>
-            <p class="text-muted-foreground mb-2 text-xs">
-              Top-level fields removed from the upstream JSON body, one per line.
-            </p>
             <textarea
               :value="stripFieldsText(d)"
               rows="2"
@@ -449,7 +426,6 @@ defineExpose({ validate })
           <KvEditor
             :model-value="d.role_mappings"
             title="Role Mappings"
-            description="Maps request roles to upstream-supported roles (case-sensitive). Example: developer → system."
             key-placeholder="developer"
             value-placeholder="system"
             @update:model-value="(v) => updateSection(d.uid, { role_mappings: v as KvPair[] })"
@@ -461,7 +437,6 @@ defineExpose({ validate })
             <KvEditor
               :model-value="d.model_overrides"
               title="Model Overrides"
-              description='Per-model body overrides: key = model name, value = a JSON object (e.g. <code>{"max_tokens": 4096}</code>).'
               key-placeholder="model-name"
               value-placeholder='{"max_tokens": 4096}'
               @update:model-value="(v) => updateSection(d.uid, { model_overrides: v as KvPair[] })"
@@ -579,10 +554,7 @@ defineExpose({ validate })
       <FieldLabel>Fallback Protocol</FieldLabel>
       <template v-if="protocolKeys.length === 1">
         <p class="text-muted-foreground text-xs">
-          Single protocol section — fallback is automatic (<code>{{
-            API_KIND_LABELS[protocolKeys[0]]
-          }}</code
-          >).
+          Auto: <code>{{ API_KIND_LABELS[protocolKeys[0]] }}</code>
         </p>
       </template>
       <template v-else-if="protocolKeys.length > 1">
@@ -596,12 +568,9 @@ defineExpose({ validate })
             </SelectItem>
           </SelectContent>
         </Select>
-        <p class="text-muted-foreground text-xs">
-          Required with multiple protocol sections: the encoding target of translated-lane dispatch.
-        </p>
       </template>
       <template v-else>
-        <p class="text-muted-foreground text-xs">Declare at least one protocol section.</p>
+        <p class="text-muted-foreground text-xs">Add a protocol section first.</p>
       </template>
     </div>
   </div>
