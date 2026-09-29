@@ -43,6 +43,8 @@ const health = useHealthStore()
 const route = useRoute()
 const router = useRouter()
 
+const appVersion = __APP_VERSION__
+
 function handleDisconnect() {
   store.disconnect()
   router.replace("/connect")
@@ -137,9 +139,7 @@ const navItems: NavItem[] = [
               </div>
               <div class="grid flex-1 text-left text-sm leading-tight">
                 <span class="truncate font-semibold">SAG Gateway</span>
-                <span class="text-muted-foreground truncate text-xs">
-                  v{{ health.gatewayVersion || "-" }}
-                </span>
+                <span class="text-muted-foreground truncate text-xs"> v{{ appVersion }} </span>
               </div>
             </SidebarMenuButton>
           </SidebarMenuItem>
