@@ -3,13 +3,6 @@ import { GitBranch, Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import Combobox from "@/components/Combobox.vue"
-import KvEditor from "@/components/KvEditor.vue"
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -22,15 +15,11 @@ import {
 } from "@/components/ui/dialog"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from "@/components/ui/item"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { getErrorMessage } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { CreateRoutePayload } from "@/types/api"
-
-interface KvPair {
-  key: string
-  value: string
-}
 
 const UNLABELED = "—"
 
@@ -49,7 +38,6 @@ const props = withDefaults(
   defineProps<{
     providerName?: string
     enabledModels: string[]
-    modelOverrides: Record<string, KvPair[]>
     upstreamModels: Record<string, unknown>[]
     upstreamModelsLoading: boolean
     upstreamModelsError: string
@@ -68,7 +56,6 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   "update:enabledModels": [value: string[]]
-  "update:modelOverrides": [value: Record<string, KvPair[]>]
   fetchModels: []
   testModel: [model: string]
 }>()
@@ -130,7 +117,6 @@ async function confirmCreateRoute() {
 }
 
 // ── Internal state ─────────────────────────────────
-const expandedOverride = ref<string | undefined>(undefined)
 const customModel = ref("")
 
 const upstreamModelNames = computed(
@@ -198,31 +184,6 @@ function addCustomModel() {
   customModel.value = ""
 }
 
-// ── Clean up overrides when model removed ───────────
-watch(
-  () => props.enabledModels,
-  (models) => {
-    const updated = { ...props.modelOverrides }
-    let changed = false
-    for (const model of Object.keys(updated)) {
-      if (!models.includes(model)) {
-        delete updated[model]
-        changed = true
-        if (expandedOverride.value === model) expandedOverride.value = undefined
-      }
-    }
-    if (changed) emit("update:modelOverrides", updated)
-  },
-)
-
-function overrideCount(model: string): number {
-  return props.modelOverrides[model]?.filter((p) => p.key.trim()).length ?? 0
-}
-
-function onOverrideUpdate(model: string, pairs: KvPair[]) {
-  emit("update:modelOverrides", { ...props.modelOverrides, [model]: pairs })
-}
-
 function removeModel(name: string) {
   emit(
     "update:enabledModels",
@@ -237,128 +198,101 @@ function removeModel(name: string) {
       No models listed means all models are allowed (no restriction).
     </p>
 
-    <!-- Model list with integrated override editing -->
-    <Accordion
-      v-if="enabledModels.length > 0"
-      type="single"
-      collapsible
-      v-model="expandedOverride"
-      class="rounded-md border"
-    >
-      <AccordionItem
+    <ItemGroup v-if="enabledModels.length > 0" class="overflow-hidden rounded-md border">
+      <Item
         v-for="model in enabledModels"
         :key="model"
-        :value="model"
+        size="sm"
+        class="border-border/40 flex-nowrap rounded-none border-b px-2 py-0.5 last:border-b-0"
         :class="{
           'text-muted-foreground bg-amber-500/10 dark:bg-amber-500/15':
             isModelMissingFromUpstream(model),
         }"
       >
-        <div class="hover:bg-muted/50 flex items-center [&>:first-child]:flex-1">
-          <AccordionTrigger class="px-3 py-0.5 hover:no-underline">
-            <template #icon><span class="hidden" /></template>
-            <span class="flex items-center gap-2">
-              <span
-                class="font-mono text-sm"
-                :class="{
-                  'font-medium text-amber-700 dark:text-amber-300':
-                    isModelMissingFromUpstream(model),
-                }"
-              >
-                {{ model }}
-              </span>
-              <Badge
-                v-if="upstreamProtocol"
-                variant="outline"
-                class="px-1 py-0 font-mono text-[10px]"
-                :title="`Effective upstream protocol: ${upstreamProtocol}`"
-              >
-                {{ upstreamProtocol }}
-              </Badge>
-              <Badge
-                v-if="overrideCount(model) > 0"
-                variant="secondary"
-                class="px-1 py-0 text-[10px] font-medium"
-              >
-                {{ overrideCount(model) }}
-              </Badge>
-            </span>
-          </AccordionTrigger>
-          <div class="flex items-center gap-1 pr-3">
-            <Tooltip v-if="modelTestStates">
-              <TooltipTrigger as-child>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  :disabled="modelTestStates[model]?.loading"
-                  :class="
-                    modelTestStates[model]?.data?.length
-                      ? modelTestStates[model]!.data![0].success
-                        ? 'text-green-500'
-                        : 'text-destructive'
-                      : ''
-                  "
-                  @click="emit('testModel', model)"
-                >
-                  <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
-                  <Zap v-else class="h-3 w-3" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" align="end" class="max-w-xs">
-                <template v-if="modelTestStates[model]?.data">
-                  <div
-                    v-for="r in modelTestStates[model]!.data"
-                    :key="r.key_prefix"
-                    class="break-words whitespace-normal"
-                  >
-                    <span :class="r.success ? 'text-green-300' : 'text-red-300'">{{
-                      r.success ? "✓" : "✗"
-                    }}</span>
-                    {{ r.key_prefix }}: {{ r.message }}
-                  </div>
-                </template>
-                <template v-else-if="modelTestStates[model]?.error">
-                  <div class="break-words whitespace-normal text-red-300">
-                    {{ modelTestStates[model]!.error }}
-                  </div>
-                </template>
-                <template v-else> Click to test </template>
-              </TooltipContent>
-            </Tooltip>
+        <ItemContent class="min-w-0 flex-1 flex-row items-center gap-2">
+          <ItemTitle
+            class="min-w-0 flex-1 truncate font-mono text-sm"
+            :class="{
+              'font-medium text-amber-700 dark:text-amber-300': isModelMissingFromUpstream(model),
+            }"
+          >
+            {{ model }}
+          </ItemTitle>
+          <Badge
+            v-if="upstreamProtocol"
+            variant="outline"
+            class="flex-none px-1 py-0 font-mono text-[10px]"
+            :title="`Effective upstream protocol: ${upstreamProtocol}`"
+          >
+            {{ upstreamProtocol }}
+          </Badge>
+        </ItemContent>
 
-            <Tooltip v-if="providerName">
-              <TooltipTrigger as-child>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  title="Create route"
-                  aria-label="Create route"
-                  @click.stop="openCreateRoute(model)"
+        <ItemActions class="flex-none gap-1">
+          <Tooltip v-if="modelTestStates">
+            <TooltipTrigger as-child>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                :disabled="modelTestStates[model]?.loading"
+                :class="
+                  modelTestStates[model]?.data?.length
+                    ? modelTestStates[model]!.data![0].success
+                      ? 'text-green-500'
+                      : 'text-destructive'
+                    : ''
+                "
+                @click="emit('testModel', model)"
+              >
+                <Loader2 v-if="modelTestStates[model]?.loading" class="h-3 w-3 animate-spin" />
+                <Zap v-else class="h-3 w-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="end" class="max-w-xs">
+              <template v-if="modelTestStates[model]?.data">
+                <div
+                  v-for="r in modelTestStates[model]!.data"
+                  :key="r.key_prefix"
+                  class="break-words whitespace-normal"
                 >
-                  <GitBranch class="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" align="end" class="text-xs">
-                Create route {{ providerName }}/{{ model }}
-              </TooltipContent>
-            </Tooltip>
+                  <span :class="r.success ? 'text-green-300' : 'text-red-300'">{{
+                    r.success ? "✓" : "✗"
+                  }}</span>
+                  {{ r.key_prefix }}: {{ r.message }}
+                </div>
+              </template>
+              <template v-else-if="modelTestStates[model]?.error">
+                <div class="break-words whitespace-normal text-red-300">
+                  {{ modelTestStates[model]!.error }}
+                </div>
+              </template>
+              <template v-else> Click to test </template>
+            </TooltipContent>
+          </Tooltip>
 
-            <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
-              <Trash2 class="text-destructive h-3 w-3" />
-            </Button>
-          </div>
-        </div>
-        <AccordionContent class="border-t px-3 py-3">
-          <KvEditor
-            :model-value="modelOverrides[model] ?? []"
-            @update:model-value="(v) => onOverrideUpdate(model, v as KvPair[])"
-            description='Values are parsed as JSON (e.g. 4096, true, "text"). Applied after provider-level overrides.'
-            key-placeholder="max_tokens"
-            value-placeholder="4096"
-          />
-        </AccordionContent>
-      </AccordionItem>
-    </Accordion>
+          <Tooltip v-if="providerName">
+            <TooltipTrigger as-child>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                title="Create route"
+                aria-label="Create route"
+                @click.stop="openCreateRoute(model)"
+              >
+                <GitBranch class="h-3.5 w-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="end" class="text-xs">
+              Create route {{ providerName }}/{{ model }}
+            </TooltipContent>
+          </Tooltip>
+
+          <Button variant="ghost" size="icon-sm" @click="removeModel(model)">
+            <Trash2 class="text-destructive h-3 w-3" />
+          </Button>
+        </ItemActions>
+      </Item>
+    </ItemGroup>
 
     <!-- Multi-select model combobox -->
     <div class="min-w-0">

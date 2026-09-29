@@ -168,19 +168,6 @@ const roleMappingsList = ref<{ key: string; value: string }[]>(
   Object.entries(props.provider.role_mappings ?? {}).map(([k, v]) => ({ key: k, value: v })),
 )
 
-// ── Per-model body overrides ────────────────────────────────
-const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>(
-  Object.fromEntries(
-    Object.entries(props.provider.model_overrides ?? {}).map(([model, overrides]) => [
-      model,
-      Object.entries(overrides).map(([k, v]) => ({
-        key: k,
-        value: typeof v === "string" ? v : JSON.stringify(v),
-      })),
-    ]),
-  ),
-)
-
 function headersMap(): Record<string, string> {
   const m: Record<string, string> = {}
   for (const { key, value } of headersList.value) {
@@ -272,29 +259,6 @@ async function handleSubmit() {
     const parsedStripFields = stripFieldsList.value.filter((s) => s.trim()).map((s) => s.trim())
     if (JSON.stringify(parsedStripFields) !== JSON.stringify(props.provider.strip_fields ?? [])) {
       payload.strip_fields = parsedStripFields
-    }
-
-    // Parse model_overrides
-    const parsedModelOverrides: Record<string, Record<string, any>> = {}
-    for (const [model, pairs] of Object.entries(modelOverridesMap.value)) {
-      const overrides: Record<string, any> = {}
-      for (const { key, value: val } of pairs) {
-        if (!key.trim()) continue
-        try {
-          overrides[key.trim()] = val.trim() ? JSON.parse(val) : val
-        } catch {
-          apiError.value = `Model override "${model}.${key}": invalid JSON value`
-          return
-        }
-      }
-      if (Object.keys(overrides).length > 0) {
-        parsedModelOverrides[model] = overrides
-      }
-    }
-    if (
-      JSON.stringify(parsedModelOverrides) !== JSON.stringify(props.provider.model_overrides ?? {})
-    ) {
-      payload.model_overrides = parsedModelOverrides
     }
 
     if (
@@ -441,7 +405,6 @@ async function handleSubmit() {
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
-              v-model:model-overrides="modelOverridesMap"
               :upstream-protocol="defaultProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
@@ -471,9 +434,10 @@ async function handleSubmit() {
               <AlertTitle>提示</AlertTitle>
               <AlertDescription>
                 Body Overrides
-                对该供应商的<strong>所有模型</strong>生效。如需为特定模型设置不同参数，建议前往
-                <strong>Models Tab</strong> 配置 <strong>Model Overrides</strong>，避免在多个路由的
-                target 中重复配置 <code>extra</code>。
+                对该供应商的<strong>所有模型</strong>生效。如需为特定模型设置不同参数，请前往
+                <strong>APIs Tab</strong> 对应 API section 的 Advanced 中配置
+                <strong>Model Overrides</strong>，避免在多个路由的 target 中重复配置
+                <code>extra</code>。
               </AlertDescription>
             </Alert>
 

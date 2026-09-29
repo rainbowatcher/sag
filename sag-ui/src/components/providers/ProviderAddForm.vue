@@ -155,10 +155,6 @@ const roleMappingsList = ref<{ key: string; value: string }[]>([])
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
 const stripFields = ref<string[]>([])
 
-// ── Per-model body overrides ────────────────────────────────
-// Cleanup of stale entries is handled by ModelOverrideEditor internally.
-const modelOverridesMap = ref<Record<string, { key: string; value: string }[]>>({})
-
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
@@ -205,29 +201,6 @@ const form = useForm({
       {} as Record<string, any>,
     )
 
-    const parsedModelOverrides = Object.entries(modelOverridesMap.value).reduce(
-      (acc, [model, pairs]) => {
-        const overrides = pairs.reduce(
-          (mAcc, h) => {
-            if (h.key.trim() && h.value.trim()) {
-              try {
-                mAcc[h.key.trim()] = JSON.parse(h.value.trim())
-              } catch {
-                mAcc[h.key.trim()] = h.value.trim()
-              }
-            }
-            return mAcc
-          },
-          {} as Record<string, any>,
-        )
-        if (Object.keys(overrides).length > 0) {
-          acc[model] = overrides
-        }
-        return acc
-      },
-      {} as Record<string, Record<string, any>>,
-    )
-
     const filteredStrip = stripFields.value.filter((f) => f.trim().length > 0)
 
     try {
@@ -241,8 +214,6 @@ const form = useForm({
         headers: Object.keys(parsedHeaders).length > 0 ? parsedHeaders : undefined,
         role_mappings: Object.keys(parsedRoleMappings).length > 0 ? parsedRoleMappings : undefined,
         body_overrides: Object.keys(parsedOverrides).length > 0 ? parsedOverrides : undefined,
-        model_overrides:
-          Object.keys(parsedModelOverrides).length > 0 ? parsedModelOverrides : undefined,
         strip_fields: filteredStrip.length > 0 ? filteredStrip : undefined,
         timeout_secs: value.timeout_secs,
         proxy_mode: proxyMode.value,
@@ -409,7 +380,6 @@ async function handleSubmit(event: Event) {
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
-              v-model:model-overrides="modelOverridesMap"
               :upstream-protocol="defaultProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
