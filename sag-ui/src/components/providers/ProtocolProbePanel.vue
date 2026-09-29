@@ -103,6 +103,14 @@ function syncFromSections() {
   }
 }
 
+function applyBaseToAll(kind: ProtocolApiKind) {
+  const v = targets.value[kind].trim()
+  if (!v) return
+  for (const k of PROTOCOL_KINDS) {
+    targets.value[k] = v
+  }
+}
+
 const hasKeys = computed(() => props.apiKeys.some((k) => k.trim()))
 const targetList = computed(() =>
   PROTOCOL_KINDS.map((protocol) => ({
@@ -166,8 +174,34 @@ function statusText(r: ProbeResult): string {
       and store the provider.
     </p>
 
-    <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-      <div class="space-y-1">
+    <div class="space-y-2">
+      <div v-for="kind in PROTOCOL_KINDS" :key="kind" class="space-y-1">
+        <div class="flex items-center justify-between gap-2">
+          <FieldLabel :for="`probe-base-${kind}`">{{ PROTOCOL_LABELS[kind] }} base URL</FieldLabel>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            class="h-7 text-xs"
+            :disabled="!targets[kind].trim()"
+            title="Apply this base URL to all protocols"
+            @click="applyBaseToAll(kind)"
+          >
+            Apply to all
+          </Button>
+        </div>
+        <Input
+          :id="`probe-base-${kind}`"
+          :model-value="targets[kind]"
+          placeholder="https://api.example.com/v1"
+          class="font-mono text-sm"
+          @input="targets[kind] = ($event.target as HTMLInputElement).value"
+        />
+      </div>
+    </div>
+
+    <div class="flex flex-wrap items-end gap-2">
+      <div class="min-w-40 flex-1 space-y-1">
         <FieldLabel for="probe-model">Model *</FieldLabel>
         <Input
           id="probe-model"
@@ -175,24 +209,7 @@ function statusText(r: ProbeResult): string {
           placeholder="gpt-4o-mini"
           class="font-mono text-sm"
         />
-        <p class="text-muted-foreground text-xs">Prefer a non-reasoning model.</p>
       </div>
-
-      <div class="space-y-1">
-        <template v-for="kind in PROTOCOL_KINDS" :key="kind">
-          <FieldLabel :for="`probe-base-${kind}`">{{ PROTOCOL_LABELS[kind] }} base URL</FieldLabel>
-          <Input
-            :id="`probe-base-${kind}`"
-            :model-value="targets[kind]"
-            placeholder="https://api.example.com/v1"
-            class="mb-2 font-mono text-sm"
-            @input="targets[kind] = ($event.target as HTMLInputElement).value"
-          />
-        </template>
-      </div>
-    </div>
-
-    <div class="flex items-center gap-2">
       <Button type="button" size="sm" :disabled="!canProbe || store.probeLoading" @click="runProbe">
         <Loader2 v-if="store.probeLoading" class="h-3 w-3 animate-spin" />
         <Search v-else class="h-3.5 w-3.5" />
@@ -208,10 +225,13 @@ function statusText(r: ProbeResult): string {
       >
         Backfill {{ backfillItems.length }} protocol{{ backfillItems.length === 1 ? "" : "s" }}
       </Button>
-      <span v-if="!hasKeys" class="text-muted-foreground text-xs">
-        Add at least one API key first.
-      </span>
     </div>
+
+    <p class="text-muted-foreground text-xs">
+      Model: prefer a non-reasoning model. Use <strong>Apply to all</strong> to share one base URL
+      across protocols.
+    </p>
+    <p v-if="!hasKeys" class="text-muted-foreground text-xs">Add at least one API key first.</p>
 
     <p v-if="store.probeError" class="text-destructive text-xs">{{ store.probeError }}</p>
 
