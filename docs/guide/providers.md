@@ -13,7 +13,7 @@
 | `api_keys` | API 密钥列表 |
 | `key_strategy` | 多密钥选择策略（`fill_first` / `round_robin`） |
 | `proxy_mode` | 出站代理三态：`inherit`（默认，跟随顶层 `proxy_url`）/ `enabled`（强制走全局代理，无全局代理则配置错误）/ `disabled`（强制直连）。SAG **不读**系统代理环境变量 |
-| `models_endpoint` | 管理面板拉取模型列表的端点路径（per-API，配置在 `[providers.<name>.apis.<key>]` 节），相对本节 `base_url`，默认 `models` |
+| `models_endpoint` | 管理面板拉取模型列表的端点路径（per-API，配置在 `[providers.<name>.apis.<key>]` 节），相对本节 `base_url`，默认 `models`。探测目标节的选择规则见下方「模型列表探测」 |
 | `timeout_secs` | 上游请求超时（秒），默认 600。流式请求不受此约束（见「流式超时」），仅作为非流式请求的整体安全网 |
 | `chunk_timeout_secs` | 流式 chunk 间最大空闲时间（秒），省略则无限等待 |
 | `ttfb_timeout_secs` | 流式请求等待上游响应头（首字节）的最大时间（秒），默认 60。收到响应头后停止计时，不约束后续 body 流 |
@@ -26,6 +26,19 @@
 | `model_overrides` | 逐模型 body 字段覆盖，以 `real_model` 为 key。优先级高于 `body_overrides`，低于路由 target 的 `extra`。推荐用于避免在多个路由中重复配置同一模型的参数 |
 | `role_mappings` | 角色名映射表（如 `{ "developer" = "system" }`） |
 | `anthropic_cache_control` | 是否向 Anthropic Messages 请求注入 `cache_control` 断点，默认 `true`。仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖），详见下文 |
+
+## 模型列表探测
+
+管理面板的「获取模型列表 / 模型测试」（`POST /api/providers/fetch-models`、`POST /api/model/test`）是临时探针请求，每次只针对 **一个** `apis` 节发起，使用该节的 `base_url` + `models_endpoint` + `headers`，鉴权头形状由该节协议决定（`anthropic_messages` → `x-api-key`，其余 → `Authorization: Bearer`）。
+
+多协议供应商的目标节选择规则（与 `apis` map 的键顺序无关）：
+
+1. 显式配置了 `fallback` → 使用 `fallback` 指向的协议节；
+2. 未配置 `fallback` → 按固定优先级取第一个已声明的协议节：`chat_completions` → `responses` → `anthropic_messages`；
+3. `image` 节永远不会被选为探测目标（它不是协议节，也不承载模型列表）。
+
+管理面板 Models tab 中可临时切换探测协议（多协议供应商会显示协议下拉），该选择仅影响本次探测，不落盘。
+
 
 ## 内置供应商
 

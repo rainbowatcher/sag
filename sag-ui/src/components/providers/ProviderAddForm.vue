@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { API_KIND_LABELS, PROBE_KIND_ORDER, defaultProbeKind } from "@/lib/provider-probe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
@@ -48,14 +49,32 @@ const apis = ref<Partial<Record<ApiKind, ApiConfig>>>({})
 const fallback = ref<ApiKind | null>(null)
 const apisEditor = ref<{ validate: () => string | null } | null>(null)
 
-/** The section model listing / model tests probe: chat_completions, else the first declared. */
-const primaryKind = computed<ApiKind | null>(() => {
+/**
+ * Default section for model listing / model tests: the `fallback` protocol
+ * when declared, else chat_completions, else the next protocol key — never
+ * the `image` section, independent of key insertion order.
+ */
+const primaryKind = computed<ApiKind | null>(() => defaultProbeKind(apis.value, fallback.value))
+
+/** Sections selectable as the models-probe target (protocol keys only, fixed order). */
+const protocolSections = computed<ApiKind[]>(() => {
   const keys = Object.keys(apis.value) as ApiKind[]
-  if (keys.includes("chat_completions")) return "chat_completions"
-  return keys[0] ?? null
+  return PROBE_KIND_ORDER.filter((k) => keys.includes(k))
 })
-const primaryApi = computed<ApiConfig | null>(() =>
-  primaryKind.value ? (apis.value[primaryKind.value] ?? null) : null,
+
+/** Currently selected probe section; falls back to the default when it disappears. */
+const probeKind = ref<ApiKind | null>(null)
+watch(
+  [primaryKind, protocolSections],
+  () => {
+    if (!probeKind.value || !protocolSections.value.includes(probeKind.value)) {
+      probeKind.value = primaryKind.value
+    }
+  },
+  { immediate: true },
+)
+const probeApi = computed<ApiConfig | null>(() =>
+  probeKind.value ? (apis.value[probeKind.value] ?? null) : null,
 )
 
 /** Translated-lane protocol badge shown next to models. */
@@ -80,7 +99,7 @@ function parsedHeadersValue(): Record<string, string> {
 
 /** Effective probe headers: section overrides fully replace provider-level defaults. */
 function effectiveHeaders(): Record<string, string> {
-  return primaryApi.value?.headers ?? parsedHeadersValue()
+  return probeApi.value?.headers ?? parsedHeadersValue()
 }
 
 function roleMappingsMap(): Record<string, string> {
@@ -94,33 +113,33 @@ function roleMappingsMap(): Record<string, string> {
 }
 
 function onFetchModels() {
-  const primary = primaryApi.value
-  if (!primary) {
+  const probe = probeApi.value
+  if (!probe) {
     store.upstreamModelsError = "Declare an API section first (APIs tab)"
     return
   }
   store.fetchUpstreamModels({
-    base_url: primary.base_url,
+    base_url: probe.base_url,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    headers: effectiveHeaders(),
-    api_kind: primaryKind.value ?? undefined,
-    models_endpoint: primary.models_endpoint,
+    headers: probe.headers ?? effectiveHeaders(),
+    api_kind: probeKind.value ?? undefined,
+    models_endpoint: probe.models_endpoint,
     proxy_mode: proxyMode.value,
   })
 }
 
 function onTestModel(model: string) {
-  const primary = primaryApi.value
-  if (!primary) {
+  const probe = probeApi.value
+  if (!probe) {
     store.upstreamModelsError = "Declare an API section first (APIs tab)"
     return
   }
   store.testModelWithState(model, {
     model,
     api_keys: apiKeys.value.filter((k) => k.trim()),
-    base_url: primary.base_url,
-    api_kind: primaryKind.value ?? undefined,
-    headers: effectiveHeaders(),
+    base_url: probe.base_url,
+    api_kind: probeKind.value ?? undefined,
+    headers: probe.headers ?? effectiveHeaders(),
     proxy_mode: proxyMode.value,
   })
 }
@@ -357,15 +376,32 @@ async function handleSubmit(event: Event) {
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
           <TabsContent value="models" class="space-y-3">
-            <p v-if="primaryApi" class="text-muted-foreground text-xs">
-              Model listing probes
-              <code>{{ primaryKind }}</code>
-              → <code>{{ primaryApi.base_url }}</code
-              ><template v-if="primaryApi.models_endpoint"
-                >/{{ primaryApi.models_endpoint }}</template
-              ><template v-else>/models</template>
-              (edit on the APIs tab).
-            </p>
+            <div v-if="probeApi" class="flex min-w-0 items-center gap-2">
+              <Select
+                v-if="protocolSections.length > 1"
+                :model-value="probeKind ?? undefined"
+                @update:model-value="(v) => (probeKind = v as ApiKind)"
+              >
+                <SelectTrigger class="h-7 w-44 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem
+                    v-for="kind in protocolSections"
+                    :key="kind"
+                    :value="kind"
+                    class="text-xs"
+                  >
+                    {{ API_KIND_LABELS[kind] }}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <code v-else class="text-xs">{{ probeKind }}</code>
+              <span class="text-muted-foreground shrink-0 text-xs">→</span>
+              <code class="truncate text-xs">
+                {{ probeApi.base_url }}/{{ probeApi.models_endpoint || "models" }}
+              </code>
+            </div>
             <ModelManager
               :provider-name="form.state.values.name"
               :enabled-models="enabledModels"

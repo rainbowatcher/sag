@@ -96,6 +96,12 @@ fallback = "chat_completions"
 # The protocol set = the protocol keys of `apis` (image is a non-protocol
 # entry). lane is derived automatically: ingress ∈ protocol keys → Native,
 # otherwise Translated through `fallback`.
+#
+# Admin "fetch models" / model tests probe exactly ONE section: the
+# `fallback` protocol when set, else chat_completions, else the next
+# protocol key (responses → anthropic_messages) — never the image section.
+# The admin UI can switch the probe section per provider; the choice is
+# per-request only and never persisted.
 [providers.openai.apis.chat_completions]
 base_url = "https://api.openai.com/v1"
 
