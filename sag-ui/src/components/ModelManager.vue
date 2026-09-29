@@ -3,7 +3,6 @@ import { GitBranch, Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import Combobox from "@/components/Combobox.vue"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -43,14 +42,11 @@ const props = withDefaults(
     upstreamModelsError: string
     modelTestStates?: Record<string, ModelTestState | undefined>
     disabled?: boolean
-    /** Effective upstream protocol badge (hide when absent). */
-    upstreamProtocol?: string
   }>(),
   {
     providerName: "",
     modelTestStates: undefined,
     disabled: false,
-    upstreamProtocol: undefined,
   },
 )
 
@@ -218,14 +214,6 @@ function removeModel(name: string) {
           >
             {{ model }}
           </ItemTitle>
-          <Badge
-            v-if="upstreamProtocol"
-            variant="outline"
-            class="flex-none px-1 py-0 font-mono text-[10px]"
-            :title="`Effective upstream protocol: ${upstreamProtocol}`"
-          >
-            {{ upstreamProtocol }}
-          </Badge>
         </ItemContent>
 
         <ItemActions class="flex-none gap-1">

@@ -77,13 +77,6 @@ const probeApi = computed<ApiConfig | null>(() =>
   probeKind.value ? (apis.value[probeKind.value] ?? null) : null,
 )
 
-/** Translated-lane protocol badge shown next to models. */
-const defaultProtocol = computed<ApiKind | undefined>(() => {
-  const protocols = (Object.keys(apis.value) as ApiKind[]).filter((k) => k !== "image")
-  if (fallback.value) return fallback.value
-  return protocols.length === 1 ? protocols[0] : undefined
-})
-
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
 
@@ -380,7 +373,6 @@ async function handleSubmit(event: Event) {
               :upstream-models-loading="store.upstreamModelsLoading"
               :upstream-models-error="store.upstreamModelsError"
               :model-test-states="store.testModelState.states"
-              :upstream-protocol="defaultProtocol"
               @update:enabled-models="enabledModels = $event"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"
