@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, ref } from "vue"
 import { toast } from "vue-sonner"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import KvEditor from "@/components/KvEditor.vue"
@@ -38,10 +38,11 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { API_KIND_LABELS, PROBE_KIND_ORDER, defaultProbeKind } from "@/lib/provider-probe"
+import { useProviderProbe } from "@/composables/useProviderProbe"
+import { API_KIND_LABELS } from "@/lib/provider-probe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { ApiConfig, ApiKind, Provider, ProxyMode } from "@/types/api"
+import type { ApiKind, Provider, ProxyMode } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
@@ -71,11 +72,6 @@ const open = ref(true)
 const saving = ref(false)
 const apiError = ref("")
 
-onMounted(() => {
-  store.upstreamModels = []
-  store.upstreamModelsError = ""
-})
-
 function onOpenChange(v: boolean) {
   if (!v) emit("close")
 }
@@ -88,63 +84,12 @@ const timeoutSecs = ref(props.provider.timeout_secs)
 // always what gets sent (explicitly, so switching back to inherit works).
 const proxyMode = ref<ProxyMode>(props.provider.proxy_mode ?? "inherit")
 
-// ── API sections (protocol catalog) ──────────────────────────
-// The editor owns the whole directory: updates always send the full
-// `apis` map (whole-directory replace on the backend).
-const apis = ref<Partial<Record<ApiKind, ApiConfig>>>({ ...props.provider.apis })
-const fallback = ref<ApiKind | null>(props.provider.fallback ?? null)
-const apisEditor = ref<{ validate: () => string | null } | null>(null)
-
-/**
- * Default section for model listing / model tests: the `fallback` protocol
- * when declared, else chat_completions, else the next protocol key — never
- * the `image` section, independent of key insertion order.
- */
-const primaryKind = computed<ApiKind | null>(() => defaultProbeKind(apis.value, fallback.value))
-
-/** Sections selectable as the models-probe target (protocol keys only, fixed order). */
-const protocolSections = computed<ApiKind[]>(() => {
-  const keys = Object.keys(apis.value) as ApiKind[]
-  return PROBE_KIND_ORDER.filter((k) => keys.includes(k))
-})
-
-/** Currently selected probe section; falls back to the default when it disappears. */
-const probeKind = ref<ApiKind | null>(null)
-watch(
-  [primaryKind, protocolSections],
-  () => {
-    if (!probeKind.value || !protocolSections.value.includes(probeKind.value)) {
-      probeKind.value = primaryKind.value
-    }
-  },
-  { immediate: true },
-)
-const probeApi = computed<ApiConfig | null>(() =>
-  probeKind.value ? (apis.value[probeKind.value] ?? null) : null,
-)
-
 // ── API keys ─────────────────────────────────────────────────
 const apiKeys = ref<string[]>([...props.provider.api_keys])
 const keyStrategy = ref<"fill_first" | "round_robin">(props.provider.key_strategy)
 
 // ── Models ───────────────────────────────────────────────────
 const enabledModels = ref<string[]>([...props.provider.enabled_models])
-
-function onTestModel(model: string) {
-  const probe = probeApi.value
-  if (!probe) {
-    store.upstreamModelsError = "Declare an API section first (APIs tab)"
-    return
-  }
-  store.testModelWithState(model, {
-    model,
-    api_keys: apiKeys.value.filter((k) => k.trim()),
-    base_url: probe.base_url,
-    api_kind: probeKind.value ?? undefined,
-    headers: probe.headers ?? headersMap(),
-    proxy_mode: proxyMode.value,
-  })
-}
 
 // ── KV pairs ─────────────────────────────────────────────────
 const headersList = ref<{ key: string; value: string }[]>(
@@ -177,22 +122,23 @@ function roleMappingsMap(): Record<string, string> {
   return m
 }
 
-// ── Fetch upstream models ────────────────────────────────────
-function onFetchModels() {
-  const probe = probeApi.value
-  if (!probe) {
-    store.upstreamModelsError = "Declare an API section first (APIs tab)"
-    return
-  }
-  store.fetchUpstreamModels({
-    base_url: probe.base_url,
-    api_keys: apiKeys.value.filter((k) => k.trim()),
-    headers: probe.headers ?? headersMap(),
-    api_kind: probeKind.value ?? undefined,
-    models_endpoint: probe.models_endpoint,
-    proxy_mode: proxyMode.value,
-  })
-}
+// ── Protocol probe (shared composable) ───────────────────────
+const {
+  apis,
+  fallback,
+  apisEditor,
+  protocolSections,
+  probeKind,
+  probeApi,
+  onFetchModels,
+  onTestModel,
+} = useProviderProbe({
+  initialApis: props.provider.apis,
+  initialFallback: props.provider.fallback ?? null,
+  apiKeys,
+  proxyMode,
+  getHeaders: headersMap,
+})
 
 // ── Submit ───────────────────────────────────────────────────
 async function handleSubmit() {

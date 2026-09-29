@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Loader2, X } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { computed, onMounted, ref, watch } from "vue"
+import { ref } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
@@ -20,7 +20,8 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { API_KIND_LABELS, PROBE_KIND_ORDER, defaultProbeKind } from "@/lib/provider-probe"
+import { useProviderProbe } from "@/composables/useProviderProbe"
+import { API_KIND_LABELS } from "@/lib/provider-probe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
@@ -35,47 +36,9 @@ const emit = defineEmits<{
 const adding = ref(false)
 const apiError = ref("")
 
-onMounted(() => {
-  store.upstreamModels = []
-  store.upstreamModelsError = ""
-})
-
 // ── API keys management ──────────────────────────────────────
 const apiKeys = ref<string[]>([""])
 const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
-
-// ── API sections (protocol catalog) ──────────────────────────
-const apis = ref<Partial<Record<ApiKind, ApiConfig>>>({})
-const fallback = ref<ApiKind | null>(null)
-const apisEditor = ref<{ validate: () => string | null } | null>(null)
-
-/**
- * Default section for model listing / model tests: the `fallback` protocol
- * when declared, else chat_completions, else the next protocol key — never
- * the `image` section, independent of key insertion order.
- */
-const primaryKind = computed<ApiKind | null>(() => defaultProbeKind(apis.value, fallback.value))
-
-/** Sections selectable as the models-probe target (protocol keys only, fixed order). */
-const protocolSections = computed<ApiKind[]>(() => {
-  const keys = Object.keys(apis.value) as ApiKind[]
-  return PROBE_KIND_ORDER.filter((k) => keys.includes(k))
-})
-
-/** Currently selected probe section; falls back to the default when it disappears. */
-const probeKind = ref<ApiKind | null>(null)
-watch(
-  [primaryKind, protocolSections],
-  () => {
-    if (!probeKind.value || !protocolSections.value.includes(probeKind.value)) {
-      probeKind.value = primaryKind.value
-    }
-  },
-  { immediate: true },
-)
-const probeApi = computed<ApiConfig | null>(() =>
-  probeKind.value ? (apis.value[probeKind.value] ?? null) : null,
-)
 
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
@@ -90,11 +53,6 @@ function parsedHeadersValue(): Record<string, string> {
   )
 }
 
-/** Effective probe headers: section overrides fully replace provider-level defaults. */
-function effectiveHeaders(): Record<string, string> {
-  return probeApi.value?.headers ?? parsedHeadersValue()
-}
-
 function roleMappingsMap(): Record<string, string> {
   return roleMappingsList.value.reduce(
     (acc, m) => {
@@ -103,38 +61,6 @@ function roleMappingsMap(): Record<string, string> {
     },
     {} as Record<string, string>,
   )
-}
-
-function onFetchModels() {
-  const probe = probeApi.value
-  if (!probe) {
-    store.upstreamModelsError = "Declare an API section first (APIs tab)"
-    return
-  }
-  store.fetchUpstreamModels({
-    base_url: probe.base_url,
-    api_keys: apiKeys.value.filter((k) => k.trim()),
-    headers: probe.headers ?? effectiveHeaders(),
-    api_kind: probeKind.value ?? undefined,
-    models_endpoint: probe.models_endpoint,
-    proxy_mode: proxyMode.value,
-  })
-}
-
-function onTestModel(model: string) {
-  const probe = probeApi.value
-  if (!probe) {
-    store.upstreamModelsError = "Declare an API section first (APIs tab)"
-    return
-  }
-  store.testModelWithState(model, {
-    model,
-    api_keys: apiKeys.value.filter((k) => k.trim()),
-    base_url: probe.base_url,
-    api_kind: probeKind.value ?? undefined,
-    headers: probe.headers ?? effectiveHeaders(),
-    proxy_mode: proxyMode.value,
-  })
 }
 
 // ── Proxy mode ───────────────────────────────────────────────
@@ -147,6 +73,22 @@ const headers = ref<{ key: string; value: string }[]>([])
 const roleMappingsList = ref<{ key: string; value: string }[]>([])
 const bodyOverrides = ref<{ key: string; value: string }[]>([])
 const stripFields = ref<string[]>([])
+
+// ── Protocol probe (shared composable) ───────────────────────
+const {
+  apis,
+  fallback,
+  apisEditor,
+  protocolSections,
+  probeKind,
+  probeApi,
+  onFetchModels,
+  onTestModel,
+} = useProviderProbe({
+  apiKeys,
+  proxyMode,
+  getHeaders: parsedHeadersValue,
+})
 
 // ── Form ─────────────────────────────────────────────────────
 const formSchema = z.object({
