@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { Loader2, X } from "@lucide/vue"
+import { Loader2 } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
 import { computed, ref } from "vue"
 import { toast } from "vue-sonner"
-import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
-import KvEditor from "@/components/KvEditor.vue"
-import ModelManager from "@/components/ModelManager.vue"
 import ApisEditor from "@/components/providers/ApisEditor.vue"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import ProviderAdvancedTab from "@/components/providers/ProviderAdvancedTab.vue"
+import ProviderBasicFields from "@/components/providers/ProviderBasicFields.vue"
+import ProviderModelsTab from "@/components/providers/ProviderModelsTab.vue"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -29,26 +28,16 @@ import {
 } from "@/components/ui/drawer"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
-import { API_KIND_LABELS } from "@/lib/provider-probe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { ApiKind, Provider, ProxyMode } from "@/types/api"
+import type { Provider, ProxyMode } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
 const Modal = computed(() => ({
   Root: isDesktop.value ? Dialog : Drawer,
-  Trigger: isDesktop.value ? "div" : "div",
   Content: isDesktop.value ? DialogContent : DrawerContent,
   Header: isDesktop.value ? DialogHeader : DrawerHeader,
   Title: isDesktop.value ? DialogTitle : DrawerTitle,
@@ -266,46 +255,11 @@ async function handleSubmit() {
               />
             </div>
 
-            <div class="col-span-2">
-              <ApiKeyEditor :api-keys="apiKeys" @update:api-keys="apiKeys = $event" />
-            </div>
-
-            <div class="space-y-1">
-              <FieldLabel>Key Strategy</FieldLabel>
-              <Select
-                :model-value="keyStrategy"
-                @update:model-value="(v) => (keyStrategy = v as 'fill_first' | 'round_robin')"
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="fill_first">Fill First</SelectItem>
-                  <SelectItem value="round_robin">Round Robin</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div class="space-y-1">
-              <FieldLabel>Proxy Mode</FieldLabel>
-              <Select
-                :model-value="proxyMode"
-                @update:model-value="(v) => (proxyMode = v as ProxyMode)"
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="inherit">Inherit</SelectItem>
-                  <SelectItem value="enabled">Enabled</SelectItem>
-                  <SelectItem value="disabled">Disabled</SelectItem>
-                </SelectContent>
-              </Select>
-              <p class="text-muted-foreground text-xs">
-                How this provider resolves the upstream proxy. Inherit follows the gateway-level
-                proxy URL.
-              </p>
-            </div>
+            <ProviderBasicFields
+              v-model:api-keys="apiKeys"
+              v-model:key-strategy="keyStrategy"
+              v-model:proxy-mode="proxyMode"
+            />
           </TabsContent>
 
           <!-- ─── Tab: APIs ───────────────────────────────────── -->
@@ -322,40 +276,12 @@ async function handleSubmit() {
 
           <!-- ─── Tab: Models ─────────────────────────────────── -->
           <TabsContent value="models" class="space-y-3">
-            <div v-if="probeApi" class="flex min-w-0 items-center gap-2">
-              <Select
-                v-if="protocolSections.length > 1"
-                :model-value="probeKind ?? undefined"
-                @update:model-value="(v) => (probeKind = v as ApiKind)"
-              >
-                <SelectTrigger class="h-7 w-44 text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem
-                    v-for="kind in protocolSections"
-                    :key="kind"
-                    :value="kind"
-                    class="text-xs"
-                  >
-                    {{ API_KIND_LABELS[kind] }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <code v-else class="text-xs">{{ probeKind }}</code>
-              <span class="text-muted-foreground shrink-0 text-xs">→</span>
-              <code class="truncate text-xs">
-                {{ probeApi.base_url }}/{{ probeApi.models_endpoint || "models" }}
-              </code>
-            </div>
-            <ModelManager
+            <ProviderModelsTab
               :provider-name="provider.name"
-              :enabled-models="enabledModels"
-              :upstream-models="store.upstreamModels"
-              :upstream-models-loading="store.upstreamModelsLoading"
-              :upstream-models-error="store.upstreamModelsError"
-              :model-test-states="store.testModelState.states"
-              @update:enabled-models="enabledModels = $event"
+              :protocol-sections="protocolSections"
+              :probe-api="probeApi"
+              v-model:probe-kind="probeKind"
+              v-model:enabled-models="enabledModels"
               @fetch-models="onFetchModels"
               @test-model="onTestModel"
             />
@@ -363,77 +289,13 @@ async function handleSubmit() {
 
           <!-- ─── Tab: Advanced ───────────────────────────────── -->
           <TabsContent value="advanced" class="space-y-4">
-            <p class="text-muted-foreground text-xs">
-              Provider-level defaults below apply to every API section. A field declared inside an
-              <strong>APIs</strong> section <strong>fully replaces</strong> the default of the same
-              name for that section (maps are not merged, arrays not unioned).
-            </p>
-
-            <KvEditor
-              v-model="headersList"
-              title="Headers"
-              description="Key-value pairs of custom headers (values are plain text)."
-              key-placeholder="Header-Name"
-              value-placeholder="Value"
-            />
-
-            <Separator />
-
-            <Alert variant="warning">
-              <AlertTitle>提示</AlertTitle>
-              <AlertDescription>
-                Body Overrides
-                对该供应商的<strong>所有模型</strong>生效。如需为特定模型设置不同参数，请前往
-                <strong>APIs Tab</strong> 对应 API section 的 Advanced 中配置
-                <strong>Model Overrides</strong>，避免在多个路由的 target 中重复配置
-                <code>extra</code>。
-              </AlertDescription>
-            </Alert>
-
-            <KvEditor
-              v-model="bodyOverridesList"
-              title="Body Overrides"
-              description='Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).'
-              key-placeholder="max_tokens"
-              value-placeholder="4096"
-            />
-
-            <Separator />
-
-            <div>
-              <FieldLabel>Strip Fields</FieldLabel>
-              <p class="text-muted-foreground mb-2 text-xs">
-                Top-level fields to remove from the upstream JSON body before sending. Applied last,
-                after all overrides. Use for fields the upstream rejects (e.g.
-                <code>chat_template_kwargs</code> for pydantic <code>extra=forbid</code>).
-              </p>
-              <div
-                v-for="(_, idx) in stripFieldsList"
-                :key="idx"
-                class="mb-2 flex items-center gap-2"
-              >
-                <Input
-                  :model-value="stripFieldsList[idx]"
-                  placeholder="field_name"
-                  @input="stripFieldsList[idx] = ($event.target as HTMLInputElement).value"
-                />
-                <Button variant="outline" size="icon-sm" @click="stripFieldsList.splice(idx, 1)">
-                  <X class="h-3 w-3" />
-                </Button>
-              </div>
-              <Button variant="outline" size="sm" @click="stripFieldsList.push('')">
-                Add Field
-              </Button>
-            </div>
-
-            <Separator />
-
-            <KvEditor
-              v-model="roleMappingsList"
-              title="Role Mappings"
-              description="Map request role names to role names supported by the upstream (case-sensitive). Example: developer → system."
-              key-placeholder="developer"
-              value-placeholder="system"
+            <ProviderAdvancedTab
+              v-model:headers="headersList"
+              v-model:body-overrides="bodyOverridesList"
+              v-model:strip-fields="stripFieldsList"
+              v-model:role-mappings="roleMappingsList"
+              show-body-override-warning
+              role-mappings-description="Map request role names to role names supported by the upstream (case-sensitive). Example: developer → system."
             />
           </TabsContent>
         </Tabs>

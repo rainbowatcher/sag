@@ -8,13 +8,6 @@ import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -383,16 +376,8 @@ const table = useVueTable({
       </div>
     </div>
 
-    <!-- ── Add Provider Dialog ───────────────────────────────────── -->
-    <Dialog :open="showAdd" @update:open="(v) => !v && (showAdd = false)">
-      <DialogContent class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
-        <DialogHeader class="shrink-0">
-          <DialogTitle>New Provider</DialogTitle>
-          <DialogDescription> Configure a new upstream provider connection </DialogDescription>
-        </DialogHeader>
-        <ProviderAddForm @close="showAdd = false" @created="onCreated" />
-      </DialogContent>
-    </Dialog>
+    <!-- ── Add Drawer / Dialog ───────────────────────────────────── -->
+    <ProviderAddForm v-if="showAdd" :open="showAdd" @close="showAdd = false" @created="onCreated" />
 
     <!-- ── Loading ───────────────────────────────────────────────── -->
     <div

@@ -1,32 +1,60 @@
 <script setup lang="ts">
-import { Loader2, X } from "@lucide/vue"
+import { Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { ref } from "vue"
+import { useMediaQuery } from "@vueuse/core"
+import { computed, ref } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
-import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
-import KvEditor from "@/components/KvEditor.vue"
-import ModelManager from "@/components/ModelManager.vue"
 import ApisEditor from "@/components/providers/ApisEditor.vue"
+import ProviderAdvancedTab from "@/components/providers/ProviderAdvancedTab.vue"
+import ProviderBasicFields from "@/components/providers/ProviderBasicFields.vue"
+import ProviderModelsTab from "@/components/providers/ProviderModelsTab.vue"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  Drawer,
+  DrawerClose,
+  DrawerContent,
+  DrawerDescription,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+} from "@/components/ui/drawer"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
-import { API_KIND_LABELS } from "@/lib/provider-probe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
 
+// Self-framing modal: Dialog on desktop, Drawer on mobile — mirrors the
+// container mechanics of ProviderEditForm so both provider forms own theirs.
+const isDesktop = useMediaQuery("(min-width: 640px)")
+
+const Modal = computed(() => ({
+  Root: isDesktop.value ? Dialog : Drawer,
+  Content: isDesktop.value ? DialogContent : DrawerContent,
+  Header: isDesktop.value ? DialogHeader : DrawerHeader,
+  Title: isDesktop.value ? DialogTitle : DrawerTitle,
+  Description: isDesktop.value ? DialogDescription : DrawerDescription,
+  Footer: isDesktop.value ? DialogFooter : DrawerFooter,
+  Close: isDesktop.value ? DialogClose : DrawerClose,
+}))
+
 const store = useProviderStore()
+
+defineProps<{
+  open?: boolean
+}>()
 
 const emit = defineEmits<{
   close: []
@@ -35,6 +63,10 @@ const emit = defineEmits<{
 
 const adding = ref(false)
 const apiError = ref("")
+
+function onOpenChange(v: boolean) {
+  if (!v) emit("close")
+}
 
 // ── API keys management ──────────────────────────────────────
 const apiKeys = ref<string[]>([""])
@@ -122,19 +154,16 @@ const form = useForm({
     const parsedHeaders = parsedHeadersValue()
     const parsedRoleMappings = roleMappingsMap()
 
-    const parsedOverrides = bodyOverrides.value.reduce(
-      (acc, h) => {
-        if (h.key.trim() && h.value.trim()) {
-          try {
-            acc[h.key.trim()] = JSON.parse(h.value.trim())
-          } catch {
-            acc[h.key.trim()] = h.value.trim()
-          }
-        }
-        return acc
-      },
-      {} as Record<string, any>,
-    )
+    const parsedOverrides: Record<string, any> = {}
+    for (const { key, value: val } of bodyOverrides.value) {
+      if (!key.trim()) continue
+      try {
+        parsedOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
+      } catch {
+        apiError.value = `Body override "${key}": invalid JSON value`
+        return
+      }
+    }
 
     const filteredStrip = stripFields.value.filter((f) => f.trim().length > 0)
 
@@ -181,227 +210,127 @@ async function handleSubmit(event: Event) {
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-    <div v-if="apiError" class="mb-2 shrink-0 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500">
-      {{ apiError }}
-    </div>
+  <component :is="Modal.Root" :open="open ?? true" @update:open="onOpenChange">
+    <component :is="Modal.Content" class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
+      <component :is="Modal.Header" class="shrink-0">
+        <component :is="Modal.Title">New Provider</component>
+        <component :is="Modal.Description">
+          Configure a new upstream provider connection
+        </component>
+      </component>
 
-    <div class="min-h-0 min-w-0 flex-1 overflow-y-auto px-1 pb-4 sm:px-2">
-      <form id="provider-add-form" @submit.prevent="handleSubmit">
-        <Tabs default-value="basic">
-          <TabsList class="mb-4">
-            <TabsTrigger value="basic">Basic</TabsTrigger>
-            <TabsTrigger value="apis">APIs</TabsTrigger>
-            <TabsTrigger value="models">Models</TabsTrigger>
-            <TabsTrigger value="advanced">Advanced</TabsTrigger>
-          </TabsList>
+      <div
+        v-if="apiError"
+        class="mx-6 mb-2 shrink-0 rounded-md bg-red-50 px-3 py-2 text-sm text-red-500"
+      >
+        {{ apiError }}
+      </div>
 
-          <!-- ─── Tab: Basic ──────────────────────────────────── -->
-          <TabsContent value="basic" class="grid grid-cols-2 gap-4">
-            <form.Field name="name" #default="{ field }">
-              <Field :data-invalid="isInvalid(field)">
-                <FieldLabel :for="field.name">Name *</FieldLabel>
-                <Input
-                  :id="field.name"
-                  :model-value="field.state.value"
-                  placeholder="my-openai"
-                  :aria-invalid="isInvalid(field)"
-                  @blur="field.handleBlur"
-                  @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                />
-                <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-              </Field>
-            </form.Field>
+      <div class="min-h-0 min-w-0 flex-1 overflow-y-auto px-2 pb-4 sm:px-6">
+        <form id="provider-add-form" @submit.prevent="handleSubmit">
+          <Tabs default-value="basic">
+            <TabsList class="mb-4">
+              <TabsTrigger value="basic">Basic</TabsTrigger>
+              <TabsTrigger value="apis">APIs</TabsTrigger>
+              <TabsTrigger value="models">Models</TabsTrigger>
+              <TabsTrigger value="advanced">Advanced</TabsTrigger>
+            </TabsList>
 
-            <div class="space-y-1">
-              <form.Field name="timeout_secs" #default="{ field }">
+            <!-- ─── Tab: Basic ──────────────────────────────────── -->
+            <TabsContent value="basic" class="grid grid-cols-2 gap-4">
+              <form.Field name="name" #default="{ field }">
                 <Field :data-invalid="isInvalid(field)">
-                  <FieldLabel :for="field.name">Timeout (secs)</FieldLabel>
+                  <FieldLabel :for="field.name">Name *</FieldLabel>
                   <Input
                     :id="field.name"
-                    type="number"
                     :model-value="field.state.value"
-                    placeholder="600 (默认)"
+                    placeholder="my-openai"
                     :aria-invalid="isInvalid(field)"
                     @blur="field.handleBlur"
-                    @input="
-                      field.handleChange(
-                        ($event.target as HTMLInputElement).value === ''
-                          ? undefined
-                          : Number(($event.target as HTMLInputElement).value),
-                      )
-                    "
+                    @input="field.handleChange(($event.target as HTMLInputElement).value)"
                   />
                   <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
                 </Field>
               </form.Field>
-            </div>
 
-            <div class="col-span-2">
-              <ApiKeyEditor :api-keys="apiKeys" @update:api-keys="apiKeys = $event" />
-            </div>
-
-            <div class="space-y-1">
-              <FieldLabel>Key Strategy</FieldLabel>
-              <Select
-                :model-value="keyStrategy"
-                @update:model-value="(v) => (keyStrategy = v as 'fill_first' | 'round_robin')"
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="fill_first">Fill First</SelectItem>
-                  <SelectItem value="round_robin">Round Robin</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div class="space-y-1">
-              <FieldLabel>Proxy Mode</FieldLabel>
-              <Select
-                :model-value="proxyMode"
-                @update:model-value="(v) => (proxyMode = v as ProxyMode)"
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="inherit">Inherit</SelectItem>
-                  <SelectItem value="enabled">Enabled</SelectItem>
-                  <SelectItem value="disabled">Disabled</SelectItem>
-                </SelectContent>
-              </Select>
-              <p class="text-muted-foreground text-xs">
-                How this provider resolves the upstream proxy. Inherit follows the gateway-level
-                proxy URL.
-              </p>
-            </div>
-          </TabsContent>
-
-          <!-- ─── Tab: APIs ───────────────────────────────────── -->
-          <TabsContent value="apis" class="min-w-0 space-y-4">
-            <ApisEditor
-              ref="apisEditor"
-              v-model="apis"
-              v-model:fallback="fallback"
-              :api-keys="apiKeys"
-              :proxy-mode="proxyMode"
-              :provider-headers="parsedHeadersValue()"
-            />
-          </TabsContent>
-
-          <!-- ─── Tab: Models ─────────────────────────────────── -->
-          <TabsContent value="models" class="space-y-3">
-            <div v-if="probeApi" class="flex min-w-0 items-center gap-2">
-              <Select
-                v-if="protocolSections.length > 1"
-                :model-value="probeKind ?? undefined"
-                @update:model-value="(v) => (probeKind = v as ApiKind)"
-              >
-                <SelectTrigger class="h-7 w-44 text-xs">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem
-                    v-for="kind in protocolSections"
-                    :key="kind"
-                    :value="kind"
-                    class="text-xs"
-                  >
-                    {{ API_KIND_LABELS[kind] }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-              <code v-else class="text-xs">{{ probeKind }}</code>
-              <span class="text-muted-foreground shrink-0 text-xs">→</span>
-              <code class="truncate text-xs">
-                {{ probeApi.base_url }}/{{ probeApi.models_endpoint || "models" }}
-              </code>
-            </div>
-            <ModelManager
-              :provider-name="form.state.values.name"
-              :enabled-models="enabledModels"
-              :upstream-models="store.upstreamModels"
-              :upstream-models-loading="store.upstreamModelsLoading"
-              :upstream-models-error="store.upstreamModelsError"
-              :model-test-states="store.testModelState.states"
-              @update:enabled-models="enabledModels = $event"
-              @fetch-models="onFetchModels"
-              @test-model="onTestModel"
-            />
-          </TabsContent>
-
-          <!-- ─── Tab: Advanced ───────────────────────────────── -->
-          <TabsContent value="advanced" class="space-y-4">
-            <p class="text-muted-foreground text-xs">
-              Provider-level defaults below apply to every API section. A field declared inside an
-              <strong>APIs</strong> section <strong>fully replaces</strong> the default of the same
-              name for that section (maps are not merged, arrays not unioned).
-            </p>
-
-            <KvEditor
-              v-model="headers"
-              title="Headers"
-              description="Key-value pairs of custom headers (values are plain text)."
-              key-placeholder="Header-Name"
-              value-placeholder="Value"
-            />
-
-            <Separator />
-
-            <KvEditor
-              v-model="bodyOverrides"
-              title="Body Overrides"
-              description='Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).'
-              key-placeholder="max_tokens"
-              value-placeholder="4096"
-            />
-
-            <Separator />
-
-            <div>
-              <FieldLabel>Strip Fields</FieldLabel>
-              <p class="text-muted-foreground mb-2 text-xs">
-                Top-level fields to remove from the upstream JSON body before sending. Applied last,
-                after all overrides. Use for fields the upstream rejects (e.g.
-                <code>chat_template_kwargs</code> for pydantic <code>extra=forbid</code>).
-              </p>
-              <div v-for="(_, idx) in stripFields" :key="idx" class="mb-2 flex items-center gap-2">
-                <Input
-                  :model-value="stripFields[idx]"
-                  placeholder="field_name"
-                  @input="stripFields[idx] = ($event.target as HTMLInputElement).value"
-                />
-                <Button variant="outline" size="icon-sm" @click="stripFields.splice(idx, 1)">
-                  <X class="h-3 w-3" />
-                </Button>
+              <div class="space-y-1">
+                <form.Field name="timeout_secs" #default="{ field }">
+                  <Field :data-invalid="isInvalid(field)">
+                    <FieldLabel :for="field.name">Timeout (secs)</FieldLabel>
+                    <Input
+                      :id="field.name"
+                      type="number"
+                      :model-value="field.state.value"
+                      placeholder="600 (默认)"
+                      :aria-invalid="isInvalid(field)"
+                      @blur="field.handleBlur"
+                      @input="
+                        field.handleChange(
+                          ($event.target as HTMLInputElement).value === ''
+                            ? undefined
+                            : Number(($event.target as HTMLInputElement).value),
+                        )
+                      "
+                    />
+                    <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+                  </Field>
+                </form.Field>
               </div>
-              <Button variant="outline" size="sm" @click="stripFields.push('')"> Add Field </Button>
-            </div>
 
-            <Separator />
+              <ProviderBasicFields
+                v-model:api-keys="apiKeys"
+                v-model:key-strategy="keyStrategy"
+                v-model:proxy-mode="proxyMode"
+              />
+            </TabsContent>
 
-            <KvEditor
-              v-model="roleMappingsList"
-              title="Role Mappings"
-              description="Maps request role names to roles the upstream supports (case-sensitive). Example: developer → system."
-              key-placeholder="developer"
-              value-placeholder="system"
-            />
-          </TabsContent>
-        </Tabs>
-      </form>
-    </div>
+            <!-- ─── Tab: APIs ───────────────────────────────────── -->
+            <TabsContent value="apis" class="min-w-0 space-y-4">
+              <ApisEditor
+                ref="apisEditor"
+                v-model="apis"
+                v-model:fallback="fallback"
+                :api-keys="apiKeys"
+                :proxy-mode="proxyMode"
+                :provider-headers="parsedHeadersValue()"
+              />
+            </TabsContent>
 
-    <div class="mt-auto flex shrink-0 justify-end gap-2 border-t pt-4">
-      <Button variant="outline" size="sm" type="button" :disabled="adding" @click="emit('close')">
-        Cancel
-      </Button>
-      <Button type="submit" form="provider-add-form" size="sm" :disabled="adding">
-        <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
-        {{ adding ? "Adding..." : "Create Provider" }}
-      </Button>
-    </div>
-  </div>
+            <!-- ─── Tab: Models ─────────────────────────────────── -->
+            <TabsContent value="models" class="space-y-3">
+              <ProviderModelsTab
+                :provider-name="form.state.values.name"
+                :protocol-sections="protocolSections"
+                :probe-api="probeApi"
+                v-model:probe-kind="probeKind"
+                v-model:enabled-models="enabledModels"
+                @fetch-models="onFetchModels"
+                @test-model="onTestModel"
+              />
+            </TabsContent>
+
+            <!-- ─── Tab: Advanced ───────────────────────────────── -->
+            <TabsContent value="advanced" class="space-y-4">
+              <ProviderAdvancedTab
+                v-model:headers="headers"
+                v-model:body-overrides="bodyOverrides"
+                v-model:strip-fields="stripFields"
+                v-model:role-mappings="roleMappingsList"
+              />
+            </TabsContent>
+          </Tabs>
+        </form>
+      </div>
+
+      <component :is="Modal.Footer" class="shrink-0">
+        <component :is="Modal.Close" as-child>
+          <Button variant="outline" size="sm" type="button" :disabled="adding"> Cancel </Button>
+        </component>
+        <Button type="submit" form="provider-add-form" size="sm" :disabled="adding">
+          <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
+          {{ adding ? "Adding..." : "Create Provider" }}
+        </Button>
+      </component>
+    </component>
+  </component>
 </template>
