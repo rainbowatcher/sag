@@ -22,7 +22,6 @@ interface KvPair {
   value: string
 }
 
-/** Editable draft of one `providers.<name>.apis.<kind>` section. */
 interface SectionDraft {
   uid: number
   kind: ApiKind
@@ -33,7 +32,6 @@ interface SectionDraft {
   strip_fields: string[]
   model_overrides: KvPair[]
   role_mappings: KvPair[]
-  /** Tri-state cache control: inherit provider default / force on / force off. */
   anthropic_cache_control: "inherit" | "enable" | "disable"
   timeout_secs: string
   chunk_timeout_secs: string
@@ -44,11 +42,8 @@ interface SectionDraft {
 const props = defineProps<{
   modelValue: Partial<Record<ApiKind, ApiConfig>>
   fallback: ApiKind | null
-  /** Provider API keys — used by the protocol probe only. */
   apiKeys?: string[]
-  /** Provider proxy mode — forwarded to the protocol probe. */
   proxyMode?: ProxyMode
-  /** Provider-level default headers — applied to every probe target. */
   providerHeaders?: Record<string, string>
 }>()
 
@@ -68,13 +63,6 @@ const API_KIND_ORDER: ApiKind[] = ["chat_completions", "responses", "anthropic_m
 
 const PROTOCOL_KINDS = new Set<ApiKind>(["chat_completions", "responses", "anthropic_messages"])
 
-const DEFAULT_SECTION_BASE_URLS: Record<ApiKind, string> = {
-  chat_completions: "https://api.openai.com/v1",
-  responses: "https://api.openai.com/v1",
-  anthropic_messages: "https://api.anthropic.com",
-  image: "https://api.openai.com/v1",
-}
-
 const DEFAULT_MODELS_ENDPOINT_HINTS: Record<ApiKind, string> = {
   chat_completions: "models",
   responses: "models",
@@ -82,7 +70,8 @@ const DEFAULT_MODELS_ENDPOINT_HINTS: Record<ApiKind, string> = {
   image: "models",
 }
 
-// ── Draft state ────────────────────────────────────────────────
+const BASE_URL_PLACEHOLDER = "https://api.example.com/v1"
+
 let uidCounter = 0
 
 function pairsFrom(obj: Record<string, string> | undefined): KvPair[] {
@@ -130,7 +119,6 @@ const sections = ref<SectionDraft[]>(
 )
 const fallbackValue = ref<ApiKind | null>(props.fallback ?? null)
 
-// ── Serialization helpers ──────────────────────────────────────
 function kvToObject(pairs: KvPair[]): Record<string, string> {
   const out: Record<string, string> = {}
   for (const { key, value } of pairs) {
@@ -159,7 +147,6 @@ function parseOptionalNumber(raw: string): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined
 }
 
-/** JSON-object validation for the model_overrides editor of one section. */
 function sectionJsonError(d: SectionDraft): string | null {
   for (const { key, value } of d.model_overrides) {
     if (!key.trim() || !value.trim()) continue
@@ -232,7 +219,6 @@ function emitAll() {
   }
 }
 
-// ── Derived state ──────────────────────────────────────────────
 const availableKinds = computed(() =>
   API_KIND_ORDER.filter((kind) => !sections.value.some((d) => d.kind === kind)),
 )
@@ -241,7 +227,6 @@ const protocolKeys = computed(() =>
   sections.value.map((d) => d.kind).filter((k) => PROTOCOL_KINDS.has(k)),
 )
 
-/** Declared protocol sections' base_url — prefill source for the probe panel. */
 const filledBaseUrls = computed<Partial<Record<ProtocolApiKind, string>>>(() => {
   const out: Partial<Record<ProtocolApiKind, string>> = {}
   for (const d of sections.value) {
@@ -252,7 +237,6 @@ const filledBaseUrls = computed<Partial<Record<ProtocolApiKind, string>>>(() => 
   return out
 })
 
-/** Declared protocol sections' headers — sent per probe target. */
 const sectionHeaders = computed<Partial<Record<ProtocolApiKind, Record<string, string>>>>(() => {
   const out: Partial<Record<ProtocolApiKind, Record<string, string>>> = {}
   for (const d of sections.value) {
@@ -263,11 +247,6 @@ const sectionHeaders = computed<Partial<Record<ProtocolApiKind, Record<string, s
   return out
 })
 
-/**
- * One-click backfill from the probe matrix: write each probed base_url into
- * its API section (creating the section when missing). Purely a form edit —
- * persistence still goes through the parent form's normal save path.
- */
 function onProbeBackfill(items: { protocol: ProtocolApiKind; base_url: string }[]) {
   for (const { protocol, base_url } of items) {
     const existing = sections.value.find((d) => d.kind === protocol)
@@ -287,7 +266,7 @@ const newKind = ref<ApiKind | "">("")
 function addSection() {
   const kind = newKind.value
   if (!kind) return
-  sections.value.push(draftFrom(kind, { base_url: DEFAULT_SECTION_BASE_URLS[kind] }))
+  sections.value.push(draftFrom(kind))
   newKind.value = ""
   emitAll()
 }
@@ -327,11 +306,6 @@ function numericValue(raw: string): string | undefined {
   return raw.trim() ? raw : undefined
 }
 
-/**
- * Pre-submit validation shared by the provider forms: empty catalog,
- * missing base_url, invalid JSON, or a missing fallback on a multi-protocol
- * catalog. Returns an error message, or `null` when the catalog is valid.
- */
 function validate(): string | null {
   if (sections.value.length === 0) {
     return "At least one API section is required (e.g. chat_completions)"
@@ -371,7 +345,6 @@ defineExpose({ validate })
         field <strong>fully replaces</strong> the provider-level default of the same name.
       </p>
 
-      <!-- Existing sections -->
       <div v-for="d in sections" :key="d.uid" class="space-y-3 rounded-md border p-3">
         <div class="flex items-center gap-2">
           <Badge variant="outline" class="font-mono text-xs">
@@ -396,7 +369,7 @@ defineExpose({ validate })
             <Input
               :id="`base-url-${d.uid}`"
               :model-value="d.base_url"
-              placeholder="https://api.openai.com/v1"
+              :placeholder="BASE_URL_PLACEHOLDER"
               class="font-mono text-sm"
               @input="updateSection(d.uid, { base_url: ($event.target as HTMLInputElement).value })"
             />
@@ -570,7 +543,6 @@ defineExpose({ validate })
         </div>
       </div>
 
-      <!-- Add section -->
       <div v-if="availableKinds.length > 0" class="flex items-center gap-2">
         <Select v-model="newKind">
           <SelectTrigger class="w-56">
@@ -593,7 +565,6 @@ defineExpose({ validate })
       </p>
     </div>
 
-    <!-- ── Protocol probe ─────────────────────────────────────── -->
     <Separator />
     <ProtocolProbePanel
       :filled-base-urls="filledBaseUrls"
@@ -604,7 +575,6 @@ defineExpose({ validate })
       @backfill="onProbeBackfill"
     />
 
-    <!-- Fallback -->
     <div class="space-y-1">
       <FieldLabel>Fallback Protocol</FieldLabel>
       <template v-if="protocolKeys.length === 1">

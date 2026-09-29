@@ -27,6 +27,12 @@ use crate::{AnthropicProvider, LlmProvider, OpenAiProvider, ProviderBase};
 /// - `anthropic_messages*` → `anthropic_messages` node;
 /// - `responses_native*` → `responses` node.
 ///
+/// The dispatcher keys the call path on the **actually-used protocol**
+/// (`target.upstream_protocol`): `anthropic_messages*` / `responses_native*`
+/// are invoked directly for those protocols, so `chat` / `chat_stream` are
+/// only reached when the used protocol is `chat_completions`. The node
+/// preference above is a capability fallback, not the routing decision.
+///
 /// Unsupported combinations return `BadRequest`, matching the trait
 /// defaults.
 pub struct CatalogProvider {
