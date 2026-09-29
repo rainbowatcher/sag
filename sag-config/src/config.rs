@@ -314,8 +314,64 @@ impl GatewayConfig {
         warnings: &mut Vec<String>,
     ) {
         for (name, provider) in &self.providers {
-            if provider.api_keys.is_empty() {
-                errors.push(format!("provider '{name}': api_keys must not be empty"));
+            // ── credential mode: static vs oauth ──
+            match provider.auth_mode {
+                AuthMode::OAuth => {
+                    if provider.oauth.is_none() {
+                        errors.push(format!(
+                            "provider '{name}': auth_mode='oauth' requires an [providers.{name}.oauth] section"
+                        ));
+                    }
+                    if let Some(oauth) = &provider.oauth {
+                        if oauth.token_url.trim().is_empty() {
+                            errors.push(format!(
+                                "provider '{name}': oauth.token_url must not be empty"
+                            ));
+                        }
+                        if oauth.client_id.trim().is_empty() {
+                            errors.push(format!(
+                                "provider '{name}': oauth.client_id must not be empty"
+                            ));
+                        }
+                        if oauth.client_secret.trim().is_empty() {
+                            errors.push(format!(
+                                "provider '{name}': oauth.client_secret must not be empty"
+                            ));
+                        }
+                    }
+                    // Phase 1: OAuth tokens are rendered as
+                    // `Authorization: Bearer` for chat/responses/image.
+                    // The Anthropic Messages wire shape (`x-api-key`) is
+                    // not supported for OAuth credentials yet.
+                    if provider.apis.contains_key(&ApiKind::AnthropicMessages) {
+                        errors.push(format!(
+                            "provider '{name}': auth_mode='oauth' does not support anthropic_messages (Phase 1); remove apis.anthropic_messages or use auth_mode='static'"
+                        ));
+                    }
+                    // oauth 模式允许空 api_keys；若同时填写则忽略。
+                    if !provider.api_keys.is_empty() {
+                        warnings.push(format!(
+                            "provider '{name}': auth_mode='oauth' ignores api_keys"
+                        ));
+                    }
+                    // 单 OAuth client：key_strategy 无意义。
+                    if provider.key_strategy == KeyStrategy::RoundRobin {
+                        warnings.push(format!(
+                            "provider '{name}': auth_mode='oauth' uses a single client; key_strategy='round_robin' has no effect"
+                        ));
+                    }
+                }
+                AuthMode::Static => {
+                    if provider.api_keys.is_empty() {
+                        errors.push(format!("provider '{name}': api_keys must not be empty"));
+                    }
+                    // 字段宽容：static 下写了 oauth 段 → warning（不 error）。
+                    if provider.oauth.is_some() {
+                        warnings.push(format!(
+                            "provider '{name}': oauth section is ignored when auth_mode='static'"
+                        ));
+                    }
+                }
             }
             // ── apis 目录：非空、至少一个协议 key、fallback 规则 ──
             let protocol_keys: Vec<ApiKind> = provider
@@ -786,6 +842,67 @@ pub enum KeyStrategy {
     RoundRobin,
 }
 
+/// How a provider authenticates to the upstream LLM API.
+///
+/// Serde values are `static` / `oauth`. Unknown values follow the same
+/// strict pattern as the other config enums ([`Strategy`], [`KeyStrategy`],
+/// [`ProxyMode`]) — they fail config parsing rather than silently guessing.
+///
+/// OAuth is a **credential mode**, orthogonal to the `apis` protocol
+/// catalog: `auth_mode = "oauth"` with `apis.anthropic_messages` is
+/// rejected in validation (Phase 1 does not support rendering OAuth
+/// tokens for the Anthropic Messages wire shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Static `api_keys` (existing behavior; default).
+    #[default]
+    Static,
+    /// OAuth 2.0 client-credentials (optional `refresh_token` grant).
+    /// Explicit rename: default snake_case would render `o_auth`.
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+impl AuthMode {
+    /// Stable snake_case identifier matching the serde representation
+    /// (`rename_all = "snake_case"`), used by the save path to write the
+    /// value to TOML without a serde round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthMode::Static => "static",
+            AuthMode::OAuth => "oauth",
+        }
+    }
+}
+
+/// OAuth 2.0 client-credentials settings for a provider
+/// (`[providers.<name>.oauth]`).
+///
+/// `client_secret` is stored as TOML plaintext — the same reality as
+/// `api_keys`; vault/encryption is out of scope. `OAuthConfig` derives
+/// `PartialEq` because `adapter_config_changed` compares `old.oauth !=
+/// new.oauth` on hot reload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// Token endpoint URL (e.g. Azure AD / OIDC IdP).
+    pub token_url: String,
+    /// OAuth client id.
+    pub client_id: String,
+    /// OAuth client secret.
+    pub client_secret: String,
+    /// Optional OAuth scope(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Optional audience/resource parameter some IdPs require.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Optional refresh token. When present, the client first tries
+    /// `grant_type=refresh_token`; otherwise `client_credentials`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
 /// How a provider resolves the upstream HTTP proxy.
 ///
 /// Serde values are `inherit` / `enabled` / `disabled`. Unknown values
@@ -1006,6 +1123,16 @@ pub struct ProviderConfig {
     /// How to select among multiple `api_keys`.
     #[serde(default, skip_serializing_if = "is_default_key_strategy")]
     pub key_strategy: KeyStrategy,
+    /// Credential mode: `static` (default, uses `api_keys`) or `oauth`
+    /// (uses the `[providers.<name>.oauth]` section). Unknown values fail
+    /// parsing — no silent fallback.
+    #[serde(default, skip_serializing_if = "is_default_auth_mode")]
+    pub auth_mode: AuthMode,
+    /// OAuth client-credentials settings; required when `auth_mode =
+    /// "oauth"`. Table — declared before `apis` so TOML serialization
+    /// keeps tables after scalars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfig>,
     /// How this provider resolves the upstream HTTP proxy.
     ///
     /// - `inherit` (default): use the gateway-level `proxy_url` if one is
@@ -1135,6 +1262,8 @@ impl Default for ProviderConfig {
         Self {
             api_keys: Vec::new(),
             key_strategy: KeyStrategy::default(),
+            auth_mode: AuthMode::default(),
+            oauth: None,
             proxy_mode: ProxyMode::default(),
             enabled: default_true(),
             enabled_models: Vec::new(),
@@ -1303,6 +1432,9 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 fn is_default_key_strategy(v: &KeyStrategy) -> bool {
     *v == KeyStrategy::default()
+}
+fn is_default_auth_mode(v: &AuthMode) -> bool {
+    *v == AuthMode::default()
 }
 fn is_default_proxy_mode(v: &ProxyMode) -> bool {
     *v == ProxyMode::default()
@@ -2406,6 +2538,192 @@ api_keys = ["sk-test"]
             config.providers.get_mut("openai").unwrap().api_keys.clear();
             let err = config.validate().unwrap_err();
             assert!(err.iter().any(|e| e.contains("api_keys must not be empty")));
+        }
+
+        // ── auth_mode / oauth ───────────────────────────────────────
+
+        #[test]
+        fn rejects_unknown_auth_mode_value() {
+            // Unknown typed-enum values fail at parse time (loader strictness).
+            let result = toml::from_str::<GatewayConfig>(
+                r#"
+[server]
+[providers.openai]
+auth_mode = "jwt"
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+            );
+            assert!(
+                result.is_err(),
+                "unknown auth_mode must fail deserialization"
+            );
+        }
+
+        #[test]
+        fn legacy_config_without_auth_mode_parses_as_static() {
+            let config = valid_config();
+            let p = config.providers.get("openai").unwrap();
+            assert_eq!(p.auth_mode, AuthMode::Static);
+            assert!(p.oauth.is_none());
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn accepts_oauth_provider_with_complete_section() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.azure]
+auth_mode = "oauth"
+api_keys = []
+apis = { chat_completions = { base_url = "https://my-resource.openai.azure.com" } }
+
+[providers.azure.oauth]
+token_url = "https://login.microsoftonline.com/t/oauth2/v2.0/token"
+client_id = "cid"
+client_secret = "sec"
+scope = "https://cognitiveservices.azure.com/.default"
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok(), "{:?}", config.validate());
+            let p = config.providers.get("azure").unwrap();
+            assert_eq!(p.auth_mode, AuthMode::OAuth);
+            assert!(p.api_keys.is_empty(), "oauth allows empty api_keys");
+            let oauth = p.oauth.as_ref().expect("oauth section");
+            assert_eq!(oauth.client_id, "cid");
+            assert_eq!(
+                oauth.scope.as_deref(),
+                Some("https://cognitiveservices.azure.com/.default")
+            );
+        }
+
+        #[test]
+        fn rejects_oauth_missing_section() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.azure]
+auth_mode = "oauth"
+api_keys = []
+apis = { chat_completions = { base_url = "https://x.openai.azure.com" } }
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("requires an [providers.azure.oauth]")),
+                "expected missing oauth section error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_oauth_missing_required_fields() {
+            for field in ["token_url", "client_id", "client_secret"] {
+                let (url, cid, secret) = match field {
+                    "token_url" => ("", "cid", "sec"),
+                    "client_id" => ("https://login.example.com/token", "", "sec"),
+                    _ => ("https://login.example.com/token", "cid", ""),
+                };
+                let config: GatewayConfig = toml::from_str(
+                    format!(
+                        r#"
+[server]
+[providers.azure]
+auth_mode = "oauth"
+api_keys = []
+apis = {{ chat_completions = {{ base_url = "https://x.openai.azure.com" }} }}
+
+[providers.azure.oauth]
+token_url = "{url}"
+client_id = "{cid}"
+client_secret = "{secret}"
+"#
+                    )
+                    .as_str(),
+                )
+                .unwrap();
+                let err = config.validate().unwrap_err();
+                assert!(
+                    err.iter()
+                        .any(|e| e.contains(&format!("oauth.{field} must not be empty"))),
+                    "expected empty {field} error, got {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_anthropic_messages_with_oauth() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.anti]
+auth_mode = "oauth"
+api_keys = []
+apis = { anthropic_messages = { base_url = "https://api.anthropic.com" }, chat_completions = { base_url = "https://api.openai.com/v1" } }
+fallback = "chat_completions"
+
+[providers.anti.oauth]
+token_url = "https://login.example.com/token"
+client_id = "cid"
+client_secret = "sec"
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("anthropic_messages") && e.contains("Phase 1")),
+                "expected anthropic+oauth rejection, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn oauth_with_round_robin_still_validates() {
+            // warning-only: round_robin + oauth is a single-client no-op.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.azure]
+auth_mode = "oauth"
+key_strategy = "round_robin"
+api_keys = []
+apis = { chat_completions = { base_url = "https://x.openai.azure.com" } }
+
+[providers.azure.oauth]
+token_url = "https://login.example.com/token"
+client_id = "cid"
+client_secret = "sec"
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok(), "{:?}", config.validate());
+        }
+
+        #[test]
+        fn static_with_oauth_section_still_validates() {
+            // warning-only: oauth section ignored under static.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[providers.openai.oauth]
+token_url = "https://login.example.com/token"
+client_id = "cid"
+client_secret = "sec"
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok(), "{:?}", config.validate());
+            assert_eq!(
+                config.providers.get("openai").unwrap().auth_mode,
+                AuthMode::Static
+            );
         }
 
         #[test]

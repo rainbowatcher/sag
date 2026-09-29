@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-15
+updated: 2026-09-28
 ---
 
 # 变更时间线
@@ -9,6 +9,7 @@ updated: 2026-09-15
 
 ## 2026-09-28
 
+- **供应商**：[0005 Provider OAuth auth_mode 管理 CRUD 与表单](providers/changes/0005-oauth-admin-crud-and-ui.md) — Admin provider CRUD 与 UI 表单接入 `auth_mode` / `[providers.*.oauth]`；出参 secret 脱敏为 `"***"` + `client_secret_set`，更新时 `"***"` 保持原值，切 static 同步清空 oauth 段
 - **供应商**：[0004 供应商 role_mappings 编辑入口](providers/changes/0004-role-mappings-editor.md) — Provider 新增/编辑表单 Advanced tab 新增 Role Mappings 键值编辑区；编辑表单以 `JSON.stringify` 脏检查实现 PUT「缺省字段保留旧值 / 传 `{}` 清空」语义，新增表单仅在非空时携带该字段
 
 ## 2026-09-17

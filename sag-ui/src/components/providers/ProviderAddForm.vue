@@ -34,7 +34,15 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
+import {
+  emptyOAuthForm,
+  oauthFormToPayload,
+  type ApiConfig,
+  type ApiKind,
+  type AuthMode,
+  type OAuthConfigForm,
+  type ProxyMode,
+} from "@/types/api"
 
 // Self-framing modal: Dialog on desktop, Drawer on mobile — mirrors the
 // container mechanics of ProviderEditForm so both provider forms own theirs.
@@ -71,6 +79,10 @@ function onOpenChange(v: boolean) {
 // ── API keys management ──────────────────────────────────────
 const apiKeys = ref<string[]>([""])
 const keyStrategy = ref<"fill_first" | "round_robin">("fill_first")
+
+// ── Credential mode ──────────────────────────────────────────
+const authMode = ref<AuthMode>("static")
+const oauthForm = ref<OAuthConfigForm>(emptyOAuthForm())
 
 // ── Model management ─────────────────────────────────────────
 const enabledModels = ref<string[]>([])
@@ -140,9 +152,17 @@ const form = useForm({
     apiError.value = ""
 
     const validKeys = apiKeys.value.filter((k) => k.trim().length > 0)
-    if (validKeys.length === 0) {
+    const isOAuth = authMode.value === "oauth"
+    if (!isOAuth && validKeys.length === 0) {
       apiError.value = "At least one API key is required"
       return
+    }
+    if (isOAuth) {
+      const oauthPayload = oauthFormToPayload(oauthForm.value, false)
+      if (!oauthPayload.token_url || !oauthPayload.client_id || !oauthPayload.client_secret) {
+        apiError.value = "OAuth requires token_url, client_id, and client_secret"
+        return
+      }
     }
 
     const apisError = apisEditor.value?.validate()
@@ -170,8 +190,11 @@ const form = useForm({
     try {
       await store.addProvider({
         name: value.name,
-        api_keys: validKeys,
+        // OAuth mode ignores the key pool; still send empty for static shape.
+        api_keys: isOAuth ? [] : validKeys,
         key_strategy: keyStrategy.value,
+        auth_mode: authMode.value,
+        ...(isOAuth ? { oauth: oauthFormToPayload(oauthForm.value, false) } : {}),
         apis: apis.value as Record<ApiKind, ApiConfig>,
         ...(fallback.value ? { fallback: fallback.value } : {}),
         enabled_models: enabledModels.value,
@@ -281,6 +304,8 @@ async function handleSubmit(event: Event) {
                 v-model:api-keys="apiKeys"
                 v-model:key-strategy="keyStrategy"
                 v-model:proxy-mode="proxyMode"
+                v-model:auth-mode="authMode"
+                v-model:oauth="oauthForm"
               />
             </TabsContent>
 

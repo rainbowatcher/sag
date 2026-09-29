@@ -12,12 +12,19 @@ use axum::{
     response::IntoResponse,
 };
 use indexmap::IndexMap;
-use sag_config::{ApiConfig, ApiKind, KeyStrategy, ProviderConfig, ProxyMode};
+use sag_config::{
+    ApiConfig, ApiKind, AuthMode, KeyStrategy, OAuthConfig, ProviderConfig, ProxyMode,
+};
 use sag_core::AppError;
 use serde_json::json;
 use tracing::instrument;
 
 use sag_state::AppState;
+
+/// Mask for OAuth `client_secret` on every admin out-path. Update patches
+/// treat this literal as "keep the stored secret" (never write it back as a
+/// real credential).
+const SECRET_MASK: &str = "***";
 
 /// Apply load-time normalization to an incoming `apis` map: trim each
 /// `base_url`'s trailing `/` (mirrors `GatewayConfig::normalize`) and
@@ -84,6 +91,15 @@ pub struct AddProviderRequest {
     /// List of model IDs enabled for this provider (optional).
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    /// Credential mode: `static` (default, uses `api_keys`) or `oauth`
+    /// (uses the `[providers.<name>.oauth]` section). Unknown values fail
+    /// deserialization (typed enum strictness).
+    #[serde(default)]
+    pub auth_mode: AuthMode,
+    /// OAuth client-credentials settings. Required when `auth_mode` is
+    /// `oauth`; ignored when `auth_mode` is `static`.
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -118,6 +134,16 @@ pub struct UpdateProviderRequest {
     pub enabled_models: Option<Vec<String>>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Credential-mode patch: omitted/`null` keeps the current value.
+    /// When set to `static`, the stored `oauth` section is cleared.
+    #[serde(default)]
+    pub auth_mode: Option<AuthMode>,
+    /// Whole-section OAuth patch: omitted keeps the current section;
+    /// `null` clears it (when switching to static); value replaces the
+    /// entire section. A `client_secret` of `"***"` keeps the stored
+    /// secret — the admin out-path never returns the plaintext.
+    #[serde(default, deserialize_with = "double_option_oauth")]
+    pub oauth: Option<Option<OAuthConfig>>,
 }
 
 /// Serde helper for the triple-state `fallback` patch: missing →
@@ -130,6 +156,55 @@ where
     use serde::Deserialize;
     let value: Option<ApiKind> = Option::deserialize(deserializer)?;
     Ok(Some(value))
+}
+
+/// Serde helper for the triple-state `oauth` patch: missing → `None`
+/// (keep), JSON `null` → `Some(None)` (clear), value → `Some(Some(v))`.
+fn double_option_oauth<'de, D>(deserializer: D) -> Result<Option<Option<OAuthConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value: Option<OAuthConfig> = Option::deserialize(deserializer)?;
+    Ok(Some(value))
+}
+
+/// Resolve an inbound `client_secret` against the stored secret.
+/// `SECRET_MASK` means "keep"; any other string is the new plaintext.
+fn resolve_oauth_secret(request_secret: &str, existing: Option<&str>) -> String {
+    if request_secret == SECRET_MASK {
+        existing.unwrap_or_default().to_string()
+    } else {
+        request_secret.to_string()
+    }
+}
+
+/// Admin out-path OAuth shape: plaintext `client_secret` is never returned.
+/// `client_secret: "***"` + `client_secret_set` is the stable contract.
+#[derive(Debug, serde::Serialize)]
+pub struct OAuthInfo {
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub client_secret_set: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+fn oauth_info(oauth: &OAuthConfig) -> OAuthInfo {
+    OAuthInfo {
+        token_url: oauth.token_url.clone(),
+        client_id: oauth.client_id.clone(),
+        client_secret: SECRET_MASK.to_string(),
+        client_secret_set: !oauth.client_secret.trim().is_empty(),
+        scope: oauth.scope.clone(),
+        audience: oauth.audience.clone(),
+        refresh_token: oauth.refresh_token.clone(),
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -163,6 +238,12 @@ pub struct ProviderInfo {
     pub role_mappings: HashMap<String, String>,
     pub enabled_models: Vec<String>,
     pub enabled: bool,
+    /// Credential mode for this provider (`static` / `oauth`).
+    pub auth_mode: AuthMode,
+    /// OAuth settings when `auth_mode = "oauth"`. `client_secret` is
+    /// always the mask `"***"`; `client_secret_set` reports whether a
+    /// secret is stored. Never returns the plaintext secret.
+    pub oauth: Option<OAuthInfo>,
     /// Per-API capability bitmap keyed by `ApiKind` — a JSON object of
     /// `{ "<api_kind>": { ...capabilities } }`, read-only UI aid.
     ///
@@ -246,6 +327,8 @@ fn provider_info(name: &str, cfg: &ProviderConfig) -> ProviderInfo {
         role_mappings: cfg.role_mappings.clone(),
         enabled_models: cfg.enabled_models.clone(),
         enabled: cfg.enabled,
+        auth_mode: cfg.auth_mode,
+        oauth: cfg.oauth.as_ref().map(oauth_info),
         capabilities: provider_capabilities(cfg),
     }
 }
@@ -282,9 +365,18 @@ pub async fn add_provider(
 ) -> impl IntoResponse {
     tracing::Span::current().record("provider_name", &req.name);
 
-    // Validate: at least one API key is required (early check).
-    if req.api_keys.is_empty() {
+    // Validate: empty api_keys is rejected only for static mode — oauth
+    // uses a single client-credentials grant and allows an empty key pool.
+    if req.auth_mode == AuthMode::Static && req.api_keys.is_empty() {
         return AppError::BadRequest("at least one api_key required".into()).into_response();
+    }
+    // Validate: oauth mode must ship an oauth section (early 400; the
+    // coordinator's full validate would also catch it).
+    if req.auth_mode == AuthMode::OAuth && req.oauth.is_none() {
+        return AppError::BadRequest(
+            "auth_mode='oauth' requires an [providers.<name>.oauth] section".into(),
+        )
+        .into_response();
     }
     // Validate: the `apis` catalog must not be empty (the coordinator's
     // full validate additionally requires a protocol key + fallback rules).
@@ -300,9 +392,19 @@ pub async fn add_provider(
     normalize_apis(&mut apis);
     let echo_apis = apis.clone();
 
+    // Static mode never persists an oauth section (matches load-time
+    // semantics: the section is ignored under `auth_mode = "static"`).
+    let oauth = if req.auth_mode == AuthMode::OAuth {
+        req.oauth
+    } else {
+        None
+    };
+
     let pc = ProviderConfig {
         api_keys: req.api_keys.clone(),
         key_strategy: req.key_strategy,
+        auth_mode: req.auth_mode,
+        oauth,
         apis,
         fallback: req.fallback,
         proxy_mode: req.proxy_mode,
@@ -406,6 +508,38 @@ pub async fn update_provider(
         }
         if let Some(v) = req.enabled {
             pc.enabled = v;
+        }
+
+        // ── auth_mode / oauth patch ──
+        // - `auth_mode` omitted → keep; `static` → clear oauth; `oauth` →
+        //   require a usable oauth section after merge.
+        // - `oauth` omitted keeps the stored section; `null` clears it;
+        //   value replaces the whole section. A `"***"` `client_secret`
+        //   keeps the stored plaintext (admin out-path never returns it).
+        if let Some(mode) = req.auth_mode {
+            pc.auth_mode = mode;
+        }
+        if pc.auth_mode == AuthMode::Static {
+            pc.oauth = None;
+        } else {
+            if let Some(patch) = req.oauth {
+                match patch {
+                    Some(mut oauth) => {
+                        let existing_secret = pc.oauth.as_ref().map(|o| o.client_secret.as_str());
+                        oauth.client_secret =
+                            resolve_oauth_secret(&oauth.client_secret, existing_secret);
+                        pc.oauth = Some(oauth);
+                    }
+                    None => pc.oauth = None,
+                }
+            }
+            if pc.oauth.is_none() {
+                return AppError::BadRequest(format!(
+                    "auth_mode='oauth' requires an [providers.{}] oauth section",
+                    req.name
+                ))
+                .into_response();
+            }
         }
 
         pc
@@ -1620,4 +1754,373 @@ targets = [
     }
 
     // ── end M7 ──
+
+    // ── OAuth auth_mode CRUD (Phase 4) ────────────────────────────────
+
+    fn oauth_section_json() -> serde_json::Value {
+        serde_json::json!({
+            "token_url": "https://login.example.com/oauth2/token",
+            "client_id": "cid",
+            "client_secret": "sec-plain",
+            "scope": "scope-a",
+            "audience": "https://api.example.com",
+            "refresh_token": "rt-1",
+        })
+    }
+
+    async fn list_provider_json(app: &axum::Router, name: &str) -> serde_json::Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("provider present in list")
+            .clone()
+    }
+
+    async fn post_provider(
+        app: &axum::Router,
+        payload: serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn put_provider(
+        app: &axum::Router,
+        payload: serde_json::Value,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/providers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Round-trip: create an oauth provider, GET must never echo the
+    /// plaintext `client_secret` — only `"***"` + `client_secret_set`.
+    #[tokio::test]
+    async fn oauth_provider_round_trip_masks_client_secret() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "azure-oauth",
+                "auth_mode": "oauth",
+                "oauth": oauth_section_json(),
+                "apis": {"chat_completions": {"base_url": "https://azure.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let p = list_provider_json(&app, "azure-oauth").await;
+        assert_eq!(p["auth_mode"], "oauth");
+        assert_eq!(p["oauth"]["client_secret"], "***");
+        assert_eq!(p["oauth"]["client_secret_set"], true);
+        assert_eq!(p["oauth"]["client_id"], "cid");
+        assert_eq!(
+            p["oauth"]["token_url"],
+            "https://login.example.com/oauth2/token"
+        );
+        assert_eq!(p["oauth"]["scope"], "scope-a");
+        assert_eq!(p["oauth"]["audience"], "https://api.example.com");
+        assert_eq!(p["oauth"]["refresh_token"], "rt-1");
+        assert_eq!(p["api_keys"], serde_json::json!([]));
+
+        let cfg = state.config.read().await;
+        let oauth = cfg.providers["azure-oauth"]
+            .oauth
+            .as_ref()
+            .expect("oauth section stored");
+        assert_eq!(oauth.client_secret, "sec-plain");
+        assert_eq!(cfg.providers["azure-oauth"].auth_mode, AuthMode::OAuth);
+    }
+
+    /// Switching `auth_mode` to `static` clears the stored oauth section.
+    #[tokio::test]
+    async fn oauth_update_switch_to_static_clears_oauth() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "azure-oauth",
+                "auth_mode": "oauth",
+                "oauth": oauth_section_json(),
+                "api_keys": [],
+                "apis": {"chat_completions": {"base_url": "https://azure.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Give the new oauth provider a static key pool so the switch back
+        // to static remains config-valid.
+        let resp = put_provider(
+            &app,
+            serde_json::json!({
+                "name": "azure-oauth",
+                "auth_mode": "static",
+                "api_keys": ["sk-static"],
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let p = &cfg.providers["azure-oauth"];
+        assert_eq!(p.auth_mode, AuthMode::Static);
+        assert!(p.oauth.is_none(), "oauth section must be cleared on static");
+        assert_eq!(p.api_keys, vec!["sk-static"]);
+        drop(cfg);
+
+        let p = list_provider_json(&app, "azure-oauth").await;
+        assert_eq!(p["auth_mode"], "static");
+        assert!(p["oauth"].is_null());
+    }
+
+    /// OAuth mode allows empty `api_keys` on create.
+    #[tokio::test]
+    async fn oauth_provider_allows_empty_api_keys() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "oauth-empty-keys",
+                "auth_mode": "oauth",
+                "oauth": {
+                    "token_url": "https://login.example.com/oauth2/token",
+                    "client_id": "cid",
+                    "client_secret": "sec",
+                },
+                "api_keys": [],
+                "apis": {"chat_completions": {"base_url": "https://x.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let cfg = state.config.read().await;
+        let p = &cfg.providers["oauth-empty-keys"];
+        assert_eq!(p.auth_mode, AuthMode::OAuth);
+        assert!(p.api_keys.is_empty());
+        assert!(p.oauth.is_some());
+    }
+
+    /// Update with `client_secret: "***"` keeps the stored secret.
+    #[tokio::test]
+    async fn oauth_update_masked_secret_keeps_original() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "azure-oauth",
+                "auth_mode": "oauth",
+                "oauth": oauth_section_json(),
+                "apis": {"chat_completions": {"base_url": "https://azure.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = put_provider(
+            &app,
+            serde_json::json!({
+                "name": "azure-oauth",
+                // Whole-section replace: the UI edit form always sends the
+                // full oauth object; `client_secret: "***"` keeps the
+                // stored secret.
+                "oauth": {
+                    "token_url": "https://login.example.com/oauth2/token-v2",
+                    "client_id": "cid-new",
+                    "client_secret": "***",
+                    "scope": "scope-b",
+                    "audience": "https://api.example.com",
+                    "refresh_token": "rt-1",
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let oauth = cfg.providers["azure-oauth"]
+            .oauth
+            .as_ref()
+            .expect("oauth kept");
+        assert_eq!(
+            oauth.client_secret, "sec-plain",
+            "mask must not overwrite secret"
+        );
+        assert_eq!(oauth.client_id, "cid-new");
+        assert_eq!(oauth.token_url, "https://login.example.com/oauth2/token-v2");
+        assert_eq!(oauth.scope.as_deref(), Some("scope-b"));
+        assert_eq!(oauth.audience.as_deref(), Some("https://api.example.com"));
+        assert_eq!(oauth.refresh_token.as_deref(), Some("rt-1"));
+
+        // And a real new secret still updates.
+        drop(cfg);
+        let resp = put_provider(
+            &app,
+            serde_json::json!({
+                "name": "azure-oauth",
+                "oauth": {
+                    "token_url": "https://login.example.com/oauth2/token-v2",
+                    "client_id": "cid-new",
+                    "client_secret": "sec-rotated",
+                    "scope": "scope-b",
+                    "audience": "https://api.example.com",
+                    "refresh_token": "rt-1",
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cfg = state.config.read().await;
+        assert_eq!(
+            cfg.providers["azure-oauth"]
+                .oauth
+                .as_ref()
+                .unwrap()
+                .client_secret,
+            "sec-rotated"
+        );
+    }
+
+    /// Create with `auth_mode = "oauth"` and no oauth section → 400.
+    #[tokio::test]
+    async fn oauth_provider_missing_section_fails_create() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "oauth-missing",
+                "auth_mode": "oauth",
+                "apis": {"chat_completions": {"base_url": "https://x.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains("oauth"),
+            "error should mention oauth section requirement"
+        );
+
+        let cfg = state.config.read().await;
+        assert!(!cfg.providers.contains_key("oauth-missing"));
+    }
+
+    /// Static mode still rejects empty api_keys on create.
+    #[tokio::test]
+    async fn static_provider_still_rejects_empty_api_keys_on_create() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "static-empty",
+                "auth_mode": "static",
+                "apis": {"chat_completions": {"base_url": "https://x.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let cfg = state.config.read().await;
+        assert!(!cfg.providers.contains_key("static-empty"));
+    }
+
+    /// Update that sets `auth_mode = "oauth"` without an oauth section →
+    /// 400 and config unchanged.
+    #[tokio::test]
+    async fn oauth_update_switch_to_oauth_without_section_fails() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = put_provider(
+            &app,
+            serde_json::json!({
+                "name": "openai",
+                "auth_mode": "oauth",
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.providers["openai"].auth_mode, AuthMode::Static);
+        assert!(cfg.providers["openai"].oauth.is_none());
+    }
+
+    /// Unknown `auth_mode` value fails deserialization (422).
+    #[tokio::test]
+    async fn oauth_unknown_auth_mode_is_422() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let resp = post_provider(
+            &app,
+            serde_json::json!({
+                "name": "bad-mode",
+                "auth_mode": "jwt",
+                "oauth": oauth_section_json(),
+                "apis": {"chat_completions": {"base_url": "https://x.example.com/v1"}},
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }

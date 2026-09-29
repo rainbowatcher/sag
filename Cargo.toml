@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors"] }
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream", "form"] }
 notify = { version = "8" }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -52,6 +52,23 @@ pub enum AppError {
         body: String,
     },
 
+    /// OAuth token endpoint failed while fetching/refreshing a provider
+    /// credential. `status` is the IdP HTTP status, or `None` for a
+    /// transport-level failure (connect/DNS/timeout).
+    ///
+    /// Deliberately **not** mapped to [`Upstream`]: a token-endpoint 400
+    /// would otherwise be classified as client-caused (no failover), while
+    /// credential misconfiguration should fail over to the next target.
+    /// Dispatch classification: 4xx → non-retryable provider-persistent
+    /// (failover, no circuit); network/5xx/429 → retryable (circuit opens
+    /// after retries are exhausted).
+    #[error("credential fetch failed: provider={provider}, status={status:?}, message={message}")]
+    CredentialFetch {
+        provider: String,
+        status: Option<u16>,
+        message: String,
+    },
+
     /// Request validation failed (unsupported parameters, etc.).
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -152,6 +169,7 @@ impl AppError {
             AppError::Config(_) => "internal_error",
             AppError::Unauthorized(_) => "auth_error",
             AppError::Upstream { .. } => "provider_error",
+            AppError::CredentialFetch { .. } => "provider_error",
             AppError::BadRequest(_) => "bad_request",
             AppError::ModelNotFound(_) => "model_not_found",
             AppError::NotFound(_) => "internal_error",
@@ -182,6 +200,9 @@ impl AppError {
             // (including 403 quota language) → provider error.
             AppError::Upstream { status: 429, .. } => Some(FailureReason::RateLimited),
             AppError::Upstream { .. } => Some(FailureReason::ProviderError),
+            // Token-endpoint failures are provider-side credential issues
+            // (failover), not client-caused request errors.
+            AppError::CredentialFetch { .. } => Some(FailureReason::ProviderError),
             AppError::AllProvidersExhausted { .. } => Some(FailureReason::AllExhausted),
             AppError::Network(_) => Some(FailureReason::NetworkError),
             AppError::TtfbTimeout { .. } => Some(FailureReason::Timeout),
@@ -216,6 +237,9 @@ impl AppError {
             AppError::Upstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
+            // Credential/token-endpoint failures surface as gateway errors
+            // (502) — never as the raw IdP status.
+            AppError::CredentialFetch { .. } => StatusCode::BAD_GATEWAY,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -261,6 +285,7 @@ impl AppError {
             AppError::Config(msg) => msg.clone(),
             AppError::Unauthorized(msg) => msg.clone(),
             AppError::Upstream { body, .. } => body.clone(),
+            AppError::CredentialFetch { message, .. } => message.clone(),
             AppError::BadRequest(msg) => msg.clone(),
             AppError::ModelNotFound(msg) => msg.clone(),
             AppError::NotFound(msg) => msg.clone(),
@@ -292,6 +317,9 @@ impl IntoResponse for AppError {
             AppError::Config(msg) => ("CONFIG_ERROR", msg.clone()),
             AppError::Unauthorized(msg) => ("UNAUTHORIZED", msg.clone()),
             AppError::Upstream { body, .. } => ("UPSTREAM_ERROR", body.clone()),
+            AppError::CredentialFetch { message, .. } => {
+                ("CREDENTIAL_FETCH_ERROR", message.clone())
+            }
             AppError::BadRequest(msg) => ("BAD_REQUEST", msg.clone()),
             AppError::ModelNotFound(msg) => ("MODEL_NOT_FOUND", msg.clone()),
             AppError::NotFound(msg) => ("NOT_FOUND", msg.clone()),
@@ -465,6 +493,53 @@ mod tests {
                 .unwrap()
                 .contains("time-to-first-byte")
         );
+    }
+
+    #[tokio::test]
+    async fn credential_fetch_returns_502() {
+        let (status, body) = extract(AppError::CredentialFetch {
+            provider: "azure".into(),
+            status: Some(401),
+            message: "invalid_client".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "CREDENTIAL_FETCH_ERROR");
+        assert_eq!(body["error"]["message"], "invalid_client");
+
+        // Network-level token failure (status = None) also maps to 502.
+        let (status, body) = extract(AppError::CredentialFetch {
+            provider: "azure".into(),
+            status: None,
+            message: "connection refused".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "CREDENTIAL_FETCH_ERROR");
+    }
+
+    #[test]
+    fn error_category_credential_fetch() {
+        assert_eq!(
+            AppError::CredentialFetch {
+                provider: "azure".into(),
+                status: Some(400),
+                message: "invalid_grant".into(),
+            }
+            .error_category(),
+            "provider_error"
+        );
+    }
+
+    #[test]
+    fn failure_reason_credential_fetch_is_provider_error() {
+        let err = AppError::CredentialFetch {
+            provider: "azure".into(),
+            status: Some(401),
+            message: "invalid_client".into(),
+        };
+        assert_eq!(err.failure_reason(), Some(FailureReason::ProviderError));
+        assert_eq!(err.final_status(), Some(FinalStatus::ModelFailure));
     }
 
     #[tokio::test]

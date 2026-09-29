@@ -9,13 +9,25 @@ use std::collections::HashMap;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use reqwest::header::CONTENT_TYPE;
-use sag_config::{ApiKind, ProxyMode};
+use sag_config::{ApiKind, AuthMode, OAuthConfig, ProxyMode};
 use sag_core::AppError;
 use sag_providers::{provider_auth_headers, provider_chat_endpoint};
 use serde_json::json;
 use tracing::{instrument, warn};
 
 use sag_state::AppState;
+
+/// Phase 1: temporary probe endpoints do not construct a
+/// `CredentialProvider` — reject oauth mode / oauth sections with a clear
+/// 400 instead of silently using static keys.
+fn oauth_probe_unsupported(auth_mode: AuthMode, oauth: Option<&OAuthConfig>) -> Option<AppError> {
+    if auth_mode == AuthMode::OAuth || oauth.is_some() {
+        return Some(AppError::BadRequest(
+            "oauth 模式暂不支持模型测试 / fetch-models（Phase 1）".into(),
+        ));
+    }
+    None
+}
 
 /// Which API section this temporary probe talks to — selects the auth
 /// header shape (`anthropic_messages` → `x-api-key`, everything else →
@@ -49,6 +61,13 @@ pub struct FetchModelsRequest {
     /// forces a direct connection ignoring the global/system proxy.
     #[serde(default)]
     pub proxy_mode: ProxyMode,
+    /// Credential mode for this temporary probe (default `static`).
+    /// `oauth` (or a present `oauth` section) → 400 (Phase 1).
+    #[serde(default)]
+    pub auth_mode: AuthMode,
+    /// Optional oauth section; present → 400 (Phase 1).
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
 }
 
 fn build_models_url(base_url: &str, models_endpoint: &str) -> String {
@@ -89,6 +108,15 @@ pub async fn fetch_models(
     State(state): State<AppState>,
     Json(req): Json<FetchModelsRequest>,
 ) -> impl IntoResponse {
+    if let Some(err) = oauth_probe_unsupported(req.auth_mode, req.oauth.as_ref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": { "code": "OAUTH_UNSUPPORTED", "message": err.to_string() }
+            })),
+        )
+            .into_response();
+    }
     let Some(api_key) = req.api_keys.first() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -196,12 +224,28 @@ pub struct ModelTestRequest {
     /// forces a direct connection ignoring the global/system proxy.
     #[serde(default)]
     pub proxy_mode: ProxyMode,
+    /// Credential mode (default `static`). `oauth` or a present `oauth`
+    /// section → 400 (Phase 1).
+    #[serde(default)]
+    pub auth_mode: AuthMode,
+    /// Optional oauth section; present → 400 (Phase 1).
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
 }
 
 pub async fn model_test(
     State(state): State<AppState>,
     Json(req): Json<ModelTestRequest>,
 ) -> impl IntoResponse {
+    if let Some(err) = oauth_probe_unsupported(req.auth_mode, req.oauth.as_ref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": { "code": "OAUTH_UNSUPPORTED", "message": err.to_string() }
+            })),
+        )
+            .into_response();
+    }
     let connect_url = match resolve_test_proxy(&state, req.proxy_mode).await {
         Ok(url) => url,
         Err(e) => return e.into_response(),
@@ -581,12 +625,67 @@ mod tests {
         let req: ModelTestRequest =
             serde_json::from_str(r#"{"model":"gpt-4o","base_url":"https://x.com"}"#).unwrap();
         assert_eq!(req.proxy_mode, ProxyMode::Inherit);
+        assert_eq!(req.auth_mode, sag_config::AuthMode::Static);
+        assert!(req.oauth.is_none());
 
         let req: ModelTestRequest = serde_json::from_str(
             r#"{"model":"gpt-4o","base_url":"https://x.com","proxy_mode":"enabled"}"#,
         )
         .unwrap();
         assert_eq!(req.proxy_mode, ProxyMode::Enabled);
+    }
+
+    #[test]
+    fn oauth_probe_unsupported_detects_auth_mode_and_section() {
+        use sag_config::{AuthMode, OAuthConfig};
+        assert!(oauth_probe_unsupported(AuthMode::OAuth, None).is_some());
+        assert!(
+            oauth_probe_unsupported(
+                AuthMode::Static,
+                Some(&OAuthConfig {
+                    token_url: "https://x".into(),
+                    client_id: "c".into(),
+                    client_secret: "s".into(),
+                    scope: None,
+                    audience: None,
+                    refresh_token: None,
+                })
+            )
+            .is_some()
+        );
+        assert!(oauth_probe_unsupported(AuthMode::Static, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_models_rejects_oauth_mode_with_400() {
+        let state = state_with_global_proxy(None).await;
+        let app = test_app(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/providers/fetch-models")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"base_url":"https://x.com/v1","auth_mode":"oauth","oauth":{"token_url":"https://t","client_id":"c","client_secret":"s"}}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn model_test_rejects_oauth_section_with_400() {
+        let state = state_with_global_proxy(None).await;
+        let app = test_app(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/model/test")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","base_url":"https://x.com","auth_mode":"oauth"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     async fn state_with_global_proxy(proxy: Option<&str>) -> sag_state::AppState {
