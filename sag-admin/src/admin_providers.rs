@@ -21,9 +21,9 @@ use tracing::instrument;
 
 use sag_state::AppState;
 
-/// Mask for OAuth secrets (`client_secret` / `refresh_token`) on every
-/// admin out-path. Update patches treat this literal as "keep the stored
-/// secret" (never write it back as a real credential).
+/// Mask for OAuth `client_secret` on every admin out-path. Update patches
+/// treat this literal as "keep the stored secret" (never write it back as a
+/// real credential).
 const SECRET_MASK: &str = "***";
 
 /// Apply load-time normalization to an incoming `apis` map: trim each
@@ -140,9 +140,8 @@ pub struct UpdateProviderRequest {
     pub auth_mode: Option<AuthMode>,
     /// Whole-section OAuth patch: omitted keeps the current section;
     /// `null` clears it (when switching to static); value replaces the
-    /// entire section. A `client_secret` / `refresh_token` of `"***"`
-    /// keeps the stored secret — the admin out-path never returns either
-    /// plaintext. Omitted / `null` `refresh_token` clears the stored token.
+    /// entire section. A `client_secret` of `"***"` keeps the stored
+    /// secret — the admin out-path never returns the plaintext.
     #[serde(default, deserialize_with = "double_option_oauth")]
     pub oauth: Option<Option<OAuthConfig>>,
 }
@@ -180,23 +179,8 @@ fn resolve_oauth_secret(request_secret: &str, existing: Option<&str>) -> String 
     }
 }
 
-/// Resolve an inbound `refresh_token` against the stored value.
-/// `"***"` keeps the stored token; `None` / blank clears; any other
-/// string is the new plaintext.
-fn resolve_oauth_refresh_token(request: Option<&str>, existing: Option<&str>) -> Option<String> {
-    match request {
-        None => None,
-        Some(rt) if rt == SECRET_MASK => existing
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string),
-        Some(rt) if rt.trim().is_empty() => None,
-        Some(rt) => Some(rt.to_string()),
-    }
-}
-
-/// Admin out-path OAuth shape: plaintext secrets are never returned.
-/// `client_secret` / `refresh_token` are the mask `"***"` when set (plus
-/// `*_set` flags); `refresh_token` is absent when not stored.
+/// Admin out-path OAuth shape: plaintext `client_secret` is never returned.
+/// `client_secret: "***"` + `client_secret_set` is the stable contract.
 #[derive(Debug, serde::Serialize)]
 pub struct OAuthInfo {
     pub token_url: String,
@@ -207,17 +191,11 @@ pub struct OAuthInfo {
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
-    /// Mask `"***"` when a refresh_token is stored; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
-    pub refresh_token_set: bool,
 }
 
 fn oauth_info(oauth: &OAuthConfig) -> OAuthInfo {
-    let refresh_token_set = oauth
-        .refresh_token
-        .as_deref()
-        .is_some_and(|rt| !rt.trim().is_empty());
     OAuthInfo {
         token_url: oauth.token_url.clone(),
         client_id: oauth.client_id.clone(),
@@ -225,8 +203,7 @@ fn oauth_info(oauth: &OAuthConfig) -> OAuthInfo {
         client_secret_set: !oauth.client_secret.trim().is_empty(),
         scope: oauth.scope.clone(),
         audience: oauth.audience.clone(),
-        refresh_token: refresh_token_set.then(|| SECRET_MASK.to_string()),
-        refresh_token_set,
+        refresh_token: oauth.refresh_token.clone(),
     }
 }
 
@@ -264,9 +241,8 @@ pub struct ProviderInfo {
     /// Credential mode for this provider (`static` / `oauth`).
     pub auth_mode: AuthMode,
     /// OAuth settings when `auth_mode = "oauth"`. `client_secret` is
-    /// always the mask `"***"`; `refresh_token` is `"***"` when set
-    /// (absent otherwise). The `*_set` flags report storage. Never
-    /// returns either plaintext secret.
+    /// always the mask `"***"`; `client_secret_set` reports whether a
+    /// secret is stored. Never returns the plaintext secret.
     pub oauth: Option<OAuthInfo>,
     /// Per-API capability bitmap keyed by `ApiKind` — a JSON object of
     /// `{ "<api_kind>": { ...capabilities } }`, read-only UI aid.
@@ -538,9 +514,8 @@ pub async fn update_provider(
         // - `auth_mode` omitted → keep; `static` → clear oauth; `oauth` →
         //   require a usable oauth section after merge.
         // - `oauth` omitted keeps the stored section; `null` clears it;
-        //   value replaces the whole section. A `"***"` `client_secret` /
-        //   `refresh_token` keeps the stored plaintext (admin out-path
-        //   never returns either).
+        //   value replaces the whole section. A `"***"` `client_secret`
+        //   keeps the stored plaintext (admin out-path never returns it).
         if let Some(mode) = req.auth_mode {
             pc.auth_mode = mode;
         }
@@ -550,15 +525,9 @@ pub async fn update_provider(
             if let Some(patch) = req.oauth {
                 match patch {
                     Some(mut oauth) => {
-                        let existing = pc.oauth.as_ref();
-                        let existing_secret = existing.map(|o| o.client_secret.as_str());
+                        let existing_secret = pc.oauth.as_ref().map(|o| o.client_secret.as_str());
                         oauth.client_secret =
                             resolve_oauth_secret(&oauth.client_secret, existing_secret);
-                        let existing_rt = existing.and_then(|o| o.refresh_token.as_deref());
-                        oauth.refresh_token = resolve_oauth_refresh_token(
-                            oauth.refresh_token.as_deref(),
-                            existing_rt,
-                        );
                         pc.oauth = Some(oauth);
                     }
                     None => pc.oauth = None,
@@ -1859,7 +1828,7 @@ targets = [
     }
 
     /// Round-trip: create an oauth provider, GET must never echo the
-    /// plaintext `client_secret` / `refresh_token` — only `"***"` + `*_set`.
+    /// plaintext `client_secret` — only `"***"` + `client_secret_set`.
     #[tokio::test]
     async fn oauth_provider_round_trip_masks_client_secret() {
         let (providers, routes) = one_provider_config("openai", vec![]);
@@ -1889,8 +1858,7 @@ targets = [
         );
         assert_eq!(p["oauth"]["scope"], "scope-a");
         assert_eq!(p["oauth"]["audience"], "https://api.example.com");
-        assert_eq!(p["oauth"]["refresh_token"], "***");
-        assert_eq!(p["oauth"]["refresh_token_set"], true);
+        assert_eq!(p["oauth"]["refresh_token"], "rt-1");
         assert_eq!(p["api_keys"], serde_json::json!([]));
 
         let cfg = state.config.read().await;
@@ -1899,7 +1867,6 @@ targets = [
             .as_ref()
             .expect("oauth section stored");
         assert_eq!(oauth.client_secret, "sec-plain");
-        assert_eq!(oauth.refresh_token.as_deref(), Some("rt-1"));
         assert_eq!(cfg.providers["azure-oauth"].auth_mode, AuthMode::OAuth);
     }
 
@@ -1979,8 +1946,7 @@ targets = [
         assert!(p.oauth.is_some());
     }
 
-    /// Update with `client_secret` / `refresh_token` `"***"` keeps the
-    /// stored secrets; a blank / omitted `refresh_token` clears it.
+    /// Update with `client_secret: "***"` keeps the stored secret.
     #[tokio::test]
     async fn oauth_update_masked_secret_keeps_original() {
         let (providers, routes) = one_provider_config("openai", vec![]);
@@ -2004,14 +1970,15 @@ targets = [
             serde_json::json!({
                 "name": "azure-oauth",
                 // Whole-section replace: the UI edit form always sends the
-                // full oauth object; `"***"` keeps the stored secret/token.
+                // full oauth object; `client_secret: "***"` keeps the
+                // stored secret.
                 "oauth": {
                     "token_url": "https://login.example.com/oauth2/token-v2",
                     "client_id": "cid-new",
                     "client_secret": "***",
                     "scope": "scope-b",
                     "audience": "https://api.example.com",
-                    "refresh_token": "***",
+                    "refresh_token": "rt-1",
                 },
             }),
         )
@@ -2031,20 +1998,10 @@ targets = [
         assert_eq!(oauth.token_url, "https://login.example.com/oauth2/token-v2");
         assert_eq!(oauth.scope.as_deref(), Some("scope-b"));
         assert_eq!(oauth.audience.as_deref(), Some("https://api.example.com"));
-        assert_eq!(
-            oauth.refresh_token.as_deref(),
-            Some("rt-1"),
-            "refresh_token mask must not overwrite stored token"
-        );
+        assert_eq!(oauth.refresh_token.as_deref(), Some("rt-1"));
 
-        // Out-path still redacts after the masked update.
+        // And a real new secret still updates.
         drop(cfg);
-        let p = list_provider_json(&app, "azure-oauth").await;
-        assert_eq!(p["oauth"]["client_secret"], "***");
-        assert_eq!(p["oauth"]["refresh_token"], "***");
-        assert_eq!(p["oauth"]["refresh_token_set"], true);
-
-        // And a real new secret still updates; omitted refresh_token clears.
         let resp = put_provider(
             &app,
             serde_json::json!({
@@ -2055,68 +2012,20 @@ targets = [
                     "client_secret": "sec-rotated",
                     "scope": "scope-b",
                     "audience": "https://api.example.com",
+                    "refresh_token": "rt-1",
                 },
             }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let cfg = state.config.read().await;
-        let oauth = cfg.providers["azure-oauth"].oauth.as_ref().unwrap();
-        assert_eq!(oauth.client_secret, "sec-rotated");
-        assert!(
-            oauth.refresh_token.is_none(),
-            "omitted refresh_token must clear the stored token"
-        );
-        drop(cfg);
-
-        let p = list_provider_json(&app, "azure-oauth").await;
-        assert!(p["oauth"]["refresh_token"].is_null());
-        assert_eq!(p["oauth"]["refresh_token_set"], false);
-    }
-
-    /// A rotated `refresh_token` (non-mask string) replaces the stored one.
-    #[tokio::test]
-    async fn oauth_update_rotated_refresh_token_replaces_stored() {
-        let (providers, routes) = one_provider_config("openai", vec![]);
-        let state = build_state(providers, routes).await;
-        let app = test_app(state.clone());
-
-        let resp = post_provider(
-            &app,
-            serde_json::json!({
-                "name": "azure-oauth",
-                "auth_mode": "oauth",
-                "oauth": oauth_section_json(),
-                "apis": {"chat_completions": {"base_url": "https://azure.example.com/v1"}},
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let resp = put_provider(
-            &app,
-            serde_json::json!({
-                "name": "azure-oauth",
-                "oauth": {
-                    "token_url": "https://login.example.com/oauth2/token",
-                    "client_id": "cid",
-                    "client_secret": "***",
-                    "refresh_token": "rt-rotated",
-                },
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
         let cfg = state.config.read().await;
         assert_eq!(
             cfg.providers["azure-oauth"]
                 .oauth
                 .as_ref()
                 .unwrap()
-                .refresh_token
-                .as_deref(),
-            Some("rt-rotated")
+                .client_secret,
+            "sec-rotated"
         );
     }
 

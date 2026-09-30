@@ -74,15 +74,10 @@ function update<K extends keyof OAuthConfigForm>(key: K, value: OAuthConfigForm[
       </div>
 
       <div class="space-y-1">
-        <FieldLabel>
-          Refresh Token
-          {{ modelValue.refresh_token === "***" ? "(leave *** to keep; clear to remove)" : "" }}
-        </FieldLabel>
+        <FieldLabel>Refresh Token</FieldLabel>
         <Input
           :model-value="modelValue.refresh_token"
-          type="password"
-          :placeholder="modelValue.refresh_token === '***' ? '***' : 'optional refresh_token grant'"
-          autocomplete="off"
+          placeholder="optional refresh_token grant"
           @input="update('refresh_token', ($event.target as HTMLInputElement).value)"
         />
       </div>

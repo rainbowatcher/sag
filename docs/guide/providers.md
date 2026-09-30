@@ -13,7 +13,7 @@
 | `api_keys` | API 密钥列表（`auth_mode = "oauth"` 时忽略，允许为空） |
 | `key_strategy` | 多密钥选择策略（`fill_first` / `round_robin`）。oauth 模式下单 client，该策略无实际效果 |
 | `auth_mode` | 凭据模式：`"static"`（默认，使用 `api_keys`）或 `"oauth"`（使用 `[providers.<name>.oauth]` 的 client credentials）。详见[配置 → Provider 完整字段](/guide/configuration#provider-完整字段) |
-| `[providers.*.oauth]` | OAuth client credentials 段（`auth_mode = "oauth"` 时必填）：`token_url` / `client_id` / `client_secret` 必填，`scope` / `audience` / `refresh_token` 可选。管理 API 出参不回显 `client_secret` / `refresh_token` 明文 |
+| `[providers.*.oauth]` | OAuth client credentials 段（`auth_mode = "oauth"` 时必填）：`token_url` / `client_id` / `client_secret` 必填，`scope` / `audience` / `refresh_token` 可选。管理 API 出参不回显 `client_secret` 明文 |
 | `proxy_mode` | 出站代理三态：`inherit`（默认，跟随顶层 `proxy_url`）/ `enabled`（强制走全局代理，无全局代理则配置错误）/ `disabled`（强制直连）。SAG **不读**系统代理环境变量 |
 | `models_endpoint` | 管理面板拉取模型列表的端点路径（per-API，配置在 `[providers.<name>.apis.<key>]` 节），相对本节 `base_url`，默认 `models`。探测目标节的选择规则见下方「模型列表探测」 |
 | `timeout_secs` | 上游请求超时（秒），默认 600。流式请求不受此约束（见「流式超时」），仅作为非流式请求的整体安全网 |
