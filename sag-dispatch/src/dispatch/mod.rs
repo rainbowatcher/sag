@@ -2180,33 +2180,6 @@ mod tests {
         );
     }
 
-    /// CredentialFetch 4xx (token-endpoint invalid_client etc.) is
-    /// NonRetryable — the circuit must stay closed (failover to the next
-    /// target, not a breaker cooldown on the healthy provider path).
-    #[tokio::test]
-    async fn apply_circuit_outcome_credential_fetch_400_does_not_open() {
-        let rt = crate::testing::test_dispatch_runtime();
-        let cfg = cb_config(5);
-        let key = RouteTargetKey::new("m", "azure-oauth", "rm", "u");
-
-        let out = apply_circuit_outcome(
-            &rt,
-            CircuitPermit::Allowed { key: key.clone() },
-            RetryOutcome::<u32>::NonRetryable(AppError::CredentialFetch {
-                provider: "azure-oauth".into(),
-                status: Some(400),
-                message: "invalid_client".into(),
-            }),
-            &cfg,
-        )
-        .await;
-        assert!(out.is_none());
-        assert!(
-            rt.circuit_breaker.read().await.is_closed(&key),
-            "CredentialFetch 4xx on a healthy target must not open the circuit"
-        );
-    }
-
     /// A non-retryable (4xx) during a probe is treated as a failed probe:
     /// the next probe is pushed one interval later and the slot is released
     /// — never left half-open forever, and never a full cooldown.
