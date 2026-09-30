@@ -153,8 +153,6 @@ Content-Type: application/json
 
 响应：`{ "models": [ ...上游 data 数组... ] }`。上游不可达 → 502。
 
-> `auth_mode = "oauth"` 的凭据暂不支持此探针（返回 400）。
-
 ### 测试模型连接
 
 ```
@@ -200,8 +198,6 @@ Content-Type: application/json
   ]
 }
 ```
-
-> `auth_mode = "oauth"` 的凭据暂不支持此探针（返回 400）。
 
 ### 探测协议支持
 
