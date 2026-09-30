@@ -78,6 +78,9 @@ Content-Type: application/json
 | `headers` | object | 否 | `{}` | 附加自定义 HTTP 头 |
 | `body_overrides` | object | 否 | `{}` | 合并到上游请求体的字段覆盖 |
 | `role_mappings` | object | 否 | `{}` | 角色映射表，如 `{ "developer": "system" }` |
+| `strip_fields` | array | 否 | `[]` | 从上游 JSON body 顶层移除的字段名 |
+| `model_strip_fields` | object | 否 | `{}` | 按 `real_model` 的字段移除表 |
+| `model_overrides` | object | 否 | `{}` | 按 `real_model` 的 body 覆盖 |
 | `anthropic_cache_control` | boolean | 否 | `true` | Anthropic 缓存控制注入，仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖） |
 
 OAuth 相关约束（与配置加载校验一致）：
@@ -131,7 +134,7 @@ Content-Type: application/json
 GET /api/providers/{name}/models
 ```
 
-从 provider 配置中返回已启用的 `enabled_models` 列表；不会实时调用上游 models endpoint。
+从 provider 配置中返回已启用的 `enabled_models` 列表；**不会**实时调用上游 models endpoint。
 
 #### 响应
 
@@ -141,7 +144,36 @@ GET /api/providers/{name}/models
 }
 ```
 
-> 如果上游返回错误或超时，返回空列表 `{ "models": [] }`。
+### 从上游拉取模型列表
+
+```
+POST /api/providers/fetch-models
+Content-Type: application/json
+
+{
+  "base_url": "https://api.openai.com/v1",
+  "models_endpoint": "models",
+  "api_kind": "chat_completions",
+  "api_keys": ["sk-xxx"],
+  "headers": {},
+  "proxy_mode": "inherit"
+}
+```
+
+向指定 `apis.<api_kind>` 节的 `base_url + models_endpoint` 发临时 GET，返回上游模型列表。不落盘、不要求 provider 已保存。
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `base_url` | string | 是 | 待测 `apis` 节的 `base_url` |
+| `models_endpoint` | string | 否 | 相对路径，默认 `models` |
+| `api_kind` | string | 否 | 决定鉴权头形状，默认 `chat_completions` |
+| `api_keys` | array | 是 | 至少一条（用于构造鉴权头） |
+| `headers` | object | 否 | 附加自定义头 |
+| `proxy_mode` | string | 否 | `"inherit"` / `"enabled"` / `"disabled"`，仅本次请求 |
+
+响应：`{ "models": [ ...上游 data 数组... ] }`。上游不可达 → 502。
+
+> `auth_mode = "oauth"` 的凭据暂不支持此探针（返回 400）。
 
 ### 测试模型连接
 
@@ -189,6 +221,70 @@ Content-Type: application/json
 }
 ```
 
+> `auth_mode = "oauth"` 的凭据暂不支持此探针（返回 400）。
+
+### 探测协议支持
+
+```
+POST /api/providers/probe-protocols
+Content-Type: application/json
+
+{
+  "api_keys": ["sk-xxx"],
+  "model": "gpt-4o-mini",
+  "targets": [
+    { "protocol": "chat_completions", "base_url": "https://api.openai.com/v1" },
+    { "protocol": "responses", "base_url": "https://api.openai.com/v1" },
+    { "protocol": "anthropic_messages", "base_url": "https://api.anthropic.com/v1" }
+  ],
+  "headers": {},
+  "proxy_mode": "inherit"
+}
+```
+
+对每个「协议 × base_url × key」发一条最小请求，判断上游是否真的支持该协议。**只读**，不写配置。
+
+| 字段 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `api_keys` | array | 是 | 逐一测试 |
+| `model` | string | 是 | 探测用模型；建议非 reasoning 模型（`max_tokens: 1` 可能被 reasoning 模型拒） |
+| `targets` | array | 是 | `{ protocol, base_url, headers? }`；`protocol` ∈ 三协议（`image` → 400） |
+| `headers` | object | 否 | 应用到全部 target（模拟 provider 级 headers） |
+| `proxy_mode` | string | 否 | 同 fetch-models |
+
+探测 URL = `base_url` + 固定协议 path（`/chat/completions` / `/responses` / `/messages`）。
+
+**响应**：
+
+```json
+{
+  "results": [
+    {
+      "protocol": "chat_completions",
+      "url": "https://api.openai.com/v1/chat/completions",
+      "key_prefix": "sk-xxx...",
+      "status": 200,
+      "message": "OK",
+      "verdict": "supported"
+    }
+  ]
+}
+```
+
+`verdict` 判定表：
+
+| HTTP | verdict | 含义 |
+|------|---------|------|
+| 2xx | `supported` | 支持 |
+| 401 / 403 | `auth_failed` | 路径存在，鉴权失败 |
+| 404 | `uncertain` | 读 body 区分 model_not_found / 未知路由 |
+| 405 | `unsupported` | 不支持 |
+| 其他 4xx | `partial` | 路径存在，schema/参数被拒 |
+| 5xx / 其他 | `uncertain` | 未知 |
+| 传输失败 | `error` | `status` 为 `null` |
+
+UI 侧可将 `supported` / `auth_failed` / `partial` 的 `base_url` 回填进 apis 表单，再经 `PUT /api/providers` 保存。
+
 ### 创建路由
 
 ```
@@ -217,6 +313,7 @@ Content-Type: application/json
 | `pipeline` | string | 否 | 请求分派管线：`"chat"`（默认，chat 协议族）或 `"image"`（图像生成） |
 | `api_endpoint` | string | 否 | **仅 `pipeline = "image"` 合法**：真实上游路径（如 `/images/generations`），拼接在 `apis.image.base_url` 之后；chat 族路由携带此字段报 400 |
 | `strategy` | string | 否 | 目标选择策略（`sticky_failover` / `fill_first` / `round_robin`），默认 `sticky_failover` |
+| `retries` | integer | 否 | 路由级重试次数；target 可再覆盖 |
 | `targets` | array | 是 | 目标供应商列表 |
 
 **target 字段说明**：
@@ -226,7 +323,11 @@ Content-Type: application/json
 | `provider` | string | 是 | 供应商名称 |
 | `real_model` | string | 否 | 实际模型名，省略则透传客户端原始模型名 |
 | `priority` | integer | 否 | 优先级，默认 0，值越大越优先 |
+| `retries` | integer | 否 | 覆盖路由/全局重试次数 |
 | `extra` | object | 否 | 针对该目标的额外 JSON 字段，合并到上游请求体 |
+| `capabilities` | object | 否 | 能力位图覆盖（`streaming` / `reasoning` / `tools` / `images` / `documents` / `stateful` / `hosted_tools` / `background`），未知 key 报错 |
+
+> `timeout_secs` 目前不由 admin API 设置（固定走路由/供应商链）。
 
 ### 列出路由
 
@@ -249,6 +350,8 @@ Content-Type: application/json
   ]
 }
 ```
+
+未传入的字段保持原值。`api_endpoint` 为三态 patch：省略保持、`null` 清除（image 路由改回 chat 时必须清）、给值则设置。`pipeline` 省略则保持。
 
 ### 删除路由
 
