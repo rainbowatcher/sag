@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-28
+updated: 2026-06-03
 ---
 
 # 供应商
@@ -71,22 +71,6 @@ updated: 2026-09-28
 
 目的：上游缓存重复的 system prompt 和对话前缀，降低后续请求的 token 成本。
 
-### 凭据模式（auth_mode / oauth）
-
-Provider 支持两种凭据模式：
-
-| 模式 | 行为 |
-|------|------|
-| `static`（默认） | 使用 `api_keys` + `key_strategy` 选择密钥；空 `api_keys` 校验失败 |
-| `oauth` | 使用 `[providers.<name>.oauth]` 的 client credentials；允许空 `api_keys`（且忽略）；`key_strategy` 无实际效果 |
-
-- `auth_mode = "oauth"` 必须提供 oauth 段（`token_url` / `client_id` / `client_secret` 非空）
-- `auth_mode = "oauth"` 与 `apis.anthropic_messages` 组合在校验层拒绝（Phase 1 边界）
-- `auth_mode = "static"` 时写了 oauth 段 → warning（忽略）
-- Admin CRUD：创建允许 oauth 空 keys；更新 patch 为 static 时同步清空 oauth 段；oauth 缺段报错
-- Admin 出参脱敏：`oauth.client_secret` 恒为 `"***"`，另有 `client_secret_set`；更新收到 `"***"` 保持原密钥
-- 管理面板 Provider 表单提供 `auth_mode` 下拉与 oauth 字段组；oauth 时 api_keys 置灰
-
 ### API Key 策略
 
 通过 `key_strategy` 控制多 key 时的选择方式：
@@ -143,7 +127,6 @@ Provider 支持两种凭据模式：
 
 ## 变更记录
 
-- [0005 Provider OAuth auth_mode 管理 CRUD 与表单](changes/0005-oauth-admin-crud-and-ui.md)
 - [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)

@@ -123,10 +123,8 @@ targets = [
 |------|------|--------|------|
 | `apis` | table | — | 协议 API 目录（**必填，至少一个协议 key**）。`[providers.<name>.apis.<kind>]`，`kind` ∈ `chat_completions` / `responses` / `anthropic_messages` / `image`。每节携带自己的 `base_url`（地址唯一来源）与可选的协议相关覆盖字段；`image` 是非协议条目，不参与 lane 判定 |
 | `fallback` | string (可选) | — | 降级协议（translated 路径的编码目标）。`apis` 恰好一个协议 key 时可省略（自动取之）；多个协议 key 时必填，值必须 ∈ apis 协议 key 集 |
-| `api_keys` | array | `[]` | API 密钥列表（所有 API 共享的凭据池）。`auth_mode = "oauth"` 时忽略（允许为空） |
+| `api_keys` | array | `[]` | API 密钥列表（所有 API 共享的凭据池） |
 | `key_strategy` | string | `"fill_first"` | 多密钥选择策略：`"fill_first"`（顺序使用，失败后切换）或 `"round_robin"`（轮询分发） |
-| `auth_mode` | string | `"static"` | 凭据模式：`"static"`（默认，使用 `api_keys`）或 `"oauth"`（使用 `[providers.<name>.oauth]` 段的 client credentials）。未知枚举值直接报错 |
-| `[providers.*.oauth]` | table | — | OAuth 2.0 client credentials 段，`auth_mode = "oauth"` 时必填。字段：`token_url`（必填）、`client_id`（必填）、`client_secret`（必填）、`scope` / `audience` / `refresh_token`（可选）。`client_secret` 以 TOML 明文存储（与 `api_keys` 同级现实）；管理 API 出参永不回显明文 |
 | `proxy_mode` | string | `"inherit"` | 出站代理三态：`"inherit"`（默认，跟随顶层 `proxy_url`）/ `"enabled"`（强制走全局代理，无全局代理则配置错误）/ `"disabled"`（强制直连）。SAG **不读**系统代理环境变量 |
 | `timeout_secs` | integer | `600` | 上游请求超时（秒）。流式请求不受此约束，仅作为非流式请求的整体安全网。provider 级为缺省值，`apis.<key>.timeout_secs` 整段覆盖 |
 | `chunk_timeout_secs` | integer (可选) | — | 流式请求中 chunk 间的最大空闲时间（秒），超时则断开连接。省略时无限等待 |
@@ -148,36 +146,6 @@ targets = [
 Authorization = "Bearer custom-token"
 X-Debug = "true"
 ```
-
-#### auth_mode / oauth 示例
-
-```toml
-# 静态密钥（默认，可省略 auth_mode）
-[providers.openai]
-auth_mode = "static"
-api_keys = ["${OPENAI_API_KEY}"]
-
-# OAuth 2.0 client credentials（Azure AD / OIDC IdP）
-[providers.azure]
-auth_mode = "oauth"
-api_keys = []          # oauth 模式忽略 api_keys，允许为空
-[providers.azure.oauth]
-token_url = "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token"
-client_id = "${AZURE_CLIENT_ID}"
-client_secret = "${AZURE_CLIENT_SECRET}"
-scope = "https://cognitiveservices.azure.com/.default"
-# audience / refresh_token 可选；有 refresh_token 时先尝试 refresh_token grant
-
-[providers.azure.apis.chat_completions]
-base_url = "https://<resource>.openai.azure.com/openai"
-```
-
-约束（与配置加载校验一致）：
-
-- `auth_mode = "oauth"` 时必须提供 `[providers.<name>.oauth]` 段，且 `token_url` / `client_id` / `client_secret` 非空
-- `auth_mode = "oauth"` 与 `apis.anthropic_messages` 组合在 Phase 1 不支持（校验报错）
-- `auth_mode = "static"` 时写了 oauth 段 → warning（忽略，不报错）；切回 static 时 admin 更新会同步清空 oauth 段
-- 管理 API 出参：`oauth.client_secret` 恒为 `"***"`，另有 `client_secret_set: bool`；更新时收到 `"***"` 视为保持原密钥
 
 #### body_overrides 示例
 

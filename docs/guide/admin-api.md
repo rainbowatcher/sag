@@ -32,15 +32,6 @@ Content-Type: application/json
   "name": "my-provider",
   "api_keys": ["..."],
   "key_strategy": "fill_first",
-  "auth_mode": "static",
-  "oauth": {
-    "token_url": "https://login.example.com/oauth2/token",
-    "client_id": "cid",
-    "client_secret": "plain-secret",
-    "scope": "scope-a",
-    "audience": "https://api.example.com",
-    "refresh_token": "optional-rt"
-  },
   "apis": {
     "chat_completions": {
       "base_url": "https://api.openai.com/v1",
@@ -66,10 +57,8 @@ Content-Type: application/json
 | `name` | string | 是 | — | 供应商唯一名称 |
 | `apis` | object | 是 | — | 协议 API 目录（至少一个条目，且至少含一个协议 key）。key ∈ `chat_completions` / `responses` / `anthropic_messages` / `image`。每节携带自己的 `base_url`（必填，地址唯一来源）与可选 `models_endpoint`（默认 `models`，相对本节 `base_url`，传入 `/v1/models/` 会被规范化为 `v1/models`），还可声明 `headers` / `body_overrides` / `strip_fields` / `model_overrides` / `role_mappings` / `anthropic_cache_control` / `timeout_secs` / `chunk_timeout_secs` / `ttfb_timeout_secs`，声明时整段覆盖 provider 级同名缺省 |
 | `fallback` | string | 条件 | — | 降级协议（translated 路径的编码目标），值必须 ∈ `apis` 的协议 key 集（`image` 非法）。`apis` 恰好一个协议 key 时省略（自动取之）；声明多个协议 key 时必填 |
-| `api_keys` | array | 否 | `[]` | API 密钥列表。`auth_mode = "static"` 时至少一条；`auth_mode = "oauth"` 时允许为空（且忽略） |
+| `api_keys` | array | 否 | `[]` | API 密钥列表 |
 | `key_strategy` | string | 否 | `"fill_first"` | 多密钥选择策略：`"fill_first"` / `"round_robin"` |
-| `auth_mode` | string | 否 | `"static"` | 凭据模式：`"static"` 或 `"oauth"`。未知值 422。`"oauth"` 时必须同时提供 `oauth` 段；`"static"` 时 `api_keys` 非空校验生效 |
-| `oauth` | object \| null | 条件 | — | OAuth client credentials 段，`auth_mode = "oauth"` 时必填。字段：`token_url` / `client_id` / `client_secret`（均非空）、`scope` / `audience` / `refresh_token`（可选）。**secret 脱敏**：GET 出参中 `client_secret` 恒为 `"***"`，另有 `client_secret_set: bool`；更新时 `"***"` 表示保持原密钥，任意其他字符串为新密钥 |
 | `timeout_secs` | integer | 否 | `600` | 上游请求超时（秒），仅约束非流式请求；`apis.<key>.timeout_secs` 可整段覆盖 |
 | `chunk_timeout_secs` | integer \| null | 否 | `null` | 流式 chunk 间最大空闲时间（秒），`null` 表示无限等待 |
 | `ttfb_timeout_secs` | integer \| null | 否 | `null`（默认 60） | 流式等待上游响应头（首字节）的最大时间（秒），收到响应头后停止计时 |
@@ -82,13 +71,6 @@ Content-Type: application/json
 | `model_strip_fields` | object | 否 | `{}` | 按 `real_model` 的字段移除表 |
 | `model_overrides` | object | 否 | `{}` | 按 `real_model` 的 body 覆盖 |
 | `anthropic_cache_control` | boolean | 否 | `true` | Anthropic 缓存控制注入，仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖） |
-
-OAuth 相关约束（与配置加载校验一致）：
-
-- `auth_mode = "oauth"` 且缺 `oauth` 段 → 400
-- `auth_mode = "oauth"` 与 `apis.anthropic_messages` 组合 → 400（Phase 1 边界）
-- 创建时 `auth_mode = "static"` 且 `api_keys` 为空 → 400；`oauth` 为空 → 允许
-- GET 响应：`auth_mode` 始终返回；`oauth` 为 `null` 或脱敏后的对象（`client_secret: "***"` + `client_secret_set`）
 
 ### 更新供应商
 
@@ -110,8 +92,6 @@ Content-Type: application/json
 只更新请求体中传入的字段，未传入的字段保持原值。支持更新所有[添加供应商](#添加供应商)中列出的字段。
 
 > `apis` 是例外的**整目录替换**：请求体中出现 `apis` 即整体替换现有目录（不按节合并），需发送完整目录。`fallback` 为三态 patch：省略保持原值，`null` 清除，给值则设置。
-
-> `auth_mode` / `oauth` 的 patch 语义：`auth_mode` 省略保持当前模式；patch 为 `"static"` 时**同步清空**存储的 oauth 段；patch 为 `"oauth"` 时若合并后缺 oauth 段则 400。`oauth` 为三态：省略保持，`null` 清除，对象整段替换。`client_secret` 为 `"***"` 时保持原密钥（管理 API 出参从不回显明文 secret）。
 
 > `priority` 不是供应商字段，不会参与路由排序。路由目标的优先级应在 `targets[].priority` 上配置。
 

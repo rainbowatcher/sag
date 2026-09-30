@@ -32,14 +32,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
-import {
-  oauthFormFromOut,
-  oauthFormToPayload,
-  type AuthMode,
-  type OAuthConfigForm,
-  type Provider,
-  type ProxyMode,
-} from "@/types/api"
+import type { Provider, ProxyMode } from "@/types/api"
 
 const isDesktop = useMediaQuery("(min-width: 640px)")
 
@@ -83,14 +76,6 @@ const proxyMode = ref<ProxyMode>(props.provider.proxy_mode ?? "inherit")
 // ── API keys ─────────────────────────────────────────────────
 const apiKeys = ref<string[]>([...props.provider.api_keys])
 const keyStrategy = ref<"fill_first" | "round_robin">(props.provider.key_strategy)
-
-// ── Credential mode ──────────────────────────────────────────
-const authMode = ref<AuthMode>(props.provider.auth_mode ?? "static")
-// Out-path secret is always `"***"` when an oauth section exists; the edit
-// form keeps that mask so a save without retyping the secret does not
-// overwrite the stored value (backend treats `"***"` as keep).
-const secretIsMasked = ref((props.provider.oauth?.client_secret ?? "") === "***")
-const oauthForm = ref<OAuthConfigForm>(oauthFormFromOut(props.provider.oauth ?? undefined))
 
 // ── Models ───────────────────────────────────────────────────
 const enabledModels = ref<string[]>([...props.provider.enabled_models])
@@ -149,7 +134,6 @@ async function handleSubmit() {
   apiError.value = ""
   saving.value = true
   try {
-    const isOAuth = authMode.value === "oauth"
     const validKeys = apiKeys.value.filter((k) => k.trim())
     const payload: Record<string, any> = {}
 
@@ -159,24 +143,8 @@ async function handleSubmit() {
       return
     }
 
-    // Always send auth_mode so switching static↔oauth is explicit.
-    payload.auth_mode = authMode.value
-    if (isOAuth) {
-      const oauthPayload = oauthFormToPayload(oauthForm.value, secretIsMasked.value)
-      if (!oauthPayload.token_url || !oauthPayload.client_id || !oauthPayload.client_secret) {
-        apiError.value = "OAuth requires token_url, client_id, and client_secret"
-        saving.value = false
-        return
-      }
-      payload.oauth = oauthPayload
-    } else {
-      // Switching back to static: null clears the stored oauth section.
-      if (props.provider.auth_mode === "oauth") {
-        payload.oauth = null
-      }
-      if (validKeys.length > 0) {
-        payload.api_keys = validKeys
-      }
+    if (validKeys.length > 0) {
+      payload.api_keys = validKeys
     }
     payload.key_strategy = keyStrategy.value
 
@@ -207,7 +175,6 @@ async function handleSubmit() {
         parsedBodyOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
       } catch {
         apiError.value = `Body override "${key}": invalid JSON value`
-        saving.value = false
         return
       }
     }
@@ -292,9 +259,6 @@ async function handleSubmit() {
               v-model:api-keys="apiKeys"
               v-model:key-strategy="keyStrategy"
               v-model:proxy-mode="proxyMode"
-              v-model:auth-mode="authMode"
-              v-model:oauth="oauthForm"
-              :secret-is-masked="secretIsMasked"
             />
           </TabsContent>
 

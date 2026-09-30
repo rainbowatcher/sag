@@ -1,15 +1,12 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reqwest::RequestBuilder;
-use sag_config::{ApiConfig, AuthMode, ProviderConfig};
+use sag_config::{ApiConfig, KeyStrategy, ProviderConfig};
 use sag_core::{ApiKind, AppError, ChatMessage, protocol_path};
 use tracing::{debug, trace, warn};
 
-use crate::{
-    CredentialProvider, apply_body_overrides, apply_body_strip, apply_headers,
-    build_credential_provider, render_auth_headers,
-};
+use crate::{apply_body_overrides, apply_body_strip, apply_headers, provider_auth_headers};
 
 /// Join an API base URL and a path with exactly one `/` between them,
 /// regardless of leading/trailing slashes on either side.
@@ -29,17 +26,12 @@ fn join_url(base: &str, path: &str) -> String {
 /// Protocol-related settings resolve through the `effective_*` helpers:
 /// an `apis.<key>` field declared (`Some`) replaces the provider-level
 /// default wholesale; `None` inherits it.
-///
-/// Auth is injected exclusively inside `send_json*` via
-/// [`ProviderBase::auth_headers`] (D8): adapters must not put auth pairs
-/// into `extra_headers` / `target_extra`.
 pub struct ProviderBase {
     /// Human-readable provider name (e.g. `"openai"`, `"anthropic"`).
     pub name: String,
-    /// Credential source (static keys or OAuth client-credentials).
-    credential: Arc<dyn CredentialProvider>,
-    /// Credential mode — selects 401 invalidate+retry behavior.
-    auth_mode: AuthMode,
+    api_keys: Vec<String>,
+    key_strategy: KeyStrategy,
+    key_counter: AtomicUsize,
     /// Per-protocol API nodes (address + optional protocol-level overrides).
     apis: HashMap<ApiKind, ApiConfig>,
     /// Reusable HTTP client with **no** total request deadline. A healthy
@@ -48,8 +40,6 @@ pub struct ProviderBase {
     /// `RequestBuilder::timeout` in [`ProviderBase::send_json`].
     pub http_client: reqwest::Client,
     /// Provider-level default headers (fallback for `effective_headers`).
-    /// **Non-auth only** — auth is injected by the credential path and
-    /// applied before these (config headers may still override auth).
     headers: HashMap<String, String>,
     /// Provider-level default body overrides (fallback for
     /// `effective_body_overrides`).
@@ -116,25 +106,19 @@ impl ProviderBase {
             sag_core::build_http_client(proxy.map(|p| p.to_connect_url()).as_deref(), None)
                 .map_err(|e| AppError::Internal(format!("failed to build reqwest client: {e}")))?;
 
-        // Empty `api_keys` is an error only for static mode; oauth mode
-        // allows an empty key list (credentials come from the token
-        // endpoint). Must ship with config validation accepting oauth
-        // (Phase 1+3 same release — D3).
-        if config.auth_mode == AuthMode::Static && config.api_keys.is_empty() {
+        if config.api_keys.is_empty() {
             return Err(AppError::BadRequest(format!(
                 "provider '{}': api_keys is empty",
                 name
             )));
         }
-
-        // OAuth token fetches reuse this client (proxy semantics stay
-        // consistent with upstream LLM traffic).
-        let credential = build_credential_provider(&name, config, http_client.clone())?;
+        let api_keys = config.api_keys.clone();
 
         Ok(Self {
             name,
-            credential,
-            auth_mode: config.auth_mode,
+            api_keys,
+            key_strategy: config.key_strategy,
+            key_counter: AtomicUsize::new(0),
             apis: config.apis.iter().map(|(k, v)| (*k, v.clone())).collect(),
             http_client,
             headers: config.headers.clone(),
@@ -149,19 +133,15 @@ impl ProviderBase {
         })
     }
 
-    /// Whether this provider authenticates via OAuth client-credentials.
-    fn is_oauth(&self) -> bool {
-        self.auth_mode == AuthMode::OAuth
-    }
-
-    /// Resolve auth header pairs for `kind` from the credential provider.
-    ///
-    /// Contract (D8): auth is always obtained here (inside `send_json*`),
-    /// never via `extra_headers` / `target_extra`, so a 401 retry can
-    /// invalidate + re-render auth without the caller noticing.
-    async fn auth_headers(&self, kind: ApiKind) -> sag_core::Result<Vec<(String, String)>> {
-        let credential = self.credential.get_credential().await?;
-        Ok(render_auth_headers(kind, &credential))
+    /// Select the current API key based on the configured strategy.
+    pub fn current_key(&self) -> &str {
+        match self.key_strategy {
+            KeyStrategy::FillFirst => &self.api_keys[0],
+            KeyStrategy::RoundRobin => {
+                let idx = self.key_counter.fetch_add(1, Ordering::Relaxed) % self.api_keys.len();
+                &self.api_keys[idx]
+            }
+        }
     }
 
     /// The configured fallback protocol (translated-lane encoding target).
@@ -310,28 +290,23 @@ impl ProviderBase {
             .unwrap_or_else(sag_config::default_ttfb_timeout_secs)
     }
 
-    /// Build a reqwest POST request for `kind` with the given auth pairs,
+    /// Build a reqwest POST request for `kind` with per-kind auth,
     /// effective headers, and effective body overrides applied.
     ///
     /// `Content-Type: application/json` is set automatically.
-    /// Auth headers are applied first, then `effective_headers(kind)` (so
-    /// configured headers can override auth), then
-    /// `effective_body_overrides(kind)`, then `target_extra`.
-    ///
-    /// `auth` is **non-optional**: callers must obtain it from
-    /// [`ProviderBase::auth_headers`] (D8 — auth never travels via
-    /// `extra_headers` / `target_extra`).
+    /// Per-kind auth headers are applied first, then
+    /// `effective_headers(kind)` (so configured headers can override auth),
+    /// then `effective_body_overrides(kind)`, then `target_extra`.
     pub(crate) fn build_request(
         &self,
         url: &str,
         kind: ApiKind,
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
-        auth: &[(String, String)],
     ) -> RequestBuilder {
         let req = self.http_client.post(url);
-        let auth_refs: Vec<(&str, &str)> =
-            auth.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let auth = provider_auth_headers(kind, self.current_key());
+        let auth_refs: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let headers = self.effective_headers(kind);
         let req = apply_headers(req, &auth_refs, &headers);
         let body_overrides = self.effective_body_overrides(kind);
@@ -388,10 +363,8 @@ impl ProviderBase {
     /// Send a JSON POST request for `kind` and return the response body
     /// text on success.
     ///
-    /// Auth is obtained internally via [`ProviderBase::auth_headers`].
-    /// OAuth mode: an upstream 401 invalidates the token cache and retries
-    /// **once** with a freshly fetched credential; a second 401 surfaces
-    /// as `AppError::Upstream{401}`. Static mode never enters that branch.
+    /// Combines `build_request` + `send` + `check_upstream_error`. Used by
+    /// `chat()` and `chat_image()`.
     ///
     /// `timeout_secs` applies a per-request deadline covering the whole
     /// round-trip (connect, headers, and body read) when `Some`. `None`
@@ -405,37 +378,21 @@ impl ProviderBase {
         target_extra: &HashMap<String, serde_json::Value>,
         timeout_secs: Option<u64>,
     ) -> sag_core::Result<String> {
-        let mut retried_401 = false;
-        loop {
-            let auth = self.auth_headers(kind).await?;
-            let mut request = self.build_request(url, kind, body.clone(), target_extra, &auth);
-            if let Some(secs) = timeout_secs {
-                request = request.timeout(std::time::Duration::from_secs(secs));
-            }
-            let response = request.send().await.map_err(AppError::from)?;
-
-            // 401 invalidate+retry must run before the response body is
-            // consumed (check_upstream_error would otherwise throw).
-            if response.status().as_u16() == 401 && self.is_oauth() && !retried_401 {
-                warn!(provider = %self.name, "upstream 401 on oauth provider; invalidating token and retrying once");
-                retried_401 = true;
-                self.credential.invalidate().await;
-                continue;
-            }
-
-            let body_text = self.check_upstream_error(response).await?;
-            trace!(response_body = %body_text, "upstream response body");
-            return Ok(body_text);
+        let mut request = self.build_request(url, kind, body, target_extra);
+        if let Some(secs) = timeout_secs {
+            request = request.timeout(std::time::Duration::from_secs(secs));
         }
+        let response = request.send().await.map_err(AppError::from)?;
+        let body_text = self.check_upstream_error(response).await?;
+        trace!(response_body = %body_text, "upstream response body");
+        Ok(body_text)
     }
 
     /// Send a JSON POST request for `kind` (streaming) and return the
     /// `Response`.
     ///
-    /// Auth is obtained internally via [`ProviderBase::auth_headers`].
-    /// OAuth mode: an upstream 401 at the headers stage (before any body
-    /// is forwarded to the client) invalidates the token cache and retries
-    /// once; a second 401 surfaces as `AppError::Upstream{401}`.
+    /// Combines `build_request` + `send` + `ensure_success`. Used by
+    /// `chat_stream()`.
     ///
     /// Unlike [`Self::send_json`], streaming does **not** apply a total
     /// request deadline (that would truncate a healthy long-lived
@@ -460,42 +417,28 @@ impl ProviderBase {
         body: serde_json::Value,
         target_extra: &HashMap<String, serde_json::Value>,
     ) -> sag_core::Result<reqwest::Response> {
+        let request = self.build_request(url, kind, body, target_extra);
         let ttfb = std::time::Duration::from_secs(self.ttfb_timeout_secs(kind));
-        let mut retried_401 = false;
-        loop {
-            let auth = self.auth_headers(kind).await?;
-            let request = self.build_request(url, kind, body.clone(), target_extra, &auth);
-            let response = match tokio::time::timeout(ttfb, request.send()).await {
-                Ok(result) => result.map_err(AppError::from)?,
-                Err(_elapsed) => {
-                    warn!(
-                        ttfb_timeout_secs = ttfb.as_secs(),
-                        "upstream time-to-first-byte timeout"
-                    );
-                    return Err(AppError::TtfbTimeout {
-                        provider: self.name.clone(),
-                        secs: ttfb.as_secs(),
-                    });
-                }
-            };
-
-            // 401 at the headers stage: body has not been forwarded to the
-            // client yet, so invalidate + retry once is safe.
-            if response.status().as_u16() == 401 && self.is_oauth() && !retried_401 {
-                warn!(provider = %self.name, "upstream 401 on oauth stream; invalidating token and retrying once");
-                retried_401 = true;
-                self.credential.invalidate().await;
-                continue;
+        let response = match tokio::time::timeout(ttfb, request.send()).await {
+            Ok(result) => result.map_err(AppError::from)?,
+            Err(_elapsed) => {
+                warn!(
+                    ttfb_timeout_secs = ttfb.as_secs(),
+                    "upstream time-to-first-byte timeout"
+                );
+                return Err(AppError::TtfbTimeout {
+                    provider: self.name.clone(),
+                    secs: ttfb.as_secs(),
+                });
             }
-
-            let response = self.ensure_success(response, kind).await?;
-            trace!("upstream stream connection established");
-            debug!(
-                status = response.status().as_u16(),
-                "upstream stream established"
-            );
-            return Ok(response);
-        }
+        };
+        let response = self.ensure_success(response, kind).await?;
+        trace!("upstream stream connection established");
+        debug!(
+            status = response.status().as_u16(),
+            "upstream stream established"
+        );
+        Ok(response)
     }
 
     /// Check upstream response status for **streaming** requests.
@@ -685,13 +628,6 @@ mod tests {
     fn extract_json_body(req: reqwest::Request) -> serde_json::Value {
         let body_bytes = req.body().unwrap().as_bytes().unwrap();
         serde_json::from_slice(body_bytes).unwrap()
-    }
-
-    fn static_auth(kind: ApiKind) -> Vec<(String, String)> {
-        crate::provider_auth_headers(kind, "sk-test")
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect()
     }
 
     #[test]
@@ -955,7 +891,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &target_extra,
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -986,7 +921,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &HashMap::new(),
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1014,7 +948,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &target_extra,
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1051,7 +984,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o", "temperature": 1.0 }),
                 &target_extra,
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1082,7 +1014,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o" }),
                 &target_extra,
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1131,7 +1062,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o" }),
                 &target_extra,
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1162,7 +1092,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 original.clone(),
                 &HashMap::new(),
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1194,7 +1123,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({ "model": "gpt-4o" }),
                 &target_extra,
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1239,7 +1167,6 @@ mod tests {
                     "keep_me": "yes"
                 }),
                 &HashMap::new(),
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1260,7 +1187,6 @@ mod tests {
                     "chat_template_kwargs": { "foo": "bar" },
                 }),
                 &HashMap::new(),
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1537,7 +1463,6 @@ mod tests {
                 ApiKind::ChatCompletions,
                 serde_json::json!({"model": "m"}),
                 &HashMap::new(),
-                &static_auth(ApiKind::ChatCompletions),
             )
             .build()
             .unwrap();
@@ -1557,7 +1482,6 @@ mod tests {
                 ApiKind::AnthropicMessages,
                 serde_json::json!({"model": "m"}),
                 &HashMap::new(),
-                &static_auth(ApiKind::AnthropicMessages),
             )
             .build()
             .unwrap();
@@ -1567,373 +1491,6 @@ mod tests {
             "2023-06-01"
         );
         assert!(req.headers().get("authorization").is_none());
-    }
-
-    // ── OAuth credential path (401 invalidate + single retry) ──────
-
-    /// Multi-request mock: token endpoint + LLM upstream that rejects the
-    /// first Authorization value with 401 and accepts the second.
-    async fn spawn_oauth_llm_and_idp(
-        reject_first: bool,
-    ) -> (
-        String,
-        String,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
-    ) {
-        use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let token_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let auths = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-        // Mock IdP
-        let idp_hits = token_hits.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let idp_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let hits = idp_hits.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    // Token value encodes the hit count so the retry can
-                    // prove a fresh credential was used.
-                    let n = hits.load(Ordering::SeqCst);
-                    let body = format!(
-                        r#"{{"access_token":"tok-{n}","token_type":"Bearer","expires_in":3600}}"#
-                    );
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    drop(stream);
-                });
-            }
-        });
-
-        // Mock LLM: records Authorization; 401 on first oauth token if
-        // reject_first, else 200 always (for the static no-retry case we
-        // still want 401-only-on-first static to prove no invalidate —
-        // static path has no token endpoint, so hit count stays 0).
-        let auths2 = auths.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let llm_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut first = true;
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let auths = auths2.clone();
-                let is_first = first;
-                first = false;
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    let mut req = Vec::new();
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                req.extend_from_slice(&buf[..n]);
-                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let text = String::from_utf8_lossy(&req).to_string();
-                    let auth = text
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            if k.trim().eq_ignore_ascii_case("authorization") {
-                                Some(v.trim().to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                    auths.lock().await.push(auth.clone());
-
-                    let oauth_style = auth.to_ascii_lowercase().starts_with("bearer tok-");
-                    let status = if reject_first && oauth_style && is_first {
-                        401u16
-                    } else {
-                        200
-                    };
-                    let body = if status == 200 {
-                        r#"{"id":"1","object":"chat.completion","choices":[]}"#.to_string()
-                    } else {
-                        r#"{"error":{"message":"unauthorized"}}"#.to_string()
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    drop(stream);
-                });
-            }
-        });
-
-        (
-            format!("http://{llm_addr}"),
-            format!("http://{idp_addr}/token"),
-            token_hits,
-            auths,
-        )
-    }
-
-    fn oauth_base_config(llm_base: &str, token_url: &str, api_keys: Vec<String>) -> ProviderConfig {
-        use sag_config::{AuthMode, OAuthConfig};
-        let mut config = crate::test_support::test_config(llm_base, 30, None, None);
-        config.api_keys = api_keys;
-        if token_url.is_empty() {
-            config.auth_mode = AuthMode::Static;
-            config.oauth = None;
-        } else {
-            config.auth_mode = AuthMode::OAuth;
-            config.oauth = Some(OAuthConfig {
-                token_url: token_url.to_string(),
-                client_id: "cid".into(),
-                client_secret: "sec".into(),
-                scope: None,
-                audience: None,
-                refresh_token: None,
-            });
-        }
-        config
-    }
-
-    #[tokio::test]
-    async fn oauth_401_invalidates_and_retries_once_with_new_token() {
-        let (llm_base, token_url, token_hits, auths) = spawn_oauth_llm_and_idp(true).await;
-        let config = oauth_base_config(&llm_base, &token_url, vec![]);
-        let base = ProviderBase::new("azure".into(), &config).unwrap();
-        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
-
-        let body_text = base
-            .send_json(
-                &url,
-                ApiKind::ChatCompletions,
-                serde_json::json!({"model":"m"}),
-                &HashMap::new(),
-                Some(5),
-            )
-            .await
-            .expect("retry after 401 must succeed");
-
-        assert!(body_text.contains("chat.completion"));
-        let recorded = auths.lock().await.clone();
-        assert_eq!(
-            recorded,
-            vec!["Bearer tok-1".to_string(), "Bearer tok-2".to_string()],
-            "second attempt must carry the refreshed token; got {recorded:?}"
-        );
-        assert_eq!(
-            token_hits.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "cold start + 401 invalidate → exactly two token fetches"
-        );
-    }
-
-    #[tokio::test]
-    async fn oauth_second_401_surfaces_upstream_and_stops() {
-        // LLM always 401s oauth tokens (reject_first=false still 401s? no —
-        // we need always-401). Build a dedicated always-401 server.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let llm_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let body = r#"{"error":{"message":"unauthorized"}}"#;
-                    let resp = format!(
-                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    drop(stream);
-                });
-            }
-        });
-
-        // Token endpoint always succeeds.
-        let token_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let idp_hits = token_hits.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let idp_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let hits = idp_hits.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body =
-                        r#"{"access_token":"tok-x","token_type":"Bearer","expires_in":3600}"#;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    drop(stream);
-                });
-            }
-        });
-
-        let llm_base = format!("http://{llm_addr}");
-        let token_url = format!("http://{idp_addr}/token");
-        let config = oauth_base_config(&llm_base, &token_url, vec![]);
-        let base = ProviderBase::new("azure".into(), &config).unwrap();
-        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
-
-        let err = base
-            .send_json(
-                &url,
-                ApiKind::ChatCompletions,
-                serde_json::json!({"model":"m"}),
-                &HashMap::new(),
-                Some(5),
-            )
-            .await
-            .unwrap_err();
-
-        match err {
-            AppError::Upstream { status, .. } => {
-                assert_eq!(status, 401, "second 401 must surface as Upstream{{401}}");
-            }
-            other => panic!("expected Upstream 401, got {other:?}"),
-        }
-        assert_eq!(
-            token_hits.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "cold + one invalidate retry = two token fetches, not a loop"
-        );
-    }
-
-    #[tokio::test]
-    async fn static_401_does_not_touch_token_endpoint() {
-        // Static mode with a 401 upstream: no invalidate branch, no token
-        // fetches (hit count stays 0 because no OAuth client is used).
-        let (llm_base, _token_url, token_hits, auths) = spawn_oauth_llm_and_idp(true).await;
-        let config = oauth_base_config(&llm_base, "", vec!["sk-static".into()]);
-        let base = ProviderBase::new("static".into(), &config).unwrap();
-        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
-
-        // Static keys never produce `Bearer tok-*`, so the mock answers 200
-        // (it only 401s oauth-style auth). Assert static auth shape + zero
-        // token-endpoint traffic.
-        let body_text = base
-            .send_json(
-                &url,
-                ApiKind::ChatCompletions,
-                serde_json::json!({"model":"m"}),
-                &HashMap::new(),
-                Some(5),
-            )
-            .await
-            .expect("static mode with non-oauth mock must succeed");
-        assert!(body_text.contains("chat.completion"));
-        let recorded = auths.lock().await.clone();
-        assert_eq!(
-            recorded,
-            vec!["Bearer sk-static".to_string()],
-            "static mode injects the static key Bearer, single attempt"
-        );
-        assert_eq!(
-            token_hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "static mode must never hit a token endpoint"
-        );
-    }
-
-    #[tokio::test]
-    async fn static_401_never_retries() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hits2 = hits.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let hits = hits2.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body = r#"{"error":{"message":"unauthorized"}}"#;
-                    let resp = format!(
-                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    drop(stream);
-                });
-            }
-        });
-        let config = oauth_base_config(&format!("http://{addr}"), "", vec!["sk".into()]);
-        let base = ProviderBase::new("s".into(), &config).unwrap();
-        let url = base.protocol_url(ApiKind::ChatCompletions).unwrap();
-        let err = base
-            .send_json(
-                &url,
-                ApiKind::ChatCompletions,
-                serde_json::json!({}),
-                &HashMap::new(),
-                Some(5),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::Upstream { status: 401, .. }));
-        assert_eq!(
-            hits.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "static 401 must not retry"
-        );
-    }
-
-    #[test]
-    fn oauth_provider_skips_empty_api_keys_check() {
-        let config = oauth_base_config("https://example.com", "http://127.0.0.1:9/token", vec![]);
-        match ProviderBase::new("azure".into(), &config) {
-            Ok(_) => {}
-            Err(e) => panic!("oauth mode must allow empty api_keys: {e}"),
-        }
-    }
-
-    #[test]
-    fn static_provider_still_rejects_empty_api_keys() {
-        let config = oauth_base_config("https://example.com", "", vec![]);
-        let err = match ProviderBase::new("s".into(), &config) {
-            Err(e) => e,
-            Ok(_) => panic!("static mode must reject empty api_keys"),
-        };
-        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[test]

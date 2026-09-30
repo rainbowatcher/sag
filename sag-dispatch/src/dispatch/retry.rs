@@ -161,15 +161,6 @@ pub fn is_retryable_error(err: &AppError) -> bool {
             429 | 408 | 500..=599 => true,
             _ => false,
         },
-        // Token-endpoint / credential failures (OAuth client_credentials).
-        // Network / 5xx / 429 are transient → retryable (circuit opens after
-        // exhaustion). Other 4xx (invalid_client / invalid_grant / …) are
-        // provider-persistent → failover without retrying into the IdP.
-        AppError::CredentialFetch { status, .. } => match status {
-            None => true,
-            Some(s) if (500..=599).contains(s) || *s == 429 => true,
-            Some(_) => false,
-        },
         _ => true,
     }
 }
@@ -187,10 +178,6 @@ pub fn is_retryable_error(err: &AppError) -> bool {
 ///   (return the error to the client, no failover, no pin movement, no
 ///   circuit change).
 ///
-/// Credential/token-endpoint failures ([`AppError::CredentialFetch`]) are
-/// never client-caused: a bad IdP response must fail over to the next
-/// target, not surface as a client error.
-///
 /// A 403 reaching this predicate is always a non-quota 403 - quota-403 is
 /// retryable and never lands in [`RetryOutcome::NonRetryable`]. 408/429 are
 /// likewise retryable (transient provider failures, not client-caused) and
@@ -199,7 +186,6 @@ pub fn is_retryable_error(err: &AppError) -> bool {
 pub fn is_client_caused_4xx(err: &AppError) -> bool {
     match err {
         AppError::BadRequest(_) => true,
-        AppError::CredentialFetch { .. } => false,
         AppError::Upstream { status, .. } => {
             let s = *status;
             (400..500).contains(&s) && !matches!(s, 401 | 403 | 404 | 408 | 429)

@@ -7,82 +7,6 @@
 export type ProxyMode = "inherit" | "enabled" | "disabled"
 
 /**
- * Provider credential mode.
- * - `static` — use `api_keys` + `key_strategy` (default).
- * - `oauth` — OAuth 2.0 client-credentials against `[providers.*.oauth]`.
- */
-export type AuthMode = "static" | "oauth"
-
-/** OAuth client-credentials settings (request / write path). */
-export interface OAuthConfig {
-  token_url: string
-  client_id: string
-  /** Plaintext secret on write. `"***"` means keep the stored secret. */
-  client_secret: string
-  scope?: string
-  audience?: string
-  refresh_token?: string
-}
-
-/**
- * OAuth section as returned by the admin API.
- * `client_secret` is always the mask `"***"`; `client_secret_set` reports
- * whether a secret is stored. Never returns plaintext.
- */
-export interface OAuthConfigOut extends OAuthConfig {
-  client_secret: string
-  client_secret_set: boolean
-}
-
-/** Edit/add form state for OAuth fields (optional strings, not API types). */
-export interface OAuthConfigForm {
-  token_url: string
-  client_id: string
-  client_secret: string
-  scope: string
-  audience: string
-  refresh_token: string
-}
-
-export function emptyOAuthForm(): OAuthConfigForm {
-  return {
-    token_url: "",
-    client_id: "",
-    client_secret: "",
-    scope: "",
-    audience: "",
-    refresh_token: "",
-  }
-}
-
-export function oauthFormFromOut(oauth?: OAuthConfigOut): OAuthConfigForm {
-  if (!oauth) return emptyOAuthForm()
-  return {
-    token_url: oauth.token_url ?? "",
-    client_id: oauth.client_id ?? "",
-    // Out-path secret is always the mask; edit form shows `***`.
-    client_secret: oauth.client_secret ?? "",
-    scope: oauth.scope ?? "",
-    audience: oauth.audience ?? "",
-    refresh_token: oauth.refresh_token ?? "",
-  }
-}
-
-/** Build the OAuth request payload from form state. Empty optional strings → omit. */
-export function oauthFormToPayload(form: OAuthConfigForm, secretIsMasked: boolean): OAuthConfig {
-  const secret = form.client_secret.trim()
-  return {
-    token_url: form.token_url.trim(),
-    client_id: form.client_id.trim(),
-    // Masked secret (or blank while one is stored) keeps the stored value.
-    client_secret: secretIsMasked && secret === "" ? "***" : secret,
-    ...(form.scope.trim() ? { scope: form.scope.trim() } : {}),
-    ...(form.audience.trim() ? { audience: form.audience.trim() } : {}),
-    ...(form.refresh_token.trim() ? { refresh_token: form.refresh_token.trim() } : {}),
-  }
-}
-
-/**
  * Key of a provider `apis` section: the three chat-family protocols plus
  * the non-protocol `image` entry (its path comes from route.`api_endpoint`).
  * Unknown keys are rejected by the backend (strict enum).
@@ -131,13 +55,6 @@ export interface Provider {
   name: string
   api_keys: string[]
   key_strategy: "fill_first" | "round_robin"
-  /** Credential mode: `static` (api_keys) or `oauth` (client credentials). */
-  auth_mode: AuthMode
-  /**
-   * OAuth settings when `auth_mode = "oauth"`.
-   * `client_secret` is always `"***"`; `client_secret_set` reports storage.
-   */
-  oauth?: OAuthConfigOut | null
   /** Protocol API catalog: one section per declared ApiKind. */
   apis: Record<ApiKind, ApiConfig>
   /**
@@ -168,10 +85,6 @@ export interface AddProviderPayload {
   name: string
   api_keys: string[]
   key_strategy?: "fill_first" | "round_robin"
-  /** Credential mode (default `static`). `oauth` requires `oauth`. */
-  auth_mode?: AuthMode
-  /** Required when `auth_mode = "oauth"`; ignored when static. */
-  oauth?: OAuthConfig
   apis: Record<ApiKind, ApiConfig>
   /** Required when `apis` declares more than one protocol key. */
   fallback?: ApiKind
@@ -191,16 +104,6 @@ export interface UpdateProviderPayload {
   name: string
   api_keys?: string[]
   key_strategy?: "fill_first" | "round_robin"
-  /**
-   * Credential-mode patch. `static` clears the stored oauth section.
-   * Omitted keeps the current mode.
-   */
-  auth_mode?: AuthMode
-  /**
-   * Triple-state oauth patch: omit → keep, `null` → clear, value → replace
-   * the whole section. `client_secret: "***"` keeps the stored secret.
-   */
-  oauth?: OAuthConfig | null
   /** Whole-directory replace: sections not repeated are dropped. */
   apis?: Record<ApiKind, ApiConfig>
   /** Triple-state: omit → keep, `null` → clear, value → set. */

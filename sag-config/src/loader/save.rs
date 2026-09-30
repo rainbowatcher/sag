@@ -5,8 +5,8 @@ use std::path::Path;
 use tracing::info;
 
 use crate::config::{
-    ApiConfig, AuthMode, GatewayConfig, KeyStrategy, Pipeline, ProviderConfig, ProxyMode,
-    RouteConfig, RouteTarget, Strategy,
+    ApiConfig, GatewayConfig, KeyStrategy, Pipeline, ProviderConfig, ProxyMode, RouteConfig,
+    RouteTarget, Strategy,
 };
 use crate::loader::json_util::{check_json_map, json_to_toml_value};
 use crate::toml_edit_util::{
@@ -120,10 +120,6 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
                 if provider.anthropic_cache_control {
                     table.remove("anthropic_cache_control");
                 }
-                // oauth — rewrite as nested sub-table (to_document may
-                // emit inline form); remove when absent.
-                table.remove("oauth");
-                write_oauth_field(&mut table, provider);
                 // apis — to_document 可能把 map 序列化为 inline 形态；
                 // 统一改写为嵌套子表 [providers.<name>.apis.<key>]。
                 table.remove("apis");
@@ -358,14 +354,6 @@ fn update_existing_provider(
     } else {
         table.remove("key_strategy");
     }
-    // auth_mode — skip if default `static`.
-    if provider.auth_mode != AuthMode::default() {
-        table["auth_mode"] = toml_edit::value(provider.auth_mode.as_str());
-    } else {
-        table.remove("auth_mode");
-    }
-    // oauth — nested sub-table; remove entirely when None (static mode).
-    write_oauth_field(table, provider);
     // proxy_mode — skip if default (mirrors `skip_serializing_if =
     // "is_default_proxy_mode"`). `inherit` is the load-time default, so
     // omitting the key on disk is both lossless and keeps user-authored
@@ -501,43 +489,6 @@ fn update_existing_provider(
     // apis — 嵌套子表同步（保留已有节的注释与字段顺序）。
     write_apis_field(table, provider)?;
     Ok(())
-}
-
-/// Write the `oauth` sub-table of a provider, or remove it when absent.
-fn write_oauth_field(table: &mut toml_edit::Table, provider: &ProviderConfig) {
-    if let Some(oauth) = &provider.oauth {
-        let item = table.entry("oauth").or_insert_with(|| {
-            let mut t = toml_edit::Table::new();
-            t.set_implicit(true);
-            toml_edit::Item::Table(t)
-        });
-        if item.as_table_mut().is_none() {
-            let mut fresh = toml_edit::Table::new();
-            fresh.set_implicit(true);
-            *item = toml_edit::Item::Table(fresh);
-        }
-        let t = item.as_table_mut().expect("oauth is a table");
-        t["token_url"] = toml_edit::value(oauth.token_url.as_str());
-        t["client_id"] = toml_edit::value(oauth.client_id.as_str());
-        t["client_secret"] = toml_edit::value(oauth.client_secret.as_str());
-        if let Some(scope) = &oauth.scope {
-            t["scope"] = toml_edit::value(scope.as_str());
-        } else {
-            t.remove("scope");
-        }
-        if let Some(audience) = &oauth.audience {
-            t["audience"] = toml_edit::value(audience.as_str());
-        } else {
-            t.remove("audience");
-        }
-        if let Some(rt) = &oauth.refresh_token {
-            t["refresh_token"] = toml_edit::value(rt.as_str());
-        } else {
-            t.remove("refresh_token");
-        }
-    } else {
-        table.remove("oauth");
-    }
 }
 
 /// Ensure `table["apis"]` is a real (non-inline) sub-table; replaces an
@@ -2964,8 +2915,6 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
 
         assert_eq!(p.api_keys, vec!["sk-a", "sk-b"]);
         assert_eq!(p.key_strategy, KeyStrategy::RoundRobin);
-        assert_eq!(p.auth_mode, AuthMode::Static);
-        assert!(p.oauth.is_none());
         assert_eq!(p.proxy_mode, ProxyMode::Disabled);
         assert_eq!(p.fallback, Some(ApiKind::ChatCompletions));
         let api = &p.apis[&ApiKind::ChatCompletions];
@@ -3000,80 +2949,6 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         assert!(
             saved.contains("anthropic_cache_control = false"),
             "Anthropic + false should be written to TOML, got:\n{saved}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn save_round_trips_oauth_provider_fields() {
-        use crate::config::{AuthMode, OAuthConfig};
-        let content = r#"
-[server]
-host = "127.0.0.1"
-port = 9090
-
-[providers.azure]
-auth_mode = "oauth"
-apis = { chat_completions = { base_url = "https://my-resource.openai.azure.com" } }
-
-[providers.azure.oauth]
-token_url = "https://login.microsoftonline.com/t/oauth2/v2.0/token"
-client_id = "cid-old"
-client_secret = "sec-old"
-scope = "https://cognitiveservices.azure.com/.default"
-"#;
-        let path = temp_toml(content);
-        let handle = load_config(&path).unwrap();
-        let mut config = handle.inner.try_read().unwrap().clone();
-        drop(handle);
-
-        // Change oauth credentials + add optional fields; update path must persist.
-        let p = config.providers.get_mut("azure").unwrap();
-        p.oauth = Some(OAuthConfig {
-            token_url: "https://login.microsoftonline.com/t2/oauth2/v2.0/token".into(),
-            client_id: "cid-new".into(),
-            client_secret: "sec-new".into(),
-            scope: Some("scope-b".into()),
-            audience: Some("aud".into()),
-            refresh_token: Some("rt".into()),
-        });
-
-        save_config_to_file(&config, &path).unwrap();
-        let reloaded_handle = load_config(&path).unwrap();
-        let reloaded = reloaded_handle.inner.try_read().unwrap();
-        let rp = reloaded.providers.get("azure").unwrap();
-        assert_eq!(rp.auth_mode, AuthMode::OAuth);
-        let oauth = rp.oauth.as_ref().expect("oauth must round-trip");
-        assert_eq!(oauth.client_id, "cid-new");
-        assert_eq!(oauth.client_secret, "sec-new");
-        assert_eq!(oauth.scope.as_deref(), Some("scope-b"));
-        assert_eq!(oauth.audience.as_deref(), Some("aud"));
-        assert_eq!(oauth.refresh_token.as_deref(), Some("rt"));
-
-        // Drop oauth + switch to static → save removes the section.
-        drop(reloaded);
-        let mut config = {
-            let handle = load_config(&path).unwrap();
-            let c = handle.inner.try_read().unwrap().clone();
-            drop(handle);
-            c
-        };
-        {
-            let p = config.providers.get_mut("azure").unwrap();
-            p.auth_mode = AuthMode::Static;
-            p.oauth = None;
-            p.api_keys = vec!["sk".into()];
-        }
-        save_config_to_file(&config, &path).unwrap();
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !saved.contains("[providers.azure.oauth]"),
-            "oauth section must be removed when cleared, got:\n{saved}"
-        );
-        assert!(
-            !saved.contains("auth_mode"),
-            "default auth_mode must not be written, got:\n{saved}"
         );
 
         let _ = std::fs::remove_file(&path);

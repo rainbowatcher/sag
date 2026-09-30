@@ -123,8 +123,6 @@ fn adapter_config_changed(old: &ProviderConfig, new: &ProviderConfig) -> bool {
 
     old.api_keys != new.api_keys
         || old.key_strategy != new.key_strategy
-        || old.auth_mode != new.auth_mode
-        || old.oauth != new.oauth
         || apis_differ(old, new)
         || old.fallback != new.fallback
         || old.timeout_secs != new.timeout_secs
@@ -1006,56 +1004,6 @@ mod tests {
         let b = base_provider();
         a.key_strategy = KeyStrategy::RoundRobin;
         assert!(adapter_config_changed(&a, &b));
-    }
-
-    #[test]
-    fn auth_mode_change_triggers_rebuild() {
-        use sag_config::{AuthMode, OAuthConfig};
-        let mut a = base_provider();
-        let b = base_provider();
-        a.auth_mode = AuthMode::OAuth;
-        a.oauth = Some(OAuthConfig {
-            token_url: "https://login.example.com/token".into(),
-            client_id: "cid".into(),
-            client_secret: "sec".into(),
-            scope: None,
-            audience: None,
-            refresh_token: None,
-        });
-        a.api_keys.clear();
-        assert!(adapter_config_changed(&a, &b));
-    }
-
-    #[test]
-    fn oauth_section_change_triggers_rebuild() {
-        use sag_config::{AuthMode, OAuthConfig};
-        let mk = |secret: &str| OAuthConfig {
-            token_url: "https://login.example.com/token".into(),
-            client_id: "cid".into(),
-            client_secret: secret.into(),
-            scope: None,
-            audience: None,
-            refresh_token: None,
-        };
-        let mut a = base_provider();
-        let mut b = base_provider();
-        a.auth_mode = AuthMode::OAuth;
-        b.auth_mode = AuthMode::OAuth;
-        a.oauth = Some(mk("sec-a"));
-        b.oauth = Some(mk("sec-b"));
-        assert!(
-            adapter_config_changed(&a, &b),
-            "oauth.client_secret change must rebuild the adapter (token cache invalidation)"
-        );
-
-        // Identical oauth sections → no rebuild.
-        let mut c = base_provider();
-        c.auth_mode = AuthMode::OAuth;
-        c.oauth = Some(mk("sec-a"));
-        let mut d = base_provider();
-        d.auth_mode = AuthMode::OAuth;
-        d.oauth = Some(mk("sec-a"));
-        assert!(!adapter_config_changed(&c, &d));
     }
 
     // The following MUST NOT trigger a rebuild.
