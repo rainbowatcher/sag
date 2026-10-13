@@ -11,7 +11,9 @@ use sag_core::{
 use tokio::sync::mpsc;
 use tracing::{error, instrument, trace, warn};
 
-use crate::{LlmProvider, ProviderBase, drain_sse_frames, emit_idle_timeout};
+use crate::{
+    LlmProvider, ProviderBase, drain_sse_frames, emit_idle_timeout, spawn_in_current_span,
+};
 
 /// OpenAI-compatible provider adapter.
 ///
@@ -201,7 +203,9 @@ impl LlmProvider for OpenAiProvider {
             .chunk_timeout_secs(ApiKind::ChatCompletions)
             .map(std::time::Duration::from_secs);
 
-        tokio::spawn(async move {
+        // The reader outlives this call: attach the provider/model span so
+        // its chunk-read errors stay correlatable with the request.
+        spawn_in_current_span(async move {
             let mut byte_stream = response.bytes_stream();
             let mut buffer: Vec<u8> = Vec::new();
             let mut had_error = false;
@@ -403,7 +407,9 @@ impl OpenAiProvider {
             .chunk_timeout_secs(ApiKind::Responses)
             .map(std::time::Duration::from_secs);
 
-        tokio::spawn(async move {
+        // The reader outlives this call: attach the provider/model span so
+        // its chunk-read errors stay correlatable with the request.
+        spawn_in_current_span(async move {
             use crate::util::find_sse_boundary;
             let mut byte_stream = response.bytes_stream();
             let mut buffer: Vec<u8> = Vec::new();

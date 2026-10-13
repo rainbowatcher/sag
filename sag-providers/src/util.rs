@@ -4,7 +4,7 @@ use std::time::Duration;
 use reqwest::RequestBuilder;
 use sag_core::{ApiKind, StreamChunk, Usage};
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, error, warn};
 
 /// Return the (name, value) pairs for auth headers used for a given API kind.
 ///
@@ -197,6 +197,25 @@ pub fn emit_idle_timeout(
         )));
     }
     true
+}
+
+/// Spawn `fut` with the caller's current [`tracing::Span`] attached.
+///
+/// Provider stream readers run in a detached task that outlives
+/// `chat_stream` / `messages_stream`, so without this the task's own events
+/// (upstream chunk read errors, chunk idle timeouts) land in the log with
+/// no provider / model / request `trace_id` context and cannot be
+/// correlated with the request that caused them.
+///
+/// `Instrument` is used rather than `Span::enter()` because an `Entered`
+/// guard must never be held across an `.await` point (it would leak the
+/// span into unrelated tasks polled on the same worker thread).
+pub fn spawn_in_current_span<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(fut.instrument(tracing::Span::current()))
 }
 
 /// Search for the SSE frame delimiter `\n\n` (or `\r\n\r\n`), returning the
@@ -466,6 +485,84 @@ fn handle_usage_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── spawn_in_current_span ───────────────────────────────────
+
+    /// Minimal `MakeWriter` capturing formatted events into a buffer.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install the capturing subscriber once for the whole test binary.
+    fn capture_logs() -> Capture {
+        static CAPTURE: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
+        CAPTURE
+            .get_or_init(|| {
+                let capture = Capture::default();
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(capture.clone())
+                        .with_max_level(tracing::Level::TRACE)
+                        .with_ansi(false)
+                        .finish(),
+                )
+                .expect("capture subscriber installs once");
+                capture
+            })
+            .clone()
+    }
+
+    /// A detached reader task must inherit the caller's span, otherwise its
+    /// events (upstream chunk read errors, idle timeouts) carry no provider /
+    /// model / request `trace_id` and cannot be correlated with a request.
+    #[tokio::test]
+    async fn spawn_in_current_span_keeps_span_context() {
+        let capture = capture_logs();
+        let span = tracing::info_span!("reader", provider = "volc", model = "glm-5.3-flash");
+        let handle = {
+            let _entered = span.enter();
+            spawn_in_current_span(async {
+                tracing::error!("chunk read failed");
+            })
+        };
+        // The await happens *outside* the span scope: the context must come
+        // from the instrumentation captured at spawn time.
+        handle.await.unwrap();
+
+        let text = capture.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("chunk read failed"))
+            .unwrap_or_else(|| panic!("event not captured: {text}"));
+        assert!(
+            line.contains("reader{provider=\"volc\" model=\"glm-5.3-flash\"}"),
+            "spawned task must log inside the caller's span: {line}"
+        );
+    }
 
     // ── apply_body_strip tests ───────────────────────────────────
 

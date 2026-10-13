@@ -256,6 +256,11 @@ impl Drop for TerminalGuard {
             return;
         }
         let had_error = self.analytics.error.load(Ordering::SeqCst);
+        // An abandoned stream with no observed upstream error is the
+        // post-commit client-disconnect terminal. It has no other log line
+        // (the pre-commit cancel logs in `DispatchCancelGuard`, the
+        // mid-stream error in `record_stream_error`), so it is logged below.
+        let client_cancelled = !had_error;
         let (
             result_status,
             result_reason,
@@ -296,6 +301,16 @@ impl Drop for TerminalGuard {
             )
         };
         let completed_at = chrono::Utc::now();
+        if client_cancelled {
+            warn!(
+                request_id = %self.analytics.request_id,
+                provider = %self.analytics.provider,
+                model = %self.analytics.requested_model,
+                real_model = %self.analytics.real_model,
+                duration_ms = self.analytics.start.elapsed().as_millis() as u64,
+                "client disconnected before stream completion; client_cancelled fact + call_logs row enqueued"
+            );
+        }
         let event = terminal_event(
             &self.analytics,
             result_status,
@@ -503,8 +518,13 @@ fn merge_stream_usage(acc: &mut Usage, frame: &Usage) {
 /// not `client_cancelled`, and the call_logs `error` column
 /// carries the upstream message.
 fn record_stream_error<S, E>(state: &mut StreamState<S, E>, msg: String) {
+    // This runs while the response body is polled by hyper — outside the
+    // request span — so the correlation identity is recorded explicitly.
     warn!(
+        request_id = %state.analytics.request_id,
         provider = %state.analytics.provider,
+        model = %state.analytics.requested_model,
+        real_model = %state.analytics.real_model,
         error = %msg,
         "mid-stream error"
     );

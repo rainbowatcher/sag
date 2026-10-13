@@ -26,3 +26,4 @@ sag-admin = { path = "../sag-admin" }
 async-trait = { workspace = true }
 http-body-util = { workspace = true }
 sqlx = { workspace = true }
+tracing-subscriber = { workspace = true }

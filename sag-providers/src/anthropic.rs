@@ -12,7 +12,7 @@ use tracing::{error, instrument, trace, warn};
 
 use crate::{
     AnthropicMessagesCodec, ChatCompletionsCodec, LlmProvider, ProviderBase, drain_sse_frames_with,
-    emit_idle_timeout, flush_sse_buffer_with, inject_cache_control_value,
+    emit_idle_timeout, flush_sse_buffer_with, inject_cache_control_value, spawn_in_current_span,
 };
 
 // ── SSE normalization (Chat bridge) ────────────────────────────────
@@ -400,7 +400,9 @@ impl AnthropicProvider {
             .chunk_timeout_secs(ApiKind::AnthropicMessages)
             .map(std::time::Duration::from_secs);
 
-        tokio::spawn(async move {
+        // The reader outlives this call: attach the provider/model span so
+        // its chunk-read errors stay correlatable with the request.
+        spawn_in_current_span(async move {
             use crate::util::find_sse_boundary;
             let mut byte_stream = response.bytes_stream();
             let mut buffer: Vec<u8> = Vec::new();
@@ -650,7 +652,9 @@ impl LlmProvider for AnthropicProvider {
             .chunk_timeout_secs(ApiKind::AnthropicMessages)
             .map(std::time::Duration::from_secs);
 
-        tokio::spawn(async move {
+        // The reader outlives this call: attach the provider/model span so
+        // its chunk-read errors stay correlatable with the request.
+        spawn_in_current_span(async move {
             let mut byte_stream = response.bytes_stream();
             let mut buffer: Vec<u8> = Vec::new();
             let mut had_error = false;

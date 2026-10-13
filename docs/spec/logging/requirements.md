@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-26
+updated: 2026-10-11
 ---
 
 # 日志
@@ -57,11 +57,17 @@ TTY 环境启用 ANSI 颜色。
 - 响应状态码和体预览
 - SSE 流式响应只记录 status 和 streaming 标记（不消费 body）
 
+请求体大于 512 KiB 时不缓冲、不产生 body 预览（保证 `DefaultBodyLimit` / JSON extractor 仍能返回 413 + `client_error` 事实），但**响应仍必须记录 status 与耗时 `elapsed_ms`**，content-length 可用时附带 `body_size`。
+
+流式响应 commit 之后的客户端断开必须记录一条 WARN，携带 request_id / provider / model / real_model / duration_ms（此前只有 pre-commit 取消有日志）。
+
 完整请求/响应体在 `trace` 级别（target: `sag_router::http_log::full`）记录。
 
 ### Trace ID
 
 每个请求生成 UUID v4 作为 `trace_id`，注入 `request.extensions()`。所有中间件和 handler 的日志携带同一 trace_id，实现全链路追踪。
+
+脱离请求生命周期的后台任务（provider 的流读取任务，如 `chat_stream` 内的 `tokio::spawn`）必须继承调用方 span：其日志（上游 chunk 读取失败、chunk idle timeout）携带 provider / model / trace_id，否则无法与请求关联。
 
 ## 配置 Schema
 
@@ -96,3 +102,4 @@ format = "compact"
 
 - [0001 初始化](changes/0001-initial.md)
 - [0002 轮转与清理](changes/0002-rotation-and-cleanup.md)
+- [0003 大请求响应日志与请求关联信息](changes/0003-request-correlation-and-large-body-response-log.md)

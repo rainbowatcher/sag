@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-26
+updated: 2026-10-11
 ---
 
 # 日志 — 规格
@@ -11,6 +11,7 @@ updated: 2026-06-26
 - [sag-gateway/src/main.rs](../../../sag-gateway/src/main.rs) — `cleanup_old_logs()` + `WorkerGuard` 生命周期
 - [sag-router/src/middleware/trace.rs](../../../sag-router/src/middleware/trace.rs) — Trace ID 中间件
 - [sag-router/src/middleware/http_log.rs](../../../sag-router/src/middleware/http_log.rs) — HTTP 请求体日志
+- [sag-providers/src/util.rs](../../../sag-providers/src/util.rs) — `spawn_in_current_span()`（后台任务 span 继承）
 - [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `LoggingConfig`、`LogFormat` 枚举
 
 ## 核心设计
@@ -91,18 +92,44 @@ Guard 在 `main()` 中作为第一个局部变量声明，利用 Rust 的反向 
 - ✅ 文件输出无 ANSI 转义码，便于 grep/分析
 - ❌ 如果有人 pipe 开发环境的输出到 `less -R`，颜色会丢失（因为 `is_terminal()` 返回 false）
 
+### 请求关联信息的传递
+
+请求内的日志靠 tracing span 链携带 `trace_id` / `provider` / `model`：根 span 由 `trace_middleware` 创建，handler 与 dispatch 都在其内。provider 的流读取任务在 `chat_stream` 返回后仍继续运行（body 由 hyper 在请求 span 之外 poll），因此**不能**依赖「当前 span」，必须显式传递。
+
+采用 `tracing::Instrument`（`spawn_in_current_span`）而非 `Span::enter()`：`Entered` guard 不能跨 `.await` 持有，否则会把 span 泄漏到同一 worker 线程上被 poll 的无关任务。
+
+**Trade-off**:
+- ✅ 脱离生命周期的任务日志可关联到请求（provider / model / trace_id）
+- ✅ `Instrument` 在 spawn 时刻捕获上下文，语义明确且无跨 await 风险
+- ❌ 后台任务持有 span 会延长其 subscriber 侧生命周期（可忽略的成本）
+
+### 大请求体的日志取舍
+
+body > 512 KiB 时不缓冲（否则 413 与流式请求会被破坏），但响应行仍要记录 status / `elapsed_ms`（content-length 可用时附带 `body_size`）。
+
+**Trade-off**:
+- ✅ 大 prompt 请求（agent 场景的常态）不再出现「有请求行、无响应行」的黑洞
+- ❌ 大 body 请求的响应没有 `body_size` / preview（无法在不消费 body 的前提下取得）
+
 ## 不变式
 
 - `tracing_init::init()` 必须在 `info!("starting SAG gateway")` 之前调用
 - `_log_guard` 必须在 `main()` 中第一个声明（保证最后 drop）
 - `cleanup_old_logs()` 在首次日志写入前调用（保护当天文件）
 - HTTP 请求日志在中间件层（先于 handler），确保所有请求都被记录
+- 大 body（> 512 KiB）请求的响应日志只依赖响应头（status / content-length / content-type），不得消费 body
+- 脱离请求生命周期的后台任务必须通过 `spawn_in_current_span` 启动，禁止裸 `tokio::spawn`
+- 每个请求的终态必须至少有一条日志：成功/失败响应行、mid-stream error WARN、post-commit 断连 WARN 或 pre-commit 取消 WARN
 
 ## 测试策略
 
 - 手动测试 `just test-env` 验证日志轮转和清理
 - 验证 TTY 环境行为不退化（`just dev` 日志仍输出到终端）
+- 日志断言测试用 `tracing-subscriber` 的 `MakeWriter` 捕获到内存 buffer：
+  - [sag-router/tests/http_log_large_body.rs](../../../sag-router/tests/http_log_large_body.rs) — 大 body 响应行（普通 + SSE）
+  - `sag-providers/src/util.rs` 内联测试 — 后台任务 span 继承
 
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
 - [0002 轮转与清理](changes/0002-rotation-and-cleanup.md)
+- [0003 大请求响应日志与请求关联信息](changes/0003-request-correlation-and-large-body-response-log.md)
