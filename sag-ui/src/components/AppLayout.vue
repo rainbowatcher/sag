@@ -1,27 +1,13 @@
 <script setup lang="ts">
-import {
-  LayoutDashboard,
-  Server,
-  GitBranch,
-  BarChart3,
-  ScrollText,
-  Settings,
-  Wifi,
-  WifiOff,
-  Moon,
-  Sun,
-  LogOut,
-} from "@lucide/vue"
+import { Wifi, WifiOff, Moon, Sun, LogOut } from "@lucide/vue"
 import { useMediaQuery } from "@vueuse/core"
 import { computed, ref, watch } from "vue"
-import { RouterLink, RouterView, useRoute, useRouter } from "vue-router"
+import { RouterView, useRouter } from "vue-router"
 import { Badge } from "@/components/ui/badge"
 import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
@@ -36,11 +22,11 @@ import { isDark, toggleDark } from "@/composables/useTheme"
 import { cn } from "@/lib/utils"
 import { useConnectionStore } from "@/stores/connection"
 import { useHealthStore } from "@/stores/health"
+import SidebarNav from "./SidebarNav.vue"
 import Button from "./ui/button/Button.vue"
 
 const store = useConnectionStore()
 const health = useHealthStore()
-const route = useRoute()
 const router = useRouter()
 
 const appVersion = __APP_VERSION__
@@ -108,21 +94,6 @@ const contentMaxClass = computed(() =>
     ? "max-w-6xl xl:max-w-7xl 2xl:max-w-[90rem]"
     : "max-w-[73rem] xl:max-w-[93rem] 2xl:max-w-[103rem]",
 )
-
-interface NavItem {
-  label: string
-  path: string
-  icon: any
-}
-
-const navItems: NavItem[] = [
-  { label: "Dashboard", path: "/", icon: LayoutDashboard },
-  { label: "Providers", path: "/providers", icon: Server },
-  { label: "Routes", path: "/routes", icon: GitBranch },
-  { label: "Analytics", path: "/analytics", icon: BarChart3 },
-  { label: "Logs", path: "/logs", icon: ScrollText },
-  { label: "Settings", path: "/settings", icon: Settings },
-]
 </script>
 
 <template>
@@ -147,24 +118,7 @@ const navItems: NavItem[] = [
       </SidebarHeader>
 
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              <SidebarMenuItem v-for="item in navItems" :key="item.path">
-                <SidebarMenuButton
-                  as-child
-                  :is-active="route.path === item.path"
-                  :tooltip="item.label"
-                >
-                  <RouterLink :to="item.path">
-                    <component :is="item.icon" />
-                    <span>{{ item.label }}</span>
-                  </RouterLink>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        <SidebarNav />
       </SidebarContent>
 
       <SidebarFooter>
