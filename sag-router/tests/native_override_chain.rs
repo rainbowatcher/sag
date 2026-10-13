@@ -545,12 +545,15 @@ async fn responses_native_full_chain_normalized_equality() {
 
     // Expected after: encode(real_model) → body_overrides → target_extra →
     // strip_fields ∪ model_strip_fields[real_model].
+    //
+    // Pure-text EasyInputMessage content is emitted as a scalar string
+    // (OpenAI `content: string | InputMessageContentList`).
     let expected_body = serde_json::json!({
         "model": "gpt-real",
         "input": [{
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": "hi"}]
+            "content": "hi"
         }],
         "temperature": 0.9,
         "seed": 42,

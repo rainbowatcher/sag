@@ -6,6 +6,12 @@ pub struct ChatMessage {
     pub role: String,
     /// Message content — can be a plain text string or an array of
     /// content parts (text, image_url, input_audio, file, etc.).
+    ///
+    /// Optional on the wire: OpenAI allows assistant messages carrying
+    /// `tool_calls` to omit `content` entirely ("Required unless tool_calls
+    /// or function_call is specified"). Missing deserializes to `Null` and
+    /// the codecs below already treat `Null` as empty content.
+    #[serde(default)]
     pub content: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -682,6 +688,57 @@ mod tests {
         assert_eq!(value.get("function_call"), Some(&json!("auto")));
         assert_eq!(value.get("functions"), Some(&json!([{"name": "f"}])));
         assert_eq!(value.get("user"), Some(&json!("user-123")));
+    }
+
+    // ── ChatMessage content wire-tolerance tests ────────────────
+
+    #[test]
+    fn chat_message_missing_content_deserializes_to_null() {
+        // OpenAI allows assistant messages carrying tool_calls to omit
+        // `content` ("Required unless tool_calls or function_call is
+        // specified"). Agent replay loops (e.g. zcode) send this shape;
+        // the gateway must tolerate it instead of failing ingress with
+        // "missing field `content`" (422).
+        let msg: ChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(msg.content, json!(null));
+        assert!(msg.extra.contains_key("tool_calls"));
+    }
+
+    #[test]
+    fn chat_message_missing_content_reserializes_as_content_null() {
+        // Missing `content` → Null → re-serializes as "content": null,
+        // the canonical form OpenAI itself emits for assistant tool_calls
+        // messages, so native passthrough stays wire-compatible.
+        let msg: ChatMessage =
+            serde_json::from_value(json!({"role": "assistant", "tool_calls": []})).unwrap();
+        let value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value.get("content"), Some(&json!(null)));
+        assert_eq!(value.get("tool_calls"), Some(&json!([])));
+    }
+
+    #[test]
+    fn chat_completion_request_tolerates_message_without_content() {
+        // Minimal ingress-shaped regression: a messages entry without
+        // `content` must not fail request deserialization.
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(req.messages[1].content.is_null());
     }
 
     // ── CallLog internal identity fields tests ──────────────────

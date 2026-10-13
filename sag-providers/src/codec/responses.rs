@@ -1836,15 +1836,22 @@ fn encode_message_item(
         _ => "user",
     };
     let mut parts: Vec<Value> = Vec::new();
+    // Text blocks are accumulated instead of pushed: a pure-text message
+    // encodes as a scalar `content` string, and a mixed one re-emits the
+    // accumulated text as the leading `input_text` part.
+    let mut text_only = String::new();
+    let mut has_non_text = false;
     for (bi, b) in msg.content.iter().enumerate() {
         match b {
             IrContentBlock::Text { text } => {
-                parts.push(json!({"type": "input_text", "text": text}))
+                text_only.push_str(text);
             }
             IrContentBlock::Reasoning { text } => {
+                has_non_text = true;
                 parts.push(json!({"type": "output_text", "text": text}));
             }
             IrContentBlock::Image { data } => {
+                has_non_text = true;
                 // Responses input_image shape pass-through when already typed;
                 // Chat-shaped image_url → input_image.
                 if data.get("type").and_then(|t| t.as_str()) == Some("input_image") {
@@ -1860,14 +1867,21 @@ fn encode_message_item(
                 }
             }
             IrContentBlock::Document { data } => {
+                has_non_text = true;
                 if data.get("type").is_some() {
                     parts.push(data.clone());
                 } else {
                     parts.push(json!({"type": "input_file", "file": data}));
                 }
             }
-            IrContentBlock::Audio { data } => parts.push(data.clone()),
-            IrContentBlock::Raw(v) => parts.push(v.clone()),
+            IrContentBlock::Audio { data } => {
+                has_non_text = true;
+                parts.push(data.clone());
+            }
+            IrContentBlock::Raw(v) => {
+                has_non_text = true;
+                parts.push(v.clone());
+            }
             // ToolUse / ToolResult travel as function_call /
             // function_call_output on their own message roles — a bare
             // content copy here is dropped → loss (S1).
@@ -1884,9 +1898,14 @@ fn encode_message_item(
     let mut item = Map::new();
     item.insert("type".into(), json!("message"));
     item.insert("role".into(), json!(role));
-    if parts.is_empty() {
-        item.insert("content".into(), json!([]));
+    if !has_non_text {
+        // Scalar string (empty string is legal for EasyInputMessage;
+        // InputMessageContentList is "one or many" so `[]` is not).
+        item.insert("content".into(), json!(text_only));
     } else {
+        // Mixed media: InputMessageContentList. Always include an input_text
+        // part so the list carries a `text` field.
+        parts.insert(0, json!({"type": "input_text", "text": text_only}));
         item.insert("content".into(), Value::Array(parts));
     }
     for (k, v) in &msg.raw {

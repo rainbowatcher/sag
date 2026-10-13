@@ -1190,6 +1190,12 @@ mod tests {
         let started_at = ctx.started_at;
         let resp = dispatch_image(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        // Route `api_endpoint` must pass through to the provider call
+        // (regression surface for the api_endpoint passthrough).
+        assert_eq!(
+            mock.last_api_endpoint(),
+            Some("/images/generations".to_string()),
+        );
 
         state.event_collector.shutdown().await;
 
