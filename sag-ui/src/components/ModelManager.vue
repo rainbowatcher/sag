@@ -4,18 +4,11 @@ import { computed, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import Combobox from "@/components/Combobox.vue"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from "@/components/ui/item"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { getErrorMessage } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { CreateRoutePayload } from "@/types/api"
@@ -58,6 +51,9 @@ const emit = defineEmits<{
 
 const routeStore = useRouteStore()
 
+// Quick Create Route confirmation: Dialog on desktop, bottom Drawer on mobile.
+const { Modal } = useResponsiveModal()
+
 // ── Quick Create Route Dialog ──────────────────────
 const routeToCreate = ref<string | null>(null)
 const customRouteName = ref("")
@@ -81,6 +77,10 @@ function openCreateRoute(model: string) {
   if (routeStore.routes.length === 0) {
     routeStore.fetchRoutes()
   }
+}
+
+function onRouteCreateOpenChange(v: boolean) {
+  if (!v) routeToCreate.value = null
 }
 
 async function confirmCreateRoute() {
@@ -340,20 +340,24 @@ function removeModel(name: string) {
       {{ upstreamModelsError }}
     </div>
 
-    <!-- ── Quick Create Route Confirmation Dialog ──────────── -->
-    <Dialog :open="routeToCreate !== null" @update:open="(v) => !v && (routeToCreate = null)">
-      <DialogContent class="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Create Route</DialogTitle>
-          <DialogDescription>
+    <!-- ── Quick Create Route Confirmation Dialog / Drawer ──── -->
+    <component
+      :is="Modal.Root"
+      :open="routeToCreate !== null"
+      @update:open="onRouteCreateOpenChange"
+    >
+      <component :is="Modal.Content" class="sm:max-w-md">
+        <component :is="Modal.Header">
+          <component :is="Modal.Title">Create Route</component>
+          <component :is="Modal.Description">
             Create a single-target route for
             <span class="text-foreground font-mono font-medium"
               >{{ providerName }}/{{ routeToCreate }}</span
             >.
-          </DialogDescription>
-        </DialogHeader>
+          </component>
+        </component>
 
-        <div class="space-y-2 py-2">
+        <div class="space-y-2 px-4 py-2 sm:px-0">
           <FieldLabel for="quick-route-name">Route Name</FieldLabel>
           <Input
             id="quick-route-name"
@@ -368,7 +372,7 @@ function removeModel(name: string) {
           </p>
         </div>
 
-        <DialogFooter class="flex flex-row justify-end gap-2 sm:justify-end">
+        <component :is="Modal.Footer">
           <Button
             variant="outline"
             size="sm"
@@ -381,8 +385,8 @@ function removeModel(name: string) {
             <Loader2 v-if="creatingRoute" class="h-3 w-3 animate-spin" />
             {{ creatingRoute ? "Creating…" : "Confirm" }}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </component>
+      </component>
+    </component>
   </div>
 </template>

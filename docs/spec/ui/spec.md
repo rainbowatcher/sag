@@ -35,7 +35,7 @@ updated: 2026-06-27
 - [sag-ui/src/components/AppLayout.vue](../../../sag-ui/src/components/AppLayout.vue) — 侧边栏 + 主内容区布局，响应式断点控制内容宽度和侧边栏宽度
 - [sag-ui/src/components/providers/ProviderList.vue](../../../sag-ui/src/components/providers/ProviderList.vue) — Provider 列表（TanStack Table）
 - [sag-ui/src/components/providers/ProviderAddForm.vue](../../../sag-ui/src/components/providers/ProviderAddForm.vue) — Provider 添加表单
-- [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Drawer/Dialog 自适应）
+- [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
 - [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）
 - [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
 - [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries）
@@ -48,6 +48,7 @@ updated: 2026-06-27
 - [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
 - [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
 - [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
+- [sag-ui/src/composables/useResponsiveModal.ts](../../../sag-ui/src/composables/useResponsiveModal.ts) — Dialog/Drawer 双轨弹框：`MODAL_DESKTOP_QUERY`（768px）+ `Modal` 八槽位组件映射（Root/Content/Header/Title/Description/Footer/Close/Trigger）
 
 ## 核心设计
 
@@ -200,7 +201,19 @@ ProviderList 和 RouteList 使用 TanStack Table，LogsPage 和 AnalyticsPage �
 **Trade-off**:
 - ✅ 零 JavaScript 开销，样式在构建时确定
 - ✅ Tailwind 断点与框架无关，无需在 Vue 组件中管理媒体查询生命周期
-- ❌ 无法根据视口动态切换组件行为（如移动端折叠侧边栏）——但 `ProviderEditForm.vue` 已有的 `useMediaQuery` 负责这类场景
+- ❌ 无法根据视口动态切换组件行为（如移动端折叠侧边栏）——这类场景统一交给 `useResponsiveModal`（弹框形态）与 `AppLayout` 的 `useMediaQuery`（侧边栏），两者共用 768px 断点
+
+### Dialog/Drawer 双轨弹框（useResponsiveModal）vs 纯 Dialog
+
+移动端（<768px）的弹框一律渲染为底部抽屉，桌面端保持 Dialog。映射集中在 `useResponsiveModal` composable，组件只写 `<component :is="Modal.Root">`。
+
+**Trade-off**:
+- ✅ 移动端获得全宽、内部可滚动、可下拉关闭的容器，长表单不再被软键盘挤到只剩半个屏幕
+- ✅ 断点与组件映射单点定义；新增弹框只需一行 `const { Modal } = useResponsiveModal()`
+- ✅ `sag-ui/src/components/ui/` 原语零修改，`shadcn-vue add --overwrite` 不会冲掉定制
+- ❌ `<component :is>` 下 vue-tsc 失去 props/emits 类型检查，`@update:open` 回调必须提取为显式 `(v: boolean)` 具名函数
+- ❌ 引入 vaul-vue 到共享 chunk：`useResponsiveModal` 被路由页导入后，Drawer 不再只随 Provider 表单按需加载（构建产物中该 chunk 约 211 kB / gzip 55 kB）
+- ❌ 移动端会出现抽屉套抽屉（Provider 弹框内点 Create route），vaul 支持嵌套，但手势层级变多
 
 ### cnfast vs clsx + tailwind-merge
 
@@ -254,6 +267,8 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **侧边栏 flex 分配**：侧边栏 `<nav class="flex-1">` 自动占满 header 和 footer 之间的剩余高度，不需显式高度计算
 - **表格滚动容器层级**：表格所在的外层 `<div class="rounded-lg border">` 只能设置高度约束（`h-full`）+ `[&>div]:h-full`，不得设置 `overflow-auto` 或 `overflow-hidden`。overflow 必须由 `<Table>` 组件的包裹 div 处理。若外层也有 overflow，sticky 表头将相对于外层容器定位，而 Table 包裹 div 的 `overflow-auto` 会创建中间滚动上下文导致 sticky 失效。`<tbody>` 上不得设置 `overflow-auto` —— 会使 `<tbody>` 变为 `display: block`，破坏 `<thead>`/`<tbody>` 之间的原生列宽同步
 - **sticky 表头**：所有使用 `<Table>` 的页面必须在 `<TableHeader>` 上设置 `class="bg-background/90 sticky top-0 z-10 backdrop-blur-xs"`。`bg-background/90` + `backdrop-blur-xs` 提供玻璃拟态效果，确保滚动时表头覆盖下方行内容且视觉层次清晰
+- **弹框形态**：应用层模态必须经 `useResponsiveModal()`，不得在组件里直接引入 `Dialog*` / `Drawer*` 原语；断点固定 768px（`md`），且必须与 `AppLayout.vue` 的 `isMobile`、`SidebarProvider` 内部断点保持一致。Popover 类浮层（Combobox / SearchSelect / DateRangePicker）不适用该规则
+- **抽屉内边距**：`DrawerContent` 无默认 padding，而 `DialogContent` 有 `p-6`。需要左右内边距的正文区写成 `px-4 sm:px-0`；若写成 `px-4 sm:px-6`，仅在它不属于 `DialogContent` 直接子元素时才不会与 `p-6` 叠成双重内边距
 - **[&>div]:h-full 高度传递**：表格的外层 `<div class="rounded-lg border">` 使用 `[&>div]:h-full` 将高度约束传递给 `<Table>` 组件的包裹 div（`overflow-auto`），使其成为 sticky 表头的滚动参照点。不使用此模式时外层 div 不得设置 overflow，否则会创建多余滚动上下文导致 sticky 失效
 
 ## 测试策略
@@ -265,7 +280,7 @@ SAG UI 当前无自动化前端测试（需求文档已标注「不包含：端�
 | 类型检查 | `pnpm typecheck`（vue-tsc） | TypeScript 编译器 |
 | 代码风格 | `pnpm lint`（oxlint）、`pnpm format`（oxfmt） | oxlint / oxfmt |
 | 构建验证 | `pnpm build`（Vite） → `just build-test`（内嵌到 gateway 二进制） | Vite / Cargo |
-| 视觉验证 | 浏览器手动检查：1920×1080、2560×1440、1024×768、1366×768 | Chrome DevTools |
+| 视觉验证 | 浏览器手动检查：1920×1080、2560×1440、1024×768、1366×768；弹框形态另需 390px（手机竖屏）与 700px（640–768 区间） | Chrome DevTools |
 | API 集成 | 通过 `scripts/test-env.py` 启动 gateway 测试实例，浏览器连接验证 | test-env |
 
 关键验证场景：
@@ -277,7 +292,9 @@ SAG UI 当前无自动化前端测试（需求文档已标注「不包含：端�
 5. **401 全局处理**：任何 API 返回 401 → `handle401()` 清除连接状态 → 重定向 `/connect?reason=expired`
 6. **固定高度布局**：加载 Logs/Providers 页面，添加足够数据使表格超出视口 → 页面标题和筛选栏保持可见，仅表格内部滚动 → 验证侧边栏导航和底部状态栏始终可交互
 7. **固定高度布局边界**：将浏览器窗口调至极小高度（如 600px）→ 图表/表格应有最小可见区域，固定区域不应挤压滚动区至零高度
+8. **弹框形态断点**：在 390px / 700px / 900px 三个视口分别打开 New Route、Edit Route、Delete Route 确认、Add/Edit Provider → 前两者应分别为 drawer（bottom）/ drawer / dialog；可用 `document.querySelectorAll('[data-slot=drawer-content]')` 与 `[data-slot=dialog-content]` 计数断言，并同时校验 `window.innerWidth` 与 `matchMedia('(min-width: 768px)')`
 
 ## 变更记录
+- [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
 - [0001 初始化与大屏幕响应式优化](changes/0001-initial.md)

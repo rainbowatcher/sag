@@ -1,50 +1,22 @@
 <script setup lang="ts">
 import { Loader2 } from "@lucide/vue"
-import { useMediaQuery } from "@vueuse/core"
-import { computed, ref } from "vue"
+import { ref } from "vue"
 import { toast } from "vue-sonner"
 import ApisEditor from "@/components/providers/ApisEditor.vue"
 import ProviderAdvancedTab from "@/components/providers/ProviderAdvancedTab.vue"
 import ProviderBasicFields from "@/components/providers/ProviderBasicFields.vue"
 import ProviderModelsTab from "@/components/providers/ProviderModelsTab.vue"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
-  Drawer,
-  DrawerClose,
-  DrawerContent,
-  DrawerDescription,
-  DrawerFooter,
-  DrawerHeader,
-  DrawerTitle,
-} from "@/components/ui/drawer"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
+import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider, ProxyMode } from "@/types/api"
 
-const isDesktop = useMediaQuery("(min-width: 640px)")
-
-const Modal = computed(() => ({
-  Root: isDesktop.value ? Dialog : Drawer,
-  Content: isDesktop.value ? DialogContent : DrawerContent,
-  Header: isDesktop.value ? DialogHeader : DrawerHeader,
-  Title: isDesktop.value ? DialogTitle : DrawerTitle,
-  Description: isDesktop.value ? DialogDescription : DrawerDescription,
-  Footer: isDesktop.value ? DialogFooter : DrawerFooter,
-  Close: isDesktop.value ? DialogClose : DrawerClose,
-}))
+const { Modal } = useResponsiveModal()
 
 const store = useProviderStore()
 

@@ -57,7 +57,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 列表页以 TanStack Table 展示：Name、Base URL、Models Endpoint、Type、Keys 数量、Status（开关）、Actions（编辑/删除）
 - 筛选：按 model 名称（Combobox 模糊搜索）、provider type（OpenAI / Anthropic）、排序（Name A-Z / 默认）
 - 添加：`ProviderAddForm` 组件，根据 provider_type 动态展示不同表单字段
-- 编辑：`ProviderEditForm` drawer，使用 `useMediaQuery` 在移动端切换为 dialog
+- 编辑：`ProviderEditForm`，视口 ≥768px（`md`）为 Dialog、<768px 为底部抽屉（drawer），由 `useResponsiveModal` 统一提供
 - 开关：Switch 组件直接切换 provider 启用/禁用，即时生效
 - 删除：二次确认对话框，底部固定栏显示确认信息
 
@@ -66,8 +66,10 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 列表页以 TanStack Table 展示：Model Name、Endpoint、Strategy（彩色标签）、Targets 数量、Actions
 - 标记引用了已禁用 provider 的 target：行变灰 + Targets 列显示琥珀色警告
 - 支持列排序（点击表头）
-- 编辑：Dialog 弹出 `RouteEditForm`，可修改 targets、strategy 等
-- 删除：Dialog 二次确认
+- 编辑：弹框内嵌 `RouteEditForm`，可修改 targets、strategy 等；视口 ≥768px 为 Dialog、<768px 为底部抽屉
+- 删除：二次确认弹框，同上双轨形态
+- 清除 Active Target / 重置 Fill-First 顺序：点击 Active Target 单元格触发二次确认，同上双轨形态
+- Models 列表中的「Create route」快捷建单：确认弹框，也使用同一双轨形态（移动端会出现抽屉套抽屉）
 
 ### Analytics
 
@@ -134,6 +136,15 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 仅新增 `xl:`（1280px）和 `2xl:`（1536px）断点，`lg:` 及以下行为不变
 - 所有变更均为纯 Tailwind CSS 工具类，无 JavaScript 媒体查询
 
+### 移动端弹框形态
+
+- 断点：`md`（768px），与 `AppLayout.vue` 的 `isMobile` 和 `SidebarProvider` 内部断点一致——整站只保留一个「移动端」定义
+- 视口 ≥768px：弹框使用 Dialog（居中卡片）；<768px：使用底部抽屉（vaul Drawer，`direction=bottom`，可下拉关闭）
+- 形态切换由 `useResponsiveModal()` 统一提供，组件不得自行写 `useMediaQuery` + 条件组件映射
+- 属于「弹框」并适用该规则：Provider 新增/编辑、Route 新增/编辑/删除确认、清除 Active Target 与重置 Fill-First 确认、Models 列表的快捷建单确认
+- 不属于「弹框」：Popover 类浮层（`Combobox`、`SearchSelect`、`DateRangePicker`）、Tooltip、移动端侧边栏（已是 Sheet）、`ProviderList` 的行内删除确认条
+- 布局约定：抽屉内没有默认内边距（`DrawerContent` 无 padding），正文区自行加 `px-4 sm:px-0`——对话框一侧已有 `DialogContent` 的 `p-6`，`sm:px-0` 避免叠加成双重内边距
+
 ## 配置
 
 UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API base URL，运行时管理 API 地址由用户手动输入并存储在 localStorage。
@@ -150,13 +161,13 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 - 与 SAG 管理 API 的 HTTP 通信
 - 固定高度布局：页面整体固定为视口高度，仅表格和图表容器内部滚动，页面头部和筛选栏保持可见
 - 大屏幕（`xl:`、`2xl:` 断点）响应式优化
+- 移动端（<768px）弹框以底部抽屉呈现，桌面端保持 Dialog
 
 ### 不包含
 
 - 服务端渲染（SSR）
 - 国际化（i18n）
 - 端到端测试
-- 移动端侧边栏折叠 / 汉堡菜单（仅桌面端布局）
 - 离线支持（PWA）
 - 图表 / 数据导出
 - `3xl:` 及以上超宽屏断点（1440px 最大内容宽度已考虑行长可读性）
@@ -174,3 +185,4 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 - [0001 初始化](changes/0001-initial.md)
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
+- [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)

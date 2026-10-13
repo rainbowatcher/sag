@@ -6,14 +6,8 @@ import RefreshButton from "@/components/RefreshButton.vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -23,12 +17,19 @@ const routeStore = useRouteStore()
 const providerStore = useProviderStore()
 const activeTargetStore = useActiveTargetStore()
 
+// Dialog on desktop, bottom Drawer on mobile.
+const { Modal } = useResponsiveModal()
+
 // ── Search / filter (debounced, shared with RouteList) ────────────
 const searchInput = ref("")
 const debouncedSearch = refDebounced(searchInput, 300)
 
 // ── Add form ──────────────────────────────────────────────────────
 const showAdd = ref(false)
+
+function onAddOpenChange(v: boolean) {
+  if (!v) showAdd.value = false
+}
 
 async function handleRouteCreated() {
   showAdd.value = false
@@ -79,15 +80,18 @@ onMounted(refreshPage)
       </div>
     </div>
 
-    <!-- ── Add Route Dialog ─────────────────────────────────────────── -->
-    <Dialog :open="showAdd" @update:open="(v) => !v && (showAdd = false)">
-      <DialogContent class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-3xl">
-        <DialogHeader class="shrink-0">
-          <DialogTitle>New Route</DialogTitle>
-          <DialogDescription>
+    <!-- ── Add Route Dialog / Drawer ─────────────────────────────────── -->
+    <component :is="Modal.Root" :open="showAdd" @update:open="onAddOpenChange">
+      <component
+        :is="Modal.Content"
+        class="flex max-h-[85vh] flex-col overflow-hidden px-4 sm:max-w-3xl sm:px-6"
+      >
+        <component :is="Modal.Header" class="shrink-0">
+          <component :is="Modal.Title">New Route</component>
+          <component :is="Modal.Description">
             Configure a new routing rule and its target providers
-          </DialogDescription>
-        </DialogHeader>
+          </component>
+        </component>
         <RouteAddForm
           :providers="providerStore.providers"
           :provider-models="routeStore.providerModels"
@@ -95,8 +99,8 @@ onMounted(refreshPage)
           @close="showAdd = false"
           @created="handleRouteCreated"
         />
-      </DialogContent>
-    </Dialog>
+      </component>
+    </component>
 
     <div class="min-h-0 flex-1 pt-4 pb-4">
       <div

@@ -13,14 +13,6 @@ import RouteEditForm from "@/components/routes/RouteEditForm.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import {
   Table,
   TableBody,
   TableCell,
@@ -29,6 +21,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import {
   activeTargetDotColor,
   clearActiveTargetModel,
@@ -44,6 +37,10 @@ import type { RouteConfig, ActiveTargetEntry } from "@/types/api"
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
 const activeTargetStore = useActiveTargetStore()
+
+// Every modal in this list (edit / delete / clear-pin) is a Dialog on desktop
+// and a bottom Drawer on mobile.
+const { Modal } = useResponsiveModal()
 
 onMounted(() => activeTargetStore.fetchActiveTargets())
 
@@ -68,6 +65,10 @@ function onEditClose() {
   editingRoute.value = null
 }
 
+function onEditOpenChange(v: boolean) {
+  if (!v) onEditClose()
+}
+
 async function onUpdated() {
   editingRoute.value = null
   await Promise.all([routeStore.fetchRoutes(), activeTargetStore.fetchActiveTargets()])
@@ -86,6 +87,10 @@ function startDelete(modelName: string) {
 function cancelDelete() {
   deleteTarget.value = null
   deleteDialogOpen.value = false
+}
+
+function onDeleteOpenChange(v: boolean) {
+  if (!v) cancelDelete()
 }
 
 async function confirmDelete() {
@@ -146,6 +151,10 @@ function openClearConfirm(entry: ActiveTargetEntry, isFillFirst: boolean) {
 function cancelClearConfirm() {
   confirmOpen.value = false
   confirmEntry.value = null
+}
+
+function onConfirmOpenChange(v: boolean) {
+  if (!v) cancelClearConfirm()
 }
 
 async function confirmClear() {
@@ -525,21 +534,14 @@ const table = useVueTable({
     </div>
   </div>
 
-  <!-- ── Clear active target / reset fill-first confirm Dialog ──── -->
-  <Dialog
-    :open="confirmOpen"
-    @update:open="
-      (v) => {
-        if (!v) cancelClearConfirm()
-      }
-    "
-  >
-    <DialogContent class="sm:max-w-md">
-      <DialogHeader>
-        <DialogTitle>
+  <!-- ── Clear active target / reset fill-first confirm Dialog / Drawer ── -->
+  <component :is="Modal.Root" :open="confirmOpen" @update:open="onConfirmOpenChange">
+    <component :is="Modal.Content" class="sm:max-w-md">
+      <component :is="Modal.Header">
+        <component :is="Modal.Title">
           {{ confirmFillFirst ? "Reset Fill-First Order" : "Clear Active Target" }}
-        </DialogTitle>
-        <DialogDescription>
+        </component>
+        <component :is="Modal.Description">
           <template v-if="confirmFillFirst">
             Reset the cached fill-first order for
             <span class="font-mono font-medium">{{ confirmEntry?.model }}</span
@@ -551,9 +553,9 @@ const table = useVueTable({
               >{{ confirmEntry?.provider }}/{{ confirmEntry?.real_model }}</span
             >? Traffic will revert to priority routing.
           </template>
-        </DialogDescription>
-      </DialogHeader>
-      <DialogFooter class="flex flex-row justify-end gap-2 sm:justify-end">
+        </component>
+      </component>
+      <component :is="Modal.Footer">
         <Button
           variant="outline"
           size="sm"
@@ -571,29 +573,22 @@ const table = useVueTable({
           <Loader2 v-if="clearingModel !== null" class="h-3 w-3 animate-spin" />
           {{ clearingModel !== null ? "Clearing…" : confirmFillFirst ? "Reset" : "Clear" }}
         </Button>
-      </DialogFooter>
-    </DialogContent>
-  </Dialog>
+      </component>
+    </component>
+  </component>
 
-  <!-- ── Delete confirmation Dialog ────────────────────────────── -->
-  <Dialog
-    :open="deleteDialogOpen"
-    @update:open="
-      (v) => {
-        if (!v) cancelDelete()
-      }
-    "
-  >
-    <DialogContent class="sm:max-w-md">
-      <DialogHeader>
-        <DialogTitle>Delete Route</DialogTitle>
-        <DialogDescription>
+  <!-- ── Delete confirmation Dialog / Drawer ─────────────────────── -->
+  <component :is="Modal.Root" :open="deleteDialogOpen" @update:open="onDeleteOpenChange">
+    <component :is="Modal.Content" class="sm:max-w-md">
+      <component :is="Modal.Header">
+        <component :is="Modal.Title">Delete Route</component>
+        <component :is="Modal.Description">
           Are you sure you want to delete route
           <span class="font-mono font-medium">{{ deleteTarget }}</span
           >? This action cannot be undone.
-        </DialogDescription>
-      </DialogHeader>
-      <DialogFooter class="flex flex-row justify-end gap-2 sm:justify-end">
+        </component>
+      </component>
+      <component :is="Modal.Footer">
         <Button variant="outline" size="sm" @click="cancelDelete" :disabled="deleting">
           Cancel
         </Button>
@@ -601,33 +596,28 @@ const table = useVueTable({
           <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
           {{ deleting ? "Deleting…" : "Delete" }}
         </Button>
-      </DialogFooter>
-    </DialogContent>
-  </Dialog>
+      </component>
+    </component>
+  </component>
 
-  <!-- ── Edit Dialog ─────────────────────────────────────────────── -->
-  <Dialog
-    :open="editingRoute !== null"
-    @update:open="
-      (v) => {
-        if (!v) onEditClose()
-      }
-    "
-  >
-    <DialogContent class="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
-      <DialogHeader>
-        <DialogTitle>Edit Route</DialogTitle>
-        <DialogDescription>
+  <!-- ── Edit Dialog / Drawer ─────────────────────────────────────── -->
+  <component :is="Modal.Root" :open="editingRoute !== null" @update:open="onEditOpenChange">
+    <component :is="Modal.Content" class="flex max-h-[90vh] flex-col overflow-hidden sm:max-w-3xl">
+      <component :is="Modal.Header" class="shrink-0">
+        <component :is="Modal.Title">Edit Route</component>
+        <component :is="Modal.Description">
           Modify routing rule for
           <span class="font-mono font-medium">{{ editingRoute?.model_name }}</span>
-        </DialogDescription>
-      </DialogHeader>
-      <RouteEditForm
-        v-if="editingRoute"
-        :route="editingRoute"
-        @close="onEditClose"
-        @updated="onUpdated"
-      />
-    </DialogContent>
-  </Dialog>
+        </component>
+      </component>
+      <div class="min-h-0 flex-1 overflow-y-auto px-4 pb-4 sm:px-0">
+        <RouteEditForm
+          v-if="editingRoute"
+          :route="editingRoute"
+          @close="onEditClose"
+          @updated="onUpdated"
+        />
+      </div>
+    </component>
+  </component>
 </template>
