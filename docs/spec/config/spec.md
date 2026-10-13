@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-08
+updated: 2026-09-30
 ---
 
 # 配置 — 规格
@@ -138,6 +138,16 @@ provider 级代理策略用三态枚举（`inherit` / `enabled` / `disabled`）�
 
 **Trade-off**: 用户看到的配置就是他们实际修改的部分。但也意味着"想显式设置为默认值"的场景无法表达（如 `timeout_secs = 120` 不会出现在文件中，除非它已经是默认值）。这在当前场景中是可接受的——如果用户想确认某个值是默认值，可以查看文档。
 
+### 多协议 fallback：显式策略 vs 静默默认
+
+`apis` 声明多个协议 key 时 `fallback` 必填（值 ∈ 协议 key 集）；恰好一个协议 key 时可省略，自动取该协议。校验直接报错，不做静默默认。
+
+**背景**: IR（协议中立中间表示）使任意入口协议 ↔ 任意目标协议的翻译成为通用能力，「能不能翻译」不再由配置回答；`fallback` 回答的是「译到哪一个已声明协议」。该值经 `used_protocol()`（`sag-dispatch/src/dispatch/capability.rs`）决定 translated 请求的实际使用协议，进而决定 `apis.<key>` 节的取用（上游地址、鉴权头形状、协议相关覆盖字段）、能力预检档位（如 `responses` 声明 `documents=false`，带文件块的请求被剔除）与 IR 编码的字段损耗清单——目标协议不同则行为不同。
+
+**被放弃的方案**: ① 多协议 key 时静默取默认（如取第一个协议 key）——行为改变不可见（可路由性、保真度、地址与鉴权随默认值漂移）；② 按请求硬需求动态选择编码目标——与能力预检职责重叠，且使同一 target 的 lane 随请求变化，行为不可预测、不可审计。
+
+**Trade-off**: 显式必填换来配置即意图、行为可预测可审计；代价是多协议 provider 需多写一个字段（校验报错附带建议值降低摩擦）。三协议全声明时不存在 translated 车道，字段不参与运行。
+
 ## 不变式
 
 - 未知配置字段**只告警、绝不拒绝**（`serde_ignored` 收集 + `warn!`），向前兼容；load / reload 共用统一反序列化路径
@@ -153,6 +163,7 @@ provider 级代理策略用三态枚举（`inherit` / `enabled` / `disabled`）�
 - `ProxyConfig` 仅存 scheme/host/port，不存原始 URL / userinfo；日志与 `Debug` 永不泄漏代理凭据
 - `proxy_mode='enabled'` 且无可用顶层 `proxy_url` 是配置错误，validate / 保存 / 接口请求一致拒绝
 - 全局代理变化按 effective proxy 差异重建受影响 provider；`disabled` provider 不重建；在途请求不强行中断
+- `fallback` 必须 ∈ `apis` 的协议 key 集；`apis` 声明多个协议 key 时必填（缺省 = 校验错误），恰好一个协议 key 时省略即自动取之
 
 ## 测试策略
 

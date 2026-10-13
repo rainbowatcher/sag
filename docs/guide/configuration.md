@@ -122,7 +122,7 @@ targets = [
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `apis` | table | — | 协议 API 目录（**必填，至少一个协议 key**）。`[providers.<name>.apis.<kind>]`，`kind` ∈ `chat_completions` / `responses` / `anthropic_messages` / `image`。每节携带自己的 `base_url`（地址唯一来源）与可选的协议相关覆盖字段；`image` 是非协议条目，不参与 lane 判定 |
-| `fallback` | string (可选) | — | 降级协议（translated 路径的编码目标）。`apis` 恰好一个协议 key 时可省略（自动取之）；多个协议 key 时必填，值必须 ∈ apis 协议 key 集 |
+| `fallback` | string (可选) | — | 降级协议（translated 路径的编码目标）。`apis` 恰好一个协议 key 时可省略（自动取之）；多个协议 key 时必填，值必须 ∈ apis 协议 key 集。该值决定 translated 请求实际使用的 `apis` 节（上游地址、鉴权、协议相关覆盖字段）与能力档，详见[多协议供应商与降级协议](/guide/providers#多协议供应商与降级协议) |
 | `api_keys` | array | `[]` | API 密钥列表（所有 API 共享的凭据池） |
 | `key_strategy` | string | `"fill_first"` | 多密钥选择策略：`"fill_first"`（顺序使用，失败后切换）或 `"round_robin"`（轮询分发） |
 | `proxy_mode` | string | `"inherit"` | 出站代理三态：`"inherit"`（默认，跟随顶层 `proxy_url`）/ `"enabled"`（强制走全局代理，无全局代理则配置错误）/ `"disabled"`（强制直连）。SAG **不读**系统代理环境变量 |

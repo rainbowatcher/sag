@@ -9,7 +9,7 @@
 | 字段 | 说明 |
 |------|------|
 | `apis` | 协议 API 目录（必填，至少一个协议 key）：`[providers.<name>.apis.<kind>]` 各节携带自己的 `base_url`（地址唯一来源）与可选覆盖字段。协议集 = apis 的协议 key 集，lane 自动判定（ingress ∈ 协议集 → Native） |
-| `fallback` | 降级协议（translated 路径的编码目标）。单协议 key 可省略；多协议 key 必填 |
+| `fallback` | 降级协议（translated 路径的编码目标）。单协议 key 可省略；多协议 key 必填。选择规则与影响见[多协议供应商与降级协议](#多协议供应商与降级协议) |
 | `api_keys` | API 密钥列表 |
 | `key_strategy` | 多密钥选择策略（`fill_first` / `round_robin`） |
 | `proxy_mode` | 出站代理三态：`inherit`（默认，跟随顶层 `proxy_url`）/ `enabled`（强制走全局代理，无全局代理则配置错误）/ `disabled`（强制直连）。SAG **不读**系统代理环境变量 |
@@ -26,6 +26,31 @@
 | `model_overrides` | 逐模型 body 字段覆盖，以 `real_model` 为 key。优先级高于 `body_overrides`，低于路由 target 的 `extra`。推荐用于避免在多个路由中重复配置同一模型的参数 |
 | `role_mappings` | 角色名映射表（如 `{ "developer" = "system" }`） |
 | `anthropic_cache_control` | 是否向 Anthropic Messages 请求注入 `cache_control` 断点，默认 `true`。仅当实际使用协议为 `anthropic_messages` 时生效（`apis.anthropic_messages` 可覆盖），详见下文 |
+
+## 多协议供应商与降级协议
+
+供应商的 `apis` 可声明多个协议 key（同址或异址均可，每节各有 `base_url`）。请求按入口协议自动判定车道：
+
+```text
+lane         = 入口协议 ∈ apis 协议 key 集 ? Native : Translated
+实际使用协议  = Native ? 入口协议 : fallback（单协议 key 时为该 key）
+```
+
+- **Native 直通**：上游 JSON 原样透传，保真度最高。声明多个协议 key 的价值就是让多个入口都走直通。
+- **Translated 翻译降级**：入口协议不在协议集内时，请求经 IR（协议中立中间表示）编码为目标协议后发出。
+
+`fallback` 只决定 **translated 请求译到哪一个已声明协议**。IR 使任意入口协议 ↔ 任意目标协议的翻译成为通用能力，「能不能翻译」不再是配置问题；但「译到哪」仍是策略问题——它同时决定这次请求实际使用的 `apis` 节，从而决定：
+
+- **上游地址与鉴权**：`apis.<fallback>.base_url`；鉴权头形状按协议（`anthropic_messages` → `x-api-key` + `anthropic-version`，其余 → `Authorization: Bearer`）
+- **协议相关覆盖**：生效的 `headers` / `body_overrides` / `model_overrides` / `role_mappings` / `timeout_secs` 等
+- **能力预检档位**：如 `responses` 不声明 `documents`（带文件块的请求会被剔除）、`chat_completions` 不声明 `stateful` / `hosted_tools`
+- **字段损耗**：翻译目标不同，IR 编码丢弃的字段不同
+
+规则：
+
+- `apis` 恰好一个协议 key：降级目标唯一，`fallback` 可省略（自动取之）
+- 多个协议 key：**必填**。不同目标协议在能力、损耗、地址与鉴权上行为不同，静默取默认属于危险的行为改变，因此校验直接报错并给出建议值
+- 三个协议 key 全声明：所有入口都是 Native，不存在 translated 车道，`fallback` 不参与运行
 
 ## 模型列表探测
 
