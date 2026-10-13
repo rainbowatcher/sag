@@ -1,31 +1,61 @@
 #!/bin/sh
+# SAG pre-commit hook —— 提交门禁：fmt-check + lint + test
+#
+# 按暂存文件类型分轨执行（改文档不会拖起 cargo test）：
+#   Rust 轨 (*.rs / Cargo.toml / Cargo.lock / justfile)  → just verify-rust
+#   前端轨 (sag-ui/** / justfile)                        → just verify-ui
+# 两条轨合起来等价于 `just verify`（= fmt-check + lint + test，前后端全量）。
+#
+# 全部为只读检查（`--check` / `--noEmit`），绝不改写工作区；格式问题请自己跑
+# `just fmt` 修。逃生舱：`SKIP_SIMPLE_GIT_HOOKS=1 git commit`。
+#
+# 安装：`just setup`（设置 core.hooksPath=scripts/hooks）
 
-if [ "$SKIP_SIMPLE_GIT_HOOKS" = "1" ]; then
-    echo "[INFO] SKIP_SIMPLE_GIT_HOOKS is set to 1, skipping hook."
+if [ "${SKIP_SIMPLE_GIT_HOOKS:-}" = "1" ]; then
+    echo "[INFO] SKIP_SIMPLE_GIT_HOOKS=1 —— 跳过 pre-commit 检查。"
     exit 0
 fi
 
-if [ -f "$SIMPLE_GIT_HOOKS_RC" ]; then
+if [ -n "${SIMPLE_GIT_HOOKS_RC:-}" ] && [ -f "$SIMPLE_GIT_HOOKS_RC" ]; then
+    # shellcheck source=/dev/null
     . "$SIMPLE_GIT_HOOKS_RC"
 fi
 
-# ── Rust: formatting check ────────────────────────────────────────
-if git diff --cached --name-only -- '*.rs' | grep -q .; then
-    echo "[INFO] Running cargo fmt --check..."
-    cargo fmt --check || {
-        echo "[ERROR] Rust formatting check failed. Run 'cargo fmt' to fix." >&2
-        exit 1
-    }
+# git 会把 hook 的工作目录设为工作树根，但 GUI 客户端 / worktree 场景下不保证，
+# 显式 cd 一次，保证 justfile 与相对路径（sag-ui/）能解析。
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if ! command -v just >/dev/null 2>&1; then
+    echo "[ERROR] 找不到 just —— GUI git 客户端（Fork / VSCode / GitKraken 等）" >&2
+    echo "        不会加载 shell rc，mise shims 里的 just/cargo/pnpm 可能不在 PATH。" >&2
+    echo "        请在终端里提交，或临时用 SKIP_SIMPLE_GIT_HOOKS=1 git commit 绕过。" >&2
+    exit 1
 fi
 
-# ── Frontend: lint-staged for sag-ui ──────────────────────────────
-if git diff --cached --name-only -- 'sag-ui/*' 'sag-ui/**/*' | grep -q .; then
-    echo "[INFO] Running lint-staged for sag-ui..."
-    cd sag-ui && npx lint-staged || {
-        echo "[ERROR] lint-staged failed." >&2
+# 只关心新增/修改/重命名（ACMR），删除文件不需要跑检查
+staged() {
+    git diff --cached --name-only --diff-filter=ACMR -- "$@"
+}
+
+run_step() {
+    label="$1"
+    shift
+    echo "[INFO] $label"
+    if ! "$@"; then
+        echo "" >&2
+        echo "[ERROR] $label 失败，提交已中止。" >&2
+        echo "        格式化: just fmt    静态检查: just lint    测试: just test" >&2
+        echo "        临时绕过: SKIP_SIMPLE_GIT_HOOKS=1 git commit" >&2
         exit 1
-    }
-    cd "$OLDPWD" || exit 1
+    fi
+}
+
+if staged '*.rs' 'Cargo.toml' 'Cargo.lock' 'justfile' | grep -q .; then
+    run_step "Rust: fmt-check + clippy + test (just verify-rust)" just verify-rust
+fi
+
+if staged 'sag-ui/*' 'sag-ui/**/*' 'justfile' | grep -q .; then
+    run_step "前端: fmt-check + oxlint + vue-tsc + test (just verify-ui)" just verify-ui
 fi
 
 exit 0

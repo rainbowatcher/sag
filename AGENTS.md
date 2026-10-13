@@ -2,22 +2,30 @@
 
 ## 关键命令
 
+### 门禁 / 跨前后端（推荐入口）
+- `just verify` — 全量验证：`fmt-check` + `lint` + `test`（前后端），等价于 pre-commit hook 两条轨之和
+- `just verify-rust` / `just verify-ui` — 只跑单轨验证（hook 按暂存文件类型分别调用）
+- `just fmt` — rustfmt + oxfmt 格式化（**会改写文件**）
+- `just fmt-check` — 格式化检查（只读，不改写文件）
+- `just lint` — `cargo clippy --all-targets -- -D warnings` + oxlint + vue-tsc
+- `just test` — Rust 单元/集成测试（默认跳过 doc test）+ 前端测试；`just test --doc` 只跑 doc test
+
 ### 后端 (Rust)
 - `just build` — 构建 release
-- `just test` — 运行 Rust 测试（可追加参数，如 `just test --tests` 仅运行单元/集成测试）
-- `just test --tests` — 仅运行单元测试和集成测试（跳过 doc test），验证 codebase 时优先使用
-- `just test --doc` — 仅运行文档测试
-- `just lint` — clippy + 前端 lint
-- `just fmt` — rustfmt 格式化
+- `just test-rust` — 仅 Rust 测试（无参数时默认 `--tests`，跳过 doc test）
+- `just test-rust --doc` — 仅文档测试
+- `just test-crate sag-config` — 单个 crate 的测试
+- `just clippy` — 仅 clippy
 - `just run` — 以 debug 模式运行网关
 - `just dev` — 通过 `scripts/dev.py` 同时启动前后端
 
 ### 前端 (`sag-ui/`)
 - `pnpm dev` — 启动 Vite 开发服务器
 - `pnpm build` — 生产构建
-- `pnpm lint` — oxlint 检查
-- `pnpm format` — oxfmt 格式化
-- `pnpm typecheck` — vue-tsc 类型检查
+- `just ui-lint` — oxlint 检查（`just lint` 的子步骤）
+- `just ui-typecheck` — vue-tsc 类型检查（`just lint` 的子步骤）
+- `just ui-fmt` — oxfmt 格式化（`just fmt` 的子步骤）
+- `just ui-test` — 前端测试（`just test` 的子步骤）
 
 ## 代码规范
 
@@ -29,13 +37,13 @@
   - **单元测试**: 放在 `src/` 文件中，通过 `#[cfg(test)] mod tests` 内联于被测模块底部。只测试当前模块的内部细节，不依赖外部资源（文件系统、网络、环境变量、config handle）。使用 `test_dispatch_runtime()` 或 `test_app_state()` 等内存 fixture
   - **集成测试**: 放在 crate 级 `tests/` 目录下（如 `sag-router/tests/auth_regression.rs`）。测试跨模块的公共 API 或完整请求生命周期，允许配置文件和端到端请求
   - **何时写哪个**: 逻辑正确性验证 → 单元测试（内联）；跨模块协作 / 完整流程 / admin API → 集成测试（`tests/` 目录）
-- **验证 codebase**: 使用 `just test --tests`（仅运行单元/集成测试，不包含 doc test）；仅在需要 doc test 时用 `just test --doc`
+- **验证 codebase**: 使用 `just test`（Rust 默认只跑单元/集成测试、跳过 doc test，并附带前端测试）；只跑 Rust 用 `just test-rust`，需要 doc test 时用 `just test-rust --doc`
 - **当前仓库现状**: 无 doc test、无 examples、无 bin 测试
 - **共享状态**: `AppState` 使用 `Arc<RwLock<...>>` + `ConfigHandle`
 - **Provider 模式**: `#[async_trait] pub trait LlmProvider`，通过 `Arc<dyn LlmProvider>` 存储
 - **导入顺序**: 标准库 → 外部 crate → 内部 crate, 空行分组
 - **模块导出**: `lib.rs` 统一 `pub use ...` 重新导出公开类型
-- **格式化**: 任何对 `.rs` 文件的修改完成后，必须运行 `cargo fmt`（或 `just fmt`）确保代码符合 rustfmt 风格。提交前 `pre-commit` hook 会检查 `cargo fmt --check`，未格式化的代码无法通过。
+- **格式化**: 任何对 `.rs` 文件的修改完成后，必须运行 `just fmt`（rustfmt + oxfmt）确保代码符合 rustfmt / oxfmt 风格。pre-commit hook 会以 `just verify-rust` / `just verify-ui` 复查（只读，详见「重要规则 → Git」），未格式化的代码无法通过。
 
 ### 前端 (Vue/TypeScript)
 - **组件**: `<script setup lang="ts">` Composition API
@@ -43,6 +51,7 @@
 - **状态管理**: Pinia (composition API 风格)
 - **样式**: Tailwind CSS utility 类, 不使用 scoped CSS
 - **路径别名**: `@/` 映射到 `src/`
+- **验证**: 改动 `.ts` / `.vue` 后跑 `just lint`（oxlint + vue-tsc）与 `just test`（含前端测试）；pre-commit hook 会自动执行 `just verify-ui`
 
 ## 重要规则
 
@@ -50,10 +59,19 @@
 `sag-ui/src/components/ui/` 目录由 shadcn-vue 自动生成，规则见该目录下的 [`AGENTS.md`](sag-ui/src/components/ui/AGENTS.md)。
 
 ### Git
-- 提交前 `pre-commit` hook 会根据暂存文件类型自动执行对应检查：
-  - `*.rs` → `cargo fmt --check`
-  - `sag-ui/**/*.{ts,vue}` → `lint-staged` → `oxfmt` + `oxlint`
-- 跳过 git hooks：`SKIP_SIMPLE_GIT_HOOKS=1 git commit`
+- **完成工作后必须提交**：任何代码改动在收尾时都要 commit，不允许留下未提交的改动（未完成、被阻塞或用户明确要求不提交时除外，需在回复中说明原因）
+- **提交门禁由 `scripts/hooks/pre-commit` 自动执行**，不需要在提交前手动跑一遍验证；hook 按暂存文件类型分轨，纯文档改动不会拖起 `cargo test`：
+
+  | 暂存文件 | 执行的 recipe | 具体动作（全部只读） |
+  |---|---|---|
+  | `*.rs` / `Cargo.toml` / `Cargo.lock` / `justfile` | `just verify-rust` | `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --no-fail-fast --tests` |
+  | `sag-ui/**` / `justfile` | `just verify-ui` | `oxfmt --check` → `oxlint` → `vue-tsc --noEmit` → 前端测试 |
+
+  - 两条轨相加 = `just verify`（前后端全量），本地想提前自查就手动跑它
+  - hook **只检查不改写**（一律 `--check` / `--noEmit`），不会静默修改你暂存的内容；格式报错请跑 `just fmt` 修好再提交
+  - 任一步失败即中止提交，失败信息里会打印修复命令与绕过方式
+  - hook 由 `just setup` 安装（`git config core.hooksPath scripts/hooks`）；GUI git 客户端不加载 shell rc，找不到 `just`/`cargo`/`pnpm` 时会以 `[ERROR] 找不到 just` 报错，去终端提交即可
+- 跳过 git hooks：`SKIP_SIMPLE_GIT_HOOKS=1 git commit`（应急用；hook 失败信息里也会提示）
 - `cargo clippy` 和 `cargo check` 请通过 `just lint` / `just test` 手动执行
 - `gateway.toml` 已 gitignored，不要提交
 - 不要修改已存在的 commit，除非用户明确要求

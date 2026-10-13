@@ -34,9 +34,19 @@ ui-install:
 
 # ── 测试 ────────────────────────────────────────────────────────────
 
-# 运行 Rust 测试（可追加参数，例如 `just test --tests` 仅运行单元/集成测试）
+# 运行全部测试（Rust + 前端）。Rust 默认只跑单元/集成测试（跳过 doc test），
+# 追加参数会覆盖默认值，例如 `just test --doc` 只跑文档测试。
 test *args:
-    cargo test --no-fail-fast {{ args }}
+    just test-rust {{ args }}
+    just ui-test
+
+# 运行 Rust 测试（无参数时默认 `--tests`，即跳过 doc test）
+test-rust *args:
+    cargo test --no-fail-fast {{ if args == "" { "--tests" } else { args } }}
+
+# 运行前端测试
+ui-test:
+    pnpm -C sag-ui run test
 
 # 运行单个 crate 的测试 (e.g. just test-crate sag-config)
 test-crate crate:
@@ -72,13 +82,27 @@ dev *args:
 
 # ── 代码质量 ────────────────────────────────────────────────────────
 
+# 格式化 Rust + 前端（会改写文件）
+fmt: fmt-rust ui-fmt
+
 # 运行 rustfmt 格式化
-fmt:
+fmt-rust:
     cargo fmt --all
 
 # 运行 oxfmt 格式化
 ui-fmt:
     pnpm -C sag-ui run format
+
+# 格式化检查 Rust + 前端（只读，不改写文件）
+fmt-check: fmt-check-rust ui-fmt-check
+
+# 运行 rustfmt 格式化检查（只读）
+fmt-check-rust:
+    cargo fmt --all --check
+
+# 运行 oxfmt 格式化检查（只读）
+ui-fmt-check:
+    pnpm -C sag-ui run format:check
 
 # 运行 clippy 检查
 clippy:
@@ -88,8 +112,23 @@ clippy:
 ui-lint *args:
     pnpm -C sag-ui run lint {{ args }}
 
-# 运行所有 lint (Rust + 前端)
-lint: clippy ui-lint
+# 运行前端类型检查 (vue-tsc)
+ui-typecheck:
+    pnpm -C sag-ui run typecheck
+
+# 运行所有 lint (Rust clippy + 前端 oxlint + vue-tsc)
+lint: clippy ui-lint ui-typecheck
+
+# ── 验证门禁 ────────────────────────────────────────────────────────
+
+# 全量验证：fmt-check + lint + test（前后端）。pre-commit hook 的等价入口
+verify: verify-rust verify-ui
+
+# Rust 轨验证：fmt-check + clippy + test
+verify-rust: fmt-check-rust clippy test-rust
+
+# 前端轨验证：fmt-check + oxlint/typecheck + test
+verify-ui: ui-fmt-check ui-lint ui-typecheck ui-test
 
 # ── 清理 ────────────────────────────────────────────────────────────
 
