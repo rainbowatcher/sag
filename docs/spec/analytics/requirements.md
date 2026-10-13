@@ -143,6 +143,8 @@ enabled = true
 storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 ```
 
+相对 `sqlite://` 路径在启动时锚定到 `$XDG_DATA_HOME/sag`（XDG Base Directory 标准，默认 `~/.local/share/sag/analytics.db`）；绝对路径与 `:memory:` 原样使用。
+
 配置只保存用户可编辑的 route 语义；系统生成的 route_id/target_id 不写入 TOML。
 
 ## 兼容性说明（迁移前现状）
@@ -182,6 +184,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 变更记录
 
+- [0006 相对 sqlite:// DSN 锚定 XDG 数据目录 + create_if_missing 修复](../config/changes/0006-xdg-base-directories.md)
 - [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)
 - [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)
 - [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)

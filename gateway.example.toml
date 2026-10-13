@@ -64,6 +64,11 @@ port = 37210
 
 [analytics]
 enabled = true
+# Relative `sqlite://` paths are anchored at the XDG data dir
+# ($XDG_DATA_HOME/sag, default ~/.local/share/sag) — this DSN therefore
+# resolves to ~/.local/share/sag/analytics.db without an absolute path in
+# the config. Use an absolute path (sqlite:///path/to/db) or ":memory:"
+# to opt out.
 storage_dsn = "sqlite://analytics.db"
 
 # Gateway client authentication (optional — remove the block to disable)

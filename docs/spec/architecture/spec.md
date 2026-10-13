@@ -39,7 +39,7 @@ flowchart TD
 
 日志根据 `std::io::stdout().is_terminal()` 选择输出目标：
 - **TTY（开发）**：仅输出到 stdout，保持开发体验简洁
-- **非 TTY（生产/test-env）**：写入 `logs/sag.*.log` 每日轮转文件
+- **非 TTY（生产/test-env）**：写入 `$XDG_STATE_HOME/sag/logs/sag.*.log` 每日轮转文件
 
 **Trade-off**: 生产环境中 stdout/stderr 被 DEVNULL 丢弃，日志仅存于文件。意味着 `panic!` 导致的非 tracing 输出会丢失。但 tracing 覆盖了所有正常的日志路径，panic 消息通过 tracing-subscriber 的 panic hook 也能捕获。
 

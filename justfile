@@ -132,11 +132,13 @@ verify-ui: ui-fmt-check ui-lint ui-typecheck ui-test
 
 # ── 清理 ────────────────────────────────────────────────────────────
 
-# 清理所有构建产物
+# 清理所有构建产物。analytics 数据库与滚动日志在用户级 XDG 目录
+# （$XDG_DATA_HOME/sag、$XDG_STATE_HOME/sag，默认 ~/.local/share/sag 与
+# ~/.local/state/sag），属用户数据，clean 不触碰；测试轨的全部产物在
+# .test-env/ 下，`just test-env stop` 后可整体删除。
 clean:
     cargo clean
     rm -rf sag-ui/dist sag-ui/node_modules
-    rm -f analytics.db analytics.db-*
 
 # 只清理 Rust 构建产物
 clean-rust:
@@ -160,7 +162,8 @@ audit:
 
 # ── 辅助 ────────────────────────────────────────────────────────────
 
-# 一键初始化开发环境（可重复运行）
+# 一键初始化开发环境（可重复运行）。配置写在项目根目录（CWD 回退命中）；
+# 也可改放 $XDG_CONFIG_HOME/sag/gateway.toml（删掉本文件即可）。
 setup:
     git config core.hooksPath scripts/hooks
     @echo "✓ Git hooks installed"

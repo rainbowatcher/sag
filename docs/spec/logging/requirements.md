@@ -40,12 +40,12 @@ TTY 环境启用 ANSI 颜色。
 非 TTY 环境使用 `tracing_appender::rolling::Rotation::DAILY`：
 - 每天自动切换到新文件
 - 文件名格式：`sag.2026-06-26.log`
-- 目录自动创建（`logs/`）
+- 目录自动创建（`$XDG_STATE_HOME/sag/logs`，XDG Base Directory 标准）
 
 ### 启动时清理
 
 每次启动自动删除 7 天前的旧日志文件：
-- 扫描 `logs/sag.*.log`，按 `modified` 时间判断
+- 扫描 `$XDG_STATE_HOME/sag/logs/sag.*.log`，按 `modified` 时间判断
 - 正在写入的当天文件不受影响
 - 清理失败不阻塞启动（best-effort）
 
@@ -100,6 +100,7 @@ format = "compact"
 
 ## 变更记录
 
+- [0006 日志目录迁移至 $XDG_STATE_HOME/sag/logs](../config/changes/0006-xdg-base-directories.md)
 - [0001 初始化](changes/0001-initial.md)
 - [0002 轮转与清理](changes/0002-rotation-and-cleanup.md)
 - [0003 大请求响应日志与请求关联信息](changes/0003-request-correlation-and-large-body-response-log.md)

@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 fastrand = { workspace = true }
+home = { workspace = true }

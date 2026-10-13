@@ -2,6 +2,11 @@
 //!
 //! An AI gateway that proxies chat completion requests to multiple LLM providers
 //! with priority-based routing, automatic fallback, and usage analytics.
+//!
+//! Persistent data follows the XDG Base Directory specification (see
+//! `sag_core::paths`): config in `$XDG_CONFIG_HOME/sag`, the analytics SQLite
+//! database in `$XDG_DATA_HOME/sag`, and daily rotating logs in
+//! `$XDG_STATE_HOME/sag/logs`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -48,7 +53,11 @@ async fn main() {
     // Declared first in main() → dropped last by Rust's reverse drop order,
     // keeping the non-blocking writer alive through `info!("all subsystems shut down")`
     // and through the `tracing::error!` emitted when startup fails.
-    let _log_guard = tracing_init::init(Some(&log_level), log_format);
+    let _log_guard = tracing_init::init(
+        &sag_core::paths::default_log_dir(),
+        Some(&log_level),
+        log_format,
+    );
 
     // Remove log files older than the retention period before any new
     // log entries are written for this process.
@@ -79,6 +88,13 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     //    configured route identities (route_name → static targets) from
     //    the same read lock.
     let (analytics_dsn, routes_identity) = snapshot_analytics_inputs(&config_handle).await;
+    // XDG Base Directory: anchor relative `sqlite://` paths at the SAG data
+    // dir (`$XDG_DATA_HOME/sag`) and create the parent directory — SQLite
+    // creates the database file but never its parent directories. Absolute
+    // paths and `:memory:` pass through; their parent dirs are also ensured
+    // (idempotent) so a deep user-provided path fails with a clear error
+    // instead of SQLite's bare "unable to open database file".
+    let analytics_dsn = resolve_analytics_dsn_with_parent(&analytics_dsn)?;
 
     // 5. Initialize analytics (shared pool + identity registry + query
     //    engine + rollup scheduler + legacy collector + event collector).
@@ -216,6 +232,10 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
 /// Phase 4: Determine analytics storage DSN from config, and snapshot the
 /// configured route identities (route_name → static targets) from
 /// the same read lock.
+///
+/// The fallback DSN stays in relative form (`sqlite://analytics.db`); it is
+/// anchored at the XDG data dir by [`resolve_analytics_dsn_with_parent`] in
+/// `run` — the same anchoring every configured DSN goes through.
 async fn snapshot_analytics_inputs(
     config_handle: &sag_config::ConfigHandle,
 ) -> (String, Vec<sag_analytics::RouteIdentity>) {
@@ -241,6 +261,33 @@ async fn snapshot_analytics_inputs(
         })
         .collect();
     (analytics_dsn, routes_identity)
+}
+
+/// XDG Base Directory: anchor relative `sqlite://` DSN paths at the SAG data
+/// dir and ensure the parent directory exists.
+///
+/// - Relative `sqlite://analytics.db` → `$XDG_DATA_HOME/sag/analytics.db`
+///   (old configs migrate without any edit).
+/// - Absolute paths and `:memory:` pass through.
+/// - The parent directory is created idempotently for every resolved file
+///   path so SQLite's bare "unable to open database file" never masks a
+///   missing-directory problem.
+fn resolve_analytics_dsn_with_parent(raw_dsn: &str) -> anyhow::Result<String> {
+    let dsn = sag_core::paths::resolve_analytics_dsn(raw_dsn);
+    if let Some(path) = sag_core::paths::sqlite_dsn_file_path(&dsn)
+        && let Some(parent) = path.parent()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create analytics data directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    if raw_dsn != dsn {
+        tracing::debug!(raw = %raw_dsn, resolved = %dsn, "relative analytics DSN anchored at the XDG data dir");
+    }
+    Ok(dsn)
 }
 
 /// Analytics subsystem handles assembled over ONE shared pool.
@@ -747,17 +794,43 @@ impl RollupSchedulerHandle {
 /// Precedence:
 /// 1. `--config <path>` flag (most explicit)
 /// 2. First non-flag positional argument (legacy `sag <path>` shape)
-/// 3. Default: `gateway.toml`
+/// 3. `./gateway.toml` when it exists — project-local layout kept working so
+///    existing checkouts need no migration (dev track)
+/// 4. Default: `$XDG_CONFIG_HOME/sag/gateway.toml` (XDG Base Directory spec)
 ///
-/// Both shapes are accepted so existing invocations like
+/// Both CLI shapes are accepted so existing invocations like
 /// `./target/release/sag /etc/sag/gateway.toml` keep working, while
 /// container / docker flows can use `./sag --config /etc/sag/gateway.toml`.
 /// Unknown flag-like tokens are warned about on stderr and ignored (not a
 /// hard error) so future flag additions don't break older invocations.
 fn resolve_config_path() -> anyhow::Result<String> {
+    let (explicit, positional) = parse_config_args(std::env::args().skip(1))?;
+    if let Some(path) = explicit.or(positional) {
+        return Ok(path);
+    }
+    // Project-local fallback: an existing `gateway.toml` next to the CWD
+    // wins over the XDG default (backward compatibility with the previous
+    // CWD-relative default).
+    if Path::new(sag_core::CONFIG_FILE_NAME).exists() {
+        return Ok(sag_core::CONFIG_FILE_NAME.to_string());
+    }
+    Ok(sag_core::paths::default_config_path()
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// Parse CLI args into `(explicit, positional)` config path candidates.
+///
+/// `--config <path>` / `--config=<path>` fill `explicit`; the first non-flag
+/// token fills `positional`; unknown flag-like tokens are warned about on
+/// stderr and dropped. Pure over the iterator so the policy is unit-testable.
+fn parse_config_args<I>(args: I) -> anyhow::Result<(Option<String>, Option<String>)>
+where
+    I: Iterator<Item = String>,
+{
     let mut explicit: Option<String> = None;
     let mut positional: Option<String> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(arg) = args.next() {
         if arg == "--config" {
             // `--config <path>`: explicit path wins over any positional.
@@ -780,26 +853,25 @@ fn resolve_config_path() -> anyhow::Result<String> {
         // Non-`--config` positional tokens after the first are dropped to keep
         // parsing deterministic.
     }
-    Ok(explicit
-        .or(positional)
-        .unwrap_or_else(|| "gateway.toml".to_string()))
+    Ok((explicit, positional))
 }
 
-/// Number of days to retain rotating log files (logs/sag.*.log).
+/// Number of days to retain rotating log files (XDG state dir sag.log.*).
 /// Files with a modification time older than this are deleted on startup.
 const LOG_RETENTION_DAYS: u64 = 7;
 
-/// Delete log files in `logs/` older than [`LOG_RETENTION_DAYS`].
+/// Delete daily rotating log files in the XDG state log dir
+/// (`$XDG_STATE_HOME/sag/logs`) older than [`LOG_RETENTION_DAYS`].
 ///
 /// Best-effort: errors on individual files are logged and skipped;
-/// a missing `logs/` directory is a silent no-op.
+/// a missing log directory is a silent no-op.
 fn cleanup_old_logs() {
-    let log_dir = std::path::Path::new("logs");
-    let dir = match std::fs::read_dir(log_dir) {
+    let log_dir = sag_core::paths::default_log_dir();
+    let dir = match std::fs::read_dir(&log_dir) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            tracing::warn!(error = %e, "cannot read logs directory for cleanup");
+            tracing::warn!(error = %e, "cannot read log directory for cleanup");
             return;
         }
     };
@@ -879,6 +951,46 @@ mod tests {
     use super::*;
     use sag_analytics::BucketState;
     use sag_core::{FinalStatus, RequestResultFact};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// CLI precedence: `--config <path>` wins over a positional token.
+    #[test]
+    fn parse_config_args_explicit_flag_wins_over_positional() {
+        let (explicit, positional) = parse_config_args(
+            args(&["gateway.toml", "--config", "/etc/sag/gateway.toml"]).into_iter(),
+        )
+        .unwrap();
+        assert_eq!(explicit.as_deref(), Some("/etc/sag/gateway.toml"));
+        assert_eq!(positional.as_deref(), Some("gateway.toml"));
+    }
+
+    /// The `--config=<path>` form is accepted (docker / systemd convenience).
+    #[test]
+    fn parse_config_args_accepts_eq_form() {
+        let (explicit, positional) =
+            parse_config_args(args(&["--config=/etc/sag/gateway.toml"]).into_iter()).unwrap();
+        assert_eq!(explicit.as_deref(), Some("/etc/sag/gateway.toml"));
+        assert_eq!(positional, None);
+    }
+
+    /// Unknown flag-like tokens are dropped (with a stderr warning); the
+    /// first non-flag token is the positional config path.
+    #[test]
+    fn parse_config_args_drops_unknown_flags() {
+        let (explicit, positional) =
+            parse_config_args(args(&["--verbose", "-v", "gateway.toml"]).into_iter()).unwrap();
+        assert_eq!(explicit, None);
+        assert_eq!(positional.as_deref(), Some("gateway.toml"));
+    }
+
+    /// A bare `--config` without a value is a hard error.
+    #[test]
+    fn parse_config_args_requires_value_after_flag() {
+        assert!(parse_config_args(args(&["--config"]).into_iter()).is_err());
+    }
 
     /// Build one `client_error` fact (no route, no attempts — the simplest
     /// fact that still exercises the full write → register → compute

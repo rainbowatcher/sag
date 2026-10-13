@@ -12,6 +12,7 @@ pub mod circuit_breaker;
 pub mod error;
 pub mod http_client;
 pub mod ir;
+pub mod paths;
 pub mod protocol;
 pub mod types;
 
@@ -26,6 +27,11 @@ pub use ir::{
     IrContentBlock, IrFinishReason, IrMessage, IrOutputItem, IrRequest, IrResponse, IrResponseMeta,
     IrRole, IrStreamEvent, IrTool, IrToolCall, LossEntry, LossInventory, LossReason, LossScope,
     Reasoning, Sampling, summarize_losses,
+};
+pub use paths::{
+    CONFIG_FILE_NAME, anchor_sqlite_dsn, default_analytics_db_path, default_config_path,
+    default_log_dir, resolve_analytics_dsn, sag_config_dir, sag_data_dir, sag_state_dir,
+    sqlite_dsn_file_path, xdg_config_home, xdg_data_home, xdg_state_home,
 };
 pub use protocol::{ApiKind, Capabilities, IngressProtocol, Lane, protocol_path, resolve_lane};
 pub use types::{

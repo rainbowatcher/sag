@@ -101,9 +101,9 @@
 | 前端 | Vite dev server 独立 HMR | emit 后的产物通过 `rust-embed` 嵌入二进制（`--features embed-ui`） |
 | 默认端口 | 37210（读 `gateway.toml`） | 37211（读 `gateway.test.toml`） |
 | 状态目录 | n/a | `.test-env/{pid,lock,build-info.json,stderr.log}` |
-| 日志 | `logs/sag.log.YYYY-MM-DD`（每日滚动，tracing-appender 写入；dev.py 将子进程 stdout 以 `[BE]` 标签回显到终端） | `logs/sag.log.YYYY-MM-DD`（每日滚动，grep 友好；stdout 重定向到 DEVNULL，**stderr 捕获到 `.test-env/stderr.log`**） |
+| 日志 | `$XDG_STATE_HOME/sag/logs/sag.log.YYYY-MM-DD`（默认 `~/.local/state/sag/logs/`，每日滚动，tracing-appender 写入；dev.py 将子进程 stdout 以 `[BE]` 标签回显到终端） | `.test-env/xdg/state/sag/logs/sag.log.YYYY-MM-DD`（每日滚动，grep 友好；stdout 重定向到 DEVNULL，**stderr 捕获到 `.test-env/stderr.log`**） |
 | 配置 | `gateway.toml` | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
-| SQLite | `analytics.db` | `analytics-test.db` |
+| SQLite | `$XDG_DATA_HOME/sag/analytics.db`（默认 `~/.local/share/sag/`） | `.test-env/xdg/data/sag/analytics-test.db` |
 
 ### 启动顺序
 
@@ -127,7 +127,11 @@ just test-env start    # 真正启动 gateway；同上必须显式写
 
 误输 `just test-env` 看到 `[ERR] no test-env state (`.test-env/pid` missing)` 不是错，是状态为空 —— 跑 `just test-env start` 即可拉起。启动路径上的 4 类常见 bail 见下一小节。
 
-State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analytics-test.db`）、日志（`logs/sag.*.log`）均列入 `.gitignore`，不会污染版本控制。
+State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`.test-env/xdg/data/sag/analytics-test.db`）、日志（`.test-env/xdg/state/sag/sag.log.*`）均列入 `.gitignore`，不会污染版本控制。
+
+### XDG Base Directory
+
+SAG 遵循 XDG 标准（`sag-core/src/paths.rs` 是唯一解析点）：配置 → `$XDG_CONFIG_HOME/sag`，analytics 数据库 → `$XDG_DATA_HOME/sag`，滚动日志 → `$XDG_STATE_HOME/sag/logs`；三个变量未设置/为空/相对路径时回退 `$HOME` 下的规范默认值（`~/.config`、`~/.local/share`、`~/.local/state`）。配置查找顺序：`--config` / 位置参数 > 项目根 `gateway.toml`（存在时，向后兼容）> `$XDG_CONFIG_HOME/sag/gateway.toml`。配置里的相对 `sqlite://` DSN 锚定到 `$XDG_DATA_HOME/sag`，老配置无感迁移；test-env 通过向子进程注入项目内 `XDG_*` 覆盖实现两轨物理隔离。
 
 ### Agent 工具接入要点
 
@@ -135,7 +139,7 @@ State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`analyti
 - **start 的 fail-fast 路径**：缺 `./target/release/sag` → exit 1 + `[ERR] binary not found ... did you run \`just build-test\`?` ；缺 `gateway.test.toml` → exit 1 + `[ERR] config not found`。Agent 拿到 exit code 后追查即可，无须自己预先验证。
 - **`_acquire_lock()`** 走 `O_CREAT | O_EXCL` 原子获取，并发 `start` 互斥；agent 调 `restart` 时无须自己加锁。
 - **PID 文件是 canonical pointer**：status 路径先看 `.test-env/pid`，再 best-effort 读 `build-info.json`（缺失时打 `(build-info.json unavailable — partial state)` 而不是硬退）。无状态目录 → exit 1 + `[ERR] no test-env state`，agent 可作为运行探针使用。
-- **日志路径**：`logs/sag.log.YYYY-MM-DD` 每日滚动（tracing-appender 管理）；SAG 进程不会自己重开该文件，reader agent 可放心 `tail -f` 或 `grep`。非 tracing 的 stderr（panic、`Error:`）落到 `.test-env/stderr.log`，排查静默失败时优先看它。
+- **日志路径**：`.test-env/xdg/state/sag/logs/sag.log.YYYY-MM-DD` 每日滚动（tracing-appender 管理；test-env 向子进程注入 `XDG_STATE_HOME=$PROJECT/.test-env/xdg/state`）；SAG 进程不会自己重开该文件，reader agent 可放心 `tail -f` 或 `grep`。非 tracing 的 stderr（panic、`Error:`）落到 `.test-env/stderr.log`，排查静默失败时优先看它。
 - **隐式前置依赖**：改 `sag-ui/**.{ts,vue}` 之后必须重跑 `just build-test`，不然 `./target/release/sag` 仍是上一版 UI；改 `gateway.test.toml` 不需重建二进制（文件级 notify 热重载）。
 
 ## 开发环境与测试环境的边界

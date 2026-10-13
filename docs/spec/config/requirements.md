@@ -13,7 +13,7 @@ updated: 2026-09-08
 
 ### 加载
 
-1. 解析命令行参数，确定配置文件路径（`--config <path>` > 位置参数 > `gateway.toml`）
+1. 解析命令行参数，确定配置文件路径（`--config <path>` > 位置参数 > `./gateway.toml`（存在时，向后兼容）> `$XDG_CONFIG_HOME/sag/gateway.toml`）
 2. Peek 配置文件中的 `[logging]` 段（在完整加载前初始化 tracing）
 3. 统一 typed 反序列化 TOML → `GatewayConfig` 结构体（`toml::Deserializer` + `serde_ignored`，与结构体 Schema 自动同步）
 4. 运行 `validate()` → 收集所有错误（不 fail-fast）
@@ -105,6 +105,7 @@ SAG 的出站代理完全由配置显式控制，**不**依赖系统代理环境
 
 ## 变更记录
 
+- [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)
 - [0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](changes/0005-outbound-proxy-configuration.md)
 - [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)
 - [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)

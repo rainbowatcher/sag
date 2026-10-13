@@ -2,8 +2,10 @@
 """SAG 开发环境启动脚本 — 一键启动 Rust 后端 + Vue 前端.
 
 用法:
-    python3 scripts/dev.py                    # 默认配置
-    python3 scripts/dev.py --config my.toml   # 指定配置文件
+    python3 scripts/dev.py                    # 走二进制默认查找顺序：
+                                              #   ./gateway.toml（存在时）
+                                              #   → $XDG_CONFIG_HOME/sag/gateway.toml
+    python3 scripts/dev.py --config my.toml   # 显式指定配置文件
     python3 scripts/dev.py --skip-ui          # 只启动后端
     python3 scripts/dev.py --skip-backend     # 只启动前端
     python3 scripts/dev.py --release          # release 模式启动后端
@@ -28,12 +30,18 @@ def log(tag: str, msg: str) -> None:
     print(f"{c}[{tag}]{reset} {msg}", flush=True)
 
 
-def start_backend(config: str, release: bool) -> subprocess.Popen:
-    """使用 watchexec 启动 Rust 后端，源码变化时自动重编译重启."""
+def start_backend(config: str | None, release: bool) -> subprocess.Popen:
+    """使用 watchexec 启动 Rust 后端，源码变化时自动重编译重启.
+
+    config 为 None 时不传位置参数，由二进制自己解析配置路径
+    （./gateway.toml 存在则命中，否则回退 $XDG_CONFIG_HOME/sag/gateway.toml，
+    见 sag-gateway/src/main.rs 的 resolve_config_path）。
+    """
     cmd = ["watchexec", "-r", "-e", "rs", "--", "cargo", "run"]
     if release:
         cmd.append("--release")
-    cmd.extend(["--", config])
+    if config:
+        cmd.extend(["--", config])
 
     log("SYS", f"Starting backend: {' '.join(cmd)}")
     return subprocess.Popen(
@@ -152,7 +160,7 @@ def wait_for_processes(procs: list[subprocess.Popen]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SAG 开发环境启动器")
-    parser.add_argument("--config", default="gateway.toml")
+    parser.add_argument("--config", default=None, help="显式配置路径（默认走二进制查找顺序）")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--skip-backend", action="store_true")
     parser.add_argument("--skip-ui", action="store_true")

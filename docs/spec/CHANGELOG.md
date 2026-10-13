@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-09-15
+updated: 2026-10-13
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-10-13
+
+- **配置**：[0006 XDG Base Directory 标准路径布局](config/changes/0006-xdg-base-directories.md) — 配置/数据库/日志按 XDG 标准落位（`$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_STATE_HOME` 下的 `sag/` 子目录）；配置查找顺序 `--config` > `./gateway.toml`（存在时）> XDG 默认；相对 `sqlite://` DSN 锚定数据目录并修复 from_str 不建库的 `SQLITE_CANTOPEN`；test-env 以项目内 XDG 覆盖保持两轨物理隔离
 
 ## 2026-09-28
 

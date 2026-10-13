@@ -177,6 +177,7 @@ provider 级代理策略用三态枚举（`inherit` / `enabled` / `disabled`）�
 - `sag-config/src/config.rs` tests — `normalize_proxy_url` / `resolve_effective_proxy` 系列（scheme 限制、userinfo 拒绝、空白归一、三态解析）
 
 ## 变更记录
+- [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)
 - [0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](changes/0005-outbound-proxy-configuration.md)
 - [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)
 - [0003 修复 macOS 文件句柄耗尽与回退白名单遗漏](changes/0003-use-native-fsevent-and-backoff-whitelist.md)

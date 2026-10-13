@@ -53,6 +53,19 @@ pub(crate) fn analytics_connect_options(dsn: &str) -> Result<SqliteConnectOption
             .filename(dsn)
             .create_if_missing(true)
     };
+    // `SqliteConnectOptions::from_str` defaults to `create_if_missing(false)`,
+    // so a `sqlite://` DSN pointing at a not-yet-existing file fails with
+    // SQLITE_CANTOPEN (14). That was masked historically: the CWD-relative
+    // `analytics.db` always existed by the time the pool opened. With
+    // XDG-anchored DSNs (see `sag_core::paths::anchor_sqlite_dsn`) the file
+    // is created on first startup, so the pool must be allowed to create it
+    // — unless the DSN opts out explicitly (`mode=rw` / `mode=ro`; sqlx maps
+    // `mode=rwc` onto create_if_missing itself).
+    let options = if dsn.contains("mode=") {
+        options
+    } else {
+        options.create_if_missing(true)
+    };
 
     let options = options
         .foreign_keys(true)
@@ -115,6 +128,40 @@ mod tests {
     /// Open a file-backed pool via the production construction path and
     /// assert the connection-level `busy_timeout` is the explicit 5s we
     /// pin (not whatever sqlx/libsqlite happens to default to).
+    /// A `sqlite://` DSN pointing at a not-yet-existing file must succeed:
+    /// `SqliteConnectOptions::from_str` defaults to `create_if_missing(false)`,
+    /// but production startup (XDG-anchored DSNs, see
+    /// `sag_core::paths::anchor_sqlite_dsn`) always opens a fresh path on
+    /// first run. `mode=rw` opts out explicitly and must still fail.
+    #[tokio::test]
+    async fn sqlite_dsn_creates_missing_database_file() {
+        let dir = std::env::temp_dir().join(format!("sag-analytics-lib-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fresh.db");
+        let dsn = format!("sqlite://{}", path.display());
+        assert!(!path.exists(), "precondition: db file must not exist");
+
+        let pool = open_analytics_pool(&dsn).await.unwrap();
+        assert!(path.exists(), "pool open must create the db file");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `mode=rw` is the explicit opt-out: an existing file opens, a missing
+    /// one must keep failing (the caller asked for read-write-no-create).
+    #[tokio::test]
+    async fn sqlite_dsn_mode_rw_keeps_create_disabled() {
+        let dir = std::env::temp_dir().join(format!("sag-analytics-lib-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("absent.db");
+        let dsn = format!("sqlite://{}?mode=rw", path.display());
+
+        let result = open_analytics_pool(&dsn).await;
+        assert!(result.is_err(), "mode=rw must not create the db file");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn open_analytics_pool_pins_explicit_busy_timeout() {
         let dir = std::env::temp_dir().join(format!("sag-analytics-lib-{}", Uuid::new_v4()));

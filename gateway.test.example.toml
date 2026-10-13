@@ -5,7 +5,9 @@
 # Differences from gateway.example.toml:
 #   - port 37211 (drifts away from dev port 37210)
 #   - host bound to 127.0.0.1 (loopback only — agent tools are local)
-#   - analytics storage_dsn points at analytics-test.db (parallel to dev)
+#   - analytics storage_dsn points at analytics-test.db; test-env.py
+#     overrides XDG_* env vars to .test-env/xdg/ so the relative path
+#     anchors inside the project (physical isolation from the dev track)
 #
 # Hot-reload is in-process: editing routes / providers takes effect without
 # restart, but [server].port / [server].host changes do NOT rebind the
@@ -66,6 +68,10 @@ port = 37211
 
 [analytics]
 enabled = true
+# Relative `sqlite://` paths anchor at $XDG_DATA_HOME/sag. The test-env
+# launcher overrides XDG_DATA_HOME to `.test-env/xdg/data`, so this lands
+# in `.test-env/xdg/data/sag/analytics-test.db` — never in the developer's
+# user-level XDG directory.
 storage_dsn = "sqlite://analytics-test.db"
 
 # NOTE: [gateway_auth] intentionally NOT included — agent tools

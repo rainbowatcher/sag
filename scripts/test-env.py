@@ -5,12 +5,19 @@ Subcommands
 -----------
 start
     Spawn `./target/release/sag gateway.test.toml` detached, write
-    `.test-env/{pid, build-info.json}`. The sag binary writes its own
-    logs to daily-rotating files under `logs/` via tracing-appender
-    (e.g. `logs/sag.log.2026-06-26`). stdout is redirected to
-    `os.devnull` (the binary does file-based logging), while stderr is
-    captured to `.test-env/stderr.log` so panics and non-tracing
-    `Error:` output leave a trace instead of vanishing silently.
+    `.test-env/{pid, build-info.json}`. The sag binary follows the XDG
+    Base Directory spec (sag-core/src/paths.rs); the launcher overrides
+    XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME to project-local
+    `.test-env/xdg/{config,data,state}` so the test track is physically
+    isolated from the developer's user-level XDG directories:
+    the analytics DB lands in `.test-env/xdg/data/sag/` and the sag
+    binary writes its own logs to daily-rotating files under
+    `.test-env/xdg/state/sag/logs/` (e.g.
+    `.test-env/xdg/state/sag/logs/sag.log.2026-06-26`) via
+    tracing-appender. stdout is redirected to `os.devnull` (the binary
+    does file-based logging), while stderr is captured to
+    `.test-env/stderr.log` so panics and non-tracing `Error:` output
+    leave a trace instead of vanishing silently.
     Locks are acquired atomically (O_EXCL) so two concurrent `start`
     calls cannot both proceed past the lock check. On any failure during
     start, lock + pid + build-info are removed.
@@ -37,9 +44,13 @@ State under `.test-env/`:
                      (canonical pointer; written BEFORE build-info.json)
     lock          — created atomically with O_EXCL; signals "instance owned"
     build-info.json — machine-readable summary of the launch
+    xdg/          — XDG_* override root (config / data / state); the whole
+                     tree is gitignored alongside `.test-env/`
 
 Logs:
-    logs/sag.log.YYYY-MM-DD — daily-rotating, managed by tracing-appender
+    .test-env/xdg/state/sag/logs/sag.log.YYYY-MM-DD — daily-rotating,
+        managed by tracing-appender (under the launcher's XDG_STATE_HOME
+        override)
     .test-env/stderr.log — captured stderr of the sag process (overwritten
         on every start), for panics / non-tracing errors
 """
@@ -57,14 +68,19 @@ from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEST_ENV_DIR = PROJECT_ROOT / ".test-env"
-LOGS_DIR = PROJECT_ROOT / "logs"
+# XDG_* override root injected into the sag child process (see module
+# docstring): keeps config / data / state physically inside the project.
+XDG_ROOT = TEST_ENV_DIR / "xdg"
+# The sag binary resolves its log dir as `$XDG_STATE_HOME/sag/logs`
+# (sag-core/src/paths.rs → default_log_dir).
+LOGS_DIR = XDG_ROOT / "state" / "sag" / "logs"
 PID_FILE = TEST_ENV_DIR / "pid"
 LOCK_FILE = TEST_ENV_DIR / "lock"
 BUILD_INFO = TEST_ENV_DIR / "build-info.json"
 STDERR_LOG = TEST_ENV_DIR / "stderr.log"
 # Daily-rotated log files are named `sag.log.YYYY-MM-DD` (tracing-appender
 # prefixes the file with "sag.log" and appends the date).
-LOG_GLOB = "logs/sag.log.*"
+LOG_GLOB = ".test-env/xdg/state/sag/logs/sag.log.*"
 
 DEFAULT_BINARY = PROJECT_ROOT / "target" / "release" / "sag"
 DEFAULT_CONFIG = PROJECT_ROOT / "gateway.test.toml"
@@ -104,6 +120,18 @@ def file_mtime_rfc3339(path: Path) -> str:
 def ensure_state_dirs() -> None:
     TEST_ENV_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def child_env() -> dict:
+    """Environment for the sag child process with XDG_* overridden to the
+    project-local `.test-env/xdg/` tree, so the test track never touches the
+    developer's user-level XDG directories (physical isolation, mirroring
+    the dev/test track split in AGENTS.md)."""
+    env = os.environ.copy()
+    env["XDG_CONFIG_HOME"] = str(XDG_ROOT / "config")
+    env["XDG_DATA_HOME"] = str(XDG_ROOT / "data")
+    env["XDG_STATE_HOME"] = str(XDG_ROOT / "state")
+    return env
 
 
 def pid_alive(pid: int) -> bool:
@@ -192,6 +220,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         proc = subprocess.Popen(
             [str(binary), str(config)],
             cwd=PROJECT_ROOT,
+            env=child_env(),
             stdout=subprocess.DEVNULL,
             stderr=stderr_handle,
             stdin=subprocess.DEVNULL,
@@ -222,7 +251,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         log("OK", f"test-env launched: PID {proc.pid}")
         log("SYS", f"binary: {binary}")
         log("SYS", f"config: {config}")
-        log("SYS", f"logs:   logs/sag.log.DATE (daily rotating)")
+        log("SYS", f"logs:   {LOGS_DIR}/sag.log.DATE (daily rotating)")
         log("SYS", f"stderr: {STDERR_LOG}")
         log("SYS", f"info:   {BUILD_INFO}")
     except Exception:

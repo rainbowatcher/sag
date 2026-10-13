@@ -1,6 +1,12 @@
 # 配置
 
-SAG 使用基于 TOML 的配置文件（默认：`gateway.toml`）。
+SAG 使用基于 TOML 的配置文件，查找顺序：
+
+1. `--config <path>` 或位置参数（显式指定）
+2. 项目根目录 `./gateway.toml`（存在时，向后兼容）
+3. `$XDG_CONFIG_HOME/sag/gateway.toml`（默认 `~/.config/sag/gateway.toml`，XDG Base Directory 标准）
+
+analytics 数据库与滚动日志同样遵循 XDG 标准：相对 `sqlite://` DSN 锚定到 `$XDG_DATA_HOME/sag`（默认 `~/.local/share/sag`），日志写入 `$XDG_STATE_HOME/sag/logs`（默认 `~/.local/state/sag/logs`）。详见 [部署 → 日志轮转与清理](/guide/deployment)。
 
 ## 日志
 
@@ -19,7 +25,7 @@ format = "compact"
 
 ### 日志文件与轮转
 
-在非 TTY 环境（生产部署、test-env）下，SAG 自动将日志写入 `logs/` 目录下的**每日轮转文件**（例如 `logs/sag.2026-06-26.log`），不依赖启动器的 stdout 重定向。开发环境（TTY）下日志输出到终端，保持不变。
+在非 TTY 环境（生产部署、test-env）下，SAG 自动将日志写入 `$XDG_STATE_HOME/sag/logs/` 目录下的**每日轮转文件**（默认 `~/.local/state/sag/logs/sag.2026-06-26.log`），不依赖启动器的 stdout 重定向。开发环境（TTY）下日志输出到终端，保持不变。
 
 每次启动时，SAG 自动清理 **7 天前**的旧日志文件，保留最近一周的日志。
 
@@ -60,7 +66,9 @@ port = 37210
 
 [analytics]
 enabled = true
-storage_dsn = "analytics.db"
+# 相对 `sqlite://` 路径锚定到 $XDG_DATA_HOME/sag（默认 ~/.local/share/sag）。
+# 此处即解析为 ~/.local/share/sag/analytics.db；也可写绝对路径或 ":memory:"。
+storage_dsn = "sqlite://analytics.db"
 
 # 网关客户端认证（可选 — 删除此段以关闭认证）
 [gateway_auth]

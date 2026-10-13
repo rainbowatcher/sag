@@ -44,7 +44,7 @@ sequenceDiagram
 ## 二进制入口点
 
 `sag-gateway` 子包负责启动编排：
-1. 初始化 tracing（TTY 环境输出到终端；非 TTY 环境写入 `logs/` 每日轮转文件）
+1. 初始化 tracing（TTY 环境输出到终端；非 TTY 环境写入 `$XDG_STATE_HOME/sag/logs/` 每日轮转文件）
 2. 清理 7 天前的旧日志文件
 3. 从 TOML 文件加载配置
 4. 启动配置文件监听，支持热重载（`notify` 监听文件变化，自动更新配置）
