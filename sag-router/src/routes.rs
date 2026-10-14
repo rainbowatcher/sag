@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use axum::{
     Extension, Json, Router,
     body::Body,
-    extract::{State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
@@ -34,6 +34,15 @@ use sag_dispatch::{
     AppState, DispatchCtx, DispatchRuntime, ResolvedRoute, dispatch_chat, dispatch_image,
     resolve_route, resolve_route_with_ingress,
 };
+
+/// Maximum request body size accepted by any route.
+///
+/// Applied as a [`DefaultBodyLimit`] layer on the whole router, so an
+/// oversized body is rejected with 413 (and recorded as the
+/// `payload_too_large` analytics fact) by the `Json` extractor rather
+/// than being buffered first. Shared with the HTTP log middleware as the
+/// upper bound for response-body buffering.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Build the main Axum router with all routes and middleware.
 ///
@@ -85,6 +94,7 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
         .route("/v1/analytics/v2/summary", get(analytics_v2_summary))
         .route("/v1/analytics/v2/trend", get(analytics_v2_trend))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
         .layer(cors)
         .layer(middleware::from_fn(crate::middleware::http_log::log_http))
         .layer(middleware::from_fn(trace_middleware))
@@ -785,9 +795,10 @@ mod tests {
         assert_eq!(attempts, 0, "client_error must carry zero target attempts");
     }
 
-    /// Over the axum default body limit (2 MiB) the `Json` extractor
-    /// rejects with 413 → the fact must carry `payload_too_large` (the
-    /// other branch of the rejection-status mapping).
+    /// Over the configured body limit (`DEFAULT_MAX_REQUEST_BODY_BYTES`)
+    /// the `Json` extractor rejects with 413 → the fact must carry
+    /// `payload_too_large` (the other branch of the rejection-status
+    /// mapping).
     #[tokio::test]
     async fn payload_too_large_writes_payload_too_large_fact() {
         let (state, runtime, pool) = build_state_with_event_pool(GatewayConfig {
@@ -801,7 +812,7 @@ mod tests {
 
         let oversized = format!(
             "{{\"model\":\"gpt-4o\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
-            "x".repeat(2 * 1024 * 1024)
+            "x".repeat(DEFAULT_MAX_REQUEST_BODY_BYTES + 1)
         );
         let resp = app.oneshot(authed_chat_request(&oversized)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);

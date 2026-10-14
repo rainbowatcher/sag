@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
 /// Maximum bytes to buffer from a response body for logging.
-const MAX_BODY_READ: usize = 10_485_760; // 10 MB
+const MAX_BODY_READ: usize = crate::routes::DEFAULT_MAX_REQUEST_BODY_BYTES;
 /// Request bodies at or below this size are buffered for a log preview;
-/// larger ones stream through untouched so the JSON
+/// larger ones stream through untouched so `DefaultBodyLimit` / the JSON
 /// extractor can reject with a proper 413 + analytics fact.
 const REQUEST_PREVIEW_MAX: usize = 512 * 1024;
 const BODY_PREVIEW_MAX: usize = 512;
