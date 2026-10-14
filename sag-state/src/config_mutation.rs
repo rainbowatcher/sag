@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use sag_analytics::{IdentityRegistry, RouteIdentity, TargetIdentity};
-use sag_config::{ConfigHandle, GatewayAuthConfig, GatewayConfig, ProviderConfig, RouteConfig};
+use sag_config::{
+    BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
+    ProviderConfig, RouteConfig,
+};
 use sag_core::AppError;
 use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
@@ -814,6 +817,56 @@ impl ConfigMutationCoordinator {
                     Some(GatewayAuthConfig { api_keys: keys })
                 };
             }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Update the top-level runtime-tuning sections of the gateway config.
+    ///
+    /// Supports the global exponential-backoff settings, the circuit-breaker
+    /// settings, and the two routing-cache TTLs
+    /// (`shuffle_cache_ttl_secs` / `sticky_failover_reset_secs`). Each
+    /// argument is an optional full-object replacement: `None` leaves the
+    /// corresponding section untouched, `Some` overwrites it.
+    ///
+    /// The circuit breaker is replaced as a full object: all four fields,
+    /// including the half-open `probe_interval_secs` probe cadence, are taken
+    /// from the provided config.
+    ///
+    /// Goes through the exact same unified mutation protocol as every other
+    /// production write: the mutation mutex, full-config validation (invalid
+    /// `backoff` / `circuit_breaker` values are rejected as
+    /// [`AppError::Config`]), atomic TOML persistence with external-edit
+    /// conflict detection, config commit + `routes_version` bump, and the
+    /// provider-registry sync. Handlers must call this instead of writing
+    /// `config` directly.
+    pub async fn update_runtime_config(
+        &self,
+        backoff: Option<BackoffConfig>,
+        circuit_breaker: Option<CircuitBreakerConfig>,
+        shuffle_cache_ttl_secs: Option<u64>,
+        sticky_failover_reset_secs: Option<u64>,
+    ) -> Result<MutationReport, AppError> {
+        self.mutate(true, |candidate| {
+            if let Some(backoff) = backoff {
+                candidate.backoff = backoff;
+            }
+            if let Some(circuit_breaker) = circuit_breaker {
+                candidate.circuit_breaker = circuit_breaker;
+            }
+            if let Some(ttl) = shuffle_cache_ttl_secs {
+                candidate.shuffle_cache_ttl_secs = ttl;
+            }
+            if let Some(ttl) = sticky_failover_reset_secs {
+                candidate.sticky_failover_reset_secs = ttl;
+            }
+            // `mutate` also validates the post-mutation candidate; validating
+            // here keeps the rejection reason attached to the field-level
+            // change and keeps this method correct if that guard ever moves.
+            candidate
+                .validate()
+                .map_err(|errs| AppError::Config(errs.join("; ")))?;
             Ok(())
         })
         .await
@@ -1632,5 +1685,83 @@ mod tests {
             .expect("mutation task must complete")
             .expect("mutation must succeed");
         assert!(report.routes_changed >= 1);
+    }
+
+    // ── update_runtime_config tests ───────────────────────────────────
+
+    /// Build an in-memory coordinator whose config carries one provider, so
+    /// the full `validate` run by every mutation accepts it.
+    fn make_runtime_coordinator() -> (ConfigMutationCoordinator, ConfigHandle) {
+        let mut providers_map = HashMap::new();
+        providers_map.insert("openai".to_string(), base_provider());
+        let config = ConfigHandle::from_config(GatewayConfig {
+            providers: providers_map,
+            ..gateway_config_base!()
+        });
+        let providers: ProviderRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let coord = ConfigMutationCoordinator::new(config.clone(), providers);
+        (coord, config)
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_applies_all_sections() {
+        let (coord, config) = make_runtime_coordinator();
+
+        let backoff = BackoffConfig {
+            retries: 5,
+            base_ms: 250,
+            max_ms: 9_000,
+            jitter: false,
+            retry_on_empty_response: false,
+        };
+        // The circuit breaker is a full-object replacement: all four fields,
+        // including `probe_interval_secs`, come from the passed config.
+        let breaker = CircuitBreakerConfig {
+            quota_exhausted_secs: 1800,
+            rate_limited_secs: 20,
+            generic_secs: 90,
+            probe_interval_secs: 45,
+        };
+
+        coord
+            .update_runtime_config(Some(backoff.clone()), Some(breaker), Some(1234), Some(4321))
+            .await
+            .expect("valid runtime config update must commit");
+
+        let cfg = config.read().await;
+        assert_eq!(cfg.backoff, backoff);
+        assert_eq!(cfg.circuit_breaker.quota_exhausted_secs, 1800);
+        assert_eq!(cfg.circuit_breaker.rate_limited_secs, 20);
+        assert_eq!(cfg.circuit_breaker.generic_secs, 90);
+        assert_eq!(cfg.shuffle_cache_ttl_secs, 1234);
+        assert_eq!(cfg.sticky_failover_reset_secs, 4321);
+        assert_eq!(cfg.circuit_breaker.probe_interval_secs, 45);
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_validation_failure_leaves_config_unchanged() {
+        let (coord, config) = make_runtime_coordinator();
+        let before = config.read().await.clone();
+
+        let invalid = BackoffConfig {
+            retries: 2,
+            base_ms: 5_000,
+            max_ms: 100,
+            jitter: true,
+            retry_on_empty_response: true,
+        };
+        let err = coord
+            .update_runtime_config(Some(invalid), None, Some(1), Some(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+
+        let after = config.read().await;
+        assert_eq!(after.backoff, before.backoff);
+        assert_eq!(after.shuffle_cache_ttl_secs, before.shuffle_cache_ttl_secs);
+        assert_eq!(
+            after.sticky_failover_reset_secs,
+            before.sticky_failover_reset_secs
+        );
     }
 }

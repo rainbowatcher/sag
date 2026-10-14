@@ -8,6 +8,7 @@
 //! - [`crate::admin_testing`] — `POST /api/providers/fetch-models`,
 //!   `POST /api/providers/probe-protocols` and `POST /api/model/test`
 //! - [`crate::admin_settings`] — `GET|PUT /api/settings`.
+//! - [`crate::admin_config`] — `GET|PUT /api/config`.
 //! - [`crate::admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`
 //! - [`crate::admin_active_targets`] — `GET|DELETE /api/active-targets`
@@ -19,6 +20,7 @@ use axum::{Router, routing::get, routing::post};
 
 use crate::admin_active_targets::{delete_active_target, list_active_targets};
 use crate::admin_circuit_breaker::{close_circuit_breaker, list_circuit_breakers};
+use crate::admin_config::{get_config, update_config};
 use crate::admin_logs::list_logs;
 use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
@@ -50,6 +52,7 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
                 .delete(delete_route),
         )
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/config", get(get_config).put(update_config))
         .route("/logs", get(list_logs))
         .route("/circuit-breaker", get(list_circuit_breakers))
         .route("/circuit-breaker/close", post(close_circuit_breaker))
