@@ -9,6 +9,16 @@
 
 use std::time::Duration;
 
+/// How long an **idle** connection may stay in the pool before being
+/// dropped. reqwest's default is 90s; SAG tightens it to reduce the chance
+/// of reusing a connection that the peer / an intermediary already closed
+/// (surfacing as a mid-stream `close_notify` / EOF).
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of **idle** connections kept per host. reqwest's default
+/// is `usize::MAX` (unbounded); SAG caps it to bound stale-connection reuse.
+const POOL_MAX_IDLE_PER_HOST: usize = 4;
+
 /// Build a [`reqwest::Client`] with SAG's proxy policy.
 ///
 /// - `proxy: None` → **direct connection**. The client explicitly disables
@@ -23,6 +33,11 @@ use std::time::Duration;
 ///   (callers like the streaming path impose their own per-request /
 ///   per-chunk timeouts). `Some(d)` applies a total timeout covering
 ///   connect through body completion.
+///
+/// The connection pool is tuned in **both** branches with
+/// [`POOL_IDLE_TIMEOUT`] and [`POOL_MAX_IDLE_PER_HOST`]. These options only
+/// constrain the *idle* pool — they never truncate an in-flight stream body.
+/// No client-level total `.timeout()` is added by this tuning.
 ///
 /// `connect_url` must be a valid `http://` or `https://` proxy URL — e.g. a
 /// `sag_config::ProxyConfig` converted via its `to_connect_url()`. This
@@ -40,12 +55,18 @@ pub fn build_http_client(
             // contract — disables the automatic "system" proxy, so the
             // client uses ONLY this explicit proxy.
             builder = builder.proxy(reqwest::Proxy::all(connect_url)?);
+            builder = builder
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST);
         }
         None => {
             // Explicitly disable the system proxy. This lives in its own
             // branch on purpose: calling `no_proxy()` *after* `.proxy(...)`
             // would clear the explicit proxy (it empties the proxy list).
             builder = builder.no_proxy();
+            builder = builder
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST);
         }
     }
     if let Some(dur) = timeout {
@@ -87,6 +108,23 @@ mod tests {
     fn timeout_is_applied_when_some() {
         let client =
             build_http_client(None, Some(Duration::from_secs(5))).expect("timeout client builds");
+        let _req = client.get("http://127.0.0.1:1/");
+    }
+
+    /// Pin the pool tuning values: a silent change to either constant must
+    /// fail this test (the spec's 30s / 4 contract).
+    #[test]
+    fn pool_connection_constants_match_plan() {
+        assert_eq!(POOL_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(POOL_MAX_IDLE_PER_HOST, 4);
+    }
+
+    /// Pool tuning must coexist with both an explicit proxy and a
+    /// request-level timeout without conflicting.
+    #[test]
+    fn pool_options_coexist_with_proxy_and_timeout() {
+        let client = build_http_client(Some("http://127.0.0.1:8080"), Some(Duration::from_secs(5)))
+            .expect("proxy + timeout + pool options build");
         let _req = client.get("http://127.0.0.1:1/");
     }
 
