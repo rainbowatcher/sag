@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-08
+updated: 2026-10-11
 ---
 
 # 配置
@@ -92,6 +92,21 @@ SAG 的出站代理完全由配置显式控制，**不**依赖系统代理环境
 - 仅支持 HTTP/HTTPS，不支持 SOCKS；代理 URL 拒绝 userinfo（`user:pass@`），避免凭据泄漏。
 - hot reload 按 effective proxy（全局 `proxy_url` + provider `proxy_mode` 解析结果）差异重建受影响 provider；`disabled` provider 不因全局代理变化重建；在途请求不强行中断。
 
+### 顶级配置可视化（Admin Config API）
+
+`GET /api/config` 返回内存生效的顶级配置快照（[0007](changes/0007-gateway-config-visualization.md) 起）：`server`（host/port）、`logging`（level/format）、`analytics`（`null` 表示 `[analytics]` 段缺失）、`backoff`、`circuit_breaker`（含 `probe_interval_secs` 共 4 字段）、`shuffle_cache_ttl_secs`、`sticky_failover_reset_secs`、`proxy_url`。不含 `providers` / `routes` / `gateway_auth`（各自有专属端点）。
+
+`PUT /api/config` 部分更新运行时可热生效的配置（字段缺省 = 保持不变）：
+
+- `backoff` 与 `circuit_breaker` 为**全对象替换**（对象出现时其全部字段必填，包括 `probe_interval_secs`），走 `ConfigMutationCoordinator::update_runtime_config` 的统一 mutation 协议（validate → 原子提交 → toml_edit 持久化 + 外部编辑冲突检测）。
+- `shuffle_cache_ttl_secs` / `sticky_failover_reset_secs` 为可选标量。
+- `server` / `logging` / `analytics` / `proxy_url` / `providers` / `routes` **不可**经该端点修改（DTO 不声明，serde 静默忽略未知字段）——server / logging / analytics 需重启生效，proxy_url 由 `PUT /api/settings` 拥有。
+- PUT 成功后按新配置刷新熔断器 stale-probe 阈值（与热重载同路径）。
+
+生效边界：backoff、circuit_breaker（含探测间隔）、两个 TTL 标量保存后对新请求**立即生效**（分发与开闸路径每次从内存配置读取）；server、logging、analytics 为只读展示，仅进程启动时生效。
+
+UI（Settings 页）：`Network` / `Authentication` 之外新增 Backoff、Breaker、Timers（可编辑保存）与 Analytics、System（Server + Logging，只读 +「Requires restart」标注）5 个 tab。
+
 ## 配置 Schema
 
 参见 [使用指南 — 配置](/guide/configuration)
@@ -105,6 +120,7 @@ SAG 的出站代理完全由配置显式控制，**不**依赖系统代理环境
 
 ## 变更记录
 
+- [0007 顶级配置 Admin API 与 Settings 页可视化](changes/0007-gateway-config-visualization.md)
 - [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)
 - [0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](changes/0005-outbound-proxy-configuration.md)
 - [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)

@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-07-23
+updated: 2026-09-30
 ---
 
 # 供应商 — 规格
@@ -14,6 +14,7 @@ updated: 2026-07-23
 - [sag-providers/src/util.rs](../../../sag-providers/src/util.rs) — 共享工具函数
 - [sag-providers/src/lib.rs](../../../sag-providers/src/lib.rs) — `create_provider()` 工厂函数
 - [sag-core/src/types.rs](../../../sag-core/src/types.rs) — `normalize_reasoning_effort()` 方法
+- [sag-core/src/http_client.rs](../../../sag-core/src/http_client.rs) — 共享 `build_http_client()`：proxy 策略 + 连接池 idle 调优（`POOL_IDLE_TIMEOUT` / `POOL_MAX_IDLE_PER_HOST`）
 - [sag-router/src/routes.rs](../../../sag-router/src/routes.rs) — 请求入口归一化调用点
 
 ## 核心设计
@@ -153,12 +154,40 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - ❌ 改变了请求内容，可能影响某些边缘场景（如用户精确控制 prompt）
 - 通过 `anthropic_cache_control = false` 可关闭
 
+### 共享 HTTP client 连接池 idle 调优
+
+`build_http_client`（`sag-core/src/http_client.rs`，provider + admin 共享）在模块级写死连接池常量，用于降低 stale 连接复用导致的流中途 `peer closed connection without sending TLS close_notify`：
+
+| 常量 | 取值 | reqwest 默认 |
+|------|------|--------------|
+| `POOL_IDLE_TIMEOUT` | `30s` | `90s` |
+| `POOL_MAX_IDLE_PER_HOST` | `4` | `usize::MAX` |
+
+**设计决策**：
+
+| 决策 | 内容 |
+|------|------|
+| 写死而非配置化 | 连接层需快速实测迭代；上游 idle 差异按部署而变，配置化收益低、误配风险高 |
+| 只调 idle 池 | 两个常量只约束空闲池中可被复用的连接，**不截断在途流**——与 client 级 total timeout 截断长流有本质区别 |
+| 禁回退 total timeout | 成功流式响应不受 client 级总 deadline 约束（非流式 request-level `timeout`，流式 TTFB + 可选 chunk idle）；给 `build_http_client` 加回 `.timeout(...)` 会重新掐断健康长流 |
+| 调参顺序 | 若 TLS 握手率升高，优先上调 `POOL_MAX_IDLE_PER_HOST`，不优先降低 idle；若上游/proxy idle 更短，再下调 idle 并保留 10–15s 余量 |
+
+**Trade-off**:
+- ✅ 改动面小、见效快，不触碰 failover / 流式超时语义
+- ✅ 与 0006 流式超时边界兼容（0006 负责「已开始的流不被总超时掐断」；本变更负责「减少拿到已死连接」）
+- ❌ 只能降低 stale 复用概率，**不修**「已断的流」（那是方案 C′ 的范围）
+- ❌ 取值写死，极端上游 idle 更短的部署需实测后手工调整
+- ❌ admin 临时测试客户端经共享 builder 获得相同池默认（短探测请求可接受）
+
 ## 不变式
 
 - `create_provider()` 是创建 provider 的唯一入口
 - 所有 provider 实现 `Send + Sync`，可在线程间安全共享
 - Anthropic 适配器仅接受单条 system message（多条会合并或丢弃）
 - `base_url` 必须以 `://` 结尾（validator 检查）
+- `build_http_client` 在 proxy 与 direct 两分支均应用 `POOL_IDLE_TIMEOUT` / `POOL_MAX_IDLE_PER_HOST`；这两个常量由单元测试钉住，静默改值会失败
+- `build_http_client` 的 pool 选项只约束 idle 池，不截断在途 stream body
+- provider 路径调用 `build_http_client` 时 `timeout: None`（无 client 级 total deadline）；**禁止**为 pool 调优回退 total `.timeout()`
 
 ## 测试策略
 
@@ -166,8 +195,10 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - `sag-providers/src/anthropic.rs` — Anthropic 翻译测试（请求构造、响应解析、reasoning_effort → thinking 翻译、reasoning_tokens 捕获）
 - `sag-providers/src/base.rs` — body_overrides 合并测试
 - `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
+- `sag-core/src/http_client.rs` — `pool_connection_constants_match_plan`（钉住 pool 常量）、`pool_options_coexist_with_proxy_and_timeout`（pool 与 proxy/timeout 共存）
 
 ## 变更记录
+- [0005 共享 HTTP client 连接池 idle 调优（降低 stale 连接复用）](changes/0005-http-client-pool-idle-tuning.md)
 - [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)

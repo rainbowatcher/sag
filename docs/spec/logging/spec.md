@@ -22,7 +22,7 @@ updated: 2026-10-11
 flowchart TD
     A[peek_logging_config] --> B{stdout is TTY?}
     B -->|yes| C[tracing_subscriber::fmt → stdout]
-    B -->|no| D[RollingFileAppender daily logs/]
+    B -->|no| D[RollingFileAppender daily $XDG_STATE_HOME/sag/logs]
     D --> E[non_blocking writer]
     E --> F[tracing_subscriber::fmt → file]
     E --> G[WorkerGuard → held in main]

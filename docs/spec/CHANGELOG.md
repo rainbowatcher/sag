@@ -11,6 +11,25 @@ updated: 2026-10-13
 
 - **配置**：[0006 XDG Base Directory 标准路径布局](config/changes/0006-xdg-base-directories.md) — 配置/数据库/日志按 XDG 标准落位（`$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` / `$XDG_STATE_HOME` 下的 `sag/` 子目录）；配置查找顺序 `--config` > `./gateway.toml`（存在时）> XDG 默认；相对 `sqlite://` DSN 锚定数据目录并修复 from_str 不建库的 `SQLITE_CANTOPEN`；test-env 以项目内 XDG 覆盖保持两轨物理隔离
 
+## 2026-10-11
+
+- **配置**：[0007 顶级配置 Admin API 与 Settings 页可视化](config/changes/0007-gateway-config-visualization.md) — 新增 GET/PUT `/api/config` 暴露 server / logging / analytics / backoff / circuit_breaker（含 `probe_interval_secs`）与两个调度 TTL 标量；可热生效参数经 coordinator 统一 mutation 协议保存即时生效，需重启 section 只读标注；Settings 页扩展 7 个 tab
+- **日志**：[0003 大请求响应日志与请求关联信息](logging/changes/0003-request-correlation-and-large-body-response-log.md) — 修复三个可观测性缺口：body > 512 KiB 的请求早退路径不再跳过响应日志（补 status / elapsed_ms，不消费 body）；provider 流读取任务改用 `spawn_in_current_span()` 继承 provider/model span（ERROR 可关联 trace_id）；流式响应 commit 后的客户端断开补一条 WARN
+
+
+## 2026-10-09
+
+- **供应商**：[0006 Chat 入口容忍缺失 `content` 的消息（assistant tool_calls 形态）](providers/changes/0006-chat-message-content-optional.md) — zcode 多轮工具调用回放发送仅含 `tool_calls`、省略 `content` 键的 assistant 消息（OpenAI 规范合法），入口强类型反序列化因 `content` 无 `#[serde(default)]` 而误拒 422；补上 default 后缺失 → `Null`，native 透传重新序列化为 `"content": null`（OpenAI 规范输出形态），codec 既有 `Null → 空内容块` 兼容无需变更
+
+## 2026-10-06
+
+- **UI**：[0003 移动端弹框统一为底部抽屉](ui/changes/0003-responsive-modal-drawer.md) — 新增 `useResponsiveModal()` 收敛 Dialog/Drawer 双轨映射与 768px 断点；`ProviderAddForm`/`ProviderEditForm` 的两份内联映射改为复用，`RoutesPage`、`RouteList`（编辑/删除/清除 Active Target 三处）、`ModelManager`（快捷建单确认）从纯 Dialog 迁到双轨
+
+## 2026-09-30
+
+- **管理 API**：[0002 探针与模型测试的协议对齐](admin/changes/0002-probe-model-test-protocol-alignment.md) — `model/test` 改走 provider adapter（合成单 lane `ProviderConfig` → `create_provider_with_proxy`），per-API headers 分层、`body_overrides`/`strip_fields`/`model_strip_fields`/`role_mappings`/`anthropic_cache_control` 与生产一致，模型级 override 经 `target_extra` 传入；支持三协议（`image` → 400 `UNSUPPORTED_API_KIND`），`api_keys` 上限 16、per-API 超时钳到 30s；协议知识收敛到 `probe_request::minimal_request` + `sag_core::protocol_path`（删除重复的 `provider_chat_endpoint` / `probe_body`）；probe 保持原始 HTTP 与裸语义（2xx 恒 `supported`），`message` 补 body 预览
+- **供应商**：[0005 共享 HTTP client 连接池 idle 调优（降低 stale 连接复用）](providers/changes/0005-http-client-pool-idle-tuning.md) — `build_http_client` 写死 `POOL_IDLE_TIMEOUT=30s` / `POOL_MAX_IDLE_PER_HOST=4`，降低「复用已被对端关闭的连接 → 流中途 close_notify EOF」概率；只限 idle 池、不截断在途流；未加回 client 级 total `.timeout()`（保持 0006 流式超时边界）；不修已断的流（C′ 另议）
+
 ## 2026-09-28
 
 - **供应商**：[0004 供应商 role_mappings 编辑入口](providers/changes/0004-role-mappings-editor.md) — Provider 新增/编辑表单 Advanced tab 新增 Role Mappings 键值编辑区；编辑表单以 `JSON.stringify` 脏检查实现 PUT「缺省字段保留旧值 / 传 `{}` 清空」语义，新增表单仅在非空时携带该字段

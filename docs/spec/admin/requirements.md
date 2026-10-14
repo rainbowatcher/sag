@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-09-30
 ---
 
 # 管理 API
@@ -28,7 +28,17 @@ updated: 2026-06-03
 ### 模型测试
 
 - `POST /api/model/test` — 发送最小消息到指定模型，验证连接和认证
-- 支持多个 API key，逐一测试并返回每个 key 的结果
+- 支持多个 API key，逐一测试并返回每个 key 的结果；每次测试最多 16 个 key（超出返回 400 `TOO_MANY_KEYS`），模型级 override 仅两层且 `api.model_overrides[<model>]` 优先于 provider 级 `model_overrides[<model>]`
+- 支持 `chat_completions` / `responses` / `anthropic_messages` 三种协议（`image` 返回 400 `UNSUPPORTED_API_KIND`）
+- 上游请求经由 provider adapter 发送，与生产派发路径一致；因此上游返回 HTTP 200 但响应体携带 `error` 对象时同样判定为失败
+- 明确不在覆盖范围内：路由 `target.extra` 合并、模型解析/映射、`enabled_models` 门控、provider 级 ttfb/chunk 超时；测试对所选协议使用非流式原生调用
+
+### 协议探测
+
+- `POST /api/providers/probe-protocols` — 对每个「协议 × base_url × key」发一条最小请求，判断上游是否支持该协议；只读，不写配置
+- 三协议的最小请求体由 `probe_request::minimal_request` 统一构造（`chat_completions` 用 `max_completion_tokens`、`responses` 用 `input` + `max_output_tokens`、`anthropic_messages` 用 `max_tokens`）；探测地址由 `sag_core::protocol_path` 派生；`image` 不是协议，target 携带 `image` 返回 400
+- 判定只看 HTTP 状态码：2xx 一律 `supported`，不做错误体嗅探（200 body 里夹带 `error` 对象仍是 `supported`）；2xx 的 `message` 给出上游 body 预览（折叠空白、截断 160 字符，body 为空时为 `OK`）
+- 探测走原始 HTTP，**不**复用 provider adapter，也不读取任何已保存 provider 的配置（裸语义）；协议知识（path / body / 鉴权头）与模型测试共享
 
 ### 供应商模型查询
 
@@ -64,3 +74,4 @@ updated: 2026-06-03
 ## 变更记录
 
 - [0001 初始化](changes/0001-initial.md)
+- [0002 探针与模型测试的协议对齐](changes/0002-probe-model-test-protocol-alignment.md)
