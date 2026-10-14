@@ -22,6 +22,7 @@ import {
 import { computed, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import RefreshButton from "@/components/RefreshButton.vue"
+import BackoffForm from "@/components/settings/BackoffForm.vue"
 import CircuitBreakerForm from "@/components/settings/CircuitBreakerForm.vue"
 import StrategyTimersForm from "@/components/settings/StrategyTimersForm.vue"
 import SystemInfoCard, { type SystemInfoRow } from "@/components/settings/SystemInfoCard.vue"
