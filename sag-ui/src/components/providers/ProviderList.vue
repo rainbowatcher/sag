@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2, Pen, Plus, Search, Trash2 } from "@lucide/vue"
+import { Copy, Loader2, Pen, Plus, Search, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
 import { computed, h, onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
@@ -8,6 +8,7 @@ import ProviderEditForm from "@/components/providers/ProviderEditForm.vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -26,10 +27,11 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { getErrorMessage } from "@/lib/utils"
 import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useProviderStore } from "@/stores/providers"
-import type { ApiKind, CircuitBreakerEntry, Provider } from "@/types/api"
+import type { AddProviderPayload, ApiKind, CircuitBreakerEntry, Provider } from "@/types/api"
 
 const store = useProviderStore()
 const cbStore = useCircuitBreakerStore()
@@ -136,6 +138,94 @@ function onEditClose() {
 async function onUpdated() {
   editingProvider.value = null
   await fetchProviders()
+}
+
+// ── Copy flow ─────────────────────────────────────────────────────
+// Dialog on desktop / bottom Drawer on mobile — same dual-track modal the
+// provider forms and ModelManager's quick-create use.
+const { Modal } = useResponsiveModal()
+
+const copyingProvider = ref<Provider | null>(null)
+const copyName = ref("")
+const isCopying = ref(false)
+
+const isCopyNameEmpty = computed(() => !copyName.value.trim())
+
+const isCopyNameExisting = computed(() => {
+  const name = copyName.value.trim()
+  if (!name) return false
+  return store.providers.some((p) => p.name === name)
+})
+
+const canConfirmCopy = computed(
+  () => !isCopyNameEmpty.value && !isCopyNameExisting.value && !isCopying.value,
+)
+
+function startCopy(p: Provider) {
+  confirmingDelete.value = null
+  copyName.value = `${p.name}-copy`
+  copyingProvider.value = p
+}
+
+function onCopyOpenChange(v: boolean) {
+  if (!v) copyingProvider.value = null
+}
+
+/**
+ * JSON round-trip clone. `structuredClone` cannot clone Vue's reactive
+ * proxies, and the store hands us reactive `Provider` objects.
+ */
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+async function confirmCopy() {
+  const source = copyingProvider.value
+  if (!source) return
+  const newName = copyName.value.trim()
+  if (!newName || isCopyNameExisting.value) return
+
+  isCopying.value = true
+  try {
+    const payload: AddProviderPayload = {
+      name: newName,
+      api_keys: [...source.api_keys],
+      key_strategy: source.key_strategy,
+      apis: deepClone(source.apis),
+      ...(source.fallback ? { fallback: source.fallback } : {}),
+      timeout_secs: source.timeout_secs,
+      headers: Object.keys(source.headers).length > 0 ? { ...source.headers } : undefined,
+      body_overrides:
+        Object.keys(source.body_overrides).length > 0
+          ? deepClone(source.body_overrides)
+          : undefined,
+      strip_fields: source.strip_fields.length > 0 ? [...source.strip_fields] : undefined,
+      model_strip_fields:
+        Object.keys(source.model_strip_fields).length > 0
+          ? deepClone(source.model_strip_fields)
+          : undefined,
+      model_overrides:
+        Object.keys(source.model_overrides).length > 0
+          ? deepClone(source.model_overrides)
+          : undefined,
+      role_mappings:
+        Object.keys(source.role_mappings).length > 0 ? { ...source.role_mappings } : undefined,
+      enabled_models: [...source.enabled_models],
+      proxy_mode: source.proxy_mode,
+    }
+
+    await store.addProvider(payload)
+    copyingProvider.value = null
+    toast.success(`Provider "${newName}" created`)
+
+    // addProvider refreshed the list, so the new provider is present here.
+    const created = store.providers.find((p) => p.name === newName)
+    if (created) editingProvider.value = created
+  } catch (e: any) {
+    toast.error(getErrorMessage(e, "Failed to copy provider"))
+  } finally {
+    isCopying.value = false
+  }
 }
 
 // ── Delete flow ───────────────────────────────────────────────────
@@ -285,6 +375,17 @@ const columns = [
             "aria-label": "Edit provider",
           },
           () => h(Pen, { class: "h-3.5 w-3.5" }),
+        ),
+        h(
+          Button,
+          {
+            variant: "ghost",
+            size: "icon-sm",
+            onClick: () => startCopy(info.row.original),
+            title: "Copy provider",
+            "aria-label": "Copy provider",
+          },
+          () => h(Copy, { class: "h-3.5 w-3.5" }),
         ),
         h(
           Button,
@@ -461,6 +562,45 @@ const table = useVueTable({
         </div>
       </div>
     </div>
+
+    <!-- ── Copy Provider Drawer / Dialog ─────────────────────────── -->
+    <component :is="Modal.Root" :open="copyingProvider !== null" @update:open="onCopyOpenChange">
+      <component :is="Modal.Content" class="sm:max-w-md">
+        <component :is="Modal.Header">
+          <component :is="Modal.Title">Copy Provider</component>
+          <component :is="Modal.Description">
+            Create a new provider by copying
+            <span class="text-foreground font-mono font-medium">{{ copyingProvider?.name }}</span
+            >. All settings and API keys are reused.
+          </component>
+        </component>
+
+        <div class="space-y-2 px-4 py-2 sm:px-0">
+          <FieldLabel for="copy-provider-name">Provider Name</FieldLabel>
+          <Input
+            id="copy-provider-name"
+            :model-value="copyName"
+            placeholder="e.g. my-openai-copy"
+            class="font-mono text-sm"
+            @input="copyName = ($event.target as HTMLInputElement).value"
+            @keydown.enter.prevent="canConfirmCopy && confirmCopy()"
+          />
+          <p v-if="isCopyNameExisting" class="text-destructive text-xs">
+            Provider "{{ copyName.trim() }}" already exists.
+          </p>
+        </div>
+
+        <component :is="Modal.Footer">
+          <Button variant="outline" size="sm" :disabled="isCopying" @click="copyingProvider = null">
+            Cancel
+          </Button>
+          <Button size="sm" :disabled="!canConfirmCopy" @click="confirmCopy">
+            <Loader2 v-if="isCopying" class="h-3 w-3 animate-spin" />
+            {{ isCopying ? "Copying…" : "Copy & Edit" }}
+          </Button>
+        </component>
+      </component>
+    </component>
 
     <!-- ── Edit Drawer / Dialog ──────────────────────────────────── -->
     <ProviderEditForm
