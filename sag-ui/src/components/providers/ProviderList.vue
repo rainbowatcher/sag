@@ -293,15 +293,16 @@ const columns = [
   }),
   columnHelper.accessor("enabled", {
     header: "Status",
-    cell: (info) => {
-      const provider = info.row.original
-      return h(Switch, {
-        modelValue: info.getValue(),
-        disabled: togglingProvider.value === provider.name,
-        "onUpdate:modelValue": () => toggleEnabled(provider),
-      })
-    },
-    meta: { class: "text-center" },
+    cell: (info) =>
+      h(
+        Badge,
+        {
+          variant: info.getValue() ? "default" : "secondary",
+          class: "text-[10px]",
+        },
+        () => (info.getValue() ? "Enabled" : "Disabled"),
+      ),
+    meta: { class: "text-left" },
   }),
   columnHelper.display({
     id: "breakers",
@@ -363,8 +364,17 @@ const columns = [
   columnHelper.display({
     id: "actions",
     header: "",
-    cell: (info) =>
-      h("div", { class: "flex items-center justify-end gap-1" }, [
+    cell: (info) => {
+      const provider = info.row.original
+      return h("div", { class: "flex items-center justify-end gap-1" }, [
+        h(Switch, {
+          modelValue: provider.enabled,
+          disabled: togglingProvider.value === provider.name,
+          "onUpdate:modelValue": () => toggleEnabled(provider),
+          title: provider.enabled ? "Disable provider" : "Enable provider",
+          "aria-label": provider.enabled ? "Disable provider" : "Enable provider",
+        }),
+        h("span", { class: "bg-border mx-1 h-4 w-px shrink-0", "aria-hidden": "true" }),
         h(
           Button,
           {
@@ -405,7 +415,9 @@ const columns = [
           },
           () => h(Trash2, { class: "h-3.5 w-3.5" }),
         ),
-      ]),
+      ])
+    },
+    meta: { class: "text-right" },
   }),
 ]
 
