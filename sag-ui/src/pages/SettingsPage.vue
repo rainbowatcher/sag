@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import {
   AlertCircle,
+  Clock,
+  Database,
   Eye,
   EyeOff,
   Globe,
@@ -8,22 +10,31 @@ import {
   Loader2,
   Plus,
   Save,
+  ScrollText,
+  Server,
   ShieldCheck,
   ShieldOff,
+  Timer,
   Trash2,
   X,
+  Zap,
 } from "@lucide/vue"
-import { onMounted, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import RefreshButton from "@/components/RefreshButton.vue"
+import CircuitBreakerForm from "@/components/settings/CircuitBreakerForm.vue"
+import StrategyTimersForm from "@/components/settings/StrategyTimersForm.vue"
+import SystemInfoCard, { type SystemInfoRow } from "@/components/settings/SystemInfoCard.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useGatewayConfigStore } from "@/stores/gatewayConfig"
 import { useSettingsStore } from "@/stores/settings"
 
 const store = useSettingsStore()
+const gatewayConfig = useGatewayConfigStore()
 
 const activeTab = ref("network")
 
@@ -59,10 +70,51 @@ function syncFormsFromStore() {
   revealKeys.value = {}
 }
 
+// ── Read-only config sections ─────────────────────────────────────
+// `server` / `logging` / `analytics` / `proxy_url` are not writable through
+// `PUT /api/config`; they are rendered as read-only rows, and a section
+// missing from the snapshot falls back to a muted placeholder.
+const serverRows = computed<SystemInfoRow[]>(() => {
+  const server = gatewayConfig.config?.server
+  const proxyUrl = gatewayConfig.config?.proxy_url
+  return [
+    { label: "Host", value: server?.host, mono: true },
+    { label: "Port", value: server?.port, mono: true },
+    // `null` (not `undefined`) means the snapshot loaded and no proxy is set.
+    {
+      label: "Global proxy",
+      value: proxyUrl === null ? "Direct (no proxy)" : proxyUrl,
+      mono: true,
+    },
+  ]
+})
+
+const loggingRows = computed<SystemInfoRow[]>(() => {
+  const logging = gatewayConfig.config?.logging
+  return [
+    { label: "Level", value: logging?.level, mono: true },
+    { label: "Format", value: logging?.format, mono: true },
+  ]
+})
+
+const analyticsRows = computed<SystemInfoRow[]>(() => {
+  const analytics = gatewayConfig.config?.analytics
+  if (!analytics) {
+    return [
+      { label: "Enabled", value: null },
+      { label: "Storage DSN", value: null },
+    ]
+  }
+  return [
+    { label: "Enabled", value: analytics.enabled ? "Yes" : "No" },
+    { label: "Storage DSN", value: analytics.storage_dsn, mono: true },
+  ]
+})
+
 async function refreshPage() {
   proxyError.value = ""
   keysError.value = ""
-  await store.fetchSettings()
+  await Promise.all([store.fetchSettings(), gatewayConfig.fetchConfig()])
   syncFormsFromStore()
 }
 
@@ -202,7 +254,7 @@ function keyFingerprint(key: string): string {
     </div>
 
     <Tabs v-model="activeTab" class="mt-4 flex min-h-0 flex-1 flex-col">
-      <TabsList class="shrink-0 self-start">
+      <TabsList class="shrink-0 flex-wrap self-start">
         <TabsTrigger value="network" class="gap-1.5">
           <Globe class="h-3.5 w-3.5" />
           Network
@@ -218,6 +270,26 @@ function keyFingerprint(key: string): string {
           >
             {{ store.apiKeys.length > 0 ? "On" : "Off" }}
           </Badge>
+        </TabsTrigger>
+        <TabsTrigger value="backoff" class="gap-1.5">
+          <Timer class="h-3.5 w-3.5" />
+          Backoff
+        </TabsTrigger>
+        <TabsTrigger value="breaker" class="gap-1.5">
+          <Zap class="h-3.5 w-3.5" />
+          Breaker
+        </TabsTrigger>
+        <TabsTrigger value="timers" class="gap-1.5">
+          <Clock class="h-3.5 w-3.5" />
+          Timers
+        </TabsTrigger>
+        <TabsTrigger value="analytics" class="gap-1.5">
+          <Database class="h-3.5 w-3.5" />
+          Analytics
+        </TabsTrigger>
+        <TabsTrigger value="system" class="gap-1.5">
+          <Server class="h-3.5 w-3.5" />
+          System
         </TabsTrigger>
       </TabsList>
 
@@ -424,6 +496,113 @@ function keyFingerprint(key: string): string {
               </div>
             </CardContent>
           </Card>
+        </TabsContent>
+
+        <!-- ── Backoff ──────────────────────────────────────────────── -->
+        <TabsContent value="backoff" class="mt-0">
+          <div
+            v-if="gatewayConfig.loading"
+            class="text-muted-foreground flex items-center gap-2 text-xs"
+          >
+            <Loader2 class="h-3.5 w-3.5 animate-spin" />
+            Loading config...
+          </div>
+          <div
+            v-else-if="gatewayConfig.error && !gatewayConfig.config"
+            class="bg-destructive/10 text-destructive flex max-w-3xl items-start gap-2 rounded-md px-3 py-2 text-xs"
+          >
+            <AlertCircle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{{ gatewayConfig.error }}</span>
+          </div>
+          <BackoffForm v-else />
+        </TabsContent>
+
+        <!-- ── Circuit breaker ──────────────────────────────────────── -->
+        <TabsContent value="breaker" class="mt-0">
+          <div
+            v-if="gatewayConfig.loading"
+            class="text-muted-foreground flex items-center gap-2 text-xs"
+          >
+            <Loader2 class="h-3.5 w-3.5 animate-spin" />
+            Loading config...
+          </div>
+          <div
+            v-else-if="gatewayConfig.error && !gatewayConfig.config"
+            class="bg-destructive/10 text-destructive flex max-w-3xl items-start gap-2 rounded-md px-3 py-2 text-xs"
+          >
+            <AlertCircle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{{ gatewayConfig.error }}</span>
+          </div>
+          <CircuitBreakerForm v-else />
+        </TabsContent>
+
+        <!-- ── Strategy timers ──────────────────────────────────────── -->
+        <TabsContent value="timers" class="mt-0">
+          <div
+            v-if="gatewayConfig.loading"
+            class="text-muted-foreground flex items-center gap-2 text-xs"
+          >
+            <Loader2 class="h-3.5 w-3.5 animate-spin" />
+            Loading config...
+          </div>
+          <div
+            v-else-if="gatewayConfig.error && !gatewayConfig.config"
+            class="bg-destructive/10 text-destructive flex max-w-3xl items-start gap-2 rounded-md px-3 py-2 text-xs"
+          >
+            <AlertCircle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{{ gatewayConfig.error }}</span>
+          </div>
+          <StrategyTimersForm v-else />
+        </TabsContent>
+
+        <!-- ── Analytics (read-only) ────────────────────────────────── -->
+        <TabsContent value="analytics" class="mt-0">
+          <div
+            v-if="gatewayConfig.loading"
+            class="text-muted-foreground flex items-center gap-2 text-xs"
+          >
+            <Loader2 class="h-3.5 w-3.5 animate-spin" />
+            Loading config...
+          </div>
+          <SystemInfoCard
+            v-else
+            title="Analytics"
+            description="Analytics collection and SQLite storage. Changes take effect after a gateway restart."
+            badge="Requires restart"
+            :icon="Database"
+            :rows="analyticsRows"
+          />
+        </TabsContent>
+
+        <!-- ── System (read-only) ───────────────────────────────────── -->
+        <TabsContent value="system" class="mt-0 space-y-4">
+          <div
+            v-if="gatewayConfig.loading"
+            class="text-muted-foreground flex items-center gap-2 text-xs"
+          >
+            <Loader2 class="h-3.5 w-3.5 animate-spin" />
+            Loading config...
+          </div>
+          <template v-else>
+            <SystemInfoCard
+              title="Server"
+              description="Gateway listen address."
+              badge="Requires restart"
+              :icon="Server"
+              :rows="serverRows"
+            />
+            <SystemInfoCard
+              title="Logging"
+              description="Log verbosity and output format."
+              badge="Requires restart"
+              :icon="ScrollText"
+              :rows="loggingRows"
+            />
+            <p class="text-muted-foreground max-w-3xl text-xs">
+              These values come from <code>gateway.toml</code> and only apply at process startup.
+              Restart the gateway to change them.
+            </p>
+          </template>
         </TabsContent>
       </div>
     </Tabs>

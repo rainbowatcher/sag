@@ -120,6 +120,76 @@ export interface UpdateProviderPayload {
   proxy_mode?: ProxyMode
 }
 
+/**
+ * Exponential-backoff tuning returned by `GET /api/config` (`[backoff]`).
+ * A full object replace is applied on `PUT /api/config`.
+ */
+export interface BackoffConfig {
+  retries: number
+  base_ms: number
+  max_ms: number
+  jitter: boolean
+  retry_on_empty_response: boolean
+}
+
+/**
+ * Circuit-breaker cooldowns plus the half-open probe cadence returned by
+ * `GET /api/config` (`[circuit_breaker]`). A full object replace is applied
+ * on `PUT /api/config`, so all four fields are sent together.
+ */
+export interface CircuitBreakerConfigForm {
+  quota_exhausted_secs: number
+  rate_limited_secs: number
+  generic_secs: number
+  probe_interval_secs: number
+}
+
+/** Analytics storage config; `null` when the section is absent. */
+export interface AnalyticsConfig {
+  enabled: boolean
+  storage_dsn: string
+}
+
+/** Gateway listen address (`[server]`); restart-required. */
+export interface ServerConfig {
+  host: string
+  port: number
+}
+
+/** Logging output config (`[logging]`); restart-required. */
+export interface LoggingConfig {
+  level: string
+  format: string
+}
+
+/**
+ * Full gateway config snapshot returned by `GET /api/config`. Only the
+ * runtime-tuning fields are writable via `PUT /api/config`; `server`,
+ * `logging` and `analytics` are read-only and apply at process startup.
+ */
+export interface GatewayConfigSnapshot {
+  server: ServerConfig
+  logging: LoggingConfig
+  analytics: AnalyticsConfig | null
+  backoff: BackoffConfig
+  circuit_breaker: CircuitBreakerConfigForm
+  shuffle_cache_ttl_secs: number
+  sticky_failover_reset_secs: number
+  proxy_url: string | null
+}
+
+/**
+ * Payload of `PUT /api/config`. Every field is optional; omitted fields
+ * stay unchanged. `backoff` / `circuit_breaker` are full-object replaces.
+ * `server` / `logging` / `analytics` are not accepted (restart-required).
+ */
+export interface UpdateGatewayConfigPayload {
+  backoff?: BackoffConfig
+  circuit_breaker?: CircuitBreakerConfigForm
+  shuffle_cache_ttl_secs?: number
+  sticky_failover_reset_secs?: number
+}
+
 /** Gateway-level settings returned by `GET /api/settings`. */
 export interface Settings {
   /** Global upstream HTTP proxy URL; `null` when none is configured. */
