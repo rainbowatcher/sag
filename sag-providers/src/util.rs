@@ -21,22 +21,6 @@ pub fn provider_auth_headers(kind: ApiKind, api_key: &str) -> Vec<(&'static str,
     }
 }
 
-/// Return the canonical API endpoint path (with leading `/`) for an API kind.
-///
-/// - `ChatCompletions`  → `/chat/completions`
-/// - `AnthropicMessages` → `/messages`
-/// - `Responses`        → `/responses`
-/// - `Image`            → `/images/generations` (route `api_endpoint` is the
-///   authoritative source; this is a convenience default)
-pub fn provider_chat_endpoint(kind: ApiKind) -> &'static str {
-    match kind {
-        ApiKind::ChatCompletions => "/chat/completions",
-        ApiKind::AnthropicMessages => "/messages",
-        ApiKind::Responses => "/responses",
-        ApiKind::Image => "/images/generations",
-    }
-}
-
 /// Apply extra and custom headers to a reqwest request builder.
 /// Custom headers override default/extra headers (such as Content-Type or Auth headers)
 /// when key names match (case-insensitive).

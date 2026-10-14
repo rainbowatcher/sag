@@ -25,6 +25,9 @@ pub mod admin_routes;
 pub mod admin_settings;
 pub mod admin_testing;
 
+pub(crate) mod probe_provider;
+pub(crate) mod probe_request;
+
 pub use admin::build_admin_routes;
 
 #[cfg(test)]

@@ -8,13 +8,15 @@
 use std::collections::HashMap;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use reqwest::header::CONTENT_TYPE;
 use sag_config::{ApiKind, ProxyMode};
 use sag_core::AppError;
-use sag_providers::{provider_auth_headers, provider_chat_endpoint};
+use sag_providers::{create_provider_with_proxy, provider_auth_headers};
 use serde_json::json;
 use tracing::{instrument, warn};
 
+use crate::probe_provider::{
+    self, MAX_MODEL_TEST_KEYS, MODEL_TEST_TIMEOUT_SECS, ProviderDefaults, TEMP_PROVIDER_NAME,
+};
 use sag_state::AppState;
 
 /// Which API section this temporary probe talks to — selects the auth
@@ -61,16 +63,26 @@ fn build_models_url(base_url: &str, models_endpoint: &str) -> String {
 /// mode). Errors — a malformed in-memory global URL or `enabled` mode with
 /// no global proxy — are surfaced as 400-style [`AppError::BadRequest`]
 /// per the temporary-test API contract.
-async fn resolve_test_proxy(state: &AppState, mode: ProxyMode) -> Result<Option<String>, AppError> {
+async fn resolve_test_proxy_config(
+    state: &AppState,
+    mode: ProxyMode,
+) -> Result<Option<sag_config::ProxyConfig>, AppError> {
     let global = state
         .config
         .read()
         .await
         .normalized_global_proxy()
         .map_err(AppError::BadRequest)?;
-    let effective =
-        sag_config::resolve_effective_proxy(mode, global.as_ref()).map_err(AppError::BadRequest)?;
-    Ok(effective.map(|p| p.to_connect_url()))
+    sag_config::resolve_effective_proxy(mode, global.as_ref()).map_err(AppError::BadRequest)
+}
+
+/// Same resolution as [`resolve_test_proxy_config`], flattened to the
+/// connect URL used by the raw reqwest paths (`fetch_models` /
+/// `probe-protocols`).
+async fn resolve_test_proxy(state: &AppState, mode: ProxyMode) -> Result<Option<String>, AppError> {
+    Ok(resolve_test_proxy_config(state, mode)
+        .await?
+        .map(|p| p.to_connect_url()))
 }
 
 /// Build the short-lived reqwest client for a temporary test request,
@@ -181,15 +193,33 @@ pub struct ModelTestRequest {
     pub model: String,
     #[serde(default)]
     pub api_keys: Vec<String>,
-    /// Temporary probe address (the `base_url` of the `apis.<kind>`
-    /// section under test).
+    /// 旧版扁平探测地址；`api` 缺省时作为 `ApiConfig.base_url` 的回退。
+    #[serde(default)]
     pub base_url: String,
-    /// API section under test: picks the auth header shape and the chat
-    /// endpoint path (default `chat_completions`).
+    /// API section under test（默认 chat_completions）。
     #[serde(default)]
     pub api_kind: Option<ApiKind>,
+    /// 旧版扁平 headers；作为 provider 级 headers 的回退。
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// 待测的整个 `apis.<kind>` 节；缺省时回退 `base_url` + `headers`（向后兼容）。
+    #[serde(default)]
+    pub api: Option<sag_config::ApiConfig>,
+    /// provider 级 headers（表单当前值）。
+    #[serde(default)]
+    pub provider_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub body_overrides: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub strip_fields: Vec<String>,
+    #[serde(default)]
+    pub model_overrides: HashMap<String, HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub model_strip_fields: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub role_mappings: HashMap<String, String>,
+    #[serde(default)]
+    pub anthropic_cache_control: Option<bool>,
     /// Proxy policy for this temporary request only (default `inherit`):
     /// resolved against the **current in-memory** gateway proxy and never
     /// persisted. `enabled` without a global proxy is a 400; `disabled`
@@ -202,35 +232,115 @@ pub async fn model_test(
     State(state): State<AppState>,
     Json(req): Json<ModelTestRequest>,
 ) -> impl IntoResponse {
-    let connect_url = match resolve_test_proxy(&state, req.proxy_mode).await {
-        Ok(url) => url,
-        Err(e) => return e.into_response(),
-    };
-    let client = match build_test_client(connect_url.as_deref()) {
-        Ok(client) => client,
-        Err(e) => {
-            warn!(?e, "failed to build temporary test http client");
-            return e.into_response();
-        }
-    };
+    let kind = api_kind_of(req.api_kind);
+
+    // image 非协议：400 早退（行为变更：原先返回上游 400 文案）。
+    if !kind.is_protocol() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "UNSUPPORTED_API_KIND",
+                    "message": "model test supports chat_completions / responses / anthropic_messages only"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    if req.api_keys.len() > MAX_MODEL_TEST_KEYS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "TOO_MANY_KEYS",
+                    "message": format!("at most {} api_keys per model test", MAX_MODEL_TEST_KEYS)
+                }
+            })),
+        )
+            .into_response();
+    }
 
     if req.api_keys.is_empty() {
         return Json(json!({ "results": [] })).into_response();
     }
 
-    let mut results = Vec::new();
+    let effective_proxy = match resolve_test_proxy_config(&state, req.proxy_mode).await {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
 
-    for key in &req.api_keys {
-        let result = test_single_key(&client, &req, key).await;
-        let prefix = if key.len() > 12 {
-            format!("{}…", &key[..12])
+    // `api` 优先；缺省回退旧扁平字段。
+    let api = req.api.clone().unwrap_or_else(|| sag_config::ApiConfig {
+        base_url: req.base_url.clone(),
+        headers: Some(req.headers.clone()),
+        ..Default::default()
+    });
+
+    // provider 级 headers：provider_headers 非空则用它，否则回退扁平 headers。
+    let defaults = ProviderDefaults {
+        headers: if req.provider_headers.is_empty() {
+            req.headers.clone()
         } else {
-            key.clone()
+            req.provider_headers.clone()
+        },
+        body_overrides: req.body_overrides.clone(),
+        strip_fields: req.strip_fields.clone(),
+        model_overrides: req.model_overrides.clone(),
+        model_strip_fields: req.model_strip_fields.clone(),
+        role_mappings: req.role_mappings.clone(),
+        anthropic_cache_control: req.anthropic_cache_control,
+    };
+
+    // 模型级 override 只有两层：api 级优先，整段取一（不 merge）。
+    let target_extra = api
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get(&req.model))
+        .or_else(|| defaults.model_overrides.get(&req.model))
+        .cloned()
+        .unwrap_or_default();
+
+    let mut results = Vec::new();
+    for key in &req.api_keys {
+        let cfg =
+            probe_provider::synthesize_config(kind, &api, key, &defaults, MODEL_TEST_TIMEOUT_SECS);
+        // 生效超时（per-API 已被钳制）——文案必须用它，避免谎报 30s。
+        let effective_timeout = cfg
+            .apis
+            .get(&kind)
+            .and_then(|a| a.timeout_secs)
+            .unwrap_or(cfg.timeout_secs);
+
+        let outcome = match create_provider_with_proxy(
+            TEMP_PROVIDER_NAME.to_string(),
+            &cfg,
+            effective_proxy.as_ref(),
+        ) {
+            Ok(provider) => {
+                probe_provider::test_protocol(
+                    provider.as_ref(),
+                    kind,
+                    &req.model,
+                    &target_extra,
+                    effective_timeout,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+
+        let (success, message) = match outcome {
+            Ok(()) => (true, "OK".to_string()),
+            Err(e) => (
+                false,
+                probe_provider::message_from_error(&e, &req.model, effective_timeout),
+            ),
         };
         results.push(json!({
-            "key_prefix": prefix,
-            "success": result.0,
-            "message": result.1,
+            "key_prefix": key_prefix(key),
+            "success": success,
+            "message": message,
         }));
     }
 
@@ -238,6 +348,13 @@ pub async fn model_test(
 }
 
 // ── Protocol support probing (Phase B) ────────────────────────────
+//
+// probe 走原始 reqwest：2xx 恒为 `supported`，**不**复用 provider adapter——
+// adapter 内建的「200 → Upstream{429|502}」改写（`openai.rs` chat / responses、
+// `anthropic.rs` messages_native）会破坏本端点的判定语义，且 adapter 会解析
+// body 要求 schema 合法，对探测器是新增假阴性。协议知识（path / body / 鉴权头）
+// 经 `probe_request::minimal_request` + `sag_core::protocol_path` +
+// `provider_auth_headers` 共享；不读取任何已保存 provider 的配置（裸语义）。
 
 /// Verdict of one (protocol × base_url × key) probe attempt.
 ///
@@ -282,11 +399,21 @@ fn body_looks_like_model_not_found(body: &str) -> bool {
         && (b.contains("does not exist") || b.contains("not found") || b.contains("not_found"))
 }
 
+/// 2xx 的 message：折叠空白 + 截断 160 字符（按 char 计）；空 body → "OK"。
+fn ok_message(body: &str) -> String {
+    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        "OK".into()
+    } else {
+        format!("OK — {}", flat.chars().take(160).collect::<String>())
+    }
+}
+
 /// Pure verdict table: HTTP status + response body → (verdict, message).
 /// Split out for unit testing without a network mock.
 fn verdict_from_status_body(status: u16, body: &str) -> (ProbeVerdict, String) {
     match status {
-        200..=299 => (ProbeVerdict::Supported, "OK".into()),
+        200..=299 => (ProbeVerdict::Supported, ok_message(body)),
         401 | 403 => (
             ProbeVerdict::AuthFailed,
             format!("path exists but authentication failed: {body}"),
@@ -346,32 +473,12 @@ pub struct ProbeProtocolsRequest {
     pub proxy_mode: ProxyMode,
 }
 
-/// Minimal probe body per protocol — output tokens are the expensive part,
-/// so both counts are pinned to the smallest accepted values
-/// (`max_tokens: 1` for chat/anthropic; `max_output_tokens: 16` for
-/// responses, some vendors enforce that floor).
-fn probe_body(protocol: ApiKind, model: &str) -> serde_json::Value {
-    match protocol {
-        ApiKind::Responses => json!({
-            "model": model,
-            "input": "hi",
-            "max_output_tokens": 16,
-        }),
-        _ => json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 1,
-        }),
-    }
-}
-
+/// Minimal probe body per protocol — the body is the sole source of the
+/// protocol knowledge shared with `model/test`; see
+/// [`crate::probe_request::minimal_request`].
+///
 /// Probe URL = `base_url` + the fixed protocol path
-/// (`sag_core::protocol_path`). `None` only for non-protocol kinds.
-fn probe_url(base_url: &str, protocol: ApiKind) -> Option<String> {
-    sag_core::protocol_path(protocol)
-        .map(|path| format!("{}/{}", base_url.trim_end_matches('/'), path))
-}
-
+/// (`sag_core::protocol_path`), see [`crate::probe_request::request_url`].
 fn key_prefix(key: &str) -> String {
     if key.len() > 12 {
         format!("{}…", &key[..12])
@@ -390,7 +497,12 @@ async fn probe_one(
     req: &ProbeProtocolsRequest,
     api_key: &str,
 ) -> (Option<u16>, ProbeVerdict, String) {
-    let body = probe_body(target.protocol, &req.model);
+    // The request body is produced solely by `minimal_request` (shared
+    // protocol knowledge) — probe never reads a saved provider's overrides.
+    let Some(minimal) = crate::probe_request::minimal_request(target.protocol, &req.model) else {
+        return (None, ProbeVerdict::Error, "unsupported protocol".into());
+    };
+    let body = minimal.to_body();
 
     let auth = provider_auth_headers(target.protocol, api_key);
     let auth_refs: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -458,7 +570,7 @@ pub async fn probe_protocols(
     let mut results = Vec::new();
     for target in &req.targets {
         // `is_protocol()` above guarantees a path exists.
-        let Some(url) = probe_url(&target.base_url, target.protocol) else {
+        let Some(url) = crate::probe_request::request_url(&target.base_url, target.protocol) else {
             continue;
         };
         for key in &req.api_keys {
@@ -477,67 +589,13 @@ pub async fn probe_protocols(
     Json(json!({ "results": results })).into_response()
 }
 
-async fn test_single_key(
-    client: &reqwest::Client,
-    req: &ModelTestRequest,
-    api_key: &str,
-) -> (bool, String) {
-    let api_kind = api_kind_of(req.api_kind);
-    let endpoint = provider_chat_endpoint(api_kind);
-    let url = format!(
-        "{}/{}",
-        req.base_url.trim_end_matches('/'),
-        endpoint.trim_start_matches('/')
-    );
-
-    let body = serde_json::json!({
-        "model": req.model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 1
-    });
-
-    let mut http_req = client.post(&url).header(CONTENT_TYPE, "application/json");
-
-    for (name, value) in provider_auth_headers(api_kind, api_key) {
-        http_req = http_req.header(name, value);
-    }
-
-    for (key, value) in &req.headers {
-        http_req = http_req.header(key.as_str(), value.as_str());
-    }
-
-    http_req = http_req.json(&body);
-
-    match http_req.send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            if (200..300).contains(&status) {
-                (true, "OK".into())
-            } else if status == 401 || status == 403 {
-                let body = resp.text().await.unwrap_or_default();
-                (false, format!("Authentication failed: {body}"))
-            } else if status == 404 {
-                let body = resp.text().await.unwrap_or_default();
-                (false, format!("Model '{}' not found: {body}", req.model))
-            } else {
-                let body = resp.text().await.unwrap_or_default();
-                (false, format!("upstream returned status {status}: {body}"))
-            }
-        }
-        Err(e) => {
-            if e.is_timeout() {
-                (false, "request timed out after 30s".into())
-            } else {
-                (false, format!("connection failed: {e}"))
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{build_state_with_proxy, test_app};
+    use crate::test_utils::{
+        build_state_with_proxy, spawn_upstream_capture_many, spawn_upstream_capture_scripted,
+        test_app,
+    };
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -689,38 +747,6 @@ mod tests {
         assert_eq!(req.proxy_mode, ProxyMode::Inherit);
         assert_eq!(req.targets.len(), 1);
         assert_eq!(req.targets[0].protocol, ApiKind::ChatCompletions);
-    }
-
-    #[test]
-    fn probe_body_minimizes_output_tokens() {
-        let chat = probe_body(ApiKind::ChatCompletions, "m");
-        assert_eq!(chat["max_tokens"], 1);
-        assert_eq!(chat["messages"][0]["content"], "hi");
-
-        let anthropic = probe_body(ApiKind::AnthropicMessages, "m");
-        assert_eq!(anthropic["max_tokens"], 1);
-
-        let responses = probe_body(ApiKind::Responses, "m");
-        assert_eq!(responses["max_output_tokens"], 16);
-        assert_eq!(responses["input"], "hi");
-        assert!(responses.get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn probe_url_appends_fixed_protocol_path() {
-        assert_eq!(
-            probe_url("https://api.openai.com/v1/", ApiKind::ChatCompletions).as_deref(),
-            Some("https://api.openai.com/v1/chat/completions")
-        );
-        assert_eq!(
-            probe_url("https://api.openai.com/v1", ApiKind::Responses).as_deref(),
-            Some("https://api.openai.com/v1/responses")
-        );
-        assert_eq!(
-            probe_url("https://api.anthropic.com", ApiKind::AnthropicMessages).as_deref(),
-            Some("https://api.anthropic.com/messages")
-        );
-        assert_eq!(probe_url("https://x.com", ApiKind::Image), None);
     }
 
     #[tokio::test]
@@ -895,6 +921,485 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("proxy_url")
+        );
+    }
+
+    // ── model/test via the provider adapter (capturing mock upstream) ──
+
+    /// A valid chat completion body (all `ChatCompletionResponse` required
+    /// fields present, empty `choices`).
+    const CHAT_OK: &str =
+        r#"{"id":"x","object":"chat.completion","created":0,"model":"m","choices":[]}"#;
+
+    /// POST `payload` to `uri` on `app`, returning `(status, json body)`.
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn model_test_responses_kind_posts_input_to_responses_path() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, "{}").await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "responses",
+                "base_url": base,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["success"], true);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.path, "/responses");
+        assert_eq!(captured.method, "POST");
+        assert!(captured.body.get("input").is_some());
+        assert!(captured.body.get("max_output_tokens").is_some());
+        assert!(
+            captured.body.get("messages").is_none(),
+            "responses body must not carry chat messages: {}",
+            captured.body
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_anthropic_kind_sends_x_api_key_and_anthropic_version() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, "{}").await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "anthropic_messages",
+                "base_url": base,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["success"], true);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.path, "/messages");
+        assert_eq!(captured.headers.get("x-api-key"), Some(&"sk-1".to_string()));
+        assert_eq!(
+            captured.headers.get("anthropic-version"),
+            Some(&"2023-06-01".to_string())
+        );
+        assert_eq!(captured.body["max_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn model_test_chat_kind_posts_max_completion_tokens() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({ "model": "m", "api_keys": ["sk-1"], "base_url": base }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.path, "/chat/completions");
+        assert_eq!(captured.body["max_completion_tokens"], 1);
+        assert!(
+            captured.body.get("max_tokens").is_none(),
+            "chat body must use max_completion_tokens: {}",
+            captured.body
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_applies_body_overrides_and_strip_fields() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "base_url": base,
+                "body_overrides": { "temperature": 0.5 },
+                "strip_fields": ["max_completion_tokens"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.body["temperature"], 0.5);
+        assert!(
+            captured.body.get("max_completion_tokens").is_none(),
+            "strip_fields must remove the field via the build_request chain: {}",
+            captured.body
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_applies_per_api_headers_over_provider_headers() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "chat_completions",
+                "api": { "base_url": base, "headers": { "x-a": "api" } },
+                "provider_headers": { "x-a": "provider", "x-b": "p" },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.headers.get("x-a"), Some(&"api".to_string()));
+        // `apis.<kind>.headers` replaces the provider-level map wholesale
+        // (config contract: 整段替换，不合并), so the provider-only key is
+        // not sent.
+        assert!(
+            !captured.headers.contains_key("x-b"),
+            "per-API headers replace provider headers wholesale"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_model_override_reaches_upstream_body() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "base_url": base,
+                "model_overrides": { "m": { "temperature": 0.9 } },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.body["temperature"], 0.9);
+    }
+
+    #[tokio::test]
+    async fn model_test_provider_headers_apply_when_api_declares_none() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "chat_completions",
+                "api": { "base_url": base },
+                "provider_headers": { "x-p": "1" },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.headers.get("x-p"), Some(&"1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn model_test_flat_headers_fallback_when_api_present() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "chat_completions",
+                "api": { "base_url": base },
+                "headers": { "x-flat": "1" },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.headers.get("x-flat"), Some(&"1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn model_test_api_model_override_reaches_upstream_body() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "chat_completions",
+                "api": {
+                    "base_url": base,
+                    "model_overrides": { "m": { "temperature": 0.3 } },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(captured.body["temperature"], 0.3);
+    }
+
+    #[tokio::test]
+    async fn model_test_api_model_override_wins_over_provider_level() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, _) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "api_kind": "chat_completions",
+                "api": {
+                    "base_url": base,
+                    "model_overrides": { "m": { "temperature": 0.3 } },
+                },
+                "model_overrides": { "m": { "temperature": 0.9 } },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let captured = rx.recv().await.expect("one upstream request");
+        assert_eq!(
+            captured.body["temperature"], 0.3,
+            "api-level model override must win wholesale"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_rejects_too_many_api_keys() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+        let keys: Vec<String> = (0..17).map(|i| format!("sk-{i}")).collect();
+
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({ "model": "m", "api_keys": keys, "base_url": base }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "TOO_MANY_KEYS");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the 16-key cap must reject before any network request"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_treats_200_with_error_body_as_failure() {
+        let (base, _rx) = spawn_upstream_capture_many(200, r#"{"error":{"message":"boom"}}"#).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({ "model": "m", "api_keys": ["sk-1"], "base_url": base }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["success"], false);
+        assert!(
+            body["results"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("boom"),
+            "200 + error body must surface the upstream message: {}",
+            body["results"][0]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_per_key_results_preserved() {
+        let (base, _rx) =
+            spawn_upstream_capture_scripted(vec![(200, CHAT_OK), (401, "unauthorized")]).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({ "model": "m", "api_keys": ["sk-0", "sk-1"], "base_url": base }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["success"], true);
+        assert_eq!(results[1]["success"], false);
+        assert!(
+            results[1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Authentication failed"),
+            "401 must keep the legacy auth wording: {}",
+            results[1]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_test_legacy_flat_payload_still_works() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, CHAT_OK).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        // Exactly the payload today's UI sends: no `api`, no provider-level
+        // fields — only the flat legacy keys.
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "base_url": base,
+                "api_kind": "chat_completions",
+                "headers": { "x-legacy": "1" },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["success"], true);
+
+        let captured = rx.recv().await.expect("legacy payload must reach upstream");
+        assert_eq!(captured.path, "/chat/completions");
+        assert_eq!(captured.headers.get("x-legacy"), Some(&"1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn model_test_image_kind_is_400_before_network() {
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, body) = post_json(
+            app,
+            "/api/model/test",
+            json!({
+                "model": "dall-e-3",
+                "api_keys": ["sk-1"],
+                "api_kind": "image",
+                "base_url": "http://127.0.0.1:9",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "UNSUPPORTED_API_KIND");
+    }
+
+    // ── probe 2xx / body preview ──────────────────────────────────
+
+    #[test]
+    fn probe_verdict_2xx_is_supported_even_with_error_body() {
+        let (verdict, message) =
+            verdict_from_status_body(200, r#"{"error":{"code":"AuthenticationError"}}"#);
+        assert_eq!(
+            verdict,
+            ProbeVerdict::Supported,
+            "probe does not sniff error bodies out of a 2xx"
+        );
+        assert!(message.contains("AuthenticationError"), "{message}");
+    }
+
+    #[test]
+    fn probe_ok_message_truncates_and_flattens_body() {
+        let long = "a".repeat(500);
+        let msg = ok_message(&long);
+        assert!(msg.starts_with("OK — "), "{msg}");
+        assert_eq!(
+            msg.chars().count(),
+            5 + 160,
+            "160-char preview after prefix"
+        );
+
+        assert_eq!(ok_message("line1\nline2\t line3"), "OK — line1 line2 line3");
+        assert_eq!(ok_message("   \n\t "), "OK");
+    }
+
+    #[tokio::test]
+    async fn probe_ignores_unknown_payload_fields_and_saved_config() {
+        let (base, mut rx) = spawn_upstream_capture_many(200, r#"{"ok":true}"#).await;
+        let app = test_app(state_with_global_proxy(None).await);
+
+        let (status, body) = post_json(
+            app,
+            "/api/providers/probe-protocols",
+            json!({
+                "model": "m",
+                "api_keys": ["sk-1"],
+                "targets": [{ "protocol": "chat_completions", "base_url": base }],
+                "body_overrides": { "temperature": 0.5 },
+                "strip_fields": ["max_completion_tokens"],
+                "model_overrides": { "m": { "temperature": 0.9 } },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["verdict"], "supported");
+        assert!(
+            body["results"][0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("OK — "),
+            "2xx preview must be the (flattened) response body: {}",
+            body["results"][0]["message"]
+        );
+
+        let captured = rx.recv().await.expect("one probe request");
+        assert_eq!(captured.path, "/chat/completions");
+        let expected = crate::probe_request::minimal_request(ApiKind::ChatCompletions, "m")
+            .unwrap()
+            .to_body();
+        assert_eq!(
+            captured.body, expected,
+            "probe body comes solely from minimal_request — no overrides applied"
         );
     }
 }
