@@ -161,13 +161,13 @@ const contentMaxClass = computed(() =>
       <SidebarRail />
     </Sidebar>
 
-    <SidebarInset class="min-h-0">
+    <SidebarInset class="min-h-0 min-w-0">
       <header v-if="isMobile" class="flex h-12 shrink-0 items-center gap-2 border-b px-4">
         <SidebarTrigger class="-ml-1" />
         <span class="text-sm font-semibold">SAG Gateway</span>
       </header>
       <div class="min-h-0 flex-1 overflow-hidden">
-        <div :class="cn('mx-auto h-full p-6 xl:p-8 2xl:p-10', contentMaxClass)">
+        <div :class="cn('mx-auto h-full w-full min-w-0 p-6 xl:p-8 2xl:p-10', contentMaxClass)">
           <RouterView />
         </div>
       </div>

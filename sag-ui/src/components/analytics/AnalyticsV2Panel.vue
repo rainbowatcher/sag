@@ -500,9 +500,9 @@ const groupRows = computed<GroupRow[]>(() => {
 </script>
 
 <template>
-  <div class="flex h-full flex-col">
+  <div class="flex h-full min-w-0 flex-col">
     <!-- ── Toolbar ─────────────────────────────────────────────── -->
-    <div class="shrink-0">
+    <div class="min-w-0 shrink-0">
       <div class="-mx-1 flex flex-nowrap items-center gap-2 overflow-x-auto px-1 py-1">
         <div class="bg-muted inline-flex shrink-0 rounded-md p-0.5 whitespace-nowrap">
           <button
@@ -580,7 +580,7 @@ const groupRows = computed<GroupRow[]>(() => {
     </div>
 
     <!-- ── Content ─────────────────────────────────────────────── -->
-    <div class="min-h-0 flex-1 space-y-4 overflow-y-auto pt-4">
+    <div class="min-h-0 min-w-0 flex-1 space-y-4 overflow-y-auto pt-4">
       <div
         v-if="loading && !overall && !trend"
         class="text-muted-foreground flex items-center justify-center gap-2 py-16"

@@ -179,7 +179,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
 </script>
 
 <template>
-  <div class="flex h-full flex-col">
+  <div class="flex h-full min-w-0 flex-col">
     <div class="shrink-0 space-y-4">
       <div class="flex flex-nowrap items-center gap-2">
         <SearchSelect
@@ -227,7 +227,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
       </Alert>
     </div>
 
-    <div class="min-h-0 flex-1 pt-4">
+    <div class="flex min-h-0 min-w-0 flex-1 flex-col pt-4">
       <div
         v-if="store.logsLoading && store.logs.length === 0"
         class="text-muted-foreground py-12 text-center"
@@ -241,7 +241,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
       >
         No call logs match the current filter.
       </div>
-      <div v-else class="max-h-full overflow-auto rounded-lg border [&>div]:overflow-visible">
+      <div v-else class="min-h-0 flex-1 overflow-auto rounded-lg border [&>div]:overflow-visible">
         <TooltipProvider :delay-duration="200">
           <Table>
             <TableHeader class="bg-background/95 sticky top-0 z-10 backdrop-blur-xs">
