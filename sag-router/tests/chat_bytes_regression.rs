@@ -11,7 +11,7 @@
 //!   (including the terminal `[DONE]` frame).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::Body,
@@ -233,6 +233,125 @@ async fn chat_n1_and_absent_n_pass_entry_gate() {
         let json = body_json(resp).await;
         assert_eq!(json["error"]["code"], "MODEL_NOT_FOUND");
     }
+}
+
+// ── missing `content` tolerance (zcode regression) ───────────────
+
+/// Spawn a mock upstream that captures the full client request
+/// (headers + body, Content-Length framed — unlike [`spawn_server`] it
+/// does NOT pre-drain) and replies with a fixed non-stream 200
+/// completion body. Returns the base URL and the captured request bytes.
+async fn spawn_capturing_server(response: &'static [u8]) -> (String, Arc<Mutex<Vec<u8>>>) {
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            let Some(idx) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let content_length = text[..idx]
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if buf.len() >= idx + 4 + content_length {
+                break;
+            }
+        }
+        *cap.lock().unwrap() = buf;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        );
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(response).await;
+        let _ = stream.flush().await;
+        let _ = stream.shutdown().await;
+    });
+    (format!("http://{addr}"), captured)
+}
+
+#[tokio::test]
+async fn chat_assistant_tool_calls_without_content_passes_ingress() {
+    // zcode regression: an assistant message carrying only `tool_calls`
+    // and no `content` key is legal per OpenAI ("Required unless
+    // tool_calls or function_call is specified"). Before the fix, ingress
+    // deserialization rejected it with 422 "missing field `content`".
+    // Now it must pass the extractor and reach route resolution
+    // (unknown model → 404 no_route proves the gate passed).
+    let state = build_state("http://127.0.0.1:1").await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let resp = app
+        .oneshot(chat_request(
+            r#"{"model":"does-not-exist","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}
+            ]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "MODEL_NOT_FOUND");
+}
+
+#[tokio::test]
+async fn chat_message_without_content_forwards_content_null_to_upstream() {
+    // Native OpenAI passthrough re-serializes the request; a message that
+    // omitted `content` must reach upstream as "content": null (the
+    // canonical OpenAI form for assistant tool_calls messages), not be
+    // dropped or rejected. Unlike [`spawn_server`], the capturing upstream
+    // does not pre-drain the request: it frames on Content-Length and hands
+    // back the exact bytes the gateway sent, which is what the passthrough
+    // assertions below inspect.
+    let body: &'static [u8] = br#"{"id":"chatcmpl-c1","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    let (base_url, captured) = spawn_capturing_server(body).await;
+
+    let state = build_state(&base_url).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let resp = app
+        .oneshot(chat_request(
+            r#"{"model":"gpt-4o","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}
+            ]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let raw = captured.lock().unwrap().clone();
+    let text = String::from_utf8(raw).unwrap();
+    let body_start = text.find("\r\n\r\n").expect("header/body separator") + 4;
+    let forwarded: serde_json::Value = serde_json::from_str(&text[body_start..]).unwrap();
+    let msgs = forwarded["messages"].as_array().unwrap();
+    assert_eq!(msgs[1]["role"], serde_json::json!("assistant"));
+    assert_eq!(
+        msgs[1].get("content"),
+        Some(&serde_json::json!(null)),
+        "omitted content must re-serialize as content:null, not be dropped: {:?}",
+        msgs[1]
+    );
+    assert!(msgs[1]["tool_calls"].is_array());
 }
 
 // ── stream byte gate ─────────────────────────────────────────────
