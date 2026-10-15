@@ -203,7 +203,9 @@ async function handleSubmit() {
         <component :is="Modal.Title">
           {{ provider.name }}
         </component>
-        <component :is="Modal.Description"> Edit provider configuration </component>
+        <component :is="Modal.Description">
+          {{ $t("providers.editForm.description") }}
+        </component>
       </component>
 
       <div
@@ -216,21 +218,21 @@ async function handleSubmit() {
       <div class="min-w-0 flex-1 overflow-y-auto px-2 pb-4 sm:px-6">
         <Tabs default-value="basic">
           <TabsList class="mb-4">
-            <TabsTrigger value="basic">Basic</TabsTrigger>
-            <TabsTrigger value="apis">APIs</TabsTrigger>
-            <TabsTrigger value="models">Models</TabsTrigger>
-            <TabsTrigger value="advanced">Advanced</TabsTrigger>
+            <TabsTrigger value="basic">{{ $t("providers.tabs.basic") }}</TabsTrigger>
+            <TabsTrigger value="apis">{{ $t("providers.tabs.apis") }}</TabsTrigger>
+            <TabsTrigger value="models">{{ $t("providers.tabs.models") }}</TabsTrigger>
+            <TabsTrigger value="advanced">{{ $t("providers.tabs.advanced") }}</TabsTrigger>
           </TabsList>
 
           <!-- ─── Tab: Basic ──────────────────────────────────── -->
           <TabsContent value="basic" class="grid grid-cols-2 gap-4">
             <div>
-              <FieldLabel>Name</FieldLabel>
+              <FieldLabel>{{ $t("common.name") }}</FieldLabel>
               <Input :model-value="provider.name" disabled class="bg-muted text-muted-foreground" />
             </div>
 
             <div class="space-y-1">
-              <FieldLabel>Timeout (secs)</FieldLabel>
+              <FieldLabel>{{ $t("providers.form.timeoutLabel") }}</FieldLabel>
               <Input
                 type="number"
                 :model-value="timeoutSecs"
@@ -278,7 +280,7 @@ async function handleSubmit() {
               v-model:strip-fields="stripFieldsList"
               v-model:role-mappings="roleMappingsList"
               show-body-override-warning
-              role-mappings-description="Map request role names to role names supported by the upstream (case-sensitive). Example: developer → system."
+              :role-mappings-description="$t('providers.advanced.roleMappingsDescriptionEdit')"
             />
           </TabsContent>
         </Tabs>
@@ -286,11 +288,13 @@ async function handleSubmit() {
 
       <component :is="Modal.Footer" class="shrink-0">
         <component :is="Modal.Close" as-child>
-          <Button variant="outline" size="sm" :disabled="saving"> Cancel </Button>
+          <Button variant="outline" size="sm" :disabled="saving">
+            {{ $t("common.cancel") }}
+          </Button>
         </component>
         <Button size="sm" :disabled="saving" @click="handleSubmit">
           <Loader2 v-if="saving" class="h-3 w-3 animate-spin" />
-          {{ saving ? "Saving..." : "Save" }}
+          {{ saving ? $t("common.saving") : $t("common.save") }}
         </Button>
       </component>
     </component>

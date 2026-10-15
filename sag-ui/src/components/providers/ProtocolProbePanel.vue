@@ -14,16 +14,17 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { t } from "@/lib/i18n"
 import { useProviderStore } from "@/stores/providers"
 import type { ProbeResult, ProbeVerdict, ProtocolApiKind, ProxyMode } from "@/types/api"
 
 const PROTOCOL_KINDS: ProtocolApiKind[] = ["chat_completions", "responses", "anthropic_messages"]
 
-const PROTOCOL_LABELS: Record<ProtocolApiKind, string> = {
-  chat_completions: "Chat Completions",
-  responses: "Responses",
-  anthropic_messages: "Anthropic Messages",
-}
+const protocolLabels = computed<Record<ProtocolApiKind, string>>(() => ({
+  chat_completions: t("providers.probe.protocolChat"),
+  responses: t("providers.probe.protocolResponses"),
+  anthropic_messages: t("providers.probe.protocolAnthropic"),
+}))
 
 /** Recover base_url from a probed URL by stripping the fixed protocol path. */
 const PROTOCOL_PATHS: Record<ProtocolApiKind, string> = {
@@ -38,14 +39,14 @@ const BACKFILL_VERDICTS: ReadonlySet<ProbeVerdict> = new Set<ProbeVerdict>([
   "partial",
 ])
 
-const VERDICT_LABELS: Record<ProbeVerdict, string> = {
-  supported: "supported",
-  auth_failed: "auth failed",
-  uncertain: "uncertain",
-  unsupported: "unsupported",
-  partial: "partial",
-  error: "error",
-}
+const verdictLabels = computed<Record<ProbeVerdict, string>>(() => ({
+  supported: t("providers.probe.verdictSupported"),
+  auth_failed: t("providers.probe.verdictAuthFailed"),
+  uncertain: t("providers.probe.verdictUncertain"),
+  unsupported: t("providers.probe.verdictUnsupported"),
+  partial: t("providers.probe.verdictPartial"),
+  error: t("providers.probe.verdictError"),
+}))
 
 const VERDICT_CLASSES: Record<ProbeVerdict, string> = {
   supported:
@@ -152,24 +153,25 @@ function applyBackfill() {
 <template>
   <div class="min-w-0 space-y-3 rounded-md border p-3">
     <p class="text-muted-foreground text-xs">
-      Read-only probe: one minimal request per protocol × key. Nothing is saved until you backfill
-      and store the provider.
+      {{ $t("providers.probe.description") }}
     </p>
 
     <div class="space-y-2">
       <div v-for="kind in PROTOCOL_KINDS" :key="kind" class="space-y-1">
         <div class="flex items-center justify-between gap-2">
-          <FieldLabel :for="`probe-base-${kind}`">{{ PROTOCOL_LABELS[kind] }} base URL</FieldLabel>
+          <FieldLabel :for="`probe-base-${kind}`">
+            {{ $t("providers.probe.baseUrlLabel", { protocol: protocolLabels[kind] }) }}
+          </FieldLabel>
           <Button
             type="button"
             variant="ghost"
             size="sm"
             class="h-7 text-xs"
             :disabled="!targets[kind].trim()"
-            title="Apply this base URL to all protocols"
+            :title="$t('providers.probe.applyAllTitle')"
             @click="applyBaseToAll(kind)"
           >
-            Apply to all
+            {{ $t("providers.probe.applyAll") }}
           </Button>
         </div>
         <Input
@@ -184,7 +186,7 @@ function applyBackfill() {
 
     <div class="flex flex-wrap items-end gap-2">
       <div class="min-w-40 flex-1 space-y-1">
-        <FieldLabel for="probe-model">Model *</FieldLabel>
+        <FieldLabel for="probe-model">{{ $t("providers.probe.modelLabel") }}</FieldLabel>
         <Input
           id="probe-model"
           v-model="model"
@@ -195,7 +197,7 @@ function applyBackfill() {
       <Button type="button" size="sm" :disabled="!canProbe || store.probeLoading" @click="runProbe">
         <Loader2 v-if="store.probeLoading" class="h-3 w-3 animate-spin" />
         <Search v-else class="h-3.5 w-3.5" />
-        {{ store.probeLoading ? "Probing…" : "Probe" }}
+        {{ store.probeLoading ? $t("providers.probe.probing") : $t("providers.probe.probe") }}
       </Button>
       <Button
         v-if="results.length > 0"
@@ -205,29 +207,35 @@ function applyBackfill() {
         :disabled="backfillItems.length === 0"
         @click="applyBackfill"
       >
-        Backfill {{ backfillItems.length }} protocol{{ backfillItems.length === 1 ? "" : "s" }}
+        {{
+          backfillItems.length === 1
+            ? $t("providers.probe.backfillOne")
+            : $t("providers.probe.backfillMany", { count: backfillItems.length })
+        }}
       </Button>
     </div>
 
     <p class="text-muted-foreground text-xs">
-      Model: prefer a non-reasoning model. Use <strong>Apply to all</strong> to share one base URL
-      across protocols.
+      {{ $t("providers.probe.modelHintLead") }}<strong>{{ $t("providers.probe.applyAll") }}</strong
+      >{{ $t("providers.probe.modelHintTail") }}
     </p>
-    <p v-if="!hasKeys" class="text-muted-foreground text-xs">Add at least one API key first.</p>
+    <p v-if="!hasKeys" class="text-muted-foreground text-xs">
+      {{ $t("providers.probe.addKeyFirst") }}
+    </p>
 
     <p v-if="store.probeError" class="text-destructive text-xs">{{ store.probeError }}</p>
 
     <Alert v-if="results.length > 0" variant="default" class="min-w-0">
-      <AlertTitle>Probe results</AlertTitle>
+      <AlertTitle>{{ $t("providers.probe.resultsTitle") }}</AlertTitle>
       <AlertDescription class="min-w-0">
         <div class="w-full min-w-0 overflow-x-auto">
           <Table class="w-max min-w-full">
             <TableHeader>
               <TableRow>
-                <TableHead>Protocol</TableHead>
-                <TableHead>Verdict</TableHead>
-                <TableHead>Key</TableHead>
-                <TableHead>Message</TableHead>
+                <TableHead>{{ $t("providers.probe.columns.protocol") }}</TableHead>
+                <TableHead>{{ $t("providers.probe.columns.verdict") }}</TableHead>
+                <TableHead>{{ $t("providers.probe.columns.key") }}</TableHead>
+                <TableHead>{{ $t("providers.probe.columns.message") }}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -239,7 +247,7 @@ function applyBackfill() {
                     class="font-mono text-xs"
                     :class="VERDICT_CLASSES[r.verdict]"
                   >
-                    {{ VERDICT_LABELS[r.verdict] }}
+                    {{ verdictLabels[r.verdict] }}
                   </Badge>
                 </TableCell>
                 <TableCell class="font-mono text-xs">{{ r.key_prefix }}</TableCell>
@@ -249,7 +257,7 @@ function applyBackfill() {
           </Table>
         </div>
         <p class="text-muted-foreground mt-2 text-xs">
-          Backfill fills matching sections only (supported / auth failed / partial).
+          {{ $t("providers.probe.backfillHint") }}
         </p>
       </AlertDescription>
     </Alert>

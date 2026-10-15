@@ -166,7 +166,7 @@ async function handleSubmit(event: Event) {
         <div class="grid grid-cols-2 gap-4">
           <form.Field name="model_name" #default="{ field }">
             <Field>
-              <FieldLabel :for="field.name">Route Alias</FieldLabel>
+              <FieldLabel :for="field.name">{{ $t("routes.form.routeAlias") }}</FieldLabel>
               <Input
                 :id="field.name"
                 :model-value="field.state.value"
@@ -176,14 +176,14 @@ async function handleSubmit(event: Event) {
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
               <p class="text-muted-foreground text-[10px]">
-                Leave empty to use the first target's real_model
+                {{ $t("routes.form.routeAliasHint") }}
               </p>
             </Field>
           </form.Field>
 
           <form.Field name="strategy" #default="{ field }">
             <Field>
-              <FieldLabel :for="field.name">Strategy</FieldLabel>
+              <FieldLabel :for="field.name">{{ $t("routes.form.strategy") }}</FieldLabel>
               <ToggleGroup
                 :model-value="field.state.value ?? 'sticky_failover'"
                 @update:model-value="(v) => field.handleChange(v as Strategy)"
@@ -192,16 +192,22 @@ async function handleSubmit(event: Event) {
                 size="sm"
                 class="justify-start"
               >
-                <ToggleGroupItem value="sticky_failover">Sticky-failover</ToggleGroupItem>
-                <ToggleGroupItem value="fill_first">Fill-first</ToggleGroupItem>
-                <ToggleGroupItem value="round_robin">Round-robin</ToggleGroupItem>
+                <ToggleGroupItem value="sticky_failover">{{
+                  $t("routes.form.strategyStickyFailover")
+                }}</ToggleGroupItem>
+                <ToggleGroupItem value="fill_first">{{
+                  $t("routes.form.strategyFillFirst")
+                }}</ToggleGroupItem>
+                <ToggleGroupItem value="round_robin">{{
+                  $t("routes.form.strategyRoundRobin")
+                }}</ToggleGroupItem>
               </ToggleGroup>
             </Field>
           </form.Field>
 
           <form.Field name="pipeline" #default="{ field }">
             <Field>
-              <FieldLabel :for="field.name">Pipeline</FieldLabel>
+              <FieldLabel :for="field.name">{{ $t("routes.form.pipeline") }}</FieldLabel>
               <ToggleGroup
                 :model-value="field.state.value ?? 'chat'"
                 @update:model-value="(v) => field.handleChange(v as Pipeline)"
@@ -210,18 +216,20 @@ async function handleSubmit(event: Event) {
                 size="sm"
                 class="justify-start"
               >
-                <ToggleGroupItem value="chat">Chat</ToggleGroupItem>
-                <ToggleGroupItem value="image">Image</ToggleGroupItem>
+                <ToggleGroupItem value="chat">{{ $t("routes.form.pipelineChat") }}</ToggleGroupItem>
+                <ToggleGroupItem value="image">{{
+                  $t("routes.form.pipelineImage")
+                }}</ToggleGroupItem>
               </ToggleGroup>
               <p class="text-muted-foreground text-[10px]">
-                Image routes send to the provider's image section with a per-route path.
+                {{ $t("routes.form.pipelineHint") }}
               </p>
             </Field>
           </form.Field>
 
           <form.Field name="api_endpoint" #default="{ field }">
             <Field v-if="form.state.values.pipeline === 'image'">
-              <FieldLabel :for="field.name">API Endpoint *</FieldLabel>
+              <FieldLabel :for="field.name">{{ $t("routes.form.apiEndpointLabel") }}</FieldLabel>
               <Input
                 :id="field.name"
                 :model-value="field.state.value"
@@ -232,9 +240,10 @@ async function handleSubmit(event: Event) {
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
               <p class="text-muted-foreground text-[10px]">
-                Appended to the target provider's
-                <code>image</code> section base_url, e.g. <code>/images/generations</code> or
-                <code>/v1beta/models/{model}:generateContent</code>
+                {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
+                >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
+                >{{ $t("routes.form.apiEndpointHintOr")
+                }}<code>/v1beta/models/{model}:generateContent</code>
               </p>
               <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
@@ -252,11 +261,11 @@ async function handleSubmit(event: Event) {
 
     <div class="mt-4 flex shrink-0 justify-end gap-2 border-t pt-4">
       <Button variant="outline" size="sm" type="button" :disabled="adding" @click="emit('close')">
-        Cancel
+        {{ $t("common.cancel") }}
       </Button>
       <Button type="submit" form="route-add-form" size="sm" :disabled="adding">
         <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
-        {{ adding ? "Adding..." : "Create Route" }}
+        {{ adding ? $t("routes.addForm.adding") : $t("routes.addForm.createRoute") }}
       </Button>
     </div>
   </div>

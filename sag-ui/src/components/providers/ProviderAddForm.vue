@@ -225,9 +225,9 @@ async function handleSubmit(event: Event) {
   <component :is="Modal.Root" :open="open ?? true" @update:open="onOpenChange">
     <component :is="Modal.Content" class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
       <component :is="Modal.Header" class="shrink-0">
-        <component :is="Modal.Title">New Provider</component>
+        <component :is="Modal.Title">{{ $t("providers.addForm.title") }}</component>
         <component :is="Modal.Description">
-          Configure a new upstream provider connection
+          {{ $t("providers.addForm.description") }}
         </component>
       </component>
 
@@ -242,21 +242,21 @@ async function handleSubmit(event: Event) {
         <form id="provider-add-form" @submit.prevent="handleSubmit">
           <Tabs default-value="basic">
             <TabsList class="mb-4">
-              <TabsTrigger value="basic">Basic</TabsTrigger>
-              <TabsTrigger value="apis">APIs</TabsTrigger>
-              <TabsTrigger value="models">Models</TabsTrigger>
-              <TabsTrigger value="advanced">Advanced</TabsTrigger>
+              <TabsTrigger value="basic">{{ $t("providers.tabs.basic") }}</TabsTrigger>
+              <TabsTrigger value="apis">{{ $t("providers.tabs.apis") }}</TabsTrigger>
+              <TabsTrigger value="models">{{ $t("providers.tabs.models") }}</TabsTrigger>
+              <TabsTrigger value="advanced">{{ $t("providers.tabs.advanced") }}</TabsTrigger>
             </TabsList>
 
             <!-- ─── Tab: Basic ──────────────────────────────────── -->
             <TabsContent value="basic" class="grid grid-cols-2 gap-4">
               <form.Field name="name" #default="{ field }">
                 <Field :data-invalid="isInvalid(field)">
-                  <FieldLabel :for="field.name">Name *</FieldLabel>
+                  <FieldLabel :for="field.name">{{ $t("providers.form.nameLabel") }}</FieldLabel>
                   <Input
                     :id="field.name"
                     :model-value="field.state.value"
-                    placeholder="my-openai"
+                    :placeholder="$t('providers.form.namePlaceholder')"
                     :aria-invalid="isInvalid(field)"
                     @blur="field.handleBlur"
                     @input="field.handleChange(($event.target as HTMLInputElement).value)"
@@ -268,7 +268,9 @@ async function handleSubmit(event: Event) {
               <div class="space-y-1">
                 <form.Field name="timeout_secs" #default="{ field }">
                   <Field :data-invalid="isInvalid(field)">
-                    <FieldLabel :for="field.name">Timeout (secs)</FieldLabel>
+                    <FieldLabel :for="field.name">{{
+                      $t("providers.form.timeoutLabel")
+                    }}</FieldLabel>
                     <Input
                       :id="field.name"
                       type="number"
@@ -336,11 +338,13 @@ async function handleSubmit(event: Event) {
 
       <component :is="Modal.Footer" class="shrink-0">
         <component :is="Modal.Close" as-child>
-          <Button variant="outline" size="sm" type="button" :disabled="adding"> Cancel </Button>
+          <Button variant="outline" size="sm" type="button" :disabled="adding">
+            {{ $t("common.cancel") }}
+          </Button>
         </component>
         <Button type="submit" form="provider-add-form" size="sm" :disabled="adding">
           <Loader2 v-if="adding" class="h-3.5 w-3.5 animate-spin" />
-          {{ adding ? "Adding..." : "Create Provider" }}
+          {{ adding ? $t("providers.addForm.adding") : $t("providers.addForm.createProvider") }}
         </Button>
       </component>
     </component>

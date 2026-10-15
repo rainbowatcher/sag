@@ -16,6 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
+import { t } from "@/lib/i18n"
 import { API_KIND_LABELS } from "@/lib/provider-probe"
 import type { ApiConfig, ApiKind, ProtocolApiKind, ProxyMode } from "@/types/api"
 
@@ -149,10 +150,18 @@ function sectionJsonError(d: SectionDraft): string | null {
     try {
       const parsed = JSON.parse(value.trim())
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        return `Model override "${key.trim()}": value must be a JSON object`
+        return t(
+          "providers.apis.validate.modelOverrideNotObject",
+          { key: key.trim() },
+          `Model override "${key.trim()}": value must be a JSON object`,
+        )
       }
     } catch {
-      return `Model override "${key.trim()}": invalid JSON value`
+      return t(
+        "providers.apis.validate.modelOverrideInvalidJson",
+        { key: key.trim() },
+        `Model override "${key.trim()}": invalid JSON value`,
+      )
     }
   }
   return null
@@ -313,26 +322,57 @@ function numericValue(raw: string): string | undefined {
 
 function validate(): string | null {
   if (sections.value.length === 0) {
-    return "At least one API section is required (e.g. chat_completions)"
+    return t(
+      "providers.apis.validate.atLeastOneSection",
+      undefined,
+      "At least one API section is required (e.g. chat_completions)",
+    )
   }
   for (const d of sections.value) {
+    const kind = API_KIND_LABELS[d.kind]
     if (!d.base_url.trim()) {
-      return `API section "${API_KIND_LABELS[d.kind]}": base_url is required`
+      return t(
+        "providers.apis.validate.baseUrlRequired",
+        { kind },
+        `API section "${kind}": base_url is required`,
+      )
     }
     const jsonError = sectionJsonError(d)
-    if (jsonError) return `API section "${API_KIND_LABELS[d.kind]}": ${jsonError}`
+    if (jsonError) {
+      return t(
+        "providers.apis.validate.sectionPrefix",
+        { kind, error: jsonError },
+        `API section "${kind}": ${jsonError}`,
+      )
+    }
     if (d.timeout_secs.trim() && parseOptionalNumber(d.timeout_secs) === undefined) {
-      return `API section "${API_KIND_LABELS[d.kind]}": timeout must be a non-negative number`
+      return t(
+        "providers.apis.validate.timeoutNonNegative",
+        { kind },
+        `API section "${kind}": timeout must be a non-negative number`,
+      )
     }
     if (d.chunk_timeout_secs.trim() && parseOptionalNumber(d.chunk_timeout_secs) === undefined) {
-      return `API section "${API_KIND_LABELS[d.kind]}": chunk timeout must be a non-negative number`
+      return t(
+        "providers.apis.validate.chunkTimeoutNonNegative",
+        { kind },
+        `API section "${kind}": chunk timeout must be a non-negative number`,
+      )
     }
     if (d.ttfb_timeout_secs.trim() && parseOptionalNumber(d.ttfb_timeout_secs) === undefined) {
-      return `API section "${API_KIND_LABELS[d.kind]}": TTFB timeout must be a non-negative number`
+      return t(
+        "providers.apis.validate.ttfbTimeoutNonNegative",
+        { kind },
+        `API section "${kind}": TTFB timeout must be a non-negative number`,
+      )
     }
   }
   if (protocolKeys.value.length > 1 && !fallbackValue.value) {
-    return "Fallback protocol is required when multiple protocol sections are declared"
+    return t(
+      "providers.apis.validate.fallbackRequired",
+      undefined,
+      "Fallback protocol is required when multiple protocol sections are declared",
+    )
   }
   return null
 }
@@ -345,7 +385,7 @@ defineExpose({ validate })
     <div v-if="availableKinds.length > 0" class="flex items-center gap-2">
       <Select v-model="newKind">
         <SelectTrigger class="w-56">
-          <SelectValue placeholder="Add API section…" />
+          <SelectValue :placeholder="$t('providers.apis.addSectionPlaceholder')" />
         </SelectTrigger>
         <SelectContent class="w-(--reka-select-trigger-width)">
           <SelectItem v-for="kind in availableKinds" :key="kind" :value="kind">
@@ -355,7 +395,7 @@ defineExpose({ validate })
       </Select>
       <Button type="button" variant="outline" size="sm" :disabled="!newKind" @click="addSection">
         <Plus class="h-3.5 w-3.5" />
-        Add Section
+        {{ $t("providers.apis.addSection") }}
       </Button>
     </div>
 
@@ -371,7 +411,7 @@ defineExpose({ validate })
             :id="`fallback-radio-${d.uid}`"
             :value="d.kind"
             :disabled="protocolKeys.length <= 1"
-            :aria-label="`Fallback: ${API_KIND_LABELS[d.kind]}`"
+            :aria-label="$t('providers.apis.fallbackAria', { kind: API_KIND_LABELS[d.kind] })"
           />
           <div class="flex min-w-0 flex-1 items-center gap-2">
             <Badge variant="outline" class="font-mono text-xs">
@@ -384,7 +424,7 @@ defineExpose({ validate })
             variant="ghost"
             size="icon-sm"
             class="ml-auto"
-            aria-label="Remove API section"
+            :aria-label="$t('providers.apis.removeSection')"
             @click="removeSection(d.uid)"
           >
             <X class="h-3.5 w-3.5" />
@@ -393,7 +433,9 @@ defineExpose({ validate })
 
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div class="space-y-1">
-            <FieldLabel :for="`base-url-${d.uid}`">Base URL *</FieldLabel>
+            <FieldLabel :for="`base-url-${d.uid}`">{{
+              $t("providers.apis.baseUrlLabel")
+            }}</FieldLabel>
             <Input
               :id="`base-url-${d.uid}`"
               :model-value="d.base_url"
@@ -403,7 +445,9 @@ defineExpose({ validate })
             />
           </div>
           <div class="space-y-1">
-            <FieldLabel :for="`models-endpoint-${d.uid}`">Models Endpoint</FieldLabel>
+            <FieldLabel :for="`models-endpoint-${d.uid}`">{{
+              $t("providers.apis.modelsEndpointLabel")
+            }}</FieldLabel>
             <Input
               :id="`models-endpoint-${d.uid}`"
               :model-value="d.models_endpoint"
@@ -419,15 +463,15 @@ defineExpose({ validate })
         <Button type="button" variant="ghost" size="sm" class="px-2" @click="toggleAdvanced(d.uid)">
           <ChevronDown v-if="d.advancedOpen" class="h-3.5 w-3.5" />
           <ChevronRight v-else class="h-3.5 w-3.5" />
-          Advanced
+          {{ $t("providers.tabs.advanced") }}
         </Button>
 
         <div v-if="d.advancedOpen" class="space-y-4">
           <KvEditor
             :model-value="d.headers"
-            title="Headers"
-            key-placeholder="Header-Name"
-            value-placeholder="Value"
+            :title="$t('providers.advanced.headersTitle')"
+            :key-placeholder="$t('providers.advanced.headerKeyPlaceholder')"
+            :value-placeholder="$t('common.value')"
             @update:model-value="(v) => updateSection(d.uid, { headers: v as KvPair[] })"
           />
 
@@ -435,7 +479,7 @@ defineExpose({ validate })
 
           <KvEditor
             :model-value="d.body_overrides"
-            title="Body Overrides"
+            :title="$t('providers.advanced.bodyOverridesTitle')"
             key-placeholder="max_tokens"
             value-placeholder="4096"
             @update:model-value="(v) => updateSection(d.uid, { body_overrides: v as KvPair[] })"
@@ -444,7 +488,7 @@ defineExpose({ validate })
           <Separator />
 
           <div>
-            <FieldLabel>Strip Fields</FieldLabel>
+            <FieldLabel>{{ $t("providers.advanced.stripFieldsTitle") }}</FieldLabel>
             <textarea
               :value="stripFieldsText(d)"
               rows="2"
@@ -458,7 +502,7 @@ defineExpose({ validate })
 
           <KvEditor
             :model-value="d.role_mappings"
-            title="Role Mappings"
+            :title="$t('providers.advanced.roleMappingsTitle')"
             key-placeholder="developer"
             value-placeholder="system"
             @update:model-value="(v) => updateSection(d.uid, { role_mappings: v as KvPair[] })"
@@ -469,7 +513,7 @@ defineExpose({ validate })
           <div class="space-y-1">
             <KvEditor
               :model-value="d.model_overrides"
-              title="Model Overrides"
+              :title="$t('providers.apis.modelOverridesTitle')"
               key-placeholder="model-name"
               value-placeholder='{"max_tokens": 4096}'
               @update:model-value="(v) => updateSection(d.uid, { model_overrides: v as KvPair[] })"
@@ -483,7 +527,9 @@ defineExpose({ validate })
 
           <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <div class="space-y-1">
-              <FieldLabel :for="`cache-ctl-${d.uid}`">Cache Control</FieldLabel>
+              <FieldLabel :for="`cache-ctl-${d.uid}`">{{
+                $t("providers.apis.cacheControl")
+              }}</FieldLabel>
               <Select
                 :model-value="d.anthropic_cache_control"
                 @update:model-value="
@@ -497,19 +543,21 @@ defineExpose({ validate })
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="inherit">Inherit default</SelectItem>
-                  <SelectItem value="enable">Enabled</SelectItem>
-                  <SelectItem value="disable">Disabled</SelectItem>
+                  <SelectItem value="inherit">{{ $t("providers.apis.cacheInherit") }}</SelectItem>
+                  <SelectItem value="enable">{{ $t("common.enabled") }}</SelectItem>
+                  <SelectItem value="disable">{{ $t("common.disabled") }}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div class="space-y-1">
-              <FieldLabel :for="`timeout-${d.uid}`">Timeout (secs)</FieldLabel>
+              <FieldLabel :for="`timeout-${d.uid}`">{{
+                $t("providers.form.timeoutLabel")
+              }}</FieldLabel>
               <Input
                 :id="`timeout-${d.uid}`"
                 type="number"
                 :model-value="d.timeout_secs"
-                placeholder="Inherit"
+                :placeholder="$t('common.inherit')"
                 @input="
                   updateSection(d.uid, {
                     timeout_secs: numericValue(($event.target as HTMLInputElement).value) ?? '',
@@ -518,12 +566,14 @@ defineExpose({ validate })
               />
             </div>
             <div class="space-y-1">
-              <FieldLabel :for="`chunk-timeout-${d.uid}`">Chunk Timeout (secs)</FieldLabel>
+              <FieldLabel :for="`chunk-timeout-${d.uid}`">{{
+                $t("providers.apis.chunkTimeout")
+              }}</FieldLabel>
               <Input
                 :id="`chunk-timeout-${d.uid}`"
                 type="number"
                 :model-value="d.chunk_timeout_secs"
-                placeholder="Inherit"
+                :placeholder="$t('common.inherit')"
                 @input="
                   updateSection(d.uid, {
                     chunk_timeout_secs:
@@ -533,12 +583,14 @@ defineExpose({ validate })
               />
             </div>
             <div class="space-y-1">
-              <FieldLabel :for="`ttfb-timeout-${d.uid}`">TTFB Timeout (secs)</FieldLabel>
+              <FieldLabel :for="`ttfb-timeout-${d.uid}`">{{
+                $t("providers.apis.ttfbTimeout")
+              }}</FieldLabel>
               <Input
                 :id="`ttfb-timeout-${d.uid}`"
                 type="number"
                 :model-value="d.ttfb_timeout_secs"
-                placeholder="Inherit"
+                :placeholder="$t('common.inherit')"
                 @input="
                   updateSection(d.uid, {
                     ttfb_timeout_secs:
@@ -553,10 +605,10 @@ defineExpose({ validate })
     </RadioGroup>
 
     <p v-if="sections.length === 0" class="text-destructive text-xs">
-      At least one API section is required.
+      {{ $t("providers.apis.atLeastOneSection") }}
     </p>
     <p v-else-if="protocolKeys.length > 1 && !fallbackValue" class="text-muted-foreground text-xs">
-      Select a fallback protocol (radio on a protocol API section).
+      {{ $t("providers.apis.selectFallback") }}
     </p>
 
     <Separator />
@@ -568,7 +620,7 @@ defineExpose({ validate })
         class="w-full justify-between px-2"
         @click="probeOpen = !probeOpen"
       >
-        <span>Protocol Probe Support</span>
+        <span>{{ $t("providers.apis.protocolProbeSupport") }}</span>
         <ChevronDown v-if="probeOpen" class="h-3.5 w-3.5" />
         <ChevronRight v-else class="h-3.5 w-3.5" />
       </Button>

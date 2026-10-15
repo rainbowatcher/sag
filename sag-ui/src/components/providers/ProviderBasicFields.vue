@@ -29,7 +29,7 @@ const emit = defineEmits<{
   </div>
 
   <div class="space-y-1">
-    <FieldLabel>Key Strategy</FieldLabel>
+    <FieldLabel>{{ $t("providers.form.keyStrategy") }}</FieldLabel>
     <Select
       :model-value="keyStrategy"
       @update:model-value="(v) => emit('update:keyStrategy', v as 'fill_first' | 'round_robin')"
@@ -38,14 +38,14 @@ const emit = defineEmits<{
         <SelectValue />
       </SelectTrigger>
       <SelectContent class="w-(--reka-select-trigger-width)">
-        <SelectItem value="fill_first">Fill First</SelectItem>
-        <SelectItem value="round_robin">Round Robin</SelectItem>
+        <SelectItem value="fill_first">{{ $t("providers.form.fillFirst") }}</SelectItem>
+        <SelectItem value="round_robin">{{ $t("providers.form.roundRobin") }}</SelectItem>
       </SelectContent>
     </Select>
   </div>
 
   <div class="space-y-1">
-    <FieldLabel>Proxy Mode</FieldLabel>
+    <FieldLabel>{{ $t("providers.form.proxyMode") }}</FieldLabel>
     <Select
       :model-value="proxyMode"
       @update:model-value="(v) => emit('update:proxyMode', v as ProxyMode)"
@@ -54,13 +54,13 @@ const emit = defineEmits<{
         <SelectValue />
       </SelectTrigger>
       <SelectContent class="w-(--reka-select-trigger-width)">
-        <SelectItem value="inherit">Inherit</SelectItem>
-        <SelectItem value="enabled">Enabled</SelectItem>
-        <SelectItem value="disabled">Disabled</SelectItem>
+        <SelectItem value="inherit">{{ $t("common.inherit") }}</SelectItem>
+        <SelectItem value="enabled">{{ $t("common.enabled") }}</SelectItem>
+        <SelectItem value="disabled">{{ $t("common.disabled") }}</SelectItem>
       </SelectContent>
     </Select>
     <p class="text-muted-foreground text-xs">
-      How this provider resolves the upstream proxy. Inherit follows the gateway-level proxy URL.
+      {{ $t("providers.form.proxyModeHelp") }}
     </p>
   </div>
 </template>

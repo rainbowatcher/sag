@@ -27,8 +27,7 @@ const props = withDefaults(
   }>(),
   {
     showBodyOverrideWarning: false,
-    roleMappingsDescription:
-      "Maps request role names to roles the upstream supports (case-sensitive). Example: developer → system.",
+    roleMappingsDescription: undefined,
   },
 )
 
@@ -59,17 +58,19 @@ function addStripField() {
 
 <template>
   <p class="text-muted-foreground text-xs">
-    Provider-level defaults below apply to every API section. A field declared inside an
-    <strong>APIs</strong> section <strong>fully replaces</strong> the default of the same name for
-    that section (maps are not merged, arrays not unioned).
+    {{ $t("providers.advanced.introLead")
+    }}<strong>{{ $t("providers.advanced.introApisTab") }}</strong
+    >{{ $t("providers.advanced.introMid")
+    }}<strong>{{ $t("providers.advanced.introFullyReplaces") }}</strong
+    >{{ $t("providers.advanced.introTail") }}
   </p>
 
   <KvEditor
     :model-value="headers"
-    title="Headers"
-    description="Key-value pairs of custom headers (values are plain text)."
-    key-placeholder="Header-Name"
-    value-placeholder="Value"
+    :title="$t('providers.advanced.headersTitle')"
+    :description="$t('providers.advanced.headersDescription')"
+    :key-placeholder="$t('providers.advanced.headerKeyPlaceholder')"
+    :value-placeholder="$t('common.value')"
     @update:model-value="emit('update:headers', $event)"
   />
 
@@ -91,8 +92,8 @@ function addStripField() {
 
   <KvEditor
     :model-value="bodyOverrides"
-    title="Body Overrides"
-    description='Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).'
+    :title="$t('providers.advanced.bodyOverridesTitle')"
+    :description="$t('providers.advanced.bodyOverridesDescription')"
     key-placeholder="max_tokens"
     value-placeholder="4096"
     @update:model-value="emit('update:bodyOverrides', $event)"
@@ -101,11 +102,9 @@ function addStripField() {
   <Separator />
 
   <div>
-    <FieldLabel>Strip Fields</FieldLabel>
+    <FieldLabel>{{ $t("providers.advanced.stripFieldsTitle") }}</FieldLabel>
     <p class="text-muted-foreground mb-2 text-xs">
-      Top-level fields to remove from the upstream JSON body before sending. Applied last, after all
-      overrides. Use for fields the upstream rejects (e.g.
-      <code>chat_template_kwargs</code> for pydantic <code>extra=forbid</code>).
+      {{ $t("providers.advanced.stripFieldsDescription") }}
     </p>
     <div v-for="(_, idx) in stripFields" :key="idx" class="mb-2 flex items-center gap-2">
       <Input
@@ -117,15 +116,19 @@ function addStripField() {
         <X class="h-3 w-3" />
       </Button>
     </div>
-    <Button type="button" variant="outline" size="sm" @click="addStripField"> Add Field </Button>
+    <Button type="button" variant="outline" size="sm" @click="addStripField">
+      {{ $t("providers.advanced.addField") }}
+    </Button>
   </div>
 
   <Separator />
 
   <KvEditor
     :model-value="roleMappings"
-    title="Role Mappings"
-    :description="roleMappingsDescription"
+    :title="$t('providers.advanced.roleMappingsTitle')"
+    :description="
+      roleMappingsDescription ?? $t('providers.advanced.roleMappingsDescriptionDefault')
+    "
     key-placeholder="developer"
     value-placeholder="system"
     @update:model-value="emit('update:roleMappings', $event)"

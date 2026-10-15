@@ -15,6 +15,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
+import { t } from "@/lib/i18n"
 import { validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, TargetItem } from "@/types/api"
@@ -99,19 +100,23 @@ const API_KIND_SHORT: Record<string, string> = {
 
 function providerApiSummary(p: Provider): string {
   const kinds = Object.keys(p.apis ?? {})
-  return kinds.length > 0 ? kinds.map((k) => API_KIND_SHORT[k] ?? k).join("/") : "no apis"
+  return kinds.length > 0
+    ? kinds.map((k) => API_KIND_SHORT[k] ?? k).join("/")
+    : t("routes.targetEditor.noApis")
 }
 
 function getProviderOptions(target: TargetItem): ComboboxOption[] {
   const list: ComboboxOption[] = props.providers.map((p) => ({
     value: p.name,
-    label: `${p.name} (${providerApiSummary(p)})${!p.enabled ? " — Disabled" : ""}`,
+    label: `${p.name} (${providerApiSummary(p)})${
+      !p.enabled ? t("routes.targetEditor.providerDisabledSuffix") : ""
+    }`,
     warning: !p.enabled,
   }))
   if (target.provider && !props.providers.some((p) => p.name === target.provider)) {
     list.unshift({
       value: target.provider,
-      label: `${target.provider} (Not Found)`,
+      label: t("routes.targetEditor.providerNotFound", { name: target.provider }),
       warning: true,
     })
   }
@@ -127,7 +132,9 @@ function getModelOptions(target: TargetItem): ComboboxOption[] {
       p && p.enabled_models.length > 0 && !p.enabled_models.includes(target.real_model)
     options.unshift({
       value: target.real_model,
-      label: isInvalid ? `${target.real_model} (Unavailable / Not in provider)` : target.real_model,
+      label: isInvalid
+        ? t("routes.targetEditor.modelUnavailable", { model: target.real_model })
+        : target.real_model,
       warning: isInvalid,
     })
   }
@@ -195,10 +202,10 @@ function onProviderChange(index: number, value: string) {
 <template>
   <div class="mt-6 space-y-3">
     <div class="flex items-center justify-between">
-      <p class="text-sm font-medium">Targets</p>
+      <p class="text-sm font-medium">{{ $t("routes.targetEditor.title") }}</p>
       <Button type="button" variant="outline" size="sm" @click="addTarget">
         <Plus class="mr-1 h-3.5 w-3.5" />
-        Add Target
+        {{ $t("routes.targetEditor.addTarget") }}
       </Button>
     </div>
 
@@ -209,14 +216,14 @@ function onProviderChange(index: number, value: string) {
             <TableHead class="w-[5%] text-center">#</TableHead>
             <TableHead class="w-[15%] cursor-pointer select-none" @click="toggleSort">
               <div class="flex items-center gap-1">
-                Priority
+                {{ $t("routes.targetEditor.priority") }}
                 <ArrowDown v-if="sortDirection === 'desc'" class="h-3 w-3" />
                 <ArrowUp v-else class="h-3 w-3" />
               </div>
             </TableHead>
-            <TableHead class="w-[35%]">Provider</TableHead>
-            <TableHead class="w-[35%]">Model</TableHead>
-            <TableHead class="w-[10%] text-right">Actions</TableHead>
+            <TableHead class="w-[35%]">{{ $t("common.provider") }}</TableHead>
+            <TableHead class="w-[35%]">{{ $t("common.model") }}</TableHead>
+            <TableHead class="w-[10%] text-right">{{ $t("common.actions") }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -238,9 +245,9 @@ function onProviderChange(index: number, value: string) {
                 <Combobox
                   :model-value="t.provider"
                   :options="getProviderOptions(t)"
-                  placeholder="Select provider..."
-                  search-placeholder="Search provider..."
-                  empty-text="No providers found"
+                  :placeholder="$t('routes.targetEditor.selectProvider')"
+                  :search-placeholder="$t('routes.targetEditor.searchProvider')"
+                  :empty-text="$t('routes.targetEditor.noProviders')"
                   @update:model-value="(v) => onProviderChange(modelValue.indexOf(t), v as string)"
                 />
               </TableCell>
@@ -248,9 +255,9 @@ function onProviderChange(index: number, value: string) {
                 <Combobox
                   :model-value="t.real_model"
                   :options="getModelOptions(t)"
-                  placeholder="Select model"
-                  search-placeholder="Search model..."
-                  empty-text="No models found"
+                  :placeholder="$t('routes.targetEditor.selectModel')"
+                  :search-placeholder="$t('routes.targetEditor.searchModel')"
+                  :empty-text="$t('routes.targetEditor.noModels')"
                   :loading="providerModelsLoading && !providerModels[t.provider]"
                   @update:model-value="
                     (v) => updateTarget(modelValue.indexOf(t), { real_model: v as string })
@@ -264,7 +271,11 @@ function onProviderChange(index: number, value: string) {
                     variant="ghost"
                     size="icon"
                     class="size-8"
-                    :aria-label="expandedId === t.id ? 'Close configuration' : 'Open configuration'"
+                    :aria-label="
+                      expandedId === t.id
+                        ? $t('routes.targetEditor.closeConfig')
+                        : $t('routes.targetEditor.openConfig')
+                    "
                     @click="toggleExpand(t.id)"
                   >
                     <EllipsisVertical class="h-3.5 w-3.5" />
@@ -275,7 +286,7 @@ function onProviderChange(index: number, value: string) {
                     size="icon"
                     class="text-destructive hover:text-destructive size-8"
                     :disabled="modelValue.length === 1"
-                    aria-label="Remove target"
+                    :aria-label="$t('routes.targetEditor.removeTarget')"
                     @click="removeTarget(modelValue.indexOf(t))"
                   >
                     <Trash2 class="h-4 w-4" />
@@ -289,7 +300,7 @@ function onProviderChange(index: number, value: string) {
               <TableCell :colspan="5" class="bg-muted/30">
                 <div class="flex items-start gap-3 py-1">
                   <div class="w-24">
-                    <Label class="text-xs">Priority</Label>
+                    <Label class="text-xs">{{ $t("routes.targetEditor.priority") }}</Label>
                     <Input
                       type="number"
                       :model-value="t.priority ?? ''"
@@ -299,7 +310,7 @@ function onProviderChange(index: number, value: string) {
                     />
                   </div>
                   <div class="w-24">
-                    <Label class="text-xs">Retries</Label>
+                    <Label class="text-xs">{{ $t("routes.targetEditor.retries") }}</Label>
                     <Input
                       type="number"
                       :model-value="t.retries"
@@ -309,7 +320,7 @@ function onProviderChange(index: number, value: string) {
                     />
                   </div>
                   <div class="flex-1">
-                    <Label class="text-xs">Extra (JSON)</Label>
+                    <Label class="text-xs">{{ $t("routes.targetEditor.extra") }}</Label>
                     <Textarea
                       :model-value="t.extra"
                       @update:model-value="
@@ -325,7 +336,7 @@ function onProviderChange(index: number, value: string) {
                         validateExtraJson(t.extra) ? 'text-destructive' : 'text-muted-foreground'
                       "
                     >
-                      {{ validateExtraJson(t.extra) ?? "Valid JSON" }}
+                      {{ validateExtraJson(t.extra) ?? $t("routes.targetEditor.validJson") }}
                     </p>
                   </div>
                 </div>

@@ -194,7 +194,7 @@ function removeModel(name: string) {
 <template>
   <div class="space-y-3">
     <p v-if="enabledModels.length === 0" class="text-muted-foreground text-xs">
-      No models listed means all models are allowed (no restriction).
+      {{ $t("providers.models.noRestriction") }}
     </p>
 
     <ItemGroup v-if="enabledModels.length > 0" class="overflow-hidden rounded-md border">
@@ -257,7 +257,7 @@ function removeModel(name: string) {
                   {{ modelTestStates[model]!.error }}
                 </div>
               </template>
-              <template v-else> Click to test </template>
+              <template v-else> {{ $t("providers.models.clickToTest") }} </template>
             </TooltipContent>
           </Tooltip>
 
@@ -266,15 +266,15 @@ function removeModel(name: string) {
               <Button
                 variant="ghost"
                 size="icon-sm"
-                title="Create route"
-                aria-label="Create route"
+                :title="$t('providers.models.createRouteTitle')"
+                :aria-label="$t('providers.models.createRouteTitle')"
                 @click.stop="openCreateRoute(model)"
               >
                 <GitBranch class="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom" align="end" class="text-xs">
-              Create route {{ providerName }}/{{ model }}
+              {{ $t("providers.models.createRouteHint", { provider: providerName, model }) }}
             </TooltipContent>
           </Tooltip>
 
@@ -290,9 +290,9 @@ function removeModel(name: string) {
       <Combobox
         :model-value="enabledModels"
         :options="comboboxOptions"
-        placeholder="Select models..."
-        search-placeholder="Search models..."
-        empty-text="No models found. Click Refresh Models."
+        :placeholder="$t('providers.models.selectPlaceholder')"
+        :search-placeholder="$t('providers.models.searchPlaceholder')"
+        :empty-text="$t('providers.models.emptyText')"
         :loading="upstreamModelsLoading"
         multiple
         @open="onComboboxOpen"
@@ -304,7 +304,7 @@ function removeModel(name: string) {
     <div class="flex items-center gap-2">
       <Input
         :model-value="customModel"
-        placeholder="Or type a model name..."
+        :placeholder="$t('providers.models.customPlaceholder')"
         class="flex-1"
         :disabled="disabled"
         @update:model-value="customModel = String($event)"
@@ -317,7 +317,7 @@ function removeModel(name: string) {
         @click="addCustomModel"
       >
         <Plus class="h-3.5 w-3.5" />
-        Add
+        {{ $t("providers.models.add") }}
       </Button>
     </div>
 
@@ -332,10 +332,10 @@ function removeModel(name: string) {
       >
         <Loader2 v-if="upstreamModelsLoading" class="h-3.5 w-3.5 animate-spin" />
         <RefreshCw v-else class="h-3.5 w-3.5" />
-        Refresh Models
+        {{ $t("providers.models.refresh") }}
       </Button>
       <div v-if="upstreamModelsLoading" class="text-muted-foreground text-xs">
-        Loading models...
+        {{ $t("providers.models.loadingModels") }}
       </div>
     </div>
 
@@ -351,27 +351,31 @@ function removeModel(name: string) {
     >
       <component :is="Modal.Content" class="sm:max-w-md">
         <component :is="Modal.Header">
-          <component :is="Modal.Title">Create Route</component>
+          <component :is="Modal.Title">{{
+            $t("providers.models.createRouteDialogTitle")
+          }}</component>
           <component :is="Modal.Description">
-            Create a single-target route for
-            <span class="text-foreground font-mono font-medium"
+            {{ $t("providers.models.createRouteDescLead")
+            }}<span class="text-foreground font-mono font-medium"
               >{{ providerName }}/{{ routeToCreate }}</span
-            >.
+            >{{ $t("providers.models.createRouteDescTail") }}
           </component>
         </component>
 
         <div class="space-y-2 px-4 py-2 sm:px-0">
-          <FieldLabel for="quick-route-name">Route Name</FieldLabel>
+          <FieldLabel for="quick-route-name">{{
+            $t("providers.models.routeNameLabel")
+          }}</FieldLabel>
           <Input
             id="quick-route-name"
             :model-value="customRouteName"
-            placeholder="e.g. volc/deepseek-v4-flash"
+            :placeholder="$t('providers.models.routeNamePlaceholder')"
             class="font-mono text-sm"
             @input="customRouteName = ($event.target as HTMLInputElement).value"
             @keydown.enter.prevent="canConfirmRoute && confirmCreateRoute()"
           />
           <p v-if="isRouteExisting" class="text-destructive text-xs">
-            Route "{{ customRouteName.trim() }}" already exists.
+            {{ $t("providers.models.routeExists", { name: customRouteName.trim() }) }}
           </p>
         </div>
 
@@ -382,11 +386,11 @@ function removeModel(name: string) {
             :disabled="creatingRoute"
             @click="routeToCreate = null"
           >
-            Cancel
+            {{ $t("common.cancel") }}
           </Button>
           <Button size="sm" :disabled="!canConfirmRoute" @click="confirmCreateRoute">
             <Loader2 v-if="creatingRoute" class="h-3 w-3 animate-spin" />
-            {{ creatingRoute ? "Creating…" : "Confirm" }}
+            {{ creatingRoute ? $t("providers.models.creating") : $t("common.confirm") }}
           </Button>
         </component>
       </component>

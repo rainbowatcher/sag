@@ -57,9 +57,9 @@ async function forceClose(model: string, provider: string, realModel: string) {
           class="h-4 w-4"
           :class="store.breakers.length > 0 ? 'text-amber-500' : 'text-muted-foreground'"
         />
-        <CardTitle class="text-sm font-medium">Circuit Breakers</CardTitle>
+        <CardTitle class="text-sm font-medium">{{ $t("circuitBreaker.title") }}</CardTitle>
         <Badge v-if="store.breakers.length > 0" variant="destructive" class="text-[10px]">
-          {{ store.breakers.length }} tripped
+          {{ $t("circuitBreaker.tripped", { count: store.breakers.length }) }}
         </Badge>
       </div>
       <Button
@@ -67,7 +67,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
         size="icon-sm"
         :disabled="store.loading"
         @click="refresh()"
-        title="Refresh circuit breaker state"
+        :title="$t('circuitBreaker.refreshTitle')"
       >
         <RefreshCw :class="store.loading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
       </Button>
@@ -92,7 +92,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
         class="text-muted-foreground flex items-center justify-center gap-2 py-8 text-sm"
       >
         <ShieldCheck class="h-4 w-4 text-green-500" />
-        All targets healthy — no circuits tripped.
+        {{ $t("circuitBreaker.allHealthy") }}
       </div>
 
       <!-- Breaker list -->
@@ -111,15 +111,19 @@ async function forceClose(model: string, provider: string, realModel: string) {
                 b.state === 'half_open' ? 'border-amber-500/30 bg-amber-500/10 text-amber-600' : ''
               "
             >
-              {{ b.state === "open" ? "Open" : "Half-Open" }}
+              {{
+                b.state === "open"
+                  ? $t("circuitBreaker.stateOpen")
+                  : $t("circuitBreaker.stateHalfOpen")
+              }}
             </Badge>
             <div
               v-if="b.probe_in_flight"
               class="flex items-center gap-0.5 text-[10px] text-amber-600"
-              title="A probe request is currently in flight"
+              :title="$t('circuitBreaker.probingTitle')"
             >
               <Zap class="h-2.5 w-2.5" />
-              probing
+              {{ $t("circuitBreaker.probing") }}
             </div>
           </div>
 
@@ -137,7 +141,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
             <div class="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-xs">
               <span class="text-muted-foreground flex items-center gap-1">
                 <Clock class="h-3 w-3" />
-                Cooldown:
+                {{ $t("circuitBreaker.cooldown") }}
                 <span
                   :class="
                     b.cooldown_until_secs * 1000 <= Date.now()
@@ -153,7 +157,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
                 class="text-muted-foreground flex items-center gap-1"
               >
                 <Activity class="h-3 w-3" />
-                Next probe:
+                {{ $t("circuitBreaker.nextProbe") }}
                 <span
                   :class="
                     b.next_probe_at_secs * 1000 <= Date.now()
@@ -166,7 +170,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
               </span>
               <span v-else class="flex items-center gap-1 font-medium text-amber-600">
                 <Activity class="h-3 w-3" />
-                Probe ready
+                {{ $t("circuitBreaker.probeReady") }}
               </span>
             </div>
           </div>

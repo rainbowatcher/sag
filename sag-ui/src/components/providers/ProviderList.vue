@@ -269,6 +269,7 @@ async function confirmDelete(name: string) {
 
 const columnHelper = createColumnHelper<Provider>()
 
+// headers must stay functions: () => t(...) — string headers freeze on locale switch (see review-p1-p2 Minor-2)
 const columns = [
   columnHelper.accessor("name", {
     header: () => t("common.name"),
@@ -480,7 +481,7 @@ const table = useVueTable({
             <Input
               v-model="searchInput"
               type="text"
-              placeholder="Search providers..."
+              :placeholder="$t('providers.list.searchPlaceholder')"
               class="h-8 pl-8"
             />
           </div>
@@ -494,7 +495,7 @@ const table = useVueTable({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All API sections</SelectItem>
+              <SelectItem value="all">{{ $t("providers.list.filterAllApis") }}</SelectItem>
               <SelectItem value="chat_completions">chat_completions</SelectItem>
               <SelectItem value="responses">responses</SelectItem>
               <SelectItem value="anthropic_messages">anthropic_messages</SelectItem>
@@ -511,8 +512,8 @@ const table = useVueTable({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="name">Name (A-Z)</SelectItem>
-              <SelectItem value="default">Default</SelectItem>
+              <SelectItem value="name">{{ $t("providers.list.sortName") }}</SelectItem>
+              <SelectItem value="default">{{ $t("common.default") }}</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -520,7 +521,7 @@ const table = useVueTable({
           <RefreshButton :loading="store.providersLoading" @click="refreshAll()" />
           <Button size="sm" @click="showAdd = true">
             <Plus class="h-3.5 w-3.5" />
-            Add Provider
+            {{ $t("providers.list.addProvider") }}
           </Button>
         </div>
       </div>
@@ -535,7 +536,7 @@ const table = useVueTable({
       class="text-muted-foreground py-12 text-center"
     >
       <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
-      Loading…
+      {{ $t("common.loading") }}
     </div>
 
     <!-- ── Empty ─────────────────────────────────────────────────── -->
@@ -545,8 +546,8 @@ const table = useVueTable({
     >
       {{
         searchInput || filterApi !== "all"
-          ? "No providers match the current filters."
-          : 'No providers configured. Click "Add Provider" to get started.'
+          ? $t("providers.list.noMatch")
+          : $t("providers.list.empty")
       }}
     </div>
 
@@ -593,12 +594,14 @@ const table = useVueTable({
     >
       <div class="flex items-center justify-between gap-4">
         <p class="text-sm">
-          Delete provider
-          <span class="font-semibold">{{ confirmingDelete }}</span
-          >?
+          {{ $t("providers.list.deleteConfirmPrefix")
+          }}<span class="font-semibold">{{ confirmingDelete }}</span
+          >{{ $t("providers.list.deleteConfirmSuffix") }}
         </p>
         <div class="flex gap-2">
-          <Button variant="outline" size="sm" @click="confirmingDelete = null"> Cancel </Button>
+          <Button variant="outline" size="sm" @click="confirmingDelete = null">
+            {{ $t("common.cancel") }}
+          </Button>
           <Button
             variant="destructive"
             size="sm"
@@ -606,7 +609,7 @@ const table = useVueTable({
             @click="confirmDelete(confirmingDelete)"
           >
             <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
-            {{ deleting ? "Deleting…" : "Delete" }}
+            {{ deleting ? $t("providers.list.deleting") : $t("common.delete") }}
           </Button>
         </div>
       </div>
@@ -616,36 +619,36 @@ const table = useVueTable({
     <component :is="Modal.Root" :open="copyingProvider !== null" @update:open="onCopyOpenChange">
       <component :is="Modal.Content" class="sm:max-w-md">
         <component :is="Modal.Header">
-          <component :is="Modal.Title">Copy Provider</component>
+          <component :is="Modal.Title">{{ $t("providers.list.copyTitle") }}</component>
           <component :is="Modal.Description">
-            Create a new provider by copying
-            <span class="text-foreground font-mono font-medium">{{ copyingProvider?.name }}</span
-            >. All settings and API keys are reused.
+            {{ $t("providers.list.copyDescLead")
+            }}<span class="text-foreground font-mono font-medium">{{ copyingProvider?.name }}</span
+            >{{ $t("providers.list.copyDescTail") }}
           </component>
         </component>
 
         <div class="space-y-2 px-4 py-2 sm:px-0">
-          <FieldLabel for="copy-provider-name">Provider Name</FieldLabel>
+          <FieldLabel for="copy-provider-name">{{ $t("providers.list.copyNameLabel") }}</FieldLabel>
           <Input
             id="copy-provider-name"
             :model-value="copyName"
-            placeholder="e.g. my-openai-copy"
+            :placeholder="$t('providers.list.copyNamePlaceholder')"
             class="font-mono text-sm"
             @input="copyName = ($event.target as HTMLInputElement).value"
             @keydown.enter.prevent="canConfirmCopy && confirmCopy()"
           />
           <p v-if="isCopyNameExisting" class="text-destructive text-xs">
-            Provider "{{ copyName.trim() }}" already exists.
+            {{ $t("providers.list.copyExists", { name: copyName.trim() }) }}
           </p>
         </div>
 
         <component :is="Modal.Footer">
           <Button variant="outline" size="sm" :disabled="isCopying" @click="copyingProvider = null">
-            Cancel
+            {{ $t("common.cancel") }}
           </Button>
           <Button size="sm" :disabled="!canConfirmCopy" @click="confirmCopy">
             <Loader2 v-if="isCopying" class="h-3 w-3 animate-spin" />
-            {{ isCopying ? "Copying…" : "Copy & Edit" }}
+            {{ isCopying ? $t("providers.list.copying") : $t("providers.list.copyAndEdit") }}
           </Button>
         </component>
       </component>

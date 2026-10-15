@@ -287,12 +287,13 @@ const strategyStyles: Record<string, string> = {
     "bg-sky-500/10 text-sky-700 border-sky-500/20 dark:bg-sky-400/15 dark:text-sky-300 dark:border-sky-400/25",
 }
 
-const strategyLabels: Record<string, string> = {
-  sticky_failover: "sticky-failover",
-  fill_first: "fill-first",
-  round_robin: "round-robin",
-}
+const strategyLabels = computed<Record<string, string>>(() => ({
+  sticky_failover: t("routeList.strategy.stickyFailover"),
+  fill_first: t("routeList.strategy.fillFirst"),
+  round_robin: t("routeList.strategy.roundRobin"),
+}))
 
+// headers must stay functions: () => t(...) — string headers freeze on locale switch (see review-p1-p2 Minor-2)
 const columns = [
   columnHelper.accessor("model_name", {
     header: () => t("routeList.columns.modelName", undefined, "Model Name"),
@@ -330,7 +331,7 @@ const columns = [
           variant: "outline",
           class: `rounded-full px-2 text-[10px] font-normal ${strategyStyles[s] || ""}`,
         },
-        () => strategyLabels[s] || s,
+        () => strategyLabels.value[s] || s,
       )
     },
     meta: { class: "2xl:min-w-[140px]" },
@@ -521,7 +522,7 @@ const table = useVueTable({
   <div v-if="routeStore.routes.length > 0" class="flex h-full flex-col gap-4">
     <!-- ── Empty (no match) ─────────────────────────────────────── -->
     <div v-if="filteredRoutes.length === 0" class="text-muted-foreground py-12 text-center text-sm">
-      No routes match the current filters.
+      {{ $t("routeList.noMatch") }}
     </div>
 
     <!-- ── Table ─────────────────────────────────────────────────── -->
@@ -592,19 +593,23 @@ const table = useVueTable({
     <component :is="Modal.Content" class="sm:max-w-md">
       <component :is="Modal.Header">
         <component :is="Modal.Title">
-          {{ confirmFillFirst ? "Reset Fill-First Order" : "Clear Active Target" }}
+          {{
+            confirmFillFirst
+              ? $t("routeList.resetFillFirstTitle")
+              : $t("routeList.clearActiveTitle")
+          }}
         </component>
         <component :is="Modal.Description">
           <template v-if="confirmFillFirst">
-            Reset the cached fill-first order for
-            <span class="font-mono font-medium">{{ confirmEntry?.model }}</span
-            >? The next request will re-shuffle and may route to a different target.
+            {{ $t("routeList.resetFillFirstDescLead")
+            }}<span class="font-mono font-medium">{{ confirmEntry?.model }}</span
+            >{{ $t("routeList.resetFillFirstDescTail") }}
           </template>
           <template v-else>
-            Clear the active target
-            <span class="font-mono font-medium"
+            {{ $t("routeList.clearActiveDescLead")
+            }}<span class="font-mono font-medium"
               >{{ confirmEntry?.provider }}/{{ confirmEntry?.real_model }}</span
-            >? Traffic will revert to priority routing.
+            >{{ $t("routeList.clearActiveDescTail") }}
           </template>
         </component>
       </component>
@@ -615,7 +620,7 @@ const table = useVueTable({
           :disabled="clearingModel !== null"
           @click="cancelClearConfirm"
         >
-          Cancel
+          {{ $t("common.cancel") }}
         </Button>
         <Button
           variant="destructive"
@@ -624,7 +629,13 @@ const table = useVueTable({
           @click="confirmClear"
         >
           <Loader2 v-if="clearingModel !== null" class="h-3 w-3 animate-spin" />
-          {{ clearingModel !== null ? "Clearing…" : confirmFillFirst ? "Reset" : "Clear" }}
+          {{
+            clearingModel !== null
+              ? $t("routeList.clearing")
+              : confirmFillFirst
+                ? $t("routeList.reset")
+                : $t("routeList.clear")
+          }}
         </Button>
       </component>
     </component>
@@ -634,20 +645,20 @@ const table = useVueTable({
   <component :is="Modal.Root" :open="deleteDialogOpen" @update:open="onDeleteOpenChange">
     <component :is="Modal.Content" class="sm:max-w-md">
       <component :is="Modal.Header">
-        <component :is="Modal.Title">Delete Route</component>
+        <component :is="Modal.Title">{{ $t("routeList.deleteTitle") }}</component>
         <component :is="Modal.Description">
-          Are you sure you want to delete route
-          <span class="font-mono font-medium">{{ deleteTarget }}</span
-          >? This action cannot be undone.
+          {{ $t("routeList.deleteDescLead")
+          }}<span class="font-mono font-medium">{{ deleteTarget }}</span
+          >{{ $t("routeList.deleteDescTail") }}
         </component>
       </component>
       <component :is="Modal.Footer">
         <Button variant="outline" size="sm" @click="cancelDelete" :disabled="deleting">
-          Cancel
+          {{ $t("common.cancel") }}
         </Button>
         <Button variant="destructive" size="sm" :disabled="deleting" @click="confirmDelete">
           <Loader2 v-if="deleting" class="h-3 w-3 animate-spin" />
-          {{ deleting ? "Deleting…" : "Delete" }}
+          {{ deleting ? $t("routeList.deleting") : $t("common.delete") }}
         </Button>
       </component>
     </component>
@@ -657,10 +668,10 @@ const table = useVueTable({
   <component :is="Modal.Root" :open="editingRoute !== null" @update:open="onEditOpenChange">
     <component :is="Modal.Content" class="flex max-h-[90vh] flex-col overflow-hidden sm:max-w-3xl">
       <component :is="Modal.Header" class="shrink-0">
-        <component :is="Modal.Title">Edit Route</component>
+        <component :is="Modal.Title">{{ $t("routeList.editTitle") }}</component>
         <component :is="Modal.Description">
-          Modify routing rule for
-          <span class="font-mono font-medium">{{ editingRoute?.model_name }}</span>
+          {{ $t("routeList.editDescLead")
+          }}<span class="font-mono font-medium">{{ editingRoute?.model_name }}</span>
         </component>
       </component>
       <div class="min-h-0 flex-1 overflow-y-auto px-4 pb-4 sm:px-0">
