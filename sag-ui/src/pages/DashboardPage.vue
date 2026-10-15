@@ -3,6 +3,7 @@ import { GitBranch, HeartPulse, Server, ShieldAlert } from "@lucide/vue"
 import { computed, onMounted } from "vue"
 import CircuitBreakerPanel from "@/components/circuit/CircuitBreakerPanel.vue"
 import { Card, CardContent } from "@/components/ui/card"
+import { t } from "@/lib/i18n"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useHealthStore } from "@/stores/health"
@@ -30,26 +31,26 @@ onMounted(async () => {
 // Aggregated analytics (calls, errors, trends) live in Analytics > Insights.
 const cards = computed(() => [
   {
-    label: "Providers",
+    label: t("nav.providers"),
     value: analyticsStore.summary.providerCount,
     icon: Server,
     color: "text-blue-500",
   },
   {
-    label: "Routes",
+    label: t("nav.routes"),
     value: analyticsStore.summary.routeCount,
     icon: GitBranch,
     color: "text-green-500",
   },
   {
-    label: "Circuits Open",
+    label: t("dashboard.circuitsOpen"),
     value: circuitBreakerStore.openBreakers.length,
     icon: ShieldAlert,
     color: circuitBreakerStore.openBreakers.length > 0 ? "text-red-500" : "text-muted-foreground",
   },
   {
-    label: "Gateway",
-    value: healthStore.gatewayOnline ? "Online" : "Offline",
+    label: t("dashboard.gateway"),
+    value: healthStore.gatewayOnline ? t("common.online") : t("common.offline"),
     icon: HeartPulse,
     color: healthStore.gatewayOnline ? "text-green-500" : "text-red-500",
   },

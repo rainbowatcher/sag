@@ -44,6 +44,6 @@ function onClick() {
     @click="onClick"
   >
     <RefreshCw :class="loading ? 'animate-spin' : ''" class="h-3.5 w-3.5" />
-    Refresh
+    {{ $t("common.refresh") }}
   </Button>
 </template>

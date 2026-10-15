@@ -89,18 +89,17 @@ async function handleSave() {
       <div class="max-w-3xl min-w-0 space-y-1.5">
         <CardTitle class="flex items-center gap-2">
           <Timer class="h-4 w-4" />
-          Retry Backoff
+          {{ $t("settings.backoff.formTitle") }}
         </CardTitle>
         <CardDescription>
-          Retry policy applied when an upstream attempt fails. Changes take effect for new requests
-          immediately.
+          {{ $t("settings.backoff.formDescription") }}
         </CardDescription>
       </div>
     </CardHeader>
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-3">
         <div class="space-y-2">
-          <Label for="backoff-retries">Retries</Label>
+          <Label for="backoff-retries">{{ $t("settings.backoff.labelRetries") }}</Label>
           <Input
             id="backoff-retries"
             v-model.number="retries"
@@ -110,10 +109,10 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">Max attempts after the initial one (≥ 1).</p>
+          <p class="text-muted-foreground text-xs">{{ $t("settings.backoff.hintRetries") }}</p>
         </div>
         <div class="space-y-2">
-          <Label for="backoff-base">Base delay (ms)</Label>
+          <Label for="backoff-base">{{ $t("settings.backoff.labelBase") }}</Label>
           <Input
             id="backoff-base"
             v-model.number="baseMs"
@@ -123,10 +122,10 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">Initial delay before the first retry.</p>
+          <p class="text-muted-foreground text-xs">{{ $t("settings.backoff.hintBase") }}</p>
         </div>
         <div class="space-y-2">
-          <Label for="backoff-max">Max delay (ms)</Label>
+          <Label for="backoff-max">{{ $t("settings.backoff.labelMax") }}</Label>
           <Input
             id="backoff-max"
             v-model.number="maxMs"
@@ -136,25 +135,25 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">Upper bound for the exponential delay.</p>
+          <p class="text-muted-foreground text-xs">{{ $t("settings.backoff.hintMax") }}</p>
         </div>
       </div>
 
       <div class="max-w-3xl space-y-3 border-t pt-4">
         <div class="flex items-center justify-between gap-4">
           <div class="space-y-0.5">
-            <Label for="backoff-jitter">Jitter</Label>
+            <Label for="backoff-jitter">{{ $t("settings.backoff.labelJitter") }}</Label>
             <p class="text-muted-foreground text-xs">
-              Randomize each delay to avoid synchronized retries.
+              {{ $t("settings.backoff.hintJitter") }}
             </p>
           </div>
           <Switch id="backoff-jitter" v-model="jitter" :disabled="store.saving" />
         </div>
         <div class="flex items-center justify-between gap-4">
           <div class="space-y-0.5">
-            <Label for="backoff-empty">Retry on empty response</Label>
+            <Label for="backoff-empty">{{ $t("settings.backoff.labelRetryOnEmpty") }}</Label>
             <p class="text-muted-foreground text-xs">
-              Treat an empty upstream response as a retryable failure.
+              {{ $t("settings.backoff.hintRetryOnEmpty") }}
             </p>
           </div>
           <Switch id="backoff-empty" v-model="retryOnEmpty" :disabled="store.saving" />
@@ -173,7 +172,7 @@ async function handleSave() {
         <Button :disabled="store.saving" @click="handleSave">
           <Loader2 v-if="store.saving" class="h-3.5 w-3.5 animate-spin" />
           <Save v-else class="h-3.5 w-3.5" />
-          Save
+          {{ $t("common.save") }}
         </Button>
       </div>
     </CardContent>

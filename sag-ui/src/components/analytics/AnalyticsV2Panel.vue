@@ -603,7 +603,7 @@ const groupRows = computed<GroupRow[]>(() => {
             class="rounded-sm px-3 py-1 text-sm transition-colors"
             :class="scope === s ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground'"
           >
-            {{ s === "route" ? "Route" : "Target" }}
+            {{ s === "route" ? $t("analytics.v2.scopeRoute") : $t("analytics.v2.scopeTarget") }}
           </button>
         </div>
         <Select
@@ -618,37 +618,37 @@ const groupRows = computed<GroupRow[]>(() => {
             <SelectItem value="1h">1h</SelectItem>
             <SelectItem value="24h">24h</SelectItem>
             <SelectItem value="7d">7d</SelectItem>
-            <SelectItem value="custom">Custom</SelectItem>
+            <SelectItem value="custom">{{ $t("common.custom") }}</SelectItem>
           </SelectContent>
         </Select>
         <DateRangePicker
           v-if="range === 'custom'"
           v-model="customRange"
           class="shrink-0"
-          placeholder="Pick a range"
+          :placeholder="$t('analytics.v2.pickRange')"
         />
         <div class="flex shrink-0 items-center gap-2">
           <SearchSelect
             v-model="routeFilter"
             :options="routeOptions"
-            placeholder="route"
-            search-placeholder="Search route..."
+            :placeholder="$t('analytics.v2.filterRoute')"
+            :search-placeholder="$t('analytics.v2.searchRoute')"
             class="w-40 shrink-0"
           />
           <SearchSelect
             v-if="scope === 'target'"
             v-model="providerFilter"
             :options="providerOptions"
-            placeholder="provider"
-            search-placeholder="Search provider..."
+            :placeholder="$t('analytics.v2.filterProvider')"
+            :search-placeholder="$t('analytics.v2.searchProvider')"
             class="w-40 shrink-0"
           />
           <SearchSelect
             v-if="scope === 'target'"
             v-model="modelFilter"
             :options="modelOptions"
-            placeholder="actual model"
-            search-placeholder="Search actual model..."
+            :placeholder="$t('analytics.v2.filterActualModel')"
+            :search-placeholder="$t('analytics.v2.searchActualModel')"
             class="w-40 shrink-0"
           />
         </div>
@@ -659,7 +659,7 @@ const groupRows = computed<GroupRow[]>(() => {
           @click="refresh()"
         >
           <Search class="h-3.5 w-3.5" />
-          Query
+          {{ $t("common.query") }}
         </Button>
         <RefreshButton
           :loading="loading"
@@ -676,34 +676,36 @@ const groupRows = computed<GroupRow[]>(() => {
         v-if="loading && !overall && !trend"
         class="text-muted-foreground flex items-center justify-center gap-2 py-16"
       >
-        <Loader2 class="h-5 w-5 animate-spin" /> Loading...
+        <Loader2 class="h-5 w-5 animate-spin" /> {{ $t("common.loading") }}
       </div>
       <div
         v-else-if="!overall && !trend && !summaryError && !trendError"
         class="text-muted-foreground flex items-center justify-center py-16 text-sm"
       >
-        No analytics data in this range. Adjust filters and click Query.
+        {{ $t("analytics.v2.noData") }}
       </div>
 
       <template v-else>
         <!-- ── Summary section ────────────────────────────────── -->
         <Alert v-if="summaryError" variant="destructive">
           <AlertCircle class="h-4 w-4" />
-          <AlertTitle>Failed to load summary</AlertTitle>
+          <AlertTitle>{{ $t("analytics.v2.failedSummary") }}</AlertTitle>
           <AlertDescription class="break-words">{{ summaryError }}</AlertDescription>
-          <Button variant="destructive" size="sm" class="mt-2" @click="refresh()">Retry</Button>
+          <Button variant="destructive" size="sm" class="mt-2" @click="refresh()">{{
+            $t("common.retry")
+          }}</Button>
         </Alert>
         <div
           v-else-if="summaryLoading && !overall"
           class="text-muted-foreground flex items-center justify-center gap-2 py-8"
         >
-          <Loader2 class="h-4 w-4 animate-spin" /> Loading summary...
+          <Loader2 class="h-4 w-4 animate-spin" /> {{ $t("analytics.v2.loadingSummary") }}
         </div>
         <div
           v-else-if="!overall"
           class="text-muted-foreground flex items-center justify-center py-8 text-sm"
         >
-          No summary data in this range.
+          {{ $t("analytics.v2.noSummary") }}
         </div>
 
         <!-- ── Summary cards ───────────────────────────────────── -->
@@ -718,8 +720,12 @@ const groupRows = computed<GroupRow[]>(() => {
                     {{ populationOf(overall, scope).toLocaleString() }}
                   </p>
                   <p class="text-muted-foreground text-xs">
-                    Success {{ overall.success.toLocaleString() }} · Failure
-                    {{ overall.failure.toLocaleString() }}
+                    {{
+                      $t("analytics.v2.successFailure", {
+                        success: overall.success.toLocaleString(),
+                        failure: overall.failure.toLocaleString(),
+                      })
+                    }}
                   </p>
                 </div>
               </CardContent>
@@ -728,7 +734,9 @@ const groupRows = computed<GroupRow[]>(() => {
               <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
                 <Activity class="h-5 w-5 text-green-500" />
                 <div>
-                  <p class="text-muted-foreground text-xs">Success Rate</p>
+                  <p class="text-muted-foreground text-xs">
+                    {{ $t("analytics.v2.columns.successRate") }}
+                  </p>
                   <p
                     v-if="overall.success_rate !== null"
                     class="text-lg font-bold tabular-nums xl:text-xl"
@@ -738,7 +746,11 @@ const groupRows = computed<GroupRow[]>(() => {
                   </p>
                   <p v-else class="text-muted-foreground text-lg">—</p>
                   <p class="text-muted-foreground text-xs">
-                    Failure {{ formatRate(overall.overall_failure_rate) }}
+                    {{
+                      $t("analytics.v2.failureRate", {
+                        rate: formatRate(overall.overall_failure_rate),
+                      })
+                    }}
                   </p>
                 </div>
               </CardContent>
@@ -747,13 +759,17 @@ const groupRows = computed<GroupRow[]>(() => {
               <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
                 <Zap class="h-5 w-5 text-amber-500" />
                 <div>
-                  <p class="text-muted-foreground text-xs">Input Tokens</p>
+                  <p class="text-muted-foreground text-xs">{{ $t("analytics.v2.inputTokens") }}</p>
                   <p class="text-lg font-bold tabular-nums xl:text-xl">
                     {{ formatCompactNumber(overall.prompt_tokens) }}
                   </p>
                   <p class="text-muted-foreground text-xs">
-                    Out {{ formatCompactNumber(overall.completion_tokens) }} · Total
-                    {{ formatCompactNumber(overall.total_tokens) }}
+                    {{
+                      $t("analytics.v2.outTotal", {
+                        out: formatCompactNumber(overall.completion_tokens),
+                        total: formatCompactNumber(overall.total_tokens),
+                      })
+                    }}
                   </p>
                 </div>
               </CardContent>
@@ -762,7 +778,7 @@ const groupRows = computed<GroupRow[]>(() => {
               <CardContent class="flex items-center gap-3 p-4 xl:gap-4">
                 <Gauge class="h-5 w-5 text-purple-500" />
                 <div>
-                  <p class="text-muted-foreground text-xs">Throughput</p>
+                  <p class="text-muted-foreground text-xs">{{ $t("analytics.v2.throughput") }}</p>
                   <p class="text-lg font-bold tabular-nums xl:text-xl">
                     {{
                       overall.request_throughput_per_sec !== null
@@ -771,8 +787,12 @@ const groupRows = computed<GroupRow[]>(() => {
                     }}
                   </p>
                   <p class="text-muted-foreground text-xs">
-                    In {{ formatRatePerSec(overall.input_token_throughput_per_sec) }} · Out
-                    {{ formatRatePerSec(overall.output_token_throughput_per_sec) }} tokens/s
+                    {{
+                      $t("analytics.v2.inOutTokensPerSec", {
+                        input: formatRatePerSec(overall.input_token_throughput_per_sec),
+                        output: formatRatePerSec(overall.output_token_throughput_per_sec),
+                      })
+                    }}
                   </p>
                 </div>
               </CardContent>
@@ -785,27 +805,30 @@ const groupRows = computed<GroupRow[]>(() => {
               <CardContent class="p-4">
                 <div class="flex items-center justify-between">
                   <p class="text-muted-foreground flex items-center gap-1.5 text-xs">
-                    <Database class="h-3.5 w-3.5" /> Cache Hit (requests)
+                    <Database class="h-3.5 w-3.5" /> {{ $t("analytics.v2.cacheHitRequests") }}
                   </p>
                   <Badge
                     v-if="overall.cache_unknown > 0"
                     variant="outline"
                     class="border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-400"
                   >
-                    unknown {{ overall.cache_unknown }}
+                    {{ $t("analytics.v2.cacheUnknownBadge", { count: overall.cache_unknown }) }}
                   </Badge>
                 </div>
                 <p class="text-lg font-bold tabular-nums xl:text-xl">
                   {{ formatRate(overall.request_cache_hit_rate) }}
                 </p>
                 <p class="text-muted-foreground text-xs">
-                  Token hit {{ formatRate(overall.token_cache_hit_rate) }}
-                  <template v-if="overall.cache_known > 0">
-                    · {{ overall.cache_known.toLocaleString() }} known
-                  </template>
-                  <template v-if="overall.cache_unknown > 0">
-                    · {{ overall.cache_unknown.toLocaleString() }} unknown
-                  </template>
+                  {{
+                    $t("analytics.v2.tokenHit", {
+                      rate: formatRate(overall.token_cache_hit_rate),
+                    })
+                  }}<template v-if="overall.cache_known > 0">{{
+                    $t("analytics.v2.known", { count: overall.cache_known.toLocaleString() })
+                  }}</template
+                  ><template v-if="overall.cache_unknown > 0">{{
+                    $t("analytics.v2.unknown", { count: overall.cache_unknown.toLocaleString() })
+                  }}</template>
                 </p>
               </CardContent>
             </Card>
@@ -814,7 +837,8 @@ const groupRows = computed<GroupRow[]>(() => {
               <CardContent class="p-4">
                 <div class="flex items-center justify-between">
                   <p class="text-muted-foreground flex items-center gap-1.5 text-xs">
-                    <component :is="lc.icon" class="h-3.5 w-3.5" /> {{ lc.title }} Latency
+                    <component :is="lc.icon" class="h-3.5 w-3.5" />
+                    {{ $t("analytics.v2.latencyTitle", { metric: lc.title }) }}
                   </p>
                   <div class="flex items-center gap-1">
                     <Badge
@@ -823,14 +847,14 @@ const groupRows = computed<GroupRow[]>(() => {
                       class="border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-400"
                       :title="$t('analytics.approxPercentilesTooltip')"
                     >
-                      ≈ approx
+                      {{ $t("analytics.v2.approx") }}
                     </Badge>
                     <Badge
                       v-if="lc.metric.low_sample"
                       variant="outline"
                       class="border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-400"
                     >
-                      low sample
+                      {{ $t("analytics.v2.lowSample") }}
                     </Badge>
                   </div>
                 </div>
@@ -838,14 +862,22 @@ const groupRows = computed<GroupRow[]>(() => {
                   {{ formatLatency(lc.metric.avg_ms) }}
                 </p>
                 <p class="text-muted-foreground text-xs">
-                  P50 {{ formatLatency(lc.metric.p50_ms) }} · P95
-                  {{ formatLatency(lc.metric.p95_ms) }} · P99
-                  {{ formatLatency(lc.metric.p99_ms) }}
+                  {{
+                    $t("analytics.v2.percentiles", {
+                      p50: formatLatency(lc.metric.p50_ms),
+                      p95: formatLatency(lc.metric.p95_ms),
+                      p99: formatLatency(lc.metric.p99_ms),
+                    })
+                  }}
                 </p>
                 <p class="text-muted-foreground text-[11px]">
-                  coverage {{ formatRate(lc.metric.coverage) }} ·
-                  {{ formatCount(lc.metric.samples) }}/{{ lc.metric.population.toLocaleString() }}
-                  samples
+                  {{
+                    $t("analytics.v2.coverage", {
+                      coverage: formatRate(lc.metric.coverage),
+                      samples: formatCount(lc.metric.samples),
+                      population: lc.metric.population.toLocaleString(),
+                    })
+                  }}
                 </p>
               </CardContent>
             </Card>
@@ -856,7 +888,9 @@ const groupRows = computed<GroupRow[]>(() => {
             v-if="scope === 'route' && unassigned.length > 0"
             class="flex flex-wrap items-center gap-2"
           >
-            <span class="text-muted-foreground text-xs">Unassigned failures:</span>
+            <span class="text-muted-foreground text-xs">{{
+              $t("analytics.v2.unassignedFailures")
+            }}</span>
             <Badge
               v-for="u in unassigned"
               :key="u.category"
@@ -957,7 +991,7 @@ const groupRows = computed<GroupRow[]>(() => {
                     :colspan="groupColumns.length"
                     class="text-muted-foreground py-6 text-center"
                   >
-                    No groups in this range.
+                    {{ $t("analytics.v2.noGroups") }}
                   </TableCell>
                 </TableRow>
               </TableBody>
@@ -970,15 +1004,17 @@ const groupRows = computed<GroupRow[]>(() => {
           <CardContent class="space-y-4 p-4">
             <Alert v-if="trendError" variant="destructive">
               <AlertCircle class="h-4 w-4" />
-              <AlertTitle>Failed to load trend</AlertTitle>
+              <AlertTitle>{{ $t("analytics.v2.failedTrend") }}</AlertTitle>
               <AlertDescription class="break-words">{{ trendError }}</AlertDescription>
-              <Button variant="destructive" size="sm" class="mt-2" @click="refresh()">Retry</Button>
+              <Button variant="destructive" size="sm" class="mt-2" @click="refresh()">{{
+                $t("common.retry")
+              }}</Button>
             </Alert>
             <div
               v-else-if="trendLoading && !trend"
               class="text-muted-foreground flex items-center justify-center gap-2 py-12"
             >
-              <Loader2 class="h-4 w-4 animate-spin" /> Loading trend...
+              <Loader2 class="h-4 w-4 animate-spin" /> {{ $t("analytics.v2.loadingTrend") }}
             </div>
             <div v-else-if="trend">
               <V2TrendChart :trend="trend" :scope="scope" />
@@ -987,7 +1023,7 @@ const groupRows = computed<GroupRow[]>(() => {
               v-else
               class="text-muted-foreground flex items-center justify-center py-12 text-sm"
             >
-              No trend data available.
+              {{ $t("analytics.v2.noTrend") }}
             </div>
           </CardContent>
         </Card>

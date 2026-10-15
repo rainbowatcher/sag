@@ -24,6 +24,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "@/components/ui/tooltip"
+import { t } from "@/lib/i18n"
 import { formatDuration } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useProviderStore } from "@/stores/providers"
@@ -40,22 +41,22 @@ const logsFilterModel = ref("")
 const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
 
-const statusCodeOptions = [
-  { value: "non_2xx", label: "Non-2xx (All Errors)" },
-  { value: "4xx", label: "4xx (Client Errors)" },
-  { value: "5xx", label: "5xx (Server Errors)" },
-  { value: "200", label: "200 OK" },
-  { value: "400", label: "400 Bad Request" },
-  { value: "401", label: "401 Unauthorized" },
-  { value: "403", label: "403 Forbidden" },
-  { value: "404", label: "404 Not Found" },
-  { value: "422", label: "422 Unprocessable Entity" },
-  { value: "429", label: "429 Too Many Requests" },
-  { value: "500", label: "500 Internal Server Error" },
-  { value: "502", label: "502 Bad Gateway" },
-  { value: "503", label: "503 Service Unavailable" },
-  { value: "504", label: "504 Gateway Timeout" },
-]
+const statusCodeOptions = computed(() => [
+  { value: "non_2xx", label: t("logs.status.non2xx") },
+  { value: "4xx", label: t("logs.status.4xx") },
+  { value: "5xx", label: t("logs.status.5xx") },
+  { value: "200", label: t("logs.status.200") },
+  { value: "400", label: t("logs.status.400") },
+  { value: "401", label: t("logs.status.401") },
+  { value: "403", label: t("logs.status.403") },
+  { value: "404", label: t("logs.status.404") },
+  { value: "422", label: t("logs.status.422") },
+  { value: "429", label: t("logs.status.429") },
+  { value: "500", label: t("logs.status.500") },
+  { value: "502", label: t("logs.status.502") },
+  { value: "503", label: t("logs.status.503") },
+  { value: "504", label: t("logs.status.504") },
+])
 
 const providerOptions = computed(() =>
   providerStore.providers.map((p) => ({ value: p.name, label: p.name })),
@@ -165,15 +166,15 @@ function cacheHitRate(row: CallLog): number | null {
   return row.cached_tokens / usage.prompt_tokens
 }
 
-/** Map sentinel provider values to human-readable labels. */
-const SENTINEL_LABELS: Record<string, string> = {
-  __no_route__: "No Route",
-  __all_disabled__: "All Disabled",
-  __all_exhausted__: "All Exhausted",
-}
+/** Map sentinel provider values to human-readable labels (reactive to locale). */
+const sentinelLabels = computed<Record<string, string>>(() => ({
+  __no_route__: t("logs.sentinel.noRoute"),
+  __all_disabled__: t("logs.sentinel.allDisabled"),
+  __all_exhausted__: t("logs.sentinel.allExhausted"),
+}))
 
 function formatProvider(raw: string): { label: string; isSentinel: boolean } {
-  const label = SENTINEL_LABELS[raw]
+  const label = sentinelLabels.value[raw]
   return label != null ? { label, isSentinel: true } : { label: raw, isSentinel: false }
 }
 </script>
@@ -185,32 +186,32 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
         <SearchSelect
           v-model="logsFilterProvider"
           :options="providerOptions"
-          placeholder="provider"
-          search-placeholder="Search provider..."
+          :placeholder="$t('logs.filter.provider')"
+          :search-placeholder="$t('logs.filter.searchProvider')"
           class="flex min-h-[2rem] min-w-0 flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
           v-model="logsFilterModel"
           :options="routeModelOptions"
-          placeholder="model"
-          search-placeholder="Search model..."
+          :placeholder="$t('logs.filter.model')"
+          :search-placeholder="$t('logs.filter.searchModel')"
           class="flex min-h-[2rem] min-w-0 flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
           v-model="logsFilterRealModel"
           :options="modelOptions"
-          placeholder="real_model"
-          search-placeholder="Search real model..."
+          :placeholder="$t('logs.filter.realModel')"
+          :search-placeholder="$t('logs.filter.searchRealModel')"
           class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
         <SearchSelect
           v-model="logsFilterStatusCode"
           :options="statusCodeOptions"
-          placeholder="status"
-          search-placeholder="Search status..."
+          :placeholder="$t('logs.filter.status')"
+          :search-placeholder="$t('logs.filter.searchStatus')"
           class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
@@ -222,7 +223,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
       </div>
       <Alert v-if="store.logsError" variant="destructive">
         <AlertCircle class="h-4 w-4" />
-        <AlertTitle>Failed to load call logs</AlertTitle>
+        <AlertTitle>{{ $t("logs.errorTitle") }}</AlertTitle>
         <AlertDescription class="break-words">{{ store.logsError }}</AlertDescription>
       </Alert>
     </div>
@@ -233,33 +234,41 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
         class="text-muted-foreground py-12 text-center"
       >
         <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
-        Loading…
+        {{ $t("common.loading") }}
       </div>
       <div
         v-else-if="store.logs.length === 0"
         class="text-muted-foreground py-12 text-center text-sm"
       >
-        No call logs match the current filter.
+        {{ $t("logs.empty") }}
       </div>
       <div v-else class="min-h-0 flex-1 overflow-auto rounded-lg border [&>div]:overflow-visible">
         <TooltipProvider :delay-duration="200">
           <Table>
             <TableHeader class="bg-background/95 sticky top-0 z-10 backdrop-blur-xs">
               <TableRow>
-                <TableHead class="min-w-[130px] text-left xl:min-w-[155px]">Time</TableHead>
-                <TableHead class="min-w-[90px] text-left xl:min-w-[110px]">Provider</TableHead>
-                <TableHead class="min-w-[140px] text-left">Client</TableHead>
-                <TableHead class="min-w-[100px] text-left xl:min-w-[130px]">Model</TableHead>
-                <TableHead class="text-right">Prompt</TableHead>
-                <TableHead class="text-right">Completion</TableHead>
-                <TableHead class="text-left">Reasoning</TableHead>
-                <TableHead class="text-right">Cached</TableHead>
-                <TableHead class="text-right">Hit</TableHead>
-                <TableHead class="text-right">Total</TableHead>
-                <TableHead class="text-right">Duration</TableHead>
-                <TableHead class="text-right">Status</TableHead>
-                <TableHead class="text-center">Effect</TableHead>
-                <TableHead class="text-center">Mode</TableHead>
+                <TableHead class="min-w-[130px] text-left xl:min-w-[155px]">{{
+                  $t("logs.columns.time")
+                }}</TableHead>
+                <TableHead class="min-w-[90px] text-left xl:min-w-[110px]">{{
+                  $t("common.provider")
+                }}</TableHead>
+                <TableHead class="min-w-[140px] text-left">{{
+                  $t("logs.columns.client")
+                }}</TableHead>
+                <TableHead class="min-w-[100px] text-left xl:min-w-[130px]">{{
+                  $t("common.model")
+                }}</TableHead>
+                <TableHead class="text-right">{{ $t("logs.columns.prompt") }}</TableHead>
+                <TableHead class="text-right">{{ $t("logs.columns.completion") }}</TableHead>
+                <TableHead class="text-left">{{ $t("logs.columns.reasoning") }}</TableHead>
+                <TableHead class="text-right">{{ $t("logs.columns.cached") }}</TableHead>
+                <TableHead class="text-right">{{ $t("logs.columns.hit") }}</TableHead>
+                <TableHead class="text-right">{{ $t("logs.columns.total") }}</TableHead>
+                <TableHead class="text-right">{{ $t("logs.columns.duration") }}</TableHead>
+                <TableHead class="text-right">{{ $t("common.status") }}</TableHead>
+                <TableHead class="text-center">{{ $t("logs.columns.effect") }}</TableHead>
+                <TableHead class="text-center">{{ $t("logs.columns.mode") }}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -341,23 +350,23 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                     >
                       <div class="grid grid-cols-[auto_auto] gap-x-4 gap-y-0.5">
                         <template v-if="row.upstream_duration_ms">
-                          <span>upstream</span>
+                          <span>{{ $t("logs.tooltip.upstream") }}</span>
                           <span class="text-right">{{
                             formatDuration(row.upstream_duration_ms)
                           }}</span>
                         </template>
                         <template v-if="row.ttft_ms">
-                          <span>ttft</span>
+                          <span>{{ $t("logs.tooltip.ttft") }}</span>
                           <span class="text-right">{{ formatDuration(row.ttft_ms) }}</span>
                         </template>
                         <template v-if="fmtTps(overallTpsFor(row))">
-                          <span>tps</span>
+                          <span>{{ $t("logs.tooltip.tps") }}</span>
                           <span class="text-right text-green-600">{{
                             fmtTps(overallTpsFor(row))
                           }}</span>
                         </template>
                         <template v-if="fmtTps(streamTpsFor(row))">
-                          <span>stream</span>
+                          <span>{{ $t("logs.tooltip.stream") }}</span>
                           <span class="text-right text-blue-600">{{
                             fmtTps(streamTpsFor(row))
                           }}</span>
@@ -384,7 +393,7 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                 </TableCell>
                 <TableCell>
                   <Badge variant="outline" class="text-xs">
-                    {{ row.reasoning_effort ?? "none" }}
+                    {{ row.reasoning_effort ?? $t("logs.none") }}
                   </Badge>
                 </TableCell>
                 <TableCell class="text-center">
@@ -402,13 +411,13 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
       <div class="flex flex-wrap items-center justify-between gap-4 text-sm">
         <!-- Range info -->
         <div class="text-muted-foreground text-xs sm:text-sm">
-          Showing
-          <span class="text-foreground font-medium tabular-nums">{{ showingStart }}</span>
-          to
-          <span class="text-foreground font-medium tabular-nums">{{ showingEnd }}</span>
-          of
-          <span class="text-foreground font-medium tabular-nums">{{ store.logsTotal }}</span>
-          rows
+          {{ $t("logs.showingLead")
+          }}<span class="text-foreground font-medium tabular-nums">{{ showingStart }}</span
+          >{{ $t("logs.showingTo")
+          }}<span class="text-foreground font-medium tabular-nums">{{ showingEnd }}</span
+          >{{ $t("logs.showingOf")
+          }}<span class="text-foreground font-medium tabular-nums">{{ store.logsTotal }}</span
+          >{{ $t("logs.showingTail") }}
         </div>
 
         <!-- comp-461 style Pagination aligned to the right -->

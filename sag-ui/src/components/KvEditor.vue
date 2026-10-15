@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { Plus, X } from "@lucide/vue"
+import { computed } from "vue"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { t } from "@/lib/i18n"
 
 defineOptions({
   inheritAttrs: false,
@@ -24,11 +26,13 @@ const props = withDefaults(
   {
     title: "",
     description: "",
-    keyPlaceholder: "Key",
-    valuePlaceholder: "Value",
     disabled: false,
   },
 )
+
+/** Caller-provided placeholders, else the localized defaults. */
+const keyPlaceholderText = computed(() => props.keyPlaceholder ?? t("common.key"))
+const valuePlaceholderText = computed(() => props.valuePlaceholder ?? t("common.value"))
 
 const emit = defineEmits<{
   "update:modelValue": [value: KvPair[]]
@@ -73,14 +77,14 @@ function updateValue(idx: number, value: string) {
     <div v-for="(pair, idx) in modelValue" :key="idx" class="mb-1 flex items-center gap-2">
       <Input
         :model-value="pair.key"
-        :placeholder="keyPlaceholder"
+        :placeholder="keyPlaceholderText"
         class="w-48"
         :disabled="disabled"
         @input="updateKey(idx, ($event.target as HTMLInputElement).value)"
       />
       <Input
         :model-value="pair.value"
-        :placeholder="valuePlaceholder"
+        :placeholder="valuePlaceholderText"
         class="flex-1"
         :disabled="disabled"
         @input="updateValue(idx, ($event.target as HTMLInputElement).value)"
@@ -91,7 +95,7 @@ function updateValue(idx: number, value: string) {
     </div>
     <Button type="button" variant="outline" size="sm" :disabled="disabled" @click="addKvPair">
       <Plus class="h-3.5 w-3.5" />
-      Add
+      {{ $t("common.add") }}
     </Button>
   </div>
 </template>

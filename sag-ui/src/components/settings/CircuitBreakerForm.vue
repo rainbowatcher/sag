@@ -111,18 +111,17 @@ async function handleSave() {
       <div class="max-w-3xl min-w-0 space-y-1.5">
         <CardTitle class="flex items-center gap-2">
           <Zap class="h-4 w-4" />
-          Circuit Breaker Cooldowns
+          {{ $t("settings.circuitBreaker.formTitle") }}
         </CardTitle>
         <CardDescription>
-          How long a failing target stays tripped and how often it is probed while cooling down.
-          Changes take effect for new requests immediately.
+          {{ $t("settings.circuitBreaker.formDescription") }}
         </CardDescription>
       </div>
     </CardHeader>
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="space-y-2">
-          <Label for="breaker-quota">Quota exhausted (s)</Label>
+          <Label for="breaker-quota">{{ $t("settings.circuitBreaker.labelQuota") }}</Label>
           <Input
             id="breaker-quota"
             v-model.number="quotaExhaustedSecs"
@@ -133,11 +132,11 @@ async function handleSave() {
             :disabled="store.saving"
           />
           <p class="text-muted-foreground text-xs">
-            Cooldown after an upstream quota-exhausted (403) failure.
+            {{ $t("settings.circuitBreaker.hintQuota") }}
           </p>
         </div>
         <div class="space-y-2">
-          <Label for="breaker-rate">Rate limited (s)</Label>
+          <Label for="breaker-rate">{{ $t("settings.circuitBreaker.labelRate") }}</Label>
           <Input
             id="breaker-rate"
             v-model.number="rateLimitedSecs"
@@ -147,10 +146,12 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">Cooldown after a 429 rate-limit response.</p>
+          <p class="text-muted-foreground text-xs">
+            {{ $t("settings.circuitBreaker.hintRate") }}
+          </p>
         </div>
         <div class="space-y-2">
-          <Label for="breaker-generic">Generic (s)</Label>
+          <Label for="breaker-generic">{{ $t("settings.circuitBreaker.labelGeneric") }}</Label>
           <Input
             id="breaker-generic"
             v-model.number="genericSecs"
@@ -160,10 +161,12 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">Cooldown for any other retryable failure.</p>
+          <p class="text-muted-foreground text-xs">
+            {{ $t("settings.circuitBreaker.hintGeneric") }}
+          </p>
         </div>
         <div class="space-y-2">
-          <Label for="breaker-probe">Probe interval (s)</Label>
+          <Label for="breaker-probe">{{ $t("settings.circuitBreaker.labelProbe") }}</Label>
           <Input
             id="breaker-probe"
             v-model.number="probeIntervalSecs"
@@ -174,7 +177,7 @@ async function handleSave() {
             :disabled="store.saving"
           />
           <p class="text-muted-foreground text-xs">
-            How often an open circuit is probed while it cools down.
+            {{ $t("settings.circuitBreaker.hintProbe") }}
           </p>
         </div>
       </div>
@@ -191,7 +194,7 @@ async function handleSave() {
         <Button :disabled="store.saving" @click="handleSave">
           <Loader2 v-if="store.saving" class="h-3.5 w-3.5 animate-spin" />
           <Save v-else class="h-3.5 w-3.5" />
-          Save
+          {{ $t("common.save") }}
         </Button>
       </div>
     </CardContent>

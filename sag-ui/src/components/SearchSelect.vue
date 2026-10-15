@@ -5,6 +5,7 @@ import { computed, ref, watch, nextTick, onMounted, onUnmounted } from "vue"
 import { Badge } from "@/components/ui/badge"
 import { Command, CommandGroup, CommandItem, CommandList } from "@/components/ui/command"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { t } from "@/lib/i18n"
 import { cn } from "@/lib/utils"
 
 defineOptions({
@@ -30,14 +31,15 @@ const props = withDefaults(
     class?: HTMLAttributes["class"]
   }>(),
   {
-    placeholder: "Select...",
-    searchPlaceholder: "Search...",
-    emptyText: "No results found.",
     disabled: false,
     hideClearAll: false,
     multiple: false,
   },
 )
+
+/** Caller-provided labels, else the localized defaults. */
+const placeholderText = computed(() => props.placeholder ?? t("common.select"))
+const emptyTextResolved = computed(() => props.emptyText ?? t("common.noResults"))
 
 const emit = defineEmits<{
   "update:modelValue": [value: string | string[]]
@@ -240,7 +242,7 @@ onUnmounted(() => {
             v-else
             ref="searchInputRef"
             v-model="searchQuery"
-            :placeholder="selectedLabel || placeholder"
+            :placeholder="selectedLabel || placeholderText"
             :disabled="disabled"
             class="placeholder:text-muted-foreground min-w-[60px] flex-1 bg-transparent text-sm outline-none"
             :class="{ 'text-muted-foreground': !selectedLabel && !searchQuery }"
@@ -268,7 +270,7 @@ onUnmounted(() => {
                 type="button"
                 class="ml-0.5 inline-flex cursor-pointer items-center rounded-full p-0 text-current/60 hover:text-current"
                 @click.stop="removeItem(value)"
-                :aria-label="'Remove ' + value"
+                :aria-label="$t('common.removeItem', { value })"
               >
                 <X :size="12" />
               </button>
@@ -282,7 +284,7 @@ onUnmounted(() => {
           <input
             ref="searchInputRef"
             v-model="searchQuery"
-            :placeholder="internalValue.length === 0 ? placeholder : ''"
+            :placeholder="internalValue.length === 0 ? placeholderText : ''"
             :disabled="disabled"
             class="placeholder:text-muted-foreground min-w-[60px] flex-1 bg-transparent text-sm outline-none"
             @focus="open = true"
@@ -296,7 +298,7 @@ onUnmounted(() => {
           type="button"
           class="text-muted-foreground/60 hover:text-muted-foreground shrink-0 cursor-pointer"
           @click.stop="clearAll"
-          :aria-label="'Clear'"
+          :aria-label="$t('common.clear')"
         >
           <X :size="14" />
         </button>
@@ -312,7 +314,7 @@ onUnmounted(() => {
             v-if="filteredOptions.length === 0"
             class="text-muted-foreground py-6 text-center text-sm"
           >
-            {{ emptyText }}
+            {{ emptyTextResolved }}
           </div>
           <CommandGroup v-else>
             <CommandItem

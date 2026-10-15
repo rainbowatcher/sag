@@ -17,7 +17,6 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { t } from "@/lib/i18n"
-import { API_KIND_LABELS } from "@/lib/provider-probe"
 import type { ApiConfig, ApiKind, ProtocolApiKind, ProxyMode } from "@/types/api"
 
 interface KvPair {
@@ -58,6 +57,14 @@ const emit = defineEmits<{
 const API_KIND_ORDER: ApiKind[] = ["chat_completions", "responses", "anthropic_messages", "image"]
 
 const PROTOCOL_KINDS = new Set<ApiKind>(["chat_completions", "responses", "anthropic_messages"])
+
+/** Display labels for `ApiKind` sections, resolved through `t()` (locale-reactive). */
+const apiKindLabels = computed<Record<ApiKind, string>>(() => ({
+  chat_completions: t("providers.probe.protocolChat"),
+  responses: t("providers.probe.protocolResponses"),
+  anthropic_messages: t("providers.probe.protocolAnthropic"),
+  image: t("providers.apis.kindImage"),
+}))
 
 const DEFAULT_MODELS_ENDPOINT_HINTS: Record<ApiKind, string> = {
   chat_completions: "models",
@@ -329,7 +336,7 @@ function validate(): string | null {
     )
   }
   for (const d of sections.value) {
-    const kind = API_KIND_LABELS[d.kind]
+    const kind = apiKindLabels.value[d.kind]
     if (!d.base_url.trim()) {
       return t(
         "providers.apis.validate.baseUrlRequired",
@@ -389,7 +396,7 @@ defineExpose({ validate })
         </SelectTrigger>
         <SelectContent class="w-(--reka-select-trigger-width)">
           <SelectItem v-for="kind in availableKinds" :key="kind" :value="kind">
-            {{ API_KIND_LABELS[kind] }}
+            {{ apiKindLabels[kind] }}
           </SelectItem>
         </SelectContent>
       </Select>
@@ -411,11 +418,11 @@ defineExpose({ validate })
             :id="`fallback-radio-${d.uid}`"
             :value="d.kind"
             :disabled="protocolKeys.length <= 1"
-            :aria-label="$t('providers.apis.fallbackAria', { kind: API_KIND_LABELS[d.kind] })"
+            :aria-label="$t('providers.apis.fallbackAria', { kind: apiKindLabels[d.kind] })"
           />
           <div class="flex min-w-0 flex-1 items-center gap-2">
             <Badge variant="outline" class="font-mono text-xs">
-              {{ API_KIND_LABELS[d.kind] }}
+              {{ apiKindLabels[d.kind] }}
             </Badge>
             <span class="text-muted-foreground truncate font-mono text-xs">{{ d.base_url }}</span>
           </div>

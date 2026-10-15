@@ -20,7 +20,7 @@ const store = useConnectionStore()
     >
       <div class="space-y-3 text-center">
         <Loader2 class="text-primary mx-auto h-8 w-8 animate-spin" />
-        <p class="text-muted-foreground text-sm">Connecting to gateway...</p>
+        <p class="text-muted-foreground text-sm">{{ $t("app.connecting") }}</p>
       </div>
     </div>
 

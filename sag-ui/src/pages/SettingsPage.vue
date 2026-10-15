@@ -272,7 +272,7 @@ async function handleKeysDisable() {
 
 /** Mask a key for the status badge (never log or toast the full value). */
 function keyFingerprint(key: string): string {
-  if (!key) return "empty"
+  if (!key) return t("settings.auth.keyEmpty")
   if (key.length <= 8) return "••••"
   return `${key.slice(0, 3)}…${key.slice(-4)}`
 }
@@ -283,9 +283,9 @@ function keyFingerprint(key: string): string {
     <div class="shrink-0">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="min-w-0">
-          <h1 class="text-lg font-semibold xl:text-xl">Settings</h1>
+          <h1 class="text-lg font-semibold xl:text-xl">{{ $t("nav.settings") }}</h1>
           <p class="text-muted-foreground text-sm">
-            Gateway-level configuration for proxy and client authentication.
+            {{ $t("settings.page.description") }}
           </p>
         </div>
         <RefreshButton :loading="store.loading" @click="refreshPage" />
@@ -296,39 +296,39 @@ function keyFingerprint(key: string): string {
       <TabsList class="shrink-0 flex-wrap self-start">
         <TabsTrigger value="network" class="gap-1.5">
           <Globe class="h-3.5 w-3.5" />
-          Network
+          {{ $t("settings.tabs.network") }}
         </TabsTrigger>
         <TabsTrigger value="auth" class="gap-1.5">
           <KeyRound class="h-3.5 w-3.5" />
-          Authentication
+          {{ $t("settings.tabs.authentication") }}
           <Badge
             v-if="!store.loading"
             variant="secondary"
             class="ml-1 h-4 px-1 text-[10px]"
             :class="store.apiKeys.length > 0 ? '' : 'text-muted-foreground'"
           >
-            {{ store.apiKeys.length > 0 ? "On" : "Off" }}
+            {{ store.apiKeys.length > 0 ? $t("common.on") : $t("common.off") }}
           </Badge>
         </TabsTrigger>
         <TabsTrigger value="backoff" class="gap-1.5">
           <Timer class="h-3.5 w-3.5" />
-          Backoff
+          {{ $t("settings.tabs.backoff") }}
         </TabsTrigger>
         <TabsTrigger value="breaker" class="gap-1.5">
           <Zap class="h-3.5 w-3.5" />
-          Breaker
+          {{ $t("settings.tabs.breaker") }}
         </TabsTrigger>
         <TabsTrigger value="timers" class="gap-1.5">
           <Clock class="h-3.5 w-3.5" />
-          Timers
+          {{ $t("settings.tabs.timers") }}
         </TabsTrigger>
         <TabsTrigger value="analytics" class="gap-1.5">
           <Database class="h-3.5 w-3.5" />
-          Analytics
+          {{ $t("settings.tabs.analytics") }}
         </TabsTrigger>
         <TabsTrigger value="system" class="gap-1.5">
           <Server class="h-3.5 w-3.5" />
-          System
+          {{ $t("settings.tabs.system") }}
         </TabsTrigger>
         <TabsTrigger value="language" class="gap-1.5">
           <Languages class="h-3.5 w-3.5" />
@@ -345,15 +345,18 @@ function keyFingerprint(key: string): string {
                 <div class="max-w-3xl min-w-0 space-y-1.5">
                   <CardTitle class="flex items-center gap-2">
                     <Globe class="h-4 w-4" />
-                    Global Proxy URL
+                    {{ $t("settings.proxy.title") }}
                   </CardTitle>
                   <CardDescription>
-                    Upstream HTTP/HTTPS proxy for providers whose proxy mode is
-                    <code>inherit</code> or <code>enabled</code>. SOCKS is not supported.
+                    {{ $t("settings.proxy.descriptionLead") }}<code>inherit</code
+                    >{{ $t("settings.proxy.descriptionMid") }}<code>enabled</code
+                    >{{ $t("settings.proxy.descriptionTail") }}
                   </CardDescription>
                 </div>
                 <Badge variant="outline" class="shrink-0 text-[10px]">
-                  {{ store.proxyUrl ? "Configured" : "Direct" }}
+                  {{
+                    store.proxyUrl ? $t("settings.proxy.configured") : $t("settings.proxy.direct")
+                  }}
                 </Badge>
               </div>
             </CardHeader>
@@ -363,7 +366,7 @@ function keyFingerprint(key: string): string {
                 class="text-muted-foreground flex items-center gap-2 text-xs"
               >
                 <Loader2 class="h-3.5 w-3.5 animate-spin" />
-                Loading settings...
+                {{ $t("settings.loadingSettings") }}
               </div>
 
               <div class="max-w-2xl space-y-2 xl:max-w-3xl">
@@ -375,8 +378,7 @@ function keyFingerprint(key: string): string {
                   @keydown.enter.prevent="handleProxySave"
                 />
                 <p class="text-muted-foreground text-xs">
-                  Leave empty for a direct connection. Changes take effect for new upstream requests
-                  immediately.
+                  {{ $t("settings.proxy.hint") }}
                 </p>
               </div>
 
@@ -392,7 +394,7 @@ function keyFingerprint(key: string): string {
                 <Button :disabled="store.loading || proxySaving" @click="handleProxySave">
                   <Loader2 v-if="proxySaving" class="h-3.5 w-3.5 animate-spin" />
                   <Save v-else class="h-3.5 w-3.5" />
-                  Save
+                  {{ $t("common.save") }}
                 </Button>
                 <Button
                   variant="outline"
@@ -400,7 +402,7 @@ function keyFingerprint(key: string): string {
                   @click="handleProxyClear"
                 >
                   <Trash2 class="h-3.5 w-3.5" />
-                  Clear
+                  {{ $t("common.clear") }}
                 </Button>
               </div>
             </CardContent>
@@ -415,11 +417,12 @@ function keyFingerprint(key: string): string {
                 <div class="max-w-3xl min-w-0 space-y-1.5">
                   <CardTitle class="flex items-center gap-2">
                     <KeyRound class="h-4 w-4" />
-                    Gateway API Keys
+                    {{ $t("settings.auth.title") }}
                   </CardTitle>
                   <CardDescription>
-                    Clients must send <code>Authorization: Bearer &lt;key&gt;</code>. An empty list
-                    disables authentication.
+                    {{ $t("settings.auth.descriptionLead")
+                    }}<code>Authorization: Bearer &lt;key&gt;</code
+                    >{{ $t("settings.auth.descriptionTail") }}
                   </CardDescription>
                 </div>
                 <Badge
@@ -431,7 +434,7 @@ function keyFingerprint(key: string): string {
                     :is="store.apiKeys.length > 0 ? ShieldCheck : ShieldOff"
                     class="h-3 w-3"
                   />
-                  {{ store.apiKeys.length > 0 ? "Enabled" : "Disabled" }}
+                  {{ store.apiKeys.length > 0 ? $t("common.enabled") : $t("common.disabled") }}
                 </Badge>
               </div>
             </CardHeader>
@@ -441,13 +444,12 @@ function keyFingerprint(key: string): string {
                 class="text-muted-foreground flex items-center gap-2 text-xs"
               >
                 <Loader2 class="h-3.5 w-3.5 animate-spin" />
-                Loading settings...
+                {{ $t("settings.loadingSettings") }}
               </div>
 
               <template v-else>
                 <div v-if="apiKeys.length === 0" class="text-muted-foreground max-w-3xl text-sm">
-                  Authentication is disabled. Add a key to require clients to authenticate against
-                  this gateway.
+                  {{ $t("settings.auth.disabledHint") }}
                 </div>
 
                 <div v-else class="space-y-2">
@@ -463,7 +465,7 @@ function keyFingerprint(key: string): string {
                       <Input
                         :type="revealKeys[idx] ? 'text' : 'password'"
                         :model-value="key"
-                        :placeholder="`sk-... (key ${idx + 1})`"
+                        :placeholder="$t('settings.auth.keyPlaceholder', { index: idx + 1 })"
                         class="pr-9 font-mono"
                         :disabled="keysSaving"
                         @input="updateApiKey(idx, ($event.target as HTMLInputElement).value)"
@@ -507,8 +509,7 @@ function keyFingerprint(key: string): string {
                   v-if="store.apiKeys.length > 0"
                   class="text-muted-foreground max-w-3xl text-xs"
                 >
-                  Removing the key your dashboard is using will lock you out until you reconnect
-                  with a remaining key.
+                  {{ $t("settings.auth.lockoutWarning") }}
                 </div>
               </template>
 
@@ -520,12 +521,12 @@ function keyFingerprint(key: string): string {
                   @click="addApiKey"
                 >
                   <Plus class="h-3.5 w-3.5" />
-                  Add Key
+                  {{ $t("settings.auth.addKey") }}
                 </Button>
                 <Button :disabled="store.loading || keysSaving" @click="handleKeysSave">
                   <Loader2 v-if="keysSaving" class="h-3.5 w-3.5 animate-spin" />
                   <Save v-else class="h-3.5 w-3.5" />
-                  Save Keys
+                  {{ $t("settings.auth.saveKeys") }}
                 </Button>
                 <Button
                   v-if="store.apiKeys.length > 0"
@@ -534,7 +535,7 @@ function keyFingerprint(key: string): string {
                   @click="handleKeysDisable"
                 >
                   <ShieldOff class="h-3.5 w-3.5" />
-                  Disable Auth
+                  {{ $t("settings.auth.disableAuth") }}
                 </Button>
               </div>
             </CardContent>
@@ -548,7 +549,7 @@ function keyFingerprint(key: string): string {
             class="text-muted-foreground flex items-center gap-2 text-xs"
           >
             <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            Loading config...
+            {{ $t("settings.loadingConfig") }}
           </div>
           <div
             v-else-if="gatewayConfig.error && !gatewayConfig.config"
@@ -567,7 +568,7 @@ function keyFingerprint(key: string): string {
             class="text-muted-foreground flex items-center gap-2 text-xs"
           >
             <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            Loading config...
+            {{ $t("settings.loadingConfig") }}
           </div>
           <div
             v-else-if="gatewayConfig.error && !gatewayConfig.config"
@@ -586,7 +587,7 @@ function keyFingerprint(key: string): string {
             class="text-muted-foreground flex items-center gap-2 text-xs"
           >
             <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            Loading config...
+            {{ $t("settings.loadingConfig") }}
           </div>
           <div
             v-else-if="gatewayConfig.error && !gatewayConfig.config"
@@ -605,13 +606,13 @@ function keyFingerprint(key: string): string {
             class="text-muted-foreground flex items-center gap-2 text-xs"
           >
             <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            Loading config...
+            {{ $t("settings.loadingConfig") }}
           </div>
           <SystemInfoCard
             v-else
-            title="Analytics"
-            description="Analytics collection and SQLite storage. Changes take effect after a gateway restart."
-            badge="Requires restart"
+            :title="$t('settings.tabs.analytics')"
+            :description="$t('settings.analytics.description')"
+            :badge="$t('settings.info.requiresRestart')"
             :icon="Database"
             :rows="analyticsRows"
           />
@@ -624,26 +625,26 @@ function keyFingerprint(key: string): string {
             class="text-muted-foreground flex items-center gap-2 text-xs"
           >
             <Loader2 class="h-3.5 w-3.5 animate-spin" />
-            Loading config...
+            {{ $t("settings.loadingConfig") }}
           </div>
           <template v-else>
             <SystemInfoCard
-              title="Server"
-              description="Gateway listen address."
-              badge="Requires restart"
+              :title="$t('settings.system.serverTitle')"
+              :description="$t('settings.system.serverDescription')"
+              :badge="$t('settings.info.requiresRestart')"
               :icon="Server"
               :rows="serverRows"
             />
             <SystemInfoCard
-              title="Logging"
-              description="Log verbosity and output format."
-              badge="Requires restart"
+              :title="$t('settings.system.loggingTitle')"
+              :description="$t('settings.system.loggingDescription')"
+              :badge="$t('settings.info.requiresRestart')"
               :icon="ScrollText"
               :rows="loggingRows"
             />
             <p class="text-muted-foreground max-w-3xl text-xs">
-              These values come from <code>gateway.toml</code> and only apply at process startup.
-              Restart the gateway to change them.
+              {{ $t("settings.system.restartNoteLead") }}<code>gateway.toml</code
+              >{{ $t("settings.system.restartNoteTail") }}
             </p>
           </template>
         </TabsContent>

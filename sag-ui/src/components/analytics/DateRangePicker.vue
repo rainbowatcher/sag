@@ -6,6 +6,7 @@ import type { HTMLAttributes } from "vue"
 import { computed, ref } from "vue"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { RangeCalendar } from "@/components/ui/range-calendar"
+import { t } from "@/lib/i18n"
 import { cn } from "@/lib/utils"
 
 export interface DateRangeMs {
@@ -15,14 +16,14 @@ export interface DateRangeMs {
   toMs: number
 }
 
-const props = withDefaults(
-  defineProps<{
-    modelValue: DateRangeMs | null
-    placeholder?: string
-    class?: HTMLAttributes["class"]
-  }>(),
-  { placeholder: "Pick a range" },
-)
+const props = defineProps<{
+  modelValue: DateRangeMs | null
+  placeholder?: string
+  class?: HTMLAttributes["class"]
+}>()
+
+/** Caller-provided placeholder, else the localized default. */
+const placeholderText = computed(() => props.placeholder ?? t("analytics.v2.pickRange"))
 
 const emit = defineEmits<{
   "update:modelValue": [value: DateRangeMs | null]
@@ -90,7 +91,7 @@ const displayLabel = computed(() => {
         "
       >
         <Calendar class="h-4 w-4 shrink-0" />
-        <span class="min-w-0 truncate">{{ displayLabel || placeholder }}</span>
+        <span class="min-w-0 truncate">{{ displayLabel || placeholderText }}</span>
       </div>
     </PopoverTrigger>
     <PopoverContent class="w-auto p-0" align="start">

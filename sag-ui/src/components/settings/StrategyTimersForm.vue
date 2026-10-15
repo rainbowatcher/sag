@@ -91,18 +91,17 @@ async function handleSave() {
       <div class="max-w-3xl min-w-0 space-y-1.5">
         <CardTitle class="flex items-center gap-2">
           <Clock class="h-4 w-4" />
-          Strategy Timers
+          {{ $t("settings.strategyTimers.formTitle") }}
         </CardTitle>
         <CardDescription>
-          Time-to-live values for the routing caches. Changes take effect for new requests
-          immediately.
+          {{ $t("settings.strategyTimers.formDescription") }}
         </CardDescription>
       </div>
     </CardHeader>
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-2">
         <div class="space-y-2">
-          <Label for="timers-shuffle">Fill-first cache TTL (s)</Label>
+          <Label for="timers-shuffle">{{ $t("settings.strategyTimers.labelFillFirstTtl") }}</Label>
           <Input
             id="timers-shuffle"
             v-model.number="shuffleCacheTtlSecs"
@@ -113,11 +112,12 @@ async function handleSave() {
             :disabled="store.saving"
           />
           <p class="text-muted-foreground text-xs">
-            How long a fill-first shuffled order stays cached. <code>0</code> never expires it.
+            {{ $t("settings.strategyTimers.hintFillFirstTtlLead") }}<code>0</code
+            >{{ $t("settings.strategyTimers.hintFillFirstTtlTail") }}
           </p>
         </div>
         <div class="space-y-2">
-          <Label for="timers-sticky">Sticky failover reset (s)</Label>
+          <Label for="timers-sticky">{{ $t("settings.strategyTimers.labelStickyReset") }}</Label>
           <Input
             id="timers-sticky"
             v-model.number="stickyFailoverResetSecs"
@@ -128,8 +128,7 @@ async function handleSave() {
             :disabled="store.saving"
           />
           <p class="text-muted-foreground text-xs">
-            How long a sticky-failover pin is remembered before the route's primary target is tried
-            again.
+            {{ $t("settings.strategyTimers.hintStickyReset") }}
           </p>
         </div>
       </div>
@@ -146,7 +145,7 @@ async function handleSave() {
         <Button :disabled="store.saving" @click="handleSave">
           <Loader2 v-if="store.saving" class="h-3.5 w-3.5 animate-spin" />
           <Save v-else class="h-3.5 w-3.5" />
-          Save
+          {{ $t("common.save") }}
         </Button>
       </div>
     </CardContent>

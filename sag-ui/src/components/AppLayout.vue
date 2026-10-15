@@ -132,7 +132,7 @@ const contentMaxClass = computed(() =>
             :class="health.gatewayOnline ? '' : 'text-destructive border-destructive/30'"
           >
             <component :is="health.gatewayOnline ? Wifi : WifiOff" class="h-3 w-3" />
-            {{ health.gatewayOnline ? "Connected" : "Offline" }}
+            {{ health.gatewayOnline ? $t("common.connected") : $t("common.offline") }}
           </Badge>
           <Button
             variant="ghost"
@@ -155,7 +155,7 @@ const contentMaxClass = computed(() =>
           @click="handleDisconnect"
         >
           <LogOut class="h-3 w-3" />
-          <span class="group-data-[collapsible=icon]:hidden">Disconnect</span>
+          <span class="group-data-[collapsible=icon]:hidden">{{ $t("common.disconnect") }}</span>
         </Button>
       </SidebarFooter>
       <SidebarRail />

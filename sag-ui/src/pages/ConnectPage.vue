@@ -2,6 +2,7 @@
 import { Loader2, Plug, Server, Key, AlertCircle } from "@lucide/vue"
 import { ref, onMounted } from "vue"
 import { useRoute, useRouter } from "vue-router"
+import { t } from "@/lib/i18n"
 import { useConnectionStore } from "@/stores/connection"
 
 const store = useConnectionStore()
@@ -20,7 +21,7 @@ onMounted(() => {
     apiKey.value = store.connection.apiKey
   }
   if (route.query.reason === "expired") {
-    error.value = "Your session has expired. Please reconnect."
+    error.value = t("connect.sessionExpired")
   }
 })
 
@@ -49,7 +50,7 @@ async function handleConnect() {
           S
         </div>
         <h1 class="text-xl font-bold tracking-tight">SAG Gateway</h1>
-        <p class="text-muted-foreground mt-1 text-sm">Connect to your AI gateway</p>
+        <p class="text-muted-foreground mt-1 text-sm">{{ $t("connect.subtitle") }}</p>
       </div>
 
       <!-- Form card -->
@@ -61,7 +62,7 @@ async function handleConnect() {
         <div class="space-y-1.5">
           <label class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium">
             <Server class="h-3.5 w-3.5" />
-            Gateway URL
+            {{ $t("connect.gatewayUrl") }}
           </label>
           <input
             v-model="gatewayUrl"
@@ -76,12 +77,12 @@ async function handleConnect() {
         <div class="space-y-1.5">
           <label class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium">
             <Key class="h-3.5 w-3.5" />
-            API Key
+            {{ $t("connect.apiKey") }}
           </label>
           <input
             v-model="apiKey"
             type="password"
-            placeholder="Enter gateway API key..."
+            :placeholder="$t('connect.apiKeyPlaceholder')"
             :disabled="store.connecting"
             class="bg-background placeholder:text-muted-foreground/50 focus:ring-ring h-10 w-full rounded-md border px-3 text-sm transition-shadow outline-none focus:ring-2 disabled:opacity-50"
           />
@@ -104,13 +105,15 @@ async function handleConnect() {
         >
           <Loader2 v-if="store.connecting" class="h-4 w-4 animate-spin" />
           <Plug v-else class="h-4 w-4" />
-          {{ store.connecting ? "Connecting..." : "Connect" }}
+          {{ store.connecting ? $t("connect.connecting") : $t("connect.connect") }}
         </button>
       </form>
 
       <p class="text-muted-foreground mt-4 text-center text-[10px]">
-        Configured in <code class="bg-muted rounded px-1 text-[10px]">gateway.toml</code> →
-        <code class="bg-muted rounded px-1 text-[10px]">[gateway_auth]</code>
+        {{ $t("connect.configuredIn")
+        }}<code class="bg-muted rounded px-1 text-[10px]">gateway.toml</code
+        >{{ $t("connect.configuredArrow")
+        }}<code class="bg-muted rounded px-1 text-[10px]">[gateway_auth]</code>
       </p>
     </div>
   </div>

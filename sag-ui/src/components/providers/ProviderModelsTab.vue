@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from "vue"
 import ModelManager from "@/components/ModelManager.vue"
 import {
   Select,
@@ -7,7 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { API_KIND_LABELS } from "@/lib/provider-probe"
+import { t } from "@/lib/i18n"
 import { useProviderStore } from "@/stores/providers"
 import type { ApiConfig, ApiKind } from "@/types/api"
 
@@ -27,6 +28,14 @@ const emit = defineEmits<{
 }>()
 
 const store = useProviderStore()
+
+/** Display labels for `ApiKind` sections, resolved through `t()` (locale-reactive). */
+const apiKindLabels = computed<Record<ApiKind, string>>(() => ({
+  chat_completions: t("providers.probe.protocolChat"),
+  responses: t("providers.probe.protocolResponses"),
+  anthropic_messages: t("providers.probe.protocolAnthropic"),
+  image: t("providers.apis.kindImage"),
+}))
 </script>
 
 <template>
@@ -41,7 +50,7 @@ const store = useProviderStore()
       </SelectTrigger>
       <SelectContent class="w-(--reka-select-trigger-width)">
         <SelectItem v-for="kind in protocolSections" :key="kind" :value="kind" class="text-xs">
-          {{ API_KIND_LABELS[kind] }}
+          {{ apiKindLabels[kind] }}
         </SelectItem>
       </SelectContent>
     </Select>

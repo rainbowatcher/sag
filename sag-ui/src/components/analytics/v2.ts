@@ -1,3 +1,4 @@
+import { t } from "@/lib/i18n"
 import { formatDuration } from "@/lib/utils"
 import type { AnalyticsGroupKey, AnalyticsScope, MetricSummary } from "@/types/api"
 
@@ -41,12 +42,14 @@ export function populationOf(m: MetricSummary, scope: AnalyticsScope): number {
  *  non-client-error requests ("Requests"). The two are never mislabelled
  *  as each other. */
 export function populationLabel(scope: AnalyticsScope): string {
-  return scope === "target" ? "attempts" : "Requests"
+  return scope === "target"
+    ? t("analytics.v2.populationAttempts")
+    : t("analytics.v2.populationRequests")
 }
 
 /** Per-second unit of the overall throughput metric — the backend's
  *  `request_throughput_per_sec` counts attempts in target scope, so the
  *  unit must not be hardcoded as `req/s`. */
 export function throughputUnit(scope: AnalyticsScope): string {
-  return scope === "target" ? "attempts/s" : "req/s"
+  return scope === "target" ? t("analytics.v2.unitAttemptsPerSec") : t("analytics.v2.unitReqPerSec")
 }

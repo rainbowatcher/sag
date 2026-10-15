@@ -36,12 +36,12 @@ function updateApiKey(idx: number, value: string) {
 
 <template>
   <div class="space-y-2">
-    <FieldLabel>API Keys</FieldLabel>
+    <FieldLabel>{{ $t("settings.auth.apiKeysLabel") }}</FieldLabel>
     <div v-for="(_, idx) in apiKeys" :key="idx" class="flex items-center gap-2">
       <Input
         type="password"
         :model-value="apiKeys[idx]"
-        :placeholder="`sk-... (key ${idx + 1})`"
+        :placeholder="$t('settings.auth.keyPlaceholder', { index: idx + 1 })"
         class="flex-1"
         :disabled="disabled"
         @input="updateApiKey(idx, ($event.target as HTMLInputElement).value)"
@@ -52,7 +52,7 @@ function updateApiKey(idx: number, value: string) {
     </div>
     <Button type="button" variant="outline" size="sm" :disabled="disabled" @click="addApiKey">
       <Plus class="h-3.5 w-3.5" />
-      Add Key
+      {{ $t("settings.auth.addKey") }}
     </Button>
   </div>
 </template>

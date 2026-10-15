@@ -13,9 +13,11 @@ export interface SystemInfoRow {
 </script>
 
 <script setup lang="ts">
+import { computed } from "vue"
 import type { Component } from "vue"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { t } from "@/lib/i18n"
 
 const props = withDefaults(
   defineProps<{
@@ -30,8 +32,11 @@ const props = withDefaults(
     icon?: Component
     rows: SystemInfoRow[]
   }>(),
-  { description: "", badge: "Requires restart" },
+  { description: "" },
 )
+
+/** Header badge, defaulting to the localized "requires restart" note. */
+const badgeText = computed(() => props.badge ?? t("settings.info.requiresRestart"))
 
 /** A missing section field renders as a placeholder instead of an empty cell. */
 function isMissing(value: SystemInfoRow["value"]): boolean {
@@ -60,8 +65,8 @@ function rowClass(row: SystemInfoRow): string {
           </CardTitle>
           <CardDescription v-if="props.description">{{ props.description }}</CardDescription>
         </div>
-        <Badge v-if="props.badge" variant="outline" class="shrink-0 text-[10px]">
-          {{ props.badge }}
+        <Badge v-if="badgeText" variant="outline" class="shrink-0 text-[10px]">
+          {{ badgeText }}
         </Badge>
       </div>
     </CardHeader>
@@ -79,7 +84,7 @@ function rowClass(row: SystemInfoRow): string {
         </div>
       </dl>
       <p v-else class="text-muted-foreground text-xs">
-        This section is not present in the current configuration snapshot.
+        {{ $t("settings.info.sectionMissing") }}
       </p>
     </CardContent>
   </Card>

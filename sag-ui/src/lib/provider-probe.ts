@@ -3,14 +3,6 @@ import type { ApiKind } from "@/types/api"
 /** Fixed probe preference order over protocol sections (never `image`). */
 export const PROBE_KIND_ORDER: ApiKind[] = ["chat_completions", "responses", "anthropic_messages"]
 
-/** Display labels for `ApiKind` sections (shared by ApisEditor and the models probe). */
-export const API_KIND_LABELS: Record<ApiKind, string> = {
-  chat_completions: "Chat Completions",
-  responses: "Responses",
-  anthropic_messages: "Anthropic Messages",
-  image: "Image",
-}
-
 /**
  * Default section for model listing / model tests: the provider's `fallback`
  * protocol when declared, else a fixed preference order (chat_completions

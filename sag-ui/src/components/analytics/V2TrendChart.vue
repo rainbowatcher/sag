@@ -19,6 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { useChartTheme } from "@/composables/useChartTheme"
+import { t } from "@/lib/i18n"
 import type {
   AnalyticsScope,
   AnalyticsTrendPoint,
@@ -63,7 +64,6 @@ const METRIC_KEYS = [
 type MetricKey = (typeof METRIC_KEYS)[number]
 
 interface MetricOption {
-  label: string
   /** 0..100 percentage scale → y-axis `max: 100`. */
   rate?: boolean
   /** Only the overall bucket has data → hide per-series lines. */
@@ -71,15 +71,15 @@ interface MetricOption {
 }
 
 const METRICS: Record<MetricKey, MetricOption> = {
-  requests: { label: "Requests" },
-  success: { label: "Success" },
-  success_rate: { label: "Success Rate (%)", rate: true },
-  prompt_tokens: { label: "Prompt Tokens" },
-  completion_tokens: { label: "Completion Tokens" },
-  total_tokens: { label: "Total Tokens" },
-  cache_hit_rate: { label: "Cache Hit Rate (%)", rate: true, overallOnly: true },
-  e2e_avg: { label: "Avg E2E (ms)", overallOnly: true },
-  e2e_p95: { label: "P95 E2E (ms)", overallOnly: true },
+  requests: {},
+  success: {},
+  success_rate: { rate: true },
+  prompt_tokens: {},
+  completion_tokens: {},
+  total_tokens: {},
+  cache_hit_rate: { rate: true, overallOnly: true },
+  e2e_avg: { overallOnly: true },
+  e2e_p95: { overallOnly: true },
 }
 
 const metric = ref<MetricKey>("requests")
@@ -87,14 +87,28 @@ const metricOption = computed(() => METRICS[metric.value])
 const overallOnly = computed(() => metricOption.value.overallOnly === true)
 
 /**
- * Dropdown entries. The "requests" entry is scope-aware (attempts in
+ * Metric labels, resolved through `t()` inside a computed so they re-render
+ * on locale switches. The "requests" entry is scope-aware (attempts in
  * target scope are never mislabelled as requests — same wording as the
  * y-axis population label).
  */
+const metricLabels = computed<Record<MetricKey, string>>(() => ({
+  requests: populationLabel(props.scope),
+  success: t("analytics.v2.columns.success"),
+  success_rate: t("analytics.v2.metric.successRate"),
+  prompt_tokens: t("analytics.v2.metric.promptTokens"),
+  completion_tokens: t("analytics.v2.metric.completionTokens"),
+  total_tokens: t("analytics.v2.metric.totalTokens"),
+  cache_hit_rate: t("analytics.v2.metric.cacheHitRate"),
+  e2e_avg: t("analytics.v2.metric.avgE2e"),
+  e2e_p95: t("analytics.v2.metric.p95E2e"),
+}))
+
+/** Dropdown entries, keyed by metric. */
 const metricOptions = computed(() =>
   METRIC_KEYS.map((key) => ({
     key,
-    label: key === "requests" ? populationLabel(props.scope) : METRICS[key].label,
+    label: metricLabels.value[key],
   })),
 )
 
@@ -164,7 +178,7 @@ const chartData = computed(() => {
   const key = metric.value
   const datasets: any[] = [
     {
-      label: `Overall ${population.value}`,
+      label: t("analytics.v2.overallSeries", { population: population.value }),
       data: props.trend.buckets.map((b) => overallValue(b.overall, key, props.scope)),
       borderColor: chartColors.value[0],
       backgroundColor: chartColors.value[0].replace("rgb(", "rgba(").replace(")", ",0.12)"),
@@ -189,7 +203,10 @@ const chartData = computed(() => {
     })
     if (props.trend.others) {
       datasets.push({
-        label: `others (${props.trend.others.total_requests.toLocaleString()} ${population.value})`,
+        label: t("analytics.v2.othersSeries", {
+          count: props.trend.others.total_requests.toLocaleString(),
+          population: population.value,
+        }),
         data: props.trend.others.points.map((p) => pointValue(p, key)),
         borderColor: "rgb(148 163 184)",
         backgroundColor: "transparent",
@@ -203,11 +220,8 @@ const chartData = computed(() => {
   return { labels: labels.value, datasets }
 })
 
-/** Y-axis title follows the metric; the requests metric keeps the
- *  scope-aware population wording (target-scope "attempts"). */
-const yTitle = computed(() =>
-  metric.value === "requests" ? population.value : metricOption.value.label,
-)
+/** Y-axis title follows the metric (scope-aware wording for `requests`). */
+const yTitle = computed(() => metricLabels.value[metric.value])
 
 /** Format a chart tick / tooltip value per the metric family: rates to
  *  1 decimal (+%), latency in rounded ms, counts localized - never raw
@@ -262,7 +276,7 @@ const chartOptions = computed(() => ({
 <template>
   <div>
     <div class="mb-2 flex items-center gap-2">
-      <span class="text-muted-foreground text-xs">Metric</span>
+      <span class="text-muted-foreground text-xs">{{ $t("analytics.v2.metricLabel") }}</span>
       <Select :model-value="metric" @update:model-value="(v) => (metric = v as MetricKey)">
         <SelectTrigger class="h-7 w-44 text-xs">
           <SelectValue />

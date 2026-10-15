@@ -8,6 +8,7 @@ import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
+import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -46,7 +47,7 @@ async function refreshPage() {
       activeTargetStore.fetchActiveTargets(),
     ])
   } catch (e: any) {
-    pageError.value = getErrorMessage(e, "Failed to load data")
+    pageError.value = getErrorMessage(e, t("routeList.loadFailed"))
   }
 }
 
@@ -65,7 +66,7 @@ onMounted(refreshPage)
             <Input
               v-model="searchInput"
               type="text"
-              placeholder="Search routes by model name…"
+              :placeholder="$t('routeList.searchPlaceholder')"
               class="h-8 pl-8"
             />
           </div>
@@ -74,7 +75,7 @@ onMounted(refreshPage)
           <RefreshButton :loading="routeStore.routesLoading" @click="refreshPage" />
           <Button size="sm" @click="showAdd = true">
             <Plus class="h-3.5 w-3.5" />
-            Add Route
+            {{ $t("routeList.addRoute") }}
           </Button>
         </div>
       </div>
@@ -87,9 +88,9 @@ onMounted(refreshPage)
         class="flex max-h-[85vh] flex-col overflow-hidden px-4 sm:max-w-3xl sm:px-6"
       >
         <component :is="Modal.Header" class="shrink-0">
-          <component :is="Modal.Title">New Route</component>
+          <component :is="Modal.Title">{{ $t("routes.addForm.title") }}</component>
           <component :is="Modal.Description">
-            Configure a new routing rule and its target providers
+            {{ $t("routes.addForm.description") }}
           </component>
         </component>
         <RouteAddForm
@@ -108,7 +109,7 @@ onMounted(refreshPage)
         class="text-muted-foreground py-12 text-center"
       >
         <Loader2 class="mx-auto mb-2 h-6 w-6 animate-spin" />
-        Loading…
+        {{ $t("common.loading") }}
       </div>
 
       <!-- ── Error ─────────────────────────────────────────────────── -->
@@ -125,7 +126,7 @@ onMounted(refreshPage)
         v-else-if="routeStore.routes.length === 0"
         class="text-muted-foreground py-12 text-center text-sm"
       >
-        No routes configured. Click "Add Route" to get started.
+        {{ $t("routeList.empty") }}
       </div>
 
       <!-- ── Route List (table + edit + delete) ──────────────────── -->

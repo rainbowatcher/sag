@@ -12,6 +12,7 @@ import {
   CommandList,
 } from "@/components/ui/command"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { t } from "@/lib/i18n"
 import { cn } from "@/lib/utils"
 
 export interface ComboboxOption {
@@ -42,15 +43,17 @@ const props = withDefaults(
     allowDeselect?: boolean
   }>(),
   {
-    placeholder: "Select...",
-    searchPlaceholder: "Search...",
-    emptyText: "No results found.",
     disabled: false,
     loading: false,
     multiple: false,
     allowDeselect: false,
   },
 )
+
+/** Caller-provided labels, else the localized defaults. */
+const placeholderText = computed(() => props.placeholder ?? t("common.select"))
+const searchPlaceholderText = computed(() => props.searchPlaceholder ?? t("common.search"))
+const emptyTextResolved = computed(() => props.emptyText ?? t("common.noResults"))
 
 const emit = defineEmits<{
   "update:modelValue": [value: string | string[]]
@@ -267,7 +270,7 @@ onUnmounted(() => {
               type="button"
               class="ml-0.5 inline-flex cursor-pointer items-center rounded-full p-0 text-current/60 hover:text-current"
               @click.stop="removeItem(value)"
-              :aria-label="'Remove ' + value"
+              :aria-label="$t('common.removeItem', { value })"
             >
               <span aria-hidden="true">×</span>
             </button>
@@ -286,7 +289,7 @@ onUnmounted(() => {
             )
           "
         >
-          {{ triggerLabel || placeholder }}
+          {{ triggerLabel || placeholderText }}
         </span>
         <Loader2
           v-if="loading"
@@ -307,16 +310,16 @@ onUnmounted(() => {
       align="start"
     >
       <Command>
-        <CommandInput :placeholder="searchPlaceholder" />
+        <CommandInput :placeholder="searchPlaceholderText" />
         <CommandList>
           <div
             v-if="loading"
             class="text-muted-foreground flex items-center justify-center gap-2 py-6 text-sm"
           >
             <Loader2 class="size-4 animate-spin" />
-            <span>Loading models...</span>
+            <span>{{ $t("common.loadingModels") }}</span>
           </div>
-          <CommandEmpty v-else>{{ emptyText }}</CommandEmpty>
+          <CommandEmpty v-else>{{ emptyTextResolved }}</CommandEmpty>
           <CommandGroup v-if="!loading">
             <CommandItem
               v-for="opt in options"
