@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-06-27
+updated: 2026-10-15
 ---
 
 # UI 管理面板 — 规格
@@ -49,6 +49,15 @@ updated: 2026-06-27
 - [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
 - [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
 - [sag-ui/src/composables/useResponsiveModal.ts](../../../sag-ui/src/composables/useResponsiveModal.ts) — Dialog/Drawer 双轨弹框：`MODAL_DESKTOP_QUERY`（768px）+ `Modal` 八槽位组件映射（Root/Content/Header/Title/Description/Footer/Close/Trigger）
+
+### 多语言（i18n）
+
+- [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，539 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
+- [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
+- [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
+- [sag-ui/src/lib/i18n/i18n.test.ts](../../../sag-ui/src/lib/i18n/i18n.test.ts) / [sag-ui/src/lib/i18n/i18n-form.test.ts](../../../sag-ui/src/lib/i18n/i18n-form.test.ts) — 边界测试与表单校验消息的 locale 切换回归
 
 ## 核心设计
 
@@ -141,6 +150,48 @@ flowchart TD
 ```
 
 ## 关键决策
+
+### DIY i18n 层 vs vue-i18n
+
+`t()` / `useI18n()` / `installI18n()` 自行实现（`sag-ui/src/lib/i18n/`），不引入 `vue-i18n`。
+
+**Trade-off**:
+- ✅ 只需 2 个语言、无 ICU MessageFormat / 复数 / 日期格式化需求——`vue-i18n` 的 SFC block、legacy API、locale fallback 配置、`@intlify` 编译链等能力完全用不上，引入后净增体积与认知成本
+- ✅ 大量文案位于 script 侧渲染函数（TanStack 列定义、toast、Zod 校验、标签映射），直接用 `t()` 比 `$t()` 模板指令 + `useI18n()` 组合更直接，也避免 `vue-i18n` 的 `globalInjection` / `legacy` 模式选择
+- ✅ 解析语义完全可控：`{param}` 命名插值 + `active → en → key` 三段回退，行为可用 20 行代码讲清
+- ✅ `t(key, params?)` 的 API 形状与 `vue-i18n` 兼容，日后真需要复数/日期能力时迁移成本可控
+- ❌ 缺少社区生态：复数、日期、数字格式化、`<i18n-t>` 组件等需自行实现
+- ❌ 无 `vue-i18n` 的 SFC `<i18n>` block 与构建期提取，key 只能手工维护（由 `check-i18n.mjs` 的 dead-key 报告部分补偿）
+
+### 默认语言 zh 与 en 作 canonical 源
+
+`DEFAULT_LOCALE = "zh"`（既有用户是中文用户，升级后界面不得无故变英文）；字典的 canonical 源却是 `en.ts`——key 用稳定英文标识符（`common.save`、`providerList.columns.apis`），`zh.ts` 声明为 `Record<keyof typeof en, string>`。
+
+**Trade-off**:
+- ✅ key 与展示文案解耦：改英文措辞不动 key，改中文译文不动代码
+- ✅ `zh.ts` 的类型绑定使漏译在 `vue-tsc` 阶段即失败，不会拖到运行时
+- ✅ 默认 zh 保证存量用户升级后无感
+- ❌ 默认语言与 canonical 源不同语言，新增文案时必须先写英文 key + 英文值，再补中文（步骤略绕，但换来了编译期齐平保证）
+
+### 迁移期 `rawFallback` 阀值 vs 一次性替换
+
+逐文件迁移期间（P1–P3），`t()` 曾带一个 `rawFallback` 参数：命中字典前先回退到原中文字面量，保证未迁移文件不出现语言退化。P4 拆除该参数，现签名为 `t(key, params?)`。
+
+**Trade-off**:
+- ✅ 迁移可分批落地，中间每个 commit 的界面都是完整的（不会出现「一半中文一半英文」的退化态）
+- ✅ 拆除后 API 面收窄，`rawFallback` 不再是「永不触发」的死代码
+- ❌ 迁移期间多一个参数与一条回退分支，且需要一次专门的拆除变更（P4）
+
+### 防回潮门禁（check-i18n.mjs）vs 仅靠 code review
+
+`just ui-i18n-check` 在 `verify-ui` 链路中强制检查：a) en/zh 键集合一致；b) 每 key 的 `{param}` 占位符集合一致；c) 花括号合法；d) `src/**/*.{ts,vue}` 无 CJK 字面量（`src/lib/i18n/` 整目录与注释行跳过）；e) dead key 仅报告不失败。
+
+**Trade-off**:
+- ✅ 「新增硬编码中文」这一最常见的回潮被机械拦住，不依赖 review 注意力
+- ✅ 占位符齐平能拦住「`{name}` 在 zh 里写成 `{n}`」这类只在特定语言下崩的 bug
+- ✅ 无依赖、纯 node 脚本（`node --experimental-strip-types`），与前端测试同一运行器
+- ❌ CJK 扫描依赖「注释行」启发式（trim 后以 `//`、`/*`、`*`、`<!--` 开头），非标准格式的注释会误报，只能改写注释
+- ❌ dead-key 只报告不失败，未使用的 key 仍可能积累（刻意保守，避免误删仍被动态拼 key 引用的条目）
 
 ### 401 集中处理 vs 逐请求拦截
 
@@ -270,17 +321,25 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **弹框形态**：应用层模态必须经 `useResponsiveModal()`，不得在组件里直接引入 `Dialog*` / `Drawer*` 原语；断点固定 768px（`md`），且必须与 `AppLayout.vue` 的 `isMobile`、`SidebarProvider` 内部断点保持一致。Popover 类浮层（Combobox / SearchSelect / DateRangePicker）不适用该规则
 - **抽屉内边距**：`DrawerContent` 无默认 padding，而 `DialogContent` 有 `p-6`。需要左右内边距的正文区写成 `px-4 sm:px-0`；若写成 `px-4 sm:px-6`，仅在它不属于 `DialogContent` 直接子元素时才不会与 `p-6` 叠成双重内边距
 - **[&>div]:h-full 高度传递**：表格的外层 `<div class="rounded-lg border">` 使用 `[&>div]:h-full` 将高度约束传递给 `<Table>` 组件的包裹 div（`overflow-auto`），使其成为 sticky 表头的滚动参照点。不使用此模式时外层 div 不得设置 overflow，否则会创建多余滚动上下文导致 sticky 失效
+- **i18n 文案单一来源**：`src/**/*.{ts,vue}` 中不得出现中文字面量（`src/lib/i18n/zh.ts` 除外）。文案一律经 `t(key)` 获取，key 必须同时存在于 `en.ts` 与 `zh.ts`——由 `just ui-i18n-check` 在 `verify-ui` 链路强制
+- **i18n 响应式绑定**：所有随语言变化的字符串必须在渲染/求值时重新调用 `t()`，不得在模块加载或组件 setup 时求值一次后缓存。具体形态：TanStack 列定义的表头一律写 `header: () => t(...)`（字符串头会在语言切换时冻结）；标签映射（如 `strategyLabels`）用 `computed`；TanStack Form 的 `validators` 用 `get validators()` getter 使 Zod schema 与其 `t()` 消息在校验时重建
+- **locale 白名单**：`localStorage` 的 `sag-ui-lang` 值必须经 `normalizeLocale` 校验（仅 `en` / `zh`），脏值写回默认语言。`t()` 不得因持久化值异常而抛错
+- **i18n 模块可在无 DOM 环境加载**：`index.ts` 不得在模块顶层触碰 `window` / `document` / `localStorage`——locale ref 懒建、`<html lang>` 同步放在 `installI18n` 的 `watchEffect` 内并对 `document === undefined` 提前返回，保证 node test runner 可直接导入
+- **`analytics.v2.scopeTarget` / `logs.tooltip.ttft` 为刻意 verbatim 的技术 token**：zh 视图在迁移前也渲染同样的英文 token，两处字典值保持英文并在 `en.ts` 内注释说明，不视为漏译
 
 ## 测试策略
 
-SAG UI 当前无自动化前端测试（需求文档已标注「不包含：端到端测试」）。验证方式：
+SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui test` → `node --experimental-strip-types --test "src/**/*.test.ts"`）；仍无端到端测试（requirements.md 已标注「不包含：端到端测试」）。验证方式：
 
 | 层面 | 方法 | 工具 |
 |------|------|------|
+| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界） | node test runner |
+| i18n 门禁 | `just ui-i18n-check`（`pnpm -C sag-ui run check:i18n`） | node + check-i18n.mjs |
 | 类型检查 | `pnpm typecheck`（vue-tsc） | TypeScript 编译器 |
 | 代码风格 | `pnpm lint`（oxlint）、`pnpm format`（oxfmt） | oxlint / oxfmt |
 | 构建验证 | `pnpm build`（Vite） → `just build-test`（内嵌到 gateway 二进制） | Vite / Cargo |
-| 视觉验证 | 浏览器手动检查：1920×1080、2560×1440、1024×768、1366×768；弹框形态另需 390px（手机竖屏）与 700px（640–768 区间） | Chrome DevTools |
+| 全链门禁 | `just verify-ui` = `fmt-check` + `lint` + `typecheck` + `test` + `i18n-check` | just |
+| 视觉验证 | 浏览器手动检查：1920×1080、2560×1440、1024×768、1366×768；弹框形态另需 390px（手机竖屏）与 700px（640–768 区间）；i18n 另需 en/zh 各过一遍 | Chrome DevTools |
 | API 集成 | 通过 `scripts/test-env.py` 启动 gateway 测试实例，浏览器连接验证 | test-env |
 
 关键验证场景：
@@ -293,8 +352,11 @@ SAG UI 当前无自动化前端测试（需求文档已标注「不包含：端�
 6. **固定高度布局**：加载 Logs/Providers 页面，添加足够数据使表格超出视口 → 页面标题和筛选栏保持可见，仅表格内部滚动 → 验证侧边栏导航和底部状态栏始终可交互
 7. **固定高度布局边界**：将浏览器窗口调至极小高度（如 600px）→ 图表/表格应有最小可见区域，固定区域不应挤压滚动区至零高度
 8. **弹框形态断点**：在 390px / 700px / 900px 三个视口分别打开 New Route、Edit Route、Delete Route 确认、Add/Edit Provider → 前两者应分别为 drawer（bottom）/ drawer / dialog；可用 `document.querySelectorAll('[data-slot=drawer-content]')` 与 `[data-slot=dialog-content]` 计数断言，并同时校验 `window.innerWidth` 与 `matchMedia('(min-width: 768px)')`
+9. **语言切换**：Settings → Language 选 English → 导航/表头/toast/表单校验消息即时变英文且 `<html lang>` 变 `en` → 刷新后仍为英文 → 切回中文同理；手动把 `localStorage["sag-ui-lang"]` 改为 `fr` 后刷新 → 界面回退中文且控制台无异常
+10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
 
 ## 变更记录
+- [0004 UI 多语言支持（i18n，第一版 en/zh）](changes/0004-ui-i18n-language-switching.md)
 - [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
 - [0001 初始化与大屏幕响应式优化](changes/0001-initial.md)

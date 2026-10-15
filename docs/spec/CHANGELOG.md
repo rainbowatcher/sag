@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-10-13
+updated: 2026-10-15
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-10-15
+
+- **UI**：[0004 UI 多语言支持（i18n，第一版 en/zh）](ui/changes/0004-ui-i18n-language-switching.md) — 新增无依赖的 DIY i18n 层（`t()` 命名插值 + `active → en → key` 三段回退、`useI18n()`、`installI18n()` 同步 `<html lang>`）；locale 经 `localStorage["sag-ui-lang"]` 持久化，默认 `zh` 且白名单校验脏值自愈；Settings 页新增 Language tab；539 个 key 全量迁移（`en.ts` canonical `as const`，`zh.ts: Record<keyof typeof en, string>` 编译期齐平），TanStack 表头改 `() => t(...)`、标签映射改 `computed`、表单 `validators` 改 getter 以免切换语言时冻结；新增 `check-i18n.mjs` 防回潮门禁（键/占位符齐平、花括号合法、CJK 字面量扫描、dead-key 报告）以 `ui-i18n-check` 接入 `verify-ui`
 
 ## 2026-10-13
 

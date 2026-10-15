@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-06-26
+updated: 2026-10-15
 ---
 
 # UI 管理面板
@@ -42,6 +42,17 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 主题状态持久化到 localStorage
 - Chart.js 图表配色随主题自动切换（通过 `useChartTheme` composable）
 - 侧边栏底部提供切换按钮
+
+### 多语言支持（i18n）
+
+- 支持英文（en）和中文（zh）两种界面语言，第一版不含第三种语言
+- 默认语言为中文（zh）；用户未做过选择时界面以中文呈现
+- 语言偏好持久化到 localStorage（键名 `sag-ui-lang`），跨会话、跨刷新保持
+- 持久化的语言值必须经白名单校验（仅接受 `en` / `zh`）；遇到脏值（损坏、被篡改、旧格式）时静默回退到默认语言，不得抛错或渲染出空白文案
+- 切换入口在 Settings 页的 Language tab（Select：English / 中文）；切换后当前页面所有文案即时翻转，无需刷新
+- 文档根元素 `<html lang>` 跟随当前语言同步为 `zh-CN` / `en`
+- 界面文案（导航、表头、toast、表单校验消息、对话框、tooltip、空态/错误态）不得以中文字面量硬编码在源文件中，统一收敛到字典；未翻译的 key 回退到英文，仍缺失时回显 key 本身并在开发环境打印警告
+- 英文（en）为字典的 canonical 源：key 为稳定英文标识符，中文译文缺失时构建/类型检查即失败
 
 ### Dashboard
 
@@ -158,6 +169,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 - shadcn-vue 组件库集成
 - Chart.js 图表（折线图、饼图）
 - 亮/暗主题切换
+- 多语言支持（en / zh）：语言偏好可切换、可持久化，文案统一收敛到字典
 - 与 SAG 管理 API 的 HTTP 通信
 - 固定高度布局：页面整体固定为视口高度，仅表格和图表容器内部滚动，页面头部和筛选栏保持可见
 - 大屏幕（`xl:`、`2xl:` 断点）响应式优化
@@ -166,7 +178,8 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 ### 不包含
 
 - 服务端渲染（SSR）
-- 国际化（i18n）
+- 第三种及更多语言（第一版仅 en / zh）
+- ICU MessageFormat 复数/性别等复杂插值、日期/数字的 locale 感知格式化（第一版仅 `{param}` 命名插值）
 - 端到端测试
 - 离线支持（PWA）
 - 图表 / 数据导出
@@ -185,4 +198,5 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 - [0001 初始化](changes/0001-initial.md)
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
+- [0004 UI 多语言支持（i18n，第一版 en/zh）](changes/0004-ui-i18n-language-switching.md)
 - [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)
