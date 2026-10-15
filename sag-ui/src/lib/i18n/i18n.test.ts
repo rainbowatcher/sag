@@ -165,14 +165,19 @@ try {
   console.error("probe threw: " + error.message)
   process.exit(3)
 }
-process.stdout.write(JSON.stringify({ locale: locale.value, value }))
+process.stdout.write("PROBE_RESULT:" + JSON.stringify({ locale: locale.value, value }) + "\\n")
 `
   const stdout = execFileSync(
     process.execPath,
     ["--experimental-strip-types", "--input-type=module", "-e", script],
-    { encoding: "utf8", env: { ...process.env, NODE_NO_WARNINGS: "1" } },
+    { encoding: "utf8", timeout: 15_000, env: { ...process.env, NODE_NO_WARNINGS: "1" } },
   )
-  return JSON.parse(stdout) as { locale: unknown; value: string }
+  // The child payload is self-delimiting: unrelated stdout noise (warnings,
+  // future debug logs) is ignored instead of breaking `JSON.parse`.
+  const marker = "PROBE_RESULT:"
+  const line = stdout.split("\n").find((l) => l.startsWith(marker))
+  if (line === undefined) throw new Error(`probe produced no result marker:\n${stdout}`)
+  return JSON.parse(line.slice(marker.length)) as { locale: unknown; value: string }
 }
 
 {

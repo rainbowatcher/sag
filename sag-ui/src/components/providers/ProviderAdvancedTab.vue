@@ -76,11 +76,16 @@ function addStripField() {
   <Separator />
 
   <Alert v-if="showBodyOverrideWarning" variant="warning">
-    <AlertTitle>提示</AlertTitle>
+    <AlertTitle>{{ $t("providers.advanced.bodyOverrideWarningTitle") }}</AlertTitle>
     <AlertDescription>
-      Body Overrides 对该供应商的<strong>所有模型</strong>生效。如需为特定模型设置不同参数，请前往
-      <strong>APIs Tab</strong> 对应 API section 的 Advanced 中配置
-      <strong>Model Overrides</strong>，避免在多个路由的 target 中重复配置 <code>extra</code>。
+      {{ $t("providers.advanced.bodyOverrideWarningLead")
+      }}<strong>{{ $t("providers.advanced.bodyOverrideWarningAllModels") }}</strong
+      >{{ $t("providers.advanced.bodyOverrideWarningAfterAllModels")
+      }}<strong>{{ $t("providers.advanced.bodyOverrideWarningApisTab") }}</strong
+      >{{ $t("providers.advanced.bodyOverrideWarningAfterApisTab")
+      }}<strong>{{ $t("providers.advanced.bodyOverrideWarningModelOverrides") }}</strong
+      >{{ $t("providers.advanced.bodyOverrideWarningAfterModelOverrides") }}<code>extra</code
+      >{{ $t("providers.advanced.bodyOverrideWarningEnd") }}
     </AlertDescription>
   </Alert>
 

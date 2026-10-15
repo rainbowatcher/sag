@@ -261,7 +261,7 @@ async function handleSubmit(event: Event) {
                       :id="field.name"
                       type="number"
                       :model-value="field.state.value"
-                      placeholder="600 (默认)"
+                      :placeholder="$t('providers.addForm.timeoutPlaceholder')"
                       :aria-invalid="isInvalid(field)"
                       @blur="field.handleBlur"
                       @input="

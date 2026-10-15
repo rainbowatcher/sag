@@ -14,6 +14,7 @@ import { toast } from "vue-sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { t } from "@/lib/i18n"
 import { getErrorMessage, formatRemaining } from "@/lib/utils"
 import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 
@@ -39,9 +40,9 @@ async function forceClose(model: string, provider: string, realModel: string) {
   closingKey.value = key
   try {
     await store.closeBreaker(model, provider, realModel)
-    toast.success(`恢复 ${provider}/${realModel} — 下一个请求将直接打上游`)
+    toast.success(t("circuitBreaker.recovered", { provider, model: realModel }))
   } catch (e: any) {
-    toast.error(getErrorMessage(e, "恢复失败"))
+    toast.error(getErrorMessage(e, t("circuitBreaker.restoreFailed")))
   } finally {
     closingKey.value = null
   }
@@ -144,7 +145,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
                       : 'text-foreground font-medium'
                   "
                 >
-                  {{ formatRemaining(b.cooldown_until_secs, "已可恢复") }}
+                  {{ formatRemaining(b.cooldown_until_secs, $t("circuitBreaker.cooldownElapsed")) }}
                 </span>
               </span>
               <span
@@ -160,7 +161,7 @@ async function forceClose(model: string, provider: string, realModel: string) {
                       : 'text-foreground font-medium'
                   "
                 >
-                  {{ formatRemaining(b.next_probe_at_secs, "已可探测") }}
+                  {{ formatRemaining(b.next_probe_at_secs, $t("circuitBreaker.probeElapsed")) }}
                 </span>
               </span>
               <span v-else class="flex items-center gap-1 font-medium text-amber-600">
@@ -177,14 +178,14 @@ async function forceClose(model: string, provider: string, realModel: string) {
             class="shrink-0 text-xs"
             :disabled="closingKey === `${b.model}-${b.provider}-${b.real_model}`"
             @click="forceClose(b.model, b.provider, b.real_model)"
-            title="强制恢复该 target，下一个请求将直接打上游"
+            :title="$t('circuitBreaker.forceCloseTitle')"
           >
             <Loader2
               v-if="closingKey === `${b.model}-${b.provider}-${b.real_model}`"
               class="h-3 w-3 animate-spin"
             />
             <RotateCcw v-else class="h-3 w-3" />
-            恢复
+            {{ $t("circuitBreaker.restore") }}
           </Button>
         </div>
       </div>

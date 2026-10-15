@@ -730,7 +730,7 @@ const groupRows = computed<GroupRow[]>(() => {
                       v-if="lc.metric.approx_percentiles"
                       variant="outline"
                       class="border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-400"
-                      title="历史区间由 1h Rollup 直方图估算（≈1% 误差），非精确分位数"
+                      :title="$t('analytics.approxPercentilesTooltip')"
                     >
                       ≈ approx
                     </Badge>
@@ -804,8 +804,7 @@ const groupRows = computed<GroupRow[]>(() => {
                             />
                           </TooltipTrigger>
                           <TooltipContent side="top" class="max-w-xs font-normal">
-                            成功样本中未上报 cached_tokens 的数量（unknown ≠
-                            miss，不计入命中率分母）
+                            {{ $t("analytics.cacheUnknownTooltip") }}
                           </TooltipContent>
                         </Tooltip>
                       </template>

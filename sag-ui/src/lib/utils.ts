@@ -66,11 +66,12 @@ export function validateExtraJson(extra: string): string | null {
  * delta is `epochSecs * 1000 - Date.now()`.
  *
  * @param epochSecs  UNIX timestamp in seconds.
- * @param expiredLabel  Text to show when the moment has already elapsed.
- *   Defaults to "已可恢复" (for cooldown). Pass "已可探测" for probe times.
+ * @param expiredLabel  Localized text shown once the moment has elapsed.
+ *   Callers pass the translated label (e.g. via `t()`); this helper stays free
+ *   of i18n imports so it can be unit-tested in isolation.
  * @returns Human-readable remaining time like "3m 45s", or `expiredLabel`.
  */
-export function formatRemaining(epochSecs: number, expiredLabel = "已可恢复"): string {
+export function formatRemaining(epochSecs: number, expiredLabel: string): string {
   const ms = epochSecs * 1000 - Date.now()
   if (ms <= 0) return expiredLabel
   const totalSec = Math.floor(ms / 1000)

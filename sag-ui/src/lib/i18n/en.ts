@@ -33,4 +33,36 @@ export const en = {
   "settings.language.label": "Interface language",
   "settings.language.optionEnglish": "English",
   "settings.language.optionChinese": "中文",
+
+  // ── Circuit breakers ────────────────────────────────────────────
+  "circuitBreaker.recovered":
+    "Recovered {provider}/{model} — the next request will go straight upstream",
+  "circuitBreaker.restoreFailed": "Failed to recover",
+  "circuitBreaker.forceCloseTitle":
+    "Force-recover this target; the next request will go straight upstream",
+  "circuitBreaker.restore": "Recover",
+  "circuitBreaker.cooldownElapsed": "Recoverable now",
+  "circuitBreaker.probeElapsed": "Probeable now",
+
+  // ── Providers ───────────────────────────────────────────────────
+  "providers.addForm.timeoutPlaceholder": "600 (default)",
+  "providers.advanced.bodyOverrideWarningTitle": "Note",
+  "providers.advanced.bodyOverrideWarningLead": "Body Overrides apply to ",
+  "providers.advanced.bodyOverrideWarningAllModels": "all models",
+  "providers.advanced.bodyOverrideWarningAfterAllModels":
+    " of this provider. To set different parameters for a specific model, go to ",
+  "providers.advanced.bodyOverrideWarningApisTab": "APIs Tab",
+  "providers.advanced.bodyOverrideWarningAfterApisTab":
+    " in the corresponding API section's Advanced and configure ",
+  "providers.advanced.bodyOverrideWarningModelOverrides": "Model Overrides",
+  "providers.advanced.bodyOverrideWarningAfterModelOverrides": ", avoiding duplicating ",
+  "providers.advanced.bodyOverrideWarningEnd": " across the targets of multiple routes.",
+
+  // ── Analytics ───────────────────────────────────────────────────
+  "analytics.approxPercentilesTooltip":
+    "Historical range estimated from the 1h Rollup histogram (≈1% error), not exact percentiles",
+  "analytics.cacheUnknownTooltip":
+    "Number of successful samples that did not report cached_tokens (unknown ≠ miss, excluded from the hit-rate denominator)",
+  "analytics.overallOnlyMetric":
+    "This metric is only available on the overall line, with no per-group breakdown",
 } as const

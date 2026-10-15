@@ -60,6 +60,7 @@ docs/.vitepress/cache
 docs/.vitepress/dist
 
 # misc
+.agent-reports/
 .plan/
 gateway.toml
 PLAN.md

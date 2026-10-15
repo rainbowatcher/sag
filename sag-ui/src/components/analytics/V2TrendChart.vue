@@ -273,7 +273,9 @@ const chartOptions = computed(() => ({
           </SelectItem>
         </SelectContent>
       </Select>
-      <p v-if="overallOnly" class="text-muted-foreground text-xs">该指标仅整体线可用，无逐组明细</p>
+      <p v-if="overallOnly" class="text-muted-foreground text-xs">
+        {{ $t("analytics.overallOnlyMetric") }}
+      </p>
     </div>
     <div class="h-64 xl:h-72">
       <Line :data="chartData" :options="chartOptions" />
