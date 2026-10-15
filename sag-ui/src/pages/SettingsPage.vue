@@ -7,6 +7,7 @@ import {
   EyeOff,
   Globe,
   KeyRound,
+  Languages,
   Loader2,
   Plus,
   Save,
@@ -29,13 +30,26 @@ import SystemInfoCard, { type SystemInfoRow } from "@/components/settings/System
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useI18n, type Locale } from "@/lib/i18n"
 import { useGatewayConfigStore } from "@/stores/gatewayConfig"
 import { useSettingsStore } from "@/stores/settings"
 
 const store = useSettingsStore()
 const gatewayConfig = useGatewayConfigStore()
+
+// UI language is the only string set migrated in P0; every other label on this
+// page stays hardcoded until the per-module migration phases land.
+const { t, locale, setLocale } = useI18n()
 
 const activeTab = ref("network")
 
@@ -291,6 +305,10 @@ function keyFingerprint(key: string): string {
         <TabsTrigger value="system" class="gap-1.5">
           <Server class="h-3.5 w-3.5" />
           System
+        </TabsTrigger>
+        <TabsTrigger value="language" class="gap-1.5">
+          <Languages class="h-3.5 w-3.5" />
+          {{ t("settings.language.tab") }}
         </TabsTrigger>
       </TabsList>
 
@@ -604,6 +622,37 @@ function keyFingerprint(key: string): string {
               Restart the gateway to change them.
             </p>
           </template>
+        </TabsContent>
+
+        <!-- ── Language (P0 i18n switch) ──────────────────────────── -->
+        <TabsContent value="language" class="mt-0">
+          <Card>
+            <CardHeader>
+              <div class="max-w-3xl min-w-0 space-y-1.5">
+                <CardTitle class="flex items-center gap-2">
+                  <Languages class="h-4 w-4" />
+                  {{ t("settings.language.title") }}
+                </CardTitle>
+                <CardDescription>
+                  {{ t("settings.language.description") }}
+                </CardDescription>
+              </div>
+            </CardHeader>
+            <CardContent class="max-w-2xl space-y-2 xl:max-w-3xl">
+              <FieldLabel for="ui-language">
+                {{ t("settings.language.label") }}
+              </FieldLabel>
+              <Select :model-value="locale" @update:model-value="(v) => setLocale(v as Locale)">
+                <SelectTrigger id="ui-language" class="w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="en">{{ t("settings.language.optionEnglish") }}</SelectItem>
+                  <SelectItem value="zh">{{ t("settings.language.optionChinese") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </Card>
         </TabsContent>
       </div>
     </Tabs>
