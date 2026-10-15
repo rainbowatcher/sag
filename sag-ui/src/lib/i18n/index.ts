@@ -35,8 +35,20 @@ function devWarn(message: string): void {
 // module in a plain node environment (no `localStorage`).
 let localeRef: Ref<Locale> | null = null
 
+/** Coerce a persisted value to a supported locale, falling back to the default. */
+function normalizeLocale(value: unknown): Locale {
+  return value === "en" || value === "zh" ? value : DEFAULT_LOCALE
+}
+
 function getLocale(): Ref<Locale> {
-  localeRef ??= useLocalStorage<Locale>(LOCALE_STORAGE_KEY, DEFAULT_LOCALE)
+  if (localeRef === null) {
+    const ref = useLocalStorage<Locale>(LOCALE_STORAGE_KEY, DEFAULT_LOCALE)
+    // localStorage is user-writable: reject anything outside the known locales
+    // (corruption, tampering, older formats) before it can reach `t()`.
+    const normalized = normalizeLocale(ref.value)
+    if (normalized !== ref.value) ref.value = normalized
+    localeRef = ref
+  }
   return localeRef
 }
 
@@ -68,7 +80,7 @@ export function t(
   rawFallback?: string,
 ): string {
   const active = getLocale().value
-  let template: string | undefined = messages[active][key]
+  let template: string | undefined = messages[active]?.[key]
   if (template === undefined) {
     const fallback: string | undefined = en[key] ?? rawFallback
     template = fallback ?? key

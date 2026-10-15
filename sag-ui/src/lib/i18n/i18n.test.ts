@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import type { App } from "vue"
 import { en } from "./en.ts"
 import {
@@ -55,19 +56,23 @@ function withZhKeyRemoved(key: string, run: () => void): void {
 
 // ── fallback order: active locale → en → rawFallback → key ──────────
 {
-  setLocale("en")
-  assert.equal(t("common.save"), "Save")
-  setLocale("zh")
-  assert.equal(t("common.save"), "保存")
+  try {
+    setLocale("en")
+    assert.equal(t("common.save"), "Save")
+    setLocale("zh")
+    assert.equal(t("common.save"), "保存")
 
-  withZhKeyRemoved("common.save", () => {
-    assert.equal(t("common.save"), "Save", "a key missing from zh falls back to en")
-  })
-  assert.equal(t("common.save"), "保存", "dictionary restored after the probe")
+    withZhKeyRemoved("common.save", () => {
+      assert.equal(t("common.save"), "Save", "a key missing from zh falls back to en")
+    })
+    assert.equal(t("common.save"), "保存", "dictionary restored after the probe")
 
-  const missing = "common.not.seeded" as MessageKey
-  assert.equal(t(missing, undefined, "Hardcoded"), "Hardcoded", "en miss → rawFallback")
-  assert.equal(t(missing), "common.not.seeded", "no fallback left → the key itself")
+    const missing = "common.not.seeded" as MessageKey
+    assert.equal(t(missing, undefined, "Hardcoded"), "Hardcoded", "en miss → rawFallback")
+    assert.equal(t(missing), "common.not.seeded", "no fallback left → the key itself")
+  } finally {
+    setLocale(DEFAULT_LOCALE)
+  }
 }
 
 // ── key parity: en and zh cover exactly the same keys ───────────────
@@ -85,29 +90,102 @@ function withZhKeyRemoved(key: string, run: () => void): void {
 
 // ── setLocale drives reactivity ─────────────────────────────────────
 {
-  const { locale } = useI18n()
-  setLocale("zh")
-  const zhValue = t("common.enabled")
-  setLocale("en")
-  assert.equal(locale.value, "en", "setLocale writes the shared reactive ref")
-  assert.equal(t("common.enabled"), "Enabled", "t() follows the locale ref")
-  assert.notEqual(t("common.enabled"), zhValue)
-  setLocale("zh")
-  assert.equal(t("common.enabled"), zhValue, "switching back restores the zh copy")
+  try {
+    const { locale } = useI18n()
+    setLocale("zh")
+    const zhValue = t("common.enabled")
+    setLocale("en")
+    assert.equal(locale.value, "en", "setLocale writes the shared reactive ref")
+    assert.equal(t("common.enabled"), "Enabled", "t() follows the locale ref")
+    assert.notEqual(t("common.enabled"), zhValue)
+    setLocale("zh")
+    assert.equal(t("common.enabled"), zhValue, "switching back restores the zh copy")
+  } finally {
+    setLocale(DEFAULT_LOCALE)
+  }
 }
 
 // ── installI18n registers $t and tolerates a missing DOM ────────────
 {
-  setLocale("zh")
-  const app = { config: { globalProperties: {} } } as unknown as App
-  installI18n(app)
-  assert.equal(typeof app.config.globalProperties.$t, "function", "$t is registered globally")
-  assert.equal(app.config.globalProperties.$t("common.save"), "保存")
-  // No `document` here: the html-lang watcher must not throw, and switching
-  // locales afterwards must still be safe.
-  assert.equal(typeof document, "undefined", "expected a non-DOM test environment")
-  setLocale("en")
-  setLocale("zh")
+  try {
+    setLocale("zh")
+    const app = { config: { globalProperties: {} } } as unknown as App
+    installI18n(app)
+    assert.equal(typeof app.config.globalProperties.$t, "function", "$t is registered globally")
+    assert.equal(app.config.globalProperties.$t("common.save"), "保存")
+    // No `document` here: the html-lang watcher must not throw, and switching
+    // locales afterwards must still be safe.
+    assert.equal(typeof document, "undefined", "expected a non-DOM test environment")
+    setLocale("en")
+    setLocale("zh")
+  } finally {
+    setLocale(DEFAULT_LOCALE)
+  }
+}
+
+// ── corrupted persisted locale is coerced, never crashes ────────────
+// The module caches its locale ref on first use, and `@vueuse/shared` freezes
+// `isClient` when it is first imported — both already happened above without a
+// DOM. Seeded-storage scenarios therefore run in a fresh child process where
+// the fake DOM globals exist *before* the module loads.
+function probeStoredLocale(seed: string | null): { locale: unknown; value: string } {
+  const moduleUrl = new URL("./index.ts", import.meta.url).href
+  const script = `
+class FakeStorage {
+  #map = new Map()
+  get length() { return this.#map.size }
+  getItem(key) { return this.#map.has(key) ? this.#map.get(key) : null }
+  setItem(key, value) { this.#map.set(key, String(value)) }
+  removeItem(key) { this.#map.delete(key) }
+  clear() { this.#map.clear() }
+  key(index) { return [...this.#map.keys()][index] ?? null }
+}
+globalThis.Storage = FakeStorage
+globalThis.localStorage = new FakeStorage()
+${seed === null ? "" : `localStorage.setItem(${JSON.stringify(LOCALE_STORAGE_KEY)}, ${JSON.stringify(seed)})`}
+globalThis.window = globalThis
+globalThis.addEventListener = () => {}
+globalThis.removeEventListener = () => {}
+globalThis.dispatchEvent = () => {}
+globalThis.StorageEvent = class StorageEvent {
+  constructor(type, init) { this.type = type; Object.assign(this, init) }
+}
+globalThis.document = {
+  documentElement: { lang: "" },
+  createElement: () => ({ innerHTML: "", content: { firstChild: null }, setAttribute() {}, style: {} }),
+  createTextNode: () => ({}),
+  querySelector: () => null,
+}
+const mod = await import(${JSON.stringify(moduleUrl)})
+const { locale } = mod.useI18n()
+let value
+try {
+  value = mod.t("common.save")
+} catch (error) {
+  console.error("probe threw: " + error.message)
+  process.exit(3)
+}
+process.stdout.write(JSON.stringify({ locale: locale.value, value }))
+`
+  const stdout = execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "-e", script],
+    { encoding: "utf8", env: { ...process.env, NODE_NO_WARNINGS: "1" } },
+  )
+  return JSON.parse(stdout) as { locale: unknown; value: string }
+}
+
+{
+  const corrupted: (string | null)[] = ["fr", "", "FR", "zh-CN", null, '{"a":1}']
+  for (const seed of corrupted) {
+    const result = probeStoredLocale(seed)
+    const label = `seed ${JSON.stringify(seed)}`
+    assert.equal(result.locale, DEFAULT_LOCALE, `${label} is coerced to the default locale`)
+    assert.equal(result.value, "保存", `${label} translates without throwing`)
+  }
+  // A valid persisted locale still survives untouched.
+  assert.deepEqual(probeStoredLocale("en"), { locale: "en", value: "Save" })
+  assert.deepEqual(probeStoredLocale("zh"), { locale: "zh", value: "保存" })
 }
 
 console.log("i18n.test: all assertions passed")
