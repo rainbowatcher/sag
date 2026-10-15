@@ -60,11 +60,7 @@ const form = useForm({
           strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
         })
         .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
-          message: t(
-            "routes.form.apiEndpointRequired",
-            undefined,
-            "API endpoint is required for image pipeline",
-          ),
+          message: t("routes.form.apiEndpointRequired"),
           path: ["api_endpoint"],
         }),
     }
@@ -73,30 +69,18 @@ const form = useForm({
     apiError.value = ""
     try {
       if (targets.value.length === 0) {
-        apiError.value = t(
-          "routes.form.targetRequired",
-          undefined,
-          "At least one target is required",
-        )
+        apiError.value = t("routes.form.targetRequired")
         return
       }
       const emptyTarget = targets.value.find((target) => !target.provider)
       if (emptyTarget) {
-        apiError.value = t(
-          "routes.form.targetProviderRequired",
-          undefined,
-          "Each target must have a provider selected",
-        )
+        apiError.value = t("routes.form.targetProviderRequired")
         return
       }
 
       const routeName = value.model_name || targets.value[0].real_model || ""
       if (!routeName) {
-        apiError.value = t(
-          "routes.form.modelNameRequired",
-          undefined,
-          "Please provide model_name or fill real_model on the first target",
-        )
+        apiError.value = t("routes.form.modelNameRequired")
         return
       }
 
@@ -117,13 +101,7 @@ const form = useForm({
             if (extraErr) {
               const targetName =
                 target.provider || target.real_model || "#" + (targets.value.indexOf(target) + 1)
-              throw new Error(
-                t(
-                  "routes.form.targetExtra",
-                  { name: targetName, error: extraErr },
-                  `Target ${targetName}: ${extraErr}`,
-                ),
-              )
+              throw new Error(t("routes.form.targetExtra", { name: targetName, error: extraErr }))
             }
             entry.extra = JSON.parse(target.extra)
           }
@@ -132,7 +110,7 @@ const form = useForm({
       }
 
       await routeStore.createRoute(payload)
-      toast.success(t("routes.toast.created", { name: routeName }, `Route "${routeName}" created`))
+      toast.success(t("routes.toast.created", { name: routeName }))
       emit("created")
     } catch (e: any) {
       apiError.value = getErrorMessage(e)

@@ -116,6 +116,10 @@ ui-lint *args:
 ui-typecheck:
     pnpm -C sag-ui run typecheck
 
+# 运行 i18n 反回归检查（键/占位符/大括号奇偶、CJK 字面量扫描、死键报告）
+ui-i18n-check:
+    pnpm -C sag-ui run check:i18n
+
 # 运行所有 lint (Rust clippy + 前端 oxlint + vue-tsc)
 lint: clippy ui-lint ui-typecheck
 
@@ -127,8 +131,8 @@ verify: verify-rust verify-ui
 # Rust 轨验证：fmt-check + clippy + test
 verify-rust: fmt-check-rust clippy test-rust
 
-# 前端轨验证：fmt-check + oxlint/typecheck + test
-verify-ui: ui-fmt-check ui-lint ui-typecheck ui-test
+# 前端轨验证：fmt-check + oxlint/typecheck + test + i18n 反回归检查
+verify-ui: ui-fmt-check ui-lint ui-typecheck ui-test ui-i18n-check
 
 # ── 清理 ────────────────────────────────────────────────────────────
 

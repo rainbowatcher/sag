@@ -99,13 +99,7 @@ async function confirmDelete() {
   deleting.value = true
   try {
     await routeStore.deleteRoute(deleteTarget.value)
-    toast.success(
-      t(
-        "routes.toast.deleted",
-        { name: deleteTarget.value },
-        `Route "${deleteTarget.value}" deleted`,
-      ),
-    )
+    toast.success(t("routes.toast.deleted", { name: deleteTarget.value }))
     deleteDialogOpen.value = false
     deleteTarget.value = null
     await Promise.all([routeStore.fetchRoutes(), activeTargetStore.fetchActiveTargets()])
@@ -132,25 +126,12 @@ async function clearActiveTarget(entry: ActiveTargetEntry, isFillFirst: boolean)
     await activeTargetStore.clearActiveTarget(model)
     toast.success(
       isFillFirst
-        ? t(
-            "routes.toast.fillFirstReset",
-            { model: entry.model },
-            `Reset fill-first order for "${entry.model}", will re-shuffle on next request`,
-          )
-        : t(
-            "routes.toast.pinCleared",
-            { model: entry.model },
-            `Cleared sticky pin for "${entry.model}", will revert to priority routing`,
-          ),
+        ? t("routes.toast.fillFirstReset", { model: entry.model })
+        : t("routes.toast.pinCleared", { model: entry.model }),
     )
     return true
   } catch (e: any) {
-    toast.error(
-      getErrorMessage(
-        e,
-        t("routes.toast.clearActiveFailed", undefined, "Failed to clear active target"),
-      ),
-    )
+    toast.error(getErrorMessage(e, t("routes.toast.clearActiveFailed")))
     return false
   } finally {
     clearingModel.value = null
@@ -213,11 +194,7 @@ function getRouteTargetStatus(route: RouteConfig): RouteTargetStatus {
         provider: target.provider,
         real_model: target.real_model,
         reason: "missing_provider",
-        message: t(
-          "routeList.targetMissingProvider",
-          { index: i + 1, provider: target.provider },
-          `Target #${i + 1}: Provider "${target.provider}" not found`,
-        ),
+        message: t("routeList.targetMissingProvider", { index: i + 1, provider: target.provider }),
       })
     } else if (!p.enabled) {
       issues.push({
@@ -225,11 +202,7 @@ function getRouteTargetStatus(route: RouteConfig): RouteTargetStatus {
         provider: target.provider,
         real_model: target.real_model,
         reason: "disabled_provider",
-        message: t(
-          "routeList.targetProviderDisabled",
-          { index: i + 1, provider: target.provider },
-          `Target #${i + 1}: Provider "${target.provider}" is disabled`,
-        ),
+        message: t("routeList.targetProviderDisabled", { index: i + 1, provider: target.provider }),
       })
     } else if (p.enabled_models.length > 0) {
       const modelToCheck = target.real_model || route.model_name
@@ -239,11 +212,11 @@ function getRouteTargetStatus(route: RouteConfig): RouteTargetStatus {
           provider: target.provider,
           real_model: target.real_model,
           reason: "invalid_model",
-          message: t(
-            "routeList.targetModelDisabled",
-            { index: i + 1, model: modelToCheck, provider: target.provider },
-            `Target #${i + 1}: Model "${modelToCheck}" is not enabled for provider "${target.provider}"`,
-          ),
+          message: t("routeList.targetModelDisabled", {
+            index: i + 1,
+            model: modelToCheck,
+            provider: target.provider,
+          }),
         })
       } else {
         validCount++
@@ -296,7 +269,7 @@ const strategyLabels = computed<Record<string, string>>(() => ({
 // headers must stay functions: () => t(...) — string headers freeze on locale switch (see review-p1-p2 Minor-2)
 const columns = [
   columnHelper.accessor("model_name", {
-    header: () => t("routeList.columns.modelName", undefined, "Model Name"),
+    header: () => t("routeList.columns.modelName"),
     cell: (info) =>
       h("div", { class: "flex items-center gap-2" }, [
         h(GitBranch, { class: "text-muted-foreground h-3.5 w-3.5 shrink-0" }),
@@ -305,7 +278,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "pipeline",
-    header: () => t("routeList.columns.pipeline", undefined, "Pipeline"),
+    header: () => t("routeList.columns.pipeline"),
     cell: (info) => {
       const r = info.row.original
       const isImage = (r.pipeline ?? "chat") === "image"
@@ -322,7 +295,7 @@ const columns = [
     },
   }),
   columnHelper.accessor("strategy", {
-    header: () => t("routeList.columns.strategy", undefined, "Strategy"),
+    header: () => t("routeList.columns.strategy"),
     cell: (info) => {
       const s = info.getValue()
       return h(
@@ -337,7 +310,7 @@ const columns = [
     meta: { class: "2xl:min-w-[140px]" },
   }),
   columnHelper.accessor("targets", {
-    header: () => t("routeList.columns.targets", undefined, "Targets"),
+    header: () => t("routeList.columns.targets"),
     sortingFn: (a, b) => {
       const sa = getRouteTargetStatus(a.original).validCount
       const sb = getRouteTargetStatus(b.original).validCount
@@ -375,12 +348,8 @@ const columns = [
             "div",
             { class: "border-border/50 border-b pb-0.5 font-semibold" },
             allInvalid
-              ? t("routeList.allTargetsUnavailable", undefined, "All targets are unavailable")
-              : t(
-                  "routeList.targetsValid",
-                  { valid: status.validCount, total: status.total },
-                  `${status.validCount}/${status.total} targets valid`,
-                ),
+              ? t("routeList.allTargetsUnavailable")
+              : t("routeList.targetsValid", { valid: status.validCount, total: status.total }),
           ),
           ...status.issues.map((issue) =>
             h("div", { class: "text-muted-foreground" }, issue.message),
@@ -392,12 +361,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "activeTarget",
-    header: () =>
-      h(
-        "span",
-        { class: "text-xs font-medium" },
-        t("routeList.columns.activeTarget", undefined, "Active Target"),
-      ),
+    header: () => h("span", { class: "text-xs font-medium" }, t("routeList.columns.activeTarget")),
     sortingFn: (a, b) => {
       // "Has an active target" sort, mirroring the cell: a sticky pin on a
       // sticky_failover route OR the current fill-first target (position 0
@@ -448,28 +412,22 @@ const columns = [
         ),
         h(TooltipContent, { side: "left", class: "max-w-xs" }, () =>
           h("div", { class: "space-y-1" }, [
-            tooltipRow(t("common.provider", undefined, "Provider"), active.provider, true),
-            tooltipRow(t("common.model", undefined, "Model"), active.real_model, true),
+            tooltipRow(t("common.provider"), active.provider, true),
+            tooltipRow(t("common.model"), active.real_model, true),
             tooltipRow(
-              t("common.status", undefined, "Status"),
-              isFillFirst
-                ? t("routeList.fillFirstTarget", undefined, "Fill-first target")
-                : active.status,
+              t("common.status"),
+              isFillFirst ? t("routeList.fillFirstTarget") : active.status,
             ),
             tooltipRow(
-              isFillFirst
-                ? t("routeList.tooltip.orderAge", undefined, "Order age")
-                : t("routeList.tooltip.pinAge", undefined, "Pin age"),
+              isFillFirst ? t("routeList.tooltip.orderAge") : t("routeList.tooltip.pinAge"),
               formatDuration(
                 (isFillFirst ? (active.fill_first_cache_age_secs ?? 0) : active.age_secs) * 1000,
               ),
               true,
             ),
             tooltipRow(
-              t("routeList.tooltip.action", undefined, "Action"),
-              isFillFirst
-                ? t("routeList.clickToReset", undefined, "Click to reset")
-                : t("routeList.clickToClear", undefined, "Click to clear"),
+              t("routeList.tooltip.action"),
+              isFillFirst ? t("routeList.clickToReset") : t("routeList.clickToClear"),
             ),
           ]),
         ),
@@ -488,8 +446,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startEdit(info.row.original),
-            title: t("routeList.editRoute", undefined, "Edit route"),
-            "aria-label": t("routeList.editRoute", undefined, "Edit route"),
+            title: t("routeList.editRoute"),
+            "aria-label": t("routeList.editRoute"),
           },
           () => h(Pen, { class: "h-3.5 w-3.5" }),
         ),
@@ -499,8 +457,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startDelete(info.row.original.model_name),
-            title: t("routeList.deleteRoute", undefined, "Delete route"),
-            "aria-label": t("routeList.deleteRoute", undefined, "Delete route"),
+            title: t("routeList.deleteRoute"),
+            "aria-label": t("routeList.deleteRoute"),
           },
           () => h(Trash2, { class: "h-3.5 w-3.5" }),
         ),

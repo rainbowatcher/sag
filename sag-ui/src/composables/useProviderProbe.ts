@@ -1,5 +1,6 @@
 import { computed, onMounted, ref, watch } from "vue"
 import type { Ref } from "vue"
+import { t } from "@/lib/i18n"
 import { PROBE_KIND_ORDER, defaultProbeKind } from "@/lib/provider-probe"
 import { useProviderStore } from "@/stores/providers"
 import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
@@ -71,7 +72,7 @@ export function useProviderProbe(options: UseProviderProbeOptions) {
   function onFetchModels() {
     const probe = probeApi.value
     if (!probe) {
-      store.upstreamModelsError = "Declare an API section first (APIs tab)"
+      store.upstreamModelsError = t("providers.probe.declareApiFirst")
       return
     }
     store.fetchUpstreamModels({
@@ -87,7 +88,7 @@ export function useProviderProbe(options: UseProviderProbeOptions) {
   function onTestModel(model: string) {
     const probe = probeApi.value
     if (!probe) {
-      store.upstreamModelsError = "Declare an API section first (APIs tab)"
+      store.upstreamModelsError = t("providers.probe.declareApiFirst")
       return
     }
     store.testModelWithState(model, {

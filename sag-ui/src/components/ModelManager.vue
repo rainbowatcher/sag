@@ -103,13 +103,11 @@ async function confirmCreateRoute() {
       ],
     }
     await routeStore.createRoute(payload)
-    toast.success(t("routes.toast.created", { name: routeName }, `Route "${routeName}" created`))
+    toast.success(t("routes.toast.created", { name: routeName }))
     routeToCreate.value = null
     await routeStore.fetchRoutes()
   } catch (e: any) {
-    toast.error(
-      getErrorMessage(e, t("routes.toast.createFailed", undefined, "Failed to create route")),
-    )
+    toast.error(getErrorMessage(e, t("routes.toast.createFailed")))
   } finally {
     creatingRoute.value = false
   }

@@ -40,22 +40,10 @@ function validate(): string | null {
   const retriesNum = num(retries.value)
   const baseNum = num(baseMs.value)
   const maxNum = num(maxMs.value)
-  if (!Number.isFinite(retriesNum) || retriesNum < 1)
-    return t("settings.backoff.retriesMin", undefined, "Retries must be at least 1.")
-  if (!Number.isFinite(baseNum) || baseNum < 0)
-    return t(
-      "settings.backoff.baseNonNegative",
-      undefined,
-      "Base delay must be a non-negative number.",
-    )
-  if (!Number.isFinite(maxNum) || maxNum < 0)
-    return t(
-      "settings.backoff.maxNonNegative",
-      undefined,
-      "Max delay must be a non-negative number.",
-    )
-  if (baseNum > maxNum)
-    return t("settings.backoff.baseExceedsMax", undefined, "Base delay must not exceed max delay.")
+  if (!Number.isFinite(retriesNum) || retriesNum < 1) return t("settings.backoff.retriesMin")
+  if (!Number.isFinite(baseNum) || baseNum < 0) return t("settings.backoff.baseNonNegative")
+  if (!Number.isFinite(maxNum) || maxNum < 0) return t("settings.backoff.maxNonNegative")
+  if (baseNum > maxNum) return t("settings.backoff.baseExceedsMax")
   return null
 }
 
@@ -76,7 +64,7 @@ async function handleSave() {
         retry_on_empty_response: retryOnEmpty.value,
       },
     })
-    toast.success(t("settings.toast.backoffSaved", undefined, "Backoff settings saved"))
+    toast.success(t("settings.toast.backoffSaved"))
   } catch (e: any) {
     formError.value = store.error || String(e)
   }

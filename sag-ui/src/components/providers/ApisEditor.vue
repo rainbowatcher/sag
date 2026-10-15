@@ -157,18 +157,10 @@ function sectionJsonError(d: SectionDraft): string | null {
     try {
       const parsed = JSON.parse(value.trim())
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        return t(
-          "providers.apis.validate.modelOverrideNotObject",
-          { key: key.trim() },
-          `Model override "${key.trim()}": value must be a JSON object`,
-        )
+        return t("providers.apis.validate.modelOverrideNotObject", { key: key.trim() })
       }
     } catch {
-      return t(
-        "providers.apis.validate.modelOverrideInvalidJson",
-        { key: key.trim() },
-        `Model override "${key.trim()}": invalid JSON value`,
-      )
+      return t("providers.apis.validate.modelOverrideInvalidJson", { key: key.trim() })
     }
   }
   return null
@@ -329,57 +321,29 @@ function numericValue(raw: string): string | undefined {
 
 function validate(): string | null {
   if (sections.value.length === 0) {
-    return t(
-      "providers.apis.validate.atLeastOneSection",
-      undefined,
-      "At least one API section is required (e.g. chat_completions)",
-    )
+    return t("providers.apis.validate.atLeastOneSection")
   }
   for (const d of sections.value) {
     const kind = apiKindLabels.value[d.kind]
     if (!d.base_url.trim()) {
-      return t(
-        "providers.apis.validate.baseUrlRequired",
-        { kind },
-        `API section "${kind}": base_url is required`,
-      )
+      return t("providers.apis.validate.baseUrlRequired", { kind })
     }
     const jsonError = sectionJsonError(d)
     if (jsonError) {
-      return t(
-        "providers.apis.validate.sectionPrefix",
-        { kind, error: jsonError },
-        `API section "${kind}": ${jsonError}`,
-      )
+      return t("providers.apis.validate.sectionPrefix", { kind, error: jsonError })
     }
     if (d.timeout_secs.trim() && parseOptionalNumber(d.timeout_secs) === undefined) {
-      return t(
-        "providers.apis.validate.timeoutNonNegative",
-        { kind },
-        `API section "${kind}": timeout must be a non-negative number`,
-      )
+      return t("providers.apis.validate.timeoutNonNegative", { kind })
     }
     if (d.chunk_timeout_secs.trim() && parseOptionalNumber(d.chunk_timeout_secs) === undefined) {
-      return t(
-        "providers.apis.validate.chunkTimeoutNonNegative",
-        { kind },
-        `API section "${kind}": chunk timeout must be a non-negative number`,
-      )
+      return t("providers.apis.validate.chunkTimeoutNonNegative", { kind })
     }
     if (d.ttfb_timeout_secs.trim() && parseOptionalNumber(d.ttfb_timeout_secs) === undefined) {
-      return t(
-        "providers.apis.validate.ttfbTimeoutNonNegative",
-        { kind },
-        `API section "${kind}": TTFB timeout must be a non-negative number`,
-      )
+      return t("providers.apis.validate.ttfbTimeoutNonNegative", { kind })
     }
   }
   if (protocolKeys.value.length > 1 && !fallbackValue.value) {
-    return t(
-      "providers.apis.validate.fallbackRequired",
-      undefined,
-      "Fallback protocol is required when multiple protocol sections are declared",
-    )
+    return t("providers.apis.validate.fallbackRequired")
   }
   return null
 }

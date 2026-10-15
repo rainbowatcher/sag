@@ -147,11 +147,7 @@ async function handleSubmit() {
       try {
         parsedBodyOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
       } catch {
-        apiError.value = t(
-          "providers.form.bodyOverrideInvalidJson",
-          { key },
-          `Body override "${key}": invalid JSON value`,
-        )
+        apiError.value = t("providers.form.bodyOverrideInvalidJson", { key })
         return
       }
     }
@@ -177,13 +173,7 @@ async function handleSubmit() {
     payload.proxy_mode = proxyMode.value
 
     await store.updateProvider(props.provider.name, payload)
-    toast.success(
-      t(
-        "providers.toast.updated",
-        { name: props.provider.name },
-        `Provider "${props.provider.name}" updated`,
-      ),
-    )
+    toast.success(t("providers.toast.updated", { name: props.provider.name }))
     emit("updated")
   } catch (e: any) {
     if (apiError.value) return

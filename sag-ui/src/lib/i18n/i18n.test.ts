@@ -39,22 +39,36 @@ function withZhKeyRemoved(key: string, run: () => void): void {
 
 // ── interpolation: named {param} only ───────────────────────────────
 {
-  // No seeded key carries a placeholder yet, so interpolation is exercised
-  // through the `rawFallback` migration valve.
-  const missing = "common.not.seeded" as MessageKey
-  assert.equal(t(missing, { name: "World" }, "Hello {name}"), "Hello World")
-  assert.equal(t(missing, { a: 1, b: 2 }, "{a} + {b}"), "1 + 2", "numbers are stringified")
-  assert.equal(t(missing, { name: "x" }, "{name} and {name}"), "x and x", "all occurrences")
-
-  // A missing param keeps its literal placeholder while the rest resolves.
-  assert.equal(t(missing, { other: "y" }, "Hello {name}, {other}"), "Hello {name}, y")
-  // No params at all → the template is returned untouched.
-  assert.equal(t(missing, undefined, "Hello {name}"), "Hello {name}")
-  // A template without placeholders ignores params.
-  assert.equal(t("common.save", { name: "x" }), "保存")
+  // Real dictionary values exercise interpolation now that the `rawFallback`
+  // migration valve is gone. Pin the locale so the assertions are about
+  // interpolation, not copy.
+  try {
+    setLocale("en")
+    assert.equal(
+      t("providers.models.createRouteHint", { provider: "openai", model: "gpt-4o" }),
+      "Create route openai/gpt-4o",
+      "every placeholder is replaced",
+    )
+    assert.equal(
+      t("analytics.v2.successFailure", { success: 3, failure: 1 }),
+      "Success 3 · Failure 1",
+      "numbers are stringified",
+    )
+    // A missing param keeps its literal placeholder while the rest resolves.
+    assert.equal(
+      t("providers.models.createRouteHint", { provider: "openai" }),
+      "Create route openai/{model}",
+    )
+    // No params at all → the template is returned untouched.
+    assert.equal(t("providers.probe.baseUrlLabel"), "{protocol} base URL")
+    // A template without placeholders ignores params.
+    assert.equal(t("common.save", { name: "x" }), "Save")
+  } finally {
+    setLocale(DEFAULT_LOCALE)
+  }
 }
 
-// ── fallback order: active locale → en → rawFallback → key ──────────
+// ── fallback order: active locale → en → the key itself ─────────────
 {
   try {
     setLocale("en")
@@ -68,11 +82,70 @@ function withZhKeyRemoved(key: string, run: () => void): void {
     assert.equal(t("common.save"), "保存", "dictionary restored after the probe")
 
     const missing = "common.not.seeded" as MessageKey
-    assert.equal(t(missing, undefined, "Hardcoded"), "Hardcoded", "en miss → rawFallback")
     assert.equal(t(missing), "common.not.seeded", "no fallback left → the key itself")
   } finally {
     setLocale(DEFAULT_LOCALE)
   }
+}
+
+// ── missing key warns in dev ────────────────────────────────────────
+// `devWarn` is gated on `import.meta.env.DEV`, which Vite injects at build
+// time and the plain node runner never defines. The probe loads a fresh copy
+// of the module through a `module.registerHooks` loader that prepends
+// `import.meta.env = { DEV: true }`, so the dev-only branch is genuinely
+// exercised instead of being stubbed away.
+function probeMissingKeyWarn(): { value: string; warns: string[] } {
+  const moduleUrl = new URL("./index.ts", import.meta.url).href
+  const script = `
+import { registerHooks } from "node:module"
+import { readFileSync } from "node:fs"
+const target = ${JSON.stringify(moduleUrl)}
+registerHooks({
+  load(url, context, nextLoad) {
+    if (url === target) {
+      const source = readFileSync(new URL(url), "utf8")
+      return {
+        format: "module-typescript",
+        source: "import.meta.env = { DEV: true };\\n" + source,
+        shortCircuit: true,
+      }
+    }
+    return nextLoad(url, context)
+  },
+})
+const mod = await import(target)
+const warns = []
+const original = console.warn
+console.warn = (...args) => warns.push(args.map(String).join(" "))
+let value
+try {
+  value = mod.t("common.not.seeded")
+} catch (error) {
+  console.error("probe threw: " + error.message)
+  process.exit(3)
+} finally {
+  console.warn = original
+}
+process.stdout.write("PROBE_RESULT:" + JSON.stringify({ value, warns }) + "\\n")
+`
+  const stdout = execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "-e", script],
+    { encoding: "utf8", timeout: 15_000, env: { ...process.env, NODE_NO_WARNINGS: "1" } },
+  )
+  const marker = "PROBE_RESULT:"
+  const line = stdout.split("\n").find((l) => l.startsWith(marker))
+  if (line === undefined) throw new Error(`probe produced no result marker:\n${stdout}`)
+  return JSON.parse(line.slice(marker.length)) as { value: string; warns: string[] }
+}
+
+{
+  const result = probeMissingKeyWarn()
+  assert.equal(result.value, "common.not.seeded", "missing key returns the key itself")
+  assert.ok(
+    result.warns.some((w) => w.includes("missing key") && w.includes("common.not.seeded")),
+    `expected a dev warning, got ${JSON.stringify(result.warns)}`,
+  )
 }
 
 // ── key parity: en and zh cover exactly the same keys ───────────────

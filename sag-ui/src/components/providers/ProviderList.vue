@@ -112,16 +112,8 @@ async function toggleEnabled(provider: Provider) {
     await store.updateProvider(provider.name, { enabled: newState })
     toast.success(
       newState
-        ? t(
-            "providers.toast.enabled",
-            { name: provider.name },
-            `Provider "${provider.name}" enabled`,
-          )
-        : t(
-            "providers.toast.disabled",
-            { name: provider.name },
-            `Provider "${provider.name}" disabled`,
-          ),
+        ? t("providers.toast.enabled", { name: provider.name })
+        : t("providers.toast.disabled", { name: provider.name }),
     )
   } catch (e: any) {
     const msg = getErrorMessage(e)
@@ -229,15 +221,13 @@ async function confirmCopy() {
 
     await store.addProvider(payload)
     copyingProvider.value = null
-    toast.success(t("providers.toast.created", { name: newName }, `Provider "${newName}" created`))
+    toast.success(t("providers.toast.created", { name: newName }))
 
     // addProvider refreshed the list, so the new provider is present here.
     const created = store.providers.find((p) => p.name === newName)
     if (created) editingProvider.value = created
   } catch (e: any) {
-    toast.error(
-      getErrorMessage(e, t("providers.toast.copyFailed", undefined, "Failed to copy provider")),
-    )
+    toast.error(getErrorMessage(e, t("providers.toast.copyFailed")))
   } finally {
     isCopying.value = false
   }
@@ -252,7 +242,7 @@ async function confirmDelete(name: string) {
   deleting.value = true
   try {
     await store.deleteProvider(name)
-    toast.success(t("providers.toast.deleted", { name }, `Provider "${name}" deleted`))
+    toast.success(t("providers.toast.deleted", { name }))
     confirmingDelete.value = null
     await fetchProviders()
   } catch (e: any) {
@@ -277,7 +267,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "apis",
-    header: () => t("providerList.columns.apis", undefined, "APIs"),
+    header: () => t("providerList.columns.apis"),
     cell: (info) => {
       const p = info.row.original
       const kinds = Object.keys(p.apis ?? {}) as ApiKind[]
@@ -285,8 +275,8 @@ const columns = [
         return h("span", { class: "text-muted-foreground text-xs" }, "—")
       }
       const fallbackNote = p.fallback
-        ? t("providerList.fallbackNamed", { name: p.fallback }, `fallback: ${p.fallback}`)
-        : t("providerList.fallbackAuto", undefined, "fallback: auto")
+        ? t("providerList.fallbackNamed", { name: p.fallback })
+        : t("providerList.fallbackAuto")
       return h(
         "div",
         { class: "flex flex-wrap gap-1", title: fallbackNote },
@@ -305,7 +295,7 @@ const columns = [
     meta: { class: "min-w-[160px]" },
   }),
   columnHelper.accessor("api_keys", {
-    header: () => t("providerList.columns.keys", undefined, "Keys"),
+    header: () => t("providerList.columns.keys"),
     cell: (info) => h("span", { class: "tabular-nums" }, String(info.getValue().length)),
     meta: { class: "text-center" },
   }),
@@ -324,7 +314,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "breakers",
-    header: () => t("providerList.columns.cb", undefined, "CB"),
+    header: () => t("providerList.columns.cb"),
     cell: (info) => {
       const provider = info.row.original
       const counts = breakersByProvider.value[provider.name]
@@ -348,7 +338,7 @@ const columns = [
             h(
               "pre",
               { class: "whitespace-pre-wrap font-mono text-[11px]" },
-              t("providerList.allTargetsHealthy", undefined, "All targets healthy"),
+              t("providerList.allTargetsHealthy"),
             ),
           ),
         ])
@@ -360,23 +350,11 @@ const columns = [
 
       const tooltipRows: string[] = []
       if (openList.length > 0) {
-        tooltipRows.push(
-          t(
-            "providerList.breakerOpenGroup",
-            { count: openList.length },
-            `Open (${openList.length}):`,
-          ),
-        )
+        tooltipRows.push(t("providerList.breakerOpenGroup", { count: openList.length }))
         for (const b of openList) tooltipRows.push(`  ${b.model} → ${b.real_model}`)
       }
       if (halfOpenList.length > 0) {
-        tooltipRows.push(
-          t(
-            "providerList.breakerHalfOpenGroup",
-            { count: halfOpenList.length },
-            `Half-Open (${halfOpenList.length}):`,
-          ),
-        )
+        tooltipRows.push(t("providerList.breakerHalfOpenGroup", { count: halfOpenList.length }))
         for (const b of halfOpenList) tooltipRows.push(`  ${b.model} → ${b.real_model}`)
       }
 
@@ -406,11 +384,11 @@ const columns = [
           disabled: togglingProvider.value === provider.name,
           "onUpdate:modelValue": () => toggleEnabled(provider),
           title: provider.enabled
-            ? t("providerList.disableProvider", undefined, "Disable provider")
-            : t("providerList.enableProvider", undefined, "Enable provider"),
+            ? t("providerList.disableProvider")
+            : t("providerList.enableProvider"),
           "aria-label": provider.enabled
-            ? t("providerList.disableProvider", undefined, "Disable provider")
-            : t("providerList.enableProvider", undefined, "Enable provider"),
+            ? t("providerList.disableProvider")
+            : t("providerList.enableProvider"),
         }),
         h("span", { class: "bg-border mx-1 h-4 w-px shrink-0", "aria-hidden": "true" }),
         h(
@@ -419,8 +397,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startEdit(info.row.original),
-            title: t("providerList.editProvider", undefined, "Edit provider"),
-            "aria-label": t("providerList.editProvider", undefined, "Edit provider"),
+            title: t("providerList.editProvider"),
+            "aria-label": t("providerList.editProvider"),
           },
           () => h(Pen, { class: "h-3.5 w-3.5" }),
         ),
@@ -430,8 +408,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startCopy(info.row.original),
-            title: t("providerList.copyProvider", undefined, "Copy provider"),
-            "aria-label": t("providerList.copyProvider", undefined, "Copy provider"),
+            title: t("providerList.copyProvider"),
+            "aria-label": t("providerList.copyProvider"),
           },
           () => h(Copy, { class: "h-3.5 w-3.5" }),
         ),
@@ -444,12 +422,12 @@ const columns = [
             onClick: () => startDelete(info.row.original.name),
             title:
               confirmingDelete.value === info.row.original.name
-                ? t("providerList.cancelDelete", undefined, "Cancel delete")
-                : t("providerList.deleteProvider", undefined, "Delete provider"),
+                ? t("providerList.cancelDelete")
+                : t("providerList.deleteProvider"),
             "aria-label":
               confirmingDelete.value === info.row.original.name
-                ? t("providerList.cancelDelete", undefined, "Cancel delete")
-                : t("providerList.deleteProvider", undefined, "Delete provider"),
+                ? t("providerList.cancelDelete")
+                : t("providerList.deleteProvider"),
           },
           () => h(Trash2, { class: "h-3.5 w-3.5" }),
         ),

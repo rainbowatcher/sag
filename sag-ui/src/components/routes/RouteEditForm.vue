@@ -67,11 +67,7 @@ const form = useForm({
           strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
         })
         .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
-          message: t(
-            "routes.form.apiEndpointRequired",
-            undefined,
-            "API endpoint is required for image pipeline",
-          ),
+          message: t("routes.form.apiEndpointRequired"),
           path: ["api_endpoint"],
         }),
     }
@@ -81,20 +77,12 @@ const form = useForm({
     apiError.value = ""
     try {
       if (targets.value.length === 0) {
-        apiError.value = t(
-          "routes.form.targetRequired",
-          undefined,
-          "At least one target is required",
-        )
+        apiError.value = t("routes.form.targetRequired")
         return
       }
       const emptyTarget = targets.value.find((target) => !target.provider)
       if (emptyTarget) {
-        apiError.value = t(
-          "routes.form.targetProviderRequired",
-          undefined,
-          "Each target must have a provider selected",
-        )
+        apiError.value = t("routes.form.targetProviderRequired")
         return
       }
 
@@ -123,13 +111,7 @@ const form = useForm({
             if (extraErr) {
               const targetName =
                 target.provider || target.real_model || "#" + (targets.value.indexOf(target) + 1)
-              throw new Error(
-                t(
-                  "routes.form.targetExtra",
-                  { name: targetName, error: extraErr },
-                  `Target ${targetName}: ${extraErr}`,
-                ),
-              )
+              throw new Error(t("routes.form.targetExtra", { name: targetName, error: extraErr }))
             }
             entry.extra = JSON.parse(target.extra)
           }
@@ -144,13 +126,7 @@ const form = useForm({
 })
 
 function onUpdated() {
-  toast.success(
-    t(
-      "routes.toast.updated",
-      { name: props.route.model_name },
-      `Route "${props.route.model_name}" updated`,
-    ),
-  )
+  toast.success(t("routes.toast.updated", { name: props.route.model_name }))
 }
 
 async function handleSubmit(event: Event) {

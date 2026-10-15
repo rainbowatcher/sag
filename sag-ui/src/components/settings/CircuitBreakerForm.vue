@@ -41,40 +41,20 @@ watch(() => store.config, syncFromStore, { immediate: true })
 function validateSecs(value: number | string, label: string): string | null {
   const secs = num(value)
   if (!Number.isInteger(secs) || secs < 1) {
-    return t(
-      "settings.form.secsMin1",
-      { label },
-      `${label} must be a whole number of seconds (≥ 1).`,
-    )
+    return t("settings.form.secsMin1", { label })
   }
   if (secs > MAX_SECS) {
-    return t(
-      "settings.form.secsMax",
-      { label, max: MAX_SECS },
-      `${label} must not exceed ${MAX_SECS} seconds (one year).`,
-    )
+    return t("settings.form.secsMax", { label, max: MAX_SECS })
   }
   return null
 }
 
 function validate(): string | null {
   return (
-    validateSecs(
-      quotaExhaustedSecs.value,
-      t("settings.circuitBreaker.cooldownQuota", undefined, "Quota-exhausted cooldown"),
-    ) ??
-    validateSecs(
-      rateLimitedSecs.value,
-      t("settings.circuitBreaker.cooldownRate", undefined, "Rate-limited cooldown"),
-    ) ??
-    validateSecs(
-      genericSecs.value,
-      t("settings.circuitBreaker.cooldownGeneric", undefined, "Generic cooldown"),
-    ) ??
-    validateSecs(
-      probeIntervalSecs.value,
-      t("settings.circuitBreaker.probeInterval", undefined, "Probe interval"),
-    )
+    validateSecs(quotaExhaustedSecs.value, t("settings.circuitBreaker.cooldownQuota")) ??
+    validateSecs(rateLimitedSecs.value, t("settings.circuitBreaker.cooldownRate")) ??
+    validateSecs(genericSecs.value, t("settings.circuitBreaker.cooldownGeneric")) ??
+    validateSecs(probeIntervalSecs.value, t("settings.circuitBreaker.probeInterval"))
   )
 }
 
@@ -96,9 +76,7 @@ async function handleSave() {
         probe_interval_secs: num(probeIntervalSecs.value),
       },
     })
-    toast.success(
-      t("settings.toast.circuitBreakerSaved", undefined, "Circuit breaker settings saved"),
-    )
+    toast.success(t("settings.toast.circuitBreakerSaved"))
   } catch (e: any) {
     formError.value = store.error || String(e)
   }

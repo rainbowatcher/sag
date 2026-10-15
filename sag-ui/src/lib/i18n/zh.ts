@@ -181,6 +181,7 @@ export const zh: Record<keyof typeof en, string> = {
   "providers.probe.modelHintLead": "模型：建议使用非推理模型。使用 ",
   "providers.probe.modelHintTail": " 在所有协议间共享同一个 base URL。",
   "providers.probe.addKeyFirst": "请先添加至少一个 API key。",
+  "providers.probe.declareApiFirst": "请先声明一个 API section（APIs 标签页）",
   "providers.probe.resultsTitle": "探测结果",
   "providers.probe.columns.protocol": "协议",
   "providers.probe.columns.verdict": "结论",
@@ -442,6 +443,7 @@ export const zh: Record<keyof typeof en, string> = {
   "dashboard.gateway": "网关",
 
   "analytics.v2.scopeRoute": "路由",
+  // intentionally verbatim — technical token; zh view rendered the same pre-migration
   "analytics.v2.scopeTarget": "Target",
   "analytics.v2.filterRoute": "路由",
   "analytics.v2.searchRoute": "搜索路由...",
@@ -608,6 +610,7 @@ export const zh: Record<keyof typeof en, string> = {
   "logs.columns.effect": "效果",
   "logs.columns.mode": "模式",
   "logs.tooltip.upstream": "上游",
+  // intentionally verbatim — technical token; zh view rendered the same pre-migration
   "logs.tooltip.ttft": "TTFT",
   "logs.tooltip.tps": "tps",
   "logs.tooltip.stream": "流式",

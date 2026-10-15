@@ -36,32 +36,18 @@ watch(() => store.config, syncFromStore, { immediate: true })
 function validateSecs(value: number | string, label: string): string | null {
   const secs = num(value)
   if (!Number.isInteger(secs) || secs < 0) {
-    return t(
-      "settings.form.secsMin0",
-      { label },
-      `${label} must be a whole number of seconds (≥ 0).`,
-    )
+    return t("settings.form.secsMin0", { label })
   }
   if (secs > MAX_SECS) {
-    return t(
-      "settings.form.secsMax",
-      { label, max: MAX_SECS },
-      `${label} must not exceed ${MAX_SECS} seconds (one year).`,
-    )
+    return t("settings.form.secsMax", { label, max: MAX_SECS })
   }
   return null
 }
 
 function validate(): string | null {
   return (
-    validateSecs(
-      shuffleCacheTtlSecs.value,
-      t("settings.strategyTimers.fillFirstTtl", undefined, "Fill-first cache TTL"),
-    ) ??
-    validateSecs(
-      stickyFailoverResetSecs.value,
-      t("settings.strategyTimers.stickyReset", undefined, "Sticky failover reset"),
-    )
+    validateSecs(shuffleCacheTtlSecs.value, t("settings.strategyTimers.fillFirstTtl")) ??
+    validateSecs(stickyFailoverResetSecs.value, t("settings.strategyTimers.stickyReset"))
   )
 }
 
@@ -78,7 +64,7 @@ async function handleSave() {
       shuffle_cache_ttl_secs: num(shuffleCacheTtlSecs.value),
       sticky_failover_reset_secs: num(stickyFailoverResetSecs.value),
     })
-    toast.success(t("settings.toast.strategyTimersSaved", undefined, "Strategy timers saved"))
+    toast.success(t("settings.toast.strategyTimersSaved"))
   } catch (e: any) {
     formError.value = store.error || String(e)
   }

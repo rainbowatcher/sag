@@ -22,12 +22,12 @@ interface NavItem {
 // Built inside a computed so the labels re-resolve through `t()` whenever the
 // active locale changes — a plain array would freeze its strings at setup.
 const navItems = computed<NavItem[]>(() => [
-  { label: t("nav.dashboard", undefined, "Dashboard"), path: "/", icon: LayoutDashboard },
-  { label: t("nav.providers", undefined, "Providers"), path: "/providers", icon: Server },
-  { label: t("nav.routes", undefined, "Routes"), path: "/routes", icon: GitBranch },
-  { label: t("nav.analytics", undefined, "Analytics"), path: "/analytics", icon: BarChart3 },
-  { label: t("nav.logs", undefined, "Logs"), path: "/logs", icon: ScrollText },
-  { label: t("nav.settings", undefined, "Settings"), path: "/settings", icon: Settings },
+  { label: t("nav.dashboard"), path: "/", icon: LayoutDashboard },
+  { label: t("nav.providers"), path: "/providers", icon: Server },
+  { label: t("nav.routes"), path: "/routes", icon: GitBranch },
+  { label: t("nav.analytics"), path: "/analytics", icon: BarChart3 },
+  { label: t("nav.logs"), path: "/logs", icon: ScrollText },
+  { label: t("nav.settings"), path: "/settings", icon: Settings },
 ])
 
 const route = useRoute()

@@ -135,7 +135,7 @@ const form = useForm({
   get validators() {
     return {
       onSubmit: z.object({
-        name: z.string().min(1, t("providers.form.nameRequired", undefined, "Name is required")),
+        name: z.string().min(1, t("providers.form.nameRequired")),
         timeout_secs: z.union([z.number(), z.undefined()]),
       }),
     }
@@ -145,11 +145,7 @@ const form = useForm({
 
     const validKeys = apiKeys.value.filter((k) => k.trim().length > 0)
     if (validKeys.length === 0) {
-      apiError.value = t(
-        "providers.form.apiKeyRequired",
-        undefined,
-        "At least one API key is required",
-      )
+      apiError.value = t("providers.form.apiKeyRequired")
       return
     }
 
@@ -168,11 +164,7 @@ const form = useForm({
       try {
         parsedOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
       } catch {
-        apiError.value = t(
-          "providers.form.bodyOverrideInvalidJson",
-          { key },
-          `Body override "${key}": invalid JSON value`,
-        )
+        apiError.value = t("providers.form.bodyOverrideInvalidJson", { key })
         return
       }
     }

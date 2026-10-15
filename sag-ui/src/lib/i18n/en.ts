@@ -194,6 +194,7 @@ export const en = {
   "providers.probe.modelHintLead": "Model: prefer a non-reasoning model. Use ",
   "providers.probe.modelHintTail": " to share one base URL across protocols.",
   "providers.probe.addKeyFirst": "Add at least one API key first.",
+  "providers.probe.declareApiFirst": "Declare an API section first (APIs tab)",
   "providers.probe.resultsTitle": "Probe results",
   "providers.probe.columns.protocol": "Protocol",
   "providers.probe.columns.verdict": "Verdict",
@@ -465,6 +466,7 @@ export const en = {
 
   // ── P3b: analytics › V2 panel ───────────────────────────────────
   "analytics.v2.scopeRoute": "Route",
+  // intentionally verbatim — technical token; zh view rendered the same pre-migration
   "analytics.v2.scopeTarget": "Target",
   "analytics.v2.filterRoute": "route",
   "analytics.v2.searchRoute": "Search route...",
@@ -643,6 +645,7 @@ export const en = {
   "logs.columns.effect": "Effect",
   "logs.columns.mode": "Mode",
   "logs.tooltip.upstream": "upstream",
+  // intentionally verbatim — technical token; zh view rendered the same pre-migration
   "logs.tooltip.ttft": "ttft",
   "logs.tooltip.tps": "tps",
   "logs.tooltip.stream": "stream",

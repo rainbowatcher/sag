@@ -71,18 +71,10 @@ function validateProxyUrl(url: string): string | null {
   try {
     parsed = new URL(url)
   } catch {
-    return t(
-      "settings.proxy.invalidUrl",
-      undefined,
-      "Invalid URL. Use the form http://host:port or https://host:port.",
-    )
+    return t("settings.proxy.invalidUrl")
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return t(
-      "settings.proxy.httpOnly",
-      undefined,
-      "Only HTTP/HTTPS proxy URLs are supported (SOCKS is not supported).",
-    )
+    return t("settings.proxy.httpOnly")
   }
   return null
 }
@@ -101,13 +93,12 @@ const serverRows = computed<SystemInfoRow[]>(() => {
   const server = gatewayConfig.config?.server
   const proxyUrl = gatewayConfig.config?.proxy_url
   return [
-    { label: t("settings.info.host", undefined, "Host"), value: server?.host, mono: true },
-    { label: t("settings.info.port", undefined, "Port"), value: server?.port, mono: true },
+    { label: t("settings.info.host"), value: server?.host, mono: true },
+    { label: t("settings.info.port"), value: server?.port, mono: true },
     // `null` (not `undefined`) means the snapshot loaded and no proxy is set.
     {
-      label: t("settings.info.globalProxy", undefined, "Global proxy"),
-      value:
-        proxyUrl === null ? t("settings.info.direct", undefined, "Direct (no proxy)") : proxyUrl,
+      label: t("settings.info.globalProxy"),
+      value: proxyUrl === null ? t("settings.info.direct") : proxyUrl,
       mono: true,
     },
   ]
@@ -116,8 +107,8 @@ const serverRows = computed<SystemInfoRow[]>(() => {
 const loggingRows = computed<SystemInfoRow[]>(() => {
   const logging = gatewayConfig.config?.logging
   return [
-    { label: t("settings.info.level", undefined, "Level"), value: logging?.level, mono: true },
-    { label: t("settings.info.format", undefined, "Format"), value: logging?.format, mono: true },
+    { label: t("settings.info.level"), value: logging?.level, mono: true },
+    { label: t("settings.info.format"), value: logging?.format, mono: true },
   ]
 })
 
@@ -125,17 +116,17 @@ const analyticsRows = computed<SystemInfoRow[]>(() => {
   const analytics = gatewayConfig.config?.analytics
   if (!analytics) {
     return [
-      { label: t("settings.info.enabled", undefined, "Enabled"), value: null },
-      { label: t("settings.info.storageDsn", undefined, "Storage DSN"), value: null },
+      { label: t("settings.info.enabled"), value: null },
+      { label: t("settings.info.storageDsn"), value: null },
     ]
   }
   return [
     {
-      label: t("settings.info.enabled", undefined, "Enabled"),
+      label: t("settings.info.enabled"),
       value: analytics.enabled ? t("common.yes") : t("common.no"),
     },
     {
-      label: t("settings.info.storageDsn", undefined, "Storage DSN"),
+      label: t("settings.info.storageDsn"),
       value: analytics.storage_dsn,
       mono: true,
     },
@@ -165,7 +156,7 @@ async function handleProxySave() {
     // Omit api_keys so a proxy-only save never touches the auth config.
     await store.saveSettings({ proxy_url: value || null })
     proxyUrl.value = store.proxyUrl ?? ""
-    toast.success(t("settings.toast.proxySaved", undefined, "Proxy settings saved"))
+    toast.success(t("settings.toast.proxySaved"))
   } catch (e: any) {
     proxyError.value = store.error || String(e)
   } finally {
@@ -180,7 +171,7 @@ async function handleProxyClear() {
   try {
     await store.saveSettings({ proxy_url: null })
     proxyUrl.value = ""
-    toast.success(t("settings.toast.proxyCleared", undefined, "Proxy settings cleared"))
+    toast.success(t("settings.toast.proxyCleared"))
   } catch (e: any) {
     proxyError.value = store.error || String(e)
   } finally {
@@ -215,19 +206,11 @@ async function handleKeysSave() {
   proxyError.value = ""
   const trimmed = apiKeys.value.map((k) => k.trim()).filter((k) => k.length > 0)
   if (apiKeys.value.some((k) => k.length > 0 && k.trim().length === 0)) {
-    keysError.value = t(
-      "settings.apiKeys.emptyOrWhitespace",
-      undefined,
-      "API keys must not be empty or whitespace-only.",
-    )
+    keysError.value = t("settings.apiKeys.emptyOrWhitespace")
     return
   }
   if (apiKeys.value.some((k) => k.length === 0)) {
-    keysError.value = t(
-      "settings.apiKeys.emptyRows",
-      undefined,
-      "Remove empty key rows before saving, or fill them in.",
-    )
+    keysError.value = t("settings.apiKeys.emptyRows")
     return
   }
   keysSaving.value = true
@@ -240,9 +223,9 @@ async function handleKeysSave() {
     apiKeys.value = [...store.apiKeys]
     revealKeys.value = {}
     if (trimmed.length === 0) {
-      toast.success(t("settings.toast.authDisabled", undefined, "Authentication disabled"))
+      toast.success(t("settings.toast.authDisabled"))
     } else {
-      toast.success(t("settings.toast.apiKeysSaved", undefined, "API keys saved"))
+      toast.success(t("settings.toast.apiKeysSaved"))
     }
   } catch (e: any) {
     keysError.value = store.error || String(e)
@@ -262,7 +245,7 @@ async function handleKeysDisable() {
     })
     apiKeys.value = []
     revealKeys.value = {}
-    toast.success(t("settings.toast.authDisabled", undefined, "Authentication disabled"))
+    toast.success(t("settings.toast.authDisabled"))
   } catch (e: any) {
     keysError.value = store.error || String(e)
   } finally {

@@ -70,21 +70,15 @@ function interpolate(template: string, params?: Record<string, string | number>)
 /**
  * Translate `key` into the active locale.
  *
- * Resolution order: active locale → `en` → `rawFallback` → `key`. The
- * `rawFallback` valve lets not-yet-migrated call sites pass their current
- * hardcoded string instead of showing a raw key.
+ * Resolution order: active locale → `en` → the key itself. A key missing from
+ * both dictionaries warns in dev and renders as its own key string.
  */
-export function t(
-  key: MessageKey,
-  params?: Record<string, string | number>,
-  rawFallback?: string,
-): string {
+export function t(key: MessageKey, params?: Record<string, string | number>): string {
   const active = getLocale().value
-  let template: string | undefined = messages[active]?.[key]
+  const template = messages[active]?.[key] ?? en[key]
   if (template === undefined) {
-    const fallback: string | undefined = en[key] ?? rawFallback
-    template = fallback ?? key
-    devWarn(`missing key "${key}" for locale "${active}", falling back to "${template}"`)
+    devWarn(`missing key "${key}" for locale "${active}"`)
+    return key
   }
   return interpolate(template, params)
 }

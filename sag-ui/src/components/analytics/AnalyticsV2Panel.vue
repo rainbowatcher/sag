@@ -204,16 +204,16 @@ const latencyCards = computed<
   const m = overall.value
   if (!m) return []
   return [
-    { key: "e2e", title: t("analytics.v2.card.e2e", undefined, "E2E"), icon: Clock, metric: m.e2e },
+    { key: "e2e", title: t("analytics.v2.card.e2e"), icon: Clock, metric: m.e2e },
     {
       key: "ttft",
-      title: t("analytics.v2.card.ttft", undefined, "TTFT"),
+      title: t("analytics.v2.card.ttft"),
       icon: Timer,
       metric: m.ttft,
     },
     {
       key: "upstream",
-      title: t("analytics.v2.card.upstream", undefined, "Upstream"),
+      title: t("analytics.v2.card.upstream"),
       icon: ArrowUpRight,
       metric: m.upstream,
     },
@@ -245,60 +245,60 @@ const groupColumns = computed<GroupColumn[]>(() => {
   const left = "left" as const
   if (scope.value === "target") {
     return [
-      { key: "provider", label: t("common.provider", undefined, "Provider"), align: left },
+      { key: "provider", label: t("common.provider"), align: left },
       {
         key: "real_model",
-        label: t("analytics.v2.columns.actualModel", undefined, "Actual Model"),
+        label: t("analytics.v2.columns.actualModel"),
         align: left,
       },
       {
         key: "attempts",
-        label: t("analytics.v2.columns.attempts", undefined, "Attempts"),
+        label: t("analytics.v2.columns.attempts"),
         align: right,
       },
       {
         key: "success",
-        label: t("analytics.v2.columns.success", undefined, "Success"),
+        label: t("analytics.v2.columns.success"),
         align: right,
       },
       {
         key: "failure",
-        label: t("analytics.v2.columns.failure", undefined, "Failure"),
+        label: t("analytics.v2.columns.failure"),
         align: right,
       },
       {
         key: "success_rate",
-        label: t("analytics.v2.columns.successRate", undefined, "Success Rate"),
+        label: t("analytics.v2.columns.successRate"),
         align: right,
       },
       {
         key: "avg_e2e",
-        label: t("analytics.v2.columns.avgE2e", undefined, "Avg E2E"),
+        label: t("analytics.v2.columns.avgE2e"),
         align: right,
       },
       {
         key: "p95_e2e",
-        label: t("analytics.v2.columns.p95E2e", undefined, "P95 E2E"),
+        label: t("analytics.v2.columns.p95E2e"),
         align: right,
       },
       {
         key: "tokens_in",
-        label: t("analytics.v2.columns.tokensIn", undefined, "Tokens In"),
+        label: t("analytics.v2.columns.tokensIn"),
         align: right,
       },
       {
         key: "tokens_out",
-        label: t("analytics.v2.columns.tokensOut", undefined, "Tokens Out"),
+        label: t("analytics.v2.columns.tokensOut"),
         align: right,
       },
       {
         key: "cache_hit",
-        label: t("analytics.v2.columns.cacheHit", undefined, "Cache Hit"),
+        label: t("analytics.v2.columns.cacheHit"),
         align: right,
       },
       {
         key: "cache_unknown",
-        label: t("analytics.v2.columns.cacheUnknown", undefined, "Cache Unknown"),
+        label: t("analytics.v2.columns.cacheUnknown"),
         align: right,
       },
     ]
@@ -306,49 +306,49 @@ const groupColumns = computed<GroupColumn[]>(() => {
   return [
     {
       key: "route_name",
-      label: t("analytics.v2.columns.routeName", undefined, "Route Name"),
+      label: t("analytics.v2.columns.routeName"),
       align: left,
     },
     {
       key: "requests",
-      label: t("analytics.v2.columns.requests", undefined, "Requests"),
+      label: t("analytics.v2.columns.requests"),
       align: right,
     },
     {
       key: "success",
-      label: t("analytics.v2.columns.success", undefined, "Success"),
+      label: t("analytics.v2.columns.success"),
       align: right,
     },
     {
       key: "success_rate",
-      label: t("analytics.v2.columns.successRate", undefined, "Success Rate"),
+      label: t("analytics.v2.columns.successRate"),
       align: right,
     },
     {
       key: "model_failure_rate",
-      label: t("analytics.v2.columns.modelFailure", undefined, "Model Failure"),
+      label: t("analytics.v2.columns.modelFailure"),
       align: right,
     },
-    { key: "avg_e2e", label: t("analytics.v2.columns.avgE2e", undefined, "Avg E2E"), align: right },
-    { key: "p95_e2e", label: t("analytics.v2.columns.p95E2e", undefined, "P95 E2E"), align: right },
+    { key: "avg_e2e", label: t("analytics.v2.columns.avgE2e"), align: right },
+    { key: "p95_e2e", label: t("analytics.v2.columns.p95E2e"), align: right },
     {
       key: "tokens_in",
-      label: t("analytics.v2.columns.tokensIn", undefined, "Tokens In"),
+      label: t("analytics.v2.columns.tokensIn"),
       align: right,
     },
     {
       key: "tokens_out",
-      label: t("analytics.v2.columns.tokensOut", undefined, "Tokens Out"),
+      label: t("analytics.v2.columns.tokensOut"),
       align: right,
     },
     {
       key: "cache_hit",
-      label: t("analytics.v2.columns.cacheHit", undefined, "Cache Hit"),
+      label: t("analytics.v2.columns.cacheHit"),
       align: right,
     },
     {
       key: "cache_unknown",
-      label: t("analytics.v2.columns.cacheUnknown", undefined, "Cache Unknown"),
+      label: t("analytics.v2.columns.cacheUnknown"),
       align: right,
     },
   ]
@@ -531,7 +531,7 @@ function buildOthersRow(overflow: AnalyticsGroupSummary[]): GroupRow {
       case "route_name":
       case "provider":
       case "real_model":
-        cells.push({ value: t("analytics.v2.others", undefined, "others") })
+        cells.push({ value: t("analytics.v2.others") })
         break
       case "requests":
         cells.push({ value: requests.toLocaleString() })
