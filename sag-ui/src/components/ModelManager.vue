@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from "@/components/ui/item"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
+import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { CreateRoutePayload } from "@/types/api"
@@ -102,11 +103,13 @@ async function confirmCreateRoute() {
       ],
     }
     await routeStore.createRoute(payload)
-    toast.success(`Route "${routeName}" created`)
+    toast.success(t("routes.toast.created", { name: routeName }, `Route "${routeName}" created`))
     routeToCreate.value = null
     await routeStore.fetchRoutes()
   } catch (e: any) {
-    toast.error(getErrorMessage(e, "Failed to create route"))
+    toast.error(
+      getErrorMessage(e, t("routes.toast.createFailed", undefined, "Failed to create route")),
+    )
   } finally {
     creatingRoute.value = false
   }

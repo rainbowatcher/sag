@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
+import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { Provider, ProxyMode } from "@/types/api"
@@ -146,7 +147,11 @@ async function handleSubmit() {
       try {
         parsedBodyOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
       } catch {
-        apiError.value = `Body override "${key}": invalid JSON value`
+        apiError.value = t(
+          "providers.form.bodyOverrideInvalidJson",
+          { key },
+          `Body override "${key}": invalid JSON value`,
+        )
         return
       }
     }
@@ -172,7 +177,13 @@ async function handleSubmit() {
     payload.proxy_mode = proxyMode.value
 
     await store.updateProvider(props.provider.name, payload)
-    toast.success(`Provider "${props.provider.name}" updated`)
+    toast.success(
+      t(
+        "providers.toast.updated",
+        { name: props.provider.name },
+        `Provider "${props.provider.name}" updated`,
+      ),
+    )
     emit("updated")
   } catch (e: any) {
     if (apiError.value) return

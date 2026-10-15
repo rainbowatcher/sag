@@ -28,6 +28,7 @@ import {
   selectActiveTarget,
   selectFillFirstTarget,
 } from "@/lib/activeTarget"
+import { t } from "@/lib/i18n"
 import { cn, formatDuration, getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
 import { useProviderStore } from "@/stores/providers"
@@ -98,7 +99,13 @@ async function confirmDelete() {
   deleting.value = true
   try {
     await routeStore.deleteRoute(deleteTarget.value)
-    toast.success(`Route "${deleteTarget.value}" deleted`)
+    toast.success(
+      t(
+        "routes.toast.deleted",
+        { name: deleteTarget.value },
+        `Route "${deleteTarget.value}" deleted`,
+      ),
+    )
     deleteDialogOpen.value = false
     deleteTarget.value = null
     await Promise.all([routeStore.fetchRoutes(), activeTargetStore.fetchActiveTargets()])
@@ -125,12 +132,25 @@ async function clearActiveTarget(entry: ActiveTargetEntry, isFillFirst: boolean)
     await activeTargetStore.clearActiveTarget(model)
     toast.success(
       isFillFirst
-        ? `Reset fill-first order for "${entry.model}", will re-shuffle on next request`
-        : `Cleared sticky pin for "${entry.model}", will revert to priority routing`,
+        ? t(
+            "routes.toast.fillFirstReset",
+            { model: entry.model },
+            `Reset fill-first order for "${entry.model}", will re-shuffle on next request`,
+          )
+        : t(
+            "routes.toast.pinCleared",
+            { model: entry.model },
+            `Cleared sticky pin for "${entry.model}", will revert to priority routing`,
+          ),
     )
     return true
   } catch (e: any) {
-    toast.error(getErrorMessage(e, "Failed to clear active target"))
+    toast.error(
+      getErrorMessage(
+        e,
+        t("routes.toast.clearActiveFailed", undefined, "Failed to clear active target"),
+      ),
+    )
     return false
   } finally {
     clearingModel.value = null
@@ -185,33 +205,45 @@ function getRouteTargetStatus(route: RouteConfig): RouteTargetStatus {
   let validCount = 0
 
   for (let i = 0; i < route.targets.length; i++) {
-    const t = route.targets[i]
-    const p = providerStore.providers.find((prov) => prov.name === t.provider)
+    const target = route.targets[i]
+    const p = providerStore.providers.find((prov) => prov.name === target.provider)
     if (!p) {
       issues.push({
         targetIndex: i + 1,
-        provider: t.provider,
-        real_model: t.real_model,
+        provider: target.provider,
+        real_model: target.real_model,
         reason: "missing_provider",
-        message: `Target #${i + 1}: Provider "${t.provider}" not found`,
+        message: t(
+          "routeList.targetMissingProvider",
+          { index: i + 1, provider: target.provider },
+          `Target #${i + 1}: Provider "${target.provider}" not found`,
+        ),
       })
     } else if (!p.enabled) {
       issues.push({
         targetIndex: i + 1,
-        provider: t.provider,
-        real_model: t.real_model,
+        provider: target.provider,
+        real_model: target.real_model,
         reason: "disabled_provider",
-        message: `Target #${i + 1}: Provider "${t.provider}" is disabled`,
+        message: t(
+          "routeList.targetProviderDisabled",
+          { index: i + 1, provider: target.provider },
+          `Target #${i + 1}: Provider "${target.provider}" is disabled`,
+        ),
       })
     } else if (p.enabled_models.length > 0) {
-      const modelToCheck = t.real_model || route.model_name
+      const modelToCheck = target.real_model || route.model_name
       if (modelToCheck !== "*" && !p.enabled_models.includes(modelToCheck)) {
         issues.push({
           targetIndex: i + 1,
-          provider: t.provider,
-          real_model: t.real_model,
+          provider: target.provider,
+          real_model: target.real_model,
           reason: "invalid_model",
-          message: `Target #${i + 1}: Model "${modelToCheck}" is not enabled for provider "${t.provider}"`,
+          message: t(
+            "routeList.targetModelDisabled",
+            { index: i + 1, model: modelToCheck, provider: target.provider },
+            `Target #${i + 1}: Model "${modelToCheck}" is not enabled for provider "${target.provider}"`,
+          ),
         })
       } else {
         validCount++
@@ -263,7 +295,7 @@ const strategyLabels: Record<string, string> = {
 
 const columns = [
   columnHelper.accessor("model_name", {
-    header: "Model Name",
+    header: () => t("routeList.columns.modelName", undefined, "Model Name"),
     cell: (info) =>
       h("div", { class: "flex items-center gap-2" }, [
         h(GitBranch, { class: "text-muted-foreground h-3.5 w-3.5 shrink-0" }),
@@ -272,7 +304,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "pipeline",
-    header: "Pipeline",
+    header: () => t("routeList.columns.pipeline", undefined, "Pipeline"),
     cell: (info) => {
       const r = info.row.original
       const isImage = (r.pipeline ?? "chat") === "image"
@@ -289,7 +321,7 @@ const columns = [
     },
   }),
   columnHelper.accessor("strategy", {
-    header: "Strategy",
+    header: () => t("routeList.columns.strategy", undefined, "Strategy"),
     cell: (info) => {
       const s = info.getValue()
       return h(
@@ -304,7 +336,7 @@ const columns = [
     meta: { class: "2xl:min-w-[140px]" },
   }),
   columnHelper.accessor("targets", {
-    header: "Targets",
+    header: () => t("routeList.columns.targets", undefined, "Targets"),
     sortingFn: (a, b) => {
       const sa = getRouteTargetStatus(a.original).validCount
       const sb = getRouteTargetStatus(b.original).validCount
@@ -342,8 +374,12 @@ const columns = [
             "div",
             { class: "border-border/50 border-b pb-0.5 font-semibold" },
             allInvalid
-              ? "All targets are unavailable"
-              : `${status.validCount}/${status.total} targets valid`,
+              ? t("routeList.allTargetsUnavailable", undefined, "All targets are unavailable")
+              : t(
+                  "routeList.targetsValid",
+                  { valid: status.validCount, total: status.total },
+                  `${status.validCount}/${status.total} targets valid`,
+                ),
           ),
           ...status.issues.map((issue) =>
             h("div", { class: "text-muted-foreground" }, issue.message),
@@ -355,7 +391,12 @@ const columns = [
   }),
   columnHelper.display({
     id: "activeTarget",
-    header: () => h("span", { class: "text-xs font-medium" }, "Active Target"),
+    header: () =>
+      h(
+        "span",
+        { class: "text-xs font-medium" },
+        t("routeList.columns.activeTarget", undefined, "Active Target"),
+      ),
     sortingFn: (a, b) => {
       // "Has an active target" sort, mirroring the cell: a sticky pin on a
       // sticky_failover route OR the current fill-first target (position 0
@@ -406,17 +447,29 @@ const columns = [
         ),
         h(TooltipContent, { side: "left", class: "max-w-xs" }, () =>
           h("div", { class: "space-y-1" }, [
-            tooltipRow("Provider", active.provider, true),
-            tooltipRow("Model", active.real_model, true),
-            tooltipRow("Status", isFillFirst ? "Fill-first target" : active.status),
+            tooltipRow(t("common.provider", undefined, "Provider"), active.provider, true),
+            tooltipRow(t("common.model", undefined, "Model"), active.real_model, true),
             tooltipRow(
-              isFillFirst ? "Order age" : "Pin age",
+              t("common.status", undefined, "Status"),
+              isFillFirst
+                ? t("routeList.fillFirstTarget", undefined, "Fill-first target")
+                : active.status,
+            ),
+            tooltipRow(
+              isFillFirst
+                ? t("routeList.tooltip.orderAge", undefined, "Order age")
+                : t("routeList.tooltip.pinAge", undefined, "Pin age"),
               formatDuration(
                 (isFillFirst ? (active.fill_first_cache_age_secs ?? 0) : active.age_secs) * 1000,
               ),
               true,
             ),
-            tooltipRow("Action", isFillFirst ? "Click to reset" : "Click to clear"),
+            tooltipRow(
+              t("routeList.tooltip.action", undefined, "Action"),
+              isFillFirst
+                ? t("routeList.clickToReset", undefined, "Click to reset")
+                : t("routeList.clickToClear", undefined, "Click to clear"),
+            ),
           ]),
         ),
       ])
@@ -425,7 +478,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "actions",
-    header: () => h("span", { class: "text-xs font-medium" }, "Actions"),
+    header: () => h("span", { class: "text-xs font-medium" }, t("common.actions")),
     cell: (info) =>
       h("div", { class: "flex items-center justify-end gap-1" }, [
         h(
@@ -434,8 +487,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startEdit(info.row.original),
-            title: "Edit route",
-            "aria-label": "Edit route",
+            title: t("routeList.editRoute", undefined, "Edit route"),
+            "aria-label": t("routeList.editRoute", undefined, "Edit route"),
           },
           () => h(Pen, { class: "h-3.5 w-3.5" }),
         ),
@@ -445,8 +498,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startDelete(info.row.original.model_name),
-            title: "Delete route",
-            "aria-label": "Delete route",
+            title: t("routeList.deleteRoute", undefined, "Delete route"),
+            "aria-label": t("routeList.deleteRoute", undefined, "Delete route"),
           },
           () => h(Trash2, { class: "h-3.5 w-3.5" }),
         ),

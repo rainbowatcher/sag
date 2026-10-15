@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { t } from "@/lib/i18n"
 import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
@@ -49,37 +50,51 @@ onMounted(() => {
   }
 })
 
-const formSchema = z
-  .object({
-    pipeline: z.enum(["chat", "image"]),
-    api_endpoint: z.string(),
-    strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
-  })
-  .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
-    message: "API endpoint is required for image pipeline",
-    path: ["api_endpoint"],
-  })
-
 const form = useForm({
   defaultValues: {
     pipeline: props.route.pipeline ?? ("chat" as Pipeline),
     api_endpoint: props.route.api_endpoint ?? "",
     strategy: props.route.strategy,
   },
-  validators: {
-    onSubmit: formSchema,
+  // `validators` is a getter so the refine message re-resolves through `t()`
+  // on every validation (form-core re-reads `options.validators` each run).
+  get validators() {
+    return {
+      onSubmit: z
+        .object({
+          pipeline: z.enum(["chat", "image"]),
+          api_endpoint: z.string(),
+          strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
+        })
+        .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
+          message: t(
+            "routes.form.apiEndpointRequired",
+            undefined,
+            "API endpoint is required for image pipeline",
+          ),
+          path: ["api_endpoint"],
+        }),
+    }
   },
   onSubmit: async ({ value }) => {
     submitted.value = true
     apiError.value = ""
     try {
       if (targets.value.length === 0) {
-        apiError.value = "At least one target is required"
+        apiError.value = t(
+          "routes.form.targetRequired",
+          undefined,
+          "At least one target is required",
+        )
         return
       }
-      const emptyTarget = targets.value.find((t) => !t.provider)
+      const emptyTarget = targets.value.find((target) => !target.provider)
       if (emptyTarget) {
-        apiError.value = "Each target must have a provider selected"
+        apiError.value = t(
+          "routes.form.targetProviderRequired",
+          undefined,
+          "Each target must have a provider selected",
+        )
         return
       }
 
@@ -90,7 +105,7 @@ const form = useForm({
         // route sends `null` to clear a previously saved one.
         api_endpoint: value.pipeline === "image" ? value.api_endpoint.trim() : null,
         strategy: value.strategy !== props.route.strategy ? value.strategy : undefined,
-        targets: targets.value.map((t) => {
+        targets: targets.value.map((target) => {
           const entry: {
             provider: string
             real_model?: string
@@ -98,19 +113,25 @@ const form = useForm({
             retries?: number
             extra?: Record<string, any>
           } = {
-            provider: t.provider,
-            real_model: t.real_model || undefined,
-            priority: t.priority,
-            retries: t.retries || undefined,
+            provider: target.provider,
+            real_model: target.real_model || undefined,
+            priority: target.priority,
+            retries: target.retries || undefined,
           }
-          if (t.extra.trim()) {
-            const extraErr = validateExtraJson(t.extra)
+          if (target.extra.trim()) {
+            const extraErr = validateExtraJson(target.extra)
             if (extraErr) {
+              const targetName =
+                target.provider || target.real_model || "#" + (targets.value.indexOf(target) + 1)
               throw new Error(
-                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: ${extraErr}`,
+                t(
+                  "routes.form.targetExtra",
+                  { name: targetName, error: extraErr },
+                  `Target ${targetName}: ${extraErr}`,
+                ),
               )
             }
-            entry.extra = JSON.parse(t.extra)
+            entry.extra = JSON.parse(target.extra)
           }
           return entry
         }),
@@ -123,7 +144,13 @@ const form = useForm({
 })
 
 function onUpdated() {
-  toast.success(`Route "${props.route.model_name}" updated`)
+  toast.success(
+    t(
+      "routes.toast.updated",
+      { name: props.route.model_name },
+      `Route "${props.route.model_name}" updated`,
+    ),
+  )
 }
 
 async function handleSubmit(event: Event) {

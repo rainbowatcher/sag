@@ -39,6 +39,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { t } from "@/lib/i18n"
 import { formatCompactNumber, successRateColor } from "@/lib/utils"
 import { useAnalyticsStore } from "@/stores/analytics"
 import { useProviderStore } from "@/stores/providers"
@@ -203,9 +204,19 @@ const latencyCards = computed<
   const m = overall.value
   if (!m) return []
   return [
-    { key: "e2e", title: "E2E", icon: Clock, metric: m.e2e },
-    { key: "ttft", title: "TTFT", icon: Timer, metric: m.ttft },
-    { key: "upstream", title: "Upstream", icon: ArrowUpRight, metric: m.upstream },
+    { key: "e2e", title: t("analytics.v2.card.e2e", undefined, "E2E"), icon: Clock, metric: m.e2e },
+    {
+      key: "ttft",
+      title: t("analytics.v2.card.ttft", undefined, "TTFT"),
+      icon: Timer,
+      metric: m.ttft,
+    },
+    {
+      key: "upstream",
+      title: t("analytics.v2.card.upstream", undefined, "Upstream"),
+      icon: ArrowUpRight,
+      metric: m.upstream,
+    },
   ]
 })
 
@@ -234,32 +245,112 @@ const groupColumns = computed<GroupColumn[]>(() => {
   const left = "left" as const
   if (scope.value === "target") {
     return [
-      { key: "provider", label: "Provider", align: left },
-      { key: "real_model", label: "Actual Model", align: left },
-      { key: "attempts", label: "Attempts", align: right },
-      { key: "success", label: "Success", align: right },
-      { key: "failure", label: "Failure", align: right },
-      { key: "success_rate", label: "Success Rate", align: right },
-      { key: "avg_e2e", label: "Avg E2E", align: right },
-      { key: "p95_e2e", label: "P95 E2E", align: right },
-      { key: "tokens_in", label: "Tokens In", align: right },
-      { key: "tokens_out", label: "Tokens Out", align: right },
-      { key: "cache_hit", label: "Cache Hit", align: right },
-      { key: "cache_unknown", label: "Cache Unknown", align: right },
+      { key: "provider", label: t("common.provider", undefined, "Provider"), align: left },
+      {
+        key: "real_model",
+        label: t("analytics.v2.columns.actualModel", undefined, "Actual Model"),
+        align: left,
+      },
+      {
+        key: "attempts",
+        label: t("analytics.v2.columns.attempts", undefined, "Attempts"),
+        align: right,
+      },
+      {
+        key: "success",
+        label: t("analytics.v2.columns.success", undefined, "Success"),
+        align: right,
+      },
+      {
+        key: "failure",
+        label: t("analytics.v2.columns.failure", undefined, "Failure"),
+        align: right,
+      },
+      {
+        key: "success_rate",
+        label: t("analytics.v2.columns.successRate", undefined, "Success Rate"),
+        align: right,
+      },
+      {
+        key: "avg_e2e",
+        label: t("analytics.v2.columns.avgE2e", undefined, "Avg E2E"),
+        align: right,
+      },
+      {
+        key: "p95_e2e",
+        label: t("analytics.v2.columns.p95E2e", undefined, "P95 E2E"),
+        align: right,
+      },
+      {
+        key: "tokens_in",
+        label: t("analytics.v2.columns.tokensIn", undefined, "Tokens In"),
+        align: right,
+      },
+      {
+        key: "tokens_out",
+        label: t("analytics.v2.columns.tokensOut", undefined, "Tokens Out"),
+        align: right,
+      },
+      {
+        key: "cache_hit",
+        label: t("analytics.v2.columns.cacheHit", undefined, "Cache Hit"),
+        align: right,
+      },
+      {
+        key: "cache_unknown",
+        label: t("analytics.v2.columns.cacheUnknown", undefined, "Cache Unknown"),
+        align: right,
+      },
     ]
   }
   return [
-    { key: "route_name", label: "Route Name", align: left },
-    { key: "requests", label: "Requests", align: right },
-    { key: "success", label: "Success", align: right },
-    { key: "success_rate", label: "Success Rate", align: right },
-    { key: "model_failure_rate", label: "Model Failure", align: right },
-    { key: "avg_e2e", label: "Avg E2E", align: right },
-    { key: "p95_e2e", label: "P95 E2E", align: right },
-    { key: "tokens_in", label: "Tokens In", align: right },
-    { key: "tokens_out", label: "Tokens Out", align: right },
-    { key: "cache_hit", label: "Cache Hit", align: right },
-    { key: "cache_unknown", label: "Cache Unknown", align: right },
+    {
+      key: "route_name",
+      label: t("analytics.v2.columns.routeName", undefined, "Route Name"),
+      align: left,
+    },
+    {
+      key: "requests",
+      label: t("analytics.v2.columns.requests", undefined, "Requests"),
+      align: right,
+    },
+    {
+      key: "success",
+      label: t("analytics.v2.columns.success", undefined, "Success"),
+      align: right,
+    },
+    {
+      key: "success_rate",
+      label: t("analytics.v2.columns.successRate", undefined, "Success Rate"),
+      align: right,
+    },
+    {
+      key: "model_failure_rate",
+      label: t("analytics.v2.columns.modelFailure", undefined, "Model Failure"),
+      align: right,
+    },
+    { key: "avg_e2e", label: t("analytics.v2.columns.avgE2e", undefined, "Avg E2E"), align: right },
+    { key: "p95_e2e", label: t("analytics.v2.columns.p95E2e", undefined, "P95 E2E"), align: right },
+    {
+      key: "tokens_in",
+      label: t("analytics.v2.columns.tokensIn", undefined, "Tokens In"),
+      align: right,
+    },
+    {
+      key: "tokens_out",
+      label: t("analytics.v2.columns.tokensOut", undefined, "Tokens Out"),
+      align: right,
+    },
+    {
+      key: "cache_hit",
+      label: t("analytics.v2.columns.cacheHit", undefined, "Cache Hit"),
+      align: right,
+    },
+    {
+      key: "cache_unknown",
+      label: t("analytics.v2.columns.cacheUnknown", undefined, "Cache Unknown"),
+      align: right,
+    },
   ]
 })
 
@@ -440,7 +531,7 @@ function buildOthersRow(overflow: AnalyticsGroupSummary[]): GroupRow {
       case "route_name":
       case "provider":
       case "real_model":
-        cells.push({ value: "others" })
+        cells.push({ value: t("analytics.v2.others", undefined, "others") })
         break
       case "requests":
         cells.push({ value: requests.toLocaleString() })

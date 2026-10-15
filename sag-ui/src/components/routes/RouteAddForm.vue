@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { t } from "@/lib/i18n"
 import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, Strategy, Pipeline, CreateRoutePayload, TargetItem } from "@/types/api"
@@ -40,18 +41,6 @@ const targets = ref<TargetItem[]>([
   },
 ])
 
-const formSchema = z
-  .object({
-    model_name: z.string(),
-    pipeline: z.enum(["chat", "image"]),
-    api_endpoint: z.string(),
-    strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
-  })
-  .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
-    message: "API endpoint is required for image pipeline",
-    path: ["api_endpoint"],
-  })
-
 const form = useForm({
   defaultValues: {
     model_name: "",
@@ -59,25 +48,55 @@ const form = useForm({
     api_endpoint: "",
     strategy: "sticky_failover" as Strategy,
   },
-  validators: {
-    onSubmit: formSchema,
+  // `validators` is a getter so the refine message re-resolves through `t()`
+  // on every validation (form-core re-reads `options.validators` each run).
+  get validators() {
+    return {
+      onSubmit: z
+        .object({
+          model_name: z.string(),
+          pipeline: z.enum(["chat", "image"]),
+          api_endpoint: z.string(),
+          strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
+        })
+        .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
+          message: t(
+            "routes.form.apiEndpointRequired",
+            undefined,
+            "API endpoint is required for image pipeline",
+          ),
+          path: ["api_endpoint"],
+        }),
+    }
   },
   onSubmit: async ({ value }) => {
     apiError.value = ""
     try {
       if (targets.value.length === 0) {
-        apiError.value = "At least one target is required"
+        apiError.value = t(
+          "routes.form.targetRequired",
+          undefined,
+          "At least one target is required",
+        )
         return
       }
-      const emptyTarget = targets.value.find((t) => !t.provider)
+      const emptyTarget = targets.value.find((target) => !target.provider)
       if (emptyTarget) {
-        apiError.value = "Each target must have a provider selected"
+        apiError.value = t(
+          "routes.form.targetProviderRequired",
+          undefined,
+          "Each target must have a provider selected",
+        )
         return
       }
 
       const routeName = value.model_name || targets.value[0].real_model || ""
       if (!routeName) {
-        apiError.value = "Please provide model_name or fill real_model on the first target"
+        apiError.value = t(
+          "routes.form.modelNameRequired",
+          undefined,
+          "Please provide model_name or fill real_model on the first target",
+        )
         return
       }
 
@@ -86,28 +105,34 @@ const form = useForm({
         pipeline: value.pipeline,
         ...(value.pipeline === "image" ? { api_endpoint: value.api_endpoint.trim() } : {}),
         strategy: value.strategy,
-        targets: targets.value.map((t) => {
+        targets: targets.value.map((target) => {
           const entry: CreateRoutePayload["targets"][number] = {
-            provider: t.provider,
-            real_model: t.real_model || undefined,
-            priority: t.priority,
-            retries: t.retries || undefined,
+            provider: target.provider,
+            real_model: target.real_model || undefined,
+            priority: target.priority,
+            retries: target.retries || undefined,
           }
-          if (t.extra.trim()) {
-            const extraErr = validateExtraJson(t.extra)
+          if (target.extra.trim()) {
+            const extraErr = validateExtraJson(target.extra)
             if (extraErr) {
+              const targetName =
+                target.provider || target.real_model || "#" + (targets.value.indexOf(target) + 1)
               throw new Error(
-                `Target ${t.provider || t.real_model || "#" + (targets.value.indexOf(t) + 1)}: ${extraErr}`,
+                t(
+                  "routes.form.targetExtra",
+                  { name: targetName, error: extraErr },
+                  `Target ${targetName}: ${extraErr}`,
+                ),
               )
             }
-            entry.extra = JSON.parse(t.extra)
+            entry.extra = JSON.parse(target.extra)
           }
           return entry
         }),
       }
 
       await routeStore.createRoute(payload)
-      toast.success(`Route "${routeName}" created`)
+      toast.success(t("routes.toast.created", { name: routeName }, `Route "${routeName}" created`))
       emit("created")
     } catch (e: any) {
       apiError.value = getErrorMessage(e)

@@ -32,6 +32,7 @@ import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useProviderProbe } from "@/composables/useProviderProbe"
+import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
 import type { ApiConfig, ApiKind, ProxyMode } from "@/types/api"
@@ -123,25 +124,32 @@ const {
 })
 
 // ── Form ─────────────────────────────────────────────────────
-const formSchema = z.object({
-  name: z.string().min(1, "Name is required"),
-  timeout_secs: z.union([z.number(), z.undefined()]),
-})
-
 const form = useForm({
   defaultValues: {
     name: "",
     timeout_secs: undefined as number | undefined,
   },
-  validators: {
-    onSubmit: formSchema,
+  // `validators` is a getter (not a plain schema) so the messages re-resolve
+  // through `t()` on every validation: form-core re-reads `options.validators`
+  // on each run, so the schema is rebuilt after a locale switch.
+  get validators() {
+    return {
+      onSubmit: z.object({
+        name: z.string().min(1, t("providers.form.nameRequired", undefined, "Name is required")),
+        timeout_secs: z.union([z.number(), z.undefined()]),
+      }),
+    }
   },
   onSubmit: async ({ value }) => {
     apiError.value = ""
 
     const validKeys = apiKeys.value.filter((k) => k.trim().length > 0)
     if (validKeys.length === 0) {
-      apiError.value = "At least one API key is required"
+      apiError.value = t(
+        "providers.form.apiKeyRequired",
+        undefined,
+        "At least one API key is required",
+      )
       return
     }
 
@@ -160,7 +168,11 @@ const form = useForm({
       try {
         parsedOverrides[key.trim()] = val.trim() ? JSON.parse(val) : val
       } catch {
-        apiError.value = `Body override "${key}": invalid JSON value`
+        apiError.value = t(
+          "providers.form.bodyOverrideInvalidJson",
+          { key },
+          `Body override "${key}": invalid JSON value`,
+        )
         return
       }
     }

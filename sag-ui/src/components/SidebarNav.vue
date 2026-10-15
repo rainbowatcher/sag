@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { BarChart3, GitBranch, LayoutDashboard, ScrollText, Server, Settings } from "@lucide/vue"
 import type { Component } from "vue"
-import { watch } from "vue"
+import { computed, watch } from "vue"
 import { RouterLink, useRoute } from "vue-router"
 import {
   SidebarGroup,
@@ -11,6 +11,7 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { t } from "@/lib/i18n"
 
 interface NavItem {
   label: string
@@ -18,14 +19,16 @@ interface NavItem {
   icon: Component
 }
 
-const navItems: NavItem[] = [
-  { label: "Dashboard", path: "/", icon: LayoutDashboard },
-  { label: "Providers", path: "/providers", icon: Server },
-  { label: "Routes", path: "/routes", icon: GitBranch },
-  { label: "Analytics", path: "/analytics", icon: BarChart3 },
-  { label: "Logs", path: "/logs", icon: ScrollText },
-  { label: "Settings", path: "/settings", icon: Settings },
-]
+// Built inside a computed so the labels re-resolve through `t()` whenever the
+// active locale changes — a plain array would freeze its strings at setup.
+const navItems = computed<NavItem[]>(() => [
+  { label: t("nav.dashboard", undefined, "Dashboard"), path: "/", icon: LayoutDashboard },
+  { label: t("nav.providers", undefined, "Providers"), path: "/providers", icon: Server },
+  { label: t("nav.routes", undefined, "Routes"), path: "/routes", icon: GitBranch },
+  { label: t("nav.analytics", undefined, "Analytics"), path: "/analytics", icon: BarChart3 },
+  { label: t("nav.logs", undefined, "Logs"), path: "/logs", icon: ScrollText },
+  { label: t("nav.settings", undefined, "Settings"), path: "/settings", icon: Settings },
+])
 
 const route = useRoute()
 const { isMobile, setOpenMobile } = useSidebar()

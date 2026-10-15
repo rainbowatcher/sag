@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
+import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useCircuitBreakerStore } from "@/stores/circuitBreaker"
 import { useProviderStore } from "@/stores/providers"
@@ -109,7 +110,19 @@ async function toggleEnabled(provider: Provider) {
   togglingProvider.value = provider.name
   try {
     await store.updateProvider(provider.name, { enabled: newState })
-    toast.success(`Provider "${provider.name}" ${newState ? "enabled" : "disabled"}`)
+    toast.success(
+      newState
+        ? t(
+            "providers.toast.enabled",
+            { name: provider.name },
+            `Provider "${provider.name}" enabled`,
+          )
+        : t(
+            "providers.toast.disabled",
+            { name: provider.name },
+            `Provider "${provider.name}" disabled`,
+          ),
+    )
   } catch (e: any) {
     const msg = getErrorMessage(e)
     toast.error(msg)
@@ -216,13 +229,15 @@ async function confirmCopy() {
 
     await store.addProvider(payload)
     copyingProvider.value = null
-    toast.success(`Provider "${newName}" created`)
+    toast.success(t("providers.toast.created", { name: newName }, `Provider "${newName}" created`))
 
     // addProvider refreshed the list, so the new provider is present here.
     const created = store.providers.find((p) => p.name === newName)
     if (created) editingProvider.value = created
   } catch (e: any) {
-    toast.error(getErrorMessage(e, "Failed to copy provider"))
+    toast.error(
+      getErrorMessage(e, t("providers.toast.copyFailed", undefined, "Failed to copy provider")),
+    )
   } finally {
     isCopying.value = false
   }
@@ -237,7 +252,7 @@ async function confirmDelete(name: string) {
   deleting.value = true
   try {
     await store.deleteProvider(name)
-    toast.success(`Provider "${name}" deleted`)
+    toast.success(t("providers.toast.deleted", { name }, `Provider "${name}" deleted`))
     confirmingDelete.value = null
     await fetchProviders()
   } catch (e: any) {
@@ -256,19 +271,21 @@ const columnHelper = createColumnHelper<Provider>()
 
 const columns = [
   columnHelper.accessor("name", {
-    header: "Name",
+    header: () => t("common.name"),
     cell: (info) => info.getValue(),
   }),
   columnHelper.display({
     id: "apis",
-    header: "APIs",
+    header: () => t("providerList.columns.apis", undefined, "APIs"),
     cell: (info) => {
       const p = info.row.original
       const kinds = Object.keys(p.apis ?? {}) as ApiKind[]
       if (kinds.length === 0) {
         return h("span", { class: "text-muted-foreground text-xs" }, "—")
       }
-      const fallbackNote = p.fallback ? `fallback: ${p.fallback}` : "fallback: auto"
+      const fallbackNote = p.fallback
+        ? t("providerList.fallbackNamed", { name: p.fallback }, `fallback: ${p.fallback}`)
+        : t("providerList.fallbackAuto", undefined, "fallback: auto")
       return h(
         "div",
         { class: "flex flex-wrap gap-1", title: fallbackNote },
@@ -287,12 +304,12 @@ const columns = [
     meta: { class: "min-w-[160px]" },
   }),
   columnHelper.accessor("api_keys", {
-    header: "Keys",
+    header: () => t("providerList.columns.keys", undefined, "Keys"),
     cell: (info) => h("span", { class: "tabular-nums" }, String(info.getValue().length)),
     meta: { class: "text-center" },
   }),
   columnHelper.accessor("enabled", {
-    header: "Status",
+    header: () => t("common.status"),
     cell: (info) =>
       h(
         Badge,
@@ -300,13 +317,13 @@ const columns = [
           variant: info.getValue() ? "default" : "secondary",
           class: "text-[10px]",
         },
-        () => (info.getValue() ? "Enabled" : "Disabled"),
+        () => (info.getValue() ? t("common.enabled") : t("common.disabled")),
       ),
     meta: { class: "text-left" },
   }),
   columnHelper.display({
     id: "breakers",
-    header: "CB",
+    header: () => t("providerList.columns.cb", undefined, "CB"),
     cell: (info) => {
       const provider = info.row.original
       const counts = breakersByProvider.value[provider.name]
@@ -327,7 +344,11 @@ const columns = [
             ]),
           ),
           h(TooltipContent, { side: "left", class: "max-w-xs text-xs" }, () =>
-            h("pre", { class: "whitespace-pre-wrap font-mono text-[11px]" }, "All targets healthy"),
+            h(
+              "pre",
+              { class: "whitespace-pre-wrap font-mono text-[11px]" },
+              t("providerList.allTargetsHealthy", undefined, "All targets healthy"),
+            ),
           ),
         ])
       }
@@ -338,11 +359,23 @@ const columns = [
 
       const tooltipRows: string[] = []
       if (openList.length > 0) {
-        tooltipRows.push(`Open (${openList.length}):`)
+        tooltipRows.push(
+          t(
+            "providerList.breakerOpenGroup",
+            { count: openList.length },
+            `Open (${openList.length}):`,
+          ),
+        )
         for (const b of openList) tooltipRows.push(`  ${b.model} → ${b.real_model}`)
       }
       if (halfOpenList.length > 0) {
-        tooltipRows.push(`Half-Open (${halfOpenList.length}):`)
+        tooltipRows.push(
+          t(
+            "providerList.breakerHalfOpenGroup",
+            { count: halfOpenList.length },
+            `Half-Open (${halfOpenList.length}):`,
+          ),
+        )
         for (const b of halfOpenList) tooltipRows.push(`  ${b.model} → ${b.real_model}`)
       }
 
@@ -371,8 +404,12 @@ const columns = [
           modelValue: provider.enabled,
           disabled: togglingProvider.value === provider.name,
           "onUpdate:modelValue": () => toggleEnabled(provider),
-          title: provider.enabled ? "Disable provider" : "Enable provider",
-          "aria-label": provider.enabled ? "Disable provider" : "Enable provider",
+          title: provider.enabled
+            ? t("providerList.disableProvider", undefined, "Disable provider")
+            : t("providerList.enableProvider", undefined, "Enable provider"),
+          "aria-label": provider.enabled
+            ? t("providerList.disableProvider", undefined, "Disable provider")
+            : t("providerList.enableProvider", undefined, "Enable provider"),
         }),
         h("span", { class: "bg-border mx-1 h-4 w-px shrink-0", "aria-hidden": "true" }),
         h(
@@ -381,8 +418,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startEdit(info.row.original),
-            title: "Edit provider",
-            "aria-label": "Edit provider",
+            title: t("providerList.editProvider", undefined, "Edit provider"),
+            "aria-label": t("providerList.editProvider", undefined, "Edit provider"),
           },
           () => h(Pen, { class: "h-3.5 w-3.5" }),
         ),
@@ -392,8 +429,8 @@ const columns = [
             variant: "ghost",
             size: "icon-sm",
             onClick: () => startCopy(info.row.original),
-            title: "Copy provider",
-            "aria-label": "Copy provider",
+            title: t("providerList.copyProvider", undefined, "Copy provider"),
+            "aria-label": t("providerList.copyProvider", undefined, "Copy provider"),
           },
           () => h(Copy, { class: "h-3.5 w-3.5" }),
         ),
@@ -406,12 +443,12 @@ const columns = [
             onClick: () => startDelete(info.row.original.name),
             title:
               confirmingDelete.value === info.row.original.name
-                ? "Cancel delete"
-                : "Delete provider",
+                ? t("providerList.cancelDelete", undefined, "Cancel delete")
+                : t("providerList.deleteProvider", undefined, "Delete provider"),
             "aria-label":
               confirmingDelete.value === info.row.original.name
-                ? "Cancel delete"
-                : "Delete provider",
+                ? t("providerList.cancelDelete", undefined, "Cancel delete")
+                : t("providerList.deleteProvider", undefined, "Delete provider"),
           },
           () => h(Trash2, { class: "h-3.5 w-3.5" }),
         ),
