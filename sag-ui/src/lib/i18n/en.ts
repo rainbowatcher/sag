@@ -466,7 +466,6 @@ export const en = {
 
   // ── P3b: analytics › V2 panel ───────────────────────────────────
   "analytics.v2.scopeRoute": "Route",
-  // intentionally verbatim — technical token; zh view rendered the same pre-migration
   "analytics.v2.scopeTarget": "Target",
   "analytics.v2.filterRoute": "route",
   "analytics.v2.searchRoute": "Search route...",

@@ -272,10 +272,10 @@ export const zh: Record<keyof typeof en, string> = {
 
   // ── Routes: list table ───────────────────────────────────────
   "routeList.columns.modelName": "模型名称",
-  "routeList.columns.pipeline": "Pipeline",
+  "routeList.columns.pipeline": "流水线",
   "routeList.columns.strategy": "策略",
-  "routeList.columns.targets": "Targets",
-  "routeList.columns.activeTarget": "Active Target",
+  "routeList.columns.targets": "目标",
+  "routeList.columns.activeTarget": "当前目标",
   "routeList.allTargetsUnavailable": "所有 target 均不可用",
   "routeList.targetsValid": "{valid}/{total} 个 target 有效",
   "routeList.targetMissingProvider": 'Target #{index}：未找到供应商 "{provider}"',
@@ -284,7 +284,7 @@ export const zh: Record<keyof typeof en, string> = {
   "routeList.tooltip.orderAge": "顺序时长",
   "routeList.tooltip.pinAge": "Pin 时长",
   "routeList.tooltip.action": "操作",
-  "routeList.fillFirstTarget": "Fill-first target",
+  "routeList.fillFirstTarget": "Fill-first 目标",
   "routeList.clickToReset": "点击重置",
   "routeList.clickToClear": "点击清除",
   "routeList.editRoute": "编辑路由",
@@ -317,7 +317,7 @@ export const zh: Record<keyof typeof en, string> = {
   "routes.form.strategyStickyFailover": "Sticky-failover",
   "routes.form.strategyFillFirst": "Fill-first",
   "routes.form.strategyRoundRobin": "Round-robin",
-  "routes.form.pipeline": "Pipeline",
+  "routes.form.pipeline": "流水线",
   "routes.form.pipelineChat": "Chat",
   "routes.form.pipelineImage": "Image",
   "routes.form.pipelineHint": "Image 路由会带每条路由的路径发送到供应商的 image section。",
@@ -443,8 +443,7 @@ export const zh: Record<keyof typeof en, string> = {
   "dashboard.gateway": "网关",
 
   "analytics.v2.scopeRoute": "路由",
-  // intentionally verbatim — technical token; zh view rendered the same pre-migration
-  "analytics.v2.scopeTarget": "Target",
+  "analytics.v2.scopeTarget": "目标",
   "analytics.v2.filterRoute": "路由",
   "analytics.v2.searchRoute": "搜索路由...",
   "analytics.v2.filterProvider": "供应商",
