@@ -41,8 +41,15 @@ export const en = {
   "nav.logs": "Logs",
   "nav.settings": "Settings",
 
+  // ── Settings › Appearance ───────────────────────────────────────
+  "settings.appearance.themeTitle": "Theme",
+  "settings.appearance.themeDescription": "Choose how the dashboard renders light and dark colors.",
+  "settings.appearance.themeLabel": "Theme",
+  "settings.appearance.themeSystem": "System",
+  "settings.appearance.themeLight": "Light",
+  "settings.appearance.themeDark": "Dark",
+
   // ── Settings › Language ─────────────────────────────────────────
-  "settings.language.tab": "Language",
   "settings.language.title": "Language",
   "settings.language.description":
     "Choose the display language of the admin dashboard. The preference is stored in this browser.",
@@ -536,6 +543,7 @@ export const en = {
   "settings.tabs.timers": "Timers",
   "settings.tabs.analytics": "Analytics",
   "settings.tabs.system": "System",
+  "settings.tabs.appearance": "Appearance",
   "settings.proxy.title": "Global Proxy URL",
   "settings.proxy.descriptionLead": "Upstream HTTP/HTTPS proxy for providers whose proxy mode is ",
   "settings.proxy.descriptionMid": " or ",

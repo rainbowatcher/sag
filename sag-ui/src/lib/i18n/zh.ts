@@ -39,8 +39,15 @@ export const zh: Record<keyof typeof en, string> = {
   "nav.logs": "日志",
   "nav.settings": "设置",
 
-  // ── Settings › Language ─────────────────────────────────────────
-  "settings.language.tab": "语言",
+  // ── 设置 › 外观 ─────────────────────────────────────────────────
+  "settings.appearance.themeTitle": "主题",
+  "settings.appearance.themeDescription": "选择控制台使用浅色还是深色外观。",
+  "settings.appearance.themeLabel": "主题",
+  "settings.appearance.themeSystem": "跟随系统",
+  "settings.appearance.themeLight": "浅色",
+  "settings.appearance.themeDark": "深色",
+
+  // ── 设置 › 语言 ─────────────────────────────────────────────────
   "settings.language.title": "语言",
   "settings.language.description": "选择管理后台的显示语言。该设置保存在当前浏览器中。",
   "settings.language.label": "界面语言",
@@ -510,6 +517,7 @@ export const zh: Record<keyof typeof en, string> = {
   "settings.tabs.timers": "计时器",
   "settings.tabs.analytics": "分析",
   "settings.tabs.system": "系统",
+  "settings.tabs.appearance": "外观",
   "settings.proxy.title": "全局代理 URL",
   "settings.proxy.descriptionLead": "用于代理模式为 ",
   "settings.proxy.descriptionMid": " 或 ",

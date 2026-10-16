@@ -33,7 +33,7 @@ function ensureInit() {
   if (initialized) return
   initialized = true
   chartColors.value = resolveChartColors()
-  // useDark applies the `.dark` class in its own watcher; defer the re-read
+  // useColorMode applies the `.dark` class in its own watcher; defer the re-read
   // to the next frame so the class is already applied when we probe.
   watch(isDark, () => {
     requestAnimationFrame(() => {

@@ -9,6 +9,7 @@ import {
   KeyRound,
   Languages,
   Loader2,
+  Palette,
   Plus,
   Save,
   ScrollText,
@@ -21,6 +22,7 @@ import {
   Zap,
 } from "@lucide/vue"
 import { computed, onMounted, ref } from "vue"
+import { useRoute, useRouter } from "vue-router"
 import { toast } from "vue-sonner"
 import RefreshButton from "@/components/RefreshButton.vue"
 import BackoffForm from "@/components/settings/BackoffForm.vue"
@@ -40,7 +42,9 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { themeMode } from "@/composables/useTheme"
 import { useI18n, type Locale } from "@/lib/i18n"
+import { isSettingsTab, resolveSettingsTab } from "@/lib/settingsTabs"
 import { useGatewayConfigStore } from "@/stores/gatewayConfig"
 import { useSettingsStore } from "@/stores/settings"
 
@@ -51,7 +55,26 @@ const gatewayConfig = useGatewayConfigStore()
 // page stays hardcoded until the per-module migration phases land.
 const { t, locale, setLocale } = useI18n()
 
-const activeTab = ref("network")
+// The active tab is URL-driven (`/settings?tab=<value>`): the sidebar sub-menu
+// and browser back/forward both steer it. A bare `/settings` (no query) shows
+// the default tab without redirecting; the query is only written when the user
+// picks a tab or follows a sidebar link.
+const route = useRoute()
+const router = useRouter()
+
+const activeTab = computed(() => resolveSettingsTab(route.query.tab))
+
+function selectTab(value: string | number) {
+  const tab = String(value)
+  if (!isSettingsTab(tab)) return
+  // replace (not push) so switching tabs doesn't stack history entries.
+  router.replace({ query: { ...route.query, tab } })
+}
+
+function setThemeMode(value: unknown) {
+  const mode = String(value)
+  if (mode === "auto" || mode === "light" || mode === "dark") themeMode.value = mode
+}
 
 // ── Proxy form ────────────────────────────────────────────────────
 const proxyUrl = ref("")
@@ -275,7 +298,11 @@ function keyFingerprint(key: string): string {
       </div>
     </div>
 
-    <Tabs v-model="activeTab" class="mt-4 flex min-h-0 flex-1 flex-col">
+    <Tabs
+      :model-value="activeTab"
+      class="mt-4 flex min-h-0 flex-1 flex-col"
+      @update:model-value="selectTab"
+    >
       <TabsList class="shrink-0 flex-wrap self-start">
         <TabsTrigger value="network" class="gap-1.5">
           <Globe class="h-3.5 w-3.5" />
@@ -313,9 +340,9 @@ function keyFingerprint(key: string): string {
           <Server class="h-3.5 w-3.5" />
           {{ $t("settings.tabs.system") }}
         </TabsTrigger>
-        <TabsTrigger value="language" class="gap-1.5">
-          <Languages class="h-3.5 w-3.5" />
-          {{ t("settings.language.tab") }}
+        <TabsTrigger value="appearance" class="gap-1.5">
+          <Palette class="h-3.5 w-3.5" />
+          {{ $t("settings.tabs.appearance") }}
         </TabsTrigger>
       </TabsList>
 
@@ -632,8 +659,37 @@ function keyFingerprint(key: string): string {
           </template>
         </TabsContent>
 
-        <!-- ── Language (P0 i18n switch) ──────────────────────────── -->
-        <TabsContent value="language" class="mt-0">
+        <!-- ── Appearance (theme + language) ──────────────────────── -->
+        <TabsContent value="appearance" class="mt-0 space-y-4">
+          <Card>
+            <CardHeader>
+              <div class="max-w-3xl min-w-0 space-y-1.5">
+                <CardTitle class="flex items-center gap-2">
+                  <Palette class="h-4 w-4" />
+                  {{ $t("settings.appearance.themeTitle") }}
+                </CardTitle>
+                <CardDescription>
+                  {{ $t("settings.appearance.themeDescription") }}
+                </CardDescription>
+              </div>
+            </CardHeader>
+            <CardContent class="max-w-2xl space-y-2 xl:max-w-3xl">
+              <FieldLabel for="ui-theme">
+                {{ $t("settings.appearance.themeLabel") }}
+              </FieldLabel>
+              <Select :model-value="themeMode" @update:model-value="setThemeMode">
+                <SelectTrigger id="ui-theme" class="w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="auto">{{ $t("settings.appearance.themeSystem") }}</SelectItem>
+                  <SelectItem value="light">{{ $t("settings.appearance.themeLight") }}</SelectItem>
+                  <SelectItem value="dark">{{ $t("settings.appearance.themeDark") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </Card>
+
           <Card>
             <CardHeader>
               <div class="max-w-3xl min-w-0 space-y-1.5">
