@@ -76,6 +76,22 @@ function setThemeMode(value: unknown) {
   if (mode === "auto" || mode === "light" || mode === "dark") themeMode.value = mode
 }
 
+// reka-ui captures each `SelectItem`'s textContent once at mount and `SelectValue`
+// renders that frozen string, so its default output never re-translates on a
+// locale switch. Feeding `SelectValue` an explicit slot label (from these
+// computeds, which reuse the same `t()` keys as the items) bypasses the captured
+// fallback and re-renders with the locale.
+const themeLabels = computed<Record<"auto" | "light" | "dark", string>>(() => ({
+  auto: t("settings.appearance.themeSystem"),
+  light: t("settings.appearance.themeLight"),
+  dark: t("settings.appearance.themeDark"),
+}))
+
+const languageLabels = computed<Record<Locale, string>>(() => ({
+  en: t("settings.language.optionEnglish"),
+  zh: t("settings.language.optionChinese"),
+}))
+
 // ── Proxy form ────────────────────────────────────────────────────
 const proxyUrl = ref("")
 const proxyError = ref("")
@@ -679,7 +695,7 @@ function keyFingerprint(key: string): string {
               </FieldLabel>
               <Select :model-value="themeMode" @update:model-value="setThemeMode">
                 <SelectTrigger id="ui-theme" class="w-48">
-                  <SelectValue />
+                  <SelectValue>{{ themeLabels[themeMode] }}</SelectValue>
                 </SelectTrigger>
                 <SelectContent class="w-(--reka-select-trigger-width)">
                   <SelectItem value="auto">{{ $t("settings.appearance.themeSystem") }}</SelectItem>
@@ -708,7 +724,7 @@ function keyFingerprint(key: string): string {
               </FieldLabel>
               <Select :model-value="locale" @update:model-value="(v) => setLocale(v as Locale)">
                 <SelectTrigger id="ui-language" class="w-48">
-                  <SelectValue />
+                  <SelectValue>{{ languageLabels[locale] }}</SelectValue>
                 </SelectTrigger>
                 <SelectContent class="w-(--reka-select-trigger-width)">
                   <SelectItem value="en">{{ t("settings.language.optionEnglish") }}</SelectItem>

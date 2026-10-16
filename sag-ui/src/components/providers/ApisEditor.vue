@@ -66,6 +66,16 @@ const apiKindLabels = computed<Record<ApiKind, string>>(() => ({
   image: t("providers.apis.kindImage"),
 }))
 
+// reka-ui captures each `SelectItem`'s textContent once at mount and `SelectValue`
+// renders that frozen string, so its default output never re-translates on a
+// locale switch. This locale-reactive map feeds `SelectValue` an explicit slot
+// label (same `t()` keys as the items) instead of the captured text.
+const cacheControlLabels = computed<Record<"inherit" | "enable" | "disable", string>>(() => ({
+  inherit: t("providers.apis.cacheInherit"),
+  enable: t("common.enabled"),
+  disable: t("common.disabled"),
+}))
+
 const DEFAULT_MODELS_ENDPOINT_HINTS: Record<ApiKind, string> = {
   chat_completions: "models",
   responses: "models",
@@ -356,7 +366,9 @@ defineExpose({ validate })
     <div v-if="availableKinds.length > 0" class="flex items-center gap-2">
       <Select v-model="newKind">
         <SelectTrigger class="w-56">
-          <SelectValue :placeholder="$t('providers.apis.addSectionPlaceholder')" />
+          <SelectValue :placeholder="$t('providers.apis.addSectionPlaceholder')">{{
+            newKind ? apiKindLabels[newKind] : $t("providers.apis.addSectionPlaceholder")
+          }}</SelectValue>
         </SelectTrigger>
         <SelectContent class="w-(--reka-select-trigger-width)">
           <SelectItem v-for="kind in availableKinds" :key="kind" :value="kind">
@@ -511,7 +523,7 @@ defineExpose({ validate })
                 "
               >
                 <SelectTrigger :id="`cache-ctl-${d.uid}`" class="w-full">
-                  <SelectValue />
+                  <SelectValue>{{ cacheControlLabels[d.anthropic_cache_control] }}</SelectValue>
                 </SelectTrigger>
                 <SelectContent class="w-(--reka-select-trigger-width)">
                   <SelectItem value="inherit">{{ $t("providers.apis.cacheInherit") }}</SelectItem>

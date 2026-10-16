@@ -46,7 +46,7 @@ const apiKindLabels = computed<Record<ApiKind, string>>(() => ({
       @update:model-value="(v) => emit('update:probeKind', v as ApiKind)"
     >
       <SelectTrigger class="h-7 w-44 text-xs">
-        <SelectValue />
+        <SelectValue>{{ probeKind ? apiKindLabels[probeKind] : "" }}</SelectValue>
       </SelectTrigger>
       <SelectContent class="w-(--reka-select-trigger-width)">
         <SelectItem v-for="kind in protocolSections" :key="kind" :value="kind" class="text-xs">

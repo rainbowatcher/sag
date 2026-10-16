@@ -279,7 +279,7 @@ const chartOptions = computed(() => ({
       <span class="text-muted-foreground text-xs">{{ $t("analytics.v2.metricLabel") }}</span>
       <Select :model-value="metric" @update:model-value="(v) => (metric = v as MetricKey)">
         <SelectTrigger class="h-7 w-44 text-xs">
-          <SelectValue />
+          <SelectValue>{{ metricLabels[metric] }}</SelectValue>
         </SelectTrigger>
         <SelectContent class="w-(--reka-select-trigger-width)">
           <SelectItem v-for="m in metricOptions" :key="m.key" :value="m.key">

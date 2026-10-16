@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from "vue"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import { FieldLabel } from "@/components/ui/field"
 import {
@@ -8,6 +9,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { t } from "@/lib/i18n"
 import type { ProxyMode } from "@/types/api"
 
 defineProps<{
@@ -21,6 +23,21 @@ const emit = defineEmits<{
   "update:keyStrategy": [value: "fill_first" | "round_robin"]
   "update:proxyMode": [value: ProxyMode]
 }>()
+
+// reka-ui captures each `SelectItem`'s textContent once at mount and `SelectValue`
+// renders that frozen string, so its default output never re-translates on a
+// locale switch. These locale-reactive maps feed `SelectValue` an explicit slot
+// label (same `t()` keys as the items) instead of the captured text.
+const keyStrategyLabels = computed<Record<"fill_first" | "round_robin", string>>(() => ({
+  fill_first: t("providers.form.fillFirst"),
+  round_robin: t("providers.form.roundRobin"),
+}))
+
+const proxyModeLabels = computed<Record<ProxyMode, string>>(() => ({
+  inherit: t("common.inherit"),
+  enabled: t("common.enabled"),
+  disabled: t("common.disabled"),
+}))
 </script>
 
 <template>
@@ -35,7 +52,7 @@ const emit = defineEmits<{
       @update:model-value="(v) => emit('update:keyStrategy', v as 'fill_first' | 'round_robin')"
     >
       <SelectTrigger>
-        <SelectValue />
+        <SelectValue>{{ keyStrategyLabels[keyStrategy] }}</SelectValue>
       </SelectTrigger>
       <SelectContent class="w-(--reka-select-trigger-width)">
         <SelectItem value="fill_first">{{ $t("providers.form.fillFirst") }}</SelectItem>
@@ -51,7 +68,7 @@ const emit = defineEmits<{
       @update:model-value="(v) => emit('update:proxyMode', v as ProxyMode)"
     >
       <SelectTrigger>
-        <SelectValue />
+        <SelectValue>{{ proxyModeLabels[proxyMode] }}</SelectValue>
       </SelectTrigger>
       <SelectContent class="w-(--reka-select-trigger-width)">
         <SelectItem value="inherit">{{ $t("common.inherit") }}</SelectItem>

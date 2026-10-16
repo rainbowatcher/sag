@@ -470,7 +470,9 @@ const table = useVueTable({
             @update:model-value="(value) => (filterApi = value as 'all' | ApiKind)"
           >
             <SelectTrigger class="h-8 w-[220px]">
-              <SelectValue />
+              <SelectValue>{{
+                filterApi === "all" ? $t("providers.list.filterAllApis") : filterApi
+              }}</SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">{{ $t("providers.list.filterAllApis") }}</SelectItem>
@@ -487,7 +489,9 @@ const table = useVueTable({
             @update:model-value="(value) => (sortByName = value === 'name')"
           >
             <SelectTrigger class="h-8 w-[160px]">
-              <SelectValue />
+              <SelectValue>{{
+                sortByName ? $t("providers.list.sortName") : $t("common.default")
+              }}</SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="name">{{ $t("providers.list.sortName") }}</SelectItem>

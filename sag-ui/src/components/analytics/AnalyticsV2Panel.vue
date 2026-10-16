@@ -612,7 +612,7 @@ const groupRows = computed<GroupRow[]>(() => {
           class="shrink-0 whitespace-nowrap"
         >
           <SelectTrigger class="w-28">
-            <SelectValue />
+            <SelectValue>{{ range === "custom" ? $t("common.custom") : range }}</SelectValue>
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="1h">1h</SelectItem>
