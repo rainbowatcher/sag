@@ -30,6 +30,32 @@ just build-test
 
 构建时启用 `--features embed-ui` 的二进制自带 UI，浏览器访问 `http://<host>:<port>/` 即看到管理面板；未启用时需要把 Vite preview 反向代理到网关 `/v1` 与 `/admin`。
 
+## Homebrew 安装（macOS Apple Silicon）
+
+macOS arm64 的预编译单二进制（已内嵌 UI）通过 Homebrew tap 分发，本机无需 Rust / Node 工具链：
+
+```bash
+brew tap rainbowatcher/homebrew-tap https://github.com/rainbowatcher/homebrew-tap
+brew install sag
+```
+
+以服务方式常驻前，先准备配置文件 `$(brew --prefix)/etc/sag/gateway.toml`（内容可参考仓库根 `gateway.example.toml`），然后：
+
+```bash
+brew services start sag
+```
+
+`brew services` 走 formula 的 `service` 块，等价于 `sag --config $(brew --prefix)/etc/sag/gateway.toml`；日志写入 `$(brew --prefix)/var/log/sag.log`。该二进制与本地 `just build-test` 产物同源（tag 触发的 release 工作流在 `macos-14` 上构建并内嵌 `sag-ui/dist/`）。
+
+### 发布流程
+
+版本由 tag 触发的 GitHub Actions 工作流（`.github/workflows/release.yml`）自动维护：先跑测试，再在 Apple Silicon runner 上构建内嵌 UI 的单二进制，创建 GitHub Release，并把 tarball 的版本 / URL / sha256 写回 `rainbowatcher/homebrew-tap`。日常发版只需升级版本号并推送 tag：
+
+```bash
+just release minor          # 升级 Rust + npm 版本号并提交
+git push origin main vX.Y.Z
+```
+
 ## 热重载边界
 
 `notify` 监听 `gateway.toml` 变更并热替换 providers / routes / backoff / circuit_breaker / analytics。**`[server].host` 与 `[server].port` 改动不会触发 listen socket 重新 bind** —— 已绑定的 listening socket 不会在端口 / 地址变更时迁移。修改这两个字段后必须停止进程再启动。`[gateway_auth]` 同样需要重启。详见 [配置 → 热重载](/guide/configuration#热重载)。

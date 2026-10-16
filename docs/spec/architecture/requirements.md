@@ -72,7 +72,7 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 - 插件系统（通过 Rust trait 实现扩展，非动态加载）
 
 ### 版本升级脚本
-- `scripts/bump-version.py` 升级版本时仅将实际发生变更且已被 Git 跟踪的文件传给自动提交。
+- `scripts/release.py` 升级版本时仅将实际发生变更且已被 Git 跟踪的文件传给自动提交。
 - 被 `.gitignore` 忽略或未被 Git 跟踪的派生文件可以在工作区同步，但不得导致 `git commit` 因无效 pathspec 失败。
 
 ## 与其它模块的交互

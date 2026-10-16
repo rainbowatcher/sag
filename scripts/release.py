@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""bump-version.py — 递归升级 Rust + npm 项目文件版本号。
+"""release.py — 递归升级 Rust + npm 项目文件版本号，提交并打 tag。
 
 用法:
-  python3 scripts/bump-version.py major|minor|patch [--dry-run] [--no-commit] [--npm PATH ...]
+  python3 scripts/release.py major|minor|patch [--dry-run] [--no-commit] [--npm PATH ...]
 
 升级对象:
   - Rust: 递归发现的所有 Cargo.toml（跳过 target/、node_modules/ 等），
@@ -15,10 +15,13 @@
 
 语义: 按 semver 递增指定段并清零低位段，丢弃 pre-release / build 后缀。
 
-提交: 升级完成后自动执行 `git commit -m "chore: release vX.Y.Z"`，
+提交与打 tag: 升级完成后自动执行 `git commit -m "chore: release vX.Y.Z"`，
 只提交本次实际改动且已被 Git 跟踪的文件（不推送、不碰其他工作区变更）；
-未跟踪或被忽略的文件仅保留工作区更新，不传给 git commit；
---dry-run / --no-commit 可跳过提交。不传升级段则打印 help。
+未跟踪或被忽略的文件仅保留工作区更新，不传给 git commit。
+提交成功后，在该 release commit 上创建轻量 tag `vX.Y.Z`（不推送），
+并打印可复制执行的 push 提示。若目标 tag 已存在于本地或 origin，
+则在修改任何文件前报错退出。--dry-run / --no-commit 跳过提交与打 tag，
+只打印相应提示。脚本永不 push。不传升级段则打印 help。
 """
 
 from __future__ import annotations
@@ -166,6 +169,79 @@ def git_tracked_files(root: Path, paths: list[str]) -> list[str]:
     return [path for path in paths if path in tracked]
 
 
+def tag_exists_local(root: Path, tag: str) -> bool:
+    """检查本地是否已存在同名 tag。"""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def tag_exists_remote(root: Path, tag: str) -> bool:
+    """检查 origin 是否已有同名 tag；查询失败（网络/远端不可用）时直接中止。"""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-remote", "--tags", "origin", tag],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.exit(
+            f"error: 无法查询 origin 上的 tag {tag}"
+            f"（git ls-remote rc={proc.returncode}）: {proc.stderr.strip()}"
+        )
+    return bool(proc.stdout.strip())
+
+
+def current_branch(root: Path) -> str:
+    """返回当前分支名；detached HEAD 时回退为 HEAD。"""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.stdout.strip() or "HEAD"
+
+
+def read_target_version(root: Path, npm_files: list[Path], kind: str) -> str | None:
+    """只读扫描版本源，返回本次升级后的目标版本号；无可升级版本返回 None。
+
+    用于在修改任何文件前做 tag 冲突检查，因此不写入、不提交。
+    """
+    for toml in find_cargo_tomls(root):
+        lines = toml.read_text(encoding="utf-8").splitlines()
+        section = None
+        for line in lines:
+            m = SECTION_RE.match(line)
+            if m:
+                section = m.group(1)
+                continue
+            if section not in CARGO_VERSION_SECTIONS:
+                continue
+            m = CARGO_VERSION_LINE_RE.match(line)
+            if m:
+                v = parse_version(m.group(2))
+                if v:
+                    return str(v.bump(kind))
+                break
+    for p in npm_files:
+        if not p.exists():
+            continue
+        try:
+            top_version = json.loads(p.read_text(encoding="utf-8")).get("version")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(top_version, str):
+            v = parse_version(top_version)
+            if v:
+                return str(v.bump(kind))
+    return None
+
+
 def bump_npm(path: Path, kind: str) -> tuple[str, str] | None:
     """升级单个 package.json 的顶层 version，返回 (旧, 新)；无 version 返回 None。"""
     # 先用 json 解析出确切的顶层 version，避免误改嵌套的 "version" key
@@ -197,9 +273,9 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python3 scripts/bump-version.py patch      # 所有 crate + npm 打 patch\n"
-            "  python3 scripts/bump-version.py minor --dry-run\n"
-            "  python3 scripts/bump-version.py major --npm sag-ui/package.json\n"
+            "  python3 scripts/release.py patch      # 所有 crate + npm 打 patch\n"
+            "  python3 scripts/release.py minor --dry-run\n"
+            "  python3 scripts/release.py major --npm sag-ui/package.json\n"
         ),
     )
     parser.add_argument(
@@ -243,6 +319,24 @@ def main() -> int:
         return 1
 
     npm_files = [root / p for p in (args.npm or DEFAULT_NPM_FILES)]
+
+    # ── tag 冲突预检（必须在修改任何文件之前）──────────────────────
+    target_version = read_target_version(root, npm_files, args.kind)
+    if target_version is not None:
+        target_tag = f"v{target_version}"
+        if tag_exists_local(root, target_tag):
+            print(
+                f"[ERR] 本地已存在 tag {target_tag}，已中止（未修改任何文件）。",
+                file=sys.stderr,
+            )
+            return 1
+        if tag_exists_remote(root, target_tag):
+            print(
+                f"[ERR] origin 已存在 tag {target_tag}，已中止（未修改任何文件）。",
+                file=sys.stderr,
+            )
+            return 1
+
     version_map: dict[str, tuple[str, str]] = {}
     changes = []
 
@@ -317,6 +411,7 @@ def main() -> int:
 
     # ── 自动提交 ────────────────────────────────────────────────────
     release_version = changes[0][2]
+    tag = f"v{release_version}"
     message = f"chore: release v{release_version}"
     changed_files = [str(rel) for rel, _, _ in changes]
     if lock_changed:
@@ -335,12 +430,15 @@ def main() -> int:
 
     if args.dry_run:
         print(f"将提交: {message}（{len(commit_files)} 个文件）")
+        print(f"[INFO] --dry-run 指定，跳过 tag 创建: {tag}")
         return 0
     if args.no_commit:
         print(f"[INFO] --no-commit 指定，跳过自动提交: {message}")
+        print(f"[INFO] --no-commit 指定，跳过 tag 创建: {tag}")
         return 0
     if not commit_files:
         print("[INFO] 没有可提交的已跟踪变更，跳过自动提交。")
+        print(f"[INFO] 未创建 release commit，跳过 tag 创建: {tag}")
         return 0
 
     print(f"提交: {message}")
@@ -357,6 +455,22 @@ def main() -> int:
     if proc.returncode != 0:
         print(f"[ERR] git commit 失败:\n{proc.stderr.strip()}", file=sys.stderr)
         return 1
+
+    # ── 打轻量 tag ──────────────────────────────────────────────────
+    print(f"打 tag: {tag}")
+    proc = subprocess.run(
+        ["git", "-C", str(root), "tag", tag],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        print(f"[ERR] git tag 失败:\n{proc.stderr.strip()}", file=sys.stderr)
+        return 1
+
+    # 脚本永不 push，只打印可复制执行的推送提示。
+    branch = current_branch(root)
+    print(f"Release v{release_version} is ready. Push with:")
+    print(f"  git push origin {branch} {tag}")
     return 0
 
 
