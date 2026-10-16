@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""release.py — 递归升级 Rust + npm 项目文件版本号，提交并打 tag。
+"""release.py — 升级 Rust workspace + npm 项目版本号，提交并打 tag。
 
 用法:
   python3 scripts/release.py major|minor|patch [--dry-run] [--no-commit] [--npm PATH ...]
 
 升级对象:
-  - Rust: 递归发现的所有 Cargo.toml（跳过 target/、node_modules/ 等），
-    仅升级 [package] 与 [workspace.package] 段内的 `version = "x.y.z"`；
-    同步更新 Cargo.lock 中对应 crate 的 version（workspace 成员依赖引用
-    不带版本限定符，直接改 block 是安全的）；若 Cargo.lock 被 .gitignore 忽略，
+  - Rust: 根 `Cargo.toml` 的 `[workspace.package] version` 是唯一版本源，
+    各成员 crate 通过 `version.workspace = true` 继承，脚本不再改写成员
+    `Cargo.toml`。随后同步 `Cargo.lock` 中所有 workspace 成员条目的
+    version（从根版本 (旧, 新) 推导）；若 Cargo.lock 被 .gitignore 忽略，
     仍更新本地文件但不会把它传给 git commit。
   - npm: 默认 sag-ui/package.json 与 docs/package.json 的顶层 "version"，
     可通过 --npm 追加/替换。
@@ -52,6 +52,7 @@ DEFAULT_NPM_FILES = ["sag-ui/package.json", "docs/package.json"]
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 CARGO_VERSION_LINE_RE = re.compile(r'^(version\s*=\s*)"([^"]+)"')
+CARGO_NAME_LINE_RE = re.compile(r'^(name\s*=\s*)"([^"]+)"')
 # 允许任意缩进，但必须按值确认是顶层 version（见 bump_npm）
 NPM_VERSION_LINE_RE = re.compile(r'^(\s*)"version"\s*:\s*"([^"]+)"')
 LOCK_NAME_RE = re.compile(r'^name\s*=\s*"([^"]+)"')
@@ -92,6 +93,40 @@ def find_cargo_tomls(root: Path) -> list[Path]:
             continue
         files.append(path)
     return sorted(files)
+
+
+def read_cargo_version(path: Path) -> str | None:
+    """只读读取 [package] / [workspace.package] 段的 version；无则返回 None。"""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    section = None
+    for line in lines:
+        m = SECTION_RE.match(line)
+        if m:
+            section = m.group(1)
+            continue
+        if section not in CARGO_VERSION_SECTIONS:
+            continue
+        m = CARGO_VERSION_LINE_RE.match(line)
+        if m and parse_version(m.group(2)):
+            return m.group(2)
+    return None
+
+
+def cargo_package_name(path: Path) -> str | None:
+    """只读读取 Cargo.toml [package] 段的 name；无则返回 None。"""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    section = None
+    for line in lines:
+        m = SECTION_RE.match(line)
+        if m:
+            section = m.group(1)
+            continue
+        if section != "package":
+            continue
+        m = CARGO_NAME_LINE_RE.match(line)
+        if m:
+            return m.group(2)
+    return None
 
 
 def bump_cargo_toml(path: Path, kind: str) -> tuple[str, str] | None:
@@ -213,21 +248,12 @@ def read_target_version(root: Path, npm_files: list[Path], kind: str) -> str | N
     用于在修改任何文件前做 tag 冲突检查，因此不写入、不提交。
     """
     for toml in find_cargo_tomls(root):
-        lines = toml.read_text(encoding="utf-8").splitlines()
-        section = None
-        for line in lines:
-            m = SECTION_RE.match(line)
-            if m:
-                section = m.group(1)
-                continue
-            if section not in CARGO_VERSION_SECTIONS:
-                continue
-            m = CARGO_VERSION_LINE_RE.match(line)
-            if m:
-                v = parse_version(m.group(2))
-                if v:
-                    return str(v.bump(kind))
-                break
+        old = read_cargo_version(toml)
+        if old is None:
+            continue
+        v = parse_version(old)
+        if v:
+            return str(v.bump(kind))
     for p in npm_files:
         if not p.exists():
             continue
@@ -269,11 +295,11 @@ def bump_npm(path: Path, kind: str) -> tuple[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="递归升级 Rust + npm 项目文件版本号",
+        description="升级 Rust workspace + npm 项目版本号",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python3 scripts/release.py patch      # 所有 crate + npm 打 patch\n"
+            "  python3 scripts/release.py patch      # workspace + npm 打 patch\n"
             "  python3 scripts/release.py minor --dry-run\n"
             "  python3 scripts/release.py major --npm sag-ui/package.json\n"
         ),
@@ -341,35 +367,30 @@ def main() -> int:
     changes = []
 
     # ── Rust ─────────────────────────────────────────────────────────
-    for toml in find_cargo_tomls(root):
+    # 版本唯一源是根 Cargo.toml 的 [workspace.package] version；成员 crate
+    # 通过 version.workspace = true 继承，脚本不再改写它们的 Cargo.toml。
+    root_toml = root / "Cargo.toml"
+    root_bump: tuple[str, str] | None = None
+    if root_toml.exists():
         if args.dry_run:
-            # dry-run 只读：临时复制逻辑，不写文件
-            lines = toml.read_text(encoding="utf-8").splitlines(keepends=True)
-            section = None
-            result = None
-            for line in lines:
-                m = SECTION_RE.match(line)
-                if m:
-                    section = m.group(1)
-                    continue
-                if section not in CARGO_VERSION_SECTIONS:
-                    continue
-                m = CARGO_VERSION_LINE_RE.match(line)
-                if m:
-                    v = parse_version(m.group(2))
-                    if v:
-                        result = (m.group(2), str(v.bump(args.kind)))
-                        break
-            if result:
-                changes.append((toml.relative_to(root), result[0], result[1]))
-                if toml.parent != root:
-                    version_map.setdefault(toml.parent.name, result)
+            # dry-run 只读：不写文件
+            old = read_cargo_version(root_toml)
+            if old:
+                root_bump = (old, str(parse_version(old).bump(args.kind)))
         else:
-            result = bump_cargo_toml(toml, args.kind)
-            if result:
-                changes.append((toml.relative_to(root), result[0], result[1]))
-                if toml.parent != root:
-                    version_map.setdefault(toml.parent.name, result)
+            root_bump = bump_cargo_toml(root_toml, args.kind)
+        if root_bump:
+            changes.append((root_toml.relative_to(root), root_bump[0], root_bump[1]))
+
+    # 成员 Cargo.toml 已无显式 version，Cargo.lock 里的成员条目需按根版本
+    # 变化同步：用各成员 [package] name 建立 name -> (旧, 新) 映射。
+    if root_bump:
+        for toml in find_cargo_tomls(root):
+            if toml == root_toml:
+                continue
+            name = cargo_package_name(toml)
+            if name:
+                version_map.setdefault(name, root_bump)
 
     # ── Cargo.lock ──────────────────────────────────────────────────
     lock = root / "Cargo.lock"

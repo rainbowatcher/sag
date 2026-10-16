@@ -67,9 +67,13 @@ Guard 在 `main()` 中声明为第一个局部变量，利用 Rust 的**反向 d
 
 ## 版本升级脚本
 
+版本唯一源是根 `Cargo.toml` 的 `[workspace.package] version`；9 个成员 crate 通过 `version.workspace = true` 继承，升级脚本不再改写成员 `Cargo.toml`。一次升级只写入并提交四类文件：根 `Cargo.toml`、`Cargo.lock`（成员条目以 crate 名从根版本 (旧, 新) 推导）、`sag-ui/package.json`、`docs/package.json`。
+
 `scripts/release.py` 将每个版本源文件实际修改后的路径收集为候选变更文件，行为与 `bumpp` 的 `updatedFiles` 类似：只有检测到替换的文件才进入候选列表。自动提交前通过 `git ls-files --cached` 过滤候选列表，仅向 `git commit -- <paths>` 传入已被 Git 跟踪的路径。
 
 因此，Cargo workspace 即使因项目策略将 `Cargo.lock` 放入 `.gitignore`，脚本仍会同步本地 lockfile，但会跳过该文件的自动提交，不会因无效 pathspec 失败。其它未跟踪或忽略的版本文件遵循同样规则。
+
+CI 的版本门禁（`.github/workflows/release.yml`）同样从根 `Cargo.toml` 的 `[workspace.package] version` 读取，维持单一版本源。
 
 ## 不变式
 

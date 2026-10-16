@@ -7,7 +7,8 @@ on:
   push:
     tags: ["v*"]
 
-# gh release create / upload 与 GitHub Contents API 都需要写权限。
+# 创建 Release（softprops/action-gh-release）与写 homebrew-tap（GitHub Contents
+# API）都需要写权限。
 permissions:
   contents: write
 
@@ -19,9 +20,10 @@ concurrency:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # 固定 ubuntu-24.04：ubuntu-latest 正迁移到 24.04 之后的镜像，锁定以保可复现。
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml 已固定 channel（1.98），runner 自带 rustup 会自动
       # 安装该工具链，无需任何显式的 toolchain action。
@@ -34,35 +36,36 @@ jobs:
   build:
     name: Build aarch64-apple-darwin
     needs: test
-    # macos-14 是原生 arm64（Apple Silicon）runner。
-    runs-on: macos-14
+    # macos-26 是原生 arm64（Apple Silicon）runner（macos-14 已废弃，
+    # 2026-11-02 退役）。
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify crate version matches tag
         run: |
           set -euo pipefail
-          crate_ver="$(grep -m1 '^version[[:space:]]*=' sag-gateway/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          crate_ver="$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
           tag_ver="${GITHUB_REF_NAME#v}"
-          echo "sag-gateway/Cargo.toml version = ${crate_ver}"
-          echo "tag version                   = ${tag_ver}"
+          echo "Cargo.toml [workspace.package] version = ${crate_ver}"
+          echo "tag version                            = ${tag_ver}"
           if [ -z "${crate_ver}" ]; then
-            echo "::error::could not extract version from sag-gateway/Cargo.toml"
+            echo "::error::could not extract version from Cargo.toml [workspace.package]"
             exit 1
           fi
           if [ "${crate_ver}" != "${tag_ver}" ]; then
-            echo "::error::version mismatch: tag ${GITHUB_REF_NAME} (=> ${tag_ver}) != Cargo.toml ${crate_ver}. Run the version bump before tagging."
+            echo "::error::version mismatch: tag ${GITHUB_REF_NAME} (=> ${tag_ver}) != Cargo.toml [workspace.package] ${crate_ver}. Run the version bump before tagging."
             exit 1
           fi
           echo "VERSION=${crate_ver}" >> "$GITHUB_ENV"
 
       # pnpm 版本与 mise.toml（pnpm = "11"）保持一致；sag-ui/package.json 没有
       # packageManager 字段，故显式指定。
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -96,7 +99,7 @@ jobs:
           ls -l dist
           cat "dist/${name}.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/*
@@ -104,53 +107,47 @@ jobs:
   publish:
     name: Publish release + homebrew-tap
     needs: build
-    runs-on: ubuntu-latest
+    # 固定 ubuntu-24.04：ubuntu-latest 正迁移到 24.04 之后的镜像，锁定以保可复现。
+    runs-on: ubuntu-24.04
     env:
-      # gh CLI 读 GH_TOKEN。
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # tap 的 Contents API 调用走 TAP_TOKEN（见下方 python 步骤）。
       TAP_TOKEN: ${{ secrets.TAP_RELEASE }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
 
-      - name: Verify version + read checksum
+      - name: Read version + checksum from artifact
+        # 版本一致性已由 build job 的 "Verify crate version matches tag" 门禁；
+        # 这里以「tag 版本对应的 artifact 是否存在」作为最终一致性信号。
         run: |
           set -euo pipefail
-          crate_ver="$(grep -m1 '^version[[:space:]]*=' sag-gateway/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
           tag_ver="${GITHUB_REF_NAME#v}"
-          if [ -z "${crate_ver}" ]; then
-            echo "::error::could not extract version from sag-gateway/Cargo.toml"
+          sha_file="dist/sag-v${tag_ver}-aarch64-apple-darwin.tar.gz.sha256"
+          if [ ! -f "${sha_file}" ]; then
+            echo "::error::missing ${sha_file} — tag ${GITHUB_REF_NAME} (=> ${tag_ver}) does not match the built artifact version"
             exit 1
           fi
-          if [ "${crate_ver}" != "${tag_ver}" ]; then
-            echo "::error::version mismatch: tag ${GITHUB_REF_NAME} (=> ${tag_ver}) != Cargo.toml ${crate_ver}"
-            exit 1
-          fi
-          sha="$(awk '{print $1}' "dist/sag-v${crate_ver}-aarch64-apple-darwin.tar.gz.sha256")"
+          sha="$(awk '{print $1}' "${sha_file}")"
           if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{64}$'; then
-            echo "::error::unexpected sha256 digest in .sha256 file: '${sha}'"
+            echo "::error::unexpected sha256 digest in ${sha_file}: '${sha}'"
             exit 1
           fi
-          echo "VERSION=${crate_ver}" >> "$GITHUB_ENV"
+          echo "VERSION=${tag_ver}" >> "$GITHUB_ENV"
           echo "SHA256=${sha}" >> "$GITHUB_ENV"
 
-      - name: Create GitHub Release (idempotent)
-        run: |
-          set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            # 重复推送同一 tag 时 release 已存在：直接覆盖上传资产。
-            echo "release ${GITHUB_REF_NAME} already exists — re-uploading assets"
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "sag ${GITHUB_REF_NAME}" \
-              --generate-notes
-          fi
+      # v3 的 overwrite_files 默认为 true：重复推送同一 tag 时会更新已存在的
+      # release 并覆盖上传同名资产，不会重复创建，因此无需手写
+      # `gh release view` / `gh release upload --clobber` 的幂等分支。
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: sag ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
 
       # tap 更新完全走 GitHub Contents API，不 clone tap 仓库：
       #   - GET  Formula/sag.rb（Bearer TAP_TOKEN）

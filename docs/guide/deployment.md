@@ -35,8 +35,7 @@ just build-test
 macOS arm64 的预编译单二进制（已内嵌 UI）通过 Homebrew tap 分发，本机无需 Rust / Node 工具链：
 
 ```bash
-brew tap rainbowatcher/homebrew-tap https://github.com/rainbowatcher/homebrew-tap
-brew install sag
+brew install rainbowatcher/tap/sag
 ```
 
 以服务方式常驻前，先准备配置文件 `$(brew --prefix)/etc/sag/gateway.toml`（内容可参考仓库根 `gateway.example.toml`），然后：
@@ -45,7 +44,7 @@ brew install sag
 brew services start sag
 ```
 
-`brew services` 走 formula 的 `service` 块，等价于 `sag --config $(brew --prefix)/etc/sag/gateway.toml`；日志写入 `$(brew --prefix)/var/log/sag.log`。该二进制与本地 `just build-test` 产物同源（tag 触发的 release 工作流在 `macos-14` 上构建并内嵌 `sag-ui/dist/`）。
+`brew services` 走 formula 的 `service` 块，等价于 `sag --config $(brew --prefix)/etc/sag/gateway.toml`；日志写入 `$(brew --prefix)/var/log/sag.log`。该二进制与本地 `just build-test` 产物同源（tag 触发的 release 工作流在 `macos-26` 上构建并内嵌 `sag-ui/dist/`）。
 
 ### 发布流程
 

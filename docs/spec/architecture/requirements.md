@@ -74,6 +74,8 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 ### 版本升级脚本
 - `scripts/release.py` 升级版本时仅将实际发生变更且已被 Git 跟踪的文件传给自动提交。
 - 被 `.gitignore` 忽略或未被 Git 跟踪的派生文件可以在工作区同步，但不得导致 `git commit` 因无效 pathspec 失败。
+- 版本唯一源为根 `Cargo.toml` 的 `[workspace.package] version`；成员 crate 通过 `version.workspace = true` 继承，升级脚本不得改写成员 `Cargo.toml`。
+- 一次升级写入并提交的文件固定为：根 `Cargo.toml`、`Cargo.lock`（成员条目由根版本推导）、`sag-ui/package.json`、`docs/package.json`。
 
 ## 与其它模块的交互
 - 所有子包通过 `sag-core` 的类型定义通信

@@ -40,7 +40,7 @@ updated: 2026-10-15
 
 ## 2026-09-17
 
-- **架构**：[0002 版本升级提交按实际变更文件过滤](architecture/changes/0002-version-bump-commit-files.md) — 版本升级脚本参考 `bumpp` 的 `updatedFiles` 语义，仅提交实际变更且已被 Git 跟踪的文件，避免被忽略的 `Cargo.lock` 触发无效 pathspec
+- **架构**：[0002 版本升级提交按实际变更文件过滤与 workspace 版本继承](architecture/changes/0002-version-bump-commit-files.md) — 版本升级脚本参考 `bumpp` 的 `updatedFiles` 语义，仅提交实际变更且已被 Git 跟踪的文件，避免被忽略的 `Cargo.lock` 触发无效 pathspec；版本收敛到根 `Cargo.toml` 的 `[workspace.package] version`，成员 `Cargo.toml` 通过 `version.workspace = true` 继承，脚本不再改写成员文件
 
 ## 2026-09-15
 

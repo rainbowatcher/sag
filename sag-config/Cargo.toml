@@ -1,6 +1,6 @@
 [package]
 name = "sag-config"
-version = "0.4.1"
+version.workspace = true
 edition = "2024"
 description = "Configuration management with hot-reload for SAG"
 
