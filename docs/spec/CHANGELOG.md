@@ -9,6 +9,7 @@ updated: 2026-10-17
 
 ## 2026-10-17
 
+- **analytics**：[0008 退役旧分析端点，固化两套口径契约分层](analytics/changes/0008-retire-legacy-analytics-endpoints.md) — 删除 `/v1/analytics/{cache,trend,distribution}`（零消费方 + 承诺无法兼现），保留 `/v1/analytics/stats` 与 `/api/logs` 作为热窗口诊断面（`/api/logs` 不迁移到事实表，dashboard 不展示统计），并将「诊断口径 vs 分析口径数字不可对比」写进契约
 - **分析**：[0007 call_logs 保留窗口 + 表轮转（热窗口视图）](analytics/changes/0007-call-log-retention-rotation.md) — 整表轮转为冷表 `call_logs_arch_*`，`call_logs_hot`/`call_logs_all` 视图承接热窗口与全史查询。
 
 ## 2026-10-15

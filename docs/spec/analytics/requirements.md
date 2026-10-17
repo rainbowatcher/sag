@@ -7,7 +7,7 @@ updated: 2026-10-17
 
 ## 目标
 
-为每次 API 请求记录请求级最终结果与 target 级尝试事实，提供可验收的失败率、延迟、Token、缓存统计，并支持按 route / target 两个层级查询，同时保留旧日志与旧统计接口的兼容性。
+为每次 API 请求记录请求级最终结果与 target 级尝试事实，提供可验收的失败率、延迟、Token、缓存统计，并支持按 route / target 两个层级查询；同时保留 `/v1/analytics/stats` 与 `/api/logs` 两个**诊断接口**（热窗口口径），`/v1/analytics/{cache,trend,distribution}` 已下线，时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
 
 ## 预期行为
 
@@ -35,7 +35,7 @@ updated: 2026-10-17
 
 ### 数据事实
 
-- 保留现有 `call_logs` 作为**日志/诊断数据源**，同时作为旧分析接口的数据源。
+- 保留现有 `call_logs` 作为**日志/诊断数据源**，同时作为诊断接口（`/api/logs`、`/v1/analytics/stats`）的数据源；不承载分析口径。
 - 新增请求级最终事实（下称 `request_results`）：每个纳入分析的请求恰好一条，记录最终结果。
 - 新增 target 级事实（下称 `target_attempts`）：每次实际发起上游调用的 target 尝试一条，一次请求 0..n 条。
 - `actual_model`：运行时实际调用的模型。配置 `real_model=None`（passthrough）时为请求模型；显式 `real_model` 时为路由解析后的实际模型。`request_results` 保存最终成功的 `actual_model`（仅成功非 NULL）；`target_attempts` 保存每次实际尝试的 `actual_model`。
@@ -128,12 +128,12 @@ updated: 2026-10-17
 
 ### 保留与轮转
 
-- `call_logs` 明细必须**保留窗口语义**：`call_log_retention_days`（默认 90 天）内的数据是**热窗口**，旧日志接口（`/api/logs`）与旧统计接口（`/v1/analytics/*`）只覆盖热窗口。
+- `call_logs` 明细必须**保留窗口语义**：`call_log_retention_days`（默认 90 天）内的数据是**热窗口**，保留的诊断接口（`/api/logs`、`/v1/analytics/stats`）只覆盖热窗口。
 - 窗口是 **UTC 滚动窗口**，不是日历月/日历日：`cutoff = now - retention_days × 24h`，随每日维护轮推进。
 - 超窗数据必须**保留在同库冷表**（`call_logs_arch_<UTC yyyyMMdd_HHmmss>`）中，并通过 `call_logs_all` 视图提供**全史 SQL 查询**；冷表不接任何 HTTP 接口。
 - 轮转以**整表为单位**（表轮转，非行级搬运）：单事务纯 DDL（RENAME 热表 → 冷表索引退役 → 原样回放捕获的 DDL 重建空热表 → 重建视图），无行级数据路径，失败整轮回滚。
 - **冷表只增不改**：冷表是轮转当天的 schema 快照，不得 ALTER / 插入 / 更新 / 删除 / 改名；唯一允许的写是索引退役的 `DROP INDEX`。冷表缺的列由视图以 `NULL` 补齐，查询面看到的永远是热表当前形状。
-- **旧统计结果随时间变化**：`query_stats` / `query_cache_stats` / `query_trend` 等含 `from < cutoff` 的查询，在超窗数据退出视图后结果会改变（旧区间 bucket 清零、`total` 递减、趋势图断崖）。同一查询在不同日期可能返回不同数值，不得当作稳定的历史统计值。长程统计以两级事实 + Rollup 为准。
+- **诊断口径结果随时间变化**：`call_logs_hot` 上的聚合（`/v1/analytics/stats` 的 `query_stats`）与 `/api/logs` 的 `total`，在超窗数据退出视图后会改变（`total` 递减、聚合随之收缩）。同一查询在不同日期可能返回不同数值，不得当作稳定的历史统计值。长程统计与时间趋势一律以两级事实 + Rollup（`/v1/analytics/v2/*`）为准。
 - `/api/logs` 的翻页 `offset` 在轮转发生时可能漂移（低危 UX 瑕疵，不修）。
 - **`id` 只在单表内唯一**：每次轮转后新热表的 `id` 从 1 重新开始；跨表追溯必须使用 `request_id`。
 - 已核实**无任何 JOIN 消费方**（facts / Rollup 链路不读 `call_logs`），也**没有按 `id` / `request_id` 查单条的端点**，因此轮转不影响其余链路。
@@ -143,7 +143,8 @@ updated: 2026-10-17
 
 ### API 与 UI
 
-- 保留旧分析接口与旧日志接口，行为与数据源不变（按旧明细聚合）。
+- 保留 `/v1/analytics/stats` 与 `/api/logs` 作为**诊断接口**（按旧明细聚合，数据源 `call_logs_hot`，热窗口口径）；`/v1/analytics/{cache,trend,distribution}` **已下线**，时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
+- 两套口径的端点边界即契约边界：诊断接口是**近似且不稳定**的（可丢弃写入、`NULL` 当 0、失败率无分母剔除、随轮转缩水），分析接口是**可验收**的。两者数字对不上是预期行为，不得为了对齐而把诊断口径改造成事实口径。
 - 新增统一查询模型，通过 `scope=route|target` 选择统计层级；默认 route 视角，UI 提供 target 视角切换。
 - route 视角不提供 provider / actual_model 过滤；供应商与实际模型维度的过滤只在 target 视角提供。
 - 查询结果必须包含：总体汇总、按可归属对象（route 或 target）的分组、未归属失败（如 no_route）的分类。
@@ -165,11 +166,12 @@ call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 
 
 ## 兼容性说明（迁移前现状）
 
-- 旧 `call_logs` 可能一条请求对应多行记录；旧 `/v1/analytics/*` 接口按旧明细聚合，保持兼容，不迁移为两级事实口径（0007 起其数据源为 `call_logs_hot` 视图，只覆盖热窗口，见「保留与轮转」）。
+- 旧 `call_logs` 可能一条请求对应多行记录；保留的 `/v1/analytics/stats` 与 `/api/logs` 按旧明细聚合，保持兼容，**不迁移**为两级事实口径（0007 起其数据源为 `call_logs_hot` 视图，只覆盖热窗口，见「保留与轮转」）。
+- `/v1/analytics/cache` / `/v1/analytics/trend` / `/v1/analytics/distribution` **已下线**（0008）：趋势请用 `/v1/analytics/v2/trend`，分布 / 占比用 `/v1/analytics/v2/summary?scope=target` 的 `groups`。
 - 旧 call_logs 写入链路保留“可丢弃”诊断语义：可能丢弃诊断事件，不承诺背压或原子性。
 - 旧 call_logs 的落库路径并入与正式分析共享的连接池（`SqliteLogStore::from_pool` / `CallLogCollector::new_shared`）：store 自身不关闭共享 pool，旧链路的批量插入与正式写事务共用 WAL + `BEGIN IMMEDIATE` 的并发安全设置。
 - 旧历史不强行回填 route/target 身份，旧记录中的身份字段为空。
-- 旧接口的既有响应字段（如聚合错误率、按 provider/model 过滤）按迁移前现状保留；新分析的口径以本文「最终状态与失败率」为准。
+- 保留的诊断接口既有响应字段（如聚合 `error_count`、按 provider/model 过滤）按迁移前现状保留；新分析的口径以本文「最终状态与失败率」为准。
 
 ## 功能边界
 
@@ -179,7 +181,7 @@ call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 
 - 延迟 / Token / 缓存指标
 - UTC 小时分桶与 1 小时 Rollup
 - 统一查询 API 与 UI（route/target 视角切换）
-- 旧日志接口与旧分析接口兼容保留
+- 诊断接口保留（`/v1/analytics/stats` + `/api/logs`，热窗口口径）
 
 ### 不包含
 - 认证失败、未进入 API 处理的请求（不纳入业务分析）
@@ -195,11 +197,12 @@ call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 
 - **调度**：请求处理完成后提供最终结果与 target 尝试事实；分析事件异步写入，不阻塞请求。
 - **路由**：提供 route/target 的稳定身份与最终结果归因（no_route / all_disabled）。
 - **认证**：认证失败的请求不产生分析事实。
-- **管理面板 / UI**：调用统计接口展示图表，支持 route/target 视角切换；保留旧日志页面。
+- **管理面板 / UI**：调用 `/v1/analytics/v2/*` 展示统计图表，支持 route/target 视角切换；日志页（`/api/logs`）作为含错误文本与 TTFT 的诊断面保留。dashboard 不展示统计。
 - **配置**：读取 `[analytics]` 配置与 route 语义。
 
 ## 变更记录
 
+- [0008 退役旧分析端点，固化两套口径契约分层](changes/0008-retire-legacy-analytics-endpoints.md)
 - [0007 call_logs 保留窗口 + 表轮转（热窗口视图）](changes/0007-call-log-retention-rotation.md)
 - [0006 相对 sqlite:// DSN 锚定 XDG 数据目录 + create_if_missing 修复](../config/changes/0006-xdg-base-directories.md)
 - [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)

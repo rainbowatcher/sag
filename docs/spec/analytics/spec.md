@@ -7,7 +7,7 @@ updated: 2026-10-17
 
 ## 背景与问题
 
-现状（阶段 0）只有单张 `call_logs` 日志表 + 可丢弃的 `CallLogCollector` 写入链路，旧 `/v1/analytics/*` 与 `/api/logs` 接口直接按该明细聚合。需求升级为：route 级（一请求一最终结果）与 target 级（一实际尝试一结果）两级事实、系统生成且只存在 DB 的稳定身份（route_id / target_id）、正式分析事件原子异步写入、统一失败率/延迟/Token/缓存口径、UTC 小时分桶与 1h Rollup、统一查询 API 与 UI 视角切换，同时保留旧链路与旧接口兼容。
+现状（阶段 0）只有单张 `call_logs` 日志表 + 可丢弃的 `CallLogCollector` 写入链路，`/api/logs` 与旧 `/v1/analytics/*` 接口直接按该明细聚合（0008 起旧分析端点只留 `/v1/analytics/stats`，`cache` / `trend` / `distribution` 已下线）。需求升级为：route 级（一请求一最终结果）与 target 级（一实际尝试一结果）两级事实、系统生成且只存在 DB 的稳定身份（route_id / target_id）、正式分析事件原子异步写入、统一失败率/延迟/Token/缓存口径、UTC 小时分桶与 1h Rollup、统一查询 API 与 UI 视角切换，同时保留旧链路与旧接口兼容。
 
 本规格把上述设计落成可执行方案。凡是「目标实现」标注的内容均为待实现设计，不是已存在代码；阶段 0 为当前现状。
 
@@ -15,7 +15,7 @@ updated: 2026-10-17
 
 | 阶段 | 范围 | 状态 |
 | --- | --- | --- |
-| 阶段 0 | `call_logs` + `CallLogCollector` + 旧 `/v1/analytics/*`、`/api/logs` 接口 | 已实现（现状，保持兼容） |
+| 阶段 0 | `call_logs` + `CallLogCollector` + 诊断接口（`/v1/analytics/stats`、`/api/logs`；`cache`/`trend`/`distribution` 已于 0008 下线） | 已实现（现状，保持兼容） |
 | 阶段 1 | 身份注册表（`analytics_routes` / `analytics_route_targets`）+ 两级事实表（`request_results` / `target_attempts`）+ 原子事件队列 + dispatch 接入点 + `call_logs` 可空身份列 | 目标实现 |
 | 阶段 2 | 统一查询 API（明细精确口径）+ UI route/target 视角切换 | 目标实现 |
 | 阶段 3 | 1h Rollup + 稀疏对数延迟直方图 + 跨度 > 24h 的混合查询 | 目标实现 |
@@ -25,14 +25,14 @@ updated: 2026-10-17
 ### 现有链路（阶段 0：call_logs 与旧接口）
 
 - [sag-analytics/src/lib.rs](../../../sag-analytics/src/lib.rs) — `CallLogCollector` 等公共导出（现状）
-- [sag-analytics/src/store.rs](../../../sag-analytics/src/store.rs) — `LogStore` trait：`insert_batch` / `query_stats` / `query_logs` / `query_cache_stats` / `query_trend` / `query_distribution`（现状）
-- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、旧统计/趋势/分布查询、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭；0007 起 5 个查询方法改读 `call_logs_hot` 视图并包 `with_schema_retry`，`new` / `from_pool` 在 `ensure_schema_consistency` 之后追加 `refresh_views(pool, None)`）
+- [sag-analytics/src/store.rs](../../../sag-analytics/src/store.rs) — `LogStore` trait：`insert_batch` / `query_stats` / `query_logs` / `count_logs`（0008 起删除 `query_cache_stats` / `query_trend` / `query_distribution`）
+- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、诊断查询（`query_stats` / `query_logs` / `count_logs`）、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭；0007 起查询方法改读 `call_logs_hot` 视图并包 `with_schema_retry`，`new` / `from_pool` 在 `ensure_schema_consistency` 之后追加 `refresh_views(pool, None)`；0008 起删除 `query_cache_stats` / `query_trend` / `query_distribution`）
 - [sag-analytics/src/rotate.rs](../../../sag-analytics/src/rotate.rs) — 保留窗口与冷热轮转（0007 新增）：`rotate_once`（探测 + 单事务 6 步 DDL 捕获回放）、`refresh_views` / `build_views_in_tx`（两视图构建）、`retire_indexes`（索引退役巡检）、`unique_archive_name`、`is_schema_change`、`assert_replay_faithful`；常量 `HOT_TABLE` / `HOT_VIEW` / `ALL_VIEW` / `ARCH_PREFIX`
 - [sag-analytics/src/collector.rs](../../../sag-analytics/src/collector.rs) — `CallLogCollector`：bounded mpsc + 后台写入 + `try_send` 丢弃语义（现状，可丢弃链路；0005 起新增 `new_shared(pool)` 共享池构造）
 - [sag-analytics/migrations/](../../../sag-analytics/migrations/) — `call_logs` schema 迁移（现状，`.sqlite.sql` 后缀约定）
-- [sag-router/src/handlers/mod.rs](../../../sag-router/src/handlers/mod.rs) — 旧 `/v1/analytics/stats|trend|distribution|cache` 处理器（现状）
+- [sag-router/src/handlers/mod.rs](../../../sag-router/src/handlers/mod.rs) — 诊断端点处理器：只剩 `/v1/analytics/stats`（0008 起 `trend` / `distribution` / `cache` 处理器已删除）
 - [sag-admin/src/admin_logs.rs](../../../sag-admin/src/admin_logs.rs) — 旧 `/api/logs` 日志接口（现状）
-- [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) / [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — 旧统计页面与 store（现状）
+- [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) / [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — 分析页与 store（现状：已全部走 `/v1/analytics/v2/*`，不再调用任何旧端点）
 - [sag-gateway/src/main.rs](../../../sag-gateway/src/main.rs) — 维护任务接线：`spawn_rotation_scheduler` / `rotation_round` / `RotationSchedulerHandle`（0007 新增，在 rollup 旁 spawn，graceful shutdown 位于 rollup 之后、event drain 之前）
 
 ### 身份注册表与事实写入（目标实现，阶段 1）
@@ -190,7 +190,7 @@ CREATE INDEX IF NOT EXISTS idx_target_attempts_route_completed
 | `cached_tokens` | NULL = unknown，UI 与「未命中」区分显示 |
 | `ttft_ms` / `upstream_duration_ms` | 缺失为 NULL，延迟统计排除并计入 coverage 分母；失败/取消终止一律 NULL（含已转发部分 `Data` 的失败流）——仅成功样本带值 |
 
-`call_logs` 保持现状（可丢弃诊断 + 旧接口数据源），新迁移增加可空列 `route_id TEXT`、`target_id TEXT`（新写入已知则填，旧记录保持 NULL，**不回填**）。
+`call_logs` 保持现状（可丢弃诊断 + 诊断接口数据源），新迁移增加可空列 `route_id TEXT`、`target_id TEXT`（新写入已知则填，旧记录保持 NULL，**不回填**）。
 
 ### 原子分析事件（目标实现，阶段 1）
 
@@ -502,7 +502,7 @@ stateDiagram-v2
 
 ### API 与 UI（目标实现，阶段 2）
 
-- 旧接口保留且行为不变：`GET /v1/analytics/stats|trend|distribution|cache`、`GET /api/logs`（旧明细聚合口径，不迁移为两级事实）。
+- 诊断接口保留、签名与行为不变：`GET /v1/analytics/stats`、`GET /api/logs`（旧明细聚合口径，不迁移为两级事实）；`GET /v1/analytics/{cache,trend,distribution}` 已下线（0008），时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
 - 新统一查询接口（目标实现，query 参数风格，避免路径参数）：
 
 | 接口 | 参数 | 说明 |
@@ -523,7 +523,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `call_logs` | 真实表（28 列 + 5 个标准索引） | 写入目标恒为它；轮转时整表改名为冷表，随后由原样回放 DDL 重建一张同形的空表 |
 | `call_logs_arch_<UTC yyyyMMdd_HHmmss>` | 真实表（出生即零索引） | 一次轮转搬走的「约 retention 天量」历史批次，只增不改 |
-| `call_logs_hot` | 视图 | 旧接口查询面：热表 + 窗内冷表，逐分支收窗 |
+| `call_logs_hot` | 视图 | 诊断接口查询面（`/api/logs`、`/v1/analytics/stats`）：热表 + 窗内冷表，逐分支收窗 |
 | `call_logs_all` | 视图 | 历史分析面：热表 + 全部冷表全部行，不接任何 HTTP 接口 |
 
 轮转 = 单事务纯 DDL（`pool.begin_with("BEGIN IMMEDIATE")`），无行级数据路径：
@@ -552,9 +552,35 @@ COMMIT
 两个维护子过程：
 
 - 索引退役 `retire_indexes(pool, cutoff)`：契约是「对 `MAX(timestamp) < cutoff` 的冷表 DROP 其全部索引，窗内冷表的索引一概不碰」，实现为枚举 `sqlite_master` 里 `tbl_name` 为冷表的全部 index 的通用巡检，幂等，返回本轮 drop 数。由于 ③ 让冷表生而无索引，稳态下它是幂等 no-op；契约保留是为了不把「只 DROP 那 5 个名字」写死。
-- 语句缓存容错 `with_schema_retry`：DDL 提升 schema cookie 后，连接上缓存过的 prepared statement 可能报 `database schema has changed`（`SQLITE_SCHEMA`，多连接池下尤其——DML 在连接 A、DDL 在连接 B）。查询层 5 个方法 + `insert_batch` 都包这层 retry（**只重试一次**），仍失败则上抛（HTTP 500），不 panic。
+- 语句缓存容错 `with_schema_retry`：DDL 提升 schema cookie 后，连接上缓存过的 prepared statement 可能报 `database schema has changed`（`SQLITE_SCHEMA`，多连接池下尤其——DML 在连接 A、DDL 在连接 B）。查询层各查询方法（0008 后为 `query_stats` / `query_logs` / `count_logs`）+ `insert_batch` 都包这层 retry（**只重试一次**），仍失败则上抛（HTTP 500），不 panic。
 
 职责切分：`ensure_schema_consistency` 只对热表补列；`refresh_views` / `build_views_in_tx` 只读 pragma 建视图（不 ALTER 任何表）；`rotate_once` 只做 DDL 捕获回放（不补列——回放文本已含全部列）；冷表是轮转当天的 schema 快照，谁也不补它，列差异一律由视图 `NULL AS` 消化。store 打开顺序不可颠倒：`migrate` → `ensure_schema_consistency`（先补列）→ `refresh_views(pool, None)`（后取 pragma 建视图），否则视图会把补列前的形状烘死。启动路径的 `refresh_views(pool, None)` 只兜底视图存在性（全史形状是正确窗口的**超集**：只会多看到历史，不会丢行、不报错），窗口正确性由 spawn 后立即跑的首轮调度轮负责，亚秒级收敛。
+
+### 两套口径契约分层（已实现，0008）
+
+系统里同时存在两条计算链，**从端点边界显式分层**。分层的意义不是「新旧」，而是「哪一套数字可以拿来验收」。
+
+| 维度 | 诊断口径（`/v1/analytics/stats`、`/api/logs`） | 分析口径（`/v1/analytics/v2/summary\|trend`） |
+| --- | --- | --- |
+| 数据源 | `call_logs_hot` 视图（单表明细） | `request_results` / `target_attempts`（+ 1h Rollup） |
+| 写入契约 | **可丢弃**：`CallLogCollector` bounded mpsc + `try_send`，队列满直接丢 | **不丢弃**：队列满背压，shutdown 排空，一请求事实原子提交 |
+| 时间覆盖 | 热窗口（`call_log_retention_days`，默认 90 天），随每日轮转缩水 | 全历史（Rollup 只加速、不删明细） |
+| 计数对象 | 一行 = 一条 `call_logs` 行（一请求可多行） | route 级一请求一条、target 级一尝试一条 |
+| NULL 处理 | `COALESCE(SUM(...), 0)`：未知缓存 / Token **当 0** | NULL = 未知，字典单独计数；未知样本不进请求命中率分母 |
+| 失败率 | `error_count / call_count`，以 `error` 文本非空为准，**无分母剔除规则** | 按最终状态分类，`client_error` / `no_route` / `all_disabled` / `client_cancelled` 各有明确分母 |
+| 稳定性 | **不稳定**：同一查询跨日期可能不同（窗口推进、轮转、写入丢行） | 稳定：同一区间同一结果（事实不可变、Rollup 可重算） |
+| 用途 | 人工排查（错误文本、TTFT、丢包摘要、逐条时间线） | 验收与报表（失败率、延迟分位、Token / 缓存命中率） |
+
+**数字不可对比**：`/v1/analytics/stats` 的 `call_count` 与 v2 `overall.requests` 对不上是**预期行为**——计数对象、时间覆盖、丢弃语义三者都不同。任何「让两者对齐」的改动都是把诊断口径污染成事实口径，不做。
+
+**追溯键只有 `request_id`**：`call_logs.id` 每张表从 1 重置（0007 的 `ALTER TABLE … RENAME` 把 `sqlite_sequence` 一起改名），冷热表、`/api/logs` 与事实表之间只能靠 `request_id`（UUID v4，全局唯一）对齐。
+
+**维护任务边界**（两条链互不越界）：
+
+- **Rollup**（1h 批处理）只服务 v2：读 `request_results` / `target_attempts`，写 rollup 表，**完全不读** `call_logs`。
+- **Rotation**（保留窗口 / 索引退役 / 视图重建）只服务诊断链路：只动 `call_logs`、`call_logs_arch_*` 与两个视图，**完全不碰**事实表与 rollup 表。
+
+端点边界即契约边界，`0008` 把 `cache` / `trend` / `distribution` 下线的原因也在这里：它们承诺「全生命周期统计」，而数据源在 0007 之后只剩热窗口，承诺无法兼现；保留的 `/v1/analytics/stats` 与 `/api/logs` 则被明确定位为诊断面，不声称可验收。
 
 ## 关键决策
 
@@ -594,10 +620,10 @@ COMMIT
 
 ### 事实事件与 call_logs 分层
 
-**背景**：正式统计需要原子性/背压/排空保证；`call_logs` 的「可丢弃」是旧接口的既有契约。
+**背景**：正式统计需要原子性/背压/排空保证；`call_logs` 的「可丢弃」是诊断接口的既有契约。
 
 **Trade-off**:
-- ✅ 两条写入链路契约分离：正式事件（原子、背压、drain）与诊断日志（可丢弃）互不拖累；旧接口数据源与行为不变。
+- ✅ 两条写入链路契约分离：正式事件（原子、背压、drain）与诊断日志（可丢弃）互不拖累；诊断接口数据源与行为不变。
 - ❌ 放弃「把 `call_logs` 写入链路升级为不丢弃」：改变旧链路语义、影响旧接口延迟与背压行为，且 `call_logs` 一请求多行的结构仍无法承载一请求一事实。
 
 ### 正式事件队列背压，不丢弃
@@ -658,7 +684,7 @@ COMMIT
 
 ### call_logs 用表轮转（DDL），不用行级搬运或外部归档
 
-**背景**：`call_logs` 是 append-only 明细且无保留期，主库文件随行数单调膨胀；用户要求超窗数据仍保留可 SQL 查询的参考价值，不接受「直接 DELETE」，也不接受「外部归档文件」。已核实消费方只有单表分页（`/api/logs`）与单表聚合（旧 `/v1/analytics/*`），无任何 JOIN 消费方、无按 `id` / `request_id` 查单条的端点。
+**背景**：`call_logs` 是 append-only 明细且无保留期，主库文件随行数单调膨胀；用户要求超窗数据仍保留可 SQL 查询的参考价值，不接受「直接 DELETE」，也不接受「外部归档文件」。已核实消费方只有单表分页（`/api/logs`）与单表聚合（旧 `/v1/analytics/*`，0008 起只剩 `/v1/analytics/stats`），无任何 JOIN 消费方、无按 `id` / `request_id` 查单条的端点。
 
 **Trade-off**（整表轮转 vs 行级搬运 vs 外部归档）：
 - ✅ **表轮转是纯 DDL**：整表改名 + 空表重建，零行级数据路径。因此 ① 不需要维护行映射（`RETURNING` 列清单与 `INSERT` 列清单同源）② 不需要绕 SQLite 绑定参数上限（5000 行 × 28 列分片）③ 不需要处理冷热两表 `id` 空间冲突 ④ **不背上「双表 schema 永久同步」义务**——加列不用改轮转代码。换来的是毫秒级写锁窗口（v2 批搬运的大锁窗口随机制消失）。
@@ -730,7 +756,7 @@ COMMIT
 - Rollup 表只被批处理 upsert，`request_results` / `target_attempts` 只增不删（Rollup 不删事实）
 
 ### call_logs 保留与轮转
-- 旧接口查询面恒读 `call_logs_hot`（`query_stats` / `query_logs` / `count_logs` / `query_cache_stats` / `query_trend`）；`call_logs_all` 不接任何 HTTP 接口
+- 诊断接口查询面恒读 `call_logs_hot`（`query_stats` / `query_logs` / `count_logs`，0008 起删除 `query_cache_stats` / `query_trend`）；`call_logs_all` 不接任何 HTTP 接口
 - 写入恒为 `INSERT INTO call_logs`（轮转实现不改写入 SQL；`insert_batch` 只加 `with_schema_retry` 容错）
 - 轮转是单事务 6 步纯 DDL（`BEGIN IMMEDIATE`），任一步失败整轮回滚；事务内 ⓪ 先 DROP 两视图、⑥ 再同事务重建（不依赖 `RENAME` 隐式改写视图引用这条 SQLite ≥ 3.25 语义）
 - **先 DROP 冷表索引、后回放 DDL**：顺序反转会让 `CREATE INDEX IF NOT EXISTS` 被冷表占用名字而静默跳过 → 新热表 0 索引
@@ -746,7 +772,8 @@ COMMIT
 - 未来对 `call_logs` 的迁移不得 `DROP TABLE call_logs`、不得改表名——两个视图与全部冷表的引用链都锚在 `call_logs` 这个名字上；`ALTER TABLE call_logs ADD COLUMN` 照旧安全（下次轮转捕获的 DDL 自然带上新列，冷表保持诞生时快照形状）
 
 ### API
-- 旧 `/v1/analytics/*` 与 `/api/logs` 接口签名与行为不变
+- 诊断端点只剩 `/v1/analytics/stats` 与 `/api/logs`，签名与行为不变；`/v1/analytics/{cache,trend,distribution}` 恒 404（不保留 410 / 301 壳）
+- 诊断口径与分析口径（`/v1/analytics/v2/*`）数字**不承诺可对比**，详见「两套口径契约分层」
 - `scope` 取值 ∈ `route|target`，默认 `route`；`from`/`to` 必填
 - route 视角查询不出现 `provider` / `actual_model` 过滤参数
 - 分组 key 用 `route_name` 或 `(provider, real_model)`，不用 UUID
@@ -774,7 +801,7 @@ COMMIT
 - 配置面：`DEFAULT_CALL_LOG_RETENTION_DAYS`（`sag-config` 导出）为默认值，`MAX_CALL_LOG_RETENTION_DAYS = 3650`（gateway 侧钳制，`debug!` 记录）
 - 关停：rollup 与 rotation 两个 scheduler handle 均提供 `shutdown_with_timeout`（join 超时即 abort task）
 - 单元（`sag-analytics/src/sqlite_store.rs`）：打开路径建出两视图、无冷表时视图与热表读一致、全史兜底；`with_schema_retry` 恰好重试一次且不重试非 schema 错误
-- 集成（`sag-analytics/tests/call_logs_rotation.rs`，文件库 + 共享池）：启动积压首轮即轮转、轮转期间并发写入零丢失、查询侧永不见缺失 / 过期视图、`retention=0` 与热重载、轮转后旧统计的热窗口语义
+- 集成（`sag-analytics/tests/call_logs_rotation.rs`，文件库 + 共享池）：启动积压首轮即轮转、轮转期间并发写入零丢失、查询侧永不见缺失 / 过期视图、`retention=0` 与热重载、轮转后诊断口径的热窗口语义（0008 起以 `query_stats` / `call_logs_hot` 直查断言）
 - gate（`sag-gateway/src/main.rs`）：`rotation_scheduler_shuts_down_before_event_drain` — 接线点在 rollup 之后、event drain 之前，join 成功时 shutdown 后 in-flight DDL 事务已结束（join 超时则 task 被 abort、其事务回滚，drain 可能与该回滚短暂并发）
 
 ### 关键场景
@@ -796,6 +823,8 @@ COMMIT
 15. **200 状态内上游错误**：SSE data frame / 200 body 顶层 `error` 对象被识别为上游错误——流式进入 `stream_error_after_commit` 失败路径（错误帧仍透传）；非流式记为失败尝试并 failover，全耗尽保持标准错误 envelope 并保留消息；限流特征（数字 code 429 或 code/message 含 rate limit/burst/flow/quota）→ `failure_reason=rate_limited`，否则 `provider_error`。
 
 ## 变更记录
+
+- [0008 退役旧分析端点，固化两套口径契约分层](changes/0008-retire-legacy-analytics-endpoints.md)
 
 - [0007 call_logs 保留窗口 + 表轮转（热窗口视图）](changes/0007-call-log-retention-rotation.md)
 - [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)

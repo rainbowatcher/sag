@@ -106,20 +106,70 @@ COMMIT;
 - ISO 8601 格式的 `TEXT`（如 `"2025-01-01T00:00:00Z"`）通过 `strftime('%s')` 转为秒后乘 1000
 - 无法解析的值会违反 `NOT NULL` 约束，事务自动回滚
 
-## 统计接口
+## 诊断接口
 
-`GET /v1/analytics/stats` 返回聚合的使用统计数据：
+读 `call_logs` 明细的 HTTP 面只剩两个端点，它们都是**诊断面**（人工排错用），不是分析面：
+
+| 端点 | 返回 | 口径 |
+|---|---|---|
+| `GET /v1/analytics/stats` | 按 `(provider, model, real_model)` 分组的聚合行 | 热窗口 · 近似 |
+| `GET /api/logs` | 明细分页（`{"data": [CallLog...], "total": n}`，`offset` / `limit` 默认 50，支持 `provider` / `model` / `real_model` / `status_code` 过滤） | 热窗口 · 可丢行 |
+
+### GET /v1/analytics/stats
+
+查询参数 `provider`、`model`、`real_model` 均可选（空串视同未传）。响应是 `data` 数组，**每组一行**：
 
 ```json
 {
-  "total_calls": 1234,
-  "total_tokens": 50000,
-  "total_duration_ms": 120000,
-  "error_rate": 0.02,
-  "by_provider": { ... },
-  "by_model": { ... }
+  "data": [
+    {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "real_model": "gpt-4o-2024-08-06",
+      "call_count": 100,
+      "total_prompt_tokens": 5000,
+      "total_completion_tokens": 3000,
+      "total_tokens": 8000,
+      "avg_duration_ms": 1200.5,
+      "error_count": 2
+    }
+  ]
 }
 ```
+
+无数据时 `data` 为空数组。前端**不再调用**此端点（分析页全部走 `/v1/analytics/v2/*`），保留它是给 `curl` / 脚本排错用的。
+
+已知不精确性（**不修**，属诊断口径本身）：
+
+- Token / 缓存列为 `NULL` 时按 `0` 计入求和（`COALESCE(SUM(...), 0)`），无法区分「未知」与「零」。
+- `error_count` 以 `error` 文本非空为准，不是最终状态分类：`client_error` / `no_route` / `all_disabled` / `client_cancelled` 没有分母剔除规则，不能当失败率用。
+- 一行 = 一条 `call_logs` 行；一请求多行（重试 / fallback / 取消流）就多行。
+- 写入链路可丢弃（`try_send` 队列满即丢），统计可能比实际请求少。
+- 只覆盖热窗口，且**随时间变化**（见下文「保留窗口与冷热轮转」）。
+
+## 诊断口径 vs 分析口径
+
+SAG 有两套互不兼容的数字口径。**它们对不上是预期行为，不是 bug。**
+
+| 维度 | 诊断口径（`/v1/analytics/stats`、`/api/logs`） | 分析口径（`/v1/analytics/v2/summary\|trend`） |
+|---|---|---|
+| 数据源 | `call_logs_hot`（明细） | `request_results` / `target_attempts`（+ 1h Rollup） |
+| 写入 | 可丢弃（队列满即丢） | 不丢弃（背压 + 关停排空 + 单请求原子） |
+| 时间覆盖 | 热窗口（默认 90 天），随每日轮转缩水 | 全历史 |
+| 计数 | 一行 = 一条日志行 | route 级一请求一条、target 级一尝试一条 |
+| `NULL` | 当 `0` | 未知，单独计数，不进请求命中率分母 |
+| 失败率 | `error_count / call_count`，无分母剔除 | 按最终状态分类，分母明确 |
+| 稳定性 | 同一查询跨日期可能不同 | 同一区间稳定可复现 |
+| 适合 | 看错误文本、TTFT、丢包摘要、逐条时间线 | 验收 / 报表：失败率、延迟分位、Token 与缓存命中率 |
+
+选端点的简单规则：
+
+- 要**验收数字**（成功率、P95、缓存命中率）→ `/v1/analytics/v2/summary` / `/v1/analytics/v2/trend`。
+- 要**按时间看趋势** → `v2/trend`（自定义桶宽）；旧 `GET /v1/analytics/trend` 已下线。
+- 要**按 provider / real_model 看分布与占比** → `v2/summary?scope=target` 的 `groups`；旧 `GET /v1/analytics/distribution`、`GET /v1/analytics/cache` 已下线。
+- 要**看一条请求到底错在哪**（上游错误文本、TTFT、丢包摘要）→ `/api/logs`，或在库里查 `call_logs_all`。
+
+跨口径 / 跨冷热表追溯只能用 `request_id`（UUID v4，全局唯一）：`call_logs.id` 在每次轮转后从 1 重置，不能做关联键。
 
 ## 保留窗口与冷热轮转
 
@@ -135,7 +185,7 @@ COMMIT;
 
 | 视图 | 内容 | 用途 |
 |---|---|---|
-| `call_logs_hot` | 热表 + 仍有窗内行的冷表，每个分支都带 `WHERE timestamp >= cutoff` | 旧接口（`/api/logs`、`/v1/analytics/*`）的查询面 |
+| `call_logs_hot` | 热表 + 仍有窗内行的冷表，每个分支都带 `WHERE timestamp >= cutoff` | 诊断接口（`/api/logs`、`/v1/analytics/stats`）的查询面 |
 | `call_logs_all` | 热表 + 全部冷表，无时间过滤 | 历史明细 SQL 查询（不接 HTTP 接口） |
 
 两个视图由 gateway 自动维护（启动时、每日巡检、每次轮转后重建），**不要手工 `DROP VIEW` / `CREATE VIEW`**。`call_log_retention_days = 0` 时两个视图都覆盖全史，与启用前语义一致。

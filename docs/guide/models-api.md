@@ -203,7 +203,7 @@ OpenAI envelope（`/v1/chat/completions`、`/v1/responses`、`/v1/models`）：
 
 ## GET /v1/analytics/stats
 
-聚合使用统计，支持按供应商 / 模型过滤。查询参数：`provider`、`model`、`real_model`（均可选）。
+聚合使用统计（**诊断口径**：热窗口 + 近似），支持按供应商 / 模型过滤。查询参数：`provider`、`model`、`real_model`（均可选）。响应按 `(provider, model, real_model)` 分组，每组一行：
 
 ```json
 {
@@ -211,6 +211,7 @@ OpenAI envelope（`/v1/chat/completions`、`/v1/responses`、`/v1/models`）：
     {
       "provider": "openai",
       "model": "gpt-4o",
+      "real_model": "gpt-4o-2024-08-06",
       "call_count": 100,
       "total_prompt_tokens": 5000,
       "total_completion_tokens": 3000,
@@ -222,4 +223,6 @@ OpenAI envelope（`/v1/chat/completions`、`/v1/responses`、`/v1/models`）：
 }
 ```
 
-另有 `/v1/analytics/trend`、`/v1/analytics/distribution`、`/v1/analytics/v2/*` 等端点，详见[分析](/guide/analytics)。
+该端点读 `call_logs_hot`（热窗口明细），`NULL` Token 当 `0`，写入可丢行，因此**与 `/v1/analytics/v2/*` 的数字不可对比**（对不上是预期行为）。需要验收口径请直接用 v2，详见[分析 → 诊断口径 vs 分析口径](/guide/analytics#诊断口径-vs-分析口径)。
+
+统计 / 趋势 / 分布分析请用 `/v1/analytics/v2/summary` 与 `/v1/analytics/v2/trend`（`scope=route|target`）；旧 `GET /v1/analytics/trend`、`/v1/analytics/distribution`、`/v1/analytics/cache` 已下线，详见[分析](/guide/analytics)。
