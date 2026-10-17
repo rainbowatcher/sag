@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-10-15
+updated: 2026-10-17
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-10-17
+
+- **分析**：[0007 call_logs 保留窗口 + 表轮转（热窗口视图）](analytics/changes/0007-call-log-retention-rotation.md) — 整表轮转为冷表 `call_logs_arch_*`，`call_logs_hot`/`call_logs_all` 视图承接热窗口与全史查询。
 
 ## 2026-10-15
 

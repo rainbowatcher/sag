@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-08-11
+updated: 2026-10-17
 ---
 
 # 分析
@@ -126,6 +126,21 @@ updated: 2026-08-11
 - route 级、target 级与延迟直方图属于同一小时桶时，必须**原子提交**（同桶全部成功或全部不成功）。
 - Rollup 只加速查询，**不得删除**事实明细。
 
+### 保留与轮转
+
+- `call_logs` 明细必须**保留窗口语义**：`call_log_retention_days`（默认 90 天）内的数据是**热窗口**，旧日志接口（`/api/logs`）与旧统计接口（`/v1/analytics/*`）只覆盖热窗口。
+- 窗口是 **UTC 滚动窗口**，不是日历月/日历日：`cutoff = now - retention_days × 24h`，随每日维护轮推进。
+- 超窗数据必须**保留在同库冷表**（`call_logs_arch_<UTC yyyyMMdd_HHmmss>`）中，并通过 `call_logs_all` 视图提供**全史 SQL 查询**；冷表不接任何 HTTP 接口。
+- 轮转以**整表为单位**（表轮转，非行级搬运）：单事务纯 DDL（RENAME 热表 → 冷表索引退役 → 原样回放捕获的 DDL 重建空热表 → 重建视图），无行级数据路径，失败整轮回滚。
+- **冷表只增不改**：冷表是轮转当天的 schema 快照，不得 ALTER / 插入 / 更新 / 删除 / 改名；唯一允许的写是索引退役的 `DROP INDEX`。冷表缺的列由视图以 `NULL` 补齐，查询面看到的永远是热表当前形状。
+- **旧统计结果随时间变化**：`query_stats` / `query_cache_stats` / `query_trend` 等含 `from < cutoff` 的查询，在超窗数据退出视图后结果会改变（旧区间 bucket 清零、`total` 递减、趋势图断崖）。同一查询在不同日期可能返回不同数值，不得当作稳定的历史统计值。长程统计以两级事实 + Rollup 为准。
+- `/api/logs` 的翻页 `offset` 在轮转发生时可能漂移（低危 UX 瑕疵，不修）。
+- **`id` 只在单表内唯一**：每次轮转后新热表的 `id` 从 1 重新开始；跨表追溯必须使用 `request_id`。
+- 已核实**无任何 JOIN 消费方**（facts / Rollup 链路不读 `call_logs`），也**没有按 `id` / `request_id` 查单条的端点**，因此轮转不影响其余链路。
+- 索引退役：冷表出生即无索引；对已退出窗口的冷表，其索引必须被回收（幂等巡检，窗内冷表的索引不碰）。
+- `call_log_retention_days` 语义：**0 = 禁用**（不轮转、不退役索引、视图覆盖全史），不是「保留 0 天」；`[analytics]` 段缺失时回退默认 90；配置每轮热读取，热重载在下一轮生效。
+- 维护任务（轮转 / 索引退役 / 视图重建）**永不 panic、永不让 gateway 启动失败**：DB 错误告警后下轮重试；且必须在正常关闭时先于分析事件排空停妥。
+
 ### API 与 UI
 
 - 保留旧分析接口与旧日志接口，行为与数据源不变（按旧明细聚合）。
@@ -141,6 +156,7 @@ updated: 2026-08-11
 [analytics]
 enabled = true
 storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
+call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 禁用（不是"保留 0 天"）
 ```
 
 相对 `sqlite://` 路径在启动时锚定到 `$XDG_DATA_HOME/sag`（XDG Base Directory 标准，默认 `~/.local/share/sag/analytics.db`）；绝对路径与 `:memory:` 原样使用。
@@ -149,7 +165,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 兼容性说明（迁移前现状）
 
-- 旧 `call_logs` 可能一条请求对应多行记录；旧 `/v1/analytics/*` 接口按旧明细聚合，保持兼容，不迁移为两级事实口径。
+- 旧 `call_logs` 可能一条请求对应多行记录；旧 `/v1/analytics/*` 接口按旧明细聚合，保持兼容，不迁移为两级事实口径（0007 起其数据源为 `call_logs_hot` 视图，只覆盖热窗口，见「保留与轮转」）。
 - 旧 call_logs 写入链路保留“可丢弃”诊断语义：可能丢弃诊断事件，不承诺背压或原子性。
 - 旧 call_logs 的落库路径并入与正式分析共享的连接池（`SqliteLogStore::from_pool` / `CallLogCollector::new_shared`）：store 自身不关闭共享 pool，旧链路的批量插入与正式写事务共用 WAL + `BEGIN IMMEDIATE` 的并发安全设置。
 - 旧历史不强行回填 route/target 身份，旧记录中的身份字段为空。
@@ -184,6 +200,7 @@ storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 
 ## 变更记录
 
+- [0007 call_logs 保留窗口 + 表轮转（热窗口视图）](changes/0007-call-log-retention-rotation.md)
 - [0006 相对 sqlite:// DSN 锚定 XDG 数据目录 + create_if_missing 修复](../config/changes/0006-xdg-base-directories.md)
 - [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)
 - [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)

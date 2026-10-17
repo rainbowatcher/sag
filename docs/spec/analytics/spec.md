@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-08-11
+updated: 2026-10-17
 ---
 
 # 分析 — 规格
@@ -26,12 +26,14 @@ updated: 2026-08-11
 
 - [sag-analytics/src/lib.rs](../../../sag-analytics/src/lib.rs) — `CallLogCollector` 等公共导出（现状）
 - [sag-analytics/src/store.rs](../../../sag-analytics/src/store.rs) — `LogStore` trait：`insert_batch` / `query_stats` / `query_logs` / `query_cache_stats` / `query_trend` / `query_distribution`（现状）
-- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、旧统计/趋势/分布查询、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭）
+- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、旧统计/趋势/分布查询、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭；0007 起 5 个查询方法改读 `call_logs_hot` 视图并包 `with_schema_retry`，`new` / `from_pool` 在 `ensure_schema_consistency` 之后追加 `refresh_views(pool, None)`）
+- [sag-analytics/src/rotate.rs](../../../sag-analytics/src/rotate.rs) — 保留窗口与冷热轮转（0007 新增）：`rotate_once`（探测 + 单事务 6 步 DDL 捕获回放）、`refresh_views` / `build_views_in_tx`（两视图构建）、`retire_indexes`（索引退役巡检）、`unique_archive_name`、`is_schema_change`、`assert_replay_faithful`；常量 `HOT_TABLE` / `HOT_VIEW` / `ALL_VIEW` / `ARCH_PREFIX`
 - [sag-analytics/src/collector.rs](../../../sag-analytics/src/collector.rs) — `CallLogCollector`：bounded mpsc + 后台写入 + `try_send` 丢弃语义（现状，可丢弃链路；0005 起新增 `new_shared(pool)` 共享池构造）
 - [sag-analytics/migrations/](../../../sag-analytics/migrations/) — `call_logs` schema 迁移（现状，`.sqlite.sql` 后缀约定）
 - [sag-router/src/handlers/mod.rs](../../../sag-router/src/handlers/mod.rs) — 旧 `/v1/analytics/stats|trend|distribution|cache` 处理器（现状）
 - [sag-admin/src/admin_logs.rs](../../../sag-admin/src/admin_logs.rs) — 旧 `/api/logs` 日志接口（现状）
 - [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) / [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — 旧统计页面与 store（现状）
+- [sag-gateway/src/main.rs](../../../sag-gateway/src/main.rs) — 维护任务接线：`spawn_rotation_scheduler` / `rotation_round` / `RotationSchedulerHandle`（0007 新增，在 rollup 旁 spawn，graceful shutdown 位于 rollup 之后、event drain 之前）
 
 ### 身份注册表与事实写入（目标实现，阶段 1）
 
@@ -513,6 +515,47 @@ stateDiagram-v2
 - **UUID 不暴露**：分组 key 一律用 `route_name` 或 `(provider, real_model)`，响应中不含 `route_id` / `target_id`。
 - UI（`sag-ui/src/pages/AnalyticsPage.vue` + `stores/analytics.ts` 扩展）：scope 切换、缓存命中率区分 unknown/未命中显示、`low_sample` 徽标、趋势 Top20+others 图例。
 
+### call_logs 保留窗口与冷热轮转（已实现，0007）
+
+`call_logs` 是 append-only 诊断明细，此前无任何保留机制。0007 起引入 UTC 滚动保留窗口：窗口内数据留在热表，超窗数据以**同库冷表**留下，查询面用两个视图维持「近 N 天可见 + 全史可 SQL 查」。
+
+| 对象 | 形态 | 角色 |
+| --- | --- | --- |
+| `call_logs` | 真实表（28 列 + 5 个标准索引） | 写入目标恒为它；轮转时整表改名为冷表，随后由原样回放 DDL 重建一张同形的空表 |
+| `call_logs_arch_<UTC yyyyMMdd_HHmmss>` | 真实表（出生即零索引） | 一次轮转搬走的「约 retention 天量」历史批次，只增不改 |
+| `call_logs_hot` | 视图 | 旧接口查询面：热表 + 窗内冷表，逐分支收窗 |
+| `call_logs_all` | 视图 | 历史分析面：热表 + 全部冷表全部行，不接任何 HTTP 接口 |
+
+轮转 = 单事务纯 DDL（`pool.begin_with("BEGIN IMMEDIATE")`），无行级数据路径：
+
+```
+⓪ DROP VIEW IF EXISTS call_logs_hot / call_logs_all
+① 捕获 sqlite_master 里的 table DDL + 全部 index DDL（此刻原文仍引用 call_logs）
+② ALTER TABLE call_logs RENAME TO "call_logs_arch_<ts>"
+③ DROP 冷表从 ② 继承来的全部索引（释放原名，索引名是 schema 全局命名空间）
+④ 原样回放 ① 捕获的 DDL（重建空 call_logs + 5 个标准索引）
+⑤ assert_replay_faithful：列形状 / 索引集合 / 冷表零索引，任一不符整事务回滚
+⑥ build_views_in_tx(Some(cutoff))：同一事务内重建两个视图
+COMMIT
+```
+
+调度（`sag-gateway/src/main.rs`）：`ROTATION_INTERVAL = 24h` + `MissedTickBehavior::Skip`，**spawn 后第一动作是完整一轮**（不等 tick）。每轮现读配置算 `cutoff_ms = now_ms - call_log_retention_days × 86_400_000`，`SELECT MIN(timestamp) FROM call_logs` 小于 cutoff 才真正轮转；`call_log_retention_days == 0` 整轮直接 return（不轮转、不退役、不收窗）。每轮顺序恒为 `retire_indexes` → `rotate_once` → `refresh_views`：`refresh_views` 无条件跑（未轮转的轮次靠它推进视图里的 cutoff 字面量，这正是「每日重建」的原因）；轮转失败则提前返回（视图未被破坏，下轮重试）。DB 错误一律 warn + 下轮重试，永不 panic / 永不让 gateway 启动失败。
+
+视图语义（共用 `build_views_in_tx(tx, Option<i64>)` 构建器）：
+
+- `call_logs_hot`：成员 = `call_logs`（恒为第一分支）+ `MAX(timestamp) >= cutoff` 的冷表（按表名降序）。成员判定用 `MAX`（宽，不漏掉部分过窗表里窗内的那部分），行过滤用 `timestamp >= <cutoff>`（准，字面量内联——视图不能绑参数），**每个分支都带过滤**（含热表分支，热表里也可能有旧行）。
+- `call_logs_all`：热表 + **全部**冷表，不带时间过滤。
+- 列形状的唯一真相是热表 `pragma_table_info` 的 cid 序；冷表缺的列写 `NULL AS "<col>"`，多出的列忽略。热表必须排第一——视图列名取第一分支的真实列名。
+- `cutoff = None`（`call_log_retention_days == 0`）时两视图同构：成员 = 全部表、无过滤，即「全史可见」，与启用前语义一致。
+- 换视图原子：轮转事务内 ⓪ DROP → ⑥ CREATE；独立 `refresh_views` 自己开 `BEGIN IMMEDIATE` → DROP → CREATE → commit。WAL 下读者要么看到旧视图、要么看到新视图，**不存在「视图缺失」或「视图漏掉刚轮转数据」的窗口**。
+
+两个维护子过程：
+
+- 索引退役 `retire_indexes(pool, cutoff)`：契约是「对 `MAX(timestamp) < cutoff` 的冷表 DROP 其全部索引，窗内冷表的索引一概不碰」，实现为枚举 `sqlite_master` 里 `tbl_name` 为冷表的全部 index 的通用巡检，幂等，返回本轮 drop 数。由于 ③ 让冷表生而无索引，稳态下它是幂等 no-op；契约保留是为了不把「只 DROP 那 5 个名字」写死。
+- 语句缓存容错 `with_schema_retry`：DDL 提升 schema cookie 后，连接上缓存过的 prepared statement 可能报 `database schema has changed`（`SQLITE_SCHEMA`，多连接池下尤其——DML 在连接 A、DDL 在连接 B）。查询层 5 个方法 + `insert_batch` 都包这层 retry（**只重试一次**），仍失败则上抛（HTTP 500），不 panic。
+
+职责切分：`ensure_schema_consistency` 只对热表补列；`refresh_views` / `build_views_in_tx` 只读 pragma 建视图（不 ALTER 任何表）；`rotate_once` 只做 DDL 捕获回放（不补列——回放文本已含全部列）；冷表是轮转当天的 schema 快照，谁也不补它，列差异一律由视图 `NULL AS` 消化。store 打开顺序不可颠倒：`migrate` → `ensure_schema_consistency`（先补列）→ `refresh_views(pool, None)`（后取 pragma 建视图），否则视图会把补列前的形状烘死。启动路径的 `refresh_views(pool, None)` 只兜底视图存在性（全史形状是正确窗口的**超集**：只会多看到历史，不会丢行、不报错），窗口正确性由 spawn 后立即跑的首轮调度轮负责，亚秒级收敛。
+
 ## 关键决策
 
 ### UUID 只存在 DB，不写 TOML
@@ -613,6 +656,34 @@ stateDiagram-v2
 - ✅ 固定稀疏对数桶（1ms 起 1.01 倍，0 单独成桶，overflow 兜底，NULL 不入桶）：表行数有界、可直接 SQL 累计求分位、桶内误差约 1% 贴合「约 1% 值误差」目标、明细与 Rollup 同构可合并。
 - ❌ 放弃「JSON 存全部样本」（膨胀且不可 SQL 查询）与「t-digest」（引入外部依赖、合并与序列化复杂、误差特性不透明）。
 
+### call_logs 用表轮转（DDL），不用行级搬运或外部归档
+
+**背景**：`call_logs` 是 append-only 明细且无保留期，主库文件随行数单调膨胀；用户要求超窗数据仍保留可 SQL 查询的参考价值，不接受「直接 DELETE」，也不接受「外部归档文件」。已核实消费方只有单表分页（`/api/logs`）与单表聚合（旧 `/v1/analytics/*`），无任何 JOIN 消费方、无按 `id` / `request_id` 查单条的端点。
+
+**Trade-off**（整表轮转 vs 行级搬运 vs 外部归档）：
+- ✅ **表轮转是纯 DDL**：整表改名 + 空表重建，零行级数据路径。因此 ① 不需要维护行映射（`RETURNING` 列清单与 `INSERT` 列清单同源）② 不需要绕 SQLite 绑定参数上限（5000 行 × 28 列分片）③ 不需要处理冷热两表 `id` 空间冲突 ④ **不背上「双表 schema 永久同步」义务**——加列不用改轮转代码。换来的是毫秒级写锁窗口（v2 批搬运的大锁窗口随机制消失）。
+- ✅ **同库冷表**：历史数据可直接 SQL 查（`call_logs_all`），运维零额外工具；未来空间真成问题时仍可降级为外部归档（整表导出后 DROP），反向不成立。
+- ❌ 放弃「直接 `DELETE`」（丢历史）、「JSONL.zst 月度归档文件」（每次分析要解压 + 写脚本）、「独立 SQLite 月度文件」（多文件 + 每连接 `ATTACH` 重放）、「`call_logs_daily` 摘要表」（与 facts + Rollup 在长程统计上重复建设）、「`DELETE … RETURNING` 行级搬运」（上述 ①②③④ 的代价全部由这个动作本身带来，而收益只有「逐行精确的窗口边界」，消费方画像显示收益很小）。
+- ❌ 接受「冷表是约 90 天粒度的批次而非日表」与「主库文件缓慢增长」（冷表零索引约 200B/行，几十 MB/年）：一次轮转搬走整个热表 ≈ retention 天的量，日常轮次的职责是推进视图 cutoff + 索引退役巡检。若未来需要更细粒度，改触发条件即可，机制不变——本期不做。
+
+### 事前捕获 + 原样回放，不做 DDL 字符串替换
+
+**背景**：重建热表需要「同一个 `CREATE TABLE` / `CREATE INDEX` 文本」，而捕获到的原文引用的是表名 `call_logs`，重建后表名恰好也叫 `call_logs`。
+
+**Trade-off**:
+- ✅ **零字符串替换**：捕获时 DDL 原文引用的表名本来就是 `call_logs`，回放恰好重建同名新表，实现里没有任何 `replace` 调用，也就不存在误伤 `idx_call_logs_ts` 之类 token 的可能。
+- ✅ **列真相只有 `sqlite_master`**：SQLite 的 `ALTER TABLE … ADD COLUMN` 会改写 `sqlite_master.sql` 里存的建表文本，所以捕获到的 DDL 恒等于当前 28 列全集（含后加列），「加列不用改轮转代码」由此成立；`AUTOINCREMENT` / `NOT NULL` / `DEFAULT` / `PRIMARY KEY` 原样保留（`call_logs` 无外键、无 CHECK、无触发器，回放无连带对象）。
+- ✅ **保真校验是第二道防线**：⑤ 校验列形状 + 热表索引集合 == 捕获集合 + 冷表零索引，任一不符整轮回滚 + warn，因此顺序回归或外来同名索引不会静默上线，只会让轮转失败并下轮重试。
+- ❌ 放弃「按名字做 DDL 字符串替换 / 手写一份建表语句」：前者制造误伤 token 的风险，后者让加列变成双处改且与迁移漂移。
+
+### 冷表出生即退役索引（接受冷表分支全扫）
+
+**背景**：索引名是 schema 全局命名空间。`RENAME` 后冷表仍持有 `idx_call_logs_ts` 等 5 个原名索引，此时若先回放 `CREATE INDEX IF NOT EXISTS idx_call_logs_ts ON call_logs(…)`，SQLite 发现名字已存在会**静默跳过**（不报错）→ 新热表 0 索引。因此在「原样回放」约束下「冷表保留原名索引」物理不可能。
+
+**Trade-off**:
+- ✅ **先 ③ DROP 冷表全部索引、再 ④ 回放**，名字释放后热表索引集合与捕获集合恒等，冷表零索引。代价是 `/api/logs` 的 `UNION ALL` 展开里冷表分支走全表扫描（复合查询 + `ORDER BY … LIMIT` 不会把 LIMIT 下推到分支）：稳态视图 ≈ 6 万行、轮转切换期最多 10–12 万行，扫描 + 排序约 10–30ms，对人工点页的管理后台可接受。
+- ❌ 放弃「冷表派生名索引」（`call_logs_arch_<ts>_ts` 之类）：需要结构化提取捕获索引 DDL 的列表达式，且名字必须避开 5 个标准名，否则下一次轮转回放时名字已被占用 → 保真校验反复拦下轮转。本期不做，仅作为文档化的性能逃生舱。
+
 ## 不变式
 
 可直接 grep 验证（关键字为代码/schema 中应出现的字面量）：
@@ -658,6 +729,22 @@ stateDiagram-v2
 - 三张 Rollup 表均含 `cached_known_count` / `cached_hit_count` / `prompt_tokens_cached_known` 列；`cached_known_count >= cached_hit_count`；Token 命中率分子分母 = `cached_tokens` 之和 / `prompt_tokens` 之和（全部成功样本）
 - Rollup 表只被批处理 upsert，`request_results` / `target_attempts` 只增不删（Rollup 不删事实）
 
+### call_logs 保留与轮转
+- 旧接口查询面恒读 `call_logs_hot`（`query_stats` / `query_logs` / `count_logs` / `query_cache_stats` / `query_trend`）；`call_logs_all` 不接任何 HTTP 接口
+- 写入恒为 `INSERT INTO call_logs`（轮转实现不改写入 SQL；`insert_batch` 只加 `with_schema_retry` 容错）
+- 轮转是单事务 6 步纯 DDL（`BEGIN IMMEDIATE`），任一步失败整轮回滚；事务内 ⓪ 先 DROP 两视图、⑥ 再同事务重建（不依赖 `RENAME` 隐式改写视图引用这条 SQLite ≥ 3.25 语义）
+- **先 DROP 冷表索引、后回放 DDL**：顺序反转会让 `CREATE INDEX IF NOT EXISTS` 被冷表占用名字而静默跳过 → 新热表 0 索引
+- 回放保真：新热表列 `(cid,name,type,notnull,dflt_value,pk)` == 冷表同列表；热表索引集合 == 捕获集合；**冷表 0 索引**
+- 冷表名恒匹配 `call_logs_arch_<yyyyMMdd_HHmmss>`（同秒冲突加 `_N`）；命名与成员枚举共用同一 `ARCH_PREFIX` 常量，插值标识符一律 `quote_ident` 双引号引用
+- 冷表只增不改：唯一允许的写是索引退役的 `DROP INDEX`
+- 视图列集合 == 热表 `pragma_table_info` 的 cid 序；冷表缺列写 `NULL AS`；热表恒为第一分支（视图列名来源）
+- `call_logs_hot` 的**每个分支**都带 `WHERE timestamp >= <cutoff 字面量>`（含热表分支）；`call_logs_all` 无时间过滤
+- `cutoff = None` ⇔ `call_log_retention_days == 0` ⇔ 两视图成员为全部表、无过滤（0 = 功能关闭，不是「保留 0 天」）
+- 任何改动热表列集合的操作之后必须重建视图（store 打开顺序 `migrate` → `ensure_schema_consistency` → `refresh_views` 不可颠倒；轮转路径的回放文本已含全部列 + 事务内 ⑥ 步重建）
+- 维护任务（轮转 / 索引退役 / 视图重建）DB 错误 warn + 下轮重试，永不 panic / 永不让 gateway 启动失败
+- shutdown 顺序：rollup → rotation → event drain（**join 成功时**保证 in-flight DDL 事务已结束、drain 仍是最后一个写库者；join 超时则 task 被 abort、其事务回滚，drain 可能与该回滚短暂并发，记 error 日志）
+- 未来对 `call_logs` 的迁移不得 `DROP TABLE call_logs`、不得改表名——两个视图与全部冷表的引用链都锚在 `call_logs` 这个名字上；`ALTER TABLE call_logs ADD COLUMN` 照旧安全（下次轮转捕获的 DDL 自然带上新列，冷表保持诞生时快照形状）
+
 ### API
 - 旧 `/v1/analytics/*` 与 `/api/logs` 接口签名与行为不变
 - `scope` 取值 ∈ `route|target`，默认 `route`；`from`/`to` 必填
@@ -680,6 +767,13 @@ stateDiagram-v2
 - `sag-analytics/tests/facts_regression.rs` — 端到端：emit → 落库 → 查询 → Rollup 对照
 - `sag-dispatch/tests/` — dispatch 完整生命周期产生正确事件全集
 
+### call_logs 保留与轮转（已实现，0007）
+
+- 单元（`sag-analytics/src/rotate.rs`，`:memory:`）：跳过触发（空表 / 全在窗内不出冷表）、整表搬运 + `id` 每表重置、回放保真（列形状逐项相等 / 热表索引集合相等 / 冷表 0 索引）、失败整事务回滚、同秒命名去重、缺列按热表 cid 序 `NULL AS` 补齐、成员判定 + 行窗口（部分过窗冷表只出窗内行）、`None` / `retention=0` 语义、索引退役两侧契约 + 幂等、语句缓存失效后同一查询仍成功（`is_schema_change` 正反例）、refresh 幂等
+- 单元（`sag-analytics/src/sqlite_store.rs`）：打开路径建出两视图、无冷表时视图与热表读一致、全史兜底；`with_schema_retry` 恰好重试一次且不重试非 schema 错误
+- 集成（`sag-analytics/tests/call_logs_rotation.rs`，文件库 + 共享池）：启动积压首轮即轮转、轮转期间并发写入零丢失、查询侧永不见缺失 / 过期视图、`retention=0` 与热重载、轮转后旧统计的热窗口语义
+- gate（`sag-gateway/src/main.rs`）：`rotation_scheduler_shuts_down_before_event_drain` — 接线点在 rollup 之后、event drain 之前，join 成功时 shutdown 后 in-flight DDL 事务已结束（join 超时则 task 被 abort、其事务回滚，drain 可能与该回滚短暂并发）
+
 ### 关键场景
 
 1. **直接成功**：单 target 成功 → `request_results` 一条 `success` + `target_attempts` 一条 `success`，Token/延迟有值。
@@ -700,6 +794,7 @@ stateDiagram-v2
 
 ## 变更记录
 
+- [0007 call_logs 保留窗口 + 表轮转（热窗口视图）](changes/0007-call-log-retention-rotation.md)
 - [0006 200 状态内上游错误识别 + 取消流写 call_logs](changes/0006-upstream-error-in-200-and-cancelled-call-logs.md)
 - [0005 共享 SQLite 连接池 + WAL / BEGIN IMMEDIATE 锁修复](changes/0005-shared-pool-lock-fix.md)
 - [0004 Token 命中率分母改为全部成功样本](changes/0004-token-cache-hit-rate-all-success.md)
