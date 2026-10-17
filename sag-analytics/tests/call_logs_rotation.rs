@@ -21,7 +21,7 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use sag_analytics::{
     ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, LogFilter, LogStore, RoundOutcome, SqliteLogStore,
-    SqlitePool, StatsFilter, TrendFilter, open_analytics_pool, refresh_views, run_rotation_round,
+    SqlitePool, StatsFilter, open_analytics_pool, refresh_views, run_rotation_round,
 };
 use sag_core::{CallLog, Usage};
 use uuid::Uuid;
@@ -574,23 +574,18 @@ async fn hot_window_semantics_of_legacy_stats_after_rotation() {
         "old buckets read zero after rotation (hot-window semantics)"
     );
 
-    // The trend query only returns in-window buckets.
+    // A range query spanning the rotated-out period also counts only the
+    // hot window.
     let window_start = now_ms() - RETENTION_DAYS as i64 * DAY_MS;
-    let trend = store
-        .query_trend(TrendFilter {
-            provider: None,
-            bucket_seconds: 86_400,
-            from: Utc.timestamp_millis_opt(now - 400 * DAY_MS).unwrap(),
-            to: None,
+    let range = store
+        .query_stats(StatsFilter {
+            from: Some(Utc.timestamp_millis_opt(now - 400 * DAY_MS).unwrap()),
+            ..Default::default()
         })
         .await
         .unwrap();
-    let trend_total: i64 = trend.iter().map(|row| row.call_count).sum();
-    assert_eq!(trend_total, 5, "trend counts only the hot window");
-    assert!(
-        trend.iter().all(|row| row.bucket >= window_start - DAY_MS),
-        "no bucket older than the window may survive: {trend:?}"
-    );
+    let range_total: i64 = range.iter().map(|row| row.call_count).sum();
+    assert_eq!(range_total, 5, "the range stats count only the hot window");
 
     // Paginated log reads follow the same view.
     assert_eq!(store.count_logs(LogFilter::default()).await.unwrap(), 5);

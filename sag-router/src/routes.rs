@@ -3,7 +3,7 @@
 //! This file is intentionally thin: it only owns the router wiring and the
 //! `/v1/chat/completions` orchestrator. All dispatch, resolution, retry,
 //! and streaming logic lives under [`sag_dispatch`]; the miscellaneous
-//! `/health`, `/v1/models`, and `/v1/analytics/*` (legacy + v2) handlers
+//! `/health`, `/v1/models`, `/v1/analytics/stats`, and `/v1/analytics/v2/*` handlers
 //! live under [`crate::handlers`].
 
 use std::time::{Duration, Instant};
@@ -23,10 +23,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{instrument, warn};
 
 use crate::handlers::analytics_v2::{analytics_v2_summary, analytics_v2_trend};
-use crate::handlers::{
-    analytics_cache_stats, analytics_distribution, analytics_stats, analytics_trend, list_models,
-    show_health,
-};
+use crate::handlers::{analytics_stats, list_models, show_health};
 use crate::middleware::auth::gateway_auth;
 use crate::middleware::trace::trace_middleware;
 use sag_admin::build_admin_routes;
@@ -54,8 +51,8 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
     // The three auth-protected sub-routers are built first, then wrapped
     // in a single `route_layer` so `gateway_auth` is registered once
     // (one `state.clone()`) instead of three times. The unprotected
-    // `/health` and `/v1/analytics/*` routes (legacy + v2) are added to
-    // the outer router *after* the merge, so they stay public.
+    // `/health` and `/v1/analytics/*` routes (stats 诊断面 + v2) are added
+    // to the outer router *after* the merge, so they stay public.
     let protected = Router::new()
         .nest(
             "/v1/chat/completions",
@@ -88,9 +85,6 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
     Router::new()
         .route("/health", get(show_health))
         .route("/v1/analytics/stats", get(analytics_stats))
-        .route("/v1/analytics/cache", get(analytics_cache_stats))
-        .route("/v1/analytics/trend", get(analytics_trend))
-        .route("/v1/analytics/distribution", get(analytics_distribution))
         .route("/v1/analytics/v2/summary", get(analytics_v2_summary))
         .route("/v1/analytics/v2/trend", get(analytics_v2_trend))
         .merge(protected)
@@ -907,6 +901,56 @@ mod tests {
         assert_eq!(
             requested_model, "gpt-4o",
             "parsed requests must carry their real requested model"
+        );
+    }
+
+    /// The three retired endpoints must stay gone: the 0008 retirement
+    /// removed their route registrations outright (no 410 / 301 shell), so
+    /// they answer 404 while the surviving diagnostic `/v1/analytics/stats`
+    /// still answers 200.
+    #[tokio::test]
+    async fn retired_analytics_endpoints_are_gone() {
+        let (state, runtime, _pool) = build_state_with_event_pool(GatewayConfig {
+            gateway_auth: Some(GatewayAuthConfig {
+                api_keys: vec!["test-key".into()],
+            }),
+            ..sag_config::gateway_config_base!()
+        })
+        .await;
+        let app = build_router(state.clone(), runtime);
+
+        for path in [
+            "/v1/analytics/cache",
+            "/v1/analytics/trend",
+            "/v1/analytics/distribution",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path {path}");
+        }
+
+        // The diagnostic endpoint survives the retirement.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/analytics/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["data"].is_array(),
+            "stats must keep its `{{ data: [...] }}` envelope"
         );
     }
 

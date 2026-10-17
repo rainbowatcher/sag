@@ -559,7 +559,7 @@ fn build_stream_call_log<S, E>(
     // cache/reasoning columns must carry the same values as
     // `usage`, because the persistence layer binds these
     // columns from the flat fields, not from `log.usage`.
-    // Without this, query_cache_stats undercounts streaming
+    // Without this, query_stats undercounts streaming
     // responses. Capture before the move into `Some(state.usage)`.
     // On the error terminal they revert to NULL (the same
     // failure contract as the flat token columns).
@@ -1103,7 +1103,7 @@ mod tests {
     /// columns on the stream `CallLog` must carry the same values as
     /// `usage`, because `SqliteLogStore::insert_batch` binds these
     /// columns from the flat fields (not from `log.usage`). Without
-    /// this, `query_cache_stats` undercounts every streamed response.
+    /// this, `query_stats` undercounts every streamed response.
     #[tokio::test]
     async fn cache_fields_persisted_from_stream_usage() {
         let state = build_state().await;

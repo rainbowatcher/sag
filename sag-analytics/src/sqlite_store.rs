@@ -5,10 +5,7 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::collections::HashSet;
 use tracing::warn;
 
-use crate::store::{
-    CacheStatsRow, DistributionRow, LogFilter, LogStore, StatsFilter, StatsRow, StatusCodeFilter,
-    TrendFilter, TrendRow,
-};
+use crate::store::{LogFilter, LogStore, StatsFilter, StatsRow, StatusCodeFilter};
 
 /// Stage-0.4 extension columns added to `call_logs` beyond the original
 /// 13-column schema, plus the M7 protocol/lane dimensions. Each entry is
@@ -425,138 +422,6 @@ impl LogStore for SqliteLogStore {
         .map_err(|e| AppError::Internal(format!("count_logs failed: {e}")))?;
 
         Ok(count.max(0) as u64)
-    }
-
-    async fn query_cache_stats(&self, filter: StatsFilter) -> sag_core::Result<Vec<CacheStatsRow>> {
-        let mut sql = String::from(
-            r#"
-            SELECT
-                provider,
-                model,
-                real_model,
-                COUNT(*)                                   AS total_calls,
-                COALESCE(SUM(prompt_tokens), 0)            AS total_prompt_tokens,
-                COALESCE(SUM(cached_tokens), 0)            AS total_cached_tokens,
-                COALESCE(SUM(cache_creation_tokens), 0)    AS total_cache_creation_tokens
-            FROM call_logs_hot
-            "#,
-        );
-
-        let mut conditions: Vec<&'static str> = Vec::new();
-        if filter.provider.as_deref().is_some_and(|p| !p.is_empty()) {
-            conditions.push("provider = ?");
-        }
-        if filter.model.as_deref().is_some_and(|m| !m.is_empty()) {
-            conditions.push("model = ?");
-        }
-        if filter.real_model.as_deref().is_some_and(|m| !m.is_empty()) {
-            conditions.push("real_model = ?");
-        }
-        if filter.from.is_some() {
-            conditions.push("timestamp >= ?");
-        }
-        if filter.to.is_some() {
-            conditions.push("timestamp < ?");
-        }
-        if !conditions.is_empty() {
-            sql.push_str("WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-            sql.push('\n');
-        }
-        sql.push_str(
-            r#"
-            GROUP BY provider, model, real_model
-            ORDER BY total_calls DESC
-            "#,
-        );
-
-        with_schema_retry(|| async {
-            let mut query = sqlx::query_as::<_, CacheStatsRow>(&sql);
-            if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
-                query = query.bind(p);
-            }
-            if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
-                query = query.bind(m);
-            }
-            if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
-                query = query.bind(rm);
-            }
-            if let Some(from) = filter.from {
-                query = query.bind(from.timestamp_millis());
-            }
-            if let Some(to) = filter.to {
-                query = query.bind(to.timestamp_millis());
-            }
-            query.fetch_all(&self.pool).await
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("query_cache_stats failed: {e}")))
-    }
-
-    async fn query_trend(&self, filter: TrendFilter) -> sag_core::Result<Vec<TrendRow>> {
-        let bucket_ms = (filter.bucket_seconds * 1000) as i64;
-        let mut sql = String::from(
-            r#"
-            SELECT
-                timestamp / ? * ? AS bucket,
-                COUNT(*)                          AS call_count,
-                COALESCE(SUM(prompt_tokens), 0)   AS prompt_tokens,
-                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-                SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) AS success_count
-            FROM call_logs_hot
-            WHERE timestamp >= ?
-            "#,
-        );
-
-        if filter.provider.is_some() {
-            sql.push_str(" AND provider = ?\n");
-        }
-        if filter.to.is_some() {
-            sql.push_str(" AND timestamp < ?\n");
-        }
-
-        sql.push_str(" GROUP BY bucket ORDER BY bucket");
-
-        with_schema_retry(|| async {
-            let mut query = sqlx::query_as::<_, TrendRow>(&sql)
-                .bind(bucket_ms)
-                .bind(bucket_ms)
-                .bind(filter.from.timestamp_millis());
-
-            if let Some(p) = &filter.provider {
-                query = query.bind(p);
-            }
-            if let Some(to) = filter.to {
-                query = query.bind(to.timestamp_millis());
-            }
-
-            query.fetch_all(&self.pool).await
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("query_trend failed: {e}")))
-    }
-
-    async fn query_distribution(
-        &self,
-        filter: StatsFilter,
-    ) -> sag_core::Result<Vec<DistributionRow>> {
-        // Reuse query_stats for the grouping, then compute proportions.
-        let stats = self.query_stats(filter).await?;
-        let total: i64 = stats.iter().map(|r| r.call_count).sum();
-        Ok(stats
-            .into_iter()
-            .map(|r| DistributionRow {
-                provider: r.provider,
-                model: r.model,
-                real_model: r.real_model,
-                call_count: r.call_count,
-                percentage: if total > 0 {
-                    (r.call_count as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                },
-            })
-            .collect())
     }
 
     async fn shutdown(&self) {
@@ -1419,38 +1284,6 @@ mod tests {
         // repair layer must skip every ALTER without raising.
         let store = SqliteLogStore::new_memory().await.unwrap();
         ensure_schema_consistency(&store.pool).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn query_cache_stats_aggregates_cached_tokens() {
-        let store = SqliteLogStore::new_memory().await.unwrap();
-
-        let mut with_cache = make_log("openai", "gpt-4o", "gpt-4o");
-        with_cache.usage = Some(Usage {
-            prompt_tokens: 100,
-            completion_tokens: 50,
-            total_tokens: 150,
-            cached_tokens: Some(30),
-            cache_creation_tokens: Some(15),
-            reasoning_tokens: Some(10),
-        });
-        with_cache.cached_tokens = Some(30);
-        with_cache.cache_creation_tokens = Some(15);
-
-        let no_cache = make_log("openai", "gpt-4o", "gpt-4o");
-
-        store.insert_batch(&[with_cache, no_cache]).await.unwrap();
-
-        let rows = store
-            .query_cache_stats(StatsFilter::default())
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].provider, "openai");
-        assert_eq!(rows[0].total_calls, 2);
-        assert_eq!(rows[0].total_prompt_tokens, 110);
-        assert_eq!(rows[0].total_cached_tokens, 30);
-        assert_eq!(rows[0].total_cache_creation_tokens, 15);
     }
 
     // ─── Shared-pool lifecycle & write contention ────────────────────

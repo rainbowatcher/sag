@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, instrument};
 
-use sag_analytics::{StatsFilter, TrendFilter};
+use sag_analytics::StatsFilter;
 use sag_state::AppState;
 
 #[derive(Deserialize)]
@@ -23,22 +23,6 @@ pub struct StatsQuery {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub real_model: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct TrendQuery {
-    pub provider: Option<String>,
-    /// Bucket width in seconds (e.g. 3600 for hourly). Defaults to 3600.
-    #[serde(default = "default_bucket_seconds")]
-    pub bucket_seconds: u64,
-    /// Unix millisecond timestamp for the range start.
-    pub from: i64,
-    /// Unix millisecond timestamp for the range end (exclusive).
-    pub to: Option<i64>,
-}
-
-const fn default_bucket_seconds() -> u64 {
-    3600
 }
 
 /// GET `/health`
@@ -143,77 +127,6 @@ pub async fn analytics_stats(
         Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
         Err(e) => {
             error!(?e, "analytics query failed");
-            AppError::Internal(e.to_string()).into_response()
-        }
-    }
-}
-
-/// GET `/v1/analytics/trend?bucket_seconds=3600&from=...&to=...&provider=...`
-///
-/// Returns time-bucketed call counts and token usage.
-pub async fn analytics_trend(
-    State(state): State<AppState>,
-    Query(params): Query<TrendQuery>,
-) -> Response<Body> {
-    let Some(from) = chrono::DateTime::from_timestamp_millis(params.from) else {
-        return AppError::BadRequest("invalid 'from' timestamp".into()).into_response();
-    };
-    let to = params.to.and_then(chrono::DateTime::from_timestamp_millis);
-
-    let filter = TrendFilter {
-        provider: params.provider,
-        bucket_seconds: params.bucket_seconds,
-        from,
-        to,
-    };
-    match state.collector.store().query_trend(filter).await {
-        Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
-        Err(e) => {
-            error!(?e, "trend query failed");
-            AppError::Internal(e.to_string()).into_response()
-        }
-    }
-}
-
-/// GET `/v1/analytics/distribution?provider=X&model=Y&real_model=Z`
-///
-/// Returns call distribution (proportions) grouped by provider, model, and real_model.
-pub async fn analytics_distribution(
-    State(state): State<AppState>,
-    Query(params): Query<StatsQuery>,
-) -> Response<Body> {
-    let filter = StatsFilter {
-        provider: params.provider,
-        model: params.model,
-        real_model: params.real_model,
-        ..Default::default()
-    };
-    match state.collector.store().query_distribution(filter).await {
-        Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
-        Err(e) => {
-            error!(?e, "distribution query failed");
-            AppError::Internal(e.to_string()).into_response()
-        }
-    }
-}
-
-/// GET `/v1/analytics/cache?provider=X&model=Y&real_model=Z`
-///
-/// Returns cache hit-rate statistics grouped by provider, model, and real_model.
-pub async fn analytics_cache_stats(
-    State(state): State<AppState>,
-    Query(params): Query<StatsQuery>,
-) -> Response<Body> {
-    let filter = StatsFilter {
-        provider: params.provider,
-        model: params.model,
-        real_model: params.real_model,
-        ..Default::default()
-    };
-    match state.collector.store().query_cache_stats(filter).await {
-        Ok(rows) => (StatusCode::OK, Json(json!({ "data": rows }))).into_response(),
-        Err(e) => {
-            error!(?e, "cache stats query failed");
             AppError::Internal(e.to_string()).into_response()
         }
     }

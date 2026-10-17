@@ -20,7 +20,6 @@ onMounted(async () => {
   await Promise.all([
     providerStore.fetchProviders(),
     routeStore.fetchRoutes(),
-    analyticsStore.fetchStats(),
     healthStore.checkHealth(),
     circuitBreakerStore.fetchBreakers(),
   ])

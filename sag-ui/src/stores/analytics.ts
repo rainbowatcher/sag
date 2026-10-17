@@ -6,13 +6,9 @@ import type {
   AnalyticsSummaryResponse,
   AnalyticsTrendResponse,
   AnalyticsV2Query,
-  CacheStatsRow,
   CallLog,
-  DistributionRow,
   LogFilter,
   LogsResponse,
-  StatsRow,
-  TrendRow,
 } from "@/types/api"
 import { useConnectionStore } from "./connection"
 import { useProviderStore } from "./providers"
@@ -45,28 +41,6 @@ function createQueryGuard() {
 }
 
 export const useAnalyticsStore = defineStore("analytics", () => {
-  // ── Stats (aggregated) ────────────────────────────────────────────
-  const stats = ref<StatsRow[]>([])
-  const statsLoading = ref(false)
-  const statsError = ref<string | null>(null)
-
-  async function fetchStats(provider?: string, model?: string) {
-    statsLoading.value = true
-    statsError.value = null
-    try {
-      const params = new URLSearchParams()
-      if (provider) params.set("provider", provider)
-      if (model) params.set("model", model)
-      const { data } = await api.get<{ data: StatsRow[] }>(`/v1/analytics/stats?${params}`)
-      stats.value = data.data ?? []
-    } catch (e: any) {
-      if (e?.response?.status === 401) useConnectionStore().handle401()
-      statsError.value = getErrorMessage(e, "Failed to load statistics")
-    } finally {
-      statsLoading.value = false
-    }
-  }
-
   // ── Logs (raw call history) ──────────────────────────────────────
   const logs = ref<CallLog[]>([])
   const logsTotal = ref(0)
@@ -153,96 +127,13 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     await fetchLogs({ offset: Math.max(0, logsOffset.value - logsLimit.value) })
   }
 
-  // ── Cache (hit-rate stats) ───────────────────────────────────────
-  const cache = ref<CacheStatsRow[]>([])
-  const cacheLoading = ref(false)
-  const cacheError = ref<string | null>(null)
-
-  async function fetchCacheStats(provider?: string, model?: string) {
-    cacheLoading.value = true
-    cacheError.value = null
-    try {
-      const params = new URLSearchParams()
-      if (provider) params.set("provider", provider)
-      if (model) params.set("model", model)
-      const { data } = await api.get<{ data: CacheStatsRow[] }>(`/v1/analytics/cache?${params}`)
-      cache.value = data.data ?? []
-    } catch (e: any) {
-      if (e?.response?.status === 401) useConnectionStore().handle401()
-      cacheError.value = getErrorMessage(e, "Failed to load cache statistics")
-    } finally {
-      cacheLoading.value = false
-    }
-  }
-
-  // ── Trend (time-bucketed) ───────────────────────────────────────
-  const trend = ref<TrendRow[]>([])
-  const trendLoading = ref(false)
-  const trendError = ref<string | null>(null)
-
-  async function fetchTrend(
-    bucketSeconds: number,
-    fromMs: number,
-    toMs?: number,
-    provider?: string,
-  ) {
-    trendLoading.value = true
-    trendError.value = null
-    try {
-      const params = new URLSearchParams()
-      params.set("bucket_seconds", String(bucketSeconds))
-      params.set("from", String(fromMs))
-      if (toMs != null) params.set("to", String(toMs))
-      if (provider) params.set("provider", provider)
-      const { data } = await api.get<{ data: TrendRow[] }>(`/v1/analytics/trend?${params}`)
-      trend.value = data.data ?? []
-    } catch (e: any) {
-      if (e?.response?.status === 401) useConnectionStore().handle401()
-      trendError.value = getErrorMessage(e, "Failed to load trend")
-    } finally {
-      trendLoading.value = false
-    }
-  }
-
-  // ── Distribution (proportions) ───────────────────────────────────
-  const distribution = ref<DistributionRow[]>([])
-  const distLoading = ref(false)
-  const distError = ref<string | null>(null)
-
-  async function fetchDistribution(provider?: string, model?: string) {
-    distLoading.value = true
-    distError.value = null
-    try {
-      const params = new URLSearchParams()
-      if (provider) params.set("provider", provider)
-      if (model) params.set("model", model)
-      const { data } = await api.get<{ data: DistributionRow[] }>(
-        `/v1/analytics/distribution?${params}`,
-      )
-      distribution.value = data.data ?? []
-    } catch (e: any) {
-      if (e?.response?.status === 401) useConnectionStore().handle401()
-      distError.value = getErrorMessage(e, "Failed to load distribution")
-    } finally {
-      distLoading.value = false
-    }
-  }
-
   // ── Cross-tab summary (dashboard cards) ──────────────────────────
   const summary = computed(() => {
     const p = useProviderStore()
     const r = useRouteStore()
-    let totalCalls = 0
-    let totalErrors = 0
-    for (const row of stats.value) {
-      totalCalls += row.call_count
-      totalErrors += row.error_count
-    }
     return {
       providerCount: p.providers.length,
       routeCount: r.routes.length,
-      totalCalls,
-      totalErrors,
     }
   })
 
@@ -327,26 +218,8 @@ export const useAnalyticsStore = defineStore("analytics", () => {
   }
 
   return {
-    // stats
-    stats,
-    statsLoading,
-    statsError,
-    fetchStats,
+    // dashboard summary (counts only)
     summary,
-    // cache
-    cache,
-    cacheLoading,
-    cacheError,
-    fetchCacheStats,
-    // trend / distribution
-    trend,
-    trendLoading,
-    trendError,
-    fetchTrend,
-    distribution,
-    distLoading,
-    distError,
-    fetchDistribution,
     // v2 unified query API
     v2Summary,
     v2SummaryLoading,
