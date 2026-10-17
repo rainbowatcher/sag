@@ -97,14 +97,16 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     let analytics_dsn = resolve_analytics_dsn_with_parent(&analytics_dsn)?;
 
     // 5. Initialize analytics (shared pool + identity registry + query
-    //    engine + rollup scheduler + legacy collector + event collector).
-    let analytics = load_analytics_stack(&analytics_dsn, routes_identity).await?;
+    //    engine + rollup scheduler + call_logs rotation scheduler + legacy
+    //    collector + event collector).
+    let analytics = load_analytics_stack(&analytics_dsn, routes_identity, &config_handle).await?;
     let AnalyticsStack {
         identity_registry,
         analytics_query,
         collector,
         event_collector,
         rollup_scheduler_handle,
+        rotation_scheduler_handle,
     } = analytics;
 
     // 6. Initialize provider registry from config and compute the
@@ -217,9 +219,11 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
 
     info!("gateway shut down");
 
-    // 14–15. Shut down watchers / rollup, then drain the event queue.
+    // 14–15. Shut down watchers / rollup / rotation, then drain the event
+    //        queue.
     graceful_shutdown(
         rollup_scheduler_handle,
+        rotation_scheduler_handle,
         hot_reload_handle,
         threshold_watcher_handle,
         event_collector,
@@ -292,17 +296,19 @@ fn resolve_analytics_dsn_with_parent(raw_dsn: &str) -> anyhow::Result<String> {
 
 /// Analytics subsystem handles assembled over ONE shared pool.
 ///
-/// `event_collector` and `rollup_scheduler_handle` are consumed by
-/// [`graceful_shutdown`]; the rest are handed to `AppState` / the
-/// coordinator. The pool itself is not retained here — it is moved into
-/// the [`sag_analytics::EventWriter`] and shared via `Arc` clones held by
-/// the registry / query engine / rollup engine / legacy collector.
+/// `event_collector`, `rollup_scheduler_handle` and
+/// `rotation_scheduler_handle` are consumed by [`graceful_shutdown`]; the
+/// rest are handed to `AppState` / the coordinator. The pool itself is not
+/// retained here — it is moved into the [`sag_analytics::EventWriter`] and
+/// shared via `Arc` clones held by the registry / query engine / rollup
+/// engine / rotation scheduler / legacy collector.
 struct AnalyticsStack {
     identity_registry: Arc<sag_analytics::IdentityRegistry>,
     analytics_query: sag_analytics::AnalyticsQueryEngine,
     collector: Arc<sag_analytics::CallLogCollector>,
     event_collector: Arc<sag_analytics::EventCollector>,
     rollup_scheduler_handle: RollupSchedulerHandle,
+    rotation_scheduler_handle: RotationSchedulerHandle,
 }
 
 /// Phases 5–5b: Initialize analytics. The formal path (EventCollector →
@@ -322,12 +328,34 @@ struct AnalyticsStack {
 async fn load_analytics_stack(
     analytics_dsn: &str,
     routes_identity: Vec<sag_analytics::RouteIdentity>,
+    config_handle: &sag_config::ConfigHandle,
 ) -> anyhow::Result<AnalyticsStack> {
     let analytics_pool = sag_analytics::open_analytics_pool(analytics_dsn).await?;
     let identity_registry = Arc::new(sag_analytics::IdentityRegistry::new(analytics_pool.clone()));
     identity_registry.sync(&routes_identity).await?;
     let analytics_query = sag_analytics::AnalyticsQueryEngine::new(analytics_pool.clone());
-    // 5a. 1h rollup engine over the SAME shared pool (one pool for writer /
+    // 5a. The legacy CallLogCollector (backing `/v1/analytics/*` and
+    //     `/api/logs`) is built over the SAME shared pool — `new_shared`,
+    //     never `CallLogCollector::new(dsn)` which would open a second,
+    //     independent pool on the same file and close it on shutdown,
+    //     racing the formal pool. The store does not own the pool, so its
+    //     shutdown is a no-op for the pool itself. Cloned here before the
+    //     pool is moved into the EventWriter below.
+    //
+    //     Ordering: opening the store is also what *prepares* the schema the
+    //     background writers below depend on — `from_pool` runs
+    //     `ensure_schema_consistency` (the `ALTER TABLE … ADD COLUMN`
+    //     catches) and then the `refresh_views(pool, None)` full-history
+    //     fallback. Both schedulers are therefore spawned only *after* this
+    //     point (spec §D: ensure does not run concurrently with the first
+    //     rotation round). Spawning first would let the first round capture
+    //     pre-ALTER DDL for its replay and/or overwrite the fallback view
+    //     with a narrowed one, leaving the startup view shape up to the
+    //     runtime's scheduling (and, in the worst interleaving, a narrowed
+    //     window that no round corrects for another 24h).
+    let collector =
+        Arc::new(sag_analytics::CallLogCollector::new_shared(analytics_pool.clone()).await?);
+    // 5b. 1h rollup engine over the SAME shared pool (one pool for writer /
     //     registry / query / rollup — a failed sync aborts startup above,
     //     so the rollup can only ever see a migrated, consistent DB). The
     //     single-worker scheduler is spawned immediately but only
@@ -339,15 +367,16 @@ async fn load_analytics_stack(
         Arc::new(sag_analytics::RollupEngine::new(analytics_pool.clone())),
         ROLLUP_INTERVAL,
     );
-    // 5b. The legacy CallLogCollector (backing `/v1/analytics/*` and
-    //     `/api/logs`) is built over the SAME shared pool — `new_shared`,
-    //     never `CallLogCollector::new(dsn)` which would open a second,
-    //     independent pool on the same file and close it on shutdown,
-    //     racing the formal pool. The store does not own the pool, so its
-    //     shutdown is a no-op for the pool itself. Cloned here before the
-    //     pool is moved into the EventWriter below.
-    let collector =
-        Arc::new(sag_analytics::CallLogCollector::new_shared(analytics_pool.clone()).await?);
+    // 5c. `call_logs` hot/cold rotation over the SAME shared pool, next
+    //     to the rollup scheduler: both are background DB maintenance,
+    //     both are stopped before the event drain, and neither can fail
+    //     startup (the task logs and retries on the next round). The
+    //     task's first action is one complete round, so the full-history
+    //     view shape left by the store-open `refresh_views(None)`
+    //     fallback narrows to the real retention window right after
+    //     startup instead of one interval later.
+    let rotation_scheduler_handle =
+        spawn_rotation_scheduler(analytics_pool.clone(), config_handle.clone());
     let event_collector = Arc::new(sag_analytics::EventCollector::new(
         sag_analytics::EventWriter::new(analytics_pool),
     ));
@@ -358,6 +387,7 @@ async fn load_analytics_stack(
         collector,
         event_collector,
         rollup_scheduler_handle,
+        rotation_scheduler_handle,
     })
 }
 
@@ -458,11 +488,16 @@ async fn parse_listen_addr(config_handle: &sag_config::ConfigHandle) -> anyhow::
 /// Shutdown order is load-bearing:
 /// 1. hot-reload watcher, then threshold watcher — the hot-reload watcher
 ///    uses `notify` OS threads whose `Drop` must run (see below);
-/// 2. rollup scheduler BEFORE the event drain — the drain must be the last
-///    writer to touch the analytics DB;
+/// 2. rollup scheduler, then the `call_logs` rotation scheduler, BEFORE the
+///    event drain — the drain must be the last writer to touch the analytics
+///    DB, and the rotation join is what guarantees its in-flight DDL
+///    transaction has committed (or rolled back) before the drain starts
+///    (on a join timeout the task is aborted instead; see
+///    [`shutdown_analytics_writers`]);
 /// 3. event collector drain last.
 async fn graceful_shutdown(
     rollup_scheduler_handle: RollupSchedulerHandle,
+    rotation_scheduler_handle: RotationSchedulerHandle,
     hot_reload_handle: sag_config::HotReloadHandle,
     threshold_watcher_handle: ThresholdWatcherHandle,
     event_collector: Arc<sag_analytics::EventCollector>,
@@ -480,16 +515,17 @@ async fn graceful_shutdown(
     hot_reload_handle.shutdown().await;
     threshold_watcher_handle.shutdown().await;
 
-    // 14a. Stop the rollup scheduler BEFORE draining the event queue. The
-    //      signal + join guarantees the scheduler's in-flight bucket
-    //      compute transaction has ended (a bucket is all-or-nothing: one
-    //      transaction across every rollup table) and the task has
-    //      stopped, so the drain below is the last writer to touch the
-    //      analytics DB and no background task can outlive the shared
-    //      pool / process. A timeout or panicked task is logged as an
-    //      error — never silently ignored. Any bucket left `processing`
-    //      by a hard kill is reclaimed via the lease at next startup.
-    rollup_scheduler_handle.shutdown().await;
+    // 14a. Stop the analytics background writers BEFORE draining the event
+    //      queue: rollup first, then `call_logs` rotation. Both shut-downs
+    //      signal *and* join, so when both joins succeed neither task can
+    //      start a new transaction and the rotation's in-flight DDL
+    //      transaction has committed or rolled back — the drain below is the
+    //      last writer to touch the analytics DB. On a join timeout the task
+    //      is aborted (its in-flight transaction rolls back), but the drain
+    //      may still race that rollback briefly; the timeout is logged as an
+    //      error. The ordering lives in one helper so the invariant is
+    //      exercised by the test suite as production code.
+    shutdown_analytics_writers(rollup_scheduler_handle, rotation_scheduler_handle).await;
 
     // 15. Drain the formal analytics event queue: close the sender, wait
     //     for the writer to persist every pending event before exiting.
@@ -501,6 +537,31 @@ async fn graceful_shutdown(
     info!("analytics event collector drained");
 
     info!("all subsystems shut down");
+}
+
+/// Stop the analytics background writers in their load-bearing order: the
+/// rollup scheduler first, then the `call_logs` rotation scheduler.
+///
+/// Both shut-downs signal *and* join. **When both joins succeed**, no
+/// background transaction is in flight and no background task can start a new
+/// one, so the caller's next step (the event drain) is the last writer on the
+/// analytics DB. On a join timeout the task is aborted — its in-flight
+/// transaction rolls back (SQLite atomicity) and it cannot start another
+/// round — but the abort is not awaited, so the drain may still race that
+/// rollback briefly; the timeout is logged as an error, never silently
+/// ignored. Any rollup bucket left `processing` by a hard kill is reclaimed
+/// via the lease at next startup, and an interrupted rotation DDL transaction
+/// leaves the hot table and both views intact.
+///
+/// This helper's ONLY call site is [`graceful_shutdown`], and it must stay
+/// before `event_collector.shutdown()` — that position is the whole reason the
+/// helper exists (the drain must be the last writer).
+async fn shutdown_analytics_writers(
+    rollup_scheduler_handle: RollupSchedulerHandle,
+    rotation_scheduler_handle: RotationSchedulerHandle,
+) {
+    rollup_scheduler_handle.shutdown().await;
+    rotation_scheduler_handle.shutdown().await;
 }
 
 /// Handler that wraps the [`ConfigMutationCoordinator`] for the hot-reload
@@ -763,6 +824,159 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Interval between `call_logs` rotation rounds: one round per day.
+///
+/// The daily round is what keeps the retention window moving: the cutoff is
+/// baked into the view bodies as a literal, so without a rebuild the hot
+/// window would stay frozen at whatever the last round computed. Rotation
+/// itself is *not* daily — the hot table only holds `retention_days` of rows,
+/// so a round rotates roughly once per retention period (§C of the spec);
+/// the everyday job is advancing the view cutoff and sweeping retired
+/// indexes. `MissedTickBehavior::Skip` keeps a slow round from bursting into
+/// catch-up rounds.
+const ROTATION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Fallback `call_log_retention_days` when `[analytics]` is absent — the same
+/// 90 days [`sag_config::AnalyticsConfig`] defaults to.
+const DEFAULT_CALL_LOG_RETENTION_DAYS: u32 = 90;
+
+/// Spawn the `call_logs` rotation scheduler over the shared analytics pool.
+///
+/// Startup contract: the task's **first action is one complete round** — it
+/// does not wait for the 24h tick. The store-open `refresh_views(pool, None)`
+/// fallback leaves both views in their full-history shape, which is a
+/// *superset* of the real retention window (queries may see extra history,
+/// never a missing row and never an error), and this round narrows them to the
+/// real cutoff. Callers must spawn this **after** the store has been opened
+/// (`CallLogCollector::new_shared` / `SqliteLogStore::from_pool`), so the
+/// `ensure_schema_consistency` column catches and the fallback view are already
+/// in place when the first round starts (§D: ensure never runs concurrently
+/// with the first round). Waiting a full interval would leave that superset in
+/// place for a day; running the round synchronously inside
+/// `load_analytics_stack` would put maintenance DDL on the startup critical
+/// path and add a startup failure mode, so the round runs in the background
+/// task instead (sub-second in practice: a few DDL statements plus scalar
+/// queries).
+///
+/// Round contract: retire indexes → rotate → refresh views (see
+/// [`rotation_round`]). DB errors are warned about and retried on the next
+/// round — maintenance never panics and never takes the gateway down.
+fn spawn_rotation_scheduler(
+    pool: sag_analytics::SqlitePool,
+    config: sag_config::ConfigHandle,
+) -> RotationSchedulerHandle {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        // First action of the task: one complete round, immediately (§0).
+        rotation_round(&pool, &config).await;
+
+        let mut ticker = tokio::time::interval(ROTATION_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A tokio interval's first tick fires immediately. Consume it — the
+        // round above already ran, and the next one belongs a full interval
+        // later.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("rotation scheduler stopped");
+                    return;
+                }
+                _ = ticker.tick() => {}
+            }
+            rotation_round(&pool, &config).await;
+        }
+    });
+    RotationSchedulerHandle { task, shutdown_tx }
+}
+
+/// One `call_logs` rotation round: **retire → rotate → refresh**, in that
+/// order (the order is load-bearing: the index sweep must run against the cold
+/// tables the previous round produced, and the refresh must be the last step so
+/// the views end up matching the cutoff the round just computed).
+///
+/// Retention is re-read from the live config on **every** round, so a hot
+/// reload / admin change takes effect on the next round without a restart.
+/// `call_log_retention_days == 0` disables the feature: no retirement, no
+/// rotation and no window narrowing (the full-history view shape is the
+/// terminal state).
+///
+/// `refresh_views` runs unconditionally, including on rounds that rotate
+/// nothing, because the retention cutoff is a literal inside the view bodies —
+/// an un-refreshed window would never move forward. On a rotating round the
+/// views were already rebuilt inside the rotation transaction, so this refresh
+/// is an idempotent rebuild; on a non-rotating round it is the only thing that
+/// advances the cutoff.
+///
+/// Every failure is warned about and retried on the next round: maintenance
+/// never panics and never takes the gateway down. A failed rotation returns
+/// early (the views were not damaged, so there is nothing to refresh) — the
+/// next round retries both steps.
+async fn rotation_round(pool: &sag_analytics::SqlitePool, config: &sag_config::ConfigHandle) {
+    let retention: u32 = config
+        .read()
+        .await
+        .analytics
+        .as_ref()
+        .map(|a| a.call_log_retention_days)
+        .unwrap_or(DEFAULT_CALL_LOG_RETENTION_DAYS);
+    if retention == 0 {
+        // 0 = disabled: no rotation, no retirement, no window narrowing.
+        return;
+    }
+    let cutoff_ms = unix_now_ms() - retention as i64 * 86_400_000;
+
+    if let Err(e) = sag_analytics::retire_indexes(pool, cutoff_ms).await {
+        tracing::warn!(error = %e, "index retirement failed; retrying next cycle");
+    }
+    match sag_analytics::rotate_once(pool, cutoff_ms).await {
+        Ok(Some(arch)) => tracing::info!(arch, "rotation round moved call_logs into archive"),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "rotation failed; retrying next cycle");
+            return;
+        }
+    }
+    if let Err(e) = sag_analytics::refresh_views(pool, Some(cutoff_ms)).await {
+        tracing::warn!(error = %e, "view refresh failed; retrying next cycle");
+    }
+}
+
+/// Handle for the `call_logs` rotation scheduler background task.
+struct RotationSchedulerHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl RotationSchedulerHandle {
+    /// Signal the scheduler to stop and wait up to 5s for it to exit.
+    ///
+    /// The join is the only way to know the scheduler's in-flight DDL
+    /// transaction has ended and the task has stopped. Dropping the handle
+    /// would *detach* the task (`JoinHandle::drop` does not abort), leaving it
+    /// free to run further rounds behind the caller's back, so a timeout is
+    /// logged as an error **and** the task is aborted: the abort cancels it at
+    /// its next await point and an in-flight DDL transaction rolls back
+    /// (SQLite atomicity). The abort is not awaited, so on the timeout path the
+    /// shutdown-order guarantee (drain happens last, no background writer after
+    /// it) only holds approximately — the drain may race the rollback briefly.
+    /// SQLite transactions stay atomic either way.
+    async fn shutdown(self) {
+        // `timeout` consumes the `JoinHandle`, so grab the abort handle first.
+        let abort = self.task.abort_handle();
+        let _ = self.shutdown_tx.send(());
+        match tokio::time::timeout(Duration::from_secs(5), self.task).await {
+            Ok(Ok(())) => info!("rotation scheduler shut down"),
+            Ok(Err(e)) => tracing::error!(error = %e, "rotation scheduler task panicked"),
+            Err(_) => {
+                tracing::error!("rotation scheduler did not stop within 5s; aborting it");
+                abort.abort();
+            }
+        }
+    }
+}
+
 /// Handle for the rollup scheduler background task.
 struct RollupSchedulerHandle {
     task: tokio::task::JoinHandle<()>,
@@ -773,18 +987,26 @@ impl RollupSchedulerHandle {
     /// Signal the scheduler to stop and wait up to 5s for it to exit.
     ///
     /// The join is the only way to know the scheduler's current bucket
-    /// compute transaction has ended and the task has stopped — dropping
-    /// or aborting the handle would leak the task or silently skip the
-    /// stop, so a timeout or a panicked task is logged as an error. SQLite
-    /// transactions stay atomic either way (a hard kill rolls back), but
-    /// the shutdown-order guarantee (drain happens last, no background
-    /// writer after it) requires the join to succeed.
+    /// compute transaction has ended and the task has stopped. Dropping the
+    /// handle would *detach* the task (`JoinHandle::drop` does not abort),
+    /// leaving it free to compute buckets behind the caller's back, so a
+    /// timeout is logged as an error **and** the task is aborted: the abort
+    /// cancels it at its next await point and an in-flight compute transaction
+    /// rolls back (SQLite atomicity; the bucket stays `pending` until the lease
+    /// is reclaimed). The abort is not awaited, so on the timeout path the
+    /// shutdown-order guarantee (drain happens last, no background writer after
+    /// it) only holds approximately — the drain may race the rollback briefly.
     async fn shutdown(self) {
+        // `timeout` consumes the `JoinHandle`, so grab the abort handle first.
+        let abort = self.task.abort_handle();
         let _ = self.shutdown_tx.send(());
         match tokio::time::timeout(Duration::from_secs(5), self.task).await {
             Ok(Ok(())) => info!("rollup scheduler shut down"),
             Ok(Err(e)) => tracing::error!(error = %e, "rollup scheduler task panicked"),
-            Err(_) => tracing::error!("rollup scheduler did not stop within 5s"),
+            Err(_) => {
+                tracing::error!("rollup scheduler did not stop within 5s; aborting it");
+                abort.abort();
+            }
         }
     }
 }
@@ -1075,6 +1297,268 @@ mod tests {
 
         let status = engine.bucket_status(hour).await.unwrap().unwrap();
         assert_eq!(status.state, BucketState::Pending);
+    }
+
+    // ─── call_logs rotation scheduler ────────────────────────────────
+
+    const DAY_MS: i64 = 86_400_000;
+
+    /// Minimal config for maintenance tests: `analytics` is present so the
+    /// retention read (`call_log_retention_days`) is exercised; everything
+    /// else is the empty / default shape (no providers, no routes).
+    fn maintenance_config(retention_days: u32) -> sag_config::ConfigHandle {
+        sag_config::ConfigHandle::from_config(sag_config::GatewayConfig {
+            server: sag_config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 3000,
+            },
+            analytics: Some(sag_config::AnalyticsConfig {
+                enabled: true,
+                storage_dsn: "sqlite://analytics.db".into(),
+                call_log_retention_days: retention_days,
+            }),
+            gateway_auth: None,
+            providers: HashMap::new(),
+            backoff: sag_config::BackoffConfig::default(),
+            circuit_breaker: sag_config::CircuitBreakerConfig::default(),
+            shuffle_cache_ttl_secs: 7200,
+            sticky_failover_reset_secs: 7200,
+            routes: Vec::new(),
+            logging: sag_config::LoggingConfig::default(),
+            proxy_url: None,
+        })
+    }
+
+    /// One legacy call log stamped `timestamp_ms`.
+    fn call_log(model: &str, timestamp_ms: i64) -> sag_core::CallLog {
+        use chrono::{TimeZone, Utc};
+        sag_core::CallLog {
+            request_id: uuid::Uuid::new_v4(),
+            provider: "openai".to_string(),
+            model: model.to_string(),
+            real_model: model.to_string(),
+            stream: false,
+            status_code: 200,
+            duration_ms: 10,
+            usage: None,
+            error: None,
+            timestamp: Utc.timestamp_millis_opt(timestamp_ms).unwrap(),
+            reasoning_effort: None,
+            upstream_duration_ms: None,
+            ttft_ms: None,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            user_agent: None,
+            client_ip: None,
+            error_category: None,
+            route_id: None,
+            target_id: None,
+            ingress_protocol: None,
+            upstream_protocol: None,
+            lane: None,
+            loss_summary: None,
+        }
+    }
+
+    /// `SELECT COUNT(*)` of a scalar query.
+    async fn scalar(pool: &sag_analytics::SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    /// §F test 17 — shutdown ordering. The rotation scheduler runs one
+    /// complete round as its first action (no 24h wait), `shutdown` joins it
+    /// so no DDL transaction is in flight, and both analytics writers are
+    /// stopped through [`shutdown_analytics_writers`] (the exact production
+    /// helper `graceful_shutdown` uses) **before** the event drain — which is
+    /// what makes the drain the last writer on the analytics DB.
+    #[tokio::test]
+    async fn rotation_scheduler_shuts_down_before_event_drain() {
+        let dir =
+            std::env::temp_dir().join(format!("sag-gateway-rotation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("analytics.db");
+        let pool = sag_analytics::open_analytics_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        // Production assembly: the legacy collector shares the one pool.
+        let collector = Arc::new(
+            sag_analytics::CallLogCollector::new_shared(pool.clone())
+                .await
+                .unwrap(),
+        );
+
+        // A row 400 days old sits outside the 90-day window, so the
+        // scheduler's first round must rotate it.
+        collector.log(call_log("backlog", unix_now_ms() - 400 * DAY_MS));
+        collector.flush().await;
+
+        // Both analytics writers, wired in the production order that
+        // `load_analytics_stack` uses: the store is opened first (its
+        // `ensure_schema_consistency` + full-history fallback view run to
+        // completion), and only then are the schedulers spawned — so the first
+        // rotation round always starts on a prepared schema (§D).
+        let rollup = spawn_rollup_scheduler(
+            Arc::new(sag_analytics::RollupEngine::new(pool.clone())),
+            ROLLUP_INTERVAL,
+        );
+        let rotation = spawn_rotation_scheduler(pool.clone(), maintenance_config(90));
+
+        // The first round is the task's first action (§0): it must land
+        // without waiting for the 24h tick.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let cold = scalar(
+                &pool,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'call_logs_arch_%'",
+            )
+            .await;
+            if cold == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the scheduler's first round never rotated the backlog"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The round completed, not half-applied: the hot table is the fresh
+        // empty one and both views were rebuilt against the real cutoff.
+        assert_eq!(scalar(&pool, "SELECT COUNT(*) FROM call_logs").await, 0);
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_hot").await,
+            0,
+            "the rotated row is outside the 90-day window"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_all").await,
+            1,
+            "history stays reachable through call_logs_all"
+        );
+
+        // Production shutdown order: rollup, then rotation (both joined).
+        shutdown_analytics_writers(rollup, rotation).await;
+
+        // The join really ended the in-flight DDL: a write issued now lands in
+        // the fresh hot table and is immediately visible through the rebuilt
+        // view (a still-running rename / view rebuild would break either).
+        let marker = call_log("after-shutdown", unix_now_ms());
+        let marker_id = marker.request_id;
+        collector.log(marker);
+        collector.flush().await;
+        let in_hot: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM call_logs WHERE request_id = ?1")
+                .bind(marker_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(in_hot, 1, "post-shutdown writes land in the hot table");
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_hot").await,
+            1,
+            "the rebuilt view sees the post-shutdown write"
+        );
+        assert_eq!(
+            scalar(
+                &pool,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'call_logs_arch_%'"
+            )
+            .await,
+            1,
+            "no round may rotate after the scheduler was joined"
+        );
+
+        // 15. Drain last: the formal event queue is flushed only now, so it is
+        // the final writer — it must not disturb the rotated call_logs world.
+        let event_collector =
+            sag_analytics::EventCollector::new(sag_analytics::EventWriter::new(pool.clone()));
+        event_collector
+            .emit(client_error_event(unix_now_ms()))
+            .await
+            .unwrap();
+        event_collector.shutdown().await;
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM request_results").await,
+            1,
+            "the drain persisted its queued event after the writers stopped"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_hot").await,
+            1,
+            "the drain must not touch the rotated call_logs views"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §F 15 (config half) — retention is re-read from the live config on
+    /// *every* round: the same handle that disables rotation at `0` rotates
+    /// once it is mutated to 90 days, with no restart and no re-spawn. This
+    /// pins [`rotation_round`]'s per-round `config.read()` (the hot-reload /
+    /// admin-mutation path); the integration suite replays the round with the
+    /// retention passed as an argument, so it structurally cannot see it.
+    #[tokio::test]
+    async fn rotation_round_rereads_retention_from_live_config() {
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        // Store open = the production startup path (`ensure_schema_consistency`
+        // + full-history fallback view).
+        let collector = sag_analytics::CallLogCollector::new_shared(pool.clone())
+            .await
+            .unwrap();
+        // One row 400 days old: outside the 90-day window, inside the
+        // full-history startup shape.
+        collector.log(call_log("backlog", unix_now_ms() - 400 * DAY_MS));
+        collector.flush().await;
+
+        // retention = 0 disables the round entirely.
+        let config = maintenance_config(0);
+        rotation_round(&pool, &config).await;
+        assert_eq!(
+            scalar(
+                &pool,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'call_logs_arch_%'"
+            )
+            .await,
+            0,
+            "retention 0 must not rotate"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_hot").await,
+            1,
+            "retention 0 keeps the full-history view shape"
+        );
+
+        // Hot reload / admin mutation: same handle, new value — the next round
+        // must pick it up in-round (nothing is cached at spawn time).
+        config.write().await.analytics = Some(sag_config::AnalyticsConfig {
+            enabled: true,
+            storage_dsn: "sqlite://analytics.db".into(),
+            call_log_retention_days: 90,
+        });
+        rotation_round(&pool, &config).await;
+        assert_eq!(
+            scalar(
+                &pool,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'call_logs_arch_%'"
+            )
+            .await,
+            1,
+            "the next round reads the mutated retention and rotates"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_hot").await,
+            0,
+            "the window narrowed to the new 90-day cutoff"
+        );
+
+        pool.close().await;
     }
 
     /// Compute contract: the first run happens after one interval, claims

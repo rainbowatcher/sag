@@ -5,6 +5,7 @@ pub mod event_writer;
 pub mod query;
 pub mod registry;
 pub mod rollup;
+pub mod rotate;
 pub mod sqlite_store;
 pub mod store;
 
@@ -21,12 +22,18 @@ pub use rollup::{
     RollupRunReport, RouteRollupRow, TargetRollupRow, bucket_lower_bound_ms, bucket_to_percentile,
     histogram_bucket_idx, merge_histogram_buckets,
 };
+pub use rotate::{
+    ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, is_schema_change, refresh_views, retire_indexes,
+    rotate_once, unique_archive_name,
+};
 pub use sqlite_store::{MAX_LOG_LIMIT, SqliteLogStore};
 pub use store::*;
+// Re-exported so maintenance callers (the gateway's call_logs rotation
+// scheduler) can name the shared pool type without taking a direct `sqlx`
+// dependency of their own.
+pub use sqlx::sqlite::SqlitePool;
 
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::str::FromStr;
 use std::time::Duration;
 

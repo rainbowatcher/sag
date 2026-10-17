@@ -33,6 +33,9 @@ mime_guess = { workspace = true, optional = true }
 # the formal public API instead of raw SQL.
 chrono = { workspace = true }
 uuid = { workspace = true }
+# Test-only: assert on the raw `call_logs` / `sqlite_master` state that the
+# rotation scheduler produces (the crate has no other SQL surface).
+sqlx = { workspace = true }
 
 [features]
 # When on, sag-ui/dist/ is rolled into the binary at compile time.

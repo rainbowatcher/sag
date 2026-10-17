@@ -71,6 +71,38 @@ async fn ensure_schema_consistency(pool: &SqlitePool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// Run `op` and, if it fails with a SQLite schema-change error
+/// (`SQLITE_SCHEMA` / "database schema has changed"), log a warning and run
+/// it **exactly once** more.
+///
+/// Rotation rewrites the `call_logs` schema (rename + DDL replay) and
+/// rebuilds the read views, which bumps SQLite's schema cookie. sqlx caches
+/// prepared statements per connection, so a statement prepared before the DDL
+/// surfaces a one-shot `SQLITE_SCHEMA` on its next use — re-preparing on a
+/// second attempt succeeds. A second failure is propagated unchanged: the
+/// caller maps it to a 500-style [`AppError`], never a panic.
+///
+/// `op` must be callable twice: it re-builds and re-executes the statement
+/// from scratch (sqlx `Query` consumes its arguments on execute). That is why
+/// the retry granularity is the *whole* statement or method body — see the
+/// call sites — rather than a half-consumed query value.
+async fn with_schema_retry<T, F, Fut>(op: F) -> Result<T, sqlx::Error>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    match op().await {
+        Err(e) if crate::rotate::is_schema_change(&e) => {
+            warn!(
+                error = %e,
+                "prepared statement invalidated by schema change (SQLITE_SCHEMA); retrying once"
+            );
+            op().await
+        }
+        other => other,
+    }
+}
+
 /// SQLite-backed implementation of [`LogStore`].
 pub struct SqliteLogStore {
     pool: SqlitePool,
@@ -112,6 +144,14 @@ impl SqliteLogStore {
         // installs where `pragma_table_info` sees the columns already.
         ensure_schema_consistency(&pool).await?;
 
+        // Existence fallback for the read views, **after** the column repair:
+        // the view column list is taken from the hot table's
+        // `pragma_table_info`, so building it before the ALTERs would bake the
+        // pre-repair shape into the view. `None` builds the full-history
+        // shape, which is a superset of the retention window — the scheduler's
+        // first rotation round narrows it to the real cutoff.
+        crate::rotate::refresh_views(&pool, None).await?;
+
         Ok(Self {
             pool,
             owns_pool: true,
@@ -129,6 +169,9 @@ impl SqliteLogStore {
     /// `call_logs` table is always in the expected shape.
     pub async fn from_pool(pool: SqlitePool) -> Result<Self, sqlx::Error> {
         ensure_schema_consistency(&pool).await?;
+        // Same order invariant as [`Self::new`]: repair columns first, then
+        // (re)build the read views from the repaired hot-table shape.
+        crate::rotate::refresh_views(&pool, None).await?;
         Ok(Self {
             pool,
             owns_pool: false,
@@ -150,88 +193,25 @@ impl LogStore for SqliteLogStore {
             return Ok(());
         }
 
-        // Persist the whole batch in ONE `BEGIN IMMEDIATE` transaction:
-        // atomicity (a batch either fully lands or not at all) and a single
-        // short write-lock hold instead of one lock acquisition per row.
-        // `BEGIN IMMEDIATE` takes the write lock up front so the deferred
-        // `BEGIN` upgrade race (SQLITE_BUSY_SNAPSHOT) under concurrent
-        // writers in WAL mode is avoided; the pool's busy_timeout covers
-        // the wait.
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| AppError::Internal(format!("insert_batch begin: {e}")))?;
-
-        for log in logs {
-            let (prompt, completion, total) = match &log.usage {
-                Some(u) => (
-                    Some(u.prompt_tokens as i64),
-                    Some(u.completion_tokens as i64),
-                    Some(u.total_tokens as i64),
-                ),
-                None => (None, None, None),
-            };
-
-            sqlx::query(
-                r#"
-                INSERT INTO call_logs
-                    (request_id, provider, model, real_model, stream,
-                     status_code, duration_ms,
-                     prompt_tokens, completion_tokens, total_tokens,
-                     error, timestamp,
-                     reasoning_effort,
-                     upstream_duration_ms, ttft_ms,
-                     cached_tokens, cache_creation_tokens, reasoning_tokens,
-                     user_agent, client_ip,
-                     error_category,
-                     ingress_protocol, upstream_protocol, lane,
-                     loss_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?,
-                        ?, ?,
-                        ?,
-                        ?, ?, ?,
-                        ?)
-                "#,
-            )
-            .bind(log.request_id.to_string())
-            .bind(&log.provider)
-            .bind(&log.model)
-            .bind(&log.real_model)
-            .bind(log.stream as i32)
-            .bind(log.status_code as i32)
-            .bind(log.duration_ms as i64)
-            .bind(prompt)
-            .bind(completion)
-            .bind(total)
-            .bind(&log.error)
-            .bind(log.timestamp.timestamp_millis())
-            // Extended CallLog fields.
-            .bind(log.reasoning_effort.as_ref())
-            .bind(log.upstream_duration_ms.map(|v| v as i64))
-            .bind(log.ttft_ms.map(|v| v as i64))
-            .bind(log.cached_tokens.map(|v| v as i64))
-            .bind(log.cache_creation_tokens.map(|v| v as i64))
-            .bind(log.reasoning_tokens.map(|v| v as i64))
-            .bind(log.user_agent.as_ref())
-            .bind(log.client_ip.as_ref())
-            .bind(log.error_category.as_ref())
-            // M7 protocol / lane dimensions.
-            .bind(log.ingress_protocol.as_ref())
-            .bind(log.upstream_protocol.as_ref())
-            .bind(log.lane.as_ref())
-            // M8 LossInventory summary.
-            .bind(log.loss_summary.as_ref())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to insert call log: {e}")))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Internal(format!("insert_batch commit: {e}")))?;
-        Ok(())
+        // Retry granularity = the WHOLE batch body: a failing statement aborts
+        // the transaction (dropping it rolls back), so a retry starts from a
+        // clean slate and can never duplicate rows.
+        with_schema_retry(|| async {
+            // Persist the whole batch in ONE `BEGIN IMMEDIATE` transaction:
+            // atomicity (a batch either fully lands or not at all) and a single
+            // short write-lock hold instead of one lock acquisition per row.
+            // `BEGIN IMMEDIATE` takes the write lock up front so the deferred
+            // `BEGIN` upgrade race (SQLITE_BUSY_SNAPSHOT) under concurrent
+            // writers in WAL mode is avoided; the pool's busy_timeout covers
+            // the wait.
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            for log in logs {
+                insert_call_log_row(&mut tx, log).await?;
+            }
+            tx.commit().await
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("insert_batch failed: {e}")))
     }
 
     async fn query_stats(&self, filter: StatsFilter) -> sag_core::Result<Vec<StatsRow>> {
@@ -247,7 +227,7 @@ impl LogStore for SqliteLogStore {
                 COALESCE(SUM(total_tokens), 0)             AS total_tokens,
                 ROUND(AVG(duration_ms), 1)                 AS avg_duration_ms,
                 SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS error_count
-            FROM call_logs
+            FROM call_logs_hot
             "#,
         );
 
@@ -283,27 +263,27 @@ impl LogStore for SqliteLogStore {
             "#,
         );
 
-        let mut query = sqlx::query_as::<_, StatsRow>(&sql);
-        if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
-            query = query.bind(p);
-        }
-        if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
-            query = query.bind(m);
-        }
-        if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
-            query = query.bind(rm);
-        }
-        if let Some(from) = filter.from {
-            query = query.bind(from.timestamp_millis());
-        }
-        if let Some(to) = filter.to {
-            query = query.bind(to.timestamp_millis());
-        }
-
-        query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("query_stats failed: {e}")))
+        with_schema_retry(|| async {
+            let mut query = sqlx::query_as::<_, StatsRow>(&sql);
+            if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
+                query = query.bind(p);
+            }
+            if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
+                query = query.bind(m);
+            }
+            if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
+                query = query.bind(rm);
+            }
+            if let Some(from) = filter.from {
+                query = query.bind(from.timestamp_millis());
+            }
+            if let Some(to) = filter.to {
+                query = query.bind(to.timestamp_millis());
+            }
+            query.fetch_all(&self.pool).await
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("query_stats failed: {e}")))
     }
 
     async fn query_logs(&self, filter: LogFilter) -> sag_core::Result<Vec<CallLog>> {
@@ -321,7 +301,7 @@ impl LogStore for SqliteLogStore {
                 error_category,
                 ingress_protocol, upstream_protocol, lane,
                 loss_summary
-            FROM call_logs
+            FROM call_logs_hot
             "#,
         );
 
@@ -354,32 +334,35 @@ impl LogStore for SqliteLogStore {
         }
         sql.push_str(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
 
-        let mut query = sqlx::query_as::<_, LogRow>(&sql);
-        if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
-            query = query.bind(p);
-        }
-        if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
-            query = query.bind(m);
-        }
-        if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
-            query = query.bind(rm);
-        }
-        if let Some(StatusCodeFilter::Exact(sc)) = filter.status_code {
-            query = query.bind(sc as i32);
-        }
-        let limit = filter.limit.min(MAX_LOG_LIMIT);
-        query = query.bind(limit as i64).bind(filter.offset as i64);
-
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("query_logs failed: {e}")))?;
+        let rows = with_schema_retry(|| async {
+            let mut query = sqlx::query_as::<_, LogRow>(&sql);
+            if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
+                query = query.bind(p);
+            }
+            if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
+                query = query.bind(m);
+            }
+            if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
+                query = query.bind(rm);
+            }
+            if let Some(StatusCodeFilter::Exact(sc)) = &filter.status_code {
+                query = query.bind(*sc as i32);
+            }
+            let limit = filter.limit.min(MAX_LOG_LIMIT);
+            query
+                .bind(limit as i64)
+                .bind(filter.offset as i64)
+                .fetch_all(&self.pool)
+                .await
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("query_logs failed: {e}")))?;
 
         Ok(rows.into_iter().map(|r| r.into_call_log()).collect())
     }
 
     async fn count_logs(&self, filter: LogFilter) -> sag_core::Result<u64> {
-        let mut sql = String::from("SELECT COUNT(*) FROM call_logs");
+        let mut sql = String::from("SELECT COUNT(*) FROM call_logs_hot");
 
         let mut conditions: Vec<&'static str> = Vec::new();
         if filter.provider.as_deref().is_some_and(|p| !p.is_empty()) {
@@ -408,24 +391,24 @@ impl LogStore for SqliteLogStore {
             sql.push_str(&conditions.join(" AND "));
         }
 
-        let mut query = sqlx::query_scalar::<_, i64>(&sql);
-        if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
-            query = query.bind(p);
-        }
-        if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
-            query = query.bind(m);
-        }
-        if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
-            query = query.bind(rm);
-        }
-        if let Some(StatusCodeFilter::Exact(sc)) = filter.status_code {
-            query = query.bind(sc as i32);
-        }
-
-        let count = query
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("count_logs failed: {e}")))?;
+        let count = with_schema_retry(|| async {
+            let mut query = sqlx::query_scalar::<_, i64>(&sql);
+            if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
+                query = query.bind(p);
+            }
+            if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
+                query = query.bind(m);
+            }
+            if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
+                query = query.bind(rm);
+            }
+            if let Some(StatusCodeFilter::Exact(sc)) = &filter.status_code {
+                query = query.bind(*sc as i32);
+            }
+            query.fetch_one(&self.pool).await
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("count_logs failed: {e}")))?;
 
         Ok(count.max(0) as u64)
     }
@@ -441,7 +424,7 @@ impl LogStore for SqliteLogStore {
                 COALESCE(SUM(prompt_tokens), 0)            AS total_prompt_tokens,
                 COALESCE(SUM(cached_tokens), 0)            AS total_cached_tokens,
                 COALESCE(SUM(cache_creation_tokens), 0)    AS total_cache_creation_tokens
-            FROM call_logs
+            FROM call_logs_hot
             "#,
         );
 
@@ -473,27 +456,27 @@ impl LogStore for SqliteLogStore {
             "#,
         );
 
-        let mut query = sqlx::query_as::<_, CacheStatsRow>(&sql);
-        if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
-            query = query.bind(p);
-        }
-        if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
-            query = query.bind(m);
-        }
-        if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
-            query = query.bind(rm);
-        }
-        if let Some(from) = filter.from {
-            query = query.bind(from.timestamp_millis());
-        }
-        if let Some(to) = filter.to {
-            query = query.bind(to.timestamp_millis());
-        }
-
-        query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("query_cache_stats failed: {e}")))
+        with_schema_retry(|| async {
+            let mut query = sqlx::query_as::<_, CacheStatsRow>(&sql);
+            if let Some(p) = filter.provider.as_deref().filter(|p| !p.is_empty()) {
+                query = query.bind(p);
+            }
+            if let Some(m) = filter.model.as_deref().filter(|m| !m.is_empty()) {
+                query = query.bind(m);
+            }
+            if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
+                query = query.bind(rm);
+            }
+            if let Some(from) = filter.from {
+                query = query.bind(from.timestamp_millis());
+            }
+            if let Some(to) = filter.to {
+                query = query.bind(to.timestamp_millis());
+            }
+            query.fetch_all(&self.pool).await
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("query_cache_stats failed: {e}")))
     }
 
     async fn query_trend(&self, filter: TrendFilter) -> sag_core::Result<Vec<TrendRow>> {
@@ -506,7 +489,7 @@ impl LogStore for SqliteLogStore {
                 COALESCE(SUM(prompt_tokens), 0)   AS prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                 SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) AS success_count
-            FROM call_logs
+            FROM call_logs_hot
             WHERE timestamp >= ?
             "#,
         );
@@ -520,22 +503,23 @@ impl LogStore for SqliteLogStore {
 
         sql.push_str(" GROUP BY bucket ORDER BY bucket");
 
-        let mut query = sqlx::query_as::<_, TrendRow>(&sql)
-            .bind(bucket_ms)
-            .bind(bucket_ms)
-            .bind(filter.from.timestamp_millis());
+        with_schema_retry(|| async {
+            let mut query = sqlx::query_as::<_, TrendRow>(&sql)
+                .bind(bucket_ms)
+                .bind(bucket_ms)
+                .bind(filter.from.timestamp_millis());
 
-        if let Some(p) = &filter.provider {
-            query = query.bind(p);
-        }
-        if let Some(to) = filter.to {
-            query = query.bind(to.timestamp_millis());
-        }
+            if let Some(p) = &filter.provider {
+                query = query.bind(p);
+            }
+            if let Some(to) = filter.to {
+                query = query.bind(to.timestamp_millis());
+            }
 
-        query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| AppError::Internal(format!("query_trend failed: {e}")))
+            query.fetch_all(&self.pool).await
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("query_trend failed: {e}")))
     }
 
     async fn query_distribution(
@@ -570,6 +554,79 @@ impl LogStore for SqliteLogStore {
             self.pool.close().await;
         }
     }
+}
+
+/// Append one [`CallLog`] row inside the caller's batch transaction.
+///
+/// Extracted out of [`LogStore::insert_batch`] so the retry-once wrapper can
+/// re-run the whole batch body: a closure cannot carry a `&mut Transaction`
+/// borrow into the future it returns.
+async fn insert_call_log_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    log: &CallLog,
+) -> Result<(), sqlx::Error> {
+    let (prompt, completion, total) = match &log.usage {
+        Some(u) => (
+            Some(u.prompt_tokens as i64),
+            Some(u.completion_tokens as i64),
+            Some(u.total_tokens as i64),
+        ),
+        None => (None, None, None),
+    };
+
+    sqlx::query(
+        r#"
+                INSERT INTO call_logs
+                    (request_id, provider, model, real_model, stream,
+                     status_code, duration_ms,
+                     prompt_tokens, completion_tokens, total_tokens,
+                     error, timestamp,
+                     reasoning_effort,
+                     upstream_duration_ms, ttft_ms,
+                     cached_tokens, cache_creation_tokens, reasoning_tokens,
+                     user_agent, client_ip,
+                     error_category,
+                     ingress_protocol, upstream_protocol, lane,
+                     loss_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?,
+                        ?, ?,
+                        ?,
+                        ?, ?, ?,
+                        ?)
+                "#,
+    )
+    .bind(log.request_id.to_string())
+    .bind(&log.provider)
+    .bind(&log.model)
+    .bind(&log.real_model)
+    .bind(log.stream as i32)
+    .bind(log.status_code as i32)
+    .bind(log.duration_ms as i64)
+    .bind(prompt)
+    .bind(completion)
+    .bind(total)
+    .bind(&log.error)
+    .bind(log.timestamp.timestamp_millis())
+    // Extended CallLog fields.
+    .bind(log.reasoning_effort.as_ref())
+    .bind(log.upstream_duration_ms.map(|v| v as i64))
+    .bind(log.ttft_ms.map(|v| v as i64))
+    .bind(log.cached_tokens.map(|v| v as i64))
+    .bind(log.cache_creation_tokens.map(|v| v as i64))
+    .bind(log.reasoning_tokens.map(|v| v as i64))
+    .bind(log.user_agent.as_ref())
+    .bind(log.client_ip.as_ref())
+    .bind(log.error_category.as_ref())
+    // M7 protocol / lane dimensions.
+    .bind(log.ingress_protocol.as_ref())
+    .bind(log.upstream_protocol.as_ref())
+    .bind(log.lane.as_ref())
+    // M8 LossInventory summary.
+    .bind(log.loss_summary.as_ref())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Raw row from the `call_logs` table (timestamp stored as INTEGER unix ms).
@@ -720,6 +777,184 @@ mod tests {
             lane: None,
             loss_summary: None,
         }
+    }
+
+    // ─── Read views (rotation query layer) ───────────────────────────
+
+    /// The store-open path must leave both read views in place — every store
+    /// read goes through `call_logs_hot`, so a missing view would turn every
+    /// analytics query into a 500. Both constructors run it: the DSN path
+    /// (`new`) and the shared-pool path (`from_pool`).
+    #[tokio::test]
+    async fn store_open_creates_read_views() {
+        async fn view_names(pool: &SqlitePool) -> Vec<String> {
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+        }
+
+        let expected = vec![
+            crate::rotate::ALL_VIEW.to_string(),
+            crate::rotate::HOT_VIEW.to_string(),
+        ];
+
+        let owned = SqliteLogStore::new_memory().await.unwrap();
+        assert_eq!(view_names(&owned.pool).await, expected, "`new` path");
+
+        let pool = crate::event::test_support::test_pool().await;
+        assert!(view_names(&pool).await.is_empty(), "precondition: no views");
+        let shared = SqliteLogStore::from_pool(pool.clone()).await.unwrap();
+        assert_eq!(view_names(&shared.pool).await, expected, "`from_pool` path");
+    }
+
+    /// With no cold tables the hot view is a single-table passthrough, so
+    /// view-backed reads must return exactly what the base table holds.
+    #[tokio::test]
+    async fn hot_view_reads_match_base_table_without_cold_tables() {
+        let store = SqliteLogStore::new_memory().await.unwrap();
+
+        let now = Utc::now();
+        let logs: Vec<CallLog> = (0..4)
+            .map(|i| {
+                let mut log = make_log("openai", &format!("model-{i}"), "real");
+                log.timestamp = now - chrono::Duration::milliseconds(i * 1_000);
+                log
+            })
+            .collect();
+        store.insert_batch(&logs).await.unwrap();
+
+        let filter = LogFilter {
+            limit: 10,
+            ..Default::default()
+        };
+
+        // query_logs: same rows, same order, same fields as a direct read.
+        let via_view = store.query_logs(filter.clone()).await.unwrap();
+        let direct: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT request_id, model, timestamp FROM call_logs \
+             ORDER BY timestamp DESC LIMIT 10",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(via_view.len(), direct.len());
+        assert_eq!(via_view.len(), 4);
+        for (row, (request_id, model, timestamp)) in via_view.iter().zip(direct.iter()) {
+            assert_eq!(&row.request_id.to_string(), request_id);
+            assert_eq!(&row.model, model);
+            assert_eq!(row.timestamp.timestamp_millis(), *timestamp);
+        }
+
+        // count_logs: same total as a direct `COUNT(*)`.
+        let via_view_count = store.count_logs(filter.clone()).await.unwrap();
+        let direct_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_logs")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(via_view_count, direct_count as u64);
+        assert_eq!(via_view_count, 4);
+
+        // Filtered count also matches the base table.
+        let by_model = LogFilter {
+            model: Some("model-2".into()),
+            ..filter
+        };
+        assert_eq!(store.count_logs(by_model).await.unwrap(), 1);
+    }
+
+    /// `refresh_views(pool, None)` — what the store-open path runs — builds the
+    /// full-history shape, so rows older than any retention cutoff stay
+    /// visible. A windowed rebuild (the scheduler's real cutoff) hides them,
+    /// which is exactly why the open path must not bake a cutoff in.
+    #[tokio::test]
+    async fn store_open_refresh_covers_full_history() {
+        let store = SqliteLogStore::new_memory().await.unwrap();
+
+        let now = Utc::now();
+        let mut legacy = make_log("openai", "legacy", "legacy");
+        legacy.timestamp = now - chrono::Duration::days(400);
+        let mut fresh = make_log("openai", "fresh", "fresh");
+        fresh.timestamp = now - chrono::Duration::hours(1);
+        store.insert_batch(&[legacy, fresh]).await.unwrap();
+
+        // Windowed rebuild: the view body bakes the cutoff literal, so the
+        // 400-day-old row falls out of `call_logs_hot`.
+        let cutoff = (now - chrono::Duration::days(90)).timestamp_millis();
+        crate::rotate::refresh_views(&store.pool, Some(cutoff))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_logs(LogFilter::default()).await.unwrap(),
+            1,
+            "a windowed rebuild must hide out-of-window rows"
+        );
+
+        // Store-open semantics: `None` = full-history shape → both rows.
+        crate::rotate::refresh_views(&store.pool, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_logs(LogFilter::default()).await.unwrap(),
+            2,
+            "the full-history shape must expose every row"
+        );
+        let rows = store
+            .query_logs(LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.model == "legacy"));
+    }
+
+    // ─── Retry-once wrapper (SQLITE_SCHEMA) ─────────────────────────
+
+    /// A schema-change error re-runs the statement exactly once — never more.
+    #[tokio::test]
+    async fn schema_change_error_is_retried_exactly_once() {
+        let calls = std::cell::Cell::new(0);
+        let result: Result<&'static str, sqlx::Error> = with_schema_retry(|| async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(sqlx::Error::Protocol(
+                    "database schema has changed".to_string(),
+                ))
+            } else {
+                Ok("ok")
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(calls.get(), 2, "first attempt + exactly one retry");
+    }
+
+    /// A retry that fails again is propagated (no third attempt), and
+    /// unrelated errors are not retried at all.
+    #[tokio::test]
+    async fn schema_retry_gives_up_after_one_retry_and_skips_other_errors() {
+        let calls = std::cell::Cell::new(0);
+        let result: Result<(), sqlx::Error> = with_schema_retry(|| async {
+            calls.set(calls.get() + 1);
+            Err(sqlx::Error::Protocol(
+                "(code: 17) SQLITE_SCHEMA".to_string(),
+            ))
+        })
+        .await;
+        assert!(result.is_err(), "a second failure must be propagated");
+        assert_eq!(calls.get(), 2, "at most one retry");
+
+        let calls = std::cell::Cell::new(0);
+        let result: Result<(), sqlx::Error> = with_schema_retry(|| async {
+            calls.set(calls.get() + 1);
+            Err(sqlx::Error::Protocol("no such table: nope".to_string()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "unrelated errors must not be retried");
     }
 
     #[tokio::test]

@@ -1999,6 +1999,7 @@ dependencies = [
  "sag-providers",
  "sag-router",
  "sag-state",
+ "sqlx",
  "tokio",
  "tower",
  "tracing",
