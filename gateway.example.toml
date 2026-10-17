@@ -70,6 +70,7 @@ enabled = true
 # the config. Use an absolute path (sqlite:///path/to/db) or ":memory:"
 # to opt out.
 storage_dsn = "sqlite://analytics.db"
+call_log_retention_days = 90   # call_logs 热窗口保留天数；0 = 禁用归档清理（不是"保留 0 天"）
 
 # Gateway client authentication (optional — remove the block to disable)
 [gateway_auth]

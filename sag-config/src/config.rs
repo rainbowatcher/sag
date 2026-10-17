@@ -681,10 +681,18 @@ pub struct AnalyticsConfig {
     pub enabled: bool,
     #[serde(default = "default_storage_dsn")]
     pub storage_dsn: String,
+    /// call_logs hot-window retention in days. Rows older than this are
+    /// rotated out of the hot table into archive partitions. 0 = disabled.
+    #[serde(default = "default_call_log_retention_days")]
+    pub call_log_retention_days: u32,
 }
 
 fn default_storage_dsn() -> String {
     "sqlite://analytics.db".into()
+}
+
+fn default_call_log_retention_days() -> u32 {
+    90
 }
 
 /// Gateway client authentication configuration.
@@ -1575,6 +1583,47 @@ targets = [
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         assert!(config.gateway_auth.is_none());
         assert!(config.analytics.is_none());
+    }
+
+    #[test]
+    fn parse_analytics_call_log_retention_defaults_to_90() {
+        let toml_str = r#"
+[server]
+[analytics]
+enabled = true
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let analytics = config.analytics.unwrap();
+        assert_eq!(analytics.call_log_retention_days, 90);
+    }
+
+    #[test]
+    fn parse_analytics_call_log_retention_explicit_value() {
+        let toml_str = r#"
+[server]
+[analytics]
+enabled = true
+call_log_retention_days = 30
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let analytics = config.analytics.unwrap();
+        assert_eq!(analytics.call_log_retention_days, 30);
+    }
+
+    #[test]
+    fn parse_analytics_call_log_retention_zero_disables() {
+        let toml_str = r#"
+[server]
+[analytics]
+enabled = true
+call_log_retention_days = 0
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let analytics = config.analytics.unwrap();
+        assert_eq!(analytics.call_log_retention_days, 0);
     }
 
     #[test]

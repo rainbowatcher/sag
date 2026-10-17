@@ -73,6 +73,8 @@ enabled = true
 # in `.test-env/xdg/data/sag/analytics-test.db` — never in the developer's
 # user-level XDG directory.
 storage_dsn = "sqlite://analytics-test.db"
+# 测试轨用 1 天，便于手动验证归档轮转；0 = 禁用归档清理。
+call_log_retention_days = 1
 
 # NOTE: [gateway_auth] intentionally NOT included — agent tools
 # (`.kilo/`, `.cline/`, `.kimchi/`) typically connect without Authorization.
