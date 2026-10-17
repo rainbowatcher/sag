@@ -691,8 +691,15 @@ fn default_storage_dsn() -> String {
     "sqlite://analytics.db".into()
 }
 
+/// Default `call_log_retention_days`: 90 days.
+///
+/// The single definition of the default, shared by the serde fallback below
+/// and by callers that need the value without an `[analytics]` section (the
+/// gateway scheduler's per-round retention read).
+pub const DEFAULT_CALL_LOG_RETENTION_DAYS: u32 = 90;
+
 fn default_call_log_retention_days() -> u32 {
-    90
+    DEFAULT_CALL_LOG_RETENTION_DAYS
 }
 
 /// Gateway client authentication configuration.

@@ -355,6 +355,14 @@ async fn load_analytics_stack(
     //     window that no round corrects for another 24h).
     let collector =
         Arc::new(sag_analytics::CallLogCollector::new_shared(analytics_pool.clone()).await?);
+    //     Failure boundary: every fallible step of this function — the pool
+    //     open, the identity sync and the store open above — runs *before*
+    //     the spawns below, and no step after them can return `Err`. That is
+    //     deliberate: dropping a `*SchedulerHandle` only drops its
+    //     `JoinHandle`, and `JoinHandle::drop` *detaches* (does not abort) the
+    //     task, so a `?` placed after the spawns would leak a live
+    //     maintenance task on the startup error path. New fallible work must
+    //     go above this point (or abort the handles explicitly on failure).
     // 5b. 1h rollup engine over the SAME shared pool (one pool for writer /
     //     registry / query / rollup — a failed sync aborts startup above,
     //     so the rollup can only ever see a migrated, consistent DB). The
@@ -836,9 +844,18 @@ fn unix_now_ms() -> i64 {
 /// catch-up rounds.
 const ROTATION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Fallback `call_log_retention_days` when `[analytics]` is absent — the same
-/// 90 days [`sag_config::AnalyticsConfig`] defaults to.
-const DEFAULT_CALL_LOG_RETENTION_DAYS: u32 = 90;
+/// Upper bound on the retention window used to derive the rotation cutoff
+/// (~10 years).
+///
+/// The cutoff arithmetic is `now - retention * 86_400_000`, and while every
+/// `u32` day count fits in `i64` today (`u32::MAX` days ≈ 3.7e17 ms =
+/// 371_085_174_288_000_000 ms ≪ `i64::MAX`), the clamp keeps the subtraction
+/// bounded independently of the configured width: no overflow, no debug-build
+/// panic, no behavior change.
+/// A retention that large already means "keep everything", so clamping it to
+/// ten years keeps that semantic (rotation never fires) while logging the
+/// clamp at `debug!` instead of silently pretending the value was honored.
+const MAX_CALL_LOG_RETENTION_DAYS: u32 = 3650;
 
 /// Spawn the `call_logs` rotation scheduler over the shared analytics pool.
 ///
@@ -894,25 +911,24 @@ fn spawn_rotation_scheduler(
 /// One `call_logs` rotation round: **retire → rotate → refresh**, in that
 /// order (the order is load-bearing: the index sweep must run against the cold
 /// tables the previous round produced, and the refresh must be the last step so
-/// the views end up matching the cutoff the round just computed).
+/// the views end up matching the cutoff the round just computed). The sequence
+/// itself is [`sag_analytics::run_rotation_round`] — the single definition
+/// shared with the integration tests — so this wrapper only supplies the
+/// per-round config read, the clamp and the scheduler logging.
 ///
 /// Retention is re-read from the live config on **every** round, so a hot
 /// reload / admin change takes effect on the next round without a restart.
 /// `call_log_retention_days == 0` disables the feature: no retirement, no
 /// rotation and no window narrowing (the full-history view shape is the
-/// terminal state).
+/// terminal state) — the shared round reports that as
+/// [`sag_analytics::RoundOutcome::Skipped`] without touching the database.
 ///
-/// `refresh_views` runs unconditionally, including on rounds that rotate
-/// nothing, because the retention cutoff is a literal inside the view bodies —
-/// an un-refreshed window would never move forward. On a rotating round the
-/// views were already rebuilt inside the rotation transaction, so this refresh
-/// is an idempotent rebuild; on a non-rotating round it is the only thing that
-/// advances the cutoff.
+/// `refresh_views` runs unconditionally inside the shared round, including on
+/// rounds that rotate nothing, because the retention cutoff is a literal inside
+/// the view bodies — an un-refreshed window would never move forward.
 ///
 /// Every failure is warned about and retried on the next round: maintenance
-/// never panics and never takes the gateway down. A failed rotation returns
-/// early (the views were not damaged, so there is nothing to refresh) — the
-/// next round retries both steps.
+/// never panics and never takes the gateway down.
 async fn rotation_round(pool: &sag_analytics::SqlitePool, config: &sag_config::ConfigHandle) {
     let retention: u32 = config
         .read()
@@ -920,26 +936,30 @@ async fn rotation_round(pool: &sag_analytics::SqlitePool, config: &sag_config::C
         .analytics
         .as_ref()
         .map(|a| a.call_log_retention_days)
-        .unwrap_or(DEFAULT_CALL_LOG_RETENTION_DAYS);
-    if retention == 0 {
-        // 0 = disabled: no rotation, no retirement, no window narrowing.
-        return;
+        .unwrap_or(sag_config::DEFAULT_CALL_LOG_RETENTION_DAYS);
+    // Clamp before the round computes its cutoff: the retention decides *when*
+    // a row leaves the hot window, so a value beyond the clamp is already
+    // "rotate nothing". The clamp keeps the cutoff in a sane domain (a
+    // `u32::MAX` day count would otherwise ask for a window ≈ 11.7 million
+    // years long); the round's own arithmetic is saturating on top of this.
+    let effective_retention = retention.min(MAX_CALL_LOG_RETENTION_DAYS);
+    if effective_retention != retention {
+        tracing::debug!(
+            requested_days = retention,
+            effective_days = effective_retention,
+            "call_log_retention_days exceeds the supported maximum; clamping the rotation cutoff"
+        );
     }
-    let cutoff_ms = unix_now_ms() - retention as i64 * 86_400_000;
 
-    if let Err(e) = sag_analytics::retire_indexes(pool, cutoff_ms).await {
-        tracing::warn!(error = %e, "index retirement failed; retrying next cycle");
-    }
-    match sag_analytics::rotate_once(pool, cutoff_ms).await {
-        Ok(Some(arch)) => tracing::info!(arch, "rotation round moved call_logs into archive"),
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "rotation failed; retrying next cycle");
-            return;
+    match sag_analytics::run_rotation_round(pool, effective_retention).await {
+        Ok(outcome) => {
+            if let Some(arch) = outcome.rotated() {
+                tracing::info!(arch, "rotation round moved call_logs into archive");
+            }
         }
-    }
-    if let Err(e) = sag_analytics::refresh_views(pool, Some(cutoff_ms)).await {
-        tracing::warn!(error = %e, "view refresh failed; retrying next cycle");
+        // A failed round rolled back atomically; the next round retries every
+        // step (retirement, rotation and refresh).
+        Err(e) => tracing::warn!(error = %e, "rotation round failed; retrying next cycle"),
     }
 }
 
@@ -963,14 +983,27 @@ impl RotationSchedulerHandle {
     /// it) only holds approximately — the drain may race the rollback briefly.
     /// SQLite transactions stay atomic either way.
     async fn shutdown(self) {
+        self.shutdown_with_timeout(Duration::from_secs(5)).await;
+    }
+
+    /// The body of [`Self::shutdown`] with an injectable join bound.
+    ///
+    /// Production always passes 5s; the parameter exists so the timeout →
+    /// abort path is testable in milliseconds instead of taking the full
+    /// bound (that path is the one that decides whether a hung task can
+    /// outlive shutdown). Behavior is identical to `shutdown()` otherwise.
+    async fn shutdown_with_timeout(self, join_timeout: Duration) {
         // `timeout` consumes the `JoinHandle`, so grab the abort handle first.
         let abort = self.task.abort_handle();
         let _ = self.shutdown_tx.send(());
-        match tokio::time::timeout(Duration::from_secs(5), self.task).await {
+        match tokio::time::timeout(join_timeout, self.task).await {
             Ok(Ok(())) => info!("rotation scheduler shut down"),
             Ok(Err(e)) => tracing::error!(error = %e, "rotation scheduler task panicked"),
             Err(_) => {
-                tracing::error!("rotation scheduler did not stop within 5s; aborting it");
+                tracing::error!(
+                    timeout = ?join_timeout,
+                    "rotation scheduler did not stop in time; aborting it"
+                );
                 abort.abort();
             }
         }
@@ -997,14 +1030,27 @@ impl RollupSchedulerHandle {
     /// shutdown-order guarantee (drain happens last, no background writer after
     /// it) only holds approximately — the drain may race the rollback briefly.
     async fn shutdown(self) {
+        self.shutdown_with_timeout(Duration::from_secs(5)).await;
+    }
+
+    /// The body of [`Self::shutdown`] with an injectable join bound.
+    ///
+    /// Production always passes 5s; the parameter exists so the timeout →
+    /// abort path is testable in milliseconds instead of taking the full
+    /// bound (that path is the one that decides whether a hung task can
+    /// outlive shutdown). Behavior is identical to `shutdown()` otherwise.
+    async fn shutdown_with_timeout(self, join_timeout: Duration) {
         // `timeout` consumes the `JoinHandle`, so grab the abort handle first.
         let abort = self.task.abort_handle();
         let _ = self.shutdown_tx.send(());
-        match tokio::time::timeout(Duration::from_secs(5), self.task).await {
+        match tokio::time::timeout(join_timeout, self.task).await {
             Ok(Ok(())) => info!("rollup scheduler shut down"),
             Ok(Err(e)) => tracing::error!(error = %e, "rollup scheduler task panicked"),
             Err(_) => {
-                tracing::error!("rollup scheduler did not stop within 5s; aborting it");
+                tracing::error!(
+                    timeout = ?join_timeout,
+                    "rollup scheduler did not stop in time; aborting it"
+                );
                 abort.abort();
             }
         }
@@ -1366,6 +1412,101 @@ mod tests {
         sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
     }
 
+    /// Sends when the task's future is dropped — i.e. when the abort lands.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// A fake scheduler task that ignores its shutdown signal (only the abort
+    /// can end it) plus the pieces a scheduler handle needs. `dropped_rx`
+    /// resolves when the task's future is dropped, which is how the abort is
+    /// observed.
+    fn pending_scheduler_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _guard = DropSignal(Some(dropped_tx));
+            // The fake scheduler never observes the shutdown signal: only the
+            // abort can end it. Holding the receiver here keeps the send
+            // succeeding (that it is ignored is the point).
+            let _shutdown_rx = shutdown_rx;
+            std::future::pending::<()>().await;
+        });
+        (task, shutdown_tx, dropped_rx)
+    }
+
+    /// Assert that a scheduler `shutdown_with_timeout` call returns at the
+    /// injected bound (instead of waiting for a task that never finishes) and
+    /// **aborts** the task rather than detaching it — the abort drops the
+    /// task's future, which is what runs `DropSignal::drop`.
+    async fn assert_shutdown_aborts_on_timeout<F>(
+        shutdown: F,
+        timeout: Duration,
+        dropped_rx: tokio::sync::oneshot::Receiver<()>,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        let started = tokio::time::Instant::now();
+        shutdown.await;
+        let elapsed = started.elapsed();
+
+        // ① The call returned on the timeout instead of waiting for a task that
+        //    never finishes (and it really did take the timeout path).
+        assert!(
+            elapsed >= timeout,
+            "shutdown returned before the join bound ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must not block past the bound ({elapsed:?})"
+        );
+
+        // ② The task was aborted, not detached: its future is dropped. The
+        //    abort is fire-and-forget, so poll with a bound rather than
+        //    assuming it lands synchronously.
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("aborted task was never dropped (task leaked)")
+            .expect("drop signal sender vanished");
+    }
+
+    /// RAII temporary directory: `Drop` removes the tree, so a panicking
+    /// assertion still cleans up instead of leaking `sag-gateway-*` dirs into
+    /// the system temp dir (the same contract `sag-analytics`' `TempDb` has).
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        /// Unique per call (`uuid` suffix), so tests running in parallel can
+        /// never collide on the same path.
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     /// §F test 17 — shutdown ordering. The rotation scheduler runs one
     /// complete round as its first action (no 24h wait), `shutdown` joins it
     /// so no DDL transaction is in flight, and both analytics writers are
@@ -1374,9 +1515,7 @@ mod tests {
     /// what makes the drain the last writer on the analytics DB.
     #[tokio::test]
     async fn rotation_scheduler_shuts_down_before_event_drain() {
-        let dir =
-            std::env::temp_dir().join(format!("sag-gateway-rotation-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("sag-gateway-rotation");
         let db = dir.join("analytics.db");
         let pool = sag_analytics::open_analytics_pool(db.to_str().unwrap())
             .await
@@ -1491,7 +1630,66 @@ mod tests {
         );
 
         pool.close().await;
-        let _ = std::fs::remove_dir_all(&dir);
+        // `dir`'s `Drop` removes the directory — including on an assertion
+        // panic above, which is why it is not a manual `remove_dir_all` here.
+    }
+
+    /// §F 17 (timeout half) — a task that ignores the shutdown signal must not
+    /// hang process exit: `shutdown_with_timeout` returns at the bound and
+    /// aborts the task. The short injected bound keeps the test at ~50ms
+    /// instead of the production 5s; `shutdown()` still passes 5s.
+    #[tokio::test]
+    async fn rotation_scheduler_shutdown_aborts_task_on_join_timeout() {
+        let (task, shutdown_tx, dropped_rx) = pending_scheduler_task();
+        let handle = RotationSchedulerHandle { task, shutdown_tx };
+
+        let timeout = Duration::from_millis(50);
+        assert_shutdown_aborts_on_timeout(
+            handle.shutdown_with_timeout(timeout),
+            timeout,
+            dropped_rx,
+        )
+        .await;
+    }
+
+    /// Retention clamp: a huge `call_log_retention_days` must not panic on the
+    /// cutoff arithmetic and keeps the "keep everything" semantics (no
+    /// rotation, the in-window row stays in the hot table).
+    #[tokio::test]
+    async fn rotation_round_clamps_extreme_retention_without_panicking() {
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let collector = sag_analytics::CallLogCollector::new_shared(pool.clone())
+            .await
+            .unwrap();
+        collector.log(call_log("recent", unix_now_ms()));
+        collector.flush().await;
+
+        rotation_round(&pool, &maintenance_config(u32::MAX)).await;
+
+        assert_eq!(
+            scalar(
+                &pool,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name LIKE 'call_logs_arch_%'"
+            )
+            .await,
+            0,
+            "a clamped (effectively infinite) retention must not rotate"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs").await,
+            1,
+            "the row stays in the hot table"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs_hot").await,
+            1,
+            "the clamped cutoff still covers every row"
+        );
+
+        pool.close().await;
     }
 
     /// §F 15 (config half) — retention is re-read from the live config on
@@ -1613,5 +1811,23 @@ mod tests {
 
         // Shutdown: task stops promptly and the join reports no panic.
         handle.shutdown().await;
+    }
+
+    /// §F 17 (rollup timeout half) — the same guard as the rotation scheduler:
+    /// a rollup task that ignores the shutdown signal must not hang process
+    /// exit. `shutdown_with_timeout` returns at the injected bound and aborts
+    /// the task; `shutdown()` still passes the production 5s.
+    #[tokio::test]
+    async fn rollup_scheduler_shutdown_aborts_task_on_join_timeout() {
+        let (task, shutdown_tx, dropped_rx) = pending_scheduler_task();
+        let handle = RollupSchedulerHandle { task, shutdown_tx };
+
+        let timeout = Duration::from_millis(50);
+        assert_shutdown_aborts_on_timeout(
+            handle.shutdown_with_timeout(timeout),
+            timeout,
+            dropped_rx,
+        )
+        .await;
     }
 }

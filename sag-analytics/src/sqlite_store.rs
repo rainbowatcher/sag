@@ -72,8 +72,8 @@ async fn ensure_schema_consistency(pool: &SqlitePool) -> Result<(), sqlx::Error>
 }
 
 /// Run `op` and, if it fails with a SQLite schema-change error
-/// (`SQLITE_SCHEMA` / "database schema has changed"), log a warning and run
-/// it **exactly once** more.
+/// (`SQLITE_SCHEMA`, result code 17 / "database schema has changed"), log a
+/// warning and run it **exactly once** more.
 ///
 /// Rotation rewrites the `call_logs` schema (rename + DDL replay) and
 /// rebuilds the read views, which bumps SQLite's schema cookie. sqlx caches
@@ -85,7 +85,9 @@ async fn ensure_schema_consistency(pool: &SqlitePool) -> Result<(), sqlx::Error>
 /// `op` must be callable twice: it re-builds and re-executes the statement
 /// from scratch (sqlx `Query` consumes its arguments on execute). That is why
 /// the retry granularity is the *whole* statement or method body — see the
-/// call sites — rather than a half-consumed query value.
+/// call sites — rather than a half-consumed query value. A write call site
+/// must keep `COMMIT` outside the closure so a retry can never insert the
+/// same rows twice.
 async fn with_schema_retry<T, F, Fut>(op: F) -> Result<T, sqlx::Error>
 where
     F: Fn() -> Fut,
@@ -193,10 +195,14 @@ impl LogStore for SqliteLogStore {
             return Ok(());
         }
 
-        // Retry granularity = the WHOLE batch body: a failing statement aborts
-        // the transaction (dropping it rolls back), so a retry starts from a
-        // clean slate and can never duplicate rows.
-        with_schema_retry(|| async {
+        // Retry scope = the **statement phase only**: `BEGIN IMMEDIATE` plus
+        // the row inserts. A failing statement aborts the transaction, and
+        // dropping it rolls it back, so a retry starts from a clean slate and
+        // can never duplicate rows. `commit()` deliberately sits *outside*
+        // this closure: a failed `COMMIT` leaves the batch uncommitted (sqlx
+        // drops the still open transaction, queueing its rollback), so
+        // replaying the batch after it would insert the rows twice.
+        let tx = with_schema_retry(|| async {
             // Persist the whole batch in ONE `BEGIN IMMEDIATE` transaction:
             // atomicity (a batch either fully lands or not at all) and a single
             // short write-lock hold instead of one lock acquisition per row.
@@ -208,10 +214,18 @@ impl LogStore for SqliteLogStore {
             for log in logs {
                 insert_call_log_row(&mut tx, log).await?;
             }
-            tx.commit().await
+            Ok(tx)
         })
         .await
-        .map_err(|e| AppError::Internal(format!("insert_batch failed: {e}")))
+        .map_err(|e| AppError::Internal(format!("insert_batch failed: {e}")))?;
+
+        // Single, un-retried commit. If `COMMIT` fails, sqlx drops the still
+        // open transaction, which queues a rollback — the batch stays
+        // invisible, so replaying it inside the retry scope could only ever
+        // insert it twice. The error is surfaced instead.
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("insert_batch commit failed: {e}")))
     }
 
     async fn query_stats(&self, filter: StatsFilter) -> sag_core::Result<Vec<StatsRow>> {
@@ -940,7 +954,7 @@ mod tests {
         let result: Result<(), sqlx::Error> = with_schema_retry(|| async {
             calls.set(calls.get() + 1);
             Err(sqlx::Error::Protocol(
-                "(code: 17) SQLITE_SCHEMA".to_string(),
+                "(code: 17) database schema has changed".to_string(),
             ))
         })
         .await;

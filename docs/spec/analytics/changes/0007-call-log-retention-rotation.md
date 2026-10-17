@@ -148,18 +148,18 @@ COMMIT
 
 | 文件 | 变更 |
 |------|------|
-| [`sag-analytics/src/rotate.rs`](sag-analytics/src/rotate.rs) | 新增模块：`rotate_once`（探测 + 单事务 6 步 DDL）、`refresh_views` / `build_views_in_tx`（两视图构建，热表 cid 序 + `NULL AS` 补列）、`retire_indexes`（通用幂等索引退役巡检）、`unique_archive_name`（同秒去重）、`is_schema_change`（SQLITE_SCHEMA 分类）、`assert_replay_faithful`（回放保真校验）；常量 `HOT_TABLE` / `HOT_VIEW` / `ALL_VIEW` / `ARCH_PREFIX`；11 条内联单元测试 |
+| [`sag-analytics/src/rotate.rs`](sag-analytics/src/rotate.rs) | 新增模块：`rotate_once`（探测 + 单事务 6 步 DDL）、`refresh_views` / `build_views_in_tx`（两视图构建，热表 cid 序 + `NULL AS` 补列）、`retire_indexes`（通用幂等索引退役巡检）、`unique_archive_name`（同秒去重）、`is_schema_change`（SQLITE_SCHEMA 分类）、`assert_replay_faithful`（回放保真校验）、`run_rotation_round` + `RoundOutcome`（生产 / 测试同源的共享维护入口，消除 gateway 侧双副本）；常量 `HOT_TABLE` / `HOT_VIEW` / `ALL_VIEW` / `ARCH_PREFIX`；15 条内联单元测试（原 11 条 + `run_rotation_round` 4 条） |
 | [`sag-analytics/src/lib.rs`](sag-analytics/src/lib.rs) | 导出 `rotate` 模块与 `rotate_once` / `refresh_views` / `retire_indexes` / `is_schema_change` / 视图与表名常量；重新导出 `sqlx::sqlite::SqlitePool`，让 gateway 的维护任务不必直接依赖 sqlx |
 | [`sag-analytics/src/sqlite_store.rs`](sag-analytics/src/sqlite_store.rs) | 5 个查询方法（`query_stats` / `query_logs` / `count_logs` / `query_cache_stats` / `query_trend`）由 `FROM call_logs` 改为 `FROM call_logs_hot`；新增 `with_schema_retry`（`SQLITE_SCHEMA` 只重试一次）并包住 5 个查询方法与 `insert_batch`；`new` / `from_pool` 在 `ensure_schema_consistency` 之后追加 `refresh_views(pool, None)`；新增 5 条内联测试（视图存在性、热表无冷表时读一致、全史兜底、retry 恰好一次、非 schema 错误不重试） |
-| [`sag-gateway/src/main.rs`](sag-gateway/src/main.rs) | 新增 `spawn_rotation_scheduler` / `rotation_round` / `RotationSchedulerHandle`：首轮立即跑完整一轮（retire → rotate → refresh）、每轮热读配置（0 = 跳过）、24h interval + `MissedTickBehavior::Skip`、shutdown 走 oneshot + 5s join；`load_analytics_stack` 在 rollup 旁 spawn；`graceful_shutdown` 抽出 `shutdown_analytics_writers`，顺序为 rollup → rotation → event drain；新增 1 条 shutdown 顺序测试 |
+| [`sag-gateway/src/main.rs`](sag-gateway/src/main.rs) | 新增 `spawn_rotation_scheduler` / `rotation_round` / `RotationSchedulerHandle`：首轮立即跑完整一轮（retire → rotate → refresh）、每轮热读配置（0 = 跳过）、24h interval + `MissedTickBehavior::Skip`、shutdown 走 oneshot + 5s join；`load_analytics_stack` 在 rollup 旁 spawn；`graceful_shutdown` 抽出 `shutdown_analytics_writers`，顺序为 rollup → rotation → event drain；`MAX_CALL_LOG_RETENTION_DAYS = 3650` 钳制 + `debug!` 记录；rollup / rotation 两个 scheduler handle 统一提供 `shutdown_with_timeout`（join 超时 abort）；新增 shutdown 顺序与超时上界测试 |
 | [`sag-analytics/tests/call_logs_rotation.rs`](sag-analytics/tests/call_logs_rotation.rs) | 新增 5 条集成测试（文件库 + 共享池）：启动积压首轮、并发写入轮转、视图原子性、`retention=0` 与热重载、轮转后旧统计的热窗口语义 |
 | [`sag-gateway/Cargo.toml`](sag-gateway/Cargo.toml) | 测试期新增 `sqlx` 依赖（断言轮转产生的 `call_logs` / `sqlite_master` 原始状态） |
-| [`sag-config/src/config.rs`](sag-config/src/config.rs) | `AnalyticsConfig` 新增 `call_log_retention_days: u32`（默认 90，0 = 禁用）+ 3 条解析测试（先行落地） |
+| [`sag-config/src/config.rs`](sag-config/src/config.rs) | `AnalyticsConfig` 新增 `call_log_retention_days: u32`（默认 90，0 = 禁用）+ 3 条解析测试（先行落地）；导出 `DEFAULT_CALL_LOG_RETENTION_DAYS` 供 gateway 复用默认值 |
 | [`Cargo.lock`](Cargo.lock) | 依赖图更新 |
 
 ## 测试
 
-**单元（`sag-analytics/src/rotate.rs`，`:memory:`）**：
+**单元（`sag-analytics/src/rotate.rs`，`:memory:`）**：共 15 条内联单测（1–11 为原始 11 条，末尾 4 条为 `run_rotation_round` 入口）。
 
 1. `rotate_once_skips_when_hot_empty_or_all_in_window` — 空表 / 全部在窗内两例均 `Ok(None)`，无冷表产生。
 2. `rotate_once_moves_all_rows_and_resets_hot` — 轮转后热表 0 行、冷表行数 == 原热表、冷表名匹配 `call_logs_arch_\d{8}_\d{6}`；随后 INSERT 的 `id == 1`（`sqlite_sequence` 随 RENAME 带走）。
@@ -172,6 +172,13 @@ COMMIT
 9. `retire_indexes_drops_only_expired_tables_indexes` — 合成两张带手工索引的冷表：过窗表 0 索引、窗内表索引原封不动；重复跑幂等（第二轮返回 0）。
 10. `sqlx_cached_statements_survive_rotation` — 预热语句缓存 → `rotate_once`（含视图重建）→ 同一查询仍成功且行数正确；`is_schema_change` 正例 / 反例分类。
 11. `refresh_views_is_idempotent` — 连跑两次 refresh 定义与结果不变；第二次 `rotate_once` 返回 `None`。
+
+`run_rotation_round` 入口（与 gateway 共用同一实现，消除双副本）：
+
+- `run_rotation_round_skips_when_retention_disabled` — `retention=0` 返回 `RoundOutcome::Skipped`，无冷表产生、热表行不动。
+- `run_rotation_round_rotates_backlog` — 积压数据首轮即产出冷表并刷新视图。
+- `run_rotation_round_survives_max_retention` — `u32::MAX` 天不溢出、不轮转（等价「全部保留」）。
+- `run_rotation_round_without_backlog_only_refreshes` — 无积压时仅 refresh，`rotated == None`。
 
 **单元（`sag-analytics/src/sqlite_store.rs`）**：
 

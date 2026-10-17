@@ -23,8 +23,8 @@ pub use rollup::{
     histogram_bucket_idx, merge_histogram_buckets,
 };
 pub use rotate::{
-    ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, is_schema_change, refresh_views, retire_indexes,
-    rotate_once, unique_archive_name,
+    ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, RoundOutcome, is_schema_change, refresh_views,
+    retire_indexes, rotate_once, run_rotation_round, unique_archive_name,
 };
 pub use sqlite_store::{MAX_LOG_LIMIT, SqliteLogStore};
 pub use store::*;

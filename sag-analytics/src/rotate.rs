@@ -76,6 +76,11 @@ pub const ARCH_PREFIX: &str = "call_logs_arch_";
 /// must have it (it is `NOT NULL` since the initial migration).
 const TIMESTAMP_COLUMN: &str = "timestamp";
 
+/// Milliseconds per day — the unit of a retention setting. Callers pass a
+/// **day** count (the gateway's `call_log_retention_days`), never a
+/// millisecond value.
+const DAY_MS: i64 = 86_400_000;
+
 /// One captured `sqlite_master` index row (`sql` is never NULL: implicit
 /// `sqlite_autoindex_*` entries are filtered out because they cannot be
 /// dropped nor replayed).
@@ -105,7 +110,11 @@ struct ColumnInfo {
 /// tables and both views exactly as they were.
 pub async fn rotate_once(pool: &SqlitePool, cutoff_ms: i64) -> Result<Option<String>, sqlx::Error> {
     // Trigger probe, outside the transaction — the only maintenance query
-    // that reads `call_logs` directly.
+    // that reads `call_logs` directly. Its result decides *whether* this
+    // round rotates, and nothing else: the probe borrows one pooled
+    // connection while the `BEGIN IMMEDIATE` below may land on another, so
+    // any read that has to agree with the rotation snapshot (view members,
+    // row counts, …) must be taken **inside** the transaction, never here.
     let min_ts: Option<i64> =
         sqlx::query_scalar(&format!("SELECT MIN({TIMESTAMP_COLUMN}) FROM {HOT_TABLE}"))
             .fetch_one(pool)
@@ -193,6 +202,107 @@ pub async fn refresh_views(pool: &SqlitePool, cutoff_ms: Option<i64>) -> Result<
     Ok(())
 }
 
+/// Outcome of one [`run_rotation_round`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoundOutcome {
+    /// `call_log_retention_days == 0` (rotation disabled): the round touched
+    /// nothing at all — no retirement, no rotation, no window narrowing.
+    Skipped,
+    /// The round ran to completion. `rotated` is the cold table the hot rows
+    /// were moved into (`None` when nothing was old enough to rotate), and
+    /// `retired_indexes` counts the cold-table indexes the sweep dropped.
+    Ran {
+        rotated: Option<String>,
+        retired_indexes: usize,
+    },
+}
+
+impl RoundOutcome {
+    /// The cold table this round produced, if it rotated anything.
+    pub fn rotated(&self) -> Option<&str> {
+        match self {
+            Self::Skipped | Self::Ran { rotated: None, .. } => None,
+            Self::Ran {
+                rotated: Some(arch),
+                ..
+            } => Some(arch),
+        }
+    }
+
+    /// Number of cold-table indexes dropped by this round (`0` when the
+    /// round was skipped).
+    pub fn retired_indexes(&self) -> usize {
+        match self {
+            Self::Skipped => 0,
+            Self::Ran {
+                retired_indexes, ..
+            } => *retired_indexes,
+        }
+    }
+}
+
+/// One full maintenance round: **retire → rotate → refresh**, in that order.
+///
+/// The order is load-bearing (and is the single definition of "a round" —
+/// the gateway scheduler and the rotation integration tests both call this
+/// function instead of replaying the three steps by hand):
+///
+/// - retirement runs first, against the cold tables the **previous** rounds
+///   produced;
+/// - rotation moves the whole hot table into a new cold table and rebuilds
+///   the views inside its own transaction;
+/// - the refresh runs **unconditionally**, including on rounds that rotated
+///   nothing, because the cutoff is baked into the view bodies as a literal —
+///   an un-refreshed window would never move forward. On a rotating round it
+///   is an idempotent rebuild.
+///
+/// `retention_days` is supplied by the caller (the gateway re-reads it from
+/// the live config on every round), so this crate takes no `sag-config`
+/// dependency. `retention_days == 0` disables the feature entirely and
+/// returns [`RoundOutcome::Skipped`] without touching the database.
+///
+/// Failure policy mirrors the scheduler's: a failed **retirement** is logged
+/// and the round continues (it must not block rotation); a failed
+/// **rotation** aborts the round and is propagated (it rolled back
+/// atomically, so the views still describe the pre-round world and there is
+/// nothing to refresh); a failed **refresh** is propagated as well (the round
+/// ends there anyway). Callers log and retry on the next round — maintenance
+/// never panics.
+pub async fn run_rotation_round(
+    pool: &SqlitePool,
+    retention_days: u32,
+) -> Result<RoundOutcome, sqlx::Error> {
+    if retention_days == 0 {
+        return Ok(RoundOutcome::Skipped);
+    }
+    // Saturating on both ends: every `u32` day count fits in `i64` today
+    // (`u32::MAX` days ≈ 3.7e17 ms ≪ `i64::MAX`), but the arithmetic must not
+    // panic if the retention type ever widens or the clock jumps backwards —
+    // maintenance never panics. A saturated cutoff is "keep everything".
+    let cutoff_ms = Utc::now()
+        .timestamp_millis()
+        .saturating_sub(i64::from(retention_days).saturating_mul(DAY_MS));
+
+    // No test injection point reaches this failure branch (`retire_indexes`
+    // talks to the pool directly); the behaviour is warn + continue, matching
+    // the original gateway implementation.
+    let retired_indexes = match retire_indexes(pool, cutoff_ms).await {
+        Ok(dropped) => dropped,
+        Err(e) => {
+            tracing::warn!(error = %e, "index retirement failed; retrying next cycle");
+            0
+        }
+    };
+
+    let rotated = rotate_once(pool, cutoff_ms).await?;
+    refresh_views(pool, Some(cutoff_ms)).await?;
+
+    Ok(RoundOutcome::Ran {
+        rotated,
+        retired_indexes,
+    })
+}
+
 /// Retire the indexes of every cold table that has fallen out of the window
 /// (`MAX(timestamp) < cutoff_ms`). Cold tables inside the window keep their
 /// indexes untouched; the pass is idempotent and returns the number of
@@ -242,16 +352,40 @@ pub async fn unique_archive_name(pool: &SqlitePool) -> Result<String, sqlx::Erro
     }
 }
 
-/// Does this sqlx error look like a stale prepared statement
-/// (`database schema has changed` / `SQLITE_SCHEMA`)?
+/// Does this sqlx error mean a cached prepared statement went stale
+/// (`SQLITE_SCHEMA`, SQLite result code 17)?
 ///
 /// Rotation and view rebuilds bump the schema cookie, and every pool
 /// connection caches its own prepared statements, so a read prepared before
 /// the DDL can come back as a schema-change error. Query paths use this to
 /// retry **once** instead of surfacing a 500.
+///
+/// Two detectors, deliberately kept as a belt-and-braces pair:
+///
+/// - **structured**: `sqlx` exposes the numeric SQLite result code through
+///   `DatabaseError::code()`, so a real reprepare failure is `"17"`
+///   (`SQLITE_SCHEMA` has no extended variants, so the extended code is 17
+///   too). This is the authoritative test.
+/// - **text**: `sqlx` renders a driver error as `(code: <n>) <sqlite3_errmsg>`
+///   and code 17's errmsg is exactly `database schema has changed`. A
+///   code-less error (`sqlx::Error::Protocol`, e.g. one built by our own
+///   code or by a test) carries no numeric code, so the errmsg is the only
+///   signal left — without this fallback such an error would silently stop
+///   being retried and surface as a 500.
+///
+/// The symbolic name `SQLITE_SCHEMA` is **not** matched: sqlx never renders
+/// it (`sqlx-sqlite` writes the numeric code plus `sqlite3_errmsg`), so
+/// matching it would be a branch no production path can reach.
 pub fn is_schema_change(e: &sqlx::Error) -> bool {
-    let message = e.to_string();
-    message.contains("database schema has changed") || message.contains("SQLITE_SCHEMA")
+    /// `SQLITE_SCHEMA`, as rendered by `sqlx-sqlite`'s `DatabaseError::code`.
+    const SQLITE_SCHEMA_CODE: &str = "17";
+
+    let code = e.as_database_error().and_then(|db| db.code());
+    if code.as_deref() == Some(SQLITE_SCHEMA_CODE) {
+        return true;
+    }
+    // SQLite's `sqlite3_errmsg` text for result code 17.
+    e.to_string().contains("database schema has changed")
 }
 
 /// Build `call_logs_hot` and `call_logs_all` inside the caller's transaction
@@ -306,6 +440,13 @@ async fn view_body(
     members: &[String],
     cutoff_ms: Option<i64>,
 ) -> Result<String, sqlx::Error> {
+    // The window is applied in **two layers** and both are required:
+    // `build_views_in_tx` decides *membership* (a cold table joins
+    // `call_logs_hot` only while `MAX(timestamp) >= cutoff`), and this
+    // per-branch `WHERE` filters the *rows* of a member that straddles the
+    // cutoff. Dropping the membership test would scan fully expired cold
+    // tables on every query; dropping this row filter would leak expired rows
+    // through a partially expired member. Do not remove either one.
     let filter = match cutoff_ms {
         Some(ms) => format!(" WHERE {TIMESTAMP_COLUMN} >= {ms}"),
         None => String::new(),
@@ -353,6 +494,14 @@ async fn replace_view(
 }
 
 /// Column shape of `table`, in `cid` order.
+///
+/// The table name is spliced into `pragma_table_info('…')` as a **string
+/// literal** (the pragma table-valued function takes a name, not a bindable
+/// identifier), so it goes through [`escape_literal`]. Every current caller
+/// passes an internal identifier — a compile-time constant (`HOT_TABLE`) or a
+/// name read back out of `sqlite_master` — which is why doubling single
+/// quotes is sufficient here. Reusing this helper on caller-supplied table
+/// names means re-evaluating that assumption first.
 async fn table_columns(
     conn: &mut SqliteConnection,
     table: &str,
@@ -366,7 +515,8 @@ async fn table_columns(
 }
 
 /// Full `pragma_table_info` rows of `table` (cid order) — the column shape
-/// used by the replay fidelity check.
+/// used by the replay fidelity check. Same literal-escaping caveat as
+/// [`table_columns`].
 async fn column_infos(
     conn: &mut SqliteConnection,
     table: &str,
@@ -448,6 +598,25 @@ async fn index_ddls(
 /// Verify the replayed hot table is a faithful copy of the rotated one:
 /// identical column shape, identical index set (names + statements), and no
 /// index left on the cold table. A mismatch aborts the rotation.
+///
+/// **Error kind**: the three failures below are reported as
+/// `sqlx::Error::Protocol`. That is a deliberate, bounded category mismatch —
+/// sqlx has no "internal invariant broken" variant, and `sag_core::AppError`
+/// is the HTTP layer's type, not a maintenance-internal one. It is safe
+/// because [`is_schema_change`] recognises a stale statement by the numeric
+/// SQLITE_SCHEMA code (17) or by SQLite's own errmsg text, **never** by the
+/// word "schema", so these self-produced messages can never be misread as a
+/// retryable schema change. Keep the wording below free of SQLite's errmsg
+/// text.
+///
+/// **Coverage**: all three branches are unreachable from the outside, which is
+/// why no test injects them (an accepted trade-off, argued in
+/// `rotate_once_rolls_back_atomically_on_failure`): the archive name is
+/// collision-checked, step ③ releases every index name before the replay, and
+/// the replayed DDL is captured verbatim from the same schema — so a mismatch
+/// would mean the transaction itself is broken, and the check exists to turn
+/// that into a rollback rather than a silent half-rotation. The branches only
+/// read, so a missed mismatch cannot corrupt data.
 async fn assert_replay_faithful(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     arch: &str,
@@ -507,8 +676,6 @@ mod tests {
     use super::*;
     use crate::open_analytics_pool;
     use sqlx::Row;
-
-    const DAY_MS: i64 = 86_400_000;
 
     async fn test_pool() -> SqlitePool {
         // `:memory:` uses a single connection, so every statement of a test
@@ -992,21 +1159,201 @@ mod tests {
             "cached statement must survive the rotation DDL"
         );
 
-        // Error classification used by the retry-once wrapper.
-        assert!(is_schema_change(&sqlx::Error::Protocol(
-            "database schema has changed".to_string()
-        )));
-        assert!(is_schema_change(&sqlx::Error::Protocol(
-            "(code: 17) SQLITE_SCHEMA".to_string()
-        )));
+        // Error classification used by the retry-once wrapper: sqlx reports
+        // the numeric SQLite result code, and an unrelated error must not be
+        // retried. (The classification table itself is unit-tested in
+        // `is_schema_change_matches_numeric_code_and_errmsg`.)
         let unrelated = sqlx::query("SELECT * FROM no_such_table_xyz")
             .execute(&pool)
             .await
             .unwrap_err();
+        let code = unrelated
+            .as_database_error()
+            .and_then(|db| db.code())
+            .map(|code| code.into_owned());
+        assert_eq!(
+            code.as_deref(),
+            Some("1"),
+            "sqlx reports the numeric SQLite result code"
+        );
         assert!(
             !is_schema_change(&unrelated),
             "unrelated errors must not be retried: {unrelated}"
         );
+
+        pool.close().await;
+    }
+
+    /// Minimal `DatabaseError` stub: sqlx has no public constructor for a
+    /// driver error, so the structured (numeric code) detector is exercised
+    /// through the trait. `Display` reproduces `sqlx-sqlite`'s rendering,
+    /// `(code: <n>) <errmsg>`.
+    #[derive(Debug)]
+    struct StubDbError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl std::fmt::Display for StubDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "(code: {}) {}", self.code, self.message)
+        }
+    }
+
+    impl std::error::Error for StubDbError {}
+
+    impl sqlx::error::DatabaseError for StubDbError {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.code.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error(code: &'static str, message: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(StubDbError { code, message }))
+    }
+
+    #[test]
+    fn is_schema_change_matches_numeric_code_and_errmsg() {
+        // Structured detector: `SQLITE_SCHEMA` is result code 17 (it has no
+        // extended variants), rendered as "17" by `DatabaseError::code`.
+        assert!(is_schema_change(&db_error("17", "whatever")));
+        // Text detector: SQLite's own errmsg for code 17 — the only signal a
+        // code-less error carries.
+        assert!(is_schema_change(&sqlx::Error::Protocol(
+            "(code: 17) database schema has changed".to_string()
+        )));
+        // Neither detector fires on unrelated errors…
+        assert!(!is_schema_change(&db_error("5", "database is locked")));
+        assert!(!is_schema_change(&sqlx::Error::Protocol(
+            "no such table: nope".to_string()
+        )));
+        // …and the symbolic name is not a signal: sqlx renders the numeric
+        // code plus `sqlite3_errmsg`, never `SQLITE_SCHEMA`.
+        assert!(!is_schema_change(&sqlx::Error::Protocol(
+            "(code: 17) SQLITE_SCHEMA".to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn run_rotation_round_skips_when_retention_disabled() {
+        let pool = test_pool().await;
+        let now = now_ms();
+        insert_row(&pool, "ancient", now - 400 * DAY_MS).await;
+
+        assert_eq!(
+            run_rotation_round(&pool, 0).await.unwrap(),
+            RoundOutcome::Skipped,
+            "retention 0 must skip the round explicitly"
+        );
+        assert!(cold_tables(&pool).await.is_empty(), "nothing was rotated");
+        assert_eq!(count(&pool, HOT_TABLE).await, 1, "the row stays hot");
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn run_rotation_round_rotates_backlog() {
+        let pool = test_pool().await;
+        let now = now_ms();
+        insert_row(&pool, "expired", now - 400 * DAY_MS).await;
+        insert_row(&pool, "in-window", now - DAY_MS).await;
+
+        let outcome = run_rotation_round(&pool, 90).await.unwrap();
+        let arch = outcome
+            .rotated()
+            .expect("a backlog must rotate")
+            .to_string();
+        assert!(is_archive_name(&arch), "unexpected archive name {arch}");
+        assert_eq!(outcome.retired_indexes(), 0, "fresh cold table has none");
+
+        // Both rows moved (rotation is table-wide), and the round's refresh
+        // narrowed `call_logs_hot` to the window.
+        assert_eq!(count(&pool, HOT_TABLE).await, 0);
+        assert_eq!(count(&pool, &arch).await, 2);
+        assert_eq!(count(&pool, HOT_VIEW).await, 1, "only the in-window row");
+        assert_eq!(count(&pool, ALL_VIEW).await, 2, "history stays reachable");
+
+        pool.close().await;
+    }
+
+    /// Guardrail: the `retention_days` → cutoff arithmetic must survive
+    /// `u32::MAX` (no overflow panic, no rotation — an effectively infinite
+    /// window keeps every row hot and drops no cold-table index).
+    #[tokio::test]
+    async fn run_rotation_round_survives_max_retention() {
+        let pool = test_pool().await;
+        let now = now_ms();
+        insert_row(&pool, "in-window", now - DAY_MS).await;
+        let expired = "call_logs_arch_20200101_000000";
+        create_legacy_cold(&pool, expired).await;
+        insert_legacy(&pool, expired, "expired", now - 400 * DAY_MS).await;
+        sqlx::query(&format!(
+            "CREATE INDEX \"{expired}_ts\" ON \"{expired}\" (timestamp)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = run_rotation_round(&pool, u32::MAX).await.unwrap();
+        assert_eq!(outcome.rotated(), None, "an infinite window never rotates");
+        assert_eq!(outcome.retired_indexes(), 0, "nothing is out of window");
+        assert_eq!(count(&pool, HOT_TABLE).await, 1);
+        assert_eq!(
+            count(&pool, HOT_VIEW).await,
+            2,
+            "every table stays a member"
+        );
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn run_rotation_round_without_backlog_only_refreshes() {
+        let pool = test_pool().await;
+        let now = now_ms();
+        insert_row(&pool, "in-window", now - DAY_MS).await;
+        // A fully expired cold table: no rotation is needed, but the round's
+        // refresh must still narrow the window (the cutoff is a view-body
+        // literal, so an unrefreshed view would keep it as a member).
+        let expired = "call_logs_arch_20200101_000000";
+        create_legacy_cold(&pool, expired).await;
+        insert_legacy(&pool, expired, "expired", now - 400 * DAY_MS).await;
+        refresh_views(&pool, None).await.unwrap();
+        assert_eq!(count(&pool, HOT_VIEW).await, 2, "precondition: all members");
+
+        let outcome = run_rotation_round(&pool, 90).await.unwrap();
+        assert_eq!(
+            outcome.rotated(),
+            None,
+            "nothing old enough in the hot table"
+        );
+        assert!(cold_tables(&pool).await.contains(&expired.to_string()));
+        assert_eq!(
+            count(&pool, HOT_VIEW).await,
+            1,
+            "expired cold table drops out"
+        );
+        assert_eq!(count(&pool, ALL_VIEW).await, 2);
 
         pool.close().await;
     }

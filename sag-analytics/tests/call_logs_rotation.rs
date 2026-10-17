@@ -9,9 +9,10 @@
 //!
 //! The scheduler that drives the round in production lives in `sag-gateway`,
 //! which depends on this crate (never the other way round), so the round is
-//! replayed here through the same public maintenance API in the same order
-//! (`rotation_round` below). The "spawned task runs its first round
-//! immediately" half of §0 is covered by
+//! driven here through the shared public entry point
+//! [`run_rotation_round`] — the same function the gateway scheduler calls, with
+//! retention passed as an argument instead of read from the live config. The
+//! "spawned task runs its first round immediately" half of §0 is covered by
 //! `sag-gateway/src/main.rs::rotation_scheduler_shuts_down_before_event_drain`.
 
 use std::sync::Arc;
@@ -19,8 +20,8 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use sag_analytics::{
-    ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, LogFilter, LogStore, SqliteLogStore, SqlitePool,
-    StatsFilter, TrendFilter, open_analytics_pool, refresh_views, retire_indexes, rotate_once,
+    ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, LogFilter, LogStore, RoundOutcome, SqliteLogStore,
+    SqlitePool, StatsFilter, TrendFilter, open_analytics_pool, refresh_views, run_rotation_round,
 };
 use sag_core::{CallLog, Usage};
 use uuid::Uuid;
@@ -62,20 +63,6 @@ impl Drop for TempDb {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-/// One rotation round in the exact order the gateway scheduler uses
-/// (`retire → rotate → refresh`, retention read per round). `0` disables the
-/// round entirely — no retirement, no rotation, no window narrowing.
-async fn rotation_round(pool: &SqlitePool, retention_days: u32) -> Option<String> {
-    if retention_days == 0 {
-        return None;
-    }
-    let cutoff_ms = now_ms() - retention_days as i64 * DAY_MS;
-    retire_indexes(pool, cutoff_ms).await.unwrap();
-    let arch = rotate_once(pool, cutoff_ms).await.unwrap();
-    refresh_views(pool, Some(cutoff_ms)).await.unwrap();
-    arch
 }
 
 fn make_log(model: &str, timestamp_ms: i64) -> CallLog {
@@ -215,9 +202,11 @@ async fn startup_backlog_first_round_rotates_immediately() {
     );
 
     // The first round (the scheduler runs it immediately after spawn, §0).
-    let arch = rotation_round(&pool, RETENTION_DAYS)
-        .await
-        .expect("the first round must rotate the backlog");
+    let outcome = run_rotation_round(&pool, RETENTION_DAYS).await.unwrap();
+    let arch = outcome
+        .rotated()
+        .expect("the first round must rotate the backlog")
+        .to_string();
     assert!(arch.starts_with(ARCH_PREFIX), "unexpected archive {arch}");
 
     // Exactly one cold table, empty hot table, every row preserved.
@@ -270,8 +259,9 @@ async fn concurrent_writes_during_rotation_rounds_lose_nothing() {
                     )])
                     .await
                     .unwrap();
-                if let Some(arch) = rotation_round(&pool, RETENTION_DAYS).await {
-                    rotated.push(arch);
+                let outcome = run_rotation_round(&pool, RETENTION_DAYS).await.unwrap();
+                if let Some(arch) = outcome.rotated() {
+                    rotated.push(arch.to_string());
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -377,9 +367,14 @@ async fn queries_never_see_missing_or_stale_view() {
     // Settle the window once, so every round the loops run with uses the same
     // cutoff (the startup superset is gone after this).
     let window_start = now_ms() - RETENTION_DAYS as i64 * DAY_MS;
-    rotation_round(&pool, RETENTION_DAYS)
-        .await
-        .expect("the expired rows must rotate");
+    assert!(
+        run_rotation_round(&pool, RETENTION_DAYS)
+            .await
+            .unwrap()
+            .rotated()
+            .is_some(),
+        "the expired rows must rotate"
+    );
     assert_eq!(count(&pool, HOT_VIEW).await, IN_WINDOW as i64);
 
     const ROUNDS: usize = 15;
@@ -400,7 +395,7 @@ async fn queries_never_see_missing_or_stale_view() {
                     .insert_batch(&[make_log(&format!("bg-{round}"), now_ms() - 200 * DAY_MS)])
                     .await
                     .unwrap();
-                rotation_round(&pool, RETENTION_DAYS).await;
+                run_rotation_round(&pool, RETENTION_DAYS).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -481,7 +476,10 @@ async fn rotation_respects_retention_zero_and_reload() {
     assert_eq!(count(&pool, HOT_VIEW).await, 11, "full-history shape");
 
     // retention = 0: the round returns before touching anything.
-    assert_eq!(rotation_round(&pool, 0).await, None);
+    assert_eq!(
+        run_rotation_round(&pool, 0).await.unwrap(),
+        RoundOutcome::Skipped
+    );
     assert_eq!(
         cold_tables(&pool).await,
         vec![synthetic.to_string()],
@@ -500,9 +498,11 @@ async fn rotation_respects_retention_zero_and_reload() {
     );
 
     // 0 → 90 takes effect on the next round: rotation + retirement + narrowing.
-    let arch = rotation_round(&pool, RETENTION_DAYS)
-        .await
-        .expect("a 90-day round must rotate the 200-day-old rows");
+    let outcome = run_rotation_round(&pool, RETENTION_DAYS).await.unwrap();
+    let arch = outcome
+        .rotated()
+        .expect("a 90-day round must rotate the 200-day-old rows")
+        .to_string();
     assert_eq!(count(&pool, HOT_TABLE).await, 0);
     assert_eq!(count(&pool, &arch).await, 10);
     assert!(
@@ -546,9 +546,14 @@ async fn hot_window_semantics_of_legacy_stats_after_rotation() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].call_count, 10);
 
-    rotation_round(&pool, RETENTION_DAYS)
-        .await
-        .expect("the 200-day-old rows must rotate");
+    assert!(
+        run_rotation_round(&pool, RETENTION_DAYS)
+            .await
+            .unwrap()
+            .rotated()
+            .is_some(),
+        "the 200-day-old rows must rotate"
+    );
 
     // "All time" now means the hot window: 5 calls, 150 tokens.
     let after = store.query_stats(StatsFilter::default()).await.unwrap();

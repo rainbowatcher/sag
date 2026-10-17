@@ -769,7 +769,10 @@ COMMIT
 
 ### call_logs 保留与轮转（已实现，0007）
 
-- 单元（`sag-analytics/src/rotate.rs`，`:memory:`）：跳过触发（空表 / 全在窗内不出冷表）、整表搬运 + `id` 每表重置、回放保真（列形状逐项相等 / 热表索引集合相等 / 冷表 0 索引）、失败整事务回滚、同秒命名去重、缺列按热表 cid 序 `NULL AS` 补齐、成员判定 + 行窗口（部分过窗冷表只出窗内行）、`None` / `retention=0` 语义、索引退役两侧契约 + 幂等、语句缓存失效后同一查询仍成功（`is_schema_change` 正反例）、refresh 幂等
+- 单元（`sag-analytics/src/rotate.rs`，`:memory:`）：跳过触发（空表 / 全在窗内不出冷表）、整表搬运 + `id` 每表重置、回放保真（列形状逐项相等 / 热表索引集合相等 / 冷表 0 索引）、失败整事务回滚、同秒命名去重、缺列按热表 cid 序 `NULL AS` 补齐、成员判定 + 行窗口（部分过窗冷表只出窗内行）、`None` / `retention=0` 语义、索引退役两侧契约 + 幂等、语句缓存失效后同一查询仍成功（`is_schema_change` 正反例）、refresh 幂等（现共 15 条内联单测）
+- 单元（`sag-analytics/src/rotate.rs`，`:memory:`，维护入口）：`run_rotation_round` + `RoundOutcome` 为生产 / 测试同源的共享入口（消除 gateway 侧双副本），覆盖 `retention=0` 跳过、积压首轮即轮转、`u32::MAX` 不溢出、无积压时只 refresh
+- 配置面：`DEFAULT_CALL_LOG_RETENTION_DAYS`（`sag-config` 导出）为默认值，`MAX_CALL_LOG_RETENTION_DAYS = 3650`（gateway 侧钳制，`debug!` 记录）
+- 关停：rollup 与 rotation 两个 scheduler handle 均提供 `shutdown_with_timeout`（join 超时即 abort task）
 - 单元（`sag-analytics/src/sqlite_store.rs`）：打开路径建出两视图、无冷表时视图与热表读一致、全史兜底；`with_schema_retry` 恰好重试一次且不重试非 schema 错误
 - 集成（`sag-analytics/tests/call_logs_rotation.rs`，文件库 + 共享池）：启动积压首轮即轮转、轮转期间并发写入零丢失、查询侧永不见缺失 / 过期视图、`retention=0` 与热重载、轮转后旧统计的热窗口语义
 - gate（`sag-gateway/src/main.rs`）：`rotation_scheduler_shuts_down_before_event_drain` — 接线点在 rollup 之后、event drain 之前，join 成功时 shutdown 后 in-flight DDL 事务已结束（join 超时则 task 被 abort、其事务回滚，drain 可能与该回滚短暂并发）

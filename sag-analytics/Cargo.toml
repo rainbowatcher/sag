@@ -8,6 +8,9 @@ description = "Usage analytics and call logging for SAG"
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+# public dependency: `lib.rs` re-exports `SqlitePool` (`pub use sqlx::sqlite::SqlitePool`),
+# so an sqlx upgrade reaches into the shape of this crate's public API — treat an sqlx
+# upgrade as a public API change.
 sqlx = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
