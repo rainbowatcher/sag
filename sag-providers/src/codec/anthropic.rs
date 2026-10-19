@@ -1758,11 +1758,7 @@ fn encode_tools(tools: &[IrTool]) -> Value {
                 // Preserve extras (max_uses, cache_control, …) but never
                 // the original type (pinned above), input_schema, or the
                 // chat-only reserved markers.
-                for (k, v) in &t.raw {
-                    if k != "type" && k != "input_schema" && !tool_raw::is_reserved_key(k) {
-                        tool.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                }
+                tool_raw::merge_hosted_extras(&mut tool, t, &["type", "input_schema"]);
                 return Value::Object(tool);
             }
             let mut tool = Map::new();

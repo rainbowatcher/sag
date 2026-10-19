@@ -272,6 +272,34 @@ fn anthropic_web_search_to_chat_drops_with_loss() {
     assert_no_reserved_markers(&wire);
 }
 
+/// Every tool dropped (two hosted `web_search*`) → the chat wire omits the
+/// `tools` field entirely instead of sending `"tools": []`, and each drop
+/// is recorded as its own `UnsupportedByTarget` loss.
+#[test]
+fn responses_hosted_tools_to_chat_omit_tools_field() {
+    let (wire, loss) = responses_to_chat(json!({
+        "model": CHAT_MODEL,
+        "input": "hi",
+        "tools": [
+            {"type": "web_search", "name": "web_search", "max_uses": 5},
+            {"type": "web_search_preview", "name": "web_search_preview"}
+        ]
+    }));
+
+    assert!(
+        wire.get("tools").is_none(),
+        "an all-dropped tool list must omit `tools`, not send `[]`: {wire}"
+    );
+
+    assert_eq!(loss.len(), 2, "two drops, two losses: {:?}", loss.entries);
+    for (entry, field) in loss.entries.iter().zip(["tools[0]", "tools[1]"]) {
+        assert_eq!(entry.scope, LossScope::Request);
+        assert_eq!(entry.field, field);
+        assert_eq!(entry.reason, LossReason::UnsupportedByTarget);
+    }
+    assert_no_reserved_markers(&wire);
+}
+
 // ── 4./5. Chat → Responses / Anthropic ──────────────────────────
 
 /// Chat-sourced IR expands to the flat Responses tool shape: `strict` at
@@ -313,6 +341,23 @@ fn chat_to_responses_no_pseudo_fields() {
         "absent type takes the Responses default: {tool}"
     );
     assert!(tool.get("parameters").is_none(), "{tool}");
+    assert!(tool.get("function").is_none(), "{tool}");
+    assert_no_reserved_markers(&wire);
+
+    // A chat-sourced `""` type is a literal client value: it round-trips
+    // verbatim, no `"function"` default is invented (chat source path).
+    let wire = chat_to_responses(chat_body(json!([{
+        "type": "",
+        "function": {"name": "empty_type", "parameters": {"type": "object"}}
+    }])));
+    let tool = &wire["tools"][0];
+    assert_eq!(
+        tool["type"],
+        json!(""),
+        "chat-sourced empty type must round-trip verbatim: {tool}"
+    );
+    assert_eq!(tool["name"], json!("empty_type"));
+    assert_eq!(tool["parameters"], json!({"type": "object"}));
     assert!(tool.get("function").is_none(), "{tool}");
     assert_no_reserved_markers(&wire);
 }

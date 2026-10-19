@@ -1934,11 +1934,9 @@ fn encode_tools(tools: &[IrTool]) -> Value {
                 if let Some(d) = &t.description {
                     tool.insert("description".into(), json!(d));
                 }
-                for (k, v) in &t.raw {
-                    if k != "name" && !tool_raw::is_reserved_key(k) {
-                        tool.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                }
+                // Remaining raw keys pass through verbatim (`name` and the
+                // chat-only reserved markers excepted).
+                tool_raw::merge_hosted_extras(&mut tool, t, &["name"]);
                 return Value::Object(tool);
             }
             let mut tool = Map::new();

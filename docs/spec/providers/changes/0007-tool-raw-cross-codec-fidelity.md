@@ -39,7 +39,7 @@ type: 修复
 |------|------|
 | [`sag-providers/src/codec/tool_raw.rs`](../../../../sag-providers/src/codec/tool_raw.rs) | 新增。`IrTool.raw` 双轨约定的唯一实现点：`TOOL_EXTRA_KEY` / `FUNCTION_EXTRA_KEY` 常量；`is_dual_layer` 以 `__tool_extra` 键存在性作判别式；`tool_extras` 双轨读取（双层 → 两个存储对象原样返回；扁平 → `raw` 副本作工具级字段，并把 `strict` 提升到 function 级）；`tool_raw_type` 双轨读 `type`（供 hosted 判定）；`merge_extras` 把两层展开到工具根部（`or_insert`：调用方已写字段优先），`is_reserved_key` 过滤内部伪字段 |
 | [`sag-providers/src/codec/mod.rs`](../../../../sag-providers/src/codec/mod.rs) | 注册 `mod tool_raw;`（crate 内部共享，`pub(crate)`，不对外 re-export） |
-| [`sag-providers/src/codec/chat.rs`](../../../../sag-providers/src/codec/chat.rs) | `encode_tools` 改签名为 `(tools, &mut LossInventory)` 并按 `is_dual_layer` 分两支：**chat 来源路径逐字不变**（仍从 `__tool_extra` / `__function_extra` 各回原位，绝不发明 `type`，源里 `type` 为 `""` 时也逐字往返）；外来扁平 IR 走 `tool_extras` + 补默认 `"type": "function"`（`or_insert`，源里已有非空 `type` 优先；`type` 缺失或为 `""` 均合成 `"function"`）；hosted `web_search*` 丢弃并记 `LossReason::UnsupportedByTarget`（不再压成假 function 形状），loss 经既有 `encode_losses` 通道进 `CallLog` |
+| [`sag-providers/src/codec/chat.rs`](../../../../sag-providers/src/codec/chat.rs) | `encode_tools` 改签名为 `(tools, &mut LossInventory)` 并按 `is_dual_layer` 分两支：**chat 来源路径逐字不变**（仍从 `__tool_extra` / `__function_extra` 各回原位，绝不发明 `type`，源里 `type` 为 `""` 时也逐字往返）；外来扁平 IR 走 `tool_extras` + 补默认 `"type": "function"`（`or_insert`，源里已有非空 `type` 优先；`type` 缺失或为 `""` 均合成 `"function"`）；hosted `web_search*` 丢弃并记 `LossReason::UnsupportedByTarget`（不再压成假 function 形状），loss 经既有 `encode_losses` 通道进 `CallLog`；丢弃后 `tools` 数组为空时**整个字段省略**（不再发 `"tools": []` 给上游），loss 仍按 `tools[i]` 逐条记录 |
 | [`sag-providers/src/codec/responses.rs`](../../../../sag-providers/src/codec/responses.rs) | `encode_tools` 改用 `tool_raw_type` / `merge_extras`：双层键展开到工具根部（`strict` 落根部），`is_reserved_key` 过滤伪字段（hosted 分支同样过滤）；无 `type` 时仍补 Responses 默认 `"function"` |
 | [`sag-providers/src/codec/anthropic.rs`](../../../../sag-providers/src/codec/anthropic.rs) | `encode_tools` 改用 `tool_raw_type` / `merge_extras`（Anthropic 工具对象无 `function` 嵌套，两层字段均展开到根部），`is_reserved_key` 过滤伪字段（hosted 分支同样过滤）；**按值映射，对所有来源一致**：`type` 值为 `"function"` 或 `""` 时一律省略（Anthropic tool-type 枚举无 `"function"`，自定义工具本身即 function 语义）；`"custom"`、`web_search*` 等其余值逐字保留；缺失维持缺失 |
 
@@ -78,7 +78,9 @@ type: 修复
   - Anthropic 形状 IR（扁平 `raw`，无 `type`）→ 出站工具补出 `"type": "function"`
   - chat 来源 IR（源工具无 `type`）→ 出站仍无 `type`（同协议零合成不变量回归）
   - hosted `web_search*` IR → 工具从出站 `tools` 中消失，且 loss 含 `tools[i]` + `unsupported_by_target`
+  - 全部工具被丢弃 → 出站 JSON **不含 `tools` 键**（不发空数组），loss 逐条保留
 - `sag-providers/src/codec/responses.rs`：chat 来源 IR → 出站工具无 `__tool_extra` / `__function_extra` 键，`strict` 位于工具根部
+- `sag-providers/tests/cross_codec_tools.rs`：`chat_to_responses_no_pseudo_fields` 追加 chat 来源 `type: ""` 逐字往返（不补 `"function"`）的用例；新增 `responses_hosted_tools_to_chat_omit_tools_field`（两个 hosted 工具 → 无 `tools` 键 + 两条 `unsupported_by_target` loss）
 - `sag-providers/src/codec/anthropic.rs`：chat 来源 IR → 出站工具无伪字段，`type: "function"` 被省略；扁平来源的 `"function"` / `""` 同样省略，`"custom"` 等其余值逐字保留，缺失维持缺失
 - **既有测试断言调整（本次唯一一处）**：`function_tool_named_web_search_is_not_hosted` 原先断言扁平 `raw` 出站 `type == "function"`，现改为断言 `type` 缺失——测试原意「名为 `web_search` 的 function 工具不得被误映射为 hosted `web_search_20250305`」保持不变，仅期望值随「按值映射」裁决更新
 - `sag-dispatch/src/dispatch/chat/tests.rs`：hosted 工具走 chat 目标的 encode loss 汇总进入 `CallLog` loss 摘要（验证「禁止静默」端到端可达）

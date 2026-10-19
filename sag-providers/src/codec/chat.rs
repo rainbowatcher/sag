@@ -201,7 +201,7 @@ impl ChatCompletionsCodec {
         // tools: prefer original raw value (decode failure path); else rebuild.
         let tools = match raw.remove("tools") {
             Some(v) => Some(v),
-            None if !ir.tools.is_empty() => Some(encode_tools(&ir.tools, &mut loss)),
+            None if !ir.tools.is_empty() => encode_tools(&ir.tools, &mut loss),
             None => None,
         };
 
@@ -1120,7 +1120,11 @@ fn parse_tool(v: &Value) -> Option<IrTool> {
     })
 }
 
-fn encode_tools(tools: &[IrTool], loss: &mut sag_core::LossInventory) -> Value {
+/// Encode `IrTool`s to the OpenAI `tools` array. `None` means "omit the
+/// `tools` field entirely": every tool was dropped (hosted `web_search*`),
+/// and an empty array would be sent as `"tools": []`, which upstreams may
+/// reject. Loss entries are recorded per dropped tool either way.
+fn encode_tools(tools: &[IrTool], loss: &mut sag_core::LossInventory) -> Option<Value> {
     let mut arr: Vec<Value> = Vec::with_capacity(tools.len());
     for (i, t) in tools.iter().enumerate() {
         if tool_raw::is_dual_layer(t) {
@@ -1199,7 +1203,11 @@ fn encode_tools(tools: &[IrTool], loss: &mut sag_core::LossInventory) -> Value {
         }
         arr.push(Value::Object(top));
     }
-    Value::Array(arr)
+    // Everything was dropped: omit the field rather than sending `[]`.
+    if arr.is_empty() {
+        return None;
+    }
+    Some(Value::Array(arr))
 }
 
 fn encode_response_choice(ir: &IrResponse, raw: &mut Map<String, Value>) -> ChatChoice {
@@ -1838,7 +1846,8 @@ mod tests {
     }
 
     /// Hosted tools have no Chat equivalent: drop with a loss entry, never
-    /// squeeze them into a fake function shape.
+    /// squeeze them into a fake function shape. When nothing survives, the
+    /// whole `tools` field is omitted instead of being sent as `[]`.
     #[test]
     fn encode_tools_flat_foreign_hosted_tool_dropped_with_loss() {
         let mut raw = Map::new();
@@ -1853,8 +1862,8 @@ mod tests {
         let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
         let encoded = serde_json::to_value(&req).unwrap();
         assert!(
-            encoded["tools"].as_array().is_some_and(|a| a.is_empty()),
-            "hosted tool must not become a function tool: {encoded:?}"
+            encoded.get("tools").is_none(),
+            "hosted tool must not become a function tool (and no empty array): {encoded:?}"
         );
         assert_eq!(loss.len(), 1, "loss: {:?}", loss);
         assert_eq!(loss.entries[0].field, "tools[0]");

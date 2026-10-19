@@ -96,6 +96,24 @@ pub(crate) fn merge_extras(root: &mut Map<String, Value>, t: &IrTool) {
     }
 }
 
+/// Pass the extra keys of a **hosted** tool (`web_search*`) through onto
+/// `root`, skipping the reserved markers and the `skip` keys the caller has
+/// already written structurally (`name`, or `type` / `input_schema`).
+///
+/// Unlike [`merge_extras`] the raw layout is copied as-is, without the
+/// dual-layer expansion: hosted tools have a flat wire shape in both
+/// Responses and Anthropic, and a chat-sourced hosted tool only carries the
+/// two reserved markers, so it ends up with no extras at all. `or_insert`
+/// already keeps caller fields; `skip` states the intent explicitly.
+pub(crate) fn merge_hosted_extras(root: &mut Map<String, Value>, t: &IrTool, skip: &[&str]) {
+    for (k, v) in &t.raw {
+        if skip.contains(&k.as_str()) || is_reserved_key(k) {
+            continue;
+        }
+        root.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +245,42 @@ mod tests {
                 assert!(!is_reserved_key(k), "reserved key leaked: {k}");
             }
         }
+    }
+
+    #[test]
+    fn merge_hosted_extras_passes_flat_raw_through_with_skip() {
+        let t = tool(json!({
+            "type": "web_search_preview",
+            "name": "ignored",
+            "input_schema": {"type": "object"},
+            "max_uses": 5
+        }));
+        let mut root = Map::new();
+        root.insert("type".into(), json!("web_search_20250305"));
+        root.insert("name".into(), json!("web_search"));
+        merge_hosted_extras(&mut root, &t, &["type", "input_schema"]);
+        assert_eq!(
+            Value::Object(root),
+            json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5
+            })
+        );
+    }
+
+    /// A chat-sourced hosted tool only holds the two reserved markers, so
+    /// nothing is passed through (and no marker leaks).
+    #[test]
+    fn merge_hosted_extras_ignores_dual_layer_markers() {
+        let t = dual(
+            json!({"type": "web_search_preview"}),
+            json!({"strict": true}),
+        );
+        let mut root = Map::new();
+        root.insert("type".into(), json!("web_search_preview"));
+        merge_hosted_extras(&mut root, &t, &["name"]);
+        assert_eq!(Value::Object(root), json!({"type": "web_search_preview"}));
     }
 
     #[test]
