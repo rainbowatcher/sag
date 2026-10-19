@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-11
+updated: 2026-10-19
 ---
 
 # 日志 — 规格
@@ -111,6 +111,22 @@ body > 512 KiB 时不缓冲（否则 413 与流式请求会被破坏），但响
 - ✅ 大 prompt 请求（agent 场景的常态）不再出现「有请求行、无响应行」的黑洞
 - ❌ 大 body 请求的响应没有 `body_size` / preview（无法在不消费 body 的前提下取得）
 
+### 响应体的有界收集与帧链重组
+
+响应预览需要读 body，而 `axum::body::to_bytes(body, MAX_BODY_READ)` 在超限时返回 `Err` 并**丢弃已收集数据**，body 消费后也无法重放 —— 直接用 `unwrap_or_default()` 会把 > 10 MB 的响应换成空 body 发回客户端（`content-length` 仍声明全长）。
+
+因此下沉到帧级：自己从 `Body::into_data_stream()` 收集帧，累计到 `MAX_BODY_READ` 即停止。
+
+- **未超限**：`Body::from(collected)`，与 `to_bytes` 路径字节级一致
+- **超限**：`stream::iter(已收集帧).chain(剩余流)` 重组为 `Body::from_stream(...)`，headers 不动；日志打 512 B 预览 + `truncated=true` + `collected=<n>`
+- **body `Err`**：不再折叠成空 body，记 WARN（`body_error=true`）并把错误重新注入重组后的流
+
+**Trade-off**:
+- ✅ 中间件对响应体字节透明，超限只牺牲日志完整性
+- ✅ ≤ 10 MB 路径的日志字段集合与字节输出零变化
+- ❌ 比 `to_bytes` 多一段帧链拼装代码，需要理解 `stream::iter(...).chain(...)` 的背压语义（`Body::from_stream` 仍是逐帧 poll，无额外缓冲）
+- ❌ 超限路径只记录 `collected`，无法得知真实 body 总量（除非信任 `content-length`）
+
 ## 不变式
 
 - `tracing_init::init()` 必须在 `info!("starting SAG gateway")` 之前调用
@@ -120,6 +136,8 @@ body > 512 KiB 时不缓冲（否则 413 与流式请求会被破坏），但响
 - 大 body（> 512 KiB）请求的响应日志只依赖响应头（status / content-length / content-type），不得消费 body
 - 脱离请求生命周期的后台任务必须通过 `spawn_in_current_span` 启动，禁止裸 `tokio::spawn`
 - 每个请求的终态必须至少有一条日志：成功/失败响应行、mid-stream error WARN、post-commit 断连 WARN 或 pre-commit 取消 WARN
+- 中间件任何情况下不得改变或截断响应体；日志超限时只可省略日志内容，且必须打截断标记（`truncated=true`）
+- body 流错误不得被吞成空 body：必须记 WARN（`body_error=true`）并向客户端传播
 
 ## 测试策略
 
@@ -133,3 +151,4 @@ body > 512 KiB 时不缓冲（否则 413 与流式请求会被破坏），但响
 - [0001 初始化](changes/0001-initial.md)
 - [0002 轮转与清理](changes/0002-rotation-and-cleanup.md)
 - [0003 大请求响应日志与请求关联信息](changes/0003-request-correlation-and-large-body-response-log.md)
+- [0004 响应体超限不再毁坏响应](changes/0004-response-body-truncation-fix.md)

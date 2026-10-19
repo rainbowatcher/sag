@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-10-18
+updated: 2026-10-19
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-10-19
+
+- **日志**：[0004 响应体超限不再毁坏响应](logging/changes/0004-response-body-truncation-fix.md) — `log_http` 不再用 `to_bytes(..).unwrap_or_default()` 把 > 10 MB 响应换成空 body：改为帧级有界收集 + 帧链重组（未超限字节级不变，超限时已收集帧与剩余流 `chain` 后全量转发、headers 不动），日志超限只打 512 B 预览 + `truncated=true` / `collected=<n>`；body 流错误不再被吞，记 `body_error=true` WARN 并传播给客户端；请求侧孪生缺陷（谎报 content-length 导致 handler 收到空 body）同步修复
 
 ## 2026-10-18
 

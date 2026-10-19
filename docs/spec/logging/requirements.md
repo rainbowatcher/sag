@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-11
+updated: 2026-10-19
 ---
 
 # 日志
@@ -63,6 +63,10 @@ TTY 环境启用 ANSI 颜色。
 
 完整请求/响应体在 `trace` 级别（target: `sag_router::http_log::full`）记录。
 
+日志中间件**不得改变或截断响应体**：body 收集必须有界，超过 10 MB（`MAX_BODY_READ`）时仍须把完整 body 转发给客户端且不改写 headers（`content-length` 保持与 body 一致），日志只记录 512 B 预览并打截断标记（`truncated=true` + `collected=<n>`）。
+
+body 流中途错误**不得被吞成空 body**：必须记录一条 WARN（`body_error=true`，message `"response body error"` / `"request body error"`）并把错误传播给客户端，而不是返回一个与 `content-length` 不符的空 body 或让 handler 收到空请求体。
+
 ### Trace ID
 
 每个请求生成 UUID v4 作为 `trace_id`，注入 `request.extensions()`。所有中间件和 handler 的日志携带同一 trace_id，实现全链路追踪。
@@ -104,3 +108,4 @@ format = "compact"
 - [0001 初始化](changes/0001-initial.md)
 - [0002 轮转与清理](changes/0002-rotation-and-cleanup.md)
 - [0003 大请求响应日志与请求关联信息](changes/0003-request-correlation-and-large-body-response-log.md)
+- [0004 响应体超限不再毁坏响应](changes/0004-response-body-truncation-fix.md)
