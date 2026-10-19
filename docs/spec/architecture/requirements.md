@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-10-18
 ---
 
 # 架构
@@ -47,6 +47,16 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
   Analytics Collector (SQLite)
 ```
 
+### 响应传输与压缩
+
+响应离开进程有三条独立路径，各自负责自己的编码：
+
+- **SSE（`text/event-stream`）**：响应必须带 `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`，避免 nginx / CDN 类中间层缓冲或转码事件流导致 token 一次性倾倒。SSE 永不压缩。
+- **内嵌 UI 静态资源**：由 `sag-gateway/src/ui_routes/` 的 SPA fallback serve。UI 构建会为文本产物生成 `.br`（brotli q11）与 `.gz`（gzip 9）副本，handler 按 `Accept-Encoding` 直接下发预压缩件（`br` 优先于 `gzip`）并带 `Vary: Accept-Encoding`；无预压缩副本或客户端不支持时裸发兜底。运行期不压缩 UI。`index.html` 带 `Cache-Control: no-cache`，`*.br` / `*.gz` 不作为独立资源可访问（404）。
+- **API 响应**：由 `sag-router` 的 `CompressionLayer` 动态压缩，默认开启、无配置开关。predicate 为「响应体 ≥ 1 KiB（含 1024 字节整）且非 SSE / gRPC / 图片」；级别 `Fastest`（延迟敏感优先于压缩比）。
+
+压缩层注册在 `http_log` 之外（更外层），使日志仍记录明文预览与 `content-length`。UI fallback 在 `build_router` 返回后才挂载，不经过中间件栈，因此 UI 的 `Content-Encoding` / `Vary` / `Cache-Control` 由 handler 自己设置。
+
 ### 模块隔离
 
 - `sag-core` 不依赖任何其它子包
@@ -65,6 +75,7 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 - 共享状态通过 `Arc<RwLock<T>>` 在线程间传递
 - 配置热重载通过 `notify` crate 文件监听实现
 - 单个二进制部署（可选 embed-ui 特性嵌入前端 SPA）
+- HTTP 响应压缩：内嵌 UI 走构建期预压缩，API 响应走动态压缩层，两者默认开启且无配置开关
 
 ### 不包含
 - 分布式部署 / 多实例协调
@@ -86,3 +97,4 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 
 - [0001 初始化](changes/0001-initial.md)
 - [0002 版本升级提交按实际变更文件过滤](changes/0002-version-bump-commit-files.md)
+- [0003 HTTP 响应压缩：SSE 防护头、UI 构建期预压缩、动态压缩层](changes/0003-http-response-compression.md)

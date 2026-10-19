@@ -24,7 +24,9 @@ use tracing::info;
 
 mod tracing_init;
 
-#[cfg(feature = "embed-ui")]
+// Compiled unconditionally: `ui_routes::negotiate` is a dependency-free pure
+// function so its unit tests run without the `embed-ui` feature. The embedded
+// asset serving inside the module is itself `#[cfg(feature = "embed-ui")]`.
 mod ui_routes;
 
 #[tokio::main]

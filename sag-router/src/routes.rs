@@ -19,6 +19,10 @@ use axum::{
 };
 use sag_analytics::AnalyticsEvent;
 use sag_core::{ChatCompletionRequest, FailureReason, FinalStatus, RequestResultFact};
+use tower_http::compression::{
+    CompressionLayer, CompressionLevel, Predicate,
+    predicate::{NotForContentType, SizeAbove},
+};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{instrument, warn};
 
@@ -91,6 +95,35 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
         .layer(cors)
         .layer(middleware::from_fn(crate::middleware::http_log::log_http))
+        // Dynamic compression for non-streaming JSON responses.
+        //
+        // Contract 1 — this layer MUST stay *outside* `http_log` (i.e.
+        // registered after it). `log_http` buffers the response body to log
+        // a plaintext preview plus `content-length`; if compression ran
+        // inside it the log would record compressed garbage and the
+        // `content-length` header would be gone (tower-http strips it).
+        //
+        // Contract 2 — this does not cover the UI assets: `layer()` bakes
+        // into the routes registered so far, and `sag-gateway/src/main.rs`
+        // attaches `.fallback(ui_handler)` *after* `build_router` returns,
+        // so the embedded-UI fallback is never wrapped by this layer.
+        //
+        // The predicate deliberately replaces `DefaultPredicate` (its size
+        // floor is 32 bytes): 1 KiB is the point where compression starts
+        // paying for itself. `SizeAbove` is inclusive (a body of exactly 1024
+        // bytes is compressed) and treats unknown sizes as "compress", which
+        // would catch SSE streams, so `NotForContentType::SSE` (plus
+        // gRPC / images, as in the default) is required.
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(
+                    SizeAbove::new(1024)
+                        .and(NotForContentType::SSE)
+                        .and(NotForContentType::GRPC)
+                        .and(NotForContentType::IMAGES),
+                ),
+        )
         .layer(middleware::from_fn(trace_middleware))
         .with_state(state)
 }

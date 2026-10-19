@@ -866,7 +866,11 @@ where
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
+        // `no-transform` + `X-Accel-Buffering: no` keep intermediate
+        // proxies (nginx / Cloudflare) from buffering or re-compressing
+        // the event stream, which would stall token delivery.
+        .header("Cache-Control", "no-cache, no-transform")
+        .header("X-Accel-Buffering", "no")
         .header("Connection", "keep-alive")
         .body(body)
         .unwrap()
@@ -1053,6 +1057,30 @@ mod tests {
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"data: chunk-1\n\ndata: chunk-2\n\n");
+    }
+
+    /// Regression: SSE responses must carry the anti-buffering header set
+    /// so an outer proxy does not buffer or transcode the stream.
+    #[tokio::test]
+    async fn sse_response_sets_anti_buffering_headers() {
+        let state = build_state().await;
+        let resp = stream_response(
+            &state,
+            vec![
+                StreamChunk::Data(b"data: hi\n\n".to_vec()),
+                StreamChunk::Done,
+            ],
+            "openai",
+            "gpt-4o",
+        );
+        let headers = resp.headers();
+        assert_eq!(headers.get("Content-Type").unwrap(), "text/event-stream");
+        assert_eq!(
+            headers.get("Cache-Control").unwrap(),
+            "no-cache, no-transform"
+        );
+        assert_eq!(headers.get("X-Accel-Buffering").unwrap(), "no");
+        assert_eq!(headers.get("Connection").unwrap(), "keep-alive");
     }
 
     #[tokio::test]

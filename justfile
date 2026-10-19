@@ -40,9 +40,14 @@ test *args:
     just test-rust {{ args }}
     just ui-test
 
-# 运行 Rust 测试（无参数时默认 `--tests`，即跳过 doc test）
+# 运行 Rust 测试（无参数时默认 `--tests`，即跳过 doc test）。
+# 第二条命令补跑 `embed-ui` 特性下的 sag-gateway：`sag-gateway/src/ui_routes/`
+# 的 handler 由 `#[cfg(feature = "embed-ui")]` 门控，默认特性下完全不参与编译，
+# 不显式开特性就会成为测试盲区。注意它需要 `sag-ui/dist/`（rust-embed 在编译期
+# 读取该目录），未构建过 UI 时先跑 `just ui-build` 或 `just build-test`。
 test-rust *args:
     cargo test --no-fail-fast {{ if args == "" { "--tests" } else { args } }}
+    cargo test -p sag-gateway --features embed-ui --no-fail-fast {{ if args == "" { "--tests" } else { args } }}
 
 # 运行前端测试
 ui-test:
@@ -104,9 +109,10 @@ fmt-check-rust:
 ui-fmt-check:
     pnpm -C sag-ui run format:check
 
-# 运行 clippy 检查
+# 运行 clippy 检查（第二条覆盖 `embed-ui` 门控代码，见 test-rust 注释）
 clippy:
     cargo clippy --all-targets -- -D warnings
+    cargo clippy -p sag-gateway --all-targets --features embed-ui -- -D warnings
 
 # 运行前端 oxlint
 ui-lint *args:

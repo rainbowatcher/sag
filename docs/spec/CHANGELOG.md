@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-10-17
+updated: 2026-10-18
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+## 2026-10-18
+
+- **架构**：[0003 HTTP 响应压缩：SSE 防护头、UI 构建期预压缩、动态压缩层](architecture/changes/0003-http-response-compression.md) — SSE 响应补 `Cache-Control: no-cache, no-transform` + `X-Accel-Buffering: no` 防中间层缓冲；UI 构建新增 `postbuild-compress.mjs` 生成 `.br`/`.gz` 副本，`ui_routes` 按 `Accept-Encoding` 直接下发预压缩件（带 `Vary`，运行期零压缩）；`sag-router` 插入 `CompressionLayer`（`Fastest`，`SizeAbove(1024)` ∧ ¬SSE/GRPC/IMAGES，默认开启无配置）；`just clippy` / `just test-rust` 补 `--features embed-ui` 消除门控代码盲区
 
 ## 2026-10-17
 

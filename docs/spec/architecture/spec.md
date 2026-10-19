@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-10-18
 ---
 
 # 架构 — 规格
@@ -12,6 +12,9 @@ updated: 2026-06-03
 - [sag-gateway/src/tracing_init.rs](../../../sag-gateway/src/tracing_init.rs) — tracing 初始化
 - [sag-core/src/lib.rs](../../../sag-core/src/lib.rs) — 共享类型导出
 - [sag-router/src/lib.rs](../../../sag-router/src/lib.rs) — 路由器构建
+- [sag-router/src/routes.rs](../../../sag-router/src/routes.rs) — 中间件链与响应压缩层
+- [sag-gateway/src/ui_routes/mod.rs](../../../sag-gateway/src/ui_routes/mod.rs) — 内嵌 UI serve（SPA fallback）
+- [sag-ui/scripts/postbuild-compress.mjs](../../../sag-ui/scripts/postbuild-compress.mjs) — UI 构建期预压缩
 
 ## 核心设计
 
@@ -34,6 +37,22 @@ flowchart TD
 ```
 
 ## 关键决策
+
+### 响应压缩：三层各管一段
+
+| 层 | 覆盖对象 | 时机 | 代价 |
+|------|------|------|------|
+| SSE 防护头 | 所有 `text/event-stream` 响应 | 运行期（仅设头） | 零 |
+| UI 预压缩 | `sag-ui/dist/` 下的文本产物 | 构建期（brotli q11 / gzip 9） | 二进制体积 ≈ 713 KiB（当前 53 个 `.br` + 51 个 `.gz` 实测 730,544 B） |
+| 动态压缩层 | ≥ 1 KiB（含 1024 字节整）的 API 响应 | 运行期（`Fastest`） | 每请求一次快速编码 |
+
+**Trade-off**：内嵌 UI 与 API 响应走不同路径，不是实现分裂，而是中间件挂载顺序的必然结果 —— `build_router` 的 `.layer()` 只对当时已注册的路由生效，`main.rs` 在 `build_router` 返回后才 `.fallback(ui_handler)`，UI fallback 永远不经过压缩层 / CORS / body limit / `http_log`。因此 UI 侧的 `Content-Encoding` / `Vary` / `Cache-Control` 必须由 handler 自己设。
+
+**动态压缩 predicate**：不用 tower-http 的 `DefaultPredicate`（尺寸下限 32 字节，对网关响应太低），改取 `SizeAbove(1024) ∧ ¬SSE ∧ ¬GRPC ∧ ¬IMAGES`。`SizeAbove` 把「尺寸未知」视为可压缩，而 SSE 正是尺寸未知，所以 SSE 必须显式排除。级别取 `CompressionLevel::Fastest`：网关延迟敏感，压缩比的边际收益不如 CPU 时间。默认开启，无配置开关。
+
+**压缩层必须在 `http_log` 之外**：`log_http` 缓冲响应体以记录明文预览与 `content-length`；若压缩层在其内侧，日志会记录压缩后的乱码且 `content-length` 被 tower-http 移除。
+
+**已知边界**：`Accept-Encoding: identity;q=0` 时 tower-http 返回 406（无可用编码），不额外兜底；该 406 对 SSE 路径同样生效（发生在 predicate 判定之前）。
 
 ### 日志输出：TTY 检测 + 双重路径
 
@@ -81,13 +100,19 @@ CI 的版本门禁（`.github/workflows/release.yml`）同样从根 `Cargo.toml`
 - dependents 只向下依赖（无循环依赖）
 - 配置文件路径解析支持 `--config <path>`、`--config=<path>`、位置参数三种形式
 - Shutdown 顺序：server → hot_reload → analytics → WorkerGuard
+- `CompressionLayer` 始终注册在 `http_log` 之后（更外层），顺序不可调换
+- UI fallback 永远不经过 `build_router` 的中间件栈；其 `Content-Encoding` / `Vary` / `Cache-Control` 由 `ui_handler` 自己设置
+- `*.br` / `*.gz` 预压缩件不可作为独立资源访问（404），且仅在收益 ≥ 2% 时才随构建产出
 
 ## 测试策略
 
 - 单元测试：各子包 `#[cfg(test)] mod tests`
-- 集成测试：`sag-router/tests/auth_regression.rs`
+- 集成测试：`sag-router/tests/auth_regression.rs`、`sag-router/tests/compression.rs`
+- 单元测试（无特性依赖）：`sag-gateway/src/ui_routes/negotiate.rs` 的 `Accept-Encoding` 协商
+- 单元测试（需 `embed-ui`）：`sag-gateway/src/ui_routes/mod.rs` 的预压缩下发；`just clippy` / `just test-rust` 各带一条 `--features embed-ui` 命令覆盖该门控代码（需先有 `sag-ui/dist/`）
 - 端到端：`scripts/test-env.py` 启动 release 二进制测试真实行为
 
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
 - [0002 版本升级提交按实际变更文件过滤](changes/0002-version-bump-commit-files.md)
+- [0003 HTTP 响应压缩：SSE 防护头、UI 构建期预压缩、动态压缩层](changes/0003-http-response-compression.md)

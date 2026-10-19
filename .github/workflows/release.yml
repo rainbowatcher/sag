@@ -30,7 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test
-        # 与 `just test-rust` 对齐：仓库没有 doc test，只跑单元 / 集成测试。
+        # 仅默认特性：仓库没有 doc test，只跑单元 / 集成测试。`embed-ui` 门控代码
+        # 需要先构建前端产物，由本地 `just test-rust` / `just clippy` 覆盖；CI 侧的
+        # embed-ui 编译检查由下面的 release build job 负责。
         run: cargo test --no-fail-fast --tests
 
   build:
