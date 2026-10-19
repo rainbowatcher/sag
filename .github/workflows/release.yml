@@ -25,6 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # scripts/ 下 python 工具的单元测试，当前仅 release_notes 有测试用例
+      # （不会覆盖 release.py / test-env.py）。ubuntu-24.04 自带 python3，且脚本
+      # 只用标准库，无需 setup-python。
+      - name: scripts unit tests
+        run: python3 -m unittest discover -s scripts/tests -t scripts
+
       # rust-toolchain.toml 已固定 channel（1.98），runner 自带 rustup 会自动
       # 安装该工具链，无需任何显式的 toolchain action。
       - uses: Swatinem/rust-cache@v2
@@ -116,6 +122,10 @@ jobs:
       TAP_TOKEN: ${{ secrets.TAP_RELEASE }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # release notes 需要完整历史与全部 tag（前一个版本 tag 的发现、
+          # git log 范围计算都依赖它们）；test / build job 保持默认浅克隆。
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v8
         with:
@@ -141,15 +151,25 @@ jobs:
           echo "VERSION=${tag_ver}" >> "$GITHUB_ENV"
           echo "SHA256=${sha}" >> "$GITHUB_ENV"
 
+      # 在创建 Release 之前生成自定义说明（按 conventional commit 分组）。
+      # 输出到工作区根而不是 dist/：`files: dist/*` 会把 dist 下所有文件当
+      # release 资产上传，放 dist/ 会把说明文件本身也传上去。
+      - name: Generate release notes
+        run: python3 scripts/release_notes.py --tag "${GITHUB_REF_NAME}" --output release-notes.md --repo "${GITHUB_REPOSITORY}"
+
       # v3 的 overwrite_files 默认为 true：重复推送同一 tag 时会更新已存在的
       # release 并覆盖上传同名资产，不会重复创建，因此无需手写
       # `gh release view` / `gh release upload --clobber` 的幂等分支。
+      #
+      # 不要加 generate_release_notes: true —— create-release API 的语义是「自动
+      # 生成的 notes 拼接在自定义 body 之后」，不是 fallback，保留会把自动生成
+      # 内容拖在 release-notes.md 后面。
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           name: sag ${{ github.ref_name }}
+          body_path: release-notes.md
           files: dist/*
-          generate_release_notes: true
 
       # tap 更新完全走 GitHub Contents API，不 clone tap 仓库：
       #   - GET  Formula/sag.rb（Bearer TAP_TOKEN）

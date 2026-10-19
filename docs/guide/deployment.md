@@ -50,7 +50,7 @@ brew services start sag
 
 ### 发布流程
 
-版本由 tag 触发的 GitHub Actions 工作流（`.github/workflows/release.yml`）自动维护：先跑测试，再在 Apple Silicon runner 上构建内嵌 UI 的单二进制，创建 GitHub Release，并把 tarball 的版本 / URL / sha256 写回 `rainbowatcher/homebrew-tap`。日常发版只需升级版本号并推送 tag：
+版本由 tag 触发的 GitHub Actions 工作流（`.github/workflows/release.yml`）自动维护：先跑测试，再在 Apple Silicon runner 上构建内嵌 UI 的单二进制，创建 GitHub Release，并把 tarball 的版本 / URL / sha256 写回 `rainbowatcher/homebrew-tap`。创建 GitHub Release 前会用 `scripts/release_notes.py` 从上一版本 tag 以来的 conventional commits 自动生成 release 说明（按 新增/修复/重构/文档/杂项 分组，展示在 GitHub Release 页面）。日常发版只需升级版本号并推送 tag：
 
 ```bash
 just release minor          # 升级 Rust + npm 版本号并提交

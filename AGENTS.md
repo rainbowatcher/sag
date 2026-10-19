@@ -3,12 +3,12 @@
 ## 关键命令
 
 ### 门禁 / 跨前后端（推荐入口）
-- `just verify` — 全量验证：`fmt-check` + `lint` + `test`（前后端），等价于 pre-commit hook 两条轨之和
-- `just verify-rust` / `just verify-ui` — 只跑单轨验证（hook 按暂存文件类型分别调用）
+- `just verify` — 全量验证：`fmt-check` + `lint` + `test`（前后端 + scripts/ python 工具），等价于 pre-commit hook 三条轨之和
+- `just verify-rust` / `just verify-ui` / `just test-scripts` — 只跑单轨验证（hook 按暂存文件类型分别调用）
 - `just fmt` — rustfmt + oxfmt 格式化（**会改写文件**）
 - `just fmt-check` — 格式化检查（只读，不改写文件）
 - `just lint` — `cargo clippy --all-targets -- -D warnings` + oxlint + vue-tsc
-- `just test` — Rust 单元/集成测试（默认跳过 doc test）+ 前端测试；`just test --doc` 只跑 doc test
+- `just test` — Rust 单元/集成测试（默认跳过 doc test）+ 前端测试 + scripts/ python 工具测试；`just test --doc` 只跑 doc test
 
 ### 后端 (Rust)
 - `just build` — 构建 release
@@ -66,8 +66,9 @@
   |---|---|---|
   | `*.rs` / `Cargo.toml` / `Cargo.lock` / `justfile` | `just verify-rust` | `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --no-fail-fast --tests` |
   | `sag-ui/**` / `justfile` | `just verify-ui` | `oxfmt --check` → `oxlint` → `vue-tsc --noEmit` → 前端测试 |
+  | `scripts/**` | `just test-scripts` | python unittest（`scripts/release_notes.py` 等的单元测试，当前仅 release_notes 有用例，只读） |
 
-  - 两条轨相加 = `just verify`（前后端全量），本地想提前自查就手动跑它
+  - 三条轨相加 = `just verify`（前后端 + scripts/ 全量）；本地想提前自查就手动跑它们
   - hook **只检查不改写**（一律 `--check` / `--noEmit`），不会静默修改你暂存的内容；格式报错请跑 `just fmt` 修好再提交
   - 任一步失败即中止提交，失败信息里会打印修复命令与绕过方式
   - hook 由 `just setup` 安装（`git config core.hooksPath scripts/hooks`）；GUI git 客户端不加载 shell rc，找不到 `just`/`cargo`/`pnpm` 时会以 `[ERROR] 找不到 just` 报错，去终端提交即可

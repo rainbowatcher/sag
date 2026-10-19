@@ -4,7 +4,8 @@
 # 按暂存文件类型分轨执行（改文档不会拖起 cargo test）：
 #   Rust 轨 (*.rs / Cargo.toml / Cargo.lock / justfile)  → just verify-rust
 #   前端轨 (sag-ui/** / justfile)                        → just verify-ui
-# 两条轨合起来等价于 `just verify`（= fmt-check + lint + test，前后端全量）。
+#   scripts 轨 (scripts/**)                              → just test-scripts
+# 三条轨相加 = `just verify`（= fmt-check + lint + test，前后端 + scripts/ 全量）。
 #
 # 全部为只读检查（`--check` / `--noEmit`），绝不改写工作区；格式问题请自己跑
 # `just fmt` 修。逃生舱：`SKIP_SIMPLE_GIT_HOOKS=1 git commit`。
@@ -56,6 +57,10 @@ fi
 
 if staged 'sag-ui/*' 'sag-ui/**/*' 'justfile' | grep -q .; then
     run_step "前端: fmt-check + oxlint + vue-tsc + test (just verify-ui)" just verify-ui
+fi
+
+if staged 'scripts/*' 'scripts/**/*' | grep -q .; then
+    run_step "scripts: python unittest (just test-scripts)" just test-scripts
 fi
 
 exit 0

@@ -34,11 +34,13 @@ ui-install:
 
 # ── 测试 ────────────────────────────────────────────────────────────
 
-# 运行全部测试（Rust + 前端）。Rust 默认只跑单元/集成测试（跳过 doc test），
-# 追加参数会覆盖默认值，例如 `just test --doc` 只跑文档测试。
+# 运行全部测试（Rust + 前端 + scripts/ 下的 python 工具）。Rust 默认只跑
+# 单元/集成测试（跳过 doc test），追加参数会覆盖默认值，例如 `just test --doc`
+# 只跑文档测试。
 test *args:
     just test-rust {{ args }}
     just ui-test
+    just test-scripts
 
 # 运行 Rust 测试（无参数时默认 `--tests`，即跳过 doc test）。
 # 第二条命令补跑 `embed-ui` 特性下的 sag-gateway：`sag-gateway/src/ui_routes/`
@@ -52,6 +54,10 @@ test-rust *args:
 # 运行前端测试
 ui-test:
     pnpm -C sag-ui run test
+
+# 运行 scripts/ 下 python 工具的单元测试（标准库 unittest，无第三方依赖）
+test-scripts:
+    python3 -m unittest discover -s scripts/tests -t scripts
 
 # 运行单个 crate 的测试 (e.g. just test-crate sag-config)
 test-crate crate:
@@ -131,8 +137,9 @@ lint: clippy ui-lint ui-typecheck
 
 # ── 验证门禁 ────────────────────────────────────────────────────────
 
-# 全量验证：fmt-check + lint + test（前后端）。pre-commit hook 的等价入口
-verify: verify-rust verify-ui
+# 全量验证：fmt-check + lint + test（前后端 + scripts/ python 工具）。
+# pre-commit hook 的等价入口
+verify: verify-rust verify-ui test-scripts
 
 # Rust 轨验证：fmt-check + clippy + test
 verify-rust: fmt-check-rust clippy test-rust
