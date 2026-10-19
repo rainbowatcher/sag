@@ -13,6 +13,8 @@ use sag_core::{
 
 use crate::util::extract_usage_from_value;
 
+use super::tool_raw;
+
 /// Stateless Chat Completions codec: decode to IR and encode back.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChatCompletionsCodec;
@@ -199,7 +201,7 @@ impl ChatCompletionsCodec {
         // tools: prefer original raw value (decode failure path); else rebuild.
         let tools = match raw.remove("tools") {
             Some(v) => Some(v),
-            None if !ir.tools.is_empty() => Some(encode_tools(&ir.tools)),
+            None if !ir.tools.is_empty() => Some(encode_tools(&ir.tools, &mut loss)),
             None => None,
         };
 
@@ -1118,10 +1120,14 @@ fn parse_tool(v: &Value) -> Option<IrTool> {
     })
 }
 
-fn encode_tools(tools: &[IrTool]) -> Value {
-    let arr: Vec<Value> = tools
-        .iter()
-        .map(|t| {
+fn encode_tools(tools: &[IrTool], loss: &mut sag_core::LossInventory) -> Value {
+    let mut arr: Vec<Value> = Vec::with_capacity(tools.len());
+    for (i, t) in tools.iter().enumerate() {
+        if tool_raw::is_dual_layer(t) {
+            // Chat source: restore each extra to its original position. The
+            // original `type` (any value, including `"function"`) comes only
+            // from tool_extra; never invent `"function"` when the source had
+            // no `type`.
             let mut func = Map::new();
             func.insert("name".into(), json!(t.name));
             if let Some(d) = &t.description {
@@ -1131,23 +1137,68 @@ fn encode_tools(tools: &[IrTool]) -> Value {
             if !t.input_schema.is_null() {
                 func.insert("parameters".into(), t.input_schema.clone());
             }
-            if let Some(Value::Object(function_extra)) = t.raw.get("__function_extra") {
+            if let Some(Value::Object(function_extra)) = t.raw.get(tool_raw::FUNCTION_EXTRA_KEY) {
                 for (k, v) in function_extra {
                     func.insert(k.clone(), v.clone());
                 }
             }
             let mut top = Map::new();
             top.insert("function".into(), Value::Object(func));
-            // `type` comes only from tool_extra (original value if present);
-            // never invent `"function"` when the source had no `type`.
-            if let Some(Value::Object(tool_extra)) = t.raw.get("__tool_extra") {
+            if let Some(Value::Object(tool_extra)) = t.raw.get(tool_raw::TOOL_EXTRA_KEY) {
                 for (k, v) in tool_extra {
                     top.insert(k.clone(), v.clone());
                 }
             }
-            Value::Object(top)
-        })
-        .collect();
+            arr.push(Value::Object(top));
+            continue;
+        }
+
+        // Foreign (flat) IR from Responses / Anthropic: translate to the
+        // OpenAI function shape. Hosted tools have no Chat equivalent — a
+        // hosted tool must never be squeezed into a fake function shape.
+        if let Some(ty) = tool_raw::tool_raw_type(t)
+            && ty.starts_with("web_search")
+        {
+            loss.push_loss(
+                LossScope::Request,
+                format!("tools[{i}]"),
+                LossReason::UnsupportedByTarget,
+                serde_json::to_value(t).unwrap_or(Value::Null),
+            );
+            continue;
+        }
+        let (tool_level, function_level) = tool_raw::tool_extras(t);
+        let mut func = Map::new();
+        func.insert("name".into(), json!(t.name));
+        if let Some(d) = &t.description {
+            func.insert("description".into(), json!(d));
+        }
+        if !t.input_schema.is_null() {
+            func.insert("parameters".into(), t.input_schema.clone());
+        }
+        // `strict` is function-level per OpenAI semantics.
+        for (k, v) in function_level {
+            func.entry(k).or_insert(v);
+        }
+        let mut top = Map::new();
+        top.insert("function".into(), Value::Object(func));
+        for (k, v) in tool_level {
+            top.entry(k).or_insert(v);
+        }
+        // Cross-protocol translation may synthesize the OpenAI default; a
+        // chat-sourced tool never reaches this branch. `""` is not a
+        // meaningful OpenAI tool type, so it counts as absent too.
+        match top.get("type") {
+            None => {
+                top.insert("type".into(), json!("function"));
+            }
+            Some(Value::String(s)) if s.is_empty() => {
+                top.insert("type".into(), json!("function"));
+            }
+            _ => {}
+        }
+        arr.push(Value::Object(top));
+    }
     Value::Array(arr)
 }
 
@@ -1682,6 +1733,160 @@ mod tests {
             encoded["tools"][0]
         );
         assert_eq!(normalize(encoded), normalize(body));
+    }
+
+    fn request_with_tool(tool: IrTool) -> IrRequest {
+        IrRequest {
+            model: "gpt-4o".into(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text { text: "hi".into() }],
+                ..Default::default()
+            }],
+            tools: vec![tool],
+            ..Default::default()
+        }
+    }
+
+    /// Cross-codec: a flat (Responses / Anthropic sourced) `raw` must be
+    /// translated, not dropped — `type` and `strict` reach the Chat wire
+    /// (`strict` inside `function`, per OpenAI semantics).
+    #[test]
+    fn encode_tools_flat_foreign_raw_maps_type_and_strict() {
+        let mut raw = Map::new();
+        raw.insert("type".into(), json!("function"));
+        raw.insert("strict".into(), json!(true));
+        raw.insert("cache_control".into(), json!({"type": "ephemeral"}));
+        let ir = request_with_tool(IrTool {
+            name: "fn".into(),
+            description: Some("d".into()),
+            input_schema: json!({"type": "object"}),
+            raw,
+        });
+        let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+        assert!(loss.is_empty(), "loss: {:?}", loss);
+        let encoded = serde_json::to_value(&req).unwrap();
+        let tool = &encoded["tools"][0];
+        assert_eq!(tool["type"], json!("function"), "type survives: {tool:?}");
+        assert_eq!(tool["function"]["strict"], json!(true));
+        assert!(
+            tool.get("strict").is_none(),
+            "strict belongs inside function: {tool:?}"
+        );
+        assert_eq!(tool["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(tool["function"]["name"], json!("fn"));
+        assert_eq!(tool["function"]["parameters"], json!({"type": "object"}));
+    }
+
+    /// Flat foreign `raw` without `type`: cross-protocol translation may
+    /// synthesize the OpenAI default (`"function"`).
+    #[test]
+    fn encode_tools_flat_foreign_raw_without_type_synthesizes_function() {
+        let ir = request_with_tool(IrTool {
+            name: "fn".into(),
+            description: None,
+            input_schema: Value::Null,
+            raw: Map::new(),
+        });
+        let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+        assert!(loss.is_empty(), "loss: {:?}", loss);
+        let encoded = serde_json::to_value(&req).unwrap();
+        let tool = &encoded["tools"][0];
+        assert_eq!(tool["type"], json!("function"));
+        assert!(
+            tool["function"].get("parameters").is_none(),
+            "absent parameters must stay absent: {tool:?}"
+        );
+    }
+
+    /// Flat foreign `raw` with an empty-string `type`: `""` is treated like
+    /// an absent type, so the OpenAI default is synthesized.
+    #[test]
+    fn encode_tools_flat_foreign_empty_type_synthesizes_function() {
+        let mut raw = Map::new();
+        raw.insert("type".into(), json!(""));
+        let ir = request_with_tool(IrTool {
+            name: "fn".into(),
+            description: None,
+            input_schema: Value::Null,
+            raw,
+        });
+        let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+        assert!(loss.is_empty(), "loss: {:?}", loss);
+        let encoded = serde_json::to_value(&req).unwrap();
+        assert_eq!(encoded["tools"][0]["type"], json!("function"));
+    }
+
+    /// Red line: a chat-sourced `type` round-trips verbatim — even `""`.
+    /// The `"function"` synthesis applies to foreign IR only.
+    #[test]
+    fn request_roundtrip_tool_empty_type_stays_empty() {
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "", "function": {"name": "fn"}}]
+        });
+        let (ir, back) = roundtrip_request(body.clone());
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        assert_eq!(
+            ir.tools[0].raw.get("__tool_extra"),
+            Some(&json!({"type": ""}))
+        );
+        let encoded = serde_json::to_value(&back).unwrap();
+        assert_eq!(encoded["tools"][0]["type"], json!(""));
+        assert_eq!(normalize(encoded), normalize(body));
+    }
+
+    /// Hosted tools have no Chat equivalent: drop with a loss entry, never
+    /// squeeze them into a fake function shape.
+    #[test]
+    fn encode_tools_flat_foreign_hosted_tool_dropped_with_loss() {
+        let mut raw = Map::new();
+        raw.insert("type".into(), json!("web_search_preview"));
+        raw.insert("max_uses".into(), json!(3));
+        let ir = request_with_tool(IrTool {
+            name: "web_search".into(),
+            description: None,
+            input_schema: Value::Null,
+            raw,
+        });
+        let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+        let encoded = serde_json::to_value(&req).unwrap();
+        assert!(
+            encoded["tools"].as_array().is_some_and(|a| a.is_empty()),
+            "hosted tool must not become a function tool: {encoded:?}"
+        );
+        assert_eq!(loss.len(), 1, "loss: {:?}", loss);
+        assert_eq!(loss.entries[0].field, "tools[0]");
+        assert_eq!(loss.entries[0].reason, LossReason::UnsupportedByTarget);
+    }
+
+    /// Reserved markers are internal to chat IR: never emitted, from either
+    /// source convention.
+    #[test]
+    fn encode_tools_never_emits_reserved_markers() {
+        let mut dual_raw = Map::new();
+        dual_raw.insert(tool_raw::TOOL_EXTRA_KEY.into(), json!({"type": "function"}));
+        dual_raw.insert(tool_raw::FUNCTION_EXTRA_KEY.into(), json!({"strict": true}));
+        let mut flat_raw = Map::new();
+        flat_raw.insert("type".into(), json!("function"));
+        flat_raw.insert(tool_raw::FUNCTION_EXTRA_KEY.into(), json!({"strict": true}));
+        for raw in [dual_raw, flat_raw] {
+            let ir = request_with_tool(IrTool {
+                name: "fn".into(),
+                description: None,
+                input_schema: Value::Null,
+                raw,
+            });
+            let (req, _) = ChatCompletionsCodec::encode_request_with_loss(&ir);
+            let encoded = serde_json::to_value(&req).unwrap();
+            let text = encoded.to_string();
+            assert!(
+                !text.contains(tool_raw::TOOL_EXTRA_KEY)
+                    && !text.contains(tool_raw::FUNCTION_EXTRA_KEY),
+                "reserved marker leaked: {text}"
+            );
+        }
     }
 
     #[test]

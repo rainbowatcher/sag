@@ -18,6 +18,8 @@ use sag_core::{
     IrRole, IrStreamEvent, IrTool, IrToolCall, LossReason, LossScope, Reasoning, Sampling, Usage,
 };
 
+use super::tool_raw;
+
 /// Stateless Anthropic Messages codec: decode to IR and encode back.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnthropicMessagesCodec;
@@ -1742,8 +1744,10 @@ fn encode_tools(tools: &[IrTool]) -> Value {
             // `{"type":"web_search_20250305","name":"web_search",...}`.
             // Only treat as hosted when `raw.type` **starts with**
             // `web_search` — a same-named function tool (type absent /
-            // `"function"`) must not be misclassified.
-            let raw_type = t.raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            // `"function"`) must not be misclassified. `raw.type` is read
+            // through the dual-convention accessor so chat-sourced IR is
+            // tolerated too.
+            let raw_type = tool_raw::tool_raw_type(t).unwrap_or("");
             if raw_type.starts_with("web_search") {
                 let mut tool = Map::new();
                 tool.insert("type".into(), json!("web_search_20250305"));
@@ -1752,9 +1756,10 @@ fn encode_tools(tools: &[IrTool]) -> Value {
                     tool.insert("description".into(), json!(d));
                 }
                 // Preserve extras (max_uses, cache_control, …) but never
-                // the original type (pinned above) or input_schema.
+                // the original type (pinned above), input_schema, or the
+                // chat-only reserved markers.
                 for (k, v) in &t.raw {
-                    if k != "type" && k != "input_schema" {
+                    if k != "type" && k != "input_schema" && !tool_raw::is_reserved_key(k) {
                         tool.entry(k.clone()).or_insert_with(|| v.clone());
                     }
                 }
@@ -1766,9 +1771,20 @@ fn encode_tools(tools: &[IrTool]) -> Value {
                 tool.insert("description".into(), json!(d));
             }
             tool.insert("input_schema".into(), t.input_schema.clone());
-            // Tool-level extras (cache_control, …) for round-trip.
-            for (k, v) in &t.raw {
-                tool.entry(k.clone()).or_insert_with(|| v.clone());
+            // Anthropic tool objects are flat: tool-level and function-level
+            // extras (incl. `strict`) both return to the root. Chat's reserved
+            // `__tool_extra` / `__function_extra` markers are never emitted.
+            tool_raw::merge_extras(&mut tool, t);
+            // Anthropic's tool-type enum has no `"function"`: an OpenAI
+            // `"function"` marker (and the `""` stand-in for "no type") is
+            // omitted regardless of which codec sourced the IR — a custom
+            // tool is function-semantic here. Any other value (`"custom"`,
+            // …) passes through verbatim; a missing `type` stays missing.
+            if matches!(
+                tool.get("type").and_then(|v| v.as_str()),
+                Some("function" | "")
+            ) {
+                tool.remove("type");
             }
             Value::Object(tool)
         })
@@ -2791,9 +2807,10 @@ mod tests {
             },
         });
         let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
-        assert_eq!(
-            body["tools"][0]["type"], "function",
-            "same-named function tool must not be remapped to hosted web_search"
+        assert!(
+            body["tools"][0].get("type").is_none(),
+            "`function` type is omitted (adjudication: value-based mapping), and the tool must not be remapped to hosted web_search: {}",
+            body["tools"][0]
         );
         assert_eq!(body["tools"][0]["name"], "web_search");
         assert!(
@@ -2801,5 +2818,129 @@ mod tests {
             "function tool keeps input_schema: {}",
             body["tools"][0]
         );
+    }
+
+    /// Cross-codec: chat-sourced dual-layer `raw` expands to the flat
+    /// Anthropic tool shape. The `"function"` type marker is omitted (the
+    /// Anthropic tool-type enum has no such value) and no reserved marker
+    /// reaches the wire.
+    #[test]
+    fn encode_tools_expands_chat_dual_layer_and_omits_function_type() {
+        let mut raw = Map::new();
+        raw.insert(tool_raw::TOOL_EXTRA_KEY.into(), json!({"type": "function"}));
+        raw.insert(tool_raw::FUNCTION_EXTRA_KEY.into(), json!({"strict": true}));
+        let mut ir = IrRequest {
+            model: "claude".into(),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        ir.messages.push(IrMessage {
+            role: IrRole::User,
+            content: vec![IrContentBlock::Text { text: "hi".into() }],
+            ..Default::default()
+        });
+        ir.tools.push(IrTool {
+            name: "fn".into(),
+            description: Some("d".into()),
+            input_schema: json!({"type": "object"}),
+            raw,
+        });
+        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let tool = &body["tools"][0];
+        assert!(
+            tool.get("type").is_none(),
+            "`function` type marker must be omitted: {tool:?}"
+        );
+        assert_eq!(tool["name"], json!("fn"));
+        assert_eq!(tool["description"], json!("d"));
+        assert_eq!(tool["input_schema"], json!({"type": "object"}));
+        assert_eq!(tool["strict"], json!(true), "strict lands at the root");
+        for k in tool.as_object().expect("tool object").keys() {
+            assert!(!tool_raw::is_reserved_key(k), "reserved marker leaked: {k}");
+        }
+        let tool_losses: Vec<_> = loss
+            .entries
+            .iter()
+            .filter(|e| e.field.starts_with("tools"))
+            .collect();
+        assert!(tool_losses.is_empty(), "tool losses: {tool_losses:?}");
+    }
+
+    /// Chat-sourced non-`function` type (e.g. `"custom"`) passes through
+    /// verbatim, and the extras land at the root.
+    #[test]
+    fn encode_tools_chat_dual_layer_custom_type_passes_through() {
+        let mut raw = Map::new();
+        raw.insert(
+            tool_raw::TOOL_EXTRA_KEY.into(),
+            json!({"type": "custom", "cache_control": {"type": "ephemeral"}}),
+        );
+        raw.insert(tool_raw::FUNCTION_EXTRA_KEY.into(), json!({}));
+        let mut ir = IrRequest {
+            model: "claude".into(),
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        ir.messages.push(IrMessage {
+            role: IrRole::User,
+            content: vec![IrContentBlock::Text { text: "hi".into() }],
+            ..Default::default()
+        });
+        ir.tools.push(IrTool {
+            name: "fn".into(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            raw,
+        });
+        let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let tool = &body["tools"][0];
+        assert_eq!(tool["type"], json!("custom"));
+        assert_eq!(tool["cache_control"], json!({"type": "ephemeral"}));
+        for k in tool.as_object().expect("tool object").keys() {
+            assert!(!tool_raw::is_reserved_key(k), "reserved marker leaked: {k}");
+        }
+    }
+
+    /// Adjudicated: the Anthropic `type` mapping is **value**-based, not
+    /// source-based — a flat (Responses-ingress) `"function"` and the `""`
+    /// stand-in for "no type" are both omitted; other values pass through
+    /// verbatim and an absent `type` stays absent.
+    #[test]
+    fn encode_tools_flat_type_maps_by_value() {
+        for (source_type, expected) in [
+            (Some("function"), None),
+            (Some(""), None),
+            (Some("custom"), Some("custom")),
+            (None, None),
+        ] {
+            let mut raw = Map::new();
+            if let Some(ty) = source_type {
+                raw.insert("type".into(), json!(ty));
+            }
+            let mut ir = IrRequest {
+                model: "claude".into(),
+                max_tokens: Some(64),
+                ..Default::default()
+            };
+            ir.messages.push(IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text { text: "hi".into() }],
+                ..Default::default()
+            });
+            ir.tools.push(IrTool {
+                name: "fn".into(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                raw,
+            });
+            let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+            let tool = &body["tools"][0];
+            assert_eq!(
+                tool.get("type").and_then(|v| v.as_str()),
+                expected,
+                "source type {source_type:?} → {tool:?}"
+            );
+            assert_eq!(tool["name"], json!("fn"));
+        }
     }
 }

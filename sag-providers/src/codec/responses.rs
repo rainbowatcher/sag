@@ -28,6 +28,8 @@ use sag_core::{
     Sampling, Usage,
 };
 
+use super::tool_raw;
+
 /// Stateless OpenAI Responses codec: decode to IR and encode back.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResponsesCodec;
@@ -1922,8 +1924,9 @@ fn encode_tools(tools: &[IrTool]) -> Value {
         .map(|t| {
             // M8 hosted web_search: emit Responses-hosted shape from raw
             // (`{"type":"web_search", ...}` or `web_search_preview*`)
-            // rather than function shape.
-            let raw_ty = t.raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            // rather than function shape. `raw.type` is read through the
+            // dual-convention accessor so chat-sourced IR is tolerated too.
+            let raw_ty = tool_raw::tool_raw_type(t).unwrap_or("");
             if raw_ty.starts_with("web_search") {
                 let mut tool = Map::new();
                 tool.insert("type".into(), json!(raw_ty));
@@ -1932,14 +1935,13 @@ fn encode_tools(tools: &[IrTool]) -> Value {
                     tool.insert("description".into(), json!(d));
                 }
                 for (k, v) in &t.raw {
-                    if k != "name" {
+                    if k != "name" && !tool_raw::is_reserved_key(k) {
                         tool.entry(k.clone()).or_insert_with(|| v.clone());
                     }
                 }
                 return Value::Object(tool);
             }
             let mut tool = Map::new();
-            tool.insert("type".into(), json!("function"));
             tool.insert("name".into(), json!(t.name));
             if let Some(d) = &t.description {
                 tool.insert("description".into(), json!(d));
@@ -1947,9 +1949,12 @@ fn encode_tools(tools: &[IrTool]) -> Value {
             if !t.input_schema.is_null() {
                 tool.insert("parameters".into(), t.input_schema.clone());
             }
-            for (k, v) in &t.raw {
-                tool.entry(k.clone()).or_insert_with(|| v.clone());
-            }
+            // Responses function tools are flat: tool-level and function-level
+            // extras (incl. `strict`) both return to the root. Chat's reserved
+            // `__tool_extra` / `__function_extra` markers are never emitted.
+            tool_raw::merge_extras(&mut tool, t);
+            // Original `type` wins; otherwise keep the Responses default.
+            tool.entry("type").or_insert_with(|| json!("function"));
             Value::Object(tool)
         })
         .collect();
@@ -2735,5 +2740,79 @@ mod tests {
         let back = ResponsesCodec::encode_request(&ir);
         assert_eq!(back["tools"][0]["type"], "web_search");
         assert_eq!(back["tools"][0]["max_uses"], 5);
+    }
+
+    /// Cross-codec: chat-sourced dual-layer `raw` must expand to the flat
+    /// Responses tool shape, and the reserved markers must never reach the
+    /// wire.
+    #[test]
+    fn encode_tools_expands_chat_dual_layer_without_reserved_markers() {
+        let mut raw = Map::new();
+        raw.insert(
+            tool_raw::TOOL_EXTRA_KEY.into(),
+            json!({"type": "function", "custom": 1}),
+        );
+        raw.insert(tool_raw::FUNCTION_EXTRA_KEY.into(), json!({"strict": true}));
+        let ir = IrRequest {
+            model: "gpt-4o".into(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text { text: "hi".into() }],
+                ..Default::default()
+            }],
+            tools: vec![IrTool {
+                name: "fn".into(),
+                description: Some("d".into()),
+                input_schema: json!({"type": "object"}),
+                raw,
+            }],
+            ..Default::default()
+        };
+        let back = ResponsesCodec::encode_request(&ir);
+        let tool = &back["tools"][0];
+        assert_eq!(tool["type"], json!("function"));
+        assert_eq!(tool["name"], json!("fn"));
+        assert_eq!(tool["description"], json!("d"));
+        assert_eq!(tool["parameters"], json!({"type": "object"}));
+        assert_eq!(
+            tool["strict"],
+            json!(true),
+            "function-level extras land at the root: {tool:?}"
+        );
+        assert_eq!(tool["custom"], json!(1));
+        for k in tool.as_object().expect("tool object").keys() {
+            assert!(!tool_raw::is_reserved_key(k), "reserved marker leaked: {k}");
+        }
+    }
+
+    /// Chat-sourced tool with no original `type`: the Responses default
+    /// applies, and no marker leaks.
+    #[test]
+    fn encode_tools_chat_dual_layer_without_type_uses_function_default() {
+        let mut raw = Map::new();
+        raw.insert(tool_raw::TOOL_EXTRA_KEY.into(), json!({}));
+        raw.insert(tool_raw::FUNCTION_EXTRA_KEY.into(), json!({}));
+        let ir = IrRequest {
+            model: "gpt-4o".into(),
+            messages: vec![IrMessage {
+                role: IrRole::User,
+                content: vec![IrContentBlock::Text { text: "hi".into() }],
+                ..Default::default()
+            }],
+            tools: vec![IrTool {
+                name: "fn".into(),
+                description: None,
+                input_schema: Value::Null,
+                raw,
+            }],
+            ..Default::default()
+        };
+        let back = ResponsesCodec::encode_request(&ir);
+        let tool = &back["tools"][0];
+        assert_eq!(tool["type"], json!("function"));
+        assert!(tool.get("parameters").is_none());
+        for k in tool.as_object().expect("tool object").keys() {
+            assert!(!tool_raw::is_reserved_key(k), "reserved marker leaked: {k}");
+        }
     }
 }

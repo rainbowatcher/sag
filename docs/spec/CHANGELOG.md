@@ -9,6 +9,7 @@ updated: 2026-10-19
 
 ## 2026-10-19
 
+- **供应商**：[0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](providers/changes/0007-tool-raw-cross-codec-fidelity.md) — chat 双层 / Responses、Anthropic 扁平的两套 `raw` 约定导致四个缺陷（Responses→Chat 丢 `tools[].type` 触发上游 pydantic 500、同路径丢 `strict`、Anthropic→Chat 丢 `type`、Chat→Responses/Anthropic 泄漏 `__tool_extra`/`__function_extra`）；新增 `codec/tool_raw.rs` 共享 helper（`__tool_extra` 键存在性作 chat 来源判别式 + 双轨读取 + 展开写入），chat 出站对外来 IR 走扁平 fallback 并合成 `"type": "function"`（chat↔chat 零合成不发明 `type`），Responses/Anthropic 出站展开双层键（`"function"` / `""` 按值省略，对所有来源一致），hosted `web_search*` 落 chat 目标改为丢弃 + 记 `LossReason::UnsupportedByTarget`
 - **日志**：[0004 响应体超限不再毁坏响应](logging/changes/0004-response-body-truncation-fix.md) — `log_http` 不再用 `to_bytes(..).unwrap_or_default()` 把 > 10 MB 响应换成空 body：改为帧级有界收集 + 帧链重组（未超限字节级不变，超限时已收集帧与剩余流 `chain` 后全量转发、headers 不动），日志超限只打 512 B 预览 + `truncated=true` / `collected=<n>`；body 流错误不再被吞，记 `body_error=true` WARN 并传播给客户端；请求侧孪生缺陷（谎报 content-length 导致 handler 收到空 body）同步修复
 
 ## 2026-10-18

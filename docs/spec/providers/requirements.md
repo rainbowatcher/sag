@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-10-19
 ---
 
 # 供应商
@@ -27,6 +27,18 @@ updated: 2026-06-03
    - **Anthropic**：提取 system messages → 合并为 `system` 参数，翻译 content blocks、stop_sequences、tool_choice；**将 `reasoning_effort` 翻译为 `thinking: {type: "enabled", budget_tokens: N}`**（见「Anthropic Extended Thinking 翻译」节）
 5. 发送请求到上游（认证根据供应商类型：OpenAI → `Authorization: Bearer`，Anthropic → `x-api-key`）
 6. 收到响应后翻译回 OpenAI 格式
+
+### 工具定义跨 codec 保真
+
+工具定义在 IR 中以 `IrTool` 承载，`raw` 保留协议特有的工具字段。三条 codec（chat / Responses / Anthropic）共享同一套读写约定：
+
+1. **两种布局**：chat 来源用双层结构 `{"__tool_extra": {...}, "__function_extra": {...}}`（工具级字段 / `function` 级字段分开存放）；Responses 与 Anthropic 来源用扁平平铺（工具对象除已映射字段外的其余字段原样保留）
+2. **chat 来源判别式**：`raw` 中 `__tool_extra` 键的**存在性**即「chat 来源」的结构标记，不依赖任何业务字段
+3. **同协议零合成**：chat → chat 往返逐字还原，源工具没有 `type` 就继续没有——绝不凭空发明 `type`；源 `type` 为 `""` 时同样逐字还原为 `""`（双层来源路径不做任何合成）
+4. **跨协议允许合成默认值**：跨协议编码边界允许补齐目标协议必填项。Responses / Anthropic 的 function 工具在 wire 上不带 `type`，故 chat 出站对外来 IR 在 `type` 缺失或为 `""` 时合成 `"type": "function"`；Responses 出站保留（缺失时补）`"type": "function"`；Anthropic 出站**按值映射且对所有来源一致**：`type` 为 `"function"` 或 `""` 时省略（其 tool-type 枚举无 `function`，自定义工具本身即 function 语义），`"custom"` / `web_search*` 等其余值逐字保留，缺失维持缺失
+5. **`strict` 位置由协议决定**：chat 为 `function.strict`，Responses 为工具根部；跨协议时按目标协议落位
+6. **出站禁止内部伪字段**：`__tool_extra` / `__function_extra` 仅存在于 IR，任何出站 JSON 都不得包含它们
+7. **hosted 工具丢弃必须记 loss**：hosted `web_search*` 工具的目标协议不支持时丢弃，并记 `LossReason::UnsupportedByTarget` 进 `CallLog`；禁止静默丢弃，也禁止压成假 function 形状
 
 ### 响应翻译（Anthropic → OpenAI）
 
@@ -127,6 +139,7 @@ updated: 2026-06-03
 
 ## 变更记录
 
+- [0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](changes/0007-tool-raw-cross-codec-fidelity.md)
 - [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)
 - [0001 初始化](changes/0001-initial.md)

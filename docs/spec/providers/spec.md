@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-30
+updated: 2026-10-19
 ---
 
 # 供应商 — 规格
@@ -12,6 +12,7 @@ updated: 2026-09-30
 - [sag-providers/src/openai.rs](../../../sag-providers/src/openai.rs) — OpenAI 适配器
 - [sag-providers/src/anthropic.rs](../../../sag-providers/src/anthropic.rs) — Anthropic 适配器（请求/响应翻译 + 缓存控制注入）
 - [sag-providers/src/util.rs](../../../sag-providers/src/util.rs) — 共享工具函数
+- [sag-providers/src/codec/tool_raw.rs](../../../sag-providers/src/codec/tool_raw.rs) — `IrTool.raw` 双轨约定的唯一实现点（双轨读取 + 展开写入）
 - [sag-providers/src/lib.rs](../../../sag-providers/src/lib.rs) — `create_provider()` 工厂函数
 - [sag-core/src/types.rs](../../../sag-core/src/types.rs) — `normalize_reasoning_effort()` 方法
 - [sag-core/src/http_client.rs](../../../sag-core/src/http_client.rs) — 共享 `build_http_client()`：proxy 策略 + 连接池 idle 调优（`POOL_IDLE_TIMEOUT` / `POOL_MAX_IDLE_PER_HOST`）
@@ -154,6 +155,25 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - ❌ 改变了请求内容，可能影响某些边缘场景（如用户精确控制 prompt）
 - 通过 `anthropic_cache_control = false` 可关闭
 
+### `IrTool.raw` 双轨约定与共享 helper
+
+三个 codec 对 `IrTool.raw` 各持一套布局（chat 双层 / Responses、Anthropic 扁平），布局差异曾导致四个跨 codec 缺陷（丢 `type`、丢 `strict`、泄漏内部伪字段、hosted 工具压成假 function 形状）。修复采用 D′：**不动 decode 布局，在 encode 侧兼容读取两种布局**，实现收敛到 `sag-providers/src/codec/tool_raw.rs`。
+
+| 决策 | 内容 |
+|------|------|
+| 判别式 | 「chat 来源」= `raw` 中 `__tool_extra` 键的存在性（`is_dual_layer`，结构标记，非业务字段；空对象 `{}` 也算双层） |
+| 双轨读取 | `tool_extras`：有 `__tool_extra` → 工具级字段取自它、`function` 级取自 `__function_extra`；无 → `raw` 自身即工具级字段，其中 `strict` 提升到 function 级（OpenAI 语义） |
+| 展开写入 | `merge_extras` 把两层展开到目标协议的工具根部（`or_insert`：调用方已写的 `name` / `description` / `parameters` / `type` 优先），`is_reserved_key` 保证内部伪字段永不出现在 wire 上 |
+| 同协议零合成 | chat → chat 仍走原路径，`type` 只从 `__tool_extra` 还原，不凭空发明 |
+| 跨协议合成默认值 | chat 出站对外来扁平 IR 在 `type` 缺失或为 `""` 时补 `"type": "function"`；Anthropic 出站**按值**省略 `type`（`"function"` 与 `""` 一律省略，对所有来源一致），其余值（`"custom"`、`web_search*`）逐字保留，缺失维持缺失 |
+| hosted 丢弃记 loss | hosted `web_search*` 落 chat 目标时丢弃并记 `LossReason::UnsupportedByTarget`，经 `encode_losses` 通道进 `CallLog` |
+
+**Trade-off**:
+- ✅ 四个同根因缺陷同修；chat ↔ chat 字节不变，回归面收敛在跨协议编码
+- ✅ 约定只有一个实现点，新增 codec 接 helper 即可，避免再次漂移
+- ❌ IR 仍存在两种布局，未做一次性迁移；helper 需长期维护双轨读取分支
+- ❌ 改 decode 布局（统一为双层）看似更整齐，但会重写三个 codec 的 pinned round-trip 断言与 hosted 形状测试，收益不抵风险
+
 ### 共享 HTTP client 连接池 idle 调优
 
 `build_http_client`（`sag-core/src/http_client.rs`，provider + admin 共享）在模块级写死连接池常量，用于降低 stale 连接复用导致的流中途 `peer closed connection without sending TLS close_notify`：
@@ -182,6 +202,12 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 ## 不变式
 
 - `create_provider()` 是创建 provider 的唯一入口
+- `IrTool.raw` 存在两种布局：chat 来源为双层 `{"__tool_extra", "__function_extra"}`，Responses / Anthropic 来源为扁平平铺；`__tool_extra` 键的**存在性**是「chat 来源」的唯一判别式
+- 同协议（chat ↔ chat）工具往返零合成：源工具无 `type` 时出站也不得出现 `type`，源 `type` 为 `""` 时逐字往返为 `""`
+- 跨协议编码边界允许合成目标协议必填默认值（chat 出站对缺失或 `""` 的 `type` 补 `"type": "function"`；Responses 出站保留/补 `"type": "function"`；Anthropic 出站按值省略 `"function"` / `""`，对所有来源一致）
+- `strict` 位置由目标协议决定：chat 为 `function.strict`，Responses 为工具根部
+- 任何出站 JSON 不得包含 `__tool_extra` / `__function_extra` 内部伪字段
+- hosted `web_search*` 工具无法映射到目标协议时必须丢弃并记 `LossReason::UnsupportedByTarget`，禁止静默丢弃或压成假 function 形状
 - 所有 provider 实现 `Send + Sync`，可在线程间安全共享
 - Anthropic 适配器仅接受单条 system message（多条会合并或丢弃）
 - `base_url` 必须以 `://` 结尾（validator 检查）
@@ -194,10 +220,13 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - `sag-providers/src/openai.rs` — OpenAI 适配器单元测试
 - `sag-providers/src/anthropic.rs` — Anthropic 翻译测试（请求构造、响应解析、reasoning_effort → thinking 翻译、reasoning_tokens 捕获）
 - `sag-providers/src/base.rs` — body_overrides 合并测试
+- `sag-providers/src/codec/tool_raw.rs` — 双轨读取 / 展开写入 / `is_dual_layer` 判别式单元测试
+- `sag-providers/src/codec/{chat,responses,anthropic}.rs` — 跨 codec 工具字段保真（外来 IR 补/省 `type`、`strict` 落位、出站无伪字段、hosted 丢弃记 loss）；Anthropic 侧断言 `"function"` / `""` 按值省略（含 `function_tool_named_web_search_is_not_hosted` 的扁平 `raw` 期望值）
 - `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
 - `sag-core/src/http_client.rs` — `pool_connection_constants_match_plan`（钉住 pool 常量）、`pool_options_coexist_with_proxy_and_timeout`（pool 与 proxy/timeout 共存）
 
 ## 变更记录
+- [0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](changes/0007-tool-raw-cross-codec-fidelity.md)
 - [0005 共享 HTTP client 连接池 idle 调优（降低 stale 连接复用）](changes/0005-http-client-pool-idle-tuning.md)
 - [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)

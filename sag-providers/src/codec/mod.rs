@@ -5,6 +5,7 @@
 mod anthropic;
 mod chat;
 mod responses;
+mod tool_raw;
 
 pub use anthropic::{
     AnthropicMessagesCodec, DEFAULT_MAX_TOKENS, inject_cache_control_value, resolve_budget,
