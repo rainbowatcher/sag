@@ -386,6 +386,54 @@ async fn order_round_robin(
     rotated
 }
 
+/// Effective weight for the session-sticky weighted base ordering:
+/// `priority` doubles as the weight (no separate `weight` field — design
+/// decision D3). Priority layers do not apply in the weighted base.
+pub fn effective_weight(target: &RouteTarget) -> u32 {
+    target.priority
+}
+
+/// Weighted-random **full permutation** of `targets` (Efraimidis–Spirakis
+/// A-Res): draw `u ∈ (0, 1]` per target, sort by `key = u^(1/w)`
+/// descending. The head of the permutation is the weighted-random primary
+/// choice and the tail is its fallback order — one draw decides both, so
+/// failover never re-rolls (design §4.4).
+///
+/// Rules:
+/// - all weights 0 → uniform shuffle (avoids the all-zero undefined draw);
+/// - a single `w == 0` target gets key 0.0 and stays at the tail — it is
+///   never drawn first but never leaves the permutation (fallback stays
+///   complete). Stable sort keeps zero-weight targets in input order.
+///
+/// The RNG is caller-supplied so tests can pin a seed. Every request
+/// re-draws; the permutation is never cached.
+pub fn weighted_permutation(targets: &[RouteTarget], rng: &mut fastrand::Rng) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    if targets.iter().all(|t| effective_weight(t) == 0) {
+        rng.shuffle(&mut order);
+        return order;
+    }
+    let mut keyed: Vec<(f64, usize)> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let w = effective_weight(t) as f64;
+            // `1.0 - rng.f64()` maps [0,1) to (0,1] — u = 0 would pin the
+            // key at 0 and collide with the zero-weight tail.
+            let key = if w == 0.0 {
+                0.0
+            } else {
+                (1.0 - rng.f64()).powf(1.0 / w)
+            };
+            (key, i)
+        })
+        .collect();
+    // Descending; stable so equal keys (only the w == 0 tail — positive
+    // weights tie with probability zero) keep input order.
+    keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+    keyed.into_iter().map(|(_, i)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +454,87 @@ mod tests {
 
     fn orders_map() -> Arc<RwLock<HashMap<String, CachedOrder>>> {
         Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[test]
+    fn weighted_permutation_is_full_permutation() {
+        let targets = vec![
+            target("a", 5),
+            target("b", 1),
+            target("c", 0),
+            target("d", 5),
+            target("e", 0),
+        ];
+        let mut rng = fastrand::Rng::with_seed(42);
+        for _ in 0..1000 {
+            let order = weighted_permutation(&targets, &mut rng);
+            assert_eq!(order.len(), targets.len(), "length must be preserved");
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..targets.len()).collect::<Vec<_>>(),
+                "permutation must contain every index exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_permutation_head_is_weighted() {
+        // A:B = 2:1 → A must land first ≈ 66.7% of the time.
+        // 10k draws, ±3% tolerance (≈6σ for this p) on a pinned seed.
+        let targets = vec![target("a", 2), target("b", 1)];
+        let mut rng = fastrand::Rng::with_seed(7);
+        let n = 10_000;
+        let a_first = (0..n)
+            .filter(|_| weighted_permutation(&targets, &mut rng)[0] == 0)
+            .count();
+        let share = a_first as f64 / n as f64;
+        assert!(
+            (share - 2.0 / 3.0).abs() < 0.03,
+            "expected ≈0.667 first-slot share for weight 2/3, got {share}"
+        );
+    }
+
+    #[test]
+    fn weighted_permutation_all_zero_is_uniform() {
+        // All-zero (or all-defaulted) weights → uniform shuffle.
+        let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
+        let mut rng = fastrand::Rng::with_seed(11);
+        let n = 10_000;
+        let mut firsts = [0usize; 3];
+        for _ in 0..n {
+            firsts[weighted_permutation(&targets, &mut rng)[0]] += 1;
+        }
+        for (i, count) in firsts.iter().enumerate() {
+            let share = *count as f64 / n as f64;
+            assert!(
+                (share - 1.0 / 3.0).abs() < 0.03,
+                "target {i} expected ≈0.333 first-slot share, got {share}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_permutation_zero_weight_stays_in_tail_never_first() {
+        let targets = vec![target("a", 10), target("b", 1), target("zero", 0)];
+        let mut rng = fastrand::Rng::with_seed(99);
+        for _ in 0..1000 {
+            let order = weighted_permutation(&targets, &mut rng);
+            assert_ne!(order[0], 2, "zero-weight target must never be first");
+            assert_eq!(
+                *order.last().unwrap(),
+                2,
+                "zero-weight target pins the tail"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_permutation_single_target() {
+        let targets = vec![target("solo", 0)];
+        let mut rng = fastrand::Rng::with_seed(1);
+        assert_eq!(weighted_permutation(&targets, &mut rng), vec![0]);
     }
 
     #[tokio::test]
