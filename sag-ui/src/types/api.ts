@@ -394,6 +394,8 @@ export interface LogFilter {
   provider?: string
   model?: string
   real_model?: string
+  /** Hashed session identity (`call_logs.session_key`) — exact match. */
+  session?: string
   status_code?: number | string
   offset?: number
   limit?: number

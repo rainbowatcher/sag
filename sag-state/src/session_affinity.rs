@@ -54,6 +54,10 @@ pub struct SessionPin {
     /// Config `routes_version` at pin time. A pin recorded under an older
     /// version reads as a miss (never deleted) after a config mutation.
     pub routes_version: u64,
+    /// Extraction-chain source the session key came from (`meta` / `top` /
+    /// `pc` / `fb`) — display-only, for the admin snapshot. Empty on pins
+    /// built without a key context (tests).
+    pub source: String,
 }
 
 impl SessionPin {
@@ -73,7 +77,14 @@ impl SessionPin {
             target_real_model,
             recorded_at,
             routes_version,
+            source: String::new(),
         }
+    }
+
+    /// Tag the pin with its extraction-chain source (admin snapshot).
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
     }
 }
 
@@ -343,14 +354,18 @@ impl SessionAffinityInner {
 
     /// Clone the whole memory for the admin snapshot (single short lock
     /// hold; DTOs computed outside).
-    pub fn snapshot(&self) -> Vec<(String, SessionPin)> {
+    pub fn snapshot(&self) -> Vec<SessionSnapshotEntry> {
         self.spaces
             .iter()
-            .flat_map(|(route_model, space)| {
-                space.map.iter().map(move |(map_id, pin)| {
-                    debug_assert_eq!(&pin.route_model, route_model);
-                    (map_id.clone(), pin.clone())
-                })
+            .flat_map(|(model, space)| {
+                space
+                    .map
+                    .iter()
+                    .map(move |(map_id, pin)| SessionSnapshotEntry {
+                        map_id: map_id.clone(),
+                        model: model.clone(),
+                        pin: pin.clone(),
+                    })
             })
             .collect()
     }
@@ -359,6 +374,17 @@ impl SessionAffinityInner {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+}
+
+/// One entry of [`SessionAffinityInner::snapshot`] — the hashed key, its
+/// request-model space, and the pin.
+#[derive(Debug, Clone)]
+pub struct SessionSnapshotEntry {
+    /// Hashed session identity (never the raw value).
+    pub map_id: String,
+    /// Request-model space key.
+    pub model: String,
+    pub pin: SessionPin,
 }
 
 /// Shared handle for the session-affinity memory. Shared between
@@ -526,7 +552,7 @@ mod tests {
         }
         let snap = inner.snapshot();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].0, "c");
+        assert_eq!(snap[0].map_id, "c");
     }
 
     #[test]
@@ -560,7 +586,7 @@ mod tests {
             pin_at("m", now),
             1,
         );
-        let mut keys: Vec<String> = inner.snapshot().into_iter().map(|(k, _)| k).collect();
+        let mut keys: Vec<String> = inner.snapshot().into_iter().map(|e| e.map_id).collect();
         keys.sort();
         assert_eq!(keys, vec!["a".to_string(), "c".to_string()]);
     }

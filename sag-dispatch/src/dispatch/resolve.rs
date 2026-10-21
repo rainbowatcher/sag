@@ -313,6 +313,7 @@ async fn emit_no_route_failure(
         None,
         None,
         None,
+        None,
     );
     // Formal analytics fact: no route matched → no route identity, no
     // target attempts. The sentinel `__no_route__` CallLog row above is
@@ -385,6 +386,7 @@ async fn emit_all_disabled_failure(
         user_agent,
         client_ip,
         Some(ingress_protocol.as_str().to_string()),
+        None,
         None,
         None,
         None,

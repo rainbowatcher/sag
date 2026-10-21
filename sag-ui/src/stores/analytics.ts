@@ -60,6 +60,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       provider: filter.provider,
       model: filter.model,
       real_model: filter.real_model,
+      session: filter.session,
       status_code: filter.status_code,
     }
     logsOffset.value = 0
@@ -84,6 +85,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (filter.provider) params.set("provider", filter.provider)
       if (filter.model) params.set("model", filter.model)
       if (filter.real_model) params.set("real_model", filter.real_model)
+      if (filter.session) params.set("session", filter.session)
       if (filter.status_code != null) params.set("status_code", String(filter.status_code))
       params.set("offset", String(targetOffset))
       params.set("limit", String(effectiveLimit))

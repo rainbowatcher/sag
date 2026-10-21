@@ -76,13 +76,16 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         trace_id,
         route_name,
         &request.model,
-        false, // image generation is always non-streaming
+        false,
+        // image generation is always non-streaming
         sag_core::IngressProtocol::ChatCompletions,
         started_at,
         start,
-        None, // image requests carry no reasoning_effort
+        None,
+        // image requests carry no reasoning_effort
         user_agent.clone(),
         client_ip.clone(),
+        None,
     );
 
     let img_request = build_image_request(request);
@@ -173,9 +176,12 @@ async fn finish_image_success(
         false,
         attempt_ctx.start,
         None,
-        None, // reasoning_effort — not applicable for image generation
-        None, // upstream_duration_ms — image path timing is out of scope for stage 2
-        None, // ttft_ms — image generation is single-shot, conceptually non-streaming
+        None,
+        // reasoning_effort — not applicable for image generation
+        None,
+        // upstream_duration_ms — image path timing is out of scope for stage 2
+        None,
+        // ttft_ms — image generation is single-shot, conceptually non-streaming
         attempt_ctx.user_agent.map(str::to_string),
         attempt_ctx.client_ip.map(str::to_string),
         Some(
@@ -185,7 +191,9 @@ async fn finish_image_success(
         ),
         Some(target.upstream_protocol.as_str().to_string()),
         Some(target.lane.as_str().to_string()),
-        None, // image path has no IR LossInventory
+        None,
+        // image path has no IR LossInventory,
+        None,
     ));
     emit_image_success_event(
         attempt_ctx.state,
@@ -242,7 +250,8 @@ async fn finish_image_exhausted(
         attempt_ctx.trace_id,
         attempt_ctx.start,
         errors,
-        None, // reasoning_effort — not applicable for image generation
+        None,
+        // reasoning_effort — not applicable for image generation
         attempt_ctx.user_agent,
         attempt_ctx.client_ip,
         Some(
@@ -250,6 +259,7 @@ async fn finish_image_exhausted(
                 .as_str()
                 .to_string(),
         ),
+        None,
         None,
         None,
         None,
@@ -601,7 +611,8 @@ async fn apply_image_outcome<'a>(
             errors,
             category,
             attempt_status,
-            None, // reasoning_effort — not applicable for image generation
+            None,
+            // reasoning_effort — not applicable for image generation
             ctx.user_agent,
             ctx.client_ip,
             Some(
@@ -611,6 +622,7 @@ async fn apply_image_outcome<'a>(
             ),
             Some(target.upstream_protocol.as_str().to_string()),
             Some(target.lane.as_str().to_string()),
+            None,
             None,
         );
         if let Some(err) = client_error {

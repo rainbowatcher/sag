@@ -582,6 +582,9 @@ pub(crate) struct DispatchAnalytics {
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
+    /// Hashed session identity for the pre-commit-cancel `call_logs` row
+    /// (see [`CallLog::session_key`]).
+    session_key: Option<String>,
     /// Set by every normal terminal **before** it emits; the drop guard
     /// claims this flag so it can never emit a second request result.
     done: std::sync::atomic::AtomicBool,
@@ -711,6 +714,7 @@ impl DispatchCancelGuard {
         reasoning_effort: Option<String>,
         user_agent: Option<String>,
         client_ip: Option<String>,
+        session_key: Option<String>,
     ) -> Self {
         Self {
             analytics: Arc::new(DispatchAnalytics {
@@ -726,6 +730,7 @@ impl DispatchCancelGuard {
                 reasoning_effort,
                 user_agent,
                 client_ip,
+                session_key,
                 done: std::sync::atomic::AtomicBool::new(false),
                 in_flight: std::sync::Mutex::new(None),
                 completed: std::sync::Mutex::new(Vec::new()),
@@ -893,6 +898,7 @@ impl Drop for DispatchCancelGuard {
             upstream_protocol: cancel_upstream_protocol,
             lane: cancel_lane,
             loss_summary: None,
+            session_key: analytics.session_key.clone(),
         });
         warn!(
             request_id = %request_id,
@@ -927,6 +933,7 @@ pub(in crate::dispatch) fn success_log(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> CallLog {
     let usage = usage.cloned();
     CallLog {
@@ -957,6 +964,7 @@ pub(in crate::dispatch) fn success_log(
         upstream_protocol,
         lane,
         loss_summary,
+        session_key,
     }
 }
 
@@ -981,6 +989,7 @@ pub(in crate::dispatch) fn failure_log(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> CallLog {
     CallLog {
         request_id,
@@ -1010,6 +1019,7 @@ pub(in crate::dispatch) fn failure_log(
         upstream_protocol,
         lane,
         loss_summary,
+        session_key,
     }
 }
 
@@ -1049,6 +1059,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) {
     let last_err = errors
         .last()
@@ -1070,6 +1081,7 @@ pub(in crate::dispatch) fn log_per_target_failure(
         upstream_protocol,
         lane,
         loss_summary,
+        session_key,
     );
     // Override the error_category that `failure_log` derived from
     // `AppError::Internal` with the caller-supplied category so the
@@ -1100,6 +1112,7 @@ pub(in crate::dispatch) fn failure_response(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> Response<Body> {
     state.collector.log(failure_log(
         trace_id,
@@ -1117,6 +1130,7 @@ pub(in crate::dispatch) fn failure_response(
         upstream_protocol,
         lane,
         loss_summary,
+        session_key,
     ));
     err.into_response()
 }
@@ -1140,6 +1154,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> Response<Body> {
     let reason = errors.join("; ");
     let err = AppError::AllProvidersExhausted {
@@ -1168,6 +1183,7 @@ pub(in crate::dispatch) fn fallback_exhausted_response(
         upstream_protocol,
         lane,
         loss_summary,
+        session_key,
     ));
     err.into_response()
 }
@@ -1425,6 +1441,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1443,6 +1460,7 @@ mod tests {
             Instant::now(),
             &["openai: 500".into()],
             Some("high"),
+            None,
             None,
             None,
             None,
@@ -1496,6 +1514,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         state.collector.flush().await;
@@ -1534,6 +1553,7 @@ mod tests {
             &["upstream 429".into()],
             "provider_error",
             429,
+            None,
             None,
             None,
             None,
@@ -1582,6 +1602,7 @@ mod tests {
             sag_core::IngressProtocol::ChatCompletions,
             started_at,
             Instant::now(),
+            None,
             None,
             None,
             None,
@@ -1634,10 +1655,12 @@ mod tests {
             trace_id,
             "test-route",
             "gpt-4o",
-            true, // streaming
+            true,
+            // streaming
             sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
+            None,
             None,
             None,
             None,
@@ -1696,6 +1719,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         guard.mark_done();
         guard.analytics().begin_attempt(
@@ -1732,10 +1756,12 @@ mod tests {
             trace_id,
             "test-route",
             "gpt-4o",
-            true, // streaming — cancelled before `build_streaming_response` commits
+            true,
+            // streaming — cancelled before `build_streaming_response` commits
             sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
+            None,
             None,
             None,
             None,
@@ -1818,6 +1844,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         drop(guard);
 
@@ -1861,6 +1888,7 @@ mod tests {
             sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
+            None,
             None,
             None,
             None,
@@ -1934,6 +1962,7 @@ mod tests {
             sag_core::IngressProtocol::ChatCompletions,
             chrono::Utc::now(),
             Instant::now(),
+            None,
             None,
             None,
             None,

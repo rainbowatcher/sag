@@ -26,6 +26,7 @@ use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
 };
 use crate::admin_routes::{create_route, delete_route, list_routes, update_route};
+use crate::admin_session_affinity::{delete_session_affinity, list_session_affinity};
 use crate::admin_settings::{get_settings, update_settings};
 use crate::admin_testing::{fetch_models, model_test, probe_protocols};
 use sag_state::AppState;
@@ -59,6 +60,10 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
         .route(
             "/active-targets",
             get(list_active_targets).delete(delete_active_target),
+        )
+        .route(
+            "/session-affinity",
+            get(list_session_affinity).delete(delete_session_affinity),
         )
         .with_state(state)
 }

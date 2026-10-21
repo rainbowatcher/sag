@@ -398,6 +398,11 @@ pub struct CallLog {
     /// entries). Omitted when `None` (no losses / legacy records).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_summary: Option<String>,
+    /// Hashed session identity (`SessionKey::map_id`, 32 hex chars) for
+    /// session-sticky routes with a session key — never the raw value.
+    /// `NULL` for session-less requests and non-`session_sticky` routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -770,6 +775,7 @@ mod tests {
             upstream_protocol: None,
             lane: None,
             loss_summary: None,
+            session_key: None,
         }
     }
 

@@ -77,6 +77,8 @@ pub struct LogFilter {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub real_model: Option<String>,
+    /// Hashed session identity (`CallLog::session_key`) — exact match.
+    pub session: Option<String>,
     pub status_code: Option<StatusCodeFilter>,
     pub offset: u64,
     pub limit: u64,

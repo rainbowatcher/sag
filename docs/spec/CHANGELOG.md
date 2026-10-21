@@ -7,6 +7,8 @@ updated: 2026-10-19
 
 按时间倒序列出所有模块的变更记录。
 
+- **2026-10-21** · **routing**：[0003 会话粘性路由与 priority 加权随机基底](routing/changes/0003-session-affinity-weighted-random.md) — 新增 `session_sticky` 策略：会话按上次成功目标粘住，未命中按 priority 加权随机全排列
+
 ## 2026-10-19
 
 - **供应商**：[0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](providers/changes/0007-tool-raw-cross-codec-fidelity.md) — chat 双层 / Responses、Anthropic 扁平的两套 `raw` 约定导致四个缺陷（Responses→Chat 丢 `tools[].type` 触发上游 pydantic 500、同路径丢 `strict`、Anthropic→Chat 丢 `type`、Chat→Responses/Anthropic 泄漏 `__tool_extra`/`__function_extra`）；新增 `codec/tool_raw.rs` 共享 helper（`__tool_extra` 键存在性作 chat 来源判别式 + 双轨读取 + 展开写入），chat 出站对外来 IR 走扁平 fallback 并合成 `"type": "function"`（chat↔chat 零合成不发明 `type`），Responses/Anthropic 出站展开双层键（`"function"` / `""` 按值省略，对所有来源一致），hosted `web_search*` 落 chat 目标改为丢弃 + 记 `LossReason::UnsupportedByTarget`

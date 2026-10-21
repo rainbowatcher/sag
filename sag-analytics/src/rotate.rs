@@ -846,11 +846,15 @@ mod tests {
         let columns_before = infos_of(&pool, HOT_TABLE).await;
         assert_eq!(
             columns_before.len(),
-            28,
-            "migrated call_logs has 28 columns"
+            29,
+            "migrated call_logs has 29 columns"
         );
         let indexes_before = index_ddls_of(&pool, HOT_TABLE).await;
-        assert_eq!(indexes_before.len(), 5, "standard index set is 5 indexes");
+        assert_eq!(
+            indexes_before.len(),
+            6,
+            "standard index set is 6 indexes (incl. session_key)"
+        );
 
         let arch = rotate_once(&pool, now).await.unwrap().unwrap();
 

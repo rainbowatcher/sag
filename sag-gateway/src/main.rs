@@ -1411,6 +1411,7 @@ mod tests {
             upstream_protocol: None,
             lane: None,
             loss_summary: None,
+            session_key: None,
         }
     }
 

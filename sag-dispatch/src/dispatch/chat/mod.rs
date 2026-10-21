@@ -83,9 +83,18 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         ingress_protocol,
         ir,
         entry_loss,
-        session_key: _,
+        session_key,
         mut session_writeback,
     } = ctx;
+
+    // Hashed session identity for the `call_logs` row (design §4.7): only
+    // `session_sticky` routes record it — session-less requests and every
+    // other strategy leave `call_logs.session_key` NULL.
+    let session_log_key = if strategy == sag_config::Strategy::SessionSticky {
+        session_key.as_ref().map(|k| k.map_id(&request.model))
+    } else {
+        None
+    };
 
     // IR orchestration view: routes.rs decodes once after
     // `normalize_reasoning_effort`; fall back to a local decode so direct
@@ -148,6 +157,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         request.reasoning_effort.clone(),
         user_agent.clone(),
         client_ip.clone(),
+        session_log_key.clone(),
     );
 
     // Snapshot the backoff config once so the per-target retry loop doesn't
@@ -632,6 +642,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 Some(target.upstream_protocol.as_str().to_string()),
                 Some(target.lane.as_str().to_string()),
                 encode_aware_loss_summary(),
+                session_log_key.clone(),
             );
             if let Some(err) = client_error {
                 // Client-attributed 4xx: return to the client directly — no
@@ -738,7 +749,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             target.target_real_model.clone(),
                             std::time::Instant::now(),
                             current_version,
-                        ),
+                        )
+                        .with_source(session_key.as_ref().map(|k| k.source).unwrap_or_default()),
                         current_version,
                     );
                 }
@@ -785,6 +797,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(target.upstream_protocol.as_str().to_string()),
                         Some(target.lane.as_str().to_string()),
                         encode_aware_loss_summary(),
+                        session_log_key.clone(),
                     );
                 }
                 if is_responses_ingress {
@@ -809,6 +822,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(target.upstream_protocol.as_str().to_string()),
                         Some(target.lane.as_str().to_string()),
                         encode_aware_loss_summary(),
+                        session_log_key.clone(),
                     );
                 }
                 return build_streaming_response(
@@ -832,6 +846,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     Some(target.upstream_protocol.as_str().to_string()),
                     Some(target.lane.as_str().to_string()),
                     encode_aware_loss_summary(),
+                    session_log_key.clone(),
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {
@@ -867,6 +882,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     Some(target.upstream_protocol.as_str().to_string()),
                     Some(target.lane.as_str().to_string()),
                     success_loss,
+                    session_log_key.clone(),
                 ));
                 // Formal analytics event: the request completed successfully.
                 // The writer derives `actual_model` from the final
@@ -958,6 +974,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 sag_core::summarize_losses(&[&encode_snap], 5)
             }
         },
+        session_log_key,
     );
     // Formal analytics event: every target exhausted → `model_failure`
     // with `all_exhausted` and one failure fact per actually-issued

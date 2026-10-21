@@ -67,6 +67,9 @@ struct StreamAnalytics {
     /// M8 LossInventory summary (request + encode) for the drop-guard
     /// `call_logs` row — mirrors `StreamState.loss_summary`.
     loss_summary: Option<String>,
+    /// Hashed session identity for the drop-guard `call_logs` row (see
+    /// `CallLog::session_key`).
+    session_key: Option<String>,
 }
 
 /// Build the single terminal [`sag_analytics::AnalyticsEvent`] for a
@@ -362,6 +365,7 @@ impl Drop for TerminalGuard {
             upstream_protocol: self.analytics.upstream_protocol.clone(),
             lane: self.analytics.lane.clone(),
             loss_summary: self.analytics.loss_summary.clone(),
+            session_key: self.analytics.session_key.clone(),
         });
     }
 }
@@ -386,6 +390,8 @@ struct StreamState<S, E> {
     client_ip: Option<String>,
     /// M8 LossInventory summary for the terminal `call_logs` row.
     loss_summary: Option<String>,
+    /// Hashed session identity for the terminal `call_logs` row.
+    session_key: Option<String>,
     // Declared before the guard so it drops first; the guard's own
     // `Arc` clone keeps the shared data alive regardless. The guard
     // field is never read — it exists solely for its `Drop` (client
@@ -415,6 +421,7 @@ fn make_stream_analytics(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> Arc<StreamAnalytics> {
     Arc::new(StreamAnalytics {
         event_collector: state.event_collector.clone(),
@@ -438,6 +445,7 @@ fn make_stream_analytics(
         user_agent,
         client_ip,
         loss_summary,
+        session_key,
     })
 }
 
@@ -455,6 +463,7 @@ fn make_stream_state<S, E>(
     user_agent: Option<String>,
     client_ip: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> StreamState<S, E> {
     StreamState {
         stream,
@@ -470,6 +479,7 @@ fn make_stream_state<S, E>(
         user_agent,
         client_ip,
         loss_summary,
+        session_key,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
     }
@@ -614,6 +624,7 @@ fn build_stream_call_log<S, E>(
         upstream_protocol: state.analytics.upstream_protocol.clone(),
         lane: state.analytics.lane.clone(),
         loss_summary: state.loss_summary.clone(),
+        session_key: state.session_key.clone(),
     }
 }
 
@@ -781,6 +792,7 @@ pub fn build_streaming_response<S, E>(
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -809,6 +821,7 @@ where
         upstream_protocol,
         lane,
         loss_summary.clone(),
+        session_key.clone(),
     );
     let state = make_stream_state(
         chunk_stream,
@@ -821,6 +834,7 @@ where
         user_agent,
         client_ip,
         loss_summary,
+        session_key,
     );
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -957,6 +971,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -1282,6 +1297,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1503,6 +1519,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1629,6 +1646,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1718,6 +1736,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // The disconnect: drop the response without polling the body. The
@@ -1795,6 +1814,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -1894,6 +1914,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         drop(resp);
@@ -1970,6 +1991,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2082,6 +2104,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2176,6 +2199,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -2247,6 +2271,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2361,6 +2386,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2465,6 +2491,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -2543,6 +2570,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2654,6 +2682,7 @@ mod tests {
                     user_agent: None,
                     client_ip: None,
                     loss_summary: None,
+                    session_key: None,
                 }),
             }
         });

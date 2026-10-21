@@ -27,6 +27,8 @@ const STAGE_04_COLUMNS: &[(&str, &str)] = &[
     ("lane", "TEXT"),
     // M8 LossInventory summary (also covered by migrations/20260815…).
     ("loss_summary", "TEXT"),
+    // P5 session affinity (also covered by migrations/20260816…).
+    ("session_key", "TEXT"),
 ];
 
 /// Maximum page size for `query_logs`. Shared with the admin API layer
@@ -311,7 +313,8 @@ impl LogStore for SqliteLogStore {
                 user_agent, client_ip,
                 error_category,
                 ingress_protocol, upstream_protocol, lane,
-                loss_summary
+                loss_summary,
+                session_key
             FROM call_logs_hot
             "#,
         );
@@ -325,6 +328,9 @@ impl LogStore for SqliteLogStore {
         }
         if filter.real_model.as_deref().is_some_and(|m| !m.is_empty()) {
             conditions.push("real_model = ?");
+        }
+        if filter.session.as_deref().is_some_and(|s| !s.is_empty()) {
+            conditions.push("session_key = ?");
         }
         if let Some(sc) = &filter.status_code {
             match sc {
@@ -356,6 +362,9 @@ impl LogStore for SqliteLogStore {
             if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
                 query = query.bind(rm);
             }
+            if let Some(s) = filter.session.as_deref().filter(|s| !s.is_empty()) {
+                query = query.bind(s);
+            }
             if let Some(StatusCodeFilter::Exact(sc)) = &filter.status_code {
                 query = query.bind(*sc as i32);
             }
@@ -385,6 +394,9 @@ impl LogStore for SqliteLogStore {
         if filter.real_model.as_deref().is_some_and(|m| !m.is_empty()) {
             conditions.push("real_model = ?");
         }
+        if filter.session.as_deref().is_some_and(|s| !s.is_empty()) {
+            conditions.push("session_key = ?");
+        }
         if let Some(sc) = &filter.status_code {
             match sc {
                 StatusCodeFilter::Exact(_) => conditions.push("status_code = ?"),
@@ -412,6 +424,9 @@ impl LogStore for SqliteLogStore {
             }
             if let Some(rm) = filter.real_model.as_deref().filter(|rm| !rm.is_empty()) {
                 query = query.bind(rm);
+            }
+            if let Some(s) = filter.session.as_deref().filter(|s| !s.is_empty()) {
+                query = query.bind(s);
             }
             if let Some(StatusCodeFilter::Exact(sc)) = &filter.status_code {
                 query = query.bind(*sc as i32);
@@ -466,13 +481,13 @@ async fn insert_call_log_row(
                      user_agent, client_ip,
                      error_category,
                      ingress_protocol, upstream_protocol, lane,
-                     loss_summary)
+                     loss_summary, session_key)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?,
                         ?, ?,
                         ?,
                         ?, ?, ?,
-                        ?)
+                        ?, ?)
                 "#,
     )
     .bind(log.request_id.to_string())
@@ -503,6 +518,7 @@ async fn insert_call_log_row(
     .bind(log.lane.as_ref())
     // M8 LossInventory summary.
     .bind(log.loss_summary.as_ref())
+    .bind(log.session_key.as_ref())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -536,6 +552,7 @@ struct LogRow {
     upstream_protocol: Option<String>,
     lane: Option<String>,
     loss_summary: Option<String>,
+    session_key: Option<String>,
 }
 
 impl LogRow {
@@ -606,6 +623,7 @@ impl LogRow {
             upstream_protocol: self.upstream_protocol,
             lane: self.lane,
             loss_summary: self.loss_summary,
+            session_key: self.session_key,
         }
     }
 }
@@ -655,6 +673,7 @@ mod tests {
             upstream_protocol: None,
             lane: None,
             loss_summary: None,
+            session_key: None,
         }
     }
 
@@ -929,6 +948,7 @@ mod tests {
             upstream_protocol: None,
             lane: None,
             loss_summary: None,
+            session_key: None,
             ..make_log("openai", "gpt-4o", "gpt-4o")
         };
         store.insert_batch(&[log]).await.unwrap();
@@ -1066,6 +1086,7 @@ mod tests {
             loss_summary: Some(
                 "2 entries; tools[0]:unsupported_by_ir; n:>1:unsupported_by_ir".into(),
             ),
+            session_key: None,
         };
         store
             .insert_batch(std::slice::from_ref(&log))
@@ -1109,6 +1130,67 @@ mod tests {
         assert_eq!(u.total_tokens, 150);
         assert_eq!(u.cached_tokens, Some(80));
         assert_eq!(u.reasoning_tokens, Some(20));
+    }
+
+    #[tokio::test]
+    async fn session_key_round_trips_and_filters_exactly() {
+        let store = SqliteLogStore::new_memory().await.unwrap();
+
+        // Two session-sticky rows (hashed keys) + one session-less row (NULL).
+        let mut a = make_log("openai", "gpt-4o", "gpt-4o");
+        a.session_key = Some("3fa85f6450f1c1b0a4bd1c7ec50ea1b4".into());
+        let mut b = make_log("openai", "gpt-4o", "gpt-4o");
+        b.session_key = Some("9c4f0e2d1b3a5c6d7e8f90a1b2c3d4e5".into());
+        let c = make_log("openai", "gpt-4o", "gpt-4o");
+        store
+            .insert_batch(&[a.clone(), b.clone(), c.clone()])
+            .await
+            .unwrap();
+
+        // Filter by one hashed key: exactly the matching row comes back.
+        let logs = store
+            .query_logs(LogFilter {
+                session: a.session_key.clone(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].session_key, a.session_key);
+        assert_eq!(
+            store
+                .count_logs(LogFilter {
+                    session: a.session_key.clone(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            1
+        );
+
+        // A filter never matches the NULL (session-less) rows.
+        let logs = store
+            .query_logs(LogFilter {
+                session: Some("deadbeef".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(logs.is_empty());
+
+        // No filter → all three rows; NULL preserved for the session-less one.
+        let logs = store
+            .query_logs(LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 3);
+        assert!(logs.iter().any(|l| l.session_key.is_none()));
     }
 
     #[tokio::test]

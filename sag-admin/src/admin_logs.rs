@@ -34,6 +34,9 @@ pub struct LogsQuery {
     pub model: Option<String>,
     #[serde(default)]
     pub real_model: Option<String>,
+    /// Hashed session identity — exact match on `call_logs.session_key`.
+    #[serde(default)]
+    pub session: Option<String>,
     #[serde(default)]
     pub status_code: Option<String>,
     #[serde(default)]
@@ -54,6 +57,7 @@ fn build_filter(query: LogsQuery) -> LogFilter {
         provider: query.provider.filter(|s| !s.is_empty()),
         model: query.model.filter(|s| !s.is_empty()),
         real_model: query.real_model.filter(|s| !s.is_empty()),
+        session: query.session.filter(|s| !s.is_empty()),
         status_code: query
             .status_code
             .as_deref()
@@ -89,6 +93,7 @@ pub async fn list_logs(
             .into_response(),
         (Err(e), _) | (_, Err(e)) => {
             error!(?e, "logs query or count failed");
+            eprintln!("DEBUG logs failure: {e:?}");
             AppError::Internal(e.to_string()).into_response()
         }
     }
@@ -152,6 +157,7 @@ mod tests {
             upstream_protocol: None,
             lane: None,
             loss_summary: None,
+            session_key: None,
         }
     }
 

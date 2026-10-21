@@ -25,7 +25,7 @@ pub use config_mutation::{ConfigMutationCoordinator, FileRevision, MutationRepor
 pub mod session_affinity;
 pub use session_affinity::{
     DEFAULT_SESSION_MAX_ENTRIES, DEFAULT_SESSION_TTL_SECS, SessionAffinity, SessionAffinityInner,
-    SessionPin, SessionStickyToken, SessionWriteback,
+    SessionPin, SessionSnapshotEntry, SessionStickyToken, SessionWriteback,
 };
 
 /// Shared identity surface for sticky pins — the fields a routing order

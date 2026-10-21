@@ -7,6 +7,7 @@ import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import {
   Pagination,
   PaginationContent,
@@ -40,6 +41,8 @@ const logsFilterProvider = ref("")
 const logsFilterModel = ref("")
 const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
+// Hashed session identity — paste from the session-affinity snapshot.
+const logsFilterSession = ref("")
 
 const statusCodeOptions = computed(() => [
   { value: "non_2xx", label: t("logs.status.non2xx") },
@@ -72,6 +75,7 @@ async function refreshLogs() {
     provider: logsFilterProvider.value || undefined,
     model: logsFilterModel.value || undefined,
     real_model: logsFilterRealModel.value || undefined,
+    session: logsFilterSession.value || undefined,
     status_code,
   })
 }
@@ -105,6 +109,7 @@ onMounted(() => {
   logsFilterProvider.value = store.activeLogFilter.provider ?? ""
   logsFilterModel.value = store.activeLogFilter.model ?? ""
   logsFilterRealModel.value = store.activeLogFilter.real_model ?? ""
+  logsFilterSession.value = store.activeLogFilter.session ?? ""
   logsFilterStatusCode.value =
     store.activeLogFilter.status_code != null ? String(store.activeLogFilter.status_code) : ""
 
@@ -214,6 +219,12 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           :search-placeholder="$t('logs.filter.searchStatus')"
           class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
+        />
+        <Input
+          v-model="logsFilterSession"
+          :placeholder="$t('logs.filter.session')"
+          class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
+          @keyup.enter="refreshLogs()"
         />
         <RefreshButton
           :loading="store.logsLoading"

@@ -13,7 +13,8 @@
 //!   `POST /api/providers/probe-protocols` and `POST /api/model/test`.
 //! - [`admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`.
-//! - [`admin_active_targets`] — `GET|DELETE /api/sticky-targets`.
+//! - [`admin_active_targets`] — `GET|DELETE /api/active-targets`.
+//! - [`admin_session_affinity`] — `GET|DELETE /api/session-affinity`.
 
 pub mod admin;
 pub mod admin_active_targets;
@@ -22,6 +23,7 @@ pub mod admin_config;
 pub mod admin_logs;
 pub mod admin_providers;
 pub mod admin_routes;
+pub mod admin_session_affinity;
 pub mod admin_settings;
 pub mod admin_testing;
 

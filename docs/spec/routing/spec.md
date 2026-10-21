@@ -83,6 +83,18 @@ sequenceDiagram
 
 **Trade-off**: 如果用户配错了某个 target 的 `real_model` 而上游返回 404，不会自动尝试下一个 target。这比默默 fallthrough 然后返回一个不相关的错误更好，因为错误信息直接指向问题所在。
 
+### session_sticky：会话粘性与加权随机基底
+
+- **会话键**：`SessionKey::map_id = sha256(source | request_model | value)[..16]`；
+  只存哈希（source ∈ `meta`/`top`/`pc`/`fb`）。切模型即失粘（request model 参与摘要）。
+- **线性化协议**：与 `StickyToken` 同构的 `(epoch, generation, routes_version)` 三元组，
+  决策点捕获、成功写回三者全匹配才写；TTL 惰性过期不删、LRU 驱逐 bump generation。
+- **排序**：`[会话 pin] ++ [A-Res 加权排列 of 其余]`；身份判定与
+  `prepend_sticky_target` 同源（`target_matches_entry`），passthrough 与显式
+  `real_model` 解析到同一生效模型也不互认。
+- **写回分流**：`sticky_failover` 只写 `active_targets`，`session_sticky` 只写
+  `session_affinity`（平级独立策略，不叠加）；failover 成功后重绑。
+
 ## 不变式
 
 - 同一路由内 `(provider, real_model)` 组合必须唯一（validator 在启动时检查）
@@ -100,3 +112,4 @@ sequenceDiagram
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
 - [0002 目标模型有效性校验与 Provider 变更联动感知](changes/0002-target-model-validity-and-provider-sync.md)
+- [0003 会话粘性路由与 priority 加权随机基底](changes/0003-session-affinity-weighted-random.md)

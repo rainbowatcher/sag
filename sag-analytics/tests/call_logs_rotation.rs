@@ -99,6 +99,7 @@ fn make_log(model: &str, timestamp_ms: i64) -> CallLog {
         upstream_protocol: None,
         lane: None,
         loss_summary: None,
+        session_key: None,
     }
 }
 
