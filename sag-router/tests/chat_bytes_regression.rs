@@ -76,6 +76,8 @@ async fn build_state(base_url: &str) -> AppState {
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

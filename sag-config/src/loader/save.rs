@@ -731,9 +731,24 @@ fn write_route_fields(
             Strategy::StickyFailover => "sticky_failover",
             Strategy::FillFirst => "fill_first",
             Strategy::RoundRobin => "round_robin",
+            Strategy::SessionSticky => "session_sticky",
         });
     } else {
         existing.remove("strategy");
+    }
+
+    // session_ttl_secs — skip if None (mirrors skip_serializing_if = "Option::is_none")
+    if let Some(v) = route.session_ttl_secs {
+        existing["session_ttl_secs"] = toml_edit::value(v as i64);
+    } else {
+        existing.remove("session_ttl_secs");
+    }
+
+    // session_max_entries — skip if None (mirrors skip_serializing_if = "Option::is_none")
+    if let Some(v) = route.session_max_entries {
+        existing["session_max_entries"] = toml_edit::value(v as i64);
+    } else {
+        existing.remove("session_max_entries");
     }
 
     // retries — skip if None
@@ -1068,6 +1083,8 @@ apis = { anthropic_messages = { base_url = "https://api.anthropic.com/v1" } }
                 },
             )]),
             routes: vec![RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4".into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
@@ -1348,6 +1365,8 @@ targets = [
                 },
             )]),
             routes: vec![RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4".into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
@@ -1409,6 +1428,8 @@ targets = [
                 },
             )]),
             routes: vec![RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4".into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
@@ -1464,6 +1485,8 @@ targets = [
                 },
             )]),
             routes: vec![RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4".into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
@@ -1762,6 +1785,8 @@ targets = [
         drop(handle);
 
         config.routes.push(RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "claude".into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,
@@ -2756,6 +2781,95 @@ targets = [
         assert!(
             !after_routes.contains("timeout_secs"),
             "None route timeout_secs should be removed from disk, got:\n{after_routes}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_round_trips_route_session_fields() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4"
+targets = [
+    { provider = "openai" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].strategy = Strategy::SessionSticky;
+        config.routes[0].session_ttl_secs = Some(600);
+        config.routes[0].session_max_entries = Some(500);
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(reloaded.routes[0].strategy, Strategy::SessionSticky);
+        assert_eq!(reloaded.routes[0].session_ttl_secs, Some(600));
+        assert_eq!(reloaded.routes[0].session_max_entries, Some(500));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_removes_route_session_fields_when_none() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4"
+strategy = "session_sticky"
+session_ttl_secs = 1800
+session_max_entries = 42
+targets = [
+    { provider = "openai" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].session_ttl_secs = None;
+        config.routes[0].session_max_entries = None;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let after_routes = saved
+            .split("[[routes]]")
+            .nth(1)
+            .expect("should have a routes section");
+        assert!(
+            !after_routes.contains("session_ttl_secs")
+                && !after_routes.contains("session_max_entries"),
+            "None session fields should be removed from disk, got:\n{after_routes}"
+        );
+        assert!(
+            after_routes.contains("strategy = \"session_sticky\""),
+            "strategy must survive, got:\n{after_routes}"
         );
 
         let _ = std::fs::remove_file(&path);

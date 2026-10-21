@@ -152,6 +152,8 @@ async fn build_responses_native_state(
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "route-model".into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,
@@ -231,6 +233,8 @@ async fn build_anthropic_native_state(
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "claude-native".into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,

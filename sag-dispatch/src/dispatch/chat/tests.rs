@@ -2480,6 +2480,8 @@ async fn build_state_with_strategy(
         }),
         providers: config_providers,
         routes: vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -2822,6 +2824,8 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         let mut cfg = state.config.write().await;
         cfg.routes.retain(|r| r.model_name != "gpt-4o");
         cfg.routes.push(sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

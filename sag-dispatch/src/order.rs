@@ -71,6 +71,22 @@ pub async fn order_targets(
             let ordered = order_round_robin(targets, model_name, counters).await;
             (ordered, sag_state::StickyToken::new(0, 0, routes_version))
         }
+        Strategy::SessionSticky => {
+            // TODO(P3): replaced by the real session-sticky branch
+            // (session pin hoist + weighted-random permutation) once the
+            // `SessionAffinity` state lands. Until then this arm only keeps
+            // the workspace compiling; the new enum value is inert.
+            order_sticky_failover(
+                targets,
+                model_name,
+                fill_first_orders,
+                active_targets,
+                shuffle_cache_ttl_secs,
+                sticky_failover_reset_secs,
+                routes_version,
+            )
+            .await
+        }
     }
 }
 

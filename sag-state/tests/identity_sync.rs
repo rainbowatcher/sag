@@ -39,6 +39,8 @@ fn base_provider() -> ProviderConfig {
 
 fn route(model_name: &str, targets: &[(&str, Option<&str>)]) -> RouteConfig {
     RouteConfig {
+        session_ttl_secs: None,
+        session_max_entries: None,
         model_name: model_name.into(),
         pipeline: Default::default(),
         api_endpoint: None,

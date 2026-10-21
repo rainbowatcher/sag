@@ -64,6 +64,8 @@ fn provider_config(base_url: &str) -> ProviderConfig {
 
 fn route_config(model_name: &str) -> RouteConfig {
     RouteConfig {
+        session_ttl_secs: None,
+        session_max_entries: None,
         model_name: model_name.into(),
         api_endpoint: None,
         pipeline: sag_config::Pipeline::Chat,

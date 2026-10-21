@@ -184,6 +184,22 @@ targets = [
 # pipeline = "image"
 # api_endpoint = "/images/generations"
 # targets = [{ provider = "my-image" }]
+#
+# Session-sticky routing (`strategy = "session_sticky"`): a request carrying a
+# session identity (conversation_id / prompt_cache_key / first-user-message
+# hash) sticks to the target that last served the session successfully.
+# Requests without a session identity — and the first request of a session —
+# are ordered by a weighted-random permutation where `priority` doubles as the
+# weight (higher = more likely to be drawn first; no priority layers here).
+# [[routes]]
+# model_name = "claude-sonnet-sticky"
+# strategy = "session_sticky"
+# session_ttl_secs = 3600       # optional, default 3600; 0 = pins never expire
+# session_max_entries = 10000   # optional, default 10000 (LRU per route)
+# targets = [
+#     { provider = "anthropic", real_model = "claude-3-5-sonnet-20241022", priority = 2 },
+#     { provider = "openai", real_model = "gpt-4o-mini", priority = 1 },
+# ]
 
 [[routes]]
 model_name = "gpt-4o-mini"

@@ -288,6 +288,8 @@ pub(crate) fn one_provider_config(
     let routes = routes
         .into_iter()
         .map(|(model, real_model, prio)| RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: model.into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,

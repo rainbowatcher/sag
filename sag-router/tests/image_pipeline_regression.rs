@@ -113,6 +113,8 @@ async fn build_image_state(base_url: &str, key: &str) -> AppState {
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "dall-e-3".into(),
             pipeline: Pipeline::Image,
             api_endpoint: Some("/images/generations".into()),

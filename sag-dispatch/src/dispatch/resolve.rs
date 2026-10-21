@@ -717,6 +717,8 @@ mod tests {
         providers.insert("openai".into(), crate::testing::provider_config(true));
 
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -923,6 +925,8 @@ mod tests {
             let mut cfg = state.config.write().await;
             cfg.routes.retain(|r| r.model_name != "gpt-4o");
             cfg.routes.push(sag_config::RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4o".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -1012,6 +1016,8 @@ mod tests {
         {
             let mut cfg = state.config.write().await;
             cfg.routes.push(sag_config::RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "*".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -1053,6 +1059,8 @@ mod tests {
         let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
         providers.insert("openai".into(), crate::testing::provider_config(true));
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -1106,6 +1114,8 @@ mod tests {
         providers.insert("off".into(), provider_config(false));
 
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -1214,6 +1224,8 @@ mod tests {
         providers.insert("weird".into(), provider_config(true));
 
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -1303,6 +1315,8 @@ mod tests {
         let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
         providers.insert("weird".into(), provider_config(true));
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -1532,6 +1546,8 @@ mod tests {
         providers.insert("off".into(), provider_config(false));
 
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

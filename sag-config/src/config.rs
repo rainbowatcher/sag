@@ -1347,6 +1347,16 @@ pub enum Strategy {
     /// Distribute requests across all targets in round-robin order.
     /// On failure, try the next target in sequence.
     RoundRobin,
+    /// Session-sticky routing: a request carrying a session identity sticks
+    /// to the target that last served the session successfully (falls
+    /// through when that target is unavailable, then rebinds to the target
+    /// that actually succeeded). A request without a session identity — or
+    /// whose pin has been invalidated — is routed by a weighted-random
+    /// full permutation in which each target's `priority` doubles as its
+    /// weight (higher = more likely to be drawn first; the fallback order
+    /// comes from the same draw). Priority *layers* do not apply under this
+    /// strategy; every target keeps a fallback slot.
+    SessionSticky,
 }
 
 impl Strategy {
@@ -1358,6 +1368,7 @@ impl Strategy {
             Strategy::StickyFailover => "sticky_failover",
             Strategy::FillFirst => "fill_first",
             Strategy::RoundRobin => "round_robin",
+            Strategy::SessionSticky => "session_sticky",
         }
     }
 }
@@ -1374,6 +1385,10 @@ impl Strategy {
 ///   absorbs all traffic until it becomes unavailable.
 /// - `RoundRobin`: targets are tried in a rotating order. Each request advances
 ///   the counter, distributing load evenly.
+/// - `SessionSticky`: requests carrying a session identity stick to the
+///   session's last successful target; session-less requests are ordered by
+///   a weighted-random permutation of `priority` (see
+///   [`Strategy::SessionSticky`]).
 ///
 /// ## Retries
 ///
@@ -1407,6 +1422,19 @@ pub struct RouteConfig {
     /// provider's `timeout_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Session-stickiness TTL in seconds — only used when `strategy =
+    /// "session_sticky"`. A session pin is refreshed on every hit (sliding
+    /// expiration) and counts as a miss after this many seconds of
+    /// inactivity. `0` means pins never expire. When `None` (default), the
+    /// built-in default of `3600` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ttl_secs: Option<u64>,
+    /// Maximum number of session pins kept per route — only used when
+    /// `strategy = "session_sticky"`. When the capacity is exceeded, the
+    /// least-recently-used entries are evicted. When `None` (default), the
+    /// built-in default of `10000` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_max_entries: Option<usize>,
     /// List of targets for this route.
     pub targets: Vec<RouteTarget>,
 }
@@ -3369,6 +3397,8 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         /// Helper: a `RouteConfig` with a model name and targets.
         fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: model.into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
@@ -3477,6 +3507,7 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
                 (Strategy::StickyFailover, "sticky_failover"),
                 (Strategy::FillFirst, "fill_first"),
                 (Strategy::RoundRobin, "round_robin"),
+                (Strategy::SessionSticky, "session_sticky"),
             ];
             for (variant, expected) in &cases {
                 assert_eq!(variant.as_str(), *expected, "literal mismatch");
@@ -3493,6 +3524,76 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
                     serde_name
                 );
             }
+        }
+
+        #[test]
+        fn session_sticky_route_parses_session_fields() {
+            let toml = minimal_toml().replace(
+                "model_name = \"gpt-4o\"",
+                "model_name = \"gpt-4o\"\n\
+                 strategy = \"session_sticky\"\n\
+                 session_ttl_secs = 600\n\
+                 session_max_entries = 500",
+            );
+            let config: GatewayConfig = toml::from_str(&toml).unwrap();
+            let route = &config.routes[0];
+            assert_eq!(route.strategy, Strategy::SessionSticky);
+            assert_eq!(route.session_ttl_secs, Some(600));
+            assert_eq!(route.session_max_entries, Some(500));
+        }
+
+        #[test]
+        fn route_session_fields_default_to_none() {
+            let config: GatewayConfig = toml::from_str(minimal_toml()).unwrap();
+            assert_eq!(config.routes[0].session_ttl_secs, None);
+            assert_eq!(config.routes[0].session_max_entries, None);
+        }
+
+        #[test]
+        fn route_session_fields_serialize_skip_when_none() {
+            let config: GatewayConfig = toml::from_str(minimal_toml()).unwrap();
+            let s = toml::to_string(&config.routes[0]).unwrap();
+            assert!(!s.contains("session_ttl_secs"), "None must not serialize");
+            assert!(
+                !s.contains("session_max_entries"),
+                "None must not serialize"
+            );
+
+            let mut route = config.routes[0].clone();
+            route.session_ttl_secs = Some(0);
+            route.session_max_entries = Some(10);
+            let s = toml::to_string(&route).unwrap();
+            assert!(
+                s.contains("session_ttl_secs = 0"),
+                "0 is legal (never expire)"
+            );
+            assert!(s.contains("session_max_entries = 10"));
+        }
+
+        #[test]
+        fn unknown_strategy_value_is_rejected() {
+            // Enum values are strict (AGENTS.md: 枚举严格、字段容忍) — an
+            // unknown strategy must fail to parse, never fall back silently.
+            let toml = minimal_toml().replace(
+                "model_name = \"gpt-4o\"",
+                "model_name = \"gpt-4o\"\nstrategy = \"banana\"",
+            );
+            assert!(
+                toml::from_str::<GatewayConfig>(&toml).is_err(),
+                "unknown strategy must fail"
+            );
+        }
+
+        #[test]
+        fn unknown_route_fields_are_tolerated() {
+            // Unknown *fields* are ignored for forward compatibility.
+            let toml = minimal_toml().replace(
+                "model_name = \"gpt-4o\"",
+                "model_name = \"gpt-4o\"\nsession_sources = [\"x\"]\nsome_future_field = 1",
+            );
+            let config: GatewayConfig = toml::from_str(&toml).unwrap();
+            assert_eq!(config.routes[0].model_name, "gpt-4o");
+            assert_eq!(config.routes[0].targets.len(), 1);
         }
     }
 }

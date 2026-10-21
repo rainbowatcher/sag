@@ -88,6 +88,8 @@ async fn build_state(base_url: &str, key: &str) -> AppState {
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "claude-test".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -394,6 +396,8 @@ async fn build_state_anthropic_native(base_url: &str, key: &str) -> AppState {
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "claude-native".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

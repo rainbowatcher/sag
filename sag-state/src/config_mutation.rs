@@ -1115,6 +1115,8 @@ mod tests {
         };
         let mut new = old.clone();
         new.routes.push(RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4".into(),
             pipeline: Default::default(),
             api_endpoint: None,
@@ -1132,6 +1134,8 @@ mod tests {
             ..gateway_config_base!()
         };
         old.routes.push(RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4".into(),
             pipeline: Default::default(),
             api_endpoint: None,
@@ -1152,6 +1156,8 @@ mod tests {
             ..gateway_config_base!()
         };
         old.routes.push(RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4".into(),
             pipeline: Default::default(),
             api_endpoint: None,
@@ -1164,6 +1170,8 @@ mod tests {
             ..gateway_config_base!()
         };
         new.routes.push(RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "claude".into(),
             pipeline: Default::default(),
             api_endpoint: None,
@@ -1181,6 +1189,8 @@ mod tests {
         fn route_with(caps: Option<CapabilitiesOverride>) -> GatewayConfig {
             GatewayConfig {
                 routes: vec![RouteConfig {
+                    session_ttl_secs: None,
+                    session_max_entries: None,
                     model_name: "gpt-4o".into(),
                     pipeline: Default::default(),
                     api_endpoint: None,
@@ -1543,6 +1553,8 @@ mod tests {
 
     fn new_route() -> RouteConfig {
         RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             pipeline: Default::default(),
             api_endpoint: None,

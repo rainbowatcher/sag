@@ -876,6 +876,8 @@ mod tests {
         use sag_config::{RouteConfig, Strategy};
         fn route(model: &str, strategy: Strategy) -> RouteConfig {
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: model.into(),
                 pipeline: Default::default(),
                 api_endpoint: None,
@@ -928,6 +930,8 @@ mod tests {
         use sag_config::{RouteConfig, Strategy};
         fn route(model: &str, strategy: Strategy) -> RouteConfig {
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: model.into(),
                 pipeline: Default::default(),
                 api_endpoint: None,
@@ -1017,6 +1021,8 @@ mod tests {
         use sag_config::{RouteConfig, Strategy};
         fn route(model: &str) -> RouteConfig {
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: model.into(),
                 pipeline: Default::default(),
                 api_endpoint: None,

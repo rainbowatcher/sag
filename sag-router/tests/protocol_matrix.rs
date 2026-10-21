@@ -128,6 +128,8 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "route-model".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -712,6 +714,8 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
         providers,
         backoff,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "route-model".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

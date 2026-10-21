@@ -456,6 +456,8 @@ mod tests {
 
     fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
         RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: model.into(),
             pipeline: sag_config::Pipeline::Chat,
             api_endpoint: None,
@@ -472,6 +474,8 @@ mod tests {
         strategy: sag_config::Strategy,
     ) -> RouteConfig {
         RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: model.into(),
             pipeline: sag_config::Pipeline::Chat,
             api_endpoint: None,

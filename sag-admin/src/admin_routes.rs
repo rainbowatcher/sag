@@ -221,6 +221,8 @@ pub async fn create_route(
     }
 
     let route = RouteConfig {
+        session_ttl_secs: None,
+        session_max_entries: None,
         model_name: req.model_name.clone(),
         pipeline: req.pipeline,
         api_endpoint: req.api_endpoint,
@@ -530,6 +532,8 @@ mod tests {
             ),
         );
         let routes = vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,
@@ -738,6 +742,8 @@ mod tests {
         // for the next dispatch prune).
         let (providers, _) = one_provider_config("openai", vec![]);
         let route = RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,
@@ -845,6 +851,8 @@ mod tests {
     /// Build a FillFirst route config (mirror of `one_provider_config`).
     fn fill_first_route(model: &str) -> RouteConfig {
         RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: model.into(),
             pipeline: Pipeline::Chat,
             api_endpoint: None,

@@ -260,6 +260,8 @@ mod tests {
         use sag_config::{RouteConfig, RouteTarget, Strategy};
         fn route(model: &str) -> RouteConfig {
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: model.into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -414,6 +416,8 @@ mod tests {
         // dropped (it no longer resolves to its recorded route).
         let routes = vec![
             sag_config::RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4o".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -423,6 +427,8 @@ mod tests {
                 targets: vec![],
             },
             sag_config::RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "*".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -472,6 +478,8 @@ mod tests {
         rt.route_counters.write().await.insert("gpt-4o".into(), 2);
 
         let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "gpt-4o".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,
@@ -575,6 +583,8 @@ mod tests {
 
     fn route(model: &str, targets: Vec<RouteTarget>) -> RouteConfig {
         RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: model.into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

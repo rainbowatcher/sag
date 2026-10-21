@@ -148,6 +148,8 @@ mod tests {
 
         let routes = vec![
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4o".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -165,6 +167,8 @@ mod tests {
                 }],
             },
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "claude-opus".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -182,6 +186,8 @@ mod tests {
                 }],
             },
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4o-mini".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -246,6 +252,8 @@ mod tests {
 
         let routes = vec![
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4o".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,
@@ -263,6 +271,8 @@ mod tests {
                 }],
             },
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "deleted-model".into(),
                 api_endpoint: None,
                 pipeline: sag_config::Pipeline::Chat,

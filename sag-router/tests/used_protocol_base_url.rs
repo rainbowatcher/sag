@@ -84,6 +84,8 @@ async fn build_state_with(providers: HashMap<String, ProviderConfig>, key: &str)
         }),
         providers,
         routes: vec![RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
             model_name: "route-model".into(),
             api_endpoint: None,
             pipeline: sag_config::Pipeline::Chat,

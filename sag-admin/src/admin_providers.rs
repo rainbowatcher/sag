@@ -610,6 +610,8 @@ mod tests {
 
         let routes = vec![
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "gpt-4o".into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
@@ -638,6 +640,8 @@ mod tests {
                 ],
             },
             RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
                 model_name: "claude-sonnet".into(),
                 pipeline: Pipeline::Chat,
                 api_endpoint: None,
