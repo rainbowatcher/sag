@@ -60,9 +60,13 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         ingress_protocol: _,
         ir: _,
         entry_loss: _,
-        session_key: _,
+        session_key,
         session_writeback: _,
     } = ctx;
+
+    // Hashed session identity for every `call_logs` row of this dispatch
+    // (recorded regardless of strategy — a request fact, not a behavior).
+    let session_log_key = session_key.as_ref().map(|k| k.map_id(&request.model));
 
     // Client-disconnect terminal (image dispatch is non-streaming, so this
     // is the only cancellation detection point): if the handler future is
@@ -85,7 +89,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         // image requests carry no reasoning_effort
         user_agent.clone(),
         client_ip.clone(),
-        None,
+        session_log_key.clone(),
     );
 
     let img_request = build_image_request(request);
@@ -109,6 +113,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         start,
         user_agent: user_agent.as_deref(),
         client_ip: client_ip.as_deref(),
+        session_key: session_log_key,
     };
 
     run_image_fallback(&attempt_ctx, route_name, started_at, targets, errors).await
@@ -193,7 +198,7 @@ async fn finish_image_success(
         Some(target.lane.as_str().to_string()),
         None,
         // image path has no IR LossInventory,
-        None,
+        attempt_ctx.session_key.clone(),
     ));
     emit_image_success_event(
         attempt_ctx.state,
@@ -262,7 +267,7 @@ async fn finish_image_exhausted(
         None,
         None,
         None,
-        None,
+        attempt_ctx.session_key.clone(),
     );
     emit_image_model_failure_event(
         attempt_ctx.state,
@@ -308,6 +313,8 @@ struct ImageAttemptCtx<'a> {
     start: Instant,
     user_agent: Option<&'a str>,
     client_ip: Option<&'a str>,
+    /// Hashed session identity for the terminal `call_logs` rows.
+    session_key: Option<String>,
 }
 
 /// Run one target of the image fallback loop: circuit gate → provider
@@ -623,7 +630,7 @@ async fn apply_image_outcome<'a>(
             Some(target.upstream_protocol.as_str().to_string()),
             Some(target.lane.as_str().to_string()),
             None,
-            None,
+            ctx.session_key.clone(),
         );
         if let Some(err) = client_error {
             return TargetOutcome::ClientError(err);

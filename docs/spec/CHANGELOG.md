@@ -7,6 +7,7 @@ updated: 2026-10-19
 
 按时间倒序列出所有模块的变更记录。
 
+- **2026-10-21** · **routing**：[0004 call_logs 会话哈希不区分策略记录](routing/changes/0004-session-hash-for-every-strategy.md) — 会话归属是事实不是行为：所有策略/image/pre-resolve 失败行一律记录会话哈希
 - **2026-10-21** · **routing**：[0003 会话粘性路由与 priority 加权随机基底](routing/changes/0003-session-affinity-weighted-random.md) — 新增 `session_sticky` 策略：会话按上次成功目标粘住，未命中按 priority 加权随机全排列
 
 ## 2026-10-19

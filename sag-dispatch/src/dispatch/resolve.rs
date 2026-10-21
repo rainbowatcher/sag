@@ -99,6 +99,7 @@ pub async fn resolve_route_with_ingress(
             started_at,
             user_agent,
             client_ip,
+            session_key,
             ingress_protocol,
         )
         .await);
@@ -119,6 +120,7 @@ pub async fn resolve_route_with_ingress(
             user_agent,
             client_ip,
             &[],
+            session_key,
             ingress_protocol,
         )
         .await);
@@ -157,6 +159,7 @@ pub async fn resolve_route_with_ingress(
             user_agent,
             client_ip,
             &cap_errors,
+            session_key,
             ingress_protocol,
         )
         .await);
@@ -294,6 +297,7 @@ async fn emit_no_route_failure(
     started_at: chrono::DateTime<chrono::Utc>,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    session_key: Option<&sag_core::SessionKey>,
     ingress_protocol: sag_core::IngressProtocol,
 ) -> Response<Body> {
     let response = failure_response(
@@ -313,7 +317,7 @@ async fn emit_no_route_failure(
         None,
         None,
         None,
-        None,
+        session_key.map(|k| k.map_id(&request.model)),
     );
     // Formal analytics fact: no route matched → no route identity, no
     // target attempts. The sentinel `__no_route__` CallLog row above is
@@ -356,6 +360,7 @@ async fn emit_all_disabled_failure(
     user_agent: Option<&str>,
     client_ip: Option<&str>,
     capability_errors: &[String],
+    session_key: Option<&sag_core::SessionKey>,
     ingress_protocol: sag_core::IngressProtocol,
 ) -> Response<Body> {
     let reason = if capability_errors.is_empty() {
@@ -389,7 +394,7 @@ async fn emit_all_disabled_failure(
         None,
         None,
         None,
-        None,
+        session_key.map(|k| k.map_id(&request.model)),
     );
     // Formal analytics fact: the route matched but every target is
     // disabled → carry the real matched route name (never the

@@ -3718,3 +3718,58 @@ async fn session_sticky_without_session_key_is_stateless() {
         "session-less requests must never pin anything"
     );
 }
+
+#[tokio::test]
+async fn call_log_records_session_hash_for_every_strategy() {
+    // The session grouping is a request fact, not a routing behavior:
+    // a StickyFailover route must record `call_logs.session_key` exactly
+    // like a session_sticky one (NULL only when no session was extracted).
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    let state =
+        build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::StickyFailover).await;
+    let rt = shared_runtime(&state);
+    let key = sag_core::SessionKey::new("meta", "conv-9");
+    let req = build_request("gpt-4o", false);
+
+    let (resp, _) = run_session_request(&state, &rt, &req, Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    state.collector.flush().await;
+
+    let expected = key.map_id("gpt-4o");
+    let logs = state
+        .collector
+        .store()
+        .query_logs(sag_analytics::LogFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1, "one call-log row for one request");
+    assert_eq!(
+        logs[0].session_key.as_deref(),
+        Some(expected.as_str()),
+        "hash recorded even though the route is not session_sticky"
+    );
+
+    // Session-less request → NULL (the only NULL semantics left).
+    let (resp, _) = run_session_request(&state, &rt, &req, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    state.collector.flush().await;
+    let logs = state
+        .collector
+        .store()
+        .query_logs(sag_analytics::LogFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(
+        logs.iter().filter(|l| l.session_key.is_none()).count(),
+        1,
+        "NULL means 'no session identity', nothing else"
+    );
+}

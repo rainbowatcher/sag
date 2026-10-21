@@ -94,6 +94,9 @@ sequenceDiagram
   `real_model` 解析到同一生效模型也不互认。
 - **写回分流**：`sticky_failover` 只写 `active_targets`，`session_sticky` 只写
   `session_affinity`（平级独立策略，不叠加）；failover 成功后重绑。
+- **事实 vs 行为**：`call_logs.session_key` 记录会话归属（事实），不随路由策略
+  闸门开关——所有策略、image pipeline、pre-resolve 失败行一律记录哈希，
+  NULL 仅表示未识别出会话（0004）。
 
 ## 不变式
 
@@ -113,3 +116,4 @@ sequenceDiagram
 - [0001 初始化](changes/0001-initial.md)
 - [0002 目标模型有效性校验与 Provider 变更联动感知](changes/0002-target-model-validity-and-provider-sync.md)
 - [0003 会话粘性路由与 priority 加权随机基底](changes/0003-session-affinity-weighted-random.md)
+- [0004 call_logs 会话哈希不区分策略记录](changes/0004-session-hash-for-every-strategy.md)

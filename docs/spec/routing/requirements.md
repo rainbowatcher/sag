@@ -41,7 +41,9 @@ updated: 2026-10-21
    fall-through 到加权随机基底；失败不写回，failover 成功后**重绑**到实际成功目标。
 4. 会话 pin 按 `session_ttl_secs` **滑动续期**（命中刷新计时，`0` = 永不过期），
    超容量按 LRU 淘汰；管理员可经 `GET|DELETE /api/session-affinity` 观测与清除。
-5. 会话键只以**哈希**形式存在于状态、管理端快照与 `call_logs.session_key`。
+5. 会话键只以**哈希**形式存在于状态、管理端快照与 `call_logs.session_key`；
+   凡识别出会话，`call_logs.session_key` **不区分路由策略**一律记录（NULL 仅表示
+   「请求未携带可识别的会话标识」）。
 
 ### 加权随机基底（priority 即权重）
 
@@ -119,3 +121,4 @@ updated: 2026-10-21
 - [0001 初始化](changes/0001-initial.md)
 - [0002 目标模型有效性校验与 Provider 变更联动感知](changes/0002-target-model-validity-and-provider-sync.md)
 - [0003 会话粘性路由与 priority 加权随机基底](changes/0003-session-affinity-weighted-random.md)
+- [0004 call_logs 会话哈希不区分策略记录](changes/0004-session-hash-for-every-strategy.md)

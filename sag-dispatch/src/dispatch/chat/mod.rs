@@ -87,14 +87,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         mut session_writeback,
     } = ctx;
 
-    // Hashed session identity for the `call_logs` row (design §4.7): only
-    // `session_sticky` routes record it — session-less requests and every
-    // other strategy leave `call_logs.session_key` NULL.
-    let session_log_key = if strategy == sag_config::Strategy::SessionSticky {
-        session_key.as_ref().map(|k| k.map_id(&request.model))
-    } else {
-        None
-    };
+    // Hashed session identity for the `call_logs` row: recorded for
+    // **every** strategy — the session grouping is a request fact, the
+    // stickiness is a routing behavior, and a fact column must not depend
+    // on behavior. NULL means "no session identity was extracted" (and
+    // nothing else).
+    let session_log_key = session_key.as_ref().map(|k| k.map_id(&request.model));
 
     // IR orchestration view: routes.rs decodes once after
     // `normalize_reasoning_effort`; fall back to a local decode so direct
