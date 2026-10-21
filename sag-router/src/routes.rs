@@ -192,6 +192,15 @@ async fn chat_completions(
                 .map(|s| s.to_string())
         });
 
+    // M4: decode the protocol-neutral request once after normalization;
+    // `dispatch_chat` orchestrates on IR while providers still receive the
+    // original `ChatCompletionRequest`. Hoisted above route resolution so
+    // the session extractor can use it for the content-hash fallback.
+    let ir = sag_providers::ChatCompletionsCodec::decode_request(&request);
+    // Session identity for session-sticky routing (design §4.1 chain).
+    let session_key =
+        crate::session::extract_session_key(crate::session::BodyView::Chat(&request), Some(&ir));
+
     // Resolve route → ordered targets + api_endpoint + strategy + the
     // sticky-failover token captured at decision time, plus the route
     // identity facts (`route_name`, wall-clock `started_at`) for the
@@ -247,14 +256,10 @@ async fn chat_completions(
             // Image path stays out of IR (plan § D8 / M4 hard constraint).
             ir: None,
             entry_loss: Default::default(),
+            session_key: session_key.clone(),
         })
         .await;
     }
-
-    // M4: decode the protocol-neutral request once after normalization;
-    // `dispatch_chat` orchestrates on IR while providers still receive the
-    // original `ChatCompletionRequest`.
-    let ir = sag_providers::ChatCompletionsCodec::decode_request(&request);
 
     dispatch_chat(DispatchCtx {
         state: &state,
@@ -275,6 +280,7 @@ async fn chat_completions(
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: Some(&ir),
         entry_loss: Default::default(),
+        session_key,
     })
     .await
 }
@@ -320,6 +326,9 @@ async fn anthropic_messages(
 
     // Decode Anthropic body → IR (structural drops recorded on ir.loss).
     let ir = sag_providers::AnthropicMessagesCodec::decode_request(&raw_body);
+    // Session identity for session-sticky routing (design §4.1 chain).
+    let session_key =
+        crate::session::extract_session_key(crate::session::BodyView::Raw(&raw_body), Some(&ir));
     // Synthesize a ChatCompletionRequest so resolve_route / cancel_guard /
     // analytics have model / stream / reasoning_effort / tools (plan M5-C).
     let (mut request, encode_loss) =
@@ -407,6 +416,7 @@ async fn anthropic_messages(
         ingress_protocol: sag_core::IngressProtocol::AnthropicMessages,
         ir: Some(&ir),
         entry_loss: encode_loss,
+        session_key,
     })
     .await;
 
@@ -565,6 +575,10 @@ async fn responses(
         return unprocessable("image generation is not supported on /v1/responses");
     }
 
+    // Session identity for session-sticky routing (design §4.1 chain).
+    let session_key =
+        crate::session::extract_session_key(crate::session::BodyView::Raw(&raw_body), Some(&ir));
+
     dispatch_chat(DispatchCtx {
         state: &state,
         runtime: &runtime,
@@ -584,6 +598,7 @@ async fn responses(
         ingress_protocol: sag_core::IngressProtocol::Responses,
         ir: Some(&ir),
         entry_loss: encode_loss,
+        session_key,
     })
     .await
 }

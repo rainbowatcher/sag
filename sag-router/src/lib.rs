@@ -2,6 +2,7 @@
 pub mod handlers;
 pub mod middleware;
 pub mod routes;
+pub mod session;
 
 // ── 从 sag-state 重导出（共享状态） ───────────────────────────
 pub use sag_state::{ActiveTargets, AppState, FillFirstOrders, testing::test_app_state};

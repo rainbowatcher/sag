@@ -83,6 +83,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         ingress_protocol,
         ir,
         entry_loss,
+        session_key: _,
     } = ctx;
 
     // IR orchestration view: routes.rs decodes once after

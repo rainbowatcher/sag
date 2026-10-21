@@ -291,6 +291,7 @@ fn make_ctx_with_strategy<'a>(
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     }
 }
 
@@ -325,6 +326,7 @@ fn make_ctx_with_token<'a>(
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     }
 }
 
@@ -2599,6 +2601,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2672,6 +2675,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2763,6 +2767,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2867,6 +2872,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2921,6 +2927,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     };
     let resp2 = dispatch_chat(ctx2).await;
     assert_eq!(resp2.status(), StatusCode::OK);
@@ -3019,6 +3026,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
         ir: None,
         entry_loss: Default::default(),
+        session_key: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);

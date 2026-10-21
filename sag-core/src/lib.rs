@@ -14,6 +14,7 @@ pub mod http_client;
 pub mod ir;
 pub mod paths;
 pub mod protocol;
+pub mod session;
 pub mod types;
 
 // Re-export key types at crate level for convenience
@@ -34,6 +35,7 @@ pub use paths::{
     sqlite_dsn_file_path, xdg_config_home, xdg_data_home, xdg_state_home,
 };
 pub use protocol::{ApiKind, Capabilities, IngressProtocol, Lane, protocol_path, resolve_lane};
+pub use session::{SessionKey, sha256_hex};
 pub use types::{
     CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FailureReason,
     FinalStatus, ImageData, ImageGenerationRequest, ImageGenerationResponse, RequestResultFact,

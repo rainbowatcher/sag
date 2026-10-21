@@ -148,6 +148,12 @@ pub struct DispatchCtx<'a> {
     /// Anthropic/Responses ingress). Seeds the dispatch-side encode
     /// accumulator so `CallLog.loss_summary` carries them.
     pub entry_loss: sag_core::LossInventory,
+    /// Session identity extracted at ingress (`sag-router::session`).
+    /// Consumed by session-sticky ordering and the affinity write-back
+    /// (`strategy = "session_sticky"` routes only). `None` when the
+    /// request carries no session identity — such requests are routed by
+    /// the weighted-random base ordering.
+    pub session_key: Option<sag_core::SessionKey>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
