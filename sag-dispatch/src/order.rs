@@ -21,28 +21,67 @@ use tokio::sync::RwLock;
 /// `RoundRobin` rotates the list so each request starts at a different
 /// position, persisting the per-model counter across calls.
 ///
+/// `SessionSticky` hoists the session's last successful target to the front
+/// (weighted-random permutation for everything else) — see
+/// [`order_session_sticky`].
+///
 /// Returns the ordered targets plus the sticky-failover token captured at
 /// the decision's linearization point (the second element carries the same
-/// two-component token for every strategy; only `StickyFailover` consumes
-/// it). The dispatch success path hands that token back to `active_targets`
-/// so a clear (DELETE / breaker close / targets-changed / prune) or config
-/// mutation that happened after this decision can never be overwritten by a
-/// stale pin.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// token for every strategy; only `StickyFailover` consumes it), and — for
+/// `SessionSticky` with a session identity — the [`SessionWriteback`] the
+/// dispatch success path hands back to `session_affinity` so a clear /
+/// eviction / config mutation that happened after this decision can never
+/// be overwritten by a stale pin.
+pub struct OrderParams<'a> {
+    /// Shared round-robin counters (`Strategy::RoundRobin`).
+    pub counters: &'a Arc<RwLock<HashMap<String, u64>>>,
+    /// Fill-first / sticky-failover shuffle cache.
+    pub fill_first_orders: &'a Arc<RwLock<HashMap<String, CachedOrder>>>,
+    /// Model-level sticky memory (`Strategy::StickyFailover`).
+    pub active_targets: &'a sag_state::ActiveTargets,
+    /// Session-level sticky memory (`Strategy::SessionSticky`).
+    pub session_affinity: &'a sag_state::SessionAffinity,
+    /// Session identity extracted at ingress (`None` = session-less
+    /// request; those are routed by the weighted-random base ordering).
+    pub session_key: Option<&'a sag_core::SessionKey>,
+    /// Global `shuffle_cache_ttl_secs`.
+    pub shuffle_cache_ttl_secs: u64,
+    /// Global `sticky_failover_reset_secs`.
+    pub sticky_failover_reset_secs: u64,
+    /// Route `session_ttl_secs`, resolved (`0` = pins never expire).
+    pub session_ttl_secs: u64,
+    /// Route `session_max_entries`, resolved.
+    pub session_max_entries: usize,
+    /// Config `routes_version` at the decision point.
+    pub routes_version: u64,
+}
+
+#[allow(clippy::type_complexity)]
 pub async fn order_targets(
     targets: Vec<RouteTarget>,
     model_name: &str,
     strategy: Strategy,
-    counters: &Arc<RwLock<HashMap<String, u64>>>,
-    fill_first_orders: &Arc<RwLock<HashMap<String, CachedOrder>>>,
-    active_targets: &sag_state::ActiveTargets,
-    shuffle_cache_ttl_secs: u64,
-    sticky_failover_reset_secs: u64,
-    routes_version: u64,
-) -> (Vec<RouteTarget>, sag_state::StickyToken) {
+    params: OrderParams<'_>,
+) -> (
+    Vec<RouteTarget>,
+    sag_state::StickyToken,
+    Option<sag_state::SessionWriteback>,
+) {
+    let OrderParams {
+        counters,
+        fill_first_orders,
+        active_targets,
+        session_affinity,
+        session_key,
+        shuffle_cache_ttl_secs,
+        sticky_failover_reset_secs,
+        session_ttl_secs,
+        session_max_entries,
+        routes_version,
+    } = params;
     match strategy {
         Strategy::StickyFailover => {
-            order_sticky_failover(
+            let (ordered, token) = order_sticky_failover(
                 targets,
                 model_name,
                 fill_first_orders,
@@ -51,7 +90,8 @@ pub async fn order_targets(
                 sticky_failover_reset_secs,
                 routes_version,
             )
-            .await
+            .await;
+            (ordered, token, None)
         }
         Strategy::FillFirst => {
             let ordered = order_fill_first(
@@ -65,28 +105,119 @@ pub async fn order_targets(
             .await;
             // Epoch 0: fill-first never writes back to `active_targets`, so
             // the token's epoch/generation components are inert.
-            (ordered, sag_state::StickyToken::new(0, 0, routes_version))
+            (
+                ordered,
+                sag_state::StickyToken::new(0, 0, routes_version),
+                None,
+            )
         }
         Strategy::RoundRobin => {
             let ordered = order_round_robin(targets, model_name, counters).await;
-            (ordered, sag_state::StickyToken::new(0, 0, routes_version))
+            (
+                ordered,
+                sag_state::StickyToken::new(0, 0, routes_version),
+                None,
+            )
         }
         Strategy::SessionSticky => {
-            // TODO(P3): replaced by the real session-sticky branch
-            // (session pin hoist + weighted-random permutation) once the
-            // `SessionAffinity` state lands. Until then this arm only keeps
-            // the workspace compiling; the new enum value is inert.
-            order_sticky_failover(
+            order_session_sticky(
                 targets,
                 model_name,
-                fill_first_orders,
-                active_targets,
-                shuffle_cache_ttl_secs,
-                sticky_failover_reset_secs,
+                session_affinity,
+                session_key,
+                session_ttl_secs,
+                session_max_entries,
                 routes_version,
             )
             .await
         }
+    }
+}
+
+/// Session-sticky branch of [`order_targets`] (design §4.3):
+/// `ordered = [session pin] ++ [A-Res weighted permutation of the rest]`.
+///
+/// The decision point — pin read **and** [`SessionStickyToken`] capture —
+/// runs under one write lock before anything else (mirroring
+/// [`order_sticky_failover`]'s linearization protocol), so a clear /
+/// eviction after this point makes the eventual write-back fail its
+/// generation check. Membership (the pin's target is still among the
+/// candidates), TTL and `routes_version` are checked before the hoist; a
+/// stale pin falls through to the plain weighted permutation. The returned
+/// [`sag_state::SessionWriteback`] is what the success path rebinds with —
+/// `None` for session-less requests.
+#[allow(clippy::too_many_arguments)]
+async fn order_session_sticky(
+    targets: Vec<RouteTarget>,
+    model_name: &str,
+    session_affinity: &sag_state::SessionAffinity,
+    session_key: Option<&sag_core::SessionKey>,
+    session_ttl_secs: u64,
+    session_max_entries: usize,
+    routes_version: u64,
+) -> (
+    Vec<RouteTarget>,
+    sag_state::StickyToken,
+    Option<sag_state::SessionWriteback>,
+) {
+    // Base ordering: A-Res weighted permutation (priority = weight).
+    let mut order = weighted_permutation(&targets, &mut fastrand::Rng::new());
+    let model_token = sag_state::StickyToken::new(0, 0, routes_version);
+
+    let Some(key) = session_key else {
+        // Session-less request: pure weighted randomness, no write-back.
+        return (reorder(&targets, &order), model_token, None);
+    };
+
+    // Decision point: one write lock for the pin read + token capture (the
+    // read touches the entry — sliding TTL + LRU move-to-back).
+    let map_id = key.map_id(model_name);
+    let (pin, token) = session_affinity.write().await.get_with_token(
+        model_name,
+        &map_id,
+        session_ttl_secs,
+        routes_version,
+        Instant::now(),
+    );
+
+    if let Some(pin) = &pin {
+        hoist_session_pin(&mut order, &targets, pin, model_name);
+    }
+    let writeback = sag_state::SessionWriteback {
+        map_id,
+        model: model_name.to_string(),
+        token,
+        capacity: session_max_entries,
+    };
+    (reorder(&targets, &order), model_token, Some(writeback))
+}
+
+/// Materialize an index permutation into an owned target list.
+fn reorder(targets: &[RouteTarget], order: &[usize]) -> Vec<RouteTarget> {
+    order.iter().map(|&i| targets[i].clone()).collect()
+}
+
+/// Hoist the session pin to the front of the index permutation when it is
+/// still a live target (same identity rules as [`prepend_sticky_target`],/// via the shared [`target_matches_entry`]), removing it from its old
+/// position — the pin target appears exactly once. A pin whose target is no
+/// longer among the candidates (config change / disabled / capability drop)
+/// falls through and leaves the order untouched (design §4.2 membership
+/// check).
+fn hoist_session_pin(
+    order: &mut Vec<usize>,
+    targets: &[RouteTarget],
+    pin: &sag_state::SessionPin,
+    model_name: &str,
+) -> bool {
+    if let Some(pos) = order
+        .iter()
+        .position(|&i| target_matches_entry(&targets[i], pin, model_name))
+    {
+        let idx = order.remove(pos);
+        order.insert(0, idx);
+        true
+    } else {
+        false
     }
 }
 
@@ -226,14 +357,30 @@ fn prepend_sticky_target(
         );
         return;
     }
-    if let Some(idx) = shuffled.iter().position(|t| {
-        t.provider == entry.provider
-            && t.real_model == entry.target_real_model
-            && t.real_model.as_deref().unwrap_or(model_name) == entry.real_model
-    }) {
+    if let Some(idx) = shuffled
+        .iter()
+        .position(|t| target_matches_entry(t, entry, model_name))
+    {
         let active_target = shuffled.remove(idx);
         shuffled.insert(0, active_target);
     }
+}
+
+/// The single sticky-pin identity comparison shared by
+/// [`prepend_sticky_target`] (model-level) and [`hoist_session_pin`]
+/// (session-level) — never write a second copy. A pin matches a target when
+/// the provider and the target's *spec* `real_model` match and the
+/// effective-model cross-check agrees: a passthrough (`None`) target and an
+/// explicit `Some(rm)` resolving to the same effective model are
+/// deliberately **not** the same target.
+fn target_matches_entry(
+    t: &RouteTarget,
+    entry: &impl sag_state::StickyIdentity,
+    model_name: &str,
+) -> bool {
+    t.provider == entry.id_provider()
+        && t.real_model.as_deref() == entry.id_target_real_model()
+        && t.real_model.as_deref().unwrap_or(model_name) == entry.id_effective_real_model()
 }
 
 /// Returns true when the two target lists are semantically identical
@@ -537,6 +684,225 @@ mod tests {
         assert_eq!(weighted_permutation(&targets, &mut rng), vec![0]);
     }
 
+    // ── Session-sticky ordering (P3) ────────────────────────────────
+
+    fn session_params<'a>(
+        counters: &'a Arc<RwLock<HashMap<String, u64>>>,
+        orders: &'a Arc<RwLock<HashMap<String, CachedOrder>>>,
+        active: &'a sag_state::ActiveTargets,
+        session_affinity: &'a sag_state::SessionAffinity,
+        session_key: Option<&'a sag_core::SessionKey>,
+        routes_version: u64,
+    ) -> OrderParams<'a> {
+        OrderParams {
+            counters,
+            fill_first_orders: orders,
+            active_targets: active,
+            session_affinity,
+            session_key,
+            shuffle_cache_ttl_secs: 7200,
+            sticky_failover_reset_secs: 0,
+            session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+            session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+            routes_version,
+        }
+    }
+
+    /// Bind `map_id` to `provider` for `model` (a fresh key, so the
+    /// decision-point token captured here is immediately valid).
+    async fn bind_session(
+        sa: &sag_state::SessionAffinity,
+        model: &str,
+        map_id: &str,
+        provider: &str,
+        routes_version: u64,
+    ) {
+        let mut guard = sa.write().await;
+        let (_, token) = guard.get_with_token(
+            model,
+            map_id,
+            sag_state::DEFAULT_SESSION_TTL_SECS,
+            routes_version,
+            Instant::now(),
+        );
+        let wb = sag_state::SessionWriteback {
+            map_id: map_id.into(),
+            model: model.into(),
+            token,
+            capacity: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+        };
+        assert!(guard.insert_if_generation(
+            &wb,
+            sag_state::SessionPin::new(
+                provider,
+                model,
+                model,
+                None,
+                Instant::now(),
+                routes_version
+            ),
+            routes_version,
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_sticky_hoists_pin_and_dedups() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let sa: sag_state::SessionAffinity = Arc::default();
+        let key = sag_core::SessionKey::new("meta", "c1");
+        let map_id = key.map_id("model");
+        bind_session(&sa, "model", &map_id, "b", 1).await;
+
+        let targets = vec![target("a", 3), target("b", 2), target("c", 1)];
+        for _ in 0..50 {
+            let (ordered, _, writeback) = order_targets(
+                targets.clone(),
+                "model",
+                Strategy::SessionSticky,
+                session_params(&counters, &orders, &active, &sa, Some(&key), 1),
+            )
+            .await;
+            assert_eq!(ordered[0].provider, "b", "pin must lead the order");
+            assert_eq!(
+                ordered.iter().filter(|t| t.provider == "b").count(),
+                1,
+                "hoist must dedup — the pin target appears exactly once"
+            );
+            assert_eq!(ordered.len(), 3, "order must stay a full permutation");
+            assert!(
+                writeback.is_some(),
+                "session request must carry a writeback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_sticky_pin_not_in_candidates_falls_through() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let sa: sag_state::SessionAffinity = Arc::default();
+        let key = sag_core::SessionKey::new("meta", "c1");
+        let map_id = key.map_id("model");
+        // Pin points at "zz" — not among the route's targets.
+        bind_session(&sa, "model", &map_id, "zz", 1).await;
+
+        let targets = vec![target("a", 3), target("b", 2), target("c", 1)];
+        let (ordered, _, writeback) = order_targets(
+            targets.clone(),
+            "model",
+            Strategy::SessionSticky,
+            session_params(&counters, &orders, &active, &sa, Some(&key), 1),
+        )
+        .await;
+        assert_eq!(ordered.len(), 3);
+        assert!(!ordered.iter().any(|t| t.provider == "zz"));
+        assert!(
+            writeback.is_some(),
+            "writeback still offered (rebinds on success)"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sticky_no_session_key_is_pure_weighted_permutation() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let sa: sag_state::SessionAffinity = Arc::default();
+
+        let targets = vec![target("a", 3), target("b", 2), target("c", 1)];
+        let (ordered, _, writeback) = order_targets(
+            targets.clone(),
+            "model",
+            Strategy::SessionSticky,
+            session_params(&counters, &orders, &active, &sa, None, 1),
+        )
+        .await;
+        assert!(
+            writeback.is_none(),
+            "session-less request must not write back"
+        );
+        assert_eq!(ordered.len(), 3);
+        let mut seen: Vec<&str> = ordered.iter().map(|t| t.provider.as_str()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn session_sticky_stale_pin_falls_through_without_deleting() {
+        let counters: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+        let orders = orders_map();
+        let active = active_map();
+        let sa: sag_state::SessionAffinity = Arc::default();
+        let key = sag_core::SessionKey::new("meta", "c1");
+        let map_id = key.map_id("model");
+        bind_session(&sa, "model", &map_id, "b", 1).await;
+
+        let targets = vec![target("a", 3), target("b", 2), target("c", 1)];
+        // Order against a NEWER config version: the pin must not hoist
+        // (over many draws the pinned target leads sometimes but not
+        // always — a hoist would lead every time).
+        let mut always_b = true;
+        for _ in 0..50 {
+            let (ordered, _, _) = order_targets(
+                targets.clone(),
+                "model",
+                Strategy::SessionSticky,
+                session_params(&counters, &orders, &active, &sa, Some(&key), 2),
+            )
+            .await;
+            if ordered[0].provider != "b" {
+                always_b = false;
+            }
+        }
+        assert!(!always_b, "stale-version pin must not hoist (lazy miss)");
+        // Lazy, not destructive: the entry is still in the memory.
+        assert_eq!(
+            sa.read().await.snapshot().len(),
+            1,
+            "stale pin must not be deleted"
+        );
+    }
+
+    #[test]
+    fn hoist_session_pin_identity_rules_match_prepend_sticky() {
+        // Passthrough target (`real_model: None`) matches a passthrough pin…
+        let mut order = vec![0usize, 1]; // ["a", "b"]
+        let targets = vec![target("a", 1), target("b", 1)];
+        let passthrough_pin =
+            sag_state::SessionPin::new("b", "model", "model", None, Instant::now(), 1);
+        assert!(hoist_session_pin(
+            &mut order,
+            &targets,
+            &passthrough_pin,
+            "model"
+        ));
+        assert_eq!(
+            order,
+            vec![1, 0],
+            "pin target \"b\" (index 1) hoisted to front"
+        );
+
+        // …but an explicit-`real_model` pin never matches a passthrough
+        // target (identity split, same rule as prepend_sticky_target).
+        let explicit_pin = sag_state::SessionPin::new(
+            "b",
+            "model",
+            "model",
+            Some("model".into()),
+            Instant::now(),
+            1,
+        );
+        assert!(!hoist_session_pin(
+            &mut order,
+            &targets,
+            &explicit_pin,
+            "model"
+        ));
+    }
+
     #[tokio::test]
     async fn fill_first_shuffles_once_then_caches() {
         let orders = orders_map();
@@ -810,61 +1176,85 @@ mod tests {
         let targets = vec![target("a", 0), target("b", 0), target("c", 0)];
 
         // First call: starts at 0
-        let (r1, _) = order_targets(
+        let (r1, _, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::RoundRobin,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(r1[0].provider, "a");
 
         // Second call: starts at 1
-        let (r2, _) = order_targets(
+        let (r2, _, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::RoundRobin,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(r2[0].provider, "b");
 
         // Third call: starts at 2
-        let (r3, _) = order_targets(
+        let (r3, _, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::RoundRobin,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(r3[0].provider, "c");
 
         // Fourth call: wraps back to 0
-        let (r4, _) = order_targets(
+        let (r4, _, _) = order_targets(
             targets,
             "model",
             Strategy::RoundRobin,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(r4[0].provider, "a");
@@ -878,28 +1268,40 @@ mod tests {
         let ttl = 7200;
         let targets = vec![target("a", 0), target("b", 0)];
 
-        let (r1, _) = order_targets(
+        let (r1, _, _) = order_targets(
             targets.clone(),
             "model-a",
             Strategy::RoundRobin,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
-        let (r2, _) = order_targets(
+        let (r2, _, _) = order_targets(
             targets.clone(),
             "model-b",
             Strategy::RoundRobin,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -928,16 +1330,22 @@ mod tests {
             );
         }
 
-        let (ordered, token) = order_targets(
+        let (ordered, token, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            5,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 5,
+            },
         )
         .await;
 
@@ -996,16 +1404,22 @@ mod tests {
             );
         }
 
-        let (ordered, _) = order_targets(
+        let (ordered, _, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            7200,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: 7200,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(
@@ -1028,16 +1442,22 @@ mod tests {
             );
         }
 
-        let (ordered2, _) = order_targets(
+        let (ordered2, _, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            7200,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: 7200,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(
@@ -1071,16 +1491,22 @@ mod tests {
         // cleared) generation → token captures (0, 5). The targets are
         // passthrough (`real_model: None`), so the pin records
         // `target_real_model: None`.
-        let (ordered, token) = order_targets(
+        let (ordered, token, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            7200,
-            0,
-            5,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: 7200,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 5,
+            },
         )
         .await;
         assert_eq!(ordered[0].provider, "b", "sticky entry must be prepended");
@@ -1126,16 +1552,22 @@ mod tests {
         let active = active_map();
         let targets = vec![target("a", 0)];
 
-        let (_, token) = order_targets(
+        let (_, token, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            7200,
-            0,
-            5,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: 7200,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 5,
+            },
         )
         .await;
         assert_eq!(token.generation, 0, "model never had an entry");
@@ -1179,12 +1611,18 @@ mod tests {
             targets_a.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1204,16 +1642,22 @@ mod tests {
         }
 
         // Run again with targets_b (which is different)
-        let (ordered, generation) = order_targets(
+        let (ordered, generation, _) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1286,12 +1730,18 @@ mod tests {
             targets_a.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1311,16 +1761,22 @@ mod tests {
         }
 
         // Run again with targets_b (extra changed but provider/real_model/priority identical)
-        let (ordered, generation) = order_targets(
+        let (ordered, generation, _) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1397,12 +1853,18 @@ mod tests {
             targets_a.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1422,16 +1884,22 @@ mod tests {
         }
 
         // Run again with targets_b (retries changed but provider/real_model/priority identical)
-        let (ordered, generation) = order_targets(
+        let (ordered, generation, _) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1462,16 +1930,23 @@ mod tests {
 
         // Baseline: no active entry -> primes the fill-first cache with a
         // fixed shuffled order.
-        let (baseline, _) = order_targets(
+        let (baseline, _, _) = order_targets(
             targets.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            7200,
-            3600, // reset window, irrelevant: no active entry exists
+            OrderParams {
+            counters: &counters,
+            fill_first_orders: &orders,
+            active_targets: &active,
+            session_affinity: &Default::default(),
+            session_key: None,
+            shuffle_cache_ttl_secs: 7200,
+            sticky_failover_reset_secs: 3600,
+            session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+            session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+            routes_version: // reset window, irrelevant: no active entry exists
             1,
+        },
         )
         .await;
 
@@ -1494,16 +1969,23 @@ mod tests {
 
         // Re-run: cache is already primed (same shuffle), only difference
         // is the expired active entry.
-        let (ordered, _) = order_targets(
+        let (ordered, _, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            7200,
-            3600, // entry is 7200s old, window is 3600s -> expired
+            OrderParams {
+            counters: &counters,
+            fill_first_orders: &orders,
+            active_targets: &active,
+            session_affinity: &Default::default(),
+            session_key: None,
+            shuffle_cache_ttl_secs: 7200,
+            sticky_failover_reset_secs: 3600,
+            session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+            session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+            routes_version: // entry is 7200s old, window is 3600s -> expired
             1,
+        },
         )
         .await;
 
@@ -1533,16 +2015,23 @@ mod tests {
             );
         }
 
-        let (ordered, _) = order_targets(
+        let (ordered, _, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            3600, // reset window: 3600s - the fresh entry is not expired
+            OrderParams {
+            counters: &counters,
+            fill_first_orders: &orders,
+            active_targets: &active,
+            session_affinity: &Default::default(),
+            session_key: None,
+            shuffle_cache_ttl_secs: ttl,
+            sticky_failover_reset_secs: 3600,
+            session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+            session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+            routes_version: // reset window: 3600s - the fresh entry is not expired
             1,
+        },
         )
         .await;
 
@@ -1577,16 +2066,23 @@ mod tests {
             );
         }
 
-        let (ordered, _) = order_targets(
+        let (ordered, _, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0, // reset window: 0 -> never expire
+            OrderParams {
+            counters: &counters,
+            fill_first_orders: &orders,
+            active_targets: &active,
+            session_affinity: &Default::default(),
+            session_key: None,
+            shuffle_cache_ttl_secs: ttl,
+            sticky_failover_reset_secs: 0,
+            session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+            session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+            routes_version: // reset window: 0 -> never expire
             1,
+        },
         )
         .await;
 
@@ -1613,16 +2109,22 @@ mod tests {
         let targets_b = vec![target("a", 0), target("b", 0), target("c", 0)];
 
         // Request B (routes_version 2) builds the new cache and pins "b".
-        let (ordered_b, token_b) = order_targets(
+        let (ordered_b, token_b, _) = order_targets(
             targets_b.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            2,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 2,
+            },
         )
         .await;
         assert_eq!(ordered_b.len(), 3);
@@ -1646,16 +2148,22 @@ mod tests {
 
         // Request A (routes_version 1, old targets) continues into
         // `order_targets` *after* B.
-        let (ordered_a, _) = order_targets(
+        let (ordered_a, _, _) = order_targets(
             targets_a,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 
@@ -1677,16 +2185,22 @@ mod tests {
         assert_eq!(ordered_a.len(), 2, "A sorts its own old targets locally");
 
         // A later request at the NEW version still uses B's cache/active.
-        let (ordered_new, token_new) = order_targets(
+        let (ordered_new, token_new, _) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            2,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 2,
+            },
         )
         .await;
         assert_eq!(ordered_new.len(), 3, "new-version request uses B's cache");
@@ -1713,12 +2227,18 @@ mod tests {
             targets.clone(),
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            2,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 2,
+            },
         )
         .await;
         assert_eq!(
@@ -1728,16 +2248,22 @@ mod tests {
 
         // A (version 1) with identical targets: shuffles locally and leaves
         // the version-2 cache intact.
-        let (ordered_a, _) = order_targets(
+        let (ordered_a, _, _) = order_targets(
             targets,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
         assert_eq!(ordered_a.len(), 2);
@@ -1780,16 +2306,22 @@ mod tests {
         // New targets at version 1: must clear the pin, bump the generation,
         // and replace the legacy cache (now versioned).
         let targets_b = vec![target("a", 0), target("b", 0), target("c", 0)];
-        let (ordered, token) = order_targets(
+        let (ordered, token, _) = order_targets(
             targets_b,
             "model",
             Strategy::StickyFailover,
-            &counters,
-            &orders,
-            &active,
-            ttl,
-            0,
-            1,
+            OrderParams {
+                counters: &counters,
+                fill_first_orders: &orders,
+                active_targets: &active,
+                session_affinity: &Default::default(),
+                session_key: None,
+                shuffle_cache_ttl_secs: ttl,
+                sticky_failover_reset_secs: 0,
+                session_ttl_secs: sag_state::DEFAULT_SESSION_TTL_SECS,
+                session_max_entries: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+                routes_version: 1,
+            },
         )
         .await;
 

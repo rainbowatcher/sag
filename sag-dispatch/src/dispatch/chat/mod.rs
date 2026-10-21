@@ -84,6 +84,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         ir,
         entry_loss,
         session_key: _,
+        mut session_writeback,
     } = ctx;
 
     // IR orchestration view: routes.rs decodes once after
@@ -677,40 +678,72 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             continue; // provider-persistent 4xx: failover as before
         };
 
-        if strategy == sag_config::Strategy::StickyFailover {
-            // Write back only while the token captured at routing decision
-            // time still matches: a DELETE / breaker close / targets-changed
-            // / prune (per-model generation, or the global epoch for
-            // no-entry clears) or any config mutation (routes_version) that
-            // happened after this request decided its route must not be
-            // overwritten by a stale pin.
-            //
-            // Linearization protocol: the config read guard is held across
-            // the version read *and* the active write, so a config mutation
-            // (which commits the new config and bumps `routes_version`
-            // atomically under `config.write()`, see
-            // `ConfigMutationCoordinator`) can never interleave between the
-            // version read and the conditional insert — either this
-            // writeback linearizes before the mutation (the mutation waits
-            // for the guard) or the version mismatch rejects the pin. The
-            // read-compare-insert itself runs under the single active write
-            // lock, atomic against concurrent clears.
-            let _config_guard = state.config.read().await;
-            let current_version = state.config.routes_version();
-            let mut active = runtime.active_targets.write().await;
-            active.insert_if_generation(
-                request.model.clone(),
-                sag_state::ActiveTargetEntry::new(
-                    provider_name.clone(),
-                    real_model.clone(),
-                    target.route_model.clone(),
-                    target.target_real_model.clone(),
-                    std::time::Instant::now(),
-                ),
-                &sticky_token,
-                current_version,
-            );
-            drop(active);
+        match strategy {
+            sag_config::Strategy::StickyFailover => {
+                // Write back only while the token captured at routing decision
+                // time still matches: a DELETE / breaker close / targets-changed
+                // / prune (per-model generation, or the global epoch for
+                // no-entry clears) or any config mutation (routes_version) that
+                // happened after this request decided its route must not be
+                // overwritten by a stale pin.
+                //
+                // Linearization protocol: the config read guard is held across
+                // the version read *and* the active write, so a config mutation
+                // (which commits the new config and bumps `routes_version`
+                // atomically under `config.write()`, see
+                // `ConfigMutationCoordinator`) can never interleave between the
+                // version read and the conditional insert — either this
+                // writeback linearizes before the mutation (the mutation waits
+                // for the guard) or the version mismatch rejects the pin. The
+                // read-compare-insert itself runs under the single active write
+                // lock, atomic against concurrent clears.
+                let _config_guard = state.config.read().await;
+                let current_version = state.config.routes_version();
+                let mut active = runtime.active_targets.write().await;
+                active.insert_if_generation(
+                    request.model.clone(),
+                    sag_state::ActiveTargetEntry::new(
+                        provider_name.clone(),
+                        real_model.clone(),
+                        target.route_model.clone(),
+                        target.target_real_model.clone(),
+                        std::time::Instant::now(),
+                    ),
+                    &sticky_token,
+                    current_version,
+                );
+                drop(active);
+            }
+            sag_config::Strategy::SessionSticky => {
+                // Rebind the session pin to the target that actually succeeded
+                // (failover convergence — design §4.3): without it, every
+                // later request of the session would keep re-trying the dead
+                // target first. Same conditional-write protocol as above:
+                // the epoch / per-key generation / routes_version captured at
+                // the ordering decision must all still match, and the compare
+                // + insert run under one write lock (atomic against admin
+                // clears / LRU eviction). A failed request writes nothing —
+                // the old pin stays and simply falls through until a success
+                // rebinds it.
+                if let Some(wb) = session_writeback.take() {
+                    let _config_guard = state.config.read().await;
+                    let current_version = state.config.routes_version();
+                    let mut session = runtime.session_affinity.write().await;
+                    session.insert_if_generation(
+                        &wb,
+                        sag_state::SessionPin::new(
+                            provider_name.clone(),
+                            real_model.clone(),
+                            target.route_model.clone(),
+                            target.target_real_model.clone(),
+                            std::time::Instant::now(),
+                            current_version,
+                        ),
+                        current_version,
+                    );
+                }
+            }
+            _ => {}
         }
 
         match attempt {

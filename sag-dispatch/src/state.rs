@@ -47,6 +47,11 @@ pub struct DispatchRuntime {
     /// clearing sticky memory when a breaker is manually closed — are
     /// immediately visible to dispatch ordering.
     pub active_targets: sag_state::ActiveTargets,
+    /// Session-affinity memory for `session_sticky` routes, shared with
+    /// [`AppState`] via the same `Arc` (injected through
+    /// [`DispatchRuntime::with_shared_state`]) so admin clears through
+    /// `/api/session-affinity` are immediately visible to dispatch ordering.
+    pub session_affinity: sag_state::SessionAffinity,
     /// Runtime availability memory for route targets. Shared with
     /// [`AppState`] via the same `Arc` (injected through
     /// [`DispatchRuntime::with_shared_state`]) so admin mutations — e.g. a
@@ -64,6 +69,7 @@ impl Default for DispatchRuntime {
             route_counters: Arc::default(),
             fill_first_orders: Arc::default(),
             active_targets: Arc::default(),
+            session_affinity: Arc::default(),
             circuit_breaker: Arc::default(),
             last_prune_version: Arc::new(AtomicU64::new(0)),
         }
@@ -85,11 +91,13 @@ impl DispatchRuntime {
         circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
         active_targets: sag_state::ActiveTargets,
         fill_first_orders: sag_state::FillFirstOrders,
+        session_affinity: sag_state::SessionAffinity,
     ) -> Self {
         Self {
             circuit_breaker,
             active_targets,
             fill_first_orders,
+            session_affinity,
             ..Default::default()
         }
     }
@@ -130,6 +138,10 @@ impl DispatchRuntime {
         }
         {
             let mut guard = self.active_targets.write().await;
+            guard.retain_sticky_routes(routes);
+        }
+        {
+            let mut guard = self.session_affinity.write().await;
             guard.retain_sticky_routes(routes);
         }
     }

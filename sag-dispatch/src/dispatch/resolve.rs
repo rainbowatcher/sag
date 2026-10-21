@@ -48,6 +48,7 @@ pub async fn resolve_route(
     is_stream: bool,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    session_key: Option<&sag_core::SessionKey>,
 ) -> Result<ResolvedRoute, Response<Body>> {
     // M3: only the Chat Completions mount exists; lane decisions use this
     // ingress. Future ingress mounts pass their own protocol here.
@@ -61,6 +62,7 @@ pub async fn resolve_route(
         is_stream,
         user_agent,
         client_ip,
+        session_key,
         sag_core::IngressProtocol::ChatCompletions,
     )
     .await
@@ -80,6 +82,7 @@ pub async fn resolve_route_with_ingress(
     is_stream: bool,
     user_agent: Option<&str>,
     client_ip: Option<&str>,
+    session_key: Option<&sag_core::SessionKey>,
     ingress_protocol: sag_core::IngressProtocol,
 ) -> Result<ResolvedRoute, Response<Body>> {
     let config_guard = state.config.read().await;
@@ -176,6 +179,13 @@ pub async fn resolve_route_with_ingress(
     let route_retries = route.retries;
     let route_timeout = route.timeout_secs;
     let route_model_name = route.model_name.clone();
+    // Session-sticky knobs (`session_sticky` routes only; inert elsewhere).
+    let session_ttl_secs = route
+        .session_ttl_secs
+        .unwrap_or(sag_state::DEFAULT_SESSION_TTL_SECS);
+    let session_max_entries = route
+        .session_max_entries
+        .unwrap_or(sag_state::DEFAULT_SESSION_MAX_ENTRIES);
     let global_retries = config_guard.backoff.retries;
     let shuffle_cache_ttl_secs = config_guard.shuffle_cache_ttl_secs;
     let sticky_failover_reset_secs = config_guard.sticky_failover_reset_secs;
@@ -205,16 +215,22 @@ pub async fn resolve_route_with_ingress(
     // same linearization point as the config read above) becomes part of the
     // sticky token, so a config mutation after this decision invalidates any
     // in-flight writeback.
-    let (ordered, sticky_token) = order_targets(
+    let (ordered, sticky_token, session_writeback) = order_targets(
         targets,
         &request.model,
         strategy,
-        &runtime.route_counters,
-        &runtime.fill_first_orders,
-        &runtime.active_targets,
-        shuffle_cache_ttl_secs,
-        sticky_failover_reset_secs,
-        current_version,
+        crate::order::OrderParams {
+            counters: &runtime.route_counters,
+            fill_first_orders: &runtime.fill_first_orders,
+            active_targets: &runtime.active_targets,
+            session_affinity: &runtime.session_affinity,
+            session_key,
+            shuffle_cache_ttl_secs,
+            sticky_failover_reset_secs,
+            session_ttl_secs,
+            session_max_entries,
+            routes_version: current_version,
+        },
     )
     .await;
 
@@ -237,6 +253,7 @@ pub async fn resolve_route_with_ingress(
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback,
         route_name: route_model_name,
         started_at,
         precheck_errors: cap_errors,
@@ -784,7 +801,7 @@ mod tests {
 
         // 1. First call: resolve route → populates fill_first_orders.
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(result.is_ok(), "route should resolve successfully");
@@ -810,7 +827,7 @@ mod tests {
 
         // 3. Second call: route gone → ModelNotFound, but prune ran first.
         let result2 = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(
@@ -852,7 +869,7 @@ mod tests {
             sticky_token: token1,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -874,7 +891,7 @@ mod tests {
             sticky_token: token2,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -892,7 +909,7 @@ mod tests {
             sticky_token: token3,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -914,7 +931,7 @@ mod tests {
             sticky_token: before,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -951,7 +968,7 @@ mod tests {
             sticky_token: after,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -998,7 +1015,7 @@ mod tests {
             started_at: carried_started_at,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -1044,7 +1061,7 @@ mod tests {
             route_name: wildcard_name,
             ..
         } = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .unwrap();
@@ -1154,7 +1171,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(result.is_err(), "expected ModelNotFound error");
@@ -1187,7 +1204,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(result.is_err(), "expected AllProvidersExhausted error");
@@ -1278,7 +1295,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let resolved = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await
         .expect("one capable target remains");
@@ -1352,7 +1369,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         let response = result.err().expect("all targets lack capability → 502");
@@ -1411,7 +1428,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(result.is_err(), "expected ModelNotFound error");
@@ -1464,6 +1481,7 @@ mod tests {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            session_affinity: Arc::default(),
         };
         let runtime = DispatchRuntime::default();
         (state, runtime, pool)
@@ -1483,7 +1501,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(result.is_err(), "expected ModelNotFound error");
@@ -1577,7 +1595,7 @@ mod tests {
         let started_at = chrono::Utc::now();
 
         let result = resolve_route(
-            &state, &runtime, &req, trace_id, start, started_at, false, None, None,
+            &state, &runtime, &req, trace_id, start, started_at, false, None, None, None,
         )
         .await;
         assert!(result.is_err(), "expected AllProvidersExhausted error");

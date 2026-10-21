@@ -61,6 +61,7 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         ir: _,
         entry_loss: _,
         session_key: _,
+        session_writeback: _,
     } = ctx;
 
     // Client-disconnect terminal (image dispatch is non-streaming, so this
@@ -1131,6 +1132,7 @@ mod tests {
             ir: None,
             entry_loss: Default::default(),
             session_key: None,
+            session_writeback: None,
         }
     }
 
@@ -1171,6 +1173,7 @@ mod tests {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            session_affinity: Arc::default(),
         };
         (state, pool)
     }

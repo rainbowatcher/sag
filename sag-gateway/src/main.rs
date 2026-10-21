@@ -144,6 +144,9 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     // can observe the current fill-first order and reset it (manual
     // re-shuffle) through the sticky-targets endpoints.
     let fill_first_orders: sag_router::FillFirstOrders = Arc::default();
+    // Session-affinity memory for `session_sticky` routes. Shared the same
+    // way so admin handlers can observe and clear session pins.
+    let session_affinity: sag_state::SessionAffinity = Arc::default();
 
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
@@ -155,6 +158,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         circuit_breaker: circuit_breaker.clone(),
         active_targets: active_targets.clone(),
         fill_first_orders: fill_first_orders.clone(),
+        session_affinity: session_affinity.clone(),
     };
     // `with_shared_state` shares the same Arcs (rather than creating
     // defaults) so AppState and DispatchRuntime observe the same breaker,
@@ -163,6 +167,7 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         circuit_breaker.clone(),
         active_targets,
         fill_first_orders,
+        session_affinity,
     );
 
     // 9. Start config hot-reload watcher with a coordinator-backed handler

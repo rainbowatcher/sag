@@ -22,6 +22,37 @@ use tokio::sync::RwLock;
 pub mod config_mutation;
 pub use config_mutation::{ConfigMutationCoordinator, FileRevision, MutationReport};
 
+pub mod session_affinity;
+pub use session_affinity::{
+    DEFAULT_SESSION_MAX_ENTRIES, DEFAULT_SESSION_TTL_SECS, SessionAffinity, SessionAffinityInner,
+    SessionPin, SessionStickyToken, SessionWriteback,
+};
+
+/// Shared identity surface for sticky pins — the fields a routing order
+/// must compare when deciding "is this pin one of the current targets?".
+/// Implemented by [`ActiveTargetEntry`] (model-level sticky) and
+/// [`SessionPin`] (session-level sticky) so `order.rs` keeps exactly one
+/// comparison implementation (`target_matches_entry`).
+pub trait StickyIdentity {
+    fn id_provider(&self) -> &str;
+    /// The target's `real_model` *spec* (`None` = passthrough).
+    fn id_target_real_model(&self) -> Option<&str>;
+    /// The resolved effective real model sent upstream.
+    fn id_effective_real_model(&self) -> &str;
+}
+
+impl StickyIdentity for ActiveTargetEntry {
+    fn id_provider(&self) -> &str {
+        &self.provider
+    }
+    fn id_target_real_model(&self) -> Option<&str> {
+        self.target_real_model.as_deref()
+    }
+    fn id_effective_real_model(&self) -> &str {
+        &self.real_model
+    }
+}
+
 /// One sticky-failover active-target entry: which provider + real model
 /// absorbed the last successful request for a model, plus the route that
 /// resolved the request so prune and the admin snapshot are route-aware.
@@ -470,6 +501,13 @@ pub struct AppState {
     /// order so the next request re-shuffles, the fill-first analogue of
     /// clearing `active_targets`.
     pub fill_first_orders: FillFirstOrders,
+    /// Session-affinity memory for `strategy = "session_sticky"` routes,
+    /// shared with `DispatchRuntime` via the same `Arc`. Dispatch reads the
+    /// session pin in `order_targets` (hoisting the pinned target when it
+    /// survives the membership check) and rebinds it on success via the
+    /// generation-checked [`SessionWriteback`]; the admin layer observes
+    /// and clears it through `/api/session-affinity`.
+    pub session_affinity: SessionAffinity,
 }
 
 impl AppState {
@@ -620,6 +658,7 @@ pub mod testing {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            session_affinity: Arc::default(),
         }
     }
 

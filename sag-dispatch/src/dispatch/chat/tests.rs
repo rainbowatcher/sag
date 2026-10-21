@@ -292,6 +292,7 @@ fn make_ctx_with_strategy<'a>(
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     }
 }
 
@@ -327,6 +328,7 @@ fn make_ctx_with_token<'a>(
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     }
 }
 
@@ -2557,6 +2559,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback: _,
         route_name,
         started_at,
         precheck_errors: _,
@@ -2568,6 +2571,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         start,
         chrono::Utc::now(),
         false,
+        None,
         None,
         None,
     )
@@ -2602,6 +2606,7 @@ async fn sticky_failover_keeps_active_target_even_if_others_have_higher_priority
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2637,6 +2642,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback: _,
         route_name,
         started_at,
         precheck_errors: _,
@@ -2648,6 +2654,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         start,
         chrono::Utc::now(),
         false,
+        None,
         None,
         None,
     )
@@ -2676,6 +2683,7 @@ async fn sticky_failover_updates_active_target_on_success_after_failure() {
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     };
 
     let resp = dispatch_chat(ctx).await;
@@ -2708,6 +2716,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.session_affinity.clone(),
     );
     let req = build_request("gpt-4o", false);
     let trace_id = Uuid::new_v4();
@@ -2720,6 +2729,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback: _,
         route_name,
         started_at,
         precheck_errors: _,
@@ -2731,6 +2741,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         start,
         chrono::Utc::now(),
         false,
+        None,
         None,
         None,
     )
@@ -2768,6 +2779,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2793,6 +2805,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.session_affinity.clone(),
     );
     let req = build_request("gpt-4o", false);
     let trace_id = Uuid::new_v4();
@@ -2805,6 +2818,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback: _,
         route_name,
         started_at,
         precheck_errors: _,
@@ -2816,6 +2830,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         start,
         chrono::Utc::now(),
         false,
+        None,
         None,
         None,
     )
@@ -2873,6 +2888,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -2891,6 +2907,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         api_endpoint: api_endpoint2,
         strategy: strategy2,
         sticky_token: token2,
+        session_writeback: _,
         route_name,
         started_at,
         precheck_errors: _,
@@ -2902,6 +2919,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         start,
         chrono::Utc::now(),
         false,
+        None,
         None,
         None,
     )
@@ -2928,6 +2946,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     };
     let resp2 = dispatch_chat(ctx2).await;
     assert_eq!(resp2.status(), StatusCode::OK);
@@ -2953,6 +2972,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.session_affinity.clone(),
     );
     let req = build_request("gpt-4o", false);
     let trace_id = Uuid::new_v4();
@@ -2965,6 +2985,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback: _,
         route_name,
         started_at,
         precheck_errors: _,
@@ -2976,6 +2997,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         start,
         chrono::Utc::now(),
         false,
+        None,
         None,
         None,
     )
@@ -3027,6 +3049,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         ir: None,
         entry_loss: Default::default(),
         session_key: None,
+        session_writeback: None,
     };
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -3467,5 +3490,231 @@ async fn dispatch_chat_call_log_carries_entry_loss_seed() {
     assert!(
         summary.contains("entry_field:unsupported_by_ir"),
         "summary must include the entry_loss field/reason: {summary}"
+    );
+}
+
+// ─── Session-sticky integration (P3) ─────────────────────────
+
+/// Dispatch runtime sharing the state's session-affinity memory, so the
+/// ordering decision and the success write-back see the same pins.
+fn shared_runtime(state: &AppState) -> DispatchRuntime {
+    DispatchRuntime::with_shared_state(
+        state.circuit_breaker.clone(),
+        state.active_targets.clone(),
+        state.fill_first_orders.clone(),
+        state.session_affinity.clone(),
+    )
+}
+
+/// Full request cycle for the session tests: resolve (ordering + session
+/// pin hoist + writeback capture) → dispatch (success rebind). Returns the
+/// response and the ordered provider names (index 0 = the chosen target).
+async fn run_session_request(
+    state: &AppState,
+    rt: &DispatchRuntime,
+    req: &ChatCompletionRequest,
+    key: Option<&sag_core::SessionKey>,
+) -> (Response<Body>, Vec<String>) {
+    let trace_id = Uuid::new_v4();
+    let start = Instant::now();
+    let ResolvedRoute {
+        targets: resolved_targets,
+        api_endpoint,
+        strategy,
+        sticky_token,
+        session_writeback,
+        route_name,
+        started_at,
+        ..
+    } = crate::dispatch::resolve_route(
+        state,
+        rt,
+        req,
+        trace_id,
+        start,
+        chrono::Utc::now(),
+        false,
+        None,
+        None,
+        key,
+    )
+    .await
+    .expect("route must resolve");
+    let providers: Vec<String> = resolved_targets
+        .iter()
+        .map(|t| t.provider.clone())
+        .collect();
+    let mut errors = Vec::new();
+    let ctx = DispatchCtx {
+        state,
+        runtime: rt,
+        request: req,
+        targets: &resolved_targets,
+        api_endpoint: &api_endpoint,
+        is_stream: false,
+        trace_id,
+        start,
+        route_name: &route_name,
+        started_at,
+        errors: &mut errors,
+        strategy,
+        sticky_token,
+        session_writeback,
+        user_agent: None,
+        client_ip: None,
+        ingress_protocol: sag_core::IngressProtocol::ChatCompletions,
+        ir: None,
+        entry_loss: Default::default(),
+        session_key: key.cloned(),
+    };
+    let resp = dispatch_chat(ctx).await;
+    (resp, providers)
+}
+
+/// Pre-seed a session pin binding `key` to `provider` (the pin records the
+/// same identity fields the real write-back would).
+async fn bind_session_key(
+    rt: &DispatchRuntime,
+    model: &str,
+    key: &sag_core::SessionKey,
+    provider: &str,
+    routes_version: u64,
+) {
+    let map_id = key.map_id(model);
+    let mut guard = rt.session_affinity.write().await;
+    let (_, token) = guard.get_with_token(
+        model,
+        &map_id,
+        sag_state::DEFAULT_SESSION_TTL_SECS,
+        routes_version,
+        Instant::now(),
+    );
+    let wb = sag_state::SessionWriteback {
+        map_id,
+        model: model.into(),
+        token,
+        capacity: sag_state::DEFAULT_SESSION_MAX_ENTRIES,
+    };
+    assert!(guard.insert_if_generation(
+        &wb,
+        sag_state::SessionPin::new(provider, model, model, None, Instant::now(), routes_version,),
+        routes_version,
+    ));
+}
+
+#[tokio::test]
+async fn session_sticky_binds_and_keeps_serving_the_same_target() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    let state =
+        build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::SessionSticky).await;
+    let rt = shared_runtime(&state);
+    let key = sag_core::SessionKey::new("meta", "conv-1");
+    let req = build_request("gpt-4o", false);
+
+    // Request 1: no pin yet — a weighted draw binds the session.
+    let (resp, order1) = run_session_request(&state, &rt, &req, Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bound = order1[0].clone();
+    assert_eq!(
+        m1.chat_calls() + m2.chat_calls(),
+        1,
+        "exactly one target absorbs the request"
+    );
+
+    // Request 2: the same session must lead with (and stay on) the bound target.
+    let (resp, order2) = run_session_request(&state, &rt, &req, Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(order2[0], bound, "session must stay on its bound target");
+    let (bound_calls, other_calls) = if bound == "first" {
+        (m1.chat_calls(), m2.chat_calls())
+    } else {
+        (m2.chat_calls(), m1.chat_calls())
+    };
+    assert_eq!(bound_calls, 2, "both requests served by the bound target");
+    assert_eq!(other_calls, 0, "the other target must stay untouched");
+}
+
+#[tokio::test]
+async fn session_sticky_failover_rebinds_to_the_successful_target() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    let state =
+        build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::SessionSticky).await;
+    let rt = shared_runtime(&state);
+    let key = sag_core::SessionKey::new("meta", "conv-2");
+    let req = build_request("gpt-4o", false);
+
+    // Pre-bind the session to "second"…
+    let version = state.config.routes_version();
+    bind_session_key(&rt, "gpt-4o", &key, "second", version).await;
+
+    // …which then fails: "first" absorbs the failover and the pin must
+    // follow the failover winner (rebind convergence).
+    m2.push_chat(ChatBehavior::Retryable(AppError::Upstream {
+        provider: "second".into(),
+        status: 500,
+        body: "boom".into(),
+    }));
+    let (resp, order1) = run_session_request(&state, &rt, &req, Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(order1[0], "second", "pin must lead even when it then fails");
+    assert_eq!(m2.chat_calls(), 1);
+    assert_eq!(m1.chat_calls(), 1, "failover served by first");
+
+    // Next request sticks to the rebound target.
+    let (resp, order2) = run_session_request(&state, &rt, &req, Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(order2[0], "first", "pin must follow the failover winner");
+    assert_eq!(m1.chat_calls(), 2);
+    assert_eq!(m2.chat_calls(), 1);
+}
+
+#[tokio::test]
+async fn session_sticky_sessions_are_independent() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    let state =
+        build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::SessionSticky).await;
+    let rt = shared_runtime(&state);
+    let version = state.config.routes_version();
+    let c1 = sag_core::SessionKey::new("meta", "conv-a");
+    let c2 = sag_core::SessionKey::new("meta", "conv-b");
+    let req = build_request("gpt-4o", false);
+
+    bind_session_key(&rt, "gpt-4o", &c1, "first", version).await;
+    bind_session_key(&rt, "gpt-4o", &c2, "second", version).await;
+
+    let (_, order_c1) = run_session_request(&state, &rt, &req, Some(&c1)).await;
+    let (_, order_c2) = run_session_request(&state, &rt, &req, Some(&c2)).await;
+    assert_eq!(
+        order_c1[0], "first",
+        "session conv-a must lead with its pin"
+    );
+    assert_eq!(
+        order_c2[0], "second",
+        "session conv-b must lead with its pin"
+    );
+}
+
+#[tokio::test]
+async fn session_sticky_without_session_key_is_stateless() {
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    let state =
+        build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::SessionSticky).await;
+    let rt = shared_runtime(&state);
+    let req = build_request("gpt-4o", false);
+
+    let (resp, order1) = run_session_request(&state, &rt, &req, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(order1.len(), 2, "full permutation even without a session");
+    assert!(rt.session_affinity.read().await.snapshot().is_empty());
+
+    let (resp, _) = run_session_request(&state, &rt, &req, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        rt.session_affinity.read().await.snapshot().is_empty(),
+        "session-less requests must never pin anything"
     );
 }

@@ -90,6 +90,11 @@ pub struct ResolvedRoute {
     pub api_endpoint: String,
     pub strategy: Strategy,
     pub sticky_token: sag_state::StickyToken,
+    /// Session write-back captured at the ordering decision point
+    /// (`Strategy::SessionSticky` routes with a session identity only) —
+    /// handed to [`dispatch_chat`]'s success path, which conditionally
+    /// rebinds the pin through `session_affinity.insert_if_generation`.
+    pub session_writeback: Option<sag_state::SessionWriteback>,
     /// The config route `model_name` matched for this request (`"*"` for a
     /// wildcard match). Route-level identity for analytics facts; distinct
     /// from [`ResolvedTarget::route_model`], which attributes individual
@@ -154,6 +159,10 @@ pub struct DispatchCtx<'a> {
     /// request carries no session identity — such requests are routed by
     /// the weighted-random base ordering.
     pub session_key: Option<sag_core::SessionKey>,
+    /// Session write-back captured at the ordering decision point (see
+    /// [`ResolvedRoute::session_writeback`]); `None` for non-session
+    /// strategies and session-less requests.
+    pub session_writeback: Option<sag_state::SessionWriteback>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1227,6 +1236,7 @@ mod tests {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            session_affinity: Arc::default(),
         };
         (state, pool)
     }
@@ -1271,6 +1281,7 @@ mod tests {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            session_affinity: Arc::default(),
         };
         (state, pool)
     }

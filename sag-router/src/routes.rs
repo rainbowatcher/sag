@@ -211,6 +211,7 @@ async fn chat_completions(
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback,
         route_name,
         started_at,
         precheck_errors,
@@ -224,6 +225,7 @@ async fn chat_completions(
         is_stream,
         user_agent.as_deref(),
         client_ip.as_deref(),
+        session_key.as_ref(),
     )
     .await
     {
@@ -257,6 +259,7 @@ async fn chat_completions(
             ir: None,
             entry_loss: Default::default(),
             session_key: session_key.clone(),
+            session_writeback: session_writeback.clone(),
         })
         .await;
     }
@@ -281,6 +284,7 @@ async fn chat_completions(
         ir: Some(&ir),
         entry_loss: Default::default(),
         session_key,
+        session_writeback,
     })
     .await
 }
@@ -366,6 +370,7 @@ async fn anthropic_messages(
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback,
         route_name,
         started_at,
         precheck_errors,
@@ -379,6 +384,7 @@ async fn anthropic_messages(
         is_stream,
         user_agent.as_deref(),
         client_ip.as_deref(),
+        session_key.as_ref(),
         sag_core::IngressProtocol::AnthropicMessages,
     )
     .await
@@ -417,6 +423,7 @@ async fn anthropic_messages(
         ir: Some(&ir),
         entry_loss: encode_loss,
         session_key,
+        session_writeback,
     })
     .await;
 
@@ -540,12 +547,17 @@ async fn responses(
                 .map(|s| s.to_string())
         });
 
+    // Session identity for session-sticky routing (design §4.1 chain).
+    let session_key =
+        crate::session::extract_session_key(crate::session::BodyView::Raw(&raw_body), Some(&ir));
+
     let ResolvedRoute {
         pipeline,
         targets,
         api_endpoint,
         strategy,
         sticky_token,
+        session_writeback,
         route_name,
         started_at,
         precheck_errors,
@@ -559,6 +571,7 @@ async fn responses(
         is_stream,
         user_agent.as_deref(),
         client_ip.as_deref(),
+        session_key.as_ref(),
         sag_core::IngressProtocol::Responses,
     )
     .await
@@ -574,10 +587,6 @@ async fn responses(
         // Image path is Chat-only (D8); reject with the OpenAI envelope.
         return unprocessable("image generation is not supported on /v1/responses");
     }
-
-    // Session identity for session-sticky routing (design §4.1 chain).
-    let session_key =
-        crate::session::extract_session_key(crate::session::BodyView::Raw(&raw_body), Some(&ir));
 
     dispatch_chat(DispatchCtx {
         state: &state,
@@ -599,6 +608,7 @@ async fn responses(
         ir: Some(&ir),
         entry_loss: encode_loss,
         session_key,
+        session_writeback,
     })
     .await
 }
@@ -755,6 +765,7 @@ mod tests {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            session_affinity: Arc::default(),
         };
         let runtime = DispatchRuntime::default();
         (state, runtime, pool)
