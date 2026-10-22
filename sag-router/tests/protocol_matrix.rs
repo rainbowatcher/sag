@@ -386,8 +386,10 @@ async fn chat_x_responses_native_nonstream() {
 async fn chat_x_responses_native_stream() {
     // Stream with a Responses-shaped SSE mock: frames pass through the Chat
     // bridge's `process_sse_frame` (unknown JSON → Data) and Chat ingress
-    // Raw-passthroughs them — so egress carries Responses event types and
-    // **no** `[DONE]` (the mock never sends one, and none is synthesized).
+    // Raw-passthroughs them **byte-identically** — so egress carries the
+    // Responses event types unchanged, with the Chat terminal frame
+    // `data: [DONE]` synthesized after `response.completed` (Responses never
+    // emits it; the Chat bridge supplies the ingress protocol's terminator).
     let sse = concat!(
         r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#,
         "\n\n",
@@ -397,8 +399,9 @@ async fn chat_x_responses_native_stream() {
         "\n\n",
     );
     let expected = sse.to_string();
+    let served = expected.clone();
     let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
-        let expected = expected.clone();
+        let expected = served.clone();
         async move {
             respond_sse(&mut stream, &expected).await;
         }
@@ -429,8 +432,12 @@ async fn chat_x_responses_native_stream() {
         "missing completed: {text}"
     );
     assert!(
-        !text.contains("[DONE]"),
-        "Responses-style stream must not emit [DONE]: {text}"
+        text.starts_with(&expected),
+        "Responses frames must stay byte-identical: {text}"
+    );
+    assert!(
+        text.ends_with("data: [DONE]\n\n"),
+        "Chat bridge must terminate the stream with [DONE]: {text}"
     );
 
     // Upstream path is /responses.

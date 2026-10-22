@@ -369,6 +369,18 @@ fn responses_raw_verdict(val: &serde_json::Value) -> RawVerdict {
             }
         }
 
+        // `response.cancelled` mirrors `response.incomplete`: it is a terminal
+        // frame on the client-facing lane (see `is_client_terminal_frame` in
+        // `sag-core/src/protocol.rs`), so a cancelled stream without output
+        // must still classify as Empty for `retry_on_empty`.
+        "response.cancelled" => {
+            if response_has_output(val) {
+                RawVerdict::Content
+            } else {
+                RawVerdict::Empty
+            }
+        }
+
         // Unknown frame → conservative non-empty (pass through).
         _ => RawVerdict::Content,
     }
@@ -419,7 +431,8 @@ fn classify_raw_frame(raw: &[u8], upstream: ApiKind, saw_input_tokens: &mut bool
 ///   `message_delta` / `message_stop` empty rules, `error` → 502);
 /// - [`ApiKind::Responses`] — Responses event lifecycle
 ///   (`response.created` / `in_progress` bookkeeping, output deltas
-///   non-empty, `completed` / `incomplete` empty rules, `failed` → 502).
+///   non-empty, `completed` / `incomplete` / `cancelled` empty rules,
+///   `failed` → 502).
 ///
 /// A structured [`IrStreamEvent::Start`] that carries no metadata (id /
 /// created / model all `None`) is not itself a content signal: keep peeking
@@ -1142,6 +1155,46 @@ mod tests {
             Err(other) => panic!("expected Upstream 502, got {other:?}"),
             Ok(_) => panic!("expected Upstream 502, got Ok stream"),
         }
+    }
+
+    #[tokio::test]
+    async fn validate_stream_responses_cancelled_empty_output_is_empty() {
+        let frames = vec![
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.cancelled","response":{"id":"resp_1","output":[]}}"#
+                    .to_vec(),
+            ),
+        ];
+        let stream = futures_util::stream::iter(frames);
+        let result = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::Responses).await;
+        assert!(
+            matches!(result, Err(AppError::EmptyResponse { .. })),
+            "response.cancelled with empty output must be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_stream_responses_cancelled_with_output_is_nonempty() {
+        let frames = vec![
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#
+                    .to_vec(),
+            ),
+            IrStreamEvent::Raw(
+                br#"data: {"type":"response.cancelled","response":{"id":"resp_1","output":[{"type":"message","content":[{"type":"output_text","text":"Hi"}]}]}}"#
+                    .to_vec(),
+            ),
+        ];
+        let stream = futures_util::stream::iter(frames);
+        let result = validate_stream_first_chunk(stream.boxed(), "cpa", ApiKind::Responses).await;
+        assert!(
+            result.is_ok(),
+            "response.cancelled with output must not be treated as empty"
+        );
     }
 
     // ── is_empty_ir_response ─────────────────────────────────────

@@ -87,9 +87,11 @@ impl ApiKind {
 ///   一行 trim 后以 `event: message_stop` / `event:message_stop` 开头；
 /// - Responses：含 `"type":"response.completed"` /
 ///   `"type": "response.completed"` / `"type":"response.incomplete"` /
-///   `"type": "response.incomplete"`，或任意一行 trim 后以
+///   `"type": "response.incomplete"` / `"type":"response.cancelled"` /
+///   `"type": "response.cancelled"`，或任意一行 trim 后以
 ///   `event: response.completed` / `event:response.completed` /
-///   `event: response.incomplete` / `event:response.incomplete` 开头。
+///   `event: response.incomplete` / `event:response.incomplete` /
+///   `event: response.cancelled` / `event:response.cancelled` 开头。
 ///
 /// **三协议形态并集匹配，不按 ingress（[`ApiKind`]）分派**：跨协议组合下
 /// 客户端收到的帧形态由 upstream / lane 决定（例如 Chat ingress + Responses
@@ -108,6 +110,10 @@ impl ApiKind {
 /// 截断），usage 侧信道已按 completed / incomplete 提取（见
 /// `sag-providers/src/openai.rs` 的 `extract_side_channel`）。
 ///
+/// `response.cancelled` 同样算终点：`response.completed` 的 `status` 已有
+/// `cancelled` 变体且已被现有判定命中，原始 `response.cancelled` 事件类型属于同一
+/// 终态（取消），必须对齐处理，否则取消流会被漏判为「未终止」而走空流 / 悬挂路径。
+///
 /// `response.failed` **不**算终点帧：它的 Error 帧走 502 路径，错误分类优先于
 /// 终点帧标志。
 ///
@@ -118,7 +124,7 @@ pub fn is_client_terminal_frame(frame: &[u8]) -> bool {
     // 行形态标记（Chat / Anthropic / Responses 并集）：必须行锚定前缀匹配 ——
     // 文本内容里可能原样出现 `data: [DONE]`、`event: response.completed` 等字样，
     // 子串匹配会误报。无空格 / 带空格两种变体都覆盖（不同 upstream 编码不一）。
-    const LINE_PREFIXES: [&[u8]; 8] = [
+    const LINE_PREFIXES: [&[u8]; 10] = [
         b"data: [DONE]",
         b"data:[DONE]",
         b"event: message_stop",
@@ -127,6 +133,8 @@ pub fn is_client_terminal_frame(frame: &[u8]) -> bool {
         b"event:response.completed",
         b"event: response.incomplete",
         b"event:response.incomplete",
+        b"event: response.cancelled",
+        b"event:response.cancelled",
     ];
     if has_line_prefix(frame, &LINE_PREFIXES) {
         return true;
@@ -143,14 +151,16 @@ pub fn is_client_terminal_frame(frame: &[u8]) -> bool {
         return true;
     }
 
-    // Responses 终点：`type` 字段形，completed / incomplete 都算流终点。
-    // 禁止裸 `response.completed` 子串（理由同上）；引号形在 JSON 字符串值内必被
-    // 转义，因此 `contains` 安全。
-    const RESPONSES_MARKERS: [&[u8]; 4] = [
+    // Responses 终点：`type` 字段形，completed / incomplete / cancelled 都算流终点
+    // （`response.failed` 排除，见函数文档）。禁止裸 `response.completed` 子串
+    // （理由同上）；引号形在 JSON 字符串值内必被转义，因此 `contains` 安全。
+    const RESPONSES_MARKERS: [&[u8]; 6] = [
         br#""type":"response.completed""#,
         br#""type": "response.completed""#,
         br#""type":"response.incomplete""#,
         br#""type": "response.incomplete""#,
+        br#""type":"response.cancelled""#,
+        br#""type": "response.cancelled""#,
     ];
     RESPONSES_MARKERS
         .iter()
@@ -489,6 +499,25 @@ mod tests {
         }
     }
 
+    /// `response.cancelled` 是 Responses 的另一条终态路径（取消），形态与
+    /// completed / incomplete 对齐。
+    #[test]
+    fn client_terminal_frame_detects_responses_cancelled() {
+        for frame in [
+            &b"event: response.cancelled\ndata: {\"type\":\"response.cancelled\"}\n\n"[..],
+            &b"data: {\"type\":\"response.cancelled\"}\n\n"[..],
+            &b"data: {\"type\": \"response.cancelled\"}\n\n"[..],
+            &b"event: response.cancelled\n\n"[..],
+            &b"event:response.cancelled\n\n"[..],
+        ] {
+            assert!(
+                is_client_terminal_frame(frame),
+                "expected terminal: {}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
     /// 防误报锚定：内容帧、非终点控制帧、空帧一律不命中。
     #[test]
     fn client_terminal_frame_ignores_non_terminal_frames() {
@@ -501,6 +530,7 @@ mod tests {
             // 伪造 `event:` 行形态（行锚定前缀防伪造，评审 Major-1）。
             &b"data: {\"delta\":\"event: response.completed\"}\n\n"[..],
             &b"data: {\"delta\":\"event:response.incomplete\"}\n\n"[..],
+            &b"data: {\"delta\":\"event: response.cancelled\"}\n\n"[..],
             &b"data: {\"delta\":\"event: message_stop\"}\n\n"[..],
             &b"data: {\"choices\":[{\"delta\":{\"text\":\"ends with data: [DONE]\"}}]}\n\n"[..],
             // 非终点 Anthropic 控制帧。

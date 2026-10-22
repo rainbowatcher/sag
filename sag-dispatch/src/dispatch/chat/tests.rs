@@ -190,6 +190,70 @@ impl LlmProvider for AnthropicStreamProvider {
     }
 }
 
+/// Provider serving a **native Responses** SSE stream (Chat-ingress
+/// `[DONE]` bridge / Responses-ingress bridge tests). Only
+/// `responses_stream_native` is used; the Chat-shaped calls are unreachable
+/// in those tests and panic if ever taken.
+struct ResponsesStreamProvider {
+    name: String,
+    stream: Mutex<Option<Vec<StreamChunk>>>,
+    stream_calls: AtomicU32,
+}
+
+impl ResponsesStreamProvider {
+    fn new(name: &str, chunks: Vec<StreamChunk>) -> Self {
+        Self {
+            name: name.to_string(),
+            stream: Mutex::new(Some(chunks)),
+            stream_calls: AtomicU32::new(0),
+        }
+    }
+
+    fn stream_calls(&self) -> u32 {
+        self.stream_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ResponsesStreamProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn chat(
+        &self,
+        _request: &ChatCompletionRequest,
+        _real_model: &str,
+        _api_endpoint: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<ChatCompletionResponse> {
+        unreachable!("ResponsesStreamProvider only serves streaming requests")
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: &ChatCompletionRequest,
+        _real_model: &str,
+        _api_endpoint: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        unreachable!("ResponsesStreamProvider only serves responses_stream_native")
+    }
+
+    async fn responses_stream_native(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _api_endpoint: &str,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = self.stream.lock().unwrap().take().unwrap_or_default();
+        Ok(Box::pin(futures_util::stream::iter(chunks)))
+    }
+}
+
 /// Provider whose `chat` / `chat_stream` never resolve. Used to hold a
 /// dispatch in an in-flight provider call so the test can cancel the
 /// handler future mid-call (client-disconnect simulation) and assert
@@ -4162,4 +4226,215 @@ async fn anthropic_translated_message_stop_bridge_race_classifies_success() {
     assert_eq!(log.status_code, 200);
     assert!(log.error.is_none(), "success row carries no error message");
     assert!(log.error_category.is_none());
+}
+
+/// §6 case 5b: Chat ingress + **Responses** upstream. The `[DONE]` bridge
+/// (#1) covers both translated upstream protocols, so the Chat-protocol
+/// client gets its terminator even though the Responses upstream never emits
+/// `data: [DONE]`. The upstream frames themselves stay a byte-identical Raw
+/// passthrough.
+#[tokio::test]
+async fn chat_ingress_responses_upstream_gets_done_terminator() {
+    let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n".to_vec();
+    let completed =
+        b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            .to_vec();
+    let upstream = Arc::new(ResponsesStreamProvider::new(
+        "oai",
+        vec![
+            StreamChunk::Data(delta.clone()),
+            StreamChunk::Data(completed.clone()),
+            StreamChunk::Done,
+        ],
+    ));
+    let state = build_state(vec![upstream.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-5", true);
+    let targets = vec![ResolvedTarget {
+        upstream_protocol: sag_core::ApiKind::Responses,
+        ..target("oai", "gpt-5", 0)
+    }];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream.stream_calls(), 1);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        text.matches("data: [DONE]").count(),
+        1,
+        "exactly one Chat terminator, got: {text}"
+    );
+    assert!(
+        text.ends_with("data: [DONE]\n\n"),
+        "the synthesized [DONE] must be the last frame, got: {text}"
+    );
+    assert_eq!(
+        body,
+        [delta, completed, b"data: [DONE]\n\n".to_vec()].concat(),
+        "the Responses frames must pass through byte-identically"
+    );
+}
+
+/// §6 case 6 (non-compliant upstream): Anthropic ingress + Chat upstream that
+/// never sends `finish_reason`. The bridge must synthesize a `Finish` before
+/// the `message_stop` frame so the open content block is closed and the
+/// protocol-required `message_delta` (with `stop_reason`) is emitted.
+#[tokio::test]
+async fn anthropic_bridge_closes_block_without_finish_reason() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ),
+        // No `finish_reason` chunk: the upstream just terminates.
+        StreamChunk::Done,
+    ]));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    let stop = text
+        .find(r#""type":"content_block_stop""#)
+        .unwrap_or_else(|| panic!("missing content_block_stop, got: {text}"));
+    let delta = text
+        .find(r#""type":"message_delta""#)
+        .unwrap_or_else(|| panic!("missing message_delta, got: {text}"));
+    assert!(
+        stop < delta,
+        "the block must be closed before message_delta, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""type":"content_block_stop""#).count(),
+        1,
+        "exactly one content_block_stop, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""type":"message_delta""#).count(),
+        1,
+        "exactly one message_delta, got: {text}"
+    );
+    assert!(
+        text.contains(r#""stop_reason":"end_turn""#),
+        "the synthesized message_delta must carry a stop_reason, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""type":"message_stop""#).count(),
+        1,
+        "exactly one message_stop, got: {text}"
+    );
+    assert!(
+        text.trim_end()
+            .ends_with(r#"data: {"type":"message_stop"}"#),
+        "message_stop must be the last frame, got: {text}"
+    );
+}
+
+/// §6 case 6 (compliant upstream): a Chat upstream that *does* send
+/// `finish_reason` already produced the `message_delta` — the bridge must not
+/// add a second one, only the `message_stop` terminator.
+#[tokio::test]
+async fn anthropic_bridge_no_duplicate_message_delta_with_finish() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Done,
+    ]));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        text.matches(r#""type":"message_delta""#).count(),
+        1,
+        "a compliant upstream must not gain a second message_delta, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""type":"message_stop""#).count(),
+        1,
+        "exactly one message_stop, got: {text}"
+    );
+    assert!(
+        text.trim_end()
+            .ends_with(r#"data: {"type":"message_stop"}"#),
+        "message_stop must be the last frame, got: {text}"
+    );
+}
+
+/// §6 case 6 (Responses ingress): a translated upstream without
+/// `finish_reason` must still deliver `response.completed`; a compliant one
+/// must not get a second copy.
+#[tokio::test]
+async fn responses_bridge_synthesizes_completed_without_finish() {
+    let non_compliant = Arc::new(MockProvider::new("openai"));
+    non_compliant.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Done,
+    ]));
+    let compliant = Arc::new(MockProvider::new("openai-compliant"));
+    compliant.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(
+            b"data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Data(
+            b"data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Done,
+    ]));
+    let state = build_state(vec![non_compliant.clone(), compliant.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+
+    for provider in ["openai", "openai-compliant"] {
+        let targets = vec![target(provider, "gpt-4o", 0)];
+        let mut errors = Vec::new();
+        let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+        ctx.ingress_protocol = sag_core::IngressProtocol::Responses;
+        let resp = dispatch_chat(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK, "provider {provider}");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            text.matches(r#""type":"response.completed""#).count(),
+            1,
+            "exactly one response.completed for {provider}, got: {text}"
+        );
+        assert!(
+            text.contains(r#""status":"completed""#),
+            "the terminal frame must report status=completed for {provider}, got: {text}"
+        );
+    }
+    assert_eq!(non_compliant.stream_calls(), 1);
+    assert_eq!(compliant.stream_calls(), 1);
 }
