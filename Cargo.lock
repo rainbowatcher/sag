@@ -2102,6 +2102,7 @@ dependencies = [
  "sag-providers",
  "sag-router",
  "sag-state",
+ "serde_json",
  "sqlx",
  "tokio",
  "tower",

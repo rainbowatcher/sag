@@ -27,6 +27,8 @@ async-trait = { workspace = true }
 # Optional deps for the `embed-ui` feature (see [features] below).
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
+# Optional: build the JSON 404 body for unregistered API namespaces.
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Test-only: construct AnalyticsEvent fixtures (timestamps / ids) through
@@ -42,4 +44,4 @@ sqlx = { workspace = true }
 # Default is OFF: keeps the binary lean for users who deploy the SPA
 # separately via Vite or a CDN. The test-env launcher (`just build-test`)
 # is the canonical caller for this feature.
-embed-ui = ["dep:rust-embed", "dep:mime_guess"]
+embed-ui = ["dep:rust-embed", "dep:mime_guess", "dep:serde_json"]
