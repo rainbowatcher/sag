@@ -25,7 +25,8 @@ sag-state = { path = "../sag-state" }
 async-trait = { workspace = true }
 
 # Optional deps for the `embed-ui` feature (see [features] below).
-rust-embed = { workspace = true, optional = true }
+# `include-exclude` powers the `#[exclude = "*.map"]` filter on `UiAssets`.
+rust-embed = { workspace = true, optional = true, features = ["include-exclude"] }
 mime_guess = { workspace = true, optional = true }
 # Optional: build the JSON 404 body for unregistered API namespaces.
 serde_json = { workspace = true, optional = true }

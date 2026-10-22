@@ -120,6 +120,11 @@ const NOSNIFF: &str = "nosniff";
 #[cfg(feature = "embed-ui")]
 #[derive(Embed)]
 #[folder = "../sag-ui/dist/"]
+// Sourcemaps are never served (the fallback 404s dotted subresources), and
+// `vite build` does not emit them today — but if that ever flips, this keeps
+// the maps (and their sources) out of the binary. `postbuild-compress.mjs`
+// only skips compressing them; it does not stop the embed.
+#[exclude = "*.map"]
 struct UiAssets;
 
 /// SPA fallback handler. Attached to the router via `.fallback()`.
@@ -947,5 +952,21 @@ mod tests {
                 "body mismatch for {embedded}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 3: embedded payload hygiene.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sourcemaps_are_not_embedded() {
+        let maps: Vec<String> = UiAssets::iter()
+            .map(|path| path.to_string())
+            .filter(|path| path.ends_with(".map"))
+            .collect();
+        assert!(
+            maps.is_empty(),
+            "sourcemaps must stay out of the binary: {maps:?}"
+        );
     }
 }
