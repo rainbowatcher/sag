@@ -1,6 +1,8 @@
 # 流式终点帧竞态误分类修复 — 执行计划
 
-> status: ready · created: 2026-10-12 · revised: 2026-10-22 · target: `.plan/stream-terminal-frame-race-fix.md`
+> status: done · created: 2026-10-12 · revised: 2026-10-22 · completed: 2026-10-22 · target: `.plan/done/stream-terminal-frame-race-fix.md`
+>
+> 已实施：`d3cf9b2`(fix) · `9151428`(docs) · `f6b8529`(Minor 收尾 fix) · `f1c6624`(docs 返工)，评审 ACCEPT、门禁全绿；变更记录见 `docs/spec/dispatch/changes/0007-stream-terminal-frame-race.md`。
 
 ## 1. 背景与生产证据
 
