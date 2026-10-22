@@ -34,7 +34,10 @@ pub use paths::{
     default_log_dir, resolve_analytics_dsn, sag_config_dir, sag_data_dir, sag_state_dir,
     sqlite_dsn_file_path, xdg_config_home, xdg_data_home, xdg_state_home,
 };
-pub use protocol::{ApiKind, Capabilities, IngressProtocol, Lane, protocol_path, resolve_lane};
+pub use protocol::{
+    ApiKind, Capabilities, IngressProtocol, Lane, is_client_terminal_frame, protocol_path,
+    resolve_lane,
+};
 pub use session::{SessionKey, sha256_hex};
 pub use types::{
     CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FailureReason,

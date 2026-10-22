@@ -12,7 +12,7 @@ use sag_core::{
     TargetStatus, Usage,
 };
 use std::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::state::AppState;
 
@@ -70,6 +70,23 @@ struct StreamAnalytics {
     /// Hashed session identity for the drop-guard `call_logs` row (see
     /// `CallLog::session_key`).
     session_key: Option<String>,
+    /// Set when a client-visible terminal frame (`data: [DONE]` /
+    /// `"type":"message_stop"` / `response.completed`+`response.incomplete`)
+    /// was yielded to hyper. Stored *before* the yield, so a disconnect that
+    /// hyper detects afterwards is the normal-completion tail (upstream FIN
+    /// latency), not a cancel — see `.plan/stream-terminal-frame-race-fix.md`.
+    terminal_frame_forwarded: AtomicBool,
+    /// Running usage accumulator, shared with the drop guard: the guard needs
+    /// the final usage for a `Success` terminal reached after the terminal
+    /// frame was forwarded. Locked only at the read / merge point (never
+    /// across an await).
+    usage: Mutex<Usage>,
+    /// Wall-clock first client-visible byte, shared with the drop guard for
+    /// the `ttft_ms` column of the drop-as-success terminal.
+    first_byte_at: Mutex<Option<Instant>>,
+    /// Wall-clock start of this target's first provider call, shared with the
+    /// drop guard for `upstream_duration_ms` of the drop-as-success terminal.
+    upstream_start: Instant,
 }
 
 /// Build the single terminal [`sag_analytics::AnalyticsEvent`] for a
@@ -237,10 +254,18 @@ pub(crate) fn deliver_terminal_event_detached(
 /// the axum/hyper client-disconnect detection point (dropping the response
 /// body drops this stream, which drops the guard).
 ///
-/// Classifies by whether a mid-stream `Error` chunk was observed:
-/// - error observed → `model_failure` / `stream_error_after_commit` (the
-///   upstream failed after the first committed byte; no fallback);
-/// - no error → `client_cancelled` (client disconnected).
+/// Classifies by the shared terminal state (three-way):
+/// - a mid-stream `Error` chunk was observed → `model_failure` /
+///   `stream_error_after_commit` (the upstream failed after the first
+///   committed byte; no fallback). The error takes precedence over the
+///   terminal-frame flag — `response.failed` must never be upgraded to a
+///   success;
+/// - no error, but a client-visible terminal frame was already forwarded →
+///   `Success` with the shared usage / TTFT / upstream timing (the client is
+///   entitled to close the connection after `[DONE]` / `message_stop` /
+///   `response.completed`; the drop is upstream FIN latency, not a cancel);
+/// - no error and no terminal frame → `client_cancelled` (a real mid-stream
+///   client disconnect).
 ///
 /// The guard fires at most once: the normal terminal sets the shared
 /// `done` flag *before* delivering its event, so a state dropped during or
@@ -251,6 +276,24 @@ struct TerminalGuard {
     analytics: Arc<StreamAnalytics>,
 }
 
+/// The three-way classification of a terminal reached through the drop guard
+/// ([`TerminalGuard`]).
+struct DropTerminal {
+    result_status: FinalStatus,
+    result_reason: Option<FailureReason>,
+    target_status: TargetStatus,
+    target_reason: Option<FailureReason>,
+    status_code: u16,
+    error_category: Option<String>,
+    error: Option<String>,
+    /// Success-only payload (tokens / cache / timing): `None` for the error
+    /// and cancel terminals so every such column stays NULL, mirroring the
+    /// normal-terminal contract of `build_stream_call_log`.
+    usage: Option<Usage>,
+    ttft_ms: Option<u64>,
+    upstream_duration_ms: Option<u64>,
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Claim the terminal. The normal Done/None path already set `done`;
@@ -259,77 +302,126 @@ impl Drop for TerminalGuard {
             return;
         }
         let had_error = self.analytics.error.load(Ordering::SeqCst);
-        // An abandoned stream with no observed upstream error is the
-        // post-commit client-disconnect terminal. It has no other log line
-        // (the pre-commit cancel logs in `DispatchCancelGuard`, the
-        // mid-stream error in `record_stream_error`), so it is logged below.
-        let client_cancelled = !had_error;
-        let (
-            result_status,
-            result_reason,
-            target_status,
-            target_reason,
-            status_code,
-            error_category,
-            error,
-        ) = if had_error {
-            // An in-stream upstream error was observed before the drop:
-            // the failure takes precedence over the cancel (model_failure,
-            // never downgraded to client_cancelled). The call_logs row
-            // records the upstream error message at 502.
-            (
-                FinalStatus::ModelFailure,
-                Some(FailureReason::StreamErrorAfterCommit),
-                TargetStatus::Failure,
-                Some(FailureReason::StreamErrorAfterCommit),
-                502,
-                "stream_error".to_string(),
-                self.analytics
-                    .error_message
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-                    .unwrap_or_else(|| "upstream stream error".to_string()),
-            )
+        // A client-visible terminal frame was already yielded to hyper: the
+        // client may legitimately close the connection at that point, so the
+        // drop is the normal-completion tail (upstream FIN latency), not a
+        // cancel. The flag is stored before the yield, so it cannot be raced.
+        let terminal_forwarded = self
+            .analytics
+            .terminal_frame_forwarded
+            .load(Ordering::SeqCst);
+        let terminal = if had_error {
+            // An in-stream upstream error was observed before the drop: the
+            // failure takes precedence over both the cancel and the
+            // terminal-frame flag (model_failure, never upgraded to success
+            // or downgraded to client_cancelled). The call_logs row records
+            // the upstream error message at 502.
+            DropTerminal {
+                result_status: FinalStatus::ModelFailure,
+                result_reason: Some(FailureReason::StreamErrorAfterCommit),
+                target_status: TargetStatus::Failure,
+                target_reason: Some(FailureReason::StreamErrorAfterCommit),
+                status_code: 502,
+                error_category: Some("stream_error".to_string()),
+                error: Some(
+                    self.analytics
+                        .error_message
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        .unwrap_or_else(|| "upstream stream error".to_string()),
+                ),
+                usage: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            }
+        } else if terminal_forwarded {
+            // Race tail: the terminal frame reached the client, the drop is
+            // hyper noticing the client's close before the upstream `End`
+            // was enqueued. Same payload shape as the non-race success
+            // terminal (final shared usage / TTFT / upstream duration).
+            let usage = self
+                .analytics
+                .usage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let first_byte_at = *self
+                .analytics
+                .first_byte_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let upstream_duration_ms = self.analytics.upstream_start.elapsed().as_millis() as u64;
+            DropTerminal {
+                result_status: FinalStatus::Success,
+                result_reason: None,
+                target_status: TargetStatus::Success,
+                target_reason: None,
+                status_code: 200,
+                error_category: None,
+                error: None,
+                usage: Some(usage),
+                ttft_ms: first_byte_at
+                    .map(|t| t.duration_since(self.analytics.upstream_start).as_millis() as u64),
+                upstream_duration_ms: Some(upstream_duration_ms),
+            }
         } else {
-            (
-                FinalStatus::ClientCancelled,
-                Some(FailureReason::ClientCancelled),
-                TargetStatus::Cancelled,
-                None,
+            DropTerminal {
+                result_status: FinalStatus::ClientCancelled,
+                result_reason: Some(FailureReason::ClientCancelled),
+                target_status: TargetStatus::Cancelled,
+                target_reason: None,
                 // 499 = client closed request (nginx convention).
-                499,
-                "client_cancelled".to_string(),
-                "client disconnected before stream completion".to_string(),
-            )
+                status_code: 499,
+                error_category: Some("client_cancelled".to_string()),
+                error: Some("client disconnected before stream completion".to_string()),
+                usage: None,
+                ttft_ms: None,
+                upstream_duration_ms: None,
+            }
         };
         let completed_at = chrono::Utc::now();
-        if client_cancelled {
+        let duration_ms = self.analytics.start.elapsed().as_millis() as u64;
+        // The error terminal is already logged by `record_stream_error`; the
+        // two no-error terminals are logged here.
+        if !had_error && terminal_forwarded {
+            info!(
+                request_id = %self.analytics.request_id,
+                provider = %self.analytics.provider,
+                model = %self.analytics.requested_model,
+                real_model = %self.analytics.real_model,
+                duration_ms,
+                "client closed after terminal frame; classified as success"
+            );
+        } else if !had_error {
             warn!(
                 request_id = %self.analytics.request_id,
                 provider = %self.analytics.provider,
                 model = %self.analytics.requested_model,
                 real_model = %self.analytics.real_model,
-                duration_ms = self.analytics.start.elapsed().as_millis() as u64,
+                duration_ms,
                 "client disconnected before stream completion; client_cancelled fact + call_logs row enqueued"
             );
         }
         let event = terminal_event(
             &self.analytics,
-            result_status,
-            result_reason,
+            terminal.result_status,
+            terminal.result_reason,
             completed_at,
-            None, // failure / cancel: tokens must stay NULL
-            None,
-            None,
-            target_status,
-            target_reason,
+            // Success-only payload: the drop-as-success terminal carries the
+            // final shared usage / TTFT / upstream timing; failure / cancel
+            // keep every token / timing field NULL.
+            terminal.usage.clone(),
+            terminal.ttft_ms,
+            terminal.upstream_duration_ms,
+            terminal.target_status,
+            terminal.target_reason,
         );
         // Same decoupled delivery as the normal terminal. `Drop` cannot
         // await, so use the detached path (logs enqueue failure + panics).
         deliver_terminal_event_detached(self.analytics.event_collector.clone(), event);
 
-        // The client-disconnect terminal ALSO writes a `call_logs` row so the
+        // The abandoned terminal ALSO writes a `call_logs` row so the
         // request is visible in the admin logs list (`GET /api/logs` reads
         // `call_logs` only). `CallLogCollector::log` is synchronous (a channel
         // `try_send`), safe inside `Drop`. Exactly one row per request: the
@@ -342,20 +434,27 @@ impl Drop for TerminalGuard {
             model: self.analytics.requested_model.clone(),
             real_model: self.analytics.real_model.clone(),
             stream: true,
-            status_code,
-            duration_ms: self.analytics.start.elapsed().as_millis() as u64,
-            error: Some(error),
+            status_code: terminal.status_code,
+            duration_ms,
+            error: terminal.error,
             timestamp: completed_at,
             reasoning_effort: self.analytics.reasoning_effort.clone(),
-            upstream_duration_ms: None,
-            ttft_ms: None,
-            cached_tokens: None,
-            cache_creation_tokens: None,
-            reasoning_tokens: None,
-            usage: None,
+            upstream_duration_ms: terminal.upstream_duration_ms,
+            ttft_ms: terminal.ttft_ms,
+            // Mirror the normal success row: the flat cache / reasoning
+            // columns carry the same values as `usage` (the persistence layer
+            // binds these columns from the flat fields). They stay NULL on the
+            // error / cancel terminals because `usage` is `None` there.
+            cached_tokens: terminal.usage.as_ref().and_then(|u| u.cached_tokens),
+            cache_creation_tokens: terminal
+                .usage
+                .as_ref()
+                .and_then(|u| u.cache_creation_tokens),
+            reasoning_tokens: terminal.usage.as_ref().and_then(|u| u.reasoning_tokens),
+            usage: terminal.usage,
             user_agent: self.analytics.user_agent.clone(),
             client_ip: self.analytics.client_ip.clone(),
-            error_category: Some(error_category),
+            error_category: terminal.error_category,
             // Legacy call_logs keeps its diagnostic role: formal identity
             // columns stay NULL here; M7 protocol/lane dimensions come
             // from the shared stream analytics when dispatch wired them.
@@ -378,13 +477,10 @@ struct StreamState<S, E> {
     /// `Raw` must pass through original bytes; structured events are
     /// protocol-encoded (M5+).
     encode: E,
-    usage: Usage,
     error: Option<String>,
     done: bool,
-    first_byte_at: Option<Instant>,
     collector: Arc<CallLogCollector>,
     start: Instant,
-    upstream_start: Instant,
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
@@ -414,6 +510,7 @@ fn make_stream_analytics(
     target_started_at: chrono::DateTime<chrono::Utc>,
     target_facts: Vec<TargetAttemptFact>,
     start: Instant,
+    upstream_start: Instant,
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
@@ -446,6 +543,10 @@ fn make_stream_analytics(
         client_ip,
         loss_summary,
         session_key,
+        terminal_frame_forwarded: AtomicBool::new(false),
+        usage: Mutex::new(Usage::default()),
+        first_byte_at: Mutex::new(None),
+        upstream_start,
     })
 }
 
@@ -458,7 +559,6 @@ fn make_stream_state<S, E>(
     collector: Arc<CallLogCollector>,
     analytics: Arc<StreamAnalytics>,
     start: Instant,
-    upstream_start: Instant,
     reasoning_effort: Option<String>,
     user_agent: Option<String>,
     client_ip: Option<String>,
@@ -468,13 +568,10 @@ fn make_stream_state<S, E>(
     StreamState {
         stream,
         encode,
-        usage: Usage::default(),
         error: None,
         done: false,
-        first_byte_at: None,
         collector,
         start,
-        upstream_start,
         reasoning_effort,
         user_agent,
         client_ip,
@@ -652,16 +749,23 @@ async fn finish_stream_terminal<S, E>(state: &mut StreamState<S, E>) {
     // the latency coverage denominators or be mistaken for a
     // success sample. `duration_ms` (route wall-clock) still
     // carries the total request time for diagnostics.
-    let upstream_duration_ms = Instant::now()
-        .duration_since(state.upstream_start)
-        .as_millis() as u64;
-    let ttft_ms = state
+    let upstream_duration_ms = state.analytics.upstream_start.elapsed().as_millis() as u64;
+    let first_byte_at = *state
+        .analytics
         .first_byte_at
-        .map(|t| t.duration_since(state.upstream_start).as_millis() as u64);
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let ttft_ms =
+        first_byte_at.map(|t| t.duration_since(state.analytics.upstream_start).as_millis() as u64);
     // Also shared by the analytics success fact below — the
     // fact's usage must be the *final* accumulated usage,
     // not a mid-stream partial frame.
-    let usage = state.usage.clone();
+    let usage = state
+        .analytics
+        .usage
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     state.collector.log(build_stream_call_log(
         state,
         error,
@@ -752,10 +856,14 @@ async fn finish_stream_terminal<S, E>(state: &mut StreamState<S, E>) {
 ///   truncated-SSE legacy protocol behavior is unchanged), with a
 ///   `Failure` target fact; tokens stay NULL;
 /// - the response body dropped before a normal terminal — the axum/hyper
-///   client-disconnect signal — → `ClientCancelled` / `client_cancelled`
-///   with a `Cancelled` target fact (or `ModelFailure` /
-///   `stream_error_after_commit` if a mid-stream error was already
-///   observed); tokens stay NULL; no fallback.
+///   client-disconnect signal — is classified by the shared terminal state:
+///   a mid-stream error already observed → `ModelFailure` /
+///   `stream_error_after_commit`; no error but a client-visible terminal
+///   frame already forwarded → `Success` with the shared usage / TTFT /
+///   upstream timing (the client may close after `[DONE]`; the drop is
+///   upstream FIN latency, not a cancel); otherwise `ClientCancelled` /
+///   `client_cancelled` with a `Cancelled` target fact. Failure / cancel
+///   keep tokens NULL; no fallback.
 ///
 /// The terminal event is delivered by `deliver_terminal_event`, which
 /// decouples the enqueue from the body future's cancellation lifecycle:
@@ -814,6 +922,7 @@ where
         target_started_at,
         target_facts,
         start,
+        upstream_start,
         reasoning_effort.clone(),
         user_agent.clone(),
         client_ip.clone(),
@@ -829,7 +938,6 @@ where
         state.collector.clone(),
         analytics,
         start,
-        upstream_start,
         reasoning_effort,
         user_agent,
         client_ip,
@@ -848,7 +956,12 @@ where
                 // (legacy StreamChunk contract: only Data bytes reach the
                 // client; [DONE] itself arrives as a Raw Data frame).
                 Some(IrStreamEvent::Usage(u)) => {
-                    merge_stream_usage(&mut state.usage, &u);
+                    let mut acc = state
+                        .analytics
+                        .usage
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    merge_stream_usage(&mut acc, &u);
                 }
                 Some(IrStreamEvent::Error(msg)) => {
                     record_stream_error(&mut state, msg);
@@ -865,8 +978,30 @@ where
                     if bytes.is_empty() {
                         continue;
                     }
-                    if state.first_byte_at.is_none() {
-                        state.first_byte_at = Some(Instant::now());
+                    // Single lock: check-and-stamp TTFT on the first
+                    // non-empty yielded byte (a 0-byte encode is not a
+                    // first byte).
+                    {
+                        let mut first_byte_at = state
+                            .analytics
+                            .first_byte_at
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if first_byte_at.is_none() {
+                            *first_byte_at = Some(Instant::now());
+                        }
+                    }
+                    // Judged on the *encoded* bytes: the Responses
+                    // translated lane synthesizes its terminal frame from
+                    // a structured `Finish` event, so a Raw-only check
+                    // would miss that whole lane. The flag is set before
+                    // the yield, so a disconnect hyper detects afterwards
+                    // cannot race it.
+                    if sag_core::is_client_terminal_frame(&bytes) {
+                        state
+                            .analytics
+                            .terminal_frame_forwarded
+                            .store(true, Ordering::SeqCst);
                     }
                     return Some((
                         Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes)),
@@ -2683,6 +2818,10 @@ mod tests {
                     client_ip: None,
                     loss_summary: None,
                     session_key: None,
+                    terminal_frame_forwarded: AtomicBool::new(false),
+                    usage: Mutex::new(Usage::default()),
+                    first_byte_at: Mutex::new(None),
+                    upstream_start: Instant::now(),
                 }),
             }
         });
@@ -2719,5 +2858,509 @@ mod tests {
             assert_eq!(logs[0].status_code, 499);
             assert_eq!(logs[0].error_category.as_deref(), Some("client_cancelled"));
         });
+    }
+
+    /// Drive `body` with a noop waker until it suspends, returning the number
+    /// of yielded frames. This is the controlled-timing fixture for the
+    /// terminal-frame race: a `stream::iter` that is fully `Ready` would let
+    /// the loop consume `End` before the caller can drop the body, so the race
+    /// window (`End` not yet enqueued) is reproduced by chaining
+    /// `stream::pending()` and dropping the body while suspended.
+    fn drain_until_pending(body: &mut axum::body::Body) -> usize {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut frames = 0;
+        loop {
+            let fut = body.frame();
+            futures_util::pin_mut!(fut);
+            match fut.poll(&mut cx) {
+                std::task::Poll::Ready(Some(Ok(_))) => frames += 1,
+                std::task::Poll::Ready(Some(Err(e))) => panic!("body error: {e}"),
+                std::task::Poll::Ready(None) => panic!("body ended before the drop"),
+                std::task::Poll::Pending => return frames,
+            }
+            assert!(frames < 64, "body did not suspend");
+        }
+    }
+
+    /// Race regression (`.plan/stream-terminal-frame-race-fix.md` §2.2): the
+    /// client receives `data: [DONE]`, the upstream `End` is still in flight
+    /// (upstream FIN tail latency), the client closes, hyper drops the body.
+    /// The drop guard must classify the terminal as `Success` — not
+    /// `client_cancelled` / 499 — and carry the full success payload (final
+    /// usage, TTFT, upstream duration) into both the fact and the `call_logs`
+    /// row.
+    #[tokio::test]
+    async fn race_client_drop_after_done_classifies_success() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let usage = Usage {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+            cached_tokens: Some(2),
+            cache_creation_tokens: Some(1),
+            reasoning_tokens: Some(3),
+        };
+        // Usage + `[DONE]` arrive, then the stream suspends: `End` has not
+        // been enqueued yet — the race window.
+        let stream = stream::iter(vec![
+            StreamChunk::Data(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec(),
+            ),
+            StreamChunk::Usage(usage.clone()),
+            StreamChunk::Data(b"data: [DONE]\n\n".to_vec()),
+        ])
+        .map(IrStreamEvent::from)
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            encode_chat,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now() - std::time::Duration::from_millis(50),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut body = resp.into_body();
+        // delta + `[DONE]` are forwarded; the next poll suspends (no `End`).
+        assert_eq!(drain_until_pending(&mut body), 2);
+        // The client closes after `[DONE]`; hyper drops the body.
+        drop(body);
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "exactly one terminal fact");
+
+        #[allow(clippy::type_complexity)]
+        let (final_status, failure_reason, pt, ct, cached, ttft, upstream): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT final_status, failure_reason, prompt_tokens, completion_tokens, \
+             cached_tokens, ttft_ms, upstream_duration_ms \
+             FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("success fact must be persisted");
+        assert_eq!(
+            final_status, "success",
+            "a drop after the terminal frame is a normal completion, not a cancel"
+        );
+        assert!(failure_reason.is_none());
+        assert_eq!(pt, Some(11), "final accumulated usage enters the fact");
+        assert_eq!(ct, Some(7));
+        assert_eq!(cached, Some(2));
+        assert!(ttft.is_some(), "drop-as-success carries TTFT");
+        assert!(
+            upstream.is_some_and(|v| v >= 50),
+            "drop-as-success carries upstream_duration_ms from the 50ms offset"
+        );
+
+        let target_status: String =
+            sqlx::query_scalar("SELECT status FROM target_attempts WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(target_status, "success");
+
+        // call_logs row: 200, no error, full success payload.
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(LogFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.retain(|l| l.request_id == trace_id);
+        assert_eq!(logs.len(), 1, "exactly one call_logs row");
+        let log = &logs[0];
+        assert_eq!(log.status_code, 200);
+        assert!(log.error.is_none(), "success row carries no error message");
+        assert!(log.error_category.is_none());
+        assert_eq!(log.usage.as_ref().map(|u| u.total_tokens), Some(18));
+        assert_eq!(log.cached_tokens, Some(2));
+        assert_eq!(log.cache_creation_tokens, Some(1));
+        assert_eq!(log.reasoning_tokens, Some(3));
+        assert!(log.ttft_ms.is_some(), "success row carries TTFT");
+        assert!(
+            log.upstream_duration_ms.is_some(),
+            "success row carries upstream timing"
+        );
+    }
+
+    /// Invariant regression: a disconnect before any terminal frame stays
+    /// `client_cancelled` / 499 with usage / TTFT NULL.
+    #[tokio::test]
+    async fn midstream_disconnect_still_499() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let stream = stream::iter(vec![
+            StreamChunk::Data(b"data: one\n\n".to_vec()),
+            StreamChunk::Data(b"data: two\n\n".to_vec()),
+        ])
+        .map(IrStreamEvent::from)
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            encode_chat,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now() - std::time::Duration::from_millis(50),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut body = resp.into_body();
+        assert_eq!(drain_until_pending(&mut body), 2);
+        drop(body);
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, pt): (String, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, prompt_tokens \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("client_cancelled fact must be persisted");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(failure_reason.as_deref(), Some("client_cancelled"));
+        assert!(pt.is_none(), "cancelled fact keeps tokens NULL");
+
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(LogFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.retain(|l| l.request_id == trace_id);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 499);
+        assert_eq!(logs[0].error_category.as_deref(), Some("client_cancelled"));
+        assert!(logs[0].usage.is_none());
+        assert!(logs[0].ttft_ms.is_none());
+        assert!(logs[0].upstream_duration_ms.is_none());
+    }
+
+    /// 防伪造回归（评审 Minor-3）：内容帧的文本里原样出现终点字样
+    /// （`event: response.completed` 等）不得把 `terminal_frame_forwarded`
+    /// 置位 —— 否则真实中途断连会被 Drop 三路分类误记为 200 Success。
+    #[tokio::test]
+    async fn fake_terminal_text_in_content_still_499() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let stream = stream::iter(vec![
+            StreamChunk::Data(
+                b"data: {\"choices\":[{\"delta\":{\"text\":\"event: response.completed\"}}]}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"choices\":[{\"delta\":{\"text\":\"data: [DONE]\"}}]}\n\n".to_vec(),
+            ),
+        ])
+        .map(IrStreamEvent::from)
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            encode_chat,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now() - std::time::Duration::from_millis(50),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut body = resp.into_body();
+        assert_eq!(drain_until_pending(&mut body), 2);
+        drop(body);
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason, pt): (String, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT final_status, failure_reason, prompt_tokens \
+                 FROM request_results WHERE request_id = ?",
+            )
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("client_cancelled fact must be persisted");
+        assert_eq!(final_status, "client_cancelled");
+        assert_eq!(failure_reason.as_deref(), Some("client_cancelled"));
+        assert!(pt.is_none(), "cancelled fact keeps tokens NULL");
+
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(LogFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.retain(|l| l.request_id == trace_id);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 499);
+        assert_eq!(logs[0].error_category.as_deref(), Some("client_cancelled"));
+        assert!(logs[0].usage.is_none());
+        assert!(logs[0].ttft_ms.is_none());
+        assert!(logs[0].upstream_duration_ms.is_none());
+    }
+
+    /// Invariant regression: an observed upstream error outranks both the
+    /// cancel and the terminal-frame flag — the drop stays `model_failure` /
+    /// 502.
+    #[tokio::test]
+    async fn upstream_error_then_drop_still_502() {
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let stream = stream::iter(vec![
+            StreamChunk::Data(b"data: partial\n\n".to_vec()),
+            StreamChunk::Error("upstream burst error".into()),
+        ])
+        .map(IrStreamEvent::from)
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            encode_chat,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut body = resp.into_body();
+        assert_eq!(drain_until_pending(&mut body), 1);
+        drop(body);
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let (final_status, failure_reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT final_status, failure_reason FROM request_results WHERE request_id = ?",
+        )
+        .bind(trace_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("model_failure fact must be persisted");
+        assert_eq!(final_status, "model_failure");
+        assert_eq!(failure_reason.as_deref(), Some("stream_error_after_commit"));
+
+        state.collector.flush().await;
+        let mut logs = state
+            .collector
+            .store()
+            .query_logs(LogFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        logs.retain(|l| l.request_id == trace_id);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status_code, 502);
+        assert_eq!(logs[0].error_category.as_deref(), Some("stream_error"));
+        assert_eq!(logs[0].error.as_deref(), Some("upstream burst error"));
+        assert!(logs[0].usage.is_none());
+    }
+
+    /// Wiring regression: the terminal-frame judgement runs on the bytes
+    /// **after** `encode`. A structured `Finish` event encoded by the
+    /// Responses codec synthesizes `response.completed` (translated lane) and
+    /// must set the flag; a plain delta frame and Anthropic's
+    /// `message_delta` with `stop_reason: null` must not.
+    #[tokio::test]
+    async fn terminal_frame_flag_set_on_encoded_terminal() {
+        // ── Positive: `Finish` → `response.completed` via the Responses
+        // stream encoder (no Raw terminal frame involved).
+        let (state, pool) = build_state_with_event_pool(vec![]).await;
+        let trace_id = Uuid::new_v4();
+        let stream = stream::iter(vec![IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: None,
+        }])
+        .chain(stream::pending());
+        let resp = build_streaming_response(
+            &state,
+            stream,
+            sag_providers::ResponsesCodec::stream_encoder(),
+            "test-route",
+            "openai",
+            "gpt-5",
+            "gpt-5",
+            trace_id,
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut body = resp.into_body();
+        assert_eq!(drain_until_pending(&mut body), 1);
+        drop(body);
+        tokio::task::yield_now().await;
+        state.event_collector.shutdown().await;
+
+        let final_status: String =
+            sqlx::query_scalar("SELECT final_status FROM request_results WHERE request_id = ?")
+                .bind(trace_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("success fact must be persisted");
+        assert_eq!(
+            final_status, "success",
+            "the encoded `response.completed` frame must be recognised as terminal"
+        );
+
+        // ── Negative: ordinary delta frames do not set the flag.
+        for (encode_name, ev) in [
+            (
+                "chat text delta",
+                IrStreamEvent::TextDelta {
+                    index: 0,
+                    text: "hello".into(),
+                },
+            ),
+            (
+                "anthropic message_delta",
+                IrStreamEvent::Raw(
+                    b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null}}\n\n"
+                        .to_vec(),
+                ),
+            ),
+        ] {
+            let (state, pool) = build_state_with_event_pool(vec![]).await;
+            let trace_id = Uuid::new_v4();
+            let stream = stream::iter(vec![ev]).chain(stream::pending());
+            let resp = build_streaming_response(
+                &state,
+                stream,
+                encode_chat,
+                "test-route",
+                "openai",
+                "gpt-4o",
+                "gpt-4o",
+                trace_id,
+                Instant::now(),
+                Instant::now(),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let mut body = resp.into_body();
+            assert_eq!(drain_until_pending(&mut body), 1, "{encode_name}");
+            drop(body);
+            tokio::task::yield_now().await;
+            state.event_collector.shutdown().await;
+
+            let final_status: String =
+                sqlx::query_scalar("SELECT final_status FROM request_results WHERE request_id = ?")
+                    .bind(trace_id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("cancel fact must be persisted");
+            assert_eq!(
+                final_status, "client_cancelled",
+                "{encode_name} is not a terminal frame"
+            );
+        }
     }
 }

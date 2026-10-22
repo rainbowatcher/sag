@@ -77,6 +77,99 @@ impl ApiKind {
     }
 }
 
+/// 客户端可见流的终点帧判定（见 `.plan/stream-terminal-frame-race-fix.md`）。
+///
+/// 输入是**编码后**的完整 SSE 帧字节（可能含 `event:` 行 + 一行或多行
+/// `data:`），命中下列任一形态即视为客户端可见的终点帧：
+///
+/// - Chat：任意一行 trim 后以 `data: [DONE]` / `data:[DONE]` 开头；
+/// - Anthropic：含 `"type":"message_stop"` 或 `"type": "message_stop"`，或任意
+///   一行 trim 后以 `event: message_stop` / `event:message_stop` 开头；
+/// - Responses：含 `"type":"response.completed"` /
+///   `"type": "response.completed"` / `"type":"response.incomplete"` /
+///   `"type": "response.incomplete"`，或任意一行 trim 后以
+///   `event: response.completed` / `event:response.completed` /
+///   `event: response.incomplete` / `event:response.incomplete` 开头。
+///
+/// **三协议形态并集匹配，不按 ingress（[`ApiKind`]）分派**：跨协议组合下
+/// 客户端收到的帧形态由 upstream / lane 决定（例如 Chat ingress + Responses
+/// upstream 会 Raw 透传 `event: response.completed`），按 ingress 收窄会漏判。
+///
+/// 匹配刻意采用行锚定前缀与带引号的 `"type":"..."` 形态，而不是裸子串：
+/// 帧里的模型文本内容可以原样出现 `data: [DONE]`、`message_stop`、
+/// `response.completed`、`event: response.completed`（这些字符在 JSON 字符串值里
+/// 无需转义），裸子串匹配会把普通内容 delta 误判为终点。因此**所有行形态**标记
+/// （`data:` 行、`event:` 行）都必须逐行锚定到行首（trim 前导空白后 `starts_with`）
+/// —— 内容 delta 里的伪造字样永远位于 `data: {...}` 这一行的 JSON 值中间，不可能
+/// 出现在行首。而 `"type":"..."` 的引号形若出现在字符串值内部，必然被转义成
+/// `\"type\":\"...`，故仍可用 `contains` 匹配。
+///
+/// `response.incomplete` 同样算终点：它是 Responses 流的正常收尾之一（生成被
+/// 截断），usage 侧信道已按 completed / incomplete 提取（见
+/// `sag-providers/src/openai.rs` 的 `extract_side_channel`）。
+///
+/// `response.failed` **不**算终点帧：它的 Error 帧走 502 路径，错误分类优先于
+/// 终点帧标志。
+///
+/// 与 `sag-dispatch/src/dispatch/chat/empty.rs` 的 `RawVerdict` 共享同一份
+/// 终点知识（那边按 JSON 解析后的 `type` 判定，这边是字节级快速判定），两侧各有
+/// 测试锚定，避免静默漂移。
+pub fn is_client_terminal_frame(frame: &[u8]) -> bool {
+    // 行形态标记（Chat / Anthropic / Responses 并集）：必须行锚定前缀匹配 ——
+    // 文本内容里可能原样出现 `data: [DONE]`、`event: response.completed` 等字样，
+    // 子串匹配会误报。无空格 / 带空格两种变体都覆盖（不同 upstream 编码不一）。
+    const LINE_PREFIXES: [&[u8]; 8] = [
+        b"data: [DONE]",
+        b"data:[DONE]",
+        b"event: message_stop",
+        b"event:message_stop",
+        b"event: response.completed",
+        b"event:response.completed",
+        b"event: response.incomplete",
+        b"event:response.incomplete",
+    ];
+    if has_line_prefix(frame, &LINE_PREFIXES) {
+        return true;
+    }
+
+    // Anthropic 终点：紧凑 / 带空格两种 JSON 形态。禁止裸 `message_stop`
+    // 子串（文本内容可含该单词）。
+    const ANTHROPIC_MARKERS: [&[u8]; 2] =
+        [br#""type":"message_stop""#, br#""type": "message_stop""#];
+    if ANTHROPIC_MARKERS
+        .iter()
+        .any(|marker| contains_bytes(frame, marker))
+    {
+        return true;
+    }
+
+    // Responses 终点：`type` 字段形，completed / incomplete 都算流终点。
+    // 禁止裸 `response.completed` 子串（理由同上）；引号形在 JSON 字符串值内必被
+    // 转义，因此 `contains` 安全。
+    const RESPONSES_MARKERS: [&[u8]; 4] = [
+        br#""type":"response.completed""#,
+        br#""type": "response.completed""#,
+        br#""type":"response.incomplete""#,
+        br#""type": "response.incomplete""#,
+    ];
+    RESPONSES_MARKERS
+        .iter()
+        .any(|marker| contains_bytes(frame, marker))
+}
+
+/// 是否存在某一行（trim 前导 ASCII 空白后）以给定前缀之一开头。
+fn has_line_prefix(frame: &[u8], prefixes: &[&[u8]]) -> bool {
+    frame.split(|b| *b == b'\n').any(|line| {
+        let line = line.trim_ascii_start();
+        prefixes.iter().any(|prefix| line.starts_with(prefix))
+    })
+}
+
+/// 字节子串查找（`[u8]` 没有 `contains`；不解析 JSON，热路径保持 O(n)）。
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// 协议 key → 固定上游 path（相对 `apis.<key>.base_url`，不含前导 `/`）。
 ///
 /// `image` 不适用：其路径唯一来源是 route.`api_endpoint`，返回 `None`。
@@ -336,6 +429,94 @@ mod tests {
             resolve_lane(set, IngressProtocol::AnthropicMessages),
             Lane::Translated
         );
+    }
+
+    #[test]
+    fn client_terminal_frame_detects_chat_done() {
+        assert!(is_client_terminal_frame(b"data: [DONE]\n\n"));
+        // 无空格变体（部分 upstream 不写空格）。
+        assert!(is_client_terminal_frame(b"data:[DONE]\n\n"));
+        // 带前导空白 / CRLF 的帧仍然命中（行锚定 trim 后判定）。
+        assert!(is_client_terminal_frame(b"\ndata: [DONE]\r\n\r\n"));
+        assert!(is_client_terminal_frame(b"event: done\ndata: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn client_terminal_frame_detects_anthropic_message_stop() {
+        assert!(is_client_terminal_frame(
+            b"data: {\"type\":\"message_stop\"}\n\n"
+        ));
+        // 带空格 JSON 形态。
+        assert!(is_client_terminal_frame(
+            b"data: {\"type\": \"message_stop\"}"
+        ));
+        // `event:` 行 + `data:` 行。
+        assert!(is_client_terminal_frame(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ));
+        // 仅 `event:` 行形态（无空格 / 带空格，data 行非终点）。
+        assert!(is_client_terminal_frame(
+            b"event: message_stop\ndata: {}\n\n"
+        ));
+        assert!(is_client_terminal_frame(
+            b"event:message_stop\ndata: {}\n\n"
+        ));
+    }
+
+    #[test]
+    fn client_terminal_frame_detects_responses_terminals() {
+        assert!(is_client_terminal_frame(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n"
+        ));
+        assert!(is_client_terminal_frame(
+            b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\"}}\n\n"
+        ));
+        // 仅 event 行形态（含无空格变体）。
+        for frame in [
+            &b"event: response.completed\n\n"[..],
+            &b"event:response.completed\n\n"[..],
+            &b"event: response.incomplete\n\n"[..],
+            &b"event:response.incomplete\n\n"[..],
+            // 仅 type 字段形态（含带空格变体）。
+            &b"data: {\"type\": \"response.completed\"}\n\n"[..],
+            &b"data: {\"type\": \"response.incomplete\"}\n\n"[..],
+        ] {
+            assert!(
+                is_client_terminal_frame(frame),
+                "expected terminal: {}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
+    /// 防误报锚定：内容帧、非终点控制帧、空帧一律不命中。
+    #[test]
+    fn client_terminal_frame_ignores_non_terminal_frames() {
+        for frame in [
+            // 普通 chat delta。
+            &b"data: {\"choices\":[{\"delta\":{\"text\":\"hi\"}}]}\n\n"[..],
+            // 文本内容里原样出现终点字样（裸子串匹配会误报）。
+            &b"data: {\"choices\":[{\"delta\":{\"text\":\"stream ends with data: [DONE] and message_stop\"}}]}\n\n"[..],
+            &b"data: {\"choices\":[{\"delta\":{\"text\":\"response.completed\"}}]}\n\n"[..],
+            // 伪造 `event:` 行形态（行锚定前缀防伪造，评审 Major-1）。
+            &b"data: {\"delta\":\"event: response.completed\"}\n\n"[..],
+            &b"data: {\"delta\":\"event:response.incomplete\"}\n\n"[..],
+            &b"data: {\"delta\":\"event: message_stop\"}\n\n"[..],
+            &b"data: {\"choices\":[{\"delta\":{\"text\":\"ends with data: [DONE]\"}}]}\n\n"[..],
+            // 非终点 Anthropic 控制帧。
+            &b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null}}\n\n"[..],
+            // `response.failed` 不算终点（Error 帧走 502，错误分类优先）。
+            &b"event: response.failed\ndata: {\"type\":\"response.failed\"}\n\n"[..],
+            // 空帧 / 纯注释帧。
+            &b""[..],
+            &b": ping\n\n"[..],
+        ] {
+            assert!(
+                !is_client_terminal_frame(frame),
+                "expected non-terminal: {}",
+                String::from_utf8_lossy(frame)
+            );
+        }
     }
 
     #[test]

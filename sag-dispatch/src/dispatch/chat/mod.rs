@@ -53,6 +53,41 @@ fn responses_stream_encoder() -> impl Fn(&sag_core::IrStreamEvent) -> Vec<u8> + 
     ResponsesCodec::stream_encoder()
 }
 
+/// Anthropic-ingress terminal-frame bridge for **translated** upstreams
+/// (Anthropic ingress + non-Anthropic upstream): the upstream never emits
+/// `message_stop`, so the ingress encoder's `End => message_stop` branch
+/// would never run and the client would never see a terminator. Synthesize
+/// it on the first `End`; later Ends (e.g. the provider's trailing Done)
+/// still terminate the loop. The synthesized frame is matched by
+/// `sag_core::is_client_terminal_frame`, so a client drop right after it
+/// classifies as success (200) instead of client-cancelled (499).
+///
+/// `enabled` is `is_anthropic_ingress && !use_anthropic` — the native
+/// Anthropic lane keeps the upstream's own `message_stop` (Raw passthrough).
+///
+/// **Call-site invariant:** this runs *after* the empty-response peek, so
+/// the peek observes the upstream's own semantics (a vacuum upstream whose
+/// first event is `End` still yields `EmptyResponse` and retries). Applying
+/// it before the peek would make `classify_raw_frame` read the synthesized
+/// frame as `Content` and silently skip the retry.
+fn apply_message_stop_bridge(
+    s: futures_util::stream::BoxStream<'static, sag_core::IrStreamEvent>,
+    enabled: bool,
+) -> futures_util::stream::BoxStream<'static, sag_core::IrStreamEvent> {
+    if !enabled {
+        return s;
+    }
+    let mut stop_sent = false;
+    s.map(move |ev| match ev {
+        sag_core::IrStreamEvent::End if !stop_sent => {
+            stop_sent = true;
+            sag_core::IrStreamEvent::Raw(b"data: {\"type\":\"message_stop\"}\n\n".to_vec())
+        }
+        other => other,
+    })
+    .boxed()
+}
+
 /// Try each target in order. On a retryable error, retry the same target with
 /// exponential backoff. On a non-retryable 4xx error, do **not** retry the
 /// same target and do **not** open the circuit breaker:
@@ -374,11 +409,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             } else {
                                 s.map(sag_core::IrStreamEvent::from).boxed()
                             };
-                            // Chat ingress expects the OpenAI SSE terminator.
-                            // An Anthropic upstream never emits `data: [DONE]`;
-                            // synthesize exactly one on the first End (later
-                            // Ends — e.g. the provider's trailing Done — still
-                            // terminate the loop).
+                            // Terminal-frame bridge #1 (Chat ingress +
+                            // Anthropic upstream): the upstream never emits
+                            // `data: [DONE]`, so synthesize it on the first
+                            // End; later Ends (e.g. the provider's trailing
+                            // Done) still terminate the loop. Applied before
+                            // the empty-response peek — `classify_raw_frame`
+                            // treats `data: [DONE]` as `RawVerdict::Empty`, so
+                            // an empty upstream still surfaces
+                            // `EmptyResponse` and retries.
+                            //
+                            // Bridge #2 (Anthropic ingress + translated
+                            // upstream, `message_stop`) is applied **after**
+                            // the peek — see `apply_message_stop_bridge`.
                             let s = if is_chat_ingress && use_anthropic {
                                 let mut done_sent = false;
                                 s.map(move |ev| match ev {
@@ -405,6 +448,15 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             } else {
                                 ApiKind::ChatCompletions
                             };
+                            // Anthropic-ingress translated bridge: synthesize
+                            // `message_stop` on the first End. Applied only to
+                            // the stream handed to `ChatAttempt::Stream` (i.e.
+                            // **after** the empty-response peek), so the peek
+                            // still sees the raw upstream semantics: a vacuum
+                            // upstream whose first event is `End` stays empty →
+                            // `EmptyResponse` → retry, instead of being masked
+                            // by the synthesized frame.
+                            let message_stop_bridge = is_anthropic_ingress && !use_anthropic;
                             if retry_on_empty {
                                 // Peek at the first chunk before committing the HTTP
                                 // 200 response.  If the upstream returned an empty
@@ -414,9 +466,15 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 let s =
                                     validate_stream_first_chunk(s, &provider_name, frame_upstream)
                                         .await?;
-                                Ok(ChatAttempt::Stream(s, upstream_start))
+                                Ok(ChatAttempt::Stream(
+                                    apply_message_stop_bridge(s, message_stop_bridge),
+                                    upstream_start,
+                                ))
                             } else {
-                                Ok(ChatAttempt::Stream(s, upstream_start))
+                                Ok(ChatAttempt::Stream(
+                                    apply_message_stop_bridge(s, message_stop_bridge),
+                                    upstream_start,
+                                ))
                             }
                         } else if use_anthropic {
                             let (body, loss) =

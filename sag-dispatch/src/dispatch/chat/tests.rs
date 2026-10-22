@@ -31,6 +31,11 @@ enum ChatBehavior {
 
 enum StreamBehavior {
     Ok(Vec<StreamChunk>),
+    /// Yields the chunks, then suspends forever (never ends): models the
+    /// upstream FIN tail-latency window where the client-visible terminal
+    /// frame has already been forwarded but the upstream `End` has not
+    /// arrived yet (terminal-frame race tests).
+    OkThenPending(Vec<StreamChunk>),
     /// `chat_stream` fails immediately with this error (e.g. an
     /// upstream client-caused 4xx on a streaming request).
     Err(AppError),
@@ -108,9 +113,80 @@ impl LlmProvider for MockProvider {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         match self.stream_queue.lock().unwrap().pop_front() {
             Some(StreamBehavior::Ok(chunks)) => Ok(Box::pin(futures_util::stream::iter(chunks))),
+            Some(StreamBehavior::OkThenPending(chunks)) => Ok(Box::pin(
+                futures_util::stream::iter(chunks).chain(futures_util::stream::pending()),
+            )),
             Some(StreamBehavior::Err(e)) => Err(e),
             None => Ok(Box::pin(futures_util::stream::empty())),
         }
+    }
+}
+
+/// Provider serving a **native Anthropic** SSE stream (the Chat-ingress
+/// `[DONE]` bridge / translated-egress tests). Only
+/// `anthropic_messages_stream` is used; the Chat-shaped calls are
+/// unreachable in those tests and panic if ever taken.
+struct AnthropicStreamProvider {
+    name: String,
+    stream: Mutex<Option<Vec<StreamChunk>>>,
+    stream_calls: AtomicU32,
+}
+
+impl AnthropicStreamProvider {
+    fn new(name: &str, chunks: Vec<StreamChunk>) -> Self {
+        Self {
+            name: name.to_string(),
+            stream: Mutex::new(Some(chunks)),
+            stream_calls: AtomicU32::new(0),
+        }
+    }
+
+    fn stream_calls(&self) -> u32 {
+        self.stream_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicStreamProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn chat(
+        &self,
+        _request: &ChatCompletionRequest,
+        _real_model: &str,
+        _api_endpoint: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<ChatCompletionResponse> {
+        unreachable!("AnthropicStreamProvider only serves streaming requests")
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: &ChatCompletionRequest,
+        _real_model: &str,
+        _api_endpoint: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        unreachable!("AnthropicStreamProvider only serves anthropic_messages_stream")
+    }
+
+    async fn anthropic_messages_stream(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = self.stream.lock().unwrap().take().unwrap_or_default();
+        // `chain(pending)` keeps the stream open after the last frame so the
+        // test can drop the body inside the race window (the upstream `End`
+        // has not been enqueued yet).
+        Ok(Box::pin(
+            futures_util::stream::iter(chunks).chain(futures_util::stream::pending()),
+        ))
     }
 }
 
@@ -3772,4 +3848,318 @@ async fn call_log_records_session_hash_for_every_strategy() {
         1,
         "NULL means 'no session identity', nothing else"
     );
+}
+
+// ─── Terminal-frame bridge regression ────────────────────────────
+// `.plan/stream-terminal-frame-race-fix.md` §6 cases 5 / 6: a client that
+// closes right after the client-visible terminal frame (upstream FIN tail
+// latency) must classify as success, never as `client_cancelled` / 499.
+
+/// One Anthropic SSE `data:` frame.
+fn anthropic_frame(payload: &str) -> StreamChunk {
+    StreamChunk::Data(format!("data: {payload}\n\n").into_bytes())
+}
+
+/// Drain the body until it suspends, returning the concatenated bytes seen so
+/// far. Mirrors `stream::tests::drain_until_pending` — an all-`Ready`
+/// `stream::iter` fixture cannot reproduce the race window.
+fn drain_bytes_until_pending(body: &mut axum::body::Body) -> Vec<u8> {
+    use http_body_util::BodyExt;
+    use std::future::Future;
+
+    let waker = futures_util::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut out = Vec::new();
+    let mut frames = 0usize;
+    loop {
+        let fut = body.frame();
+        futures_util::pin_mut!(fut);
+        match fut.poll(&mut cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    out.extend_from_slice(&data);
+                }
+                frames += 1;
+            }
+            std::task::Poll::Ready(Some(Err(e))) => panic!("body error: {e}"),
+            std::task::Poll::Ready(None) => panic!("body ended before the drop"),
+            std::task::Poll::Pending => {
+                assert!(frames > 0, "body suspended before forwarding any frame");
+                return out;
+            }
+        }
+        assert!(frames < 64, "body did not suspend");
+    }
+}
+
+/// §6 case 5: Chat ingress + Anthropic upstream. The `[DONE]` bridge
+/// synthesizes the OpenAI terminator on the first `End`; the client drops
+/// right after receiving it, before the upstream's trailing `End` arrives.
+/// The synthesized frame must be recognized as a terminal frame, so the drop
+/// classifies as `Success` / 200 with the full usage payload — not
+/// `client_cancelled` / 499.
+#[tokio::test]
+async fn anthropic_bridge_done_synthesis_race() {
+    let upstream = Arc::new(AnthropicStreamProvider::new(
+        "claude",
+        vec![
+            anthropic_frame(
+                r#"{"type":"message_start","message":{"id":"msg_1","model":"claude-3","usage":{"input_tokens":11,"output_tokens":1}}}"#,
+            ),
+            anthropic_frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            anthropic_frame(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            anthropic_frame(r#"{"type":"content_block_stop","index":0}"#),
+            anthropic_frame(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+            ),
+            // First `End` → bridged to `data: [DONE]`; the upstream stream
+            // then suspends (the trailing `End` has not been enqueued yet).
+            anthropic_frame(r#"{"type":"message_stop"}"#),
+        ],
+    ));
+    let (state, pool) = build_state_with_event_pool(vec![upstream.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("claude-3", true);
+    let targets = vec![ResolvedTarget {
+        upstream_protocol: sag_core::ApiKind::AnthropicMessages,
+        ..target("claude", "claude-3", 0)
+    }];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    let trace_id = ctx.trace_id;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream.stream_calls(), 1);
+
+    let mut body = resp.into_body();
+    let bytes = drain_bytes_until_pending(&mut body);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("data: [DONE]"),
+        "the first End must be bridged to the OpenAI terminator, got: {text}"
+    );
+    // The client closes after `[DONE]`; hyper drops the body.
+    drop(body);
+    tokio::task::yield_now().await;
+    state.event_collector.shutdown().await;
+
+    #[allow(clippy::type_complexity)]
+    let (final_status, failure_reason, pt, ct): (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT final_status, failure_reason, prompt_tokens, completion_tokens \
+             FROM request_results WHERE request_id = ?",
+    )
+    .bind(trace_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("success fact must be persisted");
+    assert_eq!(
+        final_status, "success",
+        "a drop after the synthesized `[DONE]` is a normal completion, not a cancel"
+    );
+    assert!(failure_reason.is_none());
+    assert_eq!(pt, Some(11), "final accumulated usage enters the fact");
+    assert_eq!(ct, Some(7));
+
+    let target_status: String =
+        sqlx::query_scalar("SELECT status FROM target_attempts WHERE request_id = ?")
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(target_status, "success");
+}
+
+/// §6 case 6 (normal path): Anthropic ingress + Chat upstream. The translated
+/// bridge synthesizes `data: {"type":"message_stop"}` on the first `End`; a
+/// later `End` terminates the loop without synthesizing a second terminator.
+#[tokio::test]
+async fn anthropic_translated_message_stop_bridge() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"
+                .to_vec(),
+        ),
+        // Upstream terminator #1 → decoded to End → synthesized message_stop.
+        StreamChunk::Data(b"data: [DONE]\n\n".to_vec()),
+        // Upstream terminator #2 → the second End terminates the loop.
+        StreamChunk::Done,
+    ]));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+
+    assert_eq!(
+        text.matches(r#""type":"message_stop""#).count(),
+        1,
+        "exactly one synthesized message_stop (the second End only terminates), got: {text}"
+    );
+    assert!(
+        text.trim_end()
+            .ends_with(r#"data: {"type":"message_stop"}"#),
+        "the terminator is the last client-visible frame, got: {text}"
+    );
+    assert!(
+        text.contains(r#""type":"text_delta""#) && text.contains("hi"),
+        "the translated content still reaches the client, got: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "the Anthropic encoder suppresses the OpenAI terminator, got: {text}"
+    );
+}
+
+/// §6 case 6 (empty upstream): the `message_stop` bridge must run **after**
+/// the empty-response peek. A vacuum Chat upstream (only `Done`, no content,
+/// no usage) on an Anthropic ingress must still classify as empty →
+/// `EmptyResponse` → retry, instead of being masked by the synthesized
+/// `message_stop` (which the Chat peek would read as `Content`).
+#[tokio::test]
+async fn anthropic_translated_message_stop_bridge_does_not_mask_empty_retry() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    // Vacuum upstream: zero content frames, no usage — the only event is the
+    // terminator, so the peek sees a bare `End`.
+    mock.push_stream(StreamBehavior::Ok(vec![StreamChunk::Done]));
+    mock.push_stream(StreamBehavior::Ok(vec![StreamChunk::Done]));
+    let state = build_state(vec![mock.clone()]).await;
+    assert!(
+        state.config.read().await.backoff.retry_on_empty_response,
+        "this regression only exists with the empty-response peek enabled"
+    );
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 1)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let resp = dispatch_chat(ctx).await;
+
+    assert_eq!(
+        mock.stream_calls(),
+        2,
+        "the empty peek must still see the raw `End` and retry (1 retry = 2 calls)"
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "an empty upstream must fail (all providers exhausted), not commit a 200"
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("message_stop"),
+        "no synthesized terminator may leak on the failure path, got: {text}"
+    );
+    assert!(
+        text.contains("empty response"),
+        "the failure reason must be the empty-response one, got: {text}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("retries exhausted")),
+        "the retry budget must be spent on the empty response, got: {errors:?}"
+    );
+}
+
+/// §6 case 6 (race tail): the client drops right after the synthesized
+/// `message_stop` frame, before the loop's terminating `End`. The drop must
+/// classify as `Success` / 200 — the synthesized frame is what
+/// `is_client_terminal_frame` matches.
+#[tokio::test]
+async fn anthropic_translated_message_stop_bridge_race_classifies_success() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::OkThenPending(vec![
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                .to_vec(),
+        ),
+        StreamChunk::Data(
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"
+                .to_vec(),
+        ),
+        // First End → synthesized message_stop, then the stream suspends.
+        StreamChunk::Data(b"data: [DONE]\n\n".to_vec()),
+    ]));
+    let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let trace_id = ctx.trace_id;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut body = resp.into_body();
+    let bytes = drain_bytes_until_pending(&mut body);
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.trim_end()
+            .ends_with(r#"data: {"type":"message_stop"}"#),
+        "the synthesized message_stop must be forwarded before the drop, got: {text}"
+    );
+    drop(body);
+    tokio::task::yield_now().await;
+    state.event_collector.shutdown().await;
+
+    #[allow(clippy::type_complexity)]
+    let (final_status, failure_reason, pt, ct): (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT final_status, failure_reason, prompt_tokens, completion_tokens \
+             FROM request_results WHERE request_id = ?",
+    )
+    .bind(trace_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("success fact must be persisted");
+    assert_eq!(
+        final_status, "success",
+        "a drop after the synthesized message_stop is a normal completion"
+    );
+    assert!(failure_reason.is_none());
+    assert_eq!(pt, Some(10));
+    assert_eq!(ct, Some(5));
+
+    state.collector.flush().await;
+    let logs = state
+        .collector
+        .store()
+        .query_logs(sag_analytics::LogFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let log = logs
+        .iter()
+        .find(|l| l.request_id == trace_id)
+        .expect("one call_logs row for the request");
+    assert_eq!(log.status_code, 200);
+    assert!(log.error.is_none(), "success row carries no error message");
+    assert!(log.error_category.is_none());
 }
