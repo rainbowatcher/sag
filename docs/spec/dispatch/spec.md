@@ -7,7 +7,7 @@ updated: 2026-10-22
 
 ## 关键文件
 
-- [sag-dispatch/src/dispatch/chat/](../../../sag-dispatch/src/dispatch/chat/) — 聊天补全分发模块（主调度、尝试结果与事实构造、空响应校验）
+- [sag-dispatch/src/dispatch/chat/](../../../sag-dispatch/src/dispatch/chat/) — 聊天补全分发模块（主调度、尝试结果与事实构造、空响应校验、translated 终点帧桥接）
 - [sag-dispatch/src/dispatch/image.rs](../../../sag-dispatch/src/dispatch/image.rs) — 图片生成分发
 - [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理（`StreamAnalytics` 共享状态、`TerminalGuard` 三路终点分类）
 - [sag-core/src/protocol.rs](../../../sag-core/src/protocol.rs) — `is_client_terminal_frame`：三协议终点帧的字节级判定
@@ -114,18 +114,28 @@ tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 
 实现分两层：
 
-1. **判定层**（`sag_core::is_client_terminal_frame`）：对**编码后**的 SSE 帧字节做三协议形态并集匹配（Chat `data: [DONE]`、Anthropic `"type":"message_stop"`、Responses `"type":"response.completed"` / `"response.incomplete"`，兼 `event:` 行变体）。行形态标记逐行锚定前缀（防内容 delta 伪造），`"type":"..."` 引号形用子串匹配（字符串值内必被转义）。不按 ingress 分派——跨协议组合下帧形态由 upstream / lane 决定。
+1. **判定层**（`sag_core::is_client_terminal_frame`）：对**编码后**的 SSE 帧字节做三协议形态并集匹配（Chat `data: [DONE]`、Anthropic `"type":"message_stop"`、Responses `"type":"response.completed"` / `"response.incomplete"` / `"type":"response.cancelled"`，兼 `event:` 行变体）。Responses 的三个流终点事件类型全部覆盖（`response.failed` 不算终点，它的 Error 帧走 502）。行形态标记逐行锚定前缀（防内容 delta 伪造），`"type":"..."` 引号形用子串匹配（字符串值内必被转义）。不按 ingress 分派——跨协议组合下帧形态由 upstream / lane 决定。
 2. **状态层**（`StreamAnalytics`）：`terminal_frame_forwarded: AtomicBool` 在 yield **之前**置位（yield 后置位会输给 hyper 的 drop），并与 `TerminalGuard` 共享 `usage` / `first_byte_at` / `upstream_start`，使 drop-as-success 行能写出完整 usage、`ttft_ms`、`upstream_duration_ms`。
 
 `TerminalGuard::Drop` 三路分类：error → 502 `stream_error_after_commit`（错误优先，`response.failed` 不升级）；无 error 但标志已置位 → `Success` 200；否则 → `client_cancelled` 499。
 
 **Trade-off**：这是**统计口径变更**（历史误分类的 499 会被正确地计为成功），dashboard 曲线会有一次性台阶；换来的是「客户端实际体验」与「网关记录」一致，且不再产生全 NULL 的成功行。
 
-### Anthropic translated 终点帧桥接
+### translated 终点帧桥接
 
-Anthropic ingress + 非 Anthropic upstream 时，上游不发 `message_stop`，ingress 编码器的 `End => message_stop` 分支也不会执行，客户端永远收不到协议终点。`apply_message_stop_bridge` 在首个 `End` 合成 `data: {"type":"message_stop"}\n\n`，后续 `End`（如 provider 尾部 `Done`）仍终止循环。
+translated 路径（ingress 协议 ≠ upstream 协议）下，upstream 不会发出 ingress 协议的终止帧，而 ingress 编码器的 `End => <终止帧>` 分支因 `End` 被内部消费而不执行，客户端可能永远收不到协议终点。三条桥接按「谁缺什么」分工：
 
-**次序不变式**：该桥接只作用于交给 `ChatAttempt::Stream` 的流（即 empty-peek **之后**）。若前置于 peek，`classify_raw_frame` 会把合成帧读作 `Content`，使真空上游不再报 `EmptyResponse` 并静默跳过 `retry_on_empty`。
+| # | 组合 | 合成的帧 | 位置 |
+|---|---|---|---|
+| 1 | Chat ingress + Anthropic / Responses upstream | `data: [DONE]\n\n` | empty-peek **之前** |
+| 2 | Anthropic ingress + 非 Anthropic upstream | `data: {"type":"message_stop"}\n\n` | empty-peek **之后** |
+| 3 | Responses ingress + 非 Responses upstream | `response.completed`（由 `Finish` 渲染） | empty-peek **之后** |
+
+`#2` / `#3` 共用 `apply_end_synthesis_bridge`（`EndSynthesis` 枚举 + `flat_map`，状态为 `finish_seen` / `end_sent`）：首个 `End` 若此前未见 `Finish`（即上游未给 `finish_reason`，不合规），先合成 `Finish { finish_reason: None }` 再发终止帧。编码器据此渲染：Anthropic → `content_block_stop`（闭合悬挂的 content block）+ `message_delta`（协议要求的 `stop_reason`，`None` 映射 `end_turn`）+ `message_stop`；Responses → `response.completed`（`status: completed`）。合规上游（已有 `Finish`）不重复合成，故不会多出第二条 `message_delta` 或第二个 `response.completed`。native 路径（`use_anthropic` / `use_responses`）不启用任何桥接，字节恒等。
+
+桥接 #1 只补 Chat 协议的终止符：Chat ingress + Responses upstream 的响应帧仍为上游原样 Raw 透传（字节恒等），帧形态转换不在范围内。
+
+**次序不变式**：`#1` 必须在 empty-peek **之前**——`classify_raw_frame` 把 `data: [DONE]` 判为 `RawVerdict::Empty`，因此真空上游仍能报 `EmptyResponse` 并走 `retry_on_empty`；`#2` / `#3` 必须在 peek **之后**——它们合成的帧（`message_stop` / `response.completed`）没有 Empty 特判，前置于 peek 会被 `classify_raw_frame` 读作 `Content`，使真空上游不再重试。该次序写在 `chat/mod.rs` 的注释里，改动桥接位置时需同时复核。
 
 ## 不变式
 
@@ -140,7 +150,8 @@ Anthropic ingress + 非 Anthropic upstream 时，上游不发 `message_stop`，i
 - 终点帧标志必须在 yield **之前**置位：先 yield 后置位会与 hyper 的 body drop 竞态
 - `TerminalGuard::Drop` 的 error 分支优先于终点帧分支；终点帧转发后的断连记 `Success` 200，转发前记 `client_cancelled` 499
 - drop-as-success 行必须携带 usage / `ttft_ms` / `upstream_duration_ms`；error 与 cancel 行这些列保持 NULL
-- Anthropic `message_stop` 桥接必须位于 empty-peek 之后；native Anthropic 透传路径字节恒等
+- Anthropic `message_stop` / Responses `response.completed` 桥接（`#2` / `#3`）必须位于 empty-peek 之后；Chat `data: [DONE]` 桥接（`#1`）必须位于 peek 之前（靠 Empty 特判）；native 透传路径字节恒等
+- 桥接 `#2` / `#3` 仅在首个 `End` 且未见过 `Finish` 时合成 `Finish { finish_reason: None }`；合规上游不得因此多出 `message_delta` / `response.completed`
 
 ## 测试策略
 
@@ -153,7 +164,7 @@ Anthropic ingress + 非 Anthropic upstream 时，上游不发 `message_stop`，i
 
 ## 变更记录
 
-- [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — `is_client_terminal_frame` 字节级三协议判定 + `TerminalGuard` 三路分类（error→502 / 标志→200 带完整 usage / 否则 499），并补 Anthropic translated 的 `message_stop` 桥接
+- [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — `is_client_terminal_frame` 字节级三协议判定（含 `response.cancelled`）+ `TerminalGuard` 三路分类（error→502 / 标志→200 带完整 usage / 否则 499），并补三条 translated 终点帧桥接（`[DONE]` / `message_stop` / `response.completed`，含不合规上游的块闭合与 `stop_reason`）
 - [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，按 TTFB、chunk idle 和错误 body 阶段分别设定边界
 - [0005 聊天分发单文件复杂度解耦与模块化](changes/0005-chat-dispatch-modularization.md)
 - [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）
