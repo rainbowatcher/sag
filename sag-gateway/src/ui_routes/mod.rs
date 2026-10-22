@@ -49,6 +49,17 @@
 //! so browsers never heuristically cache them; `no-store` would only add a
 //! header to probes. Every response gets `X-Content-Type-Options: nosniff`.
 //!
+//! # ETag / 304 only on the revalidated tier
+//!
+//! The `no-cache` tier also gets a strong `ETag` derived from the build-time
+//! SHA-256 of the *representation actually sent* — the identity file or its
+//! `.br` / `.gz` sibling. The same URL therefore has one ETag per encoding,
+//! which is what makes `Vary: Accept-Encoding` safe: a shared cache can never
+//! replay the identity bytes to a client that negotiated brotli. `immutable`
+//! assets get no ETag (they are never revalidated, so it would be 64 dead
+//! bytes), and `If-None-Match` is answered with a bodyless `304` carrying
+//! `ETag` / `Vary` / `Cache-Control` only.
+//!
 //! # Invariant: path traversal is structurally impossible
 //!
 //! Lookups go through `UiAssets::get` and nothing else. In a release build
@@ -150,7 +161,7 @@ pub(crate) async fn ui_handler(method: Method, uri: Uri, headers: HeaderMap) -> 
 
     // Step 3: an embedded file wins. Lookup is a table lookup in release
     // builds, so `../` / absolute inputs simply miss (see module invariant).
-    if let Some(response) = resolve(path, encoding, cache_control_for(path)) {
+    if let Some(response) = serve(path, encoding, cache_control_for(path), &headers) {
         return response;
     }
 
@@ -164,7 +175,7 @@ pub(crate) async fn ui_handler(method: Method, uri: Uri, headers: HeaderMap) -> 
     // Step 8: any remaining path (including `/`) returns index.html so
     // vue-router can resolve the route client-side.
     match resolve("index.html", encoding, INDEX_CACHE_CONTROL) {
-        Some(response) => response,
+        Some(response) => revalidate(&headers, response),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF)],
@@ -249,6 +260,82 @@ fn resolve(url_path: &str, encoding: Encoding, cache_control: &'static str) -> O
         .map(|file| file_response(url_path, file, Encoding::Identity, cache_control))
 }
 
+/// Looks `url_path` up and answers `304 Not Modified` when the request's
+/// `If-None-Match` matches the ETag of the representation that would be sent.
+#[cfg(feature = "embed-ui")]
+fn serve(
+    url_path: &str,
+    encoding: Encoding,
+    cache_control: &'static str,
+    request_headers: &HeaderMap,
+) -> Option<Response> {
+    resolve(url_path, encoding, cache_control).map(|response| revalidate(request_headers, response))
+}
+
+/// Downgrades a revalidated-tier response to `304` when `If-None-Match` hits.
+///
+/// The ETag is read back off the response instead of being recomputed, so the
+/// validator compared against is always the one for the representation that
+/// was actually selected (identity vs. `.br` / `.gz` sibling).
+#[cfg(feature = "embed-ui")]
+fn revalidate(request_headers: &HeaderMap, response: Response) -> Response {
+    let Some(etag) = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return response;
+    };
+    let Some(if_none_match) = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return response;
+    };
+    if !etag_list_matches(if_none_match, etag) {
+        return response;
+    }
+
+    // 304 carries the validators/metadata only (RFC 9110 §15.4.5): no body,
+    // and no `Content-Encoding` since nothing is encoded in the response.
+    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+    for name in [header::ETAG, header::VARY, header::CACHE_CONTROL] {
+        if let Some(value) = response.headers().get(&name) {
+            builder = builder.header(&name, value.clone());
+        }
+    }
+    builder.body(Body::empty()).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build 304 response",
+        )
+            .into_response()
+    })
+}
+
+/// True when an `If-None-Match` list matches `etag` (`*`, comma lists and a
+/// `W/` prefix are all honoured; `If-None-Match` uses weak comparison).
+#[cfg(feature = "embed-ui")]
+fn etag_list_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+/// Strong ETag for one embedded file: the build-time SHA-256 of *that* file.
+#[cfg(feature = "embed-ui")]
+fn etag_for(file: &rust_embed::EmbeddedFile) -> String {
+    use std::fmt::Write as _;
+
+    let mut etag = String::with_capacity(66);
+    etag.push('"');
+    for byte in file.metadata.sha256_hash() {
+        let _ = write!(etag, "{byte:02x}");
+    }
+    etag.push('"');
+    etag
+}
+
 /// Suffix of the embedded pre-compressed sibling for `encoding`.
 #[cfg(feature = "embed-ui")]
 fn encoded_suffix(encoding: Encoding) -> Option<&'static str> {
@@ -291,15 +378,25 @@ fn file_response(
     if let Some(content_encoding) = encoding.content_encoding() {
         builder = builder.header(header::CONTENT_ENCODING, content_encoding);
     }
-    builder
-        .body(Body::from(file.data.into_owned()))
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to build response for embedded asset",
-            )
-                .into_response()
-        })
+    // ETag of the representation actually sent — `file` is the identity file
+    // or its `.br` / `.gz` sibling, never re-looked-up by `mime_path`. The two
+    // encodings are different byte sequences, so sharing one validator would
+    // let `If-None-Match` answer 304 with bytes that do not match the cached
+    // `Content-Encoding`. `immutable` assets never revalidate, so they skip it.
+    if cache_control != ASSET_CACHE_CONTROL {
+        builder = builder.header(header::ETAG, etag_for(&file));
+    }
+    // `file.data` is `Cow::Borrowed(&'static [u8])` in release builds (the
+    // embed is `include_bytes!`), so `Body::from` goes through
+    // `Bytes::from_static` — no allocation, no memcpy. Never call
+    // `into_owned()` here.
+    builder.body(Body::from(file.data)).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build response for embedded asset",
+        )
+            .into_response()
+    })
 }
 
 #[cfg(all(test, feature = "embed-ui"))]
@@ -688,6 +785,166 @@ mod tests {
                 header_str(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
                 Some("nosniff"),
                 "{method} {uri} is missing nosniff"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Stage 2: zero-copy body + ETag / 304.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn shell_carries_a_strong_etag_and_assets_do_not() {
+        let Some(asset) = first_asset(".js") else {
+            return;
+        };
+        if !has_asset("index.html") {
+            return;
+        }
+
+        let shell = get("/", None).await;
+        let etag = header_str(&shell, header::ETAG).expect("shell must carry an ETag");
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"'),
+            "not strong: {etag}"
+        );
+        assert!(
+            !etag.starts_with("W/"),
+            "expected a strong ETag, got {etag}"
+        );
+
+        let asset_response = get(&format!("/{asset}"), None).await;
+        assert_eq!(
+            header_str(&asset_response, header::ETAG),
+            None,
+            "immutable assets must not carry an ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn if_none_match_hits_return_304() {
+        if !has_asset("index.html") {
+            return;
+        }
+
+        let etag = header_str(&get("/", None).await, header::ETAG).expect("etag");
+        for candidate in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"other\", {etag}"),
+            "*".to_owned(),
+        ] {
+            let response = send(request_with(
+                "/some/deep/route",
+                "GET",
+                &[("if-none-match", &candidate)],
+            ))
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "If-None-Match: {candidate} should hit"
+            );
+            assert_eq!(
+                header_str(&response, header::ETAG).as_deref(),
+                Some(etag.as_str())
+            );
+            assert_eq!(
+                header_str(&response, header::CACHE_CONTROL).as_deref(),
+                Some("no-cache")
+            );
+            assert_eq!(
+                header_str(&response, header::VARY).as_deref(),
+                Some("Accept-Encoding")
+            );
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert!(body.is_empty(), "304 must have an empty body");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_if_none_match_is_ignored() {
+        if !has_asset("index.html") {
+            return;
+        }
+
+        let response = send(request_with(
+            "/",
+            "GET",
+            &[("if-none-match", "\"stale-validator\"")],
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn brotli_representation_has_its_own_etag() {
+        if !has_asset("index.html") || !has_asset("index.html.br") {
+            return;
+        }
+
+        let identity = get("/", None).await;
+        let identity_etag = header_str(&identity, header::ETAG).expect("identity etag");
+
+        let brotli = get("/", Some("br")).await;
+        assert_eq!(
+            header_str(&brotli, header::CONTENT_ENCODING).as_deref(),
+            Some("br")
+        );
+        let brotli_etag = header_str(&brotli, header::ETAG).expect("br etag");
+        assert_ne!(
+            brotli_etag, identity_etag,
+            "the br representation must not share the identity ETag"
+        );
+
+        // Revalidating the br representation hits its own validator.
+        let response = send(request_with(
+            "/",
+            "GET",
+            &[("accept-encoding", "br"), ("if-none-match", &brotli_etag)],
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            header_str(&response, header::ETAG).as_deref(),
+            Some(brotli_etag.as_str())
+        );
+
+        // The identity validator must not validate the br representation.
+        let response = send(request_with(
+            "/",
+            "GET",
+            &[("accept-encoding", "br"), ("if-none-match", &identity_etag)],
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn served_bytes_match_the_embedded_file() {
+        // Regression guard for the zero-copy `Body::from(file.data)`: the body
+        // must still be the exact embedded bytes for both encodings.
+        let Some(path) = first_asset(".js") else {
+            return;
+        };
+
+        for (accept_encoding, suffix) in [(None, ""), (Some("br"), ".br"), (Some("gzip"), ".gz")] {
+            let embedded = format!("{path}{suffix}");
+            if !suffix.is_empty() && !has_asset(&embedded) {
+                continue;
+            }
+            let response = get(&format!("/{path}"), accept_encoding).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let expected = UiAssets::get(&embedded).expect("asset").data;
+            assert_eq!(
+                body.as_ref(),
+                expected.as_ref(),
+                "body mismatch for {embedded}"
             );
         }
     }
