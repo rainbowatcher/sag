@@ -1,11 +1,13 @@
 ---
 created: 2026-06-03
-updated: 2026-10-19
+updated: 2026-10-22
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-10-22** · **调度**：[0007 流式终点帧竞态误分类修复](dispatch/changes/0007-stream-terminal-frame-race.md) — 终点帧转发后的客户端断连改记成功（499 下降 / 成功上升，统计口径一次性台阶）并携带完整 usage / TTFT / upstream 时长；补 Anthropic translated 路径的 `message_stop` 桥接
 
 - **2026-10-21** · **routing**：[0004 call_logs 会话哈希不区分策略记录](routing/changes/0004-session-hash-for-every-strategy.md) — 会话归属是事实不是行为：所有策略/image/pre-resolve 失败行一律记录会话哈希
 - **2026-10-21** · **routing**：[0003 会话粘性路由与 priority 加权随机基底](routing/changes/0003-session-affinity-weighted-random.md) — 新增 `session_sticky` 策略：会话按上次成功目标粘住，未命中按 priority 加权随机全排列

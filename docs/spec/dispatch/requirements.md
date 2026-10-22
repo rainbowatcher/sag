@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-07-22
+updated: 2026-10-22
 ---
 
 # 调度
@@ -57,6 +57,12 @@ updated: 2026-07-22
 - SSE chunk 通过 tokio channel（`mpsc::unbounded`）从 provider 传给 axum streaming body
 - 非流式错误在 channel 中传递为 error chunk
 - `chunk_timeout_secs` 通过 `tokio::time::timeout` 实现 chunk 间超时
+- **终点帧与断连分类**：客户端收到终点帧（Chat `data: [DONE]`、Anthropic `message_stop`、Responses `response.completed` / `response.incomplete`）后关连接是协议允许的正常收尾。SAG 以「终点帧是否已转发给客户端」为界判定断连性质：
+  - 终点帧转发**之后**的断连 → `Success` / 200（上游 FIN 尾延迟，非取消），且该行携带完整 usage / `ttft_ms` / `upstream_duration_ms`
+  - 终点帧转发**之前**的断连 → `client_cancelled` / 499，usage / `ttft_ms` / `upstream_duration_ms` 为 NULL
+  - 流内已观察到上游 error 时，`stream_error_after_commit` / 502 优先于终点帧标志（`response.failed` 永不被升级为成功）
+  - 终点帧判定基于**编码后字节**，三协议形态并集匹配且行锚定，内容 delta 中的伪造字样不误判
+- **Anthropic translated 桥接终点帧**：Anthropic ingress + 非 Anthropic upstream 时，网关在首个 `End` 合成 `data: {"type":"message_stop"}` 帧转发，保证客户端总能收到协议终点；native Anthropic 透传路径字节不变，空响应重试（empty-peek）语义不变
 
 ### 图片生成
 
@@ -96,6 +102,7 @@ updated: 2026-07-22
 - 错误聚合（返回所有失败原因）
 - 超时错误的 504 vs 502 区分
 - 流式 chunk 超时的 SSE error 通知
+- 流式终点帧判定与断连分类（终点帧后断连记成功）
 
 ### 不包含
 
@@ -114,6 +121,7 @@ updated: 2026-07-22
 
 ## 变更记录
 
+- [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — 终点帧转发后的客户端断连改记成功（499 计数下降、成功计数上升），并补 drop-as-success 行的 usage / TTFT / upstream 时长与 Anthropic translated 的 `message_stop` 桥接
 - [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，保留非流式 request-level、流式 TTFB 和 chunk idle timeout
 - [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）
 - [0004 上游 4xx 不再触发重试与熔断](changes/0004-upstream-4xx-non-retryable.md)
