@@ -7,6 +7,8 @@ updated: 2026-10-22
 
 按时间倒序列出所有模块的变更记录。
 
+- **2026-10-22** · **架构**：[0004 内嵌 UI 静态服务：缓存分档、兜底收窄、零拷贝与 ETag](architecture/changes/0004-ui-static-cache-and-fallback.md) — `assets/**` 一年 `immutable`、`index.html` 保持 `no-cache` 并补 `ETag`/`304`；兜底按 `api/`→`v1/`→方法→`resolve`→`assets/`→`Accept`→末段带点的顺序收窄（未注册 API 路径 200 HTML → 404 JSON，静态面只接受 `GET`/`HEAD`，缺失资源 404 不回 shell）；`Body::from(file.data)` 去掉 `into_owned()` 的每次请求全量 memcpy；全部响应补 `nosniff`，`UiAssets` 排除 `*.map`
+
 - **2026-10-22** · **调度**：[0007 流式终点帧竞态误分类修复](dispatch/changes/0007-stream-terminal-frame-race.md) — 终点帧转发后的客户端断连改记成功（499 下降 / 成功上升，统计口径一次性台阶）并携带完整 usage / TTFT / upstream 时长；终点帧判定覆盖 Responses 三个终态（含 `response.cancelled`），并补三条 translated 桥接（`[DONE]` / `message_stop` / `response.completed`，含不合规上游的块闭合与 `stop_reason`）
 
 - **2026-10-21** · **routing**：[0004 call_logs 会话哈希不区分策略记录](routing/changes/0004-session-hash-for-every-strategy.md) — 会话归属是事实不是行为：所有策略/image/pre-resolve 失败行一律记录会话哈希
