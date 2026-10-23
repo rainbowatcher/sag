@@ -58,7 +58,8 @@
 //! replay the identity bytes to a client that negotiated brotli. `immutable`
 //! assets get no ETag (they are never revalidated, so it would be 64 dead
 //! bytes), and `If-None-Match` is answered with a bodyless `304` carrying
-//! `ETag` / `Vary` / `Cache-Control` only.
+//! `ETag` / `Vary` / `Cache-Control` plus the always-on `nosniff` and an
+//! explicit `Content-Length: 0`.
 //!
 //! # Invariant: path traversal is structurally impossible
 //!
@@ -303,8 +304,17 @@ fn revalidate(request_headers: &HeaderMap, response: Response) -> Response {
 
     // 304 carries the validators/metadata only (RFC 9110 §15.4.5): no body,
     // and no `Content-Encoding` since nothing is encoded in the response.
-    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
-    for name in [header::ETAG, header::VARY, header::CACHE_CONTROL] {
+    // `nosniff` stays on every response (see module docs), and the explicit
+    // zero `Content-Length` keeps `HEAD`-style smoke checks uniform.
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::CONTENT_LENGTH, "0");
+    for name in [
+        header::ETAG,
+        header::VARY,
+        header::CACHE_CONTROL,
+        header::X_CONTENT_TYPE_OPTIONS,
+    ] {
         if let Some(value) = response.headers().get(&name) {
             builder = builder.header(&name, value.clone());
         }
@@ -651,12 +661,17 @@ mod tests {
             return;
         }
 
-        let response = get("/", None).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            header_str(&response, header::CACHE_CONTROL).as_deref(),
-            Some("no-cache")
-        );
+        // `/` and deep client-side routes share the shell, so both must land
+        // in the revalidated tier.
+        for uri in ["/", "/some/deep/route"] {
+            let response = get(uri, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                header_str(&response, header::CACHE_CONTROL).as_deref(),
+                Some("no-cache"),
+                "{uri} must not be immutable"
+            );
+        }
     }
 
     #[tokio::test]
@@ -769,6 +784,13 @@ mod tests {
             header_str(&response, header::CONTENT_TYPE).as_deref(),
             Some("text/html")
         );
+        // The zero-copy body must not lose `Content-Length` (plan §8 risk).
+        let content_length = header_str(&response, header::CONTENT_LENGTH)
+            .expect("HEAD / must carry a Content-Length");
+        assert!(
+            content_length.parse::<usize>().is_ok_and(|len| len > 0),
+            "unexpected Content-Length {content_length}"
+        );
     }
 
     #[tokio::test]
@@ -790,6 +812,19 @@ mod tests {
                 header_str(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
                 Some("nosniff"),
                 "{method} {uri} is missing nosniff"
+            );
+        }
+
+        // The 304 downgrade path is built by hand, so it needs its own case:
+        // a revalidated hit must not drop `nosniff`.
+        if has_asset("index.html") {
+            let etag = header_str(&get("/", None).await, header::ETAG).expect("etag");
+            let response = send(request_with("/", "GET", &[("if-none-match", &etag)])).await;
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                header_str(&response, header::X_CONTENT_TYPE_OPTIONS).as_deref(),
+                Some("nosniff"),
+                "the 304 path is missing nosniff"
             );
         }
     }
@@ -861,6 +896,13 @@ mod tests {
             assert_eq!(
                 header_str(&response, header::VARY).as_deref(),
                 Some("Accept-Encoding")
+            );
+            // Set explicitly at the response level; hyper drops it on the wire
+            // for `304` (`can_have_content_length`).
+            assert_eq!(
+                header_str(&response, header::CONTENT_LENGTH).as_deref(),
+                Some("0"),
+                "304 must carry an explicit zero Content-Length"
             );
             let body = to_bytes(response.into_body(), usize::MAX)
                 .await
