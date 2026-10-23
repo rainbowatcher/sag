@@ -52,7 +52,7 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 响应离开进程有三条独立路径，各自负责自己的编码：
 
 - **SSE（`text/event-stream`）**：响应必须带 `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`，避免 nginx / CDN 类中间层缓冲或转码事件流导致 token 一次性倾倒。SSE 永不压缩。
-- **内嵌 UI 静态资源**：由 `sag-gateway/src/ui_routes/` 的 SPA fallback serve。UI 构建会为文本产物生成 `.br`（brotli q11）与 `.gz`（gzip 9）副本，handler 按 `Accept-Encoding` 直接下发预压缩件（`br` 优先于 `gzip`）并带 `Vary: Accept-Encoding`；无预压缩副本或客户端不支持时裸发兜底。运行期不压缩 UI。`index.html` 带 `Cache-Control: no-cache`，`*.br` / `*.gz` 不作为独立资源可访问（404）。
+- **内嵌 UI 静态资源**：由 `sag-gateway/src/ui_routes/` 的 SPA fallback serve。UI 构建会为文本产物生成 `.br`（brotli q11）与 `.gz`（gzip 9）副本，handler 按 `Accept-Encoding` 直接下发预压缩件（`br` 优先于 `gzip`）并带 `Vary: Accept-Encoding`；无预压缩副本或客户端不支持时裸发兜底。运行期不压缩 UI。`Cache-Control` 按路径分两档：hash 化资产（`assets/**`）为 `public, max-age=31536000, immutable`；`index.html` 等根级文件为 `no-cache`，并带构建期 sha256 强 `ETag`（按**实际下发表示**取值，`If-None-Match` 命中返回空 body `304`）。`*.br` / `.gz` 不作为独立资源可访问（404）。静态面只接受 `GET` / `HEAD`，其它方法返回 `405` + `Allow: GET, HEAD`。缺失的静态资源（`assets/**`、末段带点的子资源探针）返回 `404` 且**不**回 SPA shell；**未注册**的 `/api/*`、`/v1/*` 返回 `404` JSON（`{"error":{"code":"NOT_FOUND",...}}`，已注册路由不经 fallback）。所有响应（含 `304`）带 `X-Content-Type-Options: nosniff`。
 - **API 响应**：由 `sag-router` 的 `CompressionLayer` 动态压缩，默认开启、无配置开关。predicate 为「响应体 ≥ 1 KiB（含 1024 字节整）且非 SSE / gRPC / 图片」；级别 `Fastest`（延迟敏感优先于压缩比）。
 
 压缩层注册在 `http_log` 之外（更外层），使日志仍记录明文预览与 `content-length`。UI fallback 在 `build_router` 返回后才挂载，不经过中间件栈，因此 UI 的 `Content-Encoding` / `Vary` / `Cache-Control` 由 handler 自己设置。
