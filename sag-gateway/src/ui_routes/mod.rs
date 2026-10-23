@@ -32,7 +32,12 @@
 //! 5. `/` → shell.
 //! 6. `Accept: text/html` → shell (a browser hard-refreshing a dotted route
 //!    such as `/providers/glm-4.6` must still get the SPA).
-//! 7. last segment contains `.` → `404` (favicon / `*.map` / image probes).
+//! 7. last segment carries a known static-asset extension (see
+//!    [`ASSET_EXTENSIONS`]) → `404` (favicon / `*.map` / image / font probes).
+//!    Deliberately narrower than the plan's step 6 ("last segment contains
+//!    `.`"): that also 404'd dotted client-side routes such as
+//!    `/providers/v1.2` for a non-browser client sending `Accept: */*`. The
+//!    intent is unchanged — a missing *subresource* must not get the shell.
 //! 8. otherwise → shell.
 //!
 //! # Cache-Control is tiered by path, not by file type
@@ -173,8 +178,8 @@ pub(crate) async fn ui_handler(method: Method, uri: Uri, headers: HeaderMap) -> 
 
     // Steps 4-7: decide between a real 404 and the SPA shell.
     let is_asset_namespace = path.starts_with("assets/");
-    let is_dotted_subresource = path != "/" && looks_like_asset(path);
-    if is_asset_namespace || (is_dotted_subresource && !wants_html(&headers)) {
+    let is_static_subresource = path != "/" && looks_like_asset(path);
+    if is_asset_namespace || (is_static_subresource && !wants_html(&headers)) {
         return not_found();
     }
 
@@ -243,14 +248,33 @@ fn wants_html(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("text/html"))
 }
 
-/// True when the last path segment looks like a file name (`favicon.ico`,
-/// `foo.js.map`, `logo.svg`). Used to answer subresource probes with a 404
-/// instead of the SPA shell.
+/// File extensions that identify a *static subresource probe* rather than a
+/// client-side route. Conservative on purpose: the plan's "last segment
+/// contains `.`" also swallowed dotted routes such as `/providers/v1.2` when
+/// the client sent `Accept: */*`. Only names a build would actually emit as
+/// files belong here; anything else falls through to the shell.
+#[cfg(feature = "embed-ui")]
+const ASSET_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "cjs", "css", "map", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "ico",
+    "bmp", "woff", "woff2", "ttf", "otf", "eot", "txt", "xml", "wasm", "br", "gz",
+];
+
+/// True when the last path segment names a static file (`favicon.ico`,
+/// `foo.js.map`, `logo.svg`) — i.e. its extension is in
+/// [`ASSET_EXTENSIONS`]. Used to answer subresource probes with a 404 instead
+/// of the SPA shell; dotted routes (`/providers/v1.2`) are *not* assets.
 #[cfg(feature = "embed-ui")]
 fn looks_like_asset(path: &str) -> bool {
-    path.rsplit('/')
+    let Some((_, extension)) = path
+        .rsplit('/')
         .next()
-        .is_some_and(|last| last.contains('.'))
+        .and_then(|last| last.rsplit_once('.'))
+    else {
+        return false;
+    };
+    ASSET_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
 }
 
 /// Looks `url_path` up in the embedded assets, preferring the negotiated
@@ -421,6 +445,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use rust_embed::Embed;
     use tower::ServiceExt;
 
     use super::UiAssets;
@@ -763,6 +788,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dotted_route_without_html_accept_gets_shell() {
+        if !has_asset("index.html") {
+            return;
+        }
+
+        // A non-browser client (`Accept: */*`) asking for a dotted *route* must
+        // still get the SPA shell: only known static extensions 404 (m2).
+        let response = send(request_with("/providers/v1.2", "GET", &[("accept", "*/*")])).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&response, header::CONTENT_TYPE).as_deref(),
+            Some("text/html")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_static_file_returns_404() {
+        // Same `Accept: */*` as above, but a whitelisted extension: the 404
+        // intent (a missing subresource must not get the shell) is preserved.
+        let response = send(request_with("/gone.js", "GET", &[("accept", "*/*")])).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_string(response).await;
+        assert!(
+            !body.to_ascii_lowercase().contains("<!doctype"),
+            "got {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn non_get_method_is_rejected() {
         let response = send(request_with("/", "POST", &[])).await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -999,6 +1053,38 @@ mod tests {
     // ---------------------------------------------------------------
     // Stage 3: embedded payload hygiene.
     // ---------------------------------------------------------------
+
+    /// Test-only embed of a committed fixture directory (`tests/fixtures/embed/`).
+    /// `sag-ui/dist/` carries no `.map` today, so asserting on [`UiAssets`]
+    /// alone cannot tell "the `#[exclude]` worked" from "there was nothing to
+    /// exclude". This fixture always ships both files, so the assertions below
+    /// are non-vacuous.
+    #[derive(Embed)]
+    #[folder = "tests/fixtures/embed/"]
+    #[exclude = "*.map"]
+    struct FixtureAssets;
+
+    #[test]
+    fn exclude_attribute_drops_sourcemaps() {
+        assert!(
+            FixtureAssets::get("sample.js").is_some(),
+            "fixture sanity: sample.js must be embedded"
+        );
+        assert!(
+            FixtureAssets::get("sample.js.map").is_none(),
+            "#[exclude = \"*.map\"] must drop sample.js.map"
+        );
+
+        let embedded: Vec<String> = FixtureAssets::iter().map(|path| path.to_string()).collect();
+        assert!(
+            embedded.iter().any(|path| path == "sample.js"),
+            "fixture sanity: sample.js must be listed, got {embedded:?}"
+        );
+        assert!(
+            !embedded.iter().any(|path| path.ends_with(".map")),
+            "iter() must not list excluded files, got {embedded:?}"
+        );
+    }
 
     #[test]
     fn sourcemaps_are_not_embedded() {
