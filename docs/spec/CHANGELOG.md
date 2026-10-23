@@ -1,11 +1,14 @@
 ---
 created: 2026-06-03
-updated: 2026-10-22
+updated: 2026-10-23
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-10-23** · **架构**：[0004 内嵌 UI 静态服务（收尾）](architecture/changes/0004-ui-static-cache-and-fallback.md) — 子资源探针判定由「末段含点」收紧为 24 项扩展名白名单（`/providers/v1.2` 由 404 改回 shell，`/gone.js` 仍 404）、sourcemap 排除改用 fixture 非空转验证、release profile 开 `lto="thin"`/`codegen-units=1`/`strip="symbols"`（本机 25.7 MB → 21.3 MB，`codegen-units` 被 `.cargo/config.toml` 覆盖）、`chart.js` 拆出 `vendor-chart`（`AnalyticsPage` 258 kB → 95.5 kB）、删除 `/vite.svg` 死引用；e2e 矩阵按新产物复测（`index.html` 1783 B、新 ETag）
+- **2026-10-23** · **UI**：[0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](ui/changes/0005-build-chunk-splitting-and-favicon.md) — rolldown `codeSplitting.groups` 拆 `vendor-chart`（chart.js / vue-chartjs，`includeDependenciesRecursively: false`），首屏 `modulepreload` 仍 11 条；`index.html` 删 `/vite.svg` 死引用（1845 → 1783 B）
 
 - **2026-10-22** · **架构**：[0004 内嵌 UI 静态服务：缓存分档、兜底收窄、零拷贝与 ETag](architecture/changes/0004-ui-static-cache-and-fallback.md) — `assets/**` 一年 `immutable`、`index.html` 保持 `no-cache` 并补 `ETag`/`304`；兜底按 `api/`→`v1/`→方法→`resolve`→`assets/`→`Accept`→末段带点的顺序收窄（未注册 API 路径 200 HTML → 404 JSON，静态面只接受 `GET`/`HEAD`，缺失资源 404 不回 shell）；`Body::from(file.data)` 去掉 `into_owned()` 的每次请求全量 memcpy；全部响应补 `nosniff`，`UiAssets` 排除 `*.map`
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-18
+updated: 2026-10-23
 ---
 
 # 架构 — 规格
@@ -15,6 +15,7 @@ updated: 2026-10-18
 - [sag-router/src/routes.rs](../../../sag-router/src/routes.rs) — 中间件链与响应压缩层
 - [sag-gateway/src/ui_routes/mod.rs](../../../sag-gateway/src/ui_routes/mod.rs) — 内嵌 UI serve（SPA fallback）
 - [sag-ui/scripts/postbuild-compress.mjs](../../../sag-ui/scripts/postbuild-compress.mjs) — UI 构建期预压缩
+- [sag-ui/vite.config.ts](../../../sag-ui/vite.config.ts) — Vite 构建配置（`vendor-chart` 分包）
 
 ## 核心设计
 
@@ -43,7 +44,7 @@ flowchart TD
 | 层 | 覆盖对象 | 时机 | 代价 |
 |------|------|------|------|
 | SSE 防护头 | 所有 `text/event-stream` 响应 | 运行期（仅设头） | 零 |
-| UI 预压缩 | `sag-ui/dist/` 下的文本产物 | 构建期（brotli q11 / gzip 9） | 二进制体积 ≈ 713 KiB（当前 53 个 `.br` + 51 个 `.gz` 实测 730,544 B） |
+| UI 预压缩 | `sag-ui/dist/` 下的文本产物 | 构建期（brotli q11 / gzip 9） | 嵌入体积 ≈ 715 KiB（当前 55 个 `.br` + 53 个 `.gz` 实测 732,111 B） |
 | 动态压缩层 | ≥ 1 KiB（含 1024 字节整）的 API 响应 | 运行期（`Fastest`） | 每请求一次快速编码 |
 
 **Trade-off**：内嵌 UI 与 API 响应走不同路径，不是实现分裂，而是中间件挂载顺序的必然结果 —— `build_router` 的 `.layer()` 只对当时已注册的路由生效，`main.rs` 在 `build_router` 返回后才 `.fallback(ui_handler)`，UI fallback 永远不经过压缩层 / CORS / body limit / `http_log`。因此 UI 侧的 `Content-Encoding` / `Vary` / `Cache-Control` 必须由 handler 自己设。
@@ -53,6 +54,12 @@ flowchart TD
 **压缩层必须在 `http_log` 之外**：`log_http` 缓冲响应体以记录明文预览与 `content-length`；若压缩层在其内侧，日志会记录压缩后的乱码且 `content-length` 被 tower-http 移除。
 
 **已知边界**：`Accept-Encoding: identity;q=0` 时 tower-http 返回 406（无可用编码），不额外兜底；该 406 对 SSE 路径同样生效（发生在 predicate 判定之前）。
+
+### 发布二进制体积：release profile + UI 分包
+
+根 `Cargo.toml` 的 `[profile.release]` 取 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`：内嵌 UI 后单二进制体积是第一观感，`strip` 去符号表、cgu=1 让跨 crate 内联更充分。代价是构建变慢（决策阶段单次采样：体积 −34%、构建时长 +31.6%）与 panic backtrace 无符号名。注意 `.cargo/config.toml` 的 `[profile.release] codegen-units = 16` 会**覆盖** manifest 的同名字段（cargo 配置优先级高于 manifest），本地构建只吃到 `strip` 的收益，全量收益在 CI / 干净环境。
+
+前端侧对应的是 chunk 结构：`sag-ui/vite.config.ts` 用 rolldown 的 `output.codeSplitting.groups` 把 chart.js / vue-chartjs 拆成独立 `vendor-chart`（`AnalyticsPage` 258 kB → 95.52 kB，`vendor-chart` 162.76 kB），两 chunk 各带 content hash —— 改页面不再让图表库缓存失效（`assets/**` 是 `immutable` 一年）。首屏 `modulepreload` 仍为 11 条，`vendor-chart` 不在其中。
 
 ### 日志输出：TTY 检测 + 双重路径
 
@@ -104,6 +111,7 @@ CI 的版本门禁（`.github/workflows/release.yml`）同样从根 `Cargo.toml`
 - UI fallback 永远不经过 `build_router` 的中间件栈；其 `Content-Encoding` / `Vary` / `Cache-Control` 由 `ui_handler` 自己设置
 - UI 静态资源缓存头按 `assets/` 前缀分档：`assets/**` 为 `public, max-age=31536000, immutable`，`index.html`（及未来根级无 hash 文件）为 `no-cache` 且带 `ETag`，`If-None-Match` 命中返空 body `304`；ETag 取自**实际下发表示**（`.br`/`.gz` sibling 与 identity 各自独立）
 - 兜底顺序不可调换：`api/` / `v1/` 前缀先返 404 JSON（`NOT_FOUND`，与已注册路由同形），静态面的 `405 + Allow: GET, HEAD` 与 `404` 只在非 API 命名空间生效；`assets/` 前缀永远不回 shell
+- 「子资源探针」的判定是静态扩展名白名单（`ASSET_EXTENSIONS`，24 项），不是「末段含点」：带点的客户端路由（`/providers/v1.2`）必须仍能拿到 shell，否则非浏览器客户端会被 404
 - `*.br` / `*.gz` 预压缩件不可作为独立资源访问（404），且仅在收益 ≥ 2% 时才随构建产出
 
 ## 测试策略
@@ -111,10 +119,11 @@ CI 的版本门禁（`.github/workflows/release.yml`）同样从根 `Cargo.toml`
 - 单元测试：各子包 `#[cfg(test)] mod tests`
 - 集成测试：`sag-router/tests/auth_regression.rs`、`sag-router/tests/compression.rs`
 - 单元测试（无特性依赖）：`sag-gateway/src/ui_routes/negotiate.rs` 的 `Accept-Encoding` 协商
-- 单元测试（需 `embed-ui`）：`sag-gateway/src/ui_routes/mod.rs` 的预压缩下发；`just clippy` / `just test-rust` 各带一条 `--features embed-ui` 命令覆盖该门控代码（需先有 `sag-ui/dist/`）
+- 单元测试（需 `embed-ui`）：`sag-gateway/src/ui_routes/mod.rs` 的预压缩下发与兜底判定；`#[exclude]` 用 `sag-gateway/tests/fixtures/embed/`（`sample.js` + `sample.js.map`）的 `FixtureAssets` 验证非空转；`just clippy` / `just test-rust` 各带一条 `--features embed-ui` 命令覆盖该门控代码（需先有 `sag-ui/dist/`）
 - 端到端：`scripts/test-env.py` 启动 release 二进制测试真实行为
 
 ## 变更记录
 - [0001 初始化](changes/0001-initial.md)
 - [0002 版本升级提交按实际变更文件过滤](changes/0002-version-bump-commit-files.md)
 - [0003 HTTP 响应压缩：SSE 防护头、UI 构建期预压缩、动态压缩层](changes/0003-http-response-compression.md)
+- [0004 内嵌 UI 静态服务：缓存分档、兜底收窄、零拷贝与 ETag](changes/0004-ui-static-cache-and-fallback.md)
