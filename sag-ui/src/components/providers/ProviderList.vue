@@ -299,19 +299,6 @@ const columns = [
     cell: (info) => h("span", { class: "tabular-nums" }, String(info.getValue().length)),
     meta: { class: "text-center" },
   }),
-  columnHelper.accessor("enabled", {
-    header: () => t("common.status"),
-    cell: (info) =>
-      h(
-        Badge,
-        {
-          variant: info.getValue() ? "default" : "secondary",
-          class: "text-[10px]",
-        },
-        () => (info.getValue() ? t("common.enabled") : t("common.disabled")),
-      ),
-    meta: { class: "text-left" },
-  }),
   columnHelper.display({
     id: "breakers",
     header: () => t("providerList.columns.cb"),
