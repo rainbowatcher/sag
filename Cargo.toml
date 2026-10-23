@@ -64,3 +64,11 @@ mime_guess = "2"
 tracing-appender = "0.2"
 url = "2"
 home = "0.5"
+
+# Release profile tuned for shipped binary size (the UI is embedded into the
+# `sag` binary). Trade-off: full rebuilds get slower, including `just build-test`,
+# and `strip = "symbols"` drops symbol names from panic backtraces.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
