@@ -201,4 +201,3 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
 - [0004 UI 多语言支持（i18n，第一版 en/zh）](changes/0004-ui-i18n-language-switching.md)
 - [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)
-- [0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](changes/0005-build-chunk-splitting-and-favicon.md)
