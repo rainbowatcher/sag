@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-15
+updated: 2026-10-23
 ---
 
 # UI 管理面板 — 规格
@@ -12,6 +12,11 @@ updated: 2026-10-15
 - [sag-ui/src/main.ts](../../../sag-ui/src/main.ts) — Vue 应用入口：createPinia + createRouter + mount
 - [sag-ui/src/App.vue](../../../sag-ui/src/App.vue) — 根组件：TooltipProvider、连接验证 loading overlay、Toaster、RouterView
 - [sag-ui/src/router/index.ts](../../../sag-ui/src/router/index.ts) — 路由定义（懒加载 6 个路由）+ `beforeEach` 导航守卫
+
+### 构建
+
+- [sag-ui/vite.config.ts](../../../sag-ui/vite.config.ts) — Vite 构建配置：`codeSplitting.groups` 将 `chart.js` / `vue-chartjs` 拆为 `vendor-chart`（懒加载 chunk）
+- [sag-ui/index.html](../../../sag-ui/index.html) — SPA 入口模板（主题预置脚本 + `#app` 挂载点；不引用任何不存在的静态资源）
 
 ### 状态管理
 
@@ -326,6 +331,8 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **locale 白名单**：`localStorage` 的 `sag-ui-lang` 值必须经 `normalizeLocale` 校验（仅 `en` / `zh`），脏值写回默认语言。`t()` 不得因持久化值异常而抛错
 - **i18n 模块可在无 DOM 环境加载**：`index.ts` 不得在模块顶层触碰 `window` / `document` / `localStorage`——locale ref 懒建、`<html lang>` 同步放在 `installI18n` 的 `watchEffect` 内并对 `document === undefined` 提前返回，保证 node test runner 可直接导入
 - **`analytics.v2.scopeTarget` / `logs.tooltip.ttft` 为刻意 verbatim 的技术 token**：zh 视图在迁移前也渲染同样的英文 token，两处字典值保持英文并在 `en.ts` 内注释说明，不视为漏译
+- **图表库单独分包**：`chart.js` / `vue-chartjs` 必须落在 `vendor-chart` 组且 `includeDependenciesRecursively: false`。若后者保持默认 `true`，vue runtime 会被拖进该组、入口静态依赖它，chart.js 反而进首屏 preload，分包目标失效
+- **`index.html` 不得引用不存在的静态资源**：`sag-ui/public/` 不存在，任何 `/xxx.svg` / `/xxx.ico` 式引用都会变成每次加载一个 404（内嵌服务下是 `text/plain` 的 404）
 
 ## 测试策略
 
@@ -356,6 +363,7 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
 
 ## 变更记录
+- [0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](changes/0005-build-chunk-splitting-and-favicon.md)
 - [0004 UI 多语言支持（i18n，第一版 en/zh）](changes/0004-ui-i18n-language-switching.md)
 - [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)
