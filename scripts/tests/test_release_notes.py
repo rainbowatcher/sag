@@ -2,8 +2,8 @@
 """`scripts/release_notes.py` 纯函数层单测。
 
 覆盖范围（不跑 git、不跑 main）:
-  parse_conventional / is_release_commit / classify / select_prev_tag /
-  parse_commits / render_notes
+  parse_conventional / is_release_commit / has_breaking_footer / classify /
+  select_prev_tag / parse_commits / render_notes
 
 两种跑法都要通:
   python3 scripts/tests/test_release_notes.py -v
@@ -142,39 +142,76 @@ class SelectPrevTagTest(unittest.TestCase):
 
 
 class ParseCommitsTest(unittest.TestCase):
-    def test_parses_us_separated_lines(self) -> None:
-        raw = f"{SHA_A}\x1ffeat(ui): x\n{SHA_B}\x1ffix: y\n"
+    def test_parses_record_stream(self) -> None:
+        raw = (
+            f"{SHA_A}\x1ffeat(ui): x\x1f\x1e\n"
+            f"{SHA_B}\x1ffix: y\x1fbody line\x1e\n"
+        )
         self.assertEqual(
             rn.parse_commits(raw),
             [
-                rn.Commit(sha=SHA_A, subject="feat(ui): x"),
-                rn.Commit(sha=SHA_B, subject="fix: y"),
+                rn.Commit(sha=SHA_A, subject="feat(ui): x", body=""),
+                rn.Commit(sha=SHA_B, subject="fix: y", body="body line"),
             ],
         )
 
-    def test_bad_lines_are_skipped_without_raising(self) -> None:
+    def test_multi_line_body_is_kept_verbatim(self) -> None:
+        raw = f"{SHA_A}\x1ffeat: x\x1fbody para\n\nBREAKING CHANGE: drop v1\n\x1e"
+        parsed = rn.parse_commits(raw)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].subject, "feat: x")
+        self.assertIn("BREAKING CHANGE: drop v1", parsed[0].body)
+
+    def test_bad_records_are_skipped_without_raising(self) -> None:
         raw = (
-            f"{SHA_A}\x1ffeat: x\n"
-            "garbage-without-separator\n"
-            "\x1fonly-subject\n"
-            f"{SHA_B}\x1f\n"
-            f"{SHA_C}\x1ffix: z"
+            f"{SHA_A}\x1ffeat: x\x1f\x1e"
+            "garbage-without-separator\x1e"
+            "\x1fonly-subject\x1e"
+            f"{SHA_B}\x1f\x1f\x1e"
+            f"{SHA_C}\x1ffix: z\x1e"
         )
         self.assertEqual(
             rn.parse_commits(raw),
             [
-                rn.Commit(sha=SHA_A, subject="feat: x"),
-                rn.Commit(sha=SHA_C, subject="fix: z"),
+                rn.Commit(sha=SHA_A, subject="feat: x", body=""),
+                rn.Commit(sha=SHA_C, subject="fix: z", body=""),
             ],
         )
 
     def test_order_is_preserved(self) -> None:
-        raw = "\n".join(f"{sha}\x1fsubject {i}" for i, sha in enumerate([SHA_C, SHA_B, SHA_A]))
+        raw = "".join(
+            f"{sha}\x1fsubject {i}\x1f\x1e"
+            for i, sha in enumerate([SHA_C, SHA_B, SHA_A])
+        )
         parsed = rn.parse_commits(raw)
         self.assertEqual([c.sha for c in parsed], [SHA_C, SHA_B, SHA_A])
 
     def test_empty_input(self) -> None:
         self.assertEqual(rn.parse_commits(""), [])
+
+
+class HasBreakingFooterTest(unittest.TestCase):
+    def test_breaking_change_footer(self) -> None:
+        self.assertTrue(rn.has_breaking_footer("body\n\nBREAKING CHANGE: drop v1"))
+
+    def test_breaking_change_hyphen_footer(self) -> None:
+        self.assertTrue(rn.has_breaking_footer("BREAKING-CHANGE: drop v1"))
+
+    def test_body_without_footer_is_not_breaking(self) -> None:
+        self.assertFalse(rn.has_breaking_footer(""))
+        self.assertFalse(rn.has_breaking_footer("plain body\n\nRefs: #12"))
+
+    def test_lowercase_token_is_not_a_footer(self) -> None:
+        """conventional commits 规定 footer token 全大写，小写不当作 breaking。"""
+        self.assertFalse(rn.has_breaking_footer("breaking change: drop v1"))
+        self.assertFalse(rn.has_breaking_footer("Breaking-Change: drop v1"))
+
+    def test_token_must_start_the_line(self) -> None:
+        self.assertFalse(rn.has_breaking_footer("not a BREAKING CHANGE: here"))
+
+    def test_footer_anywhere_in_body_counts(self) -> None:
+        body = "long description\n\nBREAKING CHANGE: drop v1\n\nRefs: #12"
+        self.assertTrue(rn.has_breaking_footer(body))
 
 
 class RenderNotesTest(unittest.TestCase):
@@ -365,6 +402,54 @@ class RenderNotesTest(unittest.TestCase):
             date="2024-05-06",
         )
         self.assertIn("- feat(api)!: drop v1", body)
+
+    def test_breaking_footer_marks_head_like_bang(self) -> None:
+        """body-only 的 `BREAKING CHANGE:` footer 与 `!` 等效，渲染时补 `!`。"""
+        body = rn.render_notes(
+            [
+                rn.Commit(
+                    sha=SHA_A,
+                    subject="feat(api): drop v1",
+                    body="legacy clients break\n\nBREAKING CHANGE: drop v1",
+                )
+            ],
+            version="v0.7.0",
+            prev_tag=None,
+            date="2024-05-06",
+        )
+        self.assertIn("- feat(api)!: drop v1", body)
+
+    def test_body_without_footer_is_not_marked_breaking(self) -> None:
+        body = rn.render_notes(
+            [
+                rn.Commit(
+                    sha=SHA_A,
+                    subject="feat(api): add v2",
+                    body="Refs: #12",
+                )
+            ],
+            version="v0.7.0",
+            prev_tag=None,
+            date="2024-05-06",
+        )
+        self.assertIn("- feat(api): add v2", body)
+        self.assertNotIn("feat(api)!:", body)
+
+    def test_breaking_footer_and_bang_are_deduplicated(self) -> None:
+        body = rn.render_notes(
+            [
+                rn.Commit(
+                    sha=SHA_A,
+                    subject="feat(api)!: drop v1",
+                    body="BREAKING CHANGE: drop v1\n\nBREAKING-CHANGE: drop v1",
+                )
+            ],
+            version="v0.7.0",
+            prev_tag=None,
+            date="2024-05-06",
+        )
+        self.assertIn("- feat(api)!: drop v1", body)
+        self.assertNotIn("feat(api)!!", body)
 
     def test_entries_keep_git_log_order_within_group(self) -> None:
         commits = [

@@ -123,12 +123,15 @@ class GitRepoTestCase(unittest.TestCase):
         )
         return proc.stdout
 
-    def _commit(self, subject: str, date: str) -> None:
+    def _commit(self, subject: str, date: str, body: str | None = None) -> None:
         env = {
             **_GIT_ENV,
             "GIT_AUTHOR_DATE": f"{date}T12:00:00 +0000",
             "GIT_COMMITTER_DATE": f"{date}T12:00:00 +0000",
         }
+        message_args = ["-m", subject]
+        if body is not None:
+            message_args += ["-m", body]
         proc = subprocess.run(
             [
                 GIT,
@@ -138,8 +141,7 @@ class GitRepoTestCase(unittest.TestCase):
                 "commit",
                 "-q",
                 "--allow-empty",
-                "-m",
-                subject,
+                *message_args,
             ],
             capture_output=True,
             text=True,
@@ -249,6 +251,41 @@ class GitIntegrationTest(GitRepoTestCase):
             body,
         )
         self.assertNotIn(release_notes.FIRST_RELEASE_HINT, body)
+
+    def test_breaking_change_footer_is_marked_breaking(self) -> None:
+        """body 里的 `BREAKING CHANGE:` footer 与 `!` 等效（端到端验 `%b` 取到了）。"""
+        self._commit(
+            "feat(api): drop v1",
+            "2024-01-06",
+            body="legacy clients break\n\nBREAKING CHANGE: drop v1 endpoints",
+        )
+        self._add_release_020()
+
+        code = self._run_main("--tag", "v0.2.0")
+
+        self.assertEqual(code, 0, msg=self.last_stderr)
+        body = self.last_stdout
+        self.assertIn("- feat(api)!: drop v1", body)
+        self.assertNotIn("- feat(api): drop v1", body)
+        # 同一次渲染里的普通提交不得被误标
+        self.assertIn("feat(api): add models endpoint", body)
+        self.assertNotIn("feat(ui)!:", body)
+        self.assertNotIn("models endpoint!:", body)
+
+    def test_commit_body_without_footer_is_not_marked_breaking(self) -> None:
+        """普通 body（无 footer）不应把提交标成 breaking。"""
+        self._commit(
+            "feat(api): add models endpoint",
+            "2024-01-06",
+            body="Refs: #12\n\nnotes for reviewers",
+        )
+        self._add_release_020()
+
+        code = self._run_main("--tag", "v0.2.0")
+
+        self.assertEqual(code, 0, msg=self.last_stderr)
+        self.assertIn("feat(api): add models endpoint", self.last_stdout)
+        self.assertNotIn("feat(api)!:", self.last_stdout)
 
     def test_explicit_range_overrides_tag_discovery(self) -> None:
         """`--range` 完全接管范围：全历史（4 条）而非自动发现的 2 条。"""

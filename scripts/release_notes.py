@@ -12,8 +12,11 @@
      自动发现走 `git tag --merged <tag> --list 'v*'`，由纯函数
      `select_prev_tag()` 在祖先链上的版本 tag 里按 semver 取前驱，
      因此跳版（v0.2.0 → v0.5.0）与分支上的 hotfix tag 都不会算错。
-  3. 解析 `<sha><US><subject>` 行流，按 conventional commit type 分组，
-     剔除 release commit（`chore: release vX.Y.Z`）后渲染 markdown。
+  3. 解析 `<sha><US><subject><US><body><RS>` 记录流，按 conventional commit type
+     分组，剔除 release commit（`chore: release vX.Y.Z`）后渲染 markdown。
+     breaking 变更的两种声明方式等价：header 里的 `!`（`feat(api)!: ...`）与
+     commit body 里的 `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer，任一出现
+     都会在渲染时补上 `!` 标记。
   4. 写到 `--output`（默认 stdout）。CI 传 `release-notes.md`，注意
      **不要写进 dist/**，否则会被 release 的 `files: dist/*` 当资产上传。
 
@@ -26,8 +29,8 @@
     无 `--repo` → 降级渲染，只告警（`::warning::`，走 stderr），不阻塞发版。
 
 模块分层（架构守则）:
-  - 纯函数层（`parse_conventional` / `is_release_commit` / `classify` /
-    `parse_commits` / `select_prev_tag` / `render_notes` / `short_sha`）
+  - 纯函数层（`parse_conventional` / `is_release_commit` / `has_breaking_footer` /
+    `classify` / `parse_commits` / `select_prev_tag` / `render_notes` / `short_sha`）
     不 import subprocess、不碰文件系统，可脱离 git 仓库单测。
   - git 边界层（`git` / `is_shallow_repo` / `list_version_tags` / `log_range` /
     `commit_date`）只做 subprocess 薄封装，不做任何判定逻辑。
@@ -57,6 +60,15 @@ RELEASE_COMMIT_RE = re.compile(r"^chore(?:\([^)]*\))?: release v\d+\.\d+\.\d+$")
 CONVENTIONAL_RE = re.compile(
     r"^(?P<type>[A-Za-z]+)(?:\((?P<scope>[^()]*)\))?(?P<breaking>!)?: (?P<subject>.+)$"
 )
+
+# breaking 变更的 footer 形式：`BREAKING CHANGE: <desc>` 或 `BREAKING-CHANGE: <desc>`。
+# 按 conventional commits 规范，两个 token 必须全大写（小写不算），且位于行首。
+BREAKING_FOOTER_RE = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
+
+# git log 的字段 / 记录分隔符：`%x1f` 分隔 sha / subject / body，`%x1e` 把一条提交
+# 框成一条记录 —— body 可含换行，所以不能再按行解析。
+FIELD_SEP = "\x1f"
+RECORD_SEP = "\x1e"
 
 # 组顺序是渲染层唯一映射点：新增组时同时改这里与 TYPE_GROUPS。
 GROUP_ORDER: tuple[tuple[str, str], ...] = (
@@ -96,10 +108,15 @@ class Conventional(NamedTuple):
 
 
 class Commit(NamedTuple):
-    """`parse_commits()` 的解析结果（只保留渲染所需字段）。"""
+    """`parse_commits()` 的解析结果（只保留渲染所需字段）。
+
+    `body` 是 commit message 的正文（不含 subject 首行），仅用于识别
+    `BREAKING CHANGE:` footer；纯函数单测里可以省略。
+    """
 
     sha: str
     subject: str
+    body: str = ""
 
 
 def parse_conventional(subject: str) -> Conventional | None:
@@ -124,6 +141,11 @@ def is_release_commit(subject: str) -> bool:
     return bool(RELEASE_COMMIT_RE.match(subject.strip()))
 
 
+def has_breaking_footer(body: str) -> bool:
+    """commit body 是否声明了 `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer。"""
+    return bool(BREAKING_FOOTER_RE.search(body or ""))
+
+
 def classify(type_: str | None) -> str:
     """把 conventional type 映射成组键；None（非 conventional）→ "other"。"""
     if type_ is None:
@@ -132,17 +154,25 @@ def classify(type_: str | None) -> str:
 
 
 def parse_commits(raw: str) -> list[Commit]:
-    """解析 `git log --format=%H%x1f%s` 的行流；坏行跳过，顺序保持（新→旧）。"""
+    """解析 `git log --format=%H%x1f%s%x1f%b%x1e` 的记录流；坏记录跳过，顺序保持（新→旧）。
+
+    git log 会在每条记录后再插一个换行，记录首尾空白不属于内容（`strip`）。
+    body 之后的字段不存在（老格式只有两个字段）时按空 body 处理。
+    """
     commits: list[Commit] = []
-    for line in raw.split("\n"):
-        sha, sep, subject = line.partition("\x1f")
+    for record in raw.split(RECORD_SEP):
+        record = record.strip()
+        if not record:
+            continue
+        sha, sep, rest = record.partition(FIELD_SEP)
         if not sep:
             continue
+        subject, _, body = rest.partition(FIELD_SEP)
         sha = sha.strip()
         subject = subject.strip()
         if not sha or not subject:
             continue
-        commits.append(Commit(sha=sha, subject=subject))
+        commits.append(Commit(sha=sha, subject=subject, body=body.strip()))
     return commits
 
 
@@ -204,7 +234,8 @@ def _render_line(commit: Commit, repo: str | None) -> str:
         body = _escape(commit.subject)
     else:
         head = parsed.type if parsed.scope is None else f"{parsed.type}({parsed.scope})"
-        if parsed.breaking:
+        # `!` 与 footer 声明等效：任一出现即标 breaking，两者并存也只标一次。
+        if parsed.breaking or has_breaking_footer(commit.body):
             head += "!"
         body = f"{_escape(head)}: {_escape(parsed.subject)}"
     return f"- {body} ({_commit_ref(commit.sha, repo)})"
@@ -320,8 +351,12 @@ def list_version_tags(current_tag: str | None = None) -> list[str]:
 
 
 def log_range(range_spec: str) -> str:
-    """按 range 取 `<sha><US><subject>` 行流（git log 输出序 = 新→旧）。"""
-    return git("log", "--format=%H%x1f%s", range_spec)
+    """按 range 取 `<sha><US><subject><US><body><RS>` 记录流（git log 输出序 = 新→旧）。
+
+    body 也要取：`BREAKING CHANGE:` footer 只出现在 body 里，只读 `%s` 首行会漏掉
+    body-only 的 breaking 变更。
+    """
+    return git("log", "--format=%H%x1f%s%x1f%b%x1e", range_spec)
 
 
 def commit_date(tag: str) -> str:
