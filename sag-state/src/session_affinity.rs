@@ -350,7 +350,13 @@ impl SessionAffinityInner {
                 found = true;
             }
         }
-        self.epoch = if found { epoch } else { epoch + 1 };
+        if found {
+            self.epoch = epoch;
+        } else {
+            // No state to tombstone anywhere: bump the global epoch so an
+            // in-flight write-back for this never-seen key is rejected.
+            self.epoch = epoch + 1;
+        }
     }
 
     /// Clear every session pin of one request-model space. Unknown space →

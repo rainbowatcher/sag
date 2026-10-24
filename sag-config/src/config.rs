@@ -516,6 +516,19 @@ impl GatewayConfig {
                 ));
             }
 
+            // ── session_max_entries ──
+            // `0` is not a meaningful capacity: `insert` evicts the entry it
+            // just wrote, so the pin never sticks and `session_sticky`
+            // silently degrades to a pure weighted-random order. Reject the
+            // no-op configuration instead of accepting it (same fail-fast
+            // rationale as the image × session_sticky rule above).
+            if route.session_max_entries == Some(0) {
+                errors.push(format!(
+                    "routes[{i}] (model='{}'): session_max_entries must be greater than 0 — a capacity of 0 evicts every session pin immediately, so the route would silently fall back to weighted-random target selection; omit the field to use the built-in default (10000)",
+                    route.model_name
+                ));
+            }
+
             if let Some(retries) = route.retries
                 && retries > 10
             {
@@ -1449,7 +1462,10 @@ pub struct RouteConfig {
     /// Maximum number of session pins kept per route — only used when
     /// `strategy = "session_sticky"`. When the capacity is exceeded, the
     /// least-recently-used entries are evicted. When `None` (default), the
-    /// built-in default of `10000` applies.
+    /// built-in default of `10000` applies. Must be greater than `0`:
+    /// validation rejects `session_max_entries = 0` (every insert would be
+    /// evicted immediately, silently degrading the route to weighted-random
+    /// ordering).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_max_entries: Option<usize>,
     /// List of targets for this route.
@@ -3281,6 +3297,57 @@ targets = [{ provider = "openai" }]
                 "chat route with session_sticky must validate"
             );
             assert_eq!(config.routes[0].strategy, Strategy::SessionSticky);
+        }
+
+        #[test]
+        fn rejects_zero_session_max_entries() {
+            // `0` capacity evicts every pin immediately, so the route would
+            // silently degrade to weighted-random ordering — reject it.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+strategy = "session_sticky"
+session_max_entries = 0
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("session_max_entries must be greater than 0")),
+                "session_max_entries = 0 must error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_positive_session_max_entries() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+strategy = "session_sticky"
+session_max_entries = 500
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "positive session_max_entries must validate"
+            );
+            assert_eq!(config.routes[0].session_max_entries, Some(500));
         }
 
         #[test]

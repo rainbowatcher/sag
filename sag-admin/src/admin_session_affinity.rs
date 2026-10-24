@@ -111,7 +111,18 @@ pub async fn list_session_affinity(
     Json(serde_json::json!({ "entries": entries }))
 }
 
-/// `DELETE /api/session-affinity` body — exactly one of the three scopes.
+/// `DELETE /api/session-affinity` body — one of the three scopes.
+///
+/// # Scope precedence
+///
+/// The scopes are checked in a fixed order, first match wins: `all` →
+/// `key` → `model`. Extra scope fields are therefore **ignored, not
+/// rejected** (`{"all": true, "key": "…"}` clears everything — it does not
+/// narrow the delete to one key), which keeps the body forward-compatible
+/// with a client that always sends the whole scope set. `all: true` still
+/// requires `confirm: true` even when a `key`/`model` is also present, so a
+/// stray `key` can never bypass the confirmation gate. An empty string is
+/// treated as "field absent".
 #[derive(Debug, Deserialize)]
 pub struct DeleteSessionAffinityRequest {
     /// Clear one session by hashed key (across every space).
@@ -136,6 +147,10 @@ pub struct DeleteSessionAffinityRequest {
 /// [`sag_state::SessionAffinityInner`]), so a request already in flight can
 /// never re-pin a deleted session. Idempotent: deleting an unknown key /
 /// model is a no-op and still returns `200`.
+///
+/// Scope precedence is `all` → `key` → `model`; see
+/// [`DeleteSessionAffinityRequest`] for why the ignored scope fields are
+/// tolerated instead of rejected.
 pub async fn delete_session_affinity(
     State(state): State<AppState>,
     Json(req): Json<DeleteSessionAffinityRequest>,
