@@ -89,11 +89,16 @@ sequenceDiagram
   只存哈希（source ∈ `meta`/`top`/`pc`/`fb`）。切模型即失粘（request model 参与摘要）。
 - **线性化协议**：与 `StickyToken` 同构的 `(epoch, generation, routes_version)` 三元组，
   决策点捕获、成功写回三者全匹配才写；TTL 惰性过期不删、LRU 驱逐 bump generation。
+  墓碑集合有上限（每 space `max(session_max_entries, 1024)`）：超限时清空墓碑并
+  递增全局 epoch（同一临界区），旧 generation 的飞行写回由 epoch 检查拒绝。
 - **排序**：`[会话 pin] ++ [A-Res 加权排列 of 其余]`；身份判定与
   `prepend_sticky_target` 同源（`target_matches_entry`），passthrough 与显式
   `real_model` 解析到同一生效模型也不互认。
 - **写回分流**：`sticky_failover` 只写 `active_targets`，`session_sticky` 只写
   `session_affinity`（平级独立策略，不叠加）；failover 成功后重绑。
+- **pipeline 约束**：image 管线（`dispatch_image`）丢弃 `session_writeback`，因此
+  `session_sticky` + `pipeline = "image"` 在 `validate_routes` 即报错（fail-fast，
+  避免静默退化为纯加权随机）。
 - **事实 vs 行为**：`call_logs.session_key` 记录会话归属（事实），不随路由策略
   闸门开关——所有策略、image pipeline、pre-resolve 失败行一律记录哈希，
   NULL 仅表示未识别出会话（0004）。
@@ -104,6 +109,7 @@ sequenceDiagram
 - `priority = 0` 是合法值，不是"未配置"（与 `retries = 0` 不同，后者被 validator 拒绝）
 - 通配符路由只能有一个（validator 未强制，但行为上只有第一个被使用）
 - `api_endpoint` 必须以 `/` 开头
+- `session_sticky` 不能与 `pipeline = "image"` 组合（image 管线无会话写回）
 
 ## 测试策略
 

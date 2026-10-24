@@ -44,6 +44,8 @@ updated: 2026-10-21
 5. 会话键只以**哈希**形式存在于状态、管理端快照与 `call_logs.session_key`；
    凡识别出会话，`call_logs.session_key` **不区分路由策略**一律记录（NULL 仅表示
    「请求未携带可识别的会话标识」）。
+6. **仅支持 `pipeline = "chat"`**：image 管线不做会话写回，`session_sticky` +
+   `pipeline = "image"` 在配置校验阶段直接报错，不静默退化为纯加权随机。
 
 ### 加权随机基底（priority 即权重）
 

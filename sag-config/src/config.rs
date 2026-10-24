@@ -503,6 +503,19 @@ impl GatewayConfig {
                 _ => {}
             }
 
+            // ── strategy × pipeline ──
+            // `session_sticky` relies on the success write-back that only the
+            // chat dispatch performs; `dispatch_image` discards
+            // `session_writeback`, so an image route with `session_sticky`
+            // would never record a pin and silently degrade to a pure
+            // weighted-random order. Fail fast instead of degrading silently.
+            if route.pipeline == Pipeline::Image && route.strategy == Strategy::SessionSticky {
+                errors.push(format!(
+                    "routes[{i}] (model='{}'): strategy = \"session_sticky\" is not supported when pipeline = \"image\" — image dispatch performs no session write-back, so the route would silently fall back to weighted-random target selection; use \"sticky_failover\", \"fill_first\", or \"round_robin\"",
+                    route.model_name
+                ));
+            }
+
             if let Some(retries) = route.retries
                 && retries > 10
             {
@@ -1356,6 +1369,10 @@ pub enum Strategy {
     /// weight (higher = more likely to be drawn first; the fallback order
     /// comes from the same draw). Priority *layers* do not apply under this
     /// strategy; every target keeps a fallback slot.
+    ///
+    /// Only valid on `pipeline = "chat"` routes: the image pipeline performs
+    /// no session write-back, so `pipeline = "image"` + `SessionSticky` is
+    /// rejected by [`GatewayConfig::validate`].
     SessionSticky,
 }
 
@@ -3210,6 +3227,60 @@ targets = [{ provider = "openai" }]
                 config.routes[0].api_endpoint.as_deref(),
                 Some("/images/generations")
             );
+        }
+
+        #[test]
+        fn rejects_session_sticky_on_image_pipeline() {
+            // `dispatch_image` drops the session write-back, so this
+            // combination would silently degrade to weighted-random
+            // ordering — validation must reject it.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, image = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "dall-e-3"
+pipeline = "image"
+api_endpoint = "/images/generations"
+strategy = "session_sticky"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(
+                    |e| e.contains("strategy = \"session_sticky\" is not supported")
+                        && e.contains("pipeline = \"image\"")
+                ),
+                "image route with session_sticky must error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_session_sticky_on_chat_pipeline() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+strategy = "session_sticky"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "chat route with session_sticky must validate"
+            );
+            assert_eq!(config.routes[0].strategy, Strategy::SessionSticky);
         }
 
         #[test]

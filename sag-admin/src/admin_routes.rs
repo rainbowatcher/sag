@@ -165,11 +165,16 @@ fn validate_targets(
 ///   wildcard route and are therefore kept. Still-resolving caches are left
 ///   untouched — `order_fill_first` self-heals any targets mismatch by
 ///   re-shuffling on next use, so a live fill-first order is never broken.
+/// - drop `session_affinity` pins whose request-model key no longer resolves
+///   to the [`Strategy::SessionSticky`] route that recorded them — the
+///   session analogue of the `active_targets` rule (a strategy switch, a
+///   route removal, or an exact route shadowing a wildcard leaves pins the
+///   current config would never consult).
 ///
-/// Mirrors `sag_dispatch::DispatchRuntime::prune_stale_entries`'s
-/// fill-first rule. Runs with no config read guard held across the writes
-/// (routes are cloned first), so it cannot deadlock against dispatch or the
-/// coordinator.
+/// Mirrors `sag_dispatch::DispatchRuntime::prune_stale_entries`'s fill-first
+/// and session-affinity rules. Runs with no config read guard held across
+/// the writes (routes are cloned first), so it cannot deadlock against
+/// dispatch or the coordinator.
 async fn prune_stale_routing_state(state: &AppState) {
     let routes = state.config.read().await.routes.clone();
     let resolves_to = |k: &str| sag_config::resolve_model_route(&routes, k).is_some();
@@ -179,6 +184,11 @@ async fn prune_stale_routing_state(state: &AppState) {
     }
     state
         .active_targets
+        .write()
+        .await
+        .retain_sticky_routes(&routes);
+    state
+        .session_affinity
         .write()
         .await
         .retain_sticky_routes(&routes);
