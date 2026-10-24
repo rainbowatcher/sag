@@ -19,6 +19,14 @@
 //!   key's generation (or the global epoch for never-seen keys), so a
 //!   request that decided its route before a clear can never re-pin the
 //!   removed entry (mirrors [`StickyToken`]'s three-component token).
+//! - **Bounded tombstones.** The key domain is client-controlled (session
+//!   ids) and LRU eviction manufactures one tombstone per evicted key, so
+//!   the generation set is capped per space: past
+//!   [`RouteSessionSpace::tombstone_budget`] the whole set is dropped and
+//!   the global epoch is bumped in the same critical section. In-flight
+//!   writebacks that captured an old generation are then rejected by the
+//!   epoch check — losing one writeback is acceptable, leaking memory is
+//!   not.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -32,6 +40,13 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 /// Default per-route session-pin capacity (route `session_max_entries`
 /// default).
 pub const DEFAULT_SESSION_MAX_ENTRIES: usize = 10_000;
+
+/// Floor for a session space's tombstone budget (see
+/// [`RouteSessionSpace::tombstone_budget`]): even a tiny
+/// `session_max_entries` keeps this many generation tombstones, so ordinary
+/// eviction does not turn into a global-epoch bump that rejects in-flight
+/// writebacks of every other session.
+const MIN_SESSION_TOMBSTONES: usize = 1_024;
 
 /// A session pin: which target last successfully served a session, plus
 /// the identity needed to re-check it against the current target list
@@ -134,6 +149,8 @@ struct RouteSessionSpace {
     /// map_id → pin.
     map: HashMap<String, SessionPin>,
     /// map_id → generation tombstone counter (bumped on every removal).
+    /// Bounded by [`Self::tombstone_budget`] — never grows without limit,
+    /// see [`Self::bump_generation`].
     generations: HashMap<String, u64>,
     /// LRU order: front = least recently used. Kept in sync with `map`
     /// (every insert/touch moves the key to the back; every removal drops
@@ -156,6 +173,39 @@ impl RouteSessionSpace {
         self.lru.push_back(map_id.to_string());
     }
 
+    /// Upper bound on this space's generation tombstones: the same order of
+    /// magnitude as the pin capacity, so the tombstone set never dominates
+    /// the memory of a full pin map. [`MIN_SESSION_TOMBSTONES`] is the floor
+    /// (a route with `session_max_entries = 0..1024` would otherwise clear
+    /// its tombstones — and bump the global epoch — on almost every
+    /// eviction, rejecting unrelated in-flight writebacks).
+    fn tombstone_budget(&self) -> usize {
+        self.capacity.max(MIN_SESSION_TOMBSTONES)
+    }
+
+    /// Bump `map_id`'s generation tombstone, then keep the tombstone set
+    /// bounded. Past [`Self::tombstone_budget`] the **whole** set is dropped
+    /// and the global `epoch` is bumped in the same critical section (the
+    /// caller holds the single write lock), so decisions that captured a
+    /// pre-clear generation can never re-pin a removed entry: the epoch
+    /// check in [`SessionAffinityInner::insert_if_generation`] rejects them.
+    /// Resetting a tombstone to the "never bumped" state without the epoch
+    /// bump would re-admit exactly those stale writebacks (ABA).
+    fn bump_generation(&mut self, map_id: &str, epoch: &mut u64) {
+        *self.generations.entry(map_id.to_string()).or_insert(0) += 1;
+        self.enforce_tombstone_budget(epoch);
+    }
+
+    /// Drop every tombstone and bump `epoch` when the set outgrows
+    /// [`Self::tombstone_budget`]. Dropping tombstones is only safe together
+    /// with the epoch bump, and only inside the caller's critical section.
+    fn enforce_tombstone_budget(&mut self, epoch: &mut u64) {
+        if self.generations.len() > self.tombstone_budget() {
+            self.generations.clear();
+            *epoch += 1;
+        }
+    }
+
     /// Insert/overwrite a pin and enforce the capacity: evict the
     /// least-recently-used entries (bumping each evicted key's generation,
     /// see the module docs) until the map fits. `epoch` is bumped only in
@@ -169,7 +219,7 @@ impl RouteSessionSpace {
                 break;
             };
             if self.map.remove(&old).is_some() || self.generations.contains_key(&old) {
-                *self.generations.entry(old).or_insert(0) += 1;
+                self.bump_generation(&old, epoch);
             } else {
                 *epoch += 1;
             }
@@ -177,9 +227,9 @@ impl RouteSessionSpace {
     }
 
     /// Drop every entry in this space (generations are bumped and kept as
-    /// tombstones — never removed, see [`Self::insert`] and the ActiveTargets
-    /// `retain` rationale).
-    fn clear_entries(&mut self) {
+    /// tombstones — see [`Self::bump_generation`] and the ActiveTargets
+    /// `retain` rationale — up to the tombstone budget).
+    fn clear_entries(&mut self, epoch: &mut u64) {
         let keys: HashSet<String> = self
             .map
             .keys()
@@ -191,6 +241,7 @@ impl RouteSessionSpace {
         for k in keys {
             *self.generations.entry(k).or_insert(0) += 1;
         }
+        self.enforce_tombstone_budget(epoch);
     }
 }
 
@@ -290,36 +341,38 @@ impl SessionAffinityInner {
     /// tombstones).
     pub fn clear(&mut self, map_id: &str) {
         let mut found = false;
+        let mut epoch = self.epoch;
         for space in self.spaces.values_mut() {
             if space.map.contains_key(map_id) || space.generations.contains_key(map_id) {
                 space.map.remove(map_id);
                 space.lru.retain(|k| k != map_id);
-                *space.generations.entry(map_id.to_string()).or_insert(0) += 1;
+                space.bump_generation(map_id, &mut epoch);
                 found = true;
             }
         }
-        if !found {
-            self.epoch += 1;
-        }
+        self.epoch = if found { epoch } else { epoch + 1 };
     }
 
     /// Clear every session pin of one request-model space. Unknown space →
     /// epoch bump (no state to tombstone).
     pub fn clear_model(&mut self, model: &str) {
+        let mut epoch = self.epoch;
         match self.spaces.get_mut(model) {
-            Some(space) => space.clear_entries(),
-            None => self.epoch += 1,
+            Some(space) => space.clear_entries(&mut epoch),
+            None => epoch += 1,
         }
+        self.epoch = epoch;
     }
 
     /// Clear the whole memory. Per-key generations are bumped (tombstones
-    /// kept) **and** the epoch is bumped so never-seen keys' in-flight
-    /// writebacks are also rejected.
+    /// kept, up to the per-space budget) **and** the epoch is bumped so
+    /// never-seen keys' in-flight writebacks are also rejected.
     pub fn clear_all(&mut self) {
+        let mut epoch = self.epoch;
         for space in self.spaces.values_mut() {
-            space.clear_entries();
+            space.clear_entries(&mut epoch);
         }
-        self.epoch += 1;
+        self.epoch = epoch + 1;
     }
 
     /// Strategy-aware prune (the session analogue of
@@ -329,9 +382,10 @@ impl SessionAffinityInner {
     /// [`Strategy::SessionSticky`]. A route that switched away (or was
     /// removed / shadowed) leaves pins the current config would never write
     /// or consult. Dropped keys get their generation bumped (tombstones
-    /// kept).
+    /// kept, up to the per-space budget).
     pub fn retain_sticky_routes(&mut self, routes: &[RouteConfig]) {
         let resolves_to = |model: &str| sag_config::resolve_model_route(routes, model);
+        let mut epoch = self.epoch;
         for (model, space) in self.spaces.iter_mut() {
             let dropped: Vec<String> = space
                 .map
@@ -347,9 +401,10 @@ impl SessionAffinityInner {
             for k in dropped {
                 space.map.remove(&k);
                 space.lru.retain(|x| x != &k);
-                *space.generations.entry(k).or_insert(0) += 1;
+                space.bump_generation(&k, &mut epoch);
             }
         }
+        self.epoch = epoch;
     }
 
     /// Clone the whole memory for the admin snapshot (single short lock
@@ -406,6 +461,27 @@ mod tests {
             model: route.into(),
             token,
             capacity: DEFAULT_SESSION_MAX_ENTRIES,
+        }
+    }
+
+    fn wb_cap(map_id: &str, model: &str, token: StickyToken, capacity: usize) -> SessionWriteback {
+        SessionWriteback {
+            map_id: map_id.into(),
+            model: model.into(),
+            token,
+            capacity,
+        }
+    }
+
+    /// Churn a capacity-1 space until its tombstone set overflows the budget.
+    /// The first insert only fills the map (no eviction), every later insert
+    /// evicts exactly one key → one tombstone, so `budget + 2` inserts are
+    /// enough to exceed the budget once.
+    fn overflow_tombstones(inner: &mut SessionAffinityInner, now: Instant) {
+        for i in 0..=(MIN_SESSION_TOMBSTONES + 1) {
+            let k = format!("churn-{i}");
+            let (_, t) = inner.get_with_token("m", &k, 3600, 1, now);
+            assert!(inner.insert_if_generation(&wb_cap(&k, "m", t, 1), pin_at("m", now), 1));
         }
     }
 
@@ -598,6 +674,81 @@ mod tests {
         let (_, token) = inner.get_with_token("m", "never-pinned", 3600, 1, now);
         inner.clear("other-unknown"); // no state anywhere → epoch bump
         assert!(!inner.insert_if_generation(&wb("never-pinned", "m", token), pin_at("m", now), 1));
+    }
+
+    #[test]
+    fn tombstone_overflow_clears_the_set_and_bumps_epoch() {
+        let mut inner = SessionAffinityInner::new();
+        let now = Instant::now();
+        let epoch_before = inner.epoch();
+
+        overflow_tombstones(&mut inner, now);
+
+        let space = inner.spaces.get("m").expect("space must exist");
+        assert!(
+            space.generations.len() <= space.tombstone_budget(),
+            "tombstone set must stay bounded (got {}, budget {})",
+            space.generations.len(),
+            space.tombstone_budget()
+        );
+        assert!(
+            inner.epoch() > epoch_before,
+            "dropping tombstones must bump the global epoch"
+        );
+    }
+
+    #[test]
+    fn tombstone_clear_rejects_writeback_its_generation_would_allow() {
+        let mut inner = SessionAffinityInner::new();
+        let now = Instant::now();
+        // Decision for a never-pinned key: generation 0 at the current epoch.
+        let (_, stale) = inner.get_with_token("m", "victim", 3600, 1, now);
+        assert_eq!(stale.generation, 0);
+
+        overflow_tombstones(&mut inner, now);
+
+        let (generation_after_clear, epoch_after_clear) = {
+            let space = inner.spaces.get("m").expect("space must exist");
+            (space.generation("victim"), inner.epoch())
+        };
+        assert_eq!(
+            generation_after_clear, stale.generation,
+            "the clear resets the per-key generation — the generation check alone cannot reject"
+        );
+        assert!(epoch_after_clear != stale.epoch);
+        assert!(
+            !inner.insert_if_generation(&wb("victim", "m", stale), pin_at("m", now), 1),
+            "the epoch check must reject the pre-clear writeback"
+        );
+        assert!(
+            inner.snapshot().iter().all(|e| e.map_id != "victim"),
+            "rejected writeback must not re-pin"
+        );
+    }
+
+    #[test]
+    fn tombstones_below_budget_are_kept_and_still_reject() {
+        let mut inner = SessionAffinityInner::new();
+        let now = Instant::now();
+        let mut tokens = Vec::new();
+        for k in ["a", "b", "c"] {
+            let (_, t) = inner.get_with_token("m", k, 3600, 1, now);
+            assert!(inner.insert_if_generation(&wb_cap(k, "m", t, 1), pin_at("m", now), 1));
+            tokens.push(t);
+        }
+
+        let space = inner.spaces.get("m").expect("space must exist");
+        assert_eq!(
+            space.generations.len(),
+            2,
+            "evicted keys a and b keep their tombstones"
+        );
+        assert_eq!(inner.epoch(), 0, "no clear below the budget");
+        assert!(
+            !inner.insert_if_generation(&wb_cap("a", "m", tokens[0], 1), pin_at("m", now), 1),
+            "a pre-eviction writeback is still rejected by its generation"
+        );
+        assert_eq!(inner.snapshot().len(), 1, "normal path unchanged");
     }
 
     #[test]
