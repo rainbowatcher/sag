@@ -7,10 +7,10 @@ on:
   push:
     tags: ["v*"]
 
-# 创建 Release（softprops/action-gh-release）与写 homebrew-tap（GitHub Contents
-# API）都需要写权限。
+# 默认只读：test / build 只需读仓库内容。创建 Release 的写权限只在 publish job
+# 上按需授予（最小权限原则），homebrew-tap 的写入走单独的 TAP_TOKEN，与本权限无关。
 permissions:
-  contents: write
+  contents: read
 
 # 同一 ref 重复推送时串行执行，避免并发创建 release / 并发写 tap 产生竞态。
 concurrency:
@@ -117,6 +117,10 @@ jobs:
     needs: build
     # 固定 ubuntu-24.04：ubuntu-latest 正迁移到 24.04 之后的镜像，锁定以保可复现。
     runs-on: ubuntu-24.04
+    # 只有本 job 需要写权限（softprops/action-gh-release 创建 Release 与上传资产）；
+    # tap 更新用的是 TAP_TOKEN（见下方 python 步骤），不依赖 GITHUB_TOKEN。
+    permissions:
+      contents: write
     env:
       # tap 的 Contents API 调用走 TAP_TOKEN（见下方 python 步骤）。
       TAP_TOKEN: ${{ secrets.TAP_RELEASE }}
@@ -154,8 +158,12 @@ jobs:
       # 在创建 Release 之前生成自定义说明（按 conventional commit 分组）。
       # 输出到工作区根而不是 dist/：`files: dist/*` 会把 dist 下所有文件当
       # release 资产上传，放 dist/ 会把说明文件本身也传上去。
+      # tag 经 env 传入再以 "$TAG" 引用：git ref 名可含反引号 / `$()`，直接在
+      # run 里内插 `${{ }}` 会先被 workflow 展开、再由 bash 做命令替换。
       - name: Generate release notes
-        run: python3 scripts/release_notes.py --tag "${GITHUB_REF_NAME}" --output release-notes.md --repo "${GITHUB_REPOSITORY}"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/release_notes.py --tag "$TAG" --output release-notes.md --repo "${GITHUB_REPOSITORY}"
 
       # v3 的 overwrite_files 默认为 true：重复推送同一 tag 时会更新已存在的
       # release 并覆盖上传同名资产，不会重复创建，因此无需手写
