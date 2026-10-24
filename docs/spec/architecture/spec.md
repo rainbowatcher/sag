@@ -57,7 +57,7 @@ flowchart TD
 
 ### 发布二进制体积：release profile + UI 分包
 
-根 `Cargo.toml` 的 `[profile.release]` 取 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`：内嵌 UI 后单二进制体积是第一观感，`strip` 去符号表、cgu=1 让跨 crate 内联更充分。代价是构建变慢（决策阶段单次采样：体积 −34%、构建时长 +31.6%）与 panic backtrace 无符号名。注意 `.cargo/config.toml` 的 `[profile.release] codegen-units = 16` 会**覆盖** manifest 的同名字段（cargo 配置优先级高于 manifest），本地构建只吃到 `strip` 的收益，全量收益在 CI / 干净环境。
+根 `Cargo.toml` 的 `[profile.release]` 取 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`：内嵌 UI 后单二进制体积是第一观感，`strip` 去符号表、cgu=1 让跨 crate 内联更充分。代价是构建变慢（决策阶段单次采样：体积 −34%、构建时长 +31.6%）与 panic backtrace 无符号名。注意 `.cargo/config.toml` 曾把 `[profile.release] codegen-units` 设为 16 **覆盖** manifest 的同名字段（cargo 配置优先级高于 manifest），使 cgu=1 在本地与 CI 均失效；该覆盖行已删除，cgu=1 现生效。
 
 前端侧对应的是 chunk 结构：`sag-ui/vite.config.ts` 用 rolldown 的 `output.codeSplitting.groups` 把 chart.js / vue-chartjs 拆成独立 `vendor-chart`（`AnalyticsPage` 258 kB → 95.52 kB，`vendor-chart` 162.76 kB），两 chunk 各带 content hash —— 改页面不再让图表库缓存失效（`assets/**` 是 `immutable` 一年）。首屏 `modulepreload` 仍为 11 条，`vendor-chart` 不在其中。
 

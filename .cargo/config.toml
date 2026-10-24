@@ -17,6 +17,8 @@ incremental = true
 [profile.test.package."*"]
 opt-level = 0
 
+# Release size tuning lives in the root `Cargo.toml` (`codegen-units = 1`,
+# `lto = "thin"`, `strip = "symbols"`). Never set `codegen-units` here: cargo
+# config wins over the manifest and would silently disable that tuning.
 [profile.release]
-codegen-units = 16
 lto = "thin"

@@ -95,7 +95,7 @@ type: 优化
 | 决策阶段单次采样 | 26.4 MB | 17.4 MB | −34%，构建时长 +31.6% |
 | 收尾复测（本机 `target/release/sag`） | 25,696,768 B | 21,290,640 B | −17.1% |
 
-两次采样差距来自 `codegen-units`：本机 `.cargo/config.toml` 的 `[profile.release] codegen-units = 16` 会**覆盖** manifest 里的 `1`（cargo 配置优先级高于 manifest），所以本地构建只吃到 `strip` 的收益（`lto = "thin"` 两边原本就一致）；CI / 干净环境才拿到 cgu=1 的全量收益。代价是 `strip = "symbols"` 让 panic backtrace 不再有符号名。
+两次采样不能直接对比（构建条件不同），且 cgu=1 当时在任何环境都没生效：`.cargo/config.toml` 的 `[profile.release] codegen-units = 16` 会**覆盖** manifest 里的 `1`（cargo 配置优先级高于 manifest），CI 检出同一仓库、release 流水线也没有中和步骤，因此本地与 CI 都只吃到 `strip` 的收益（`lto = "thin"` 两边原本就一致）。该覆盖行已在评审返修中删除，cgu=1 自返修起在本地与 CI 均生效（体积 / 构建时长未重新采样）。代价是 `strip = "symbols"` 让 panic backtrace 不再有符号名。
 
 ### 5. `vendor-chart` 分包
 
@@ -150,4 +150,4 @@ chart.js 只被 `/analytics` 路由的 `V2TrendChart` 使用，拆开后两 chun
 
 - 真 favicon 仍缺：收尾只删掉了 `/vite.svg` 死引用，补一个真图标另开任务。
 - 删除内嵌 `.gz` 为决策项 D5，保留现状。
-- 决策 D4 的 `codegen-units = 1` 全量收益只在 CI / 干净环境生效，本地 `.cargo/config.toml` 的 `codegen-units = 16` 仍覆盖它。
+- 重新采样 cgu=1 生效后的体积与构建时长：评审返修删掉了 `.cargo/config.toml` 里覆盖 manifest 的 `codegen-units = 16`，决策 D4 的 `codegen-units = 1` 现于本地与 CI 均生效，原「21.3 MB / 构建时长 +31.6%」口径已过期。
