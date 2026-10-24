@@ -63,8 +63,10 @@
 //! replay the identity bytes to a client that negotiated brotli. `immutable`
 //! assets get no ETag (they are never revalidated, so it would be 64 dead
 //! bytes), and `If-None-Match` is answered with a bodyless `304` carrying
-//! `ETag` / `Vary` / `Cache-Control` plus the always-on `nosniff` and an
-//! explicit `Content-Length: 0`.
+//! `ETag` / `Vary` / `Cache-Control` plus the always-on `nosniff`. A `304`
+//! carries no `Content-Length`: RFC 9110 §8.6 only allows one equal to the
+//! hypothetical `200` length, so the header is omitted (hyper would drop it
+//! on the wire anyway).
 //!
 //! # Invariant: path traversal is structurally impossible
 //!
@@ -178,7 +180,7 @@ pub(crate) async fn ui_handler(method: Method, uri: Uri, headers: HeaderMap) -> 
 
     // Steps 4-7: decide between a real 404 and the SPA shell.
     let is_asset_namespace = path.starts_with("assets/");
-    let is_static_subresource = path != "/" && looks_like_asset(path);
+    let is_static_subresource = looks_like_asset(path);
     if is_asset_namespace || (is_static_subresource && !wants_html(&headers)) {
         return not_found();
     }
@@ -255,8 +257,32 @@ fn wants_html(headers: &HeaderMap) -> bool {
 /// files belong here; anything else falls through to the shell.
 #[cfg(feature = "embed-ui")]
 const ASSET_EXTENSIONS: &[&str] = &[
-    "js", "mjs", "cjs", "css", "map", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "ico",
-    "bmp", "woff", "woff2", "ttf", "otf", "eot", "txt", "xml", "wasm", "br", "gz",
+    "js",
+    "mjs",
+    "cjs",
+    "css",
+    "map",
+    "svg",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "avif",
+    "ico",
+    "bmp",
+    "woff",
+    "woff2",
+    "ttf",
+    "otf",
+    "eot",
+    "txt",
+    "xml",
+    "json",
+    "webmanifest",
+    "wasm",
+    "br",
+    "gz",
 ];
 
 /// True when the last path segment names a static file (`favicon.ico`,
@@ -316,23 +342,22 @@ fn revalidate(request_headers: &HeaderMap, response: Response) -> Response {
     else {
         return response;
     };
-    let Some(if_none_match) = request_headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return response;
-    };
-    if !etag_list_matches(if_none_match, etag) {
+    // `If-None-Match` may be repeated, so every line is checked (a client is
+    // free to split the list over several header lines).
+    let matched = request_headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|if_none_match| etag_list_matches(if_none_match, etag));
+    if !matched {
         return response;
     }
 
     // 304 carries the validators/metadata only (RFC 9110 §15.4.5): no body,
-    // and no `Content-Encoding` since nothing is encoded in the response.
-    // `nosniff` stays on every response (see module docs), and the explicit
-    // zero `Content-Length` keeps `HEAD`-style smoke checks uniform.
-    let mut builder = Response::builder()
-        .status(StatusCode::NOT_MODIFIED)
-        .header(header::CONTENT_LENGTH, "0");
+    // no `Content-Encoding` (nothing is encoded in the response) and no
+    // `Content-Length` (§8.6 permits it only when equal to the hypothetical
+    // 200 length). `nosniff` stays on every response (see module docs).
+    let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
     for name in [
         header::ETAG,
         header::VARY,
@@ -352,8 +377,9 @@ fn revalidate(request_headers: &HeaderMap, response: Response) -> Response {
     })
 }
 
-/// True when an `If-None-Match` list matches `etag` (`*`, comma lists and a
-/// `W/` prefix are all honoured; `If-None-Match` uses weak comparison).
+/// True when one `If-None-Match` header line matches `etag` (`*`, comma lists
+/// and a `W/` prefix are all honoured; `If-None-Match` uses weak comparison).
+/// Callers must pass every header line (see `revalidate`), not just the first.
 #[cfg(feature = "embed-ui")]
 fn etag_list_matches(if_none_match: &str, etag: &str) -> bool {
     if_none_match.split(',').map(str::trim).any(|candidate| {
@@ -443,7 +469,7 @@ mod tests {
     use axum::{
         Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        http::{HeaderMap, Method, Request, StatusCode, header},
     };
     use rust_embed::Embed;
     use tower::ServiceExt;
@@ -951,18 +977,87 @@ mod tests {
                 header_str(&response, header::VARY).as_deref(),
                 Some("Accept-Encoding")
             );
-            // Set explicitly at the response level; hyper drops it on the wire
-            // for `304` (`can_have_content_length`).
-            assert_eq!(
-                header_str(&response, header::CONTENT_LENGTH).as_deref(),
-                Some("0"),
-                "304 must carry an explicit zero Content-Length"
-            );
+            // `Content-Length` is deliberately absent here; see
+            // `not_modified_omits_content_length` for the assertion and why the
+            // router layer adds a `0` back on top of the handler's response.
             let body = to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("body");
             assert!(body.is_empty(), "304 must have an empty body");
         }
+    }
+
+    #[tokio::test]
+    async fn not_modified_omits_content_length() {
+        if !has_asset("index.html") {
+            return;
+        }
+
+        let etag = header_str(&get("/", None).await, header::ETAG).expect("etag");
+
+        // Asserted on the handler output, not through the router: axum's
+        // top-level route re-adds `Content-Length: 0` for any response whose
+        // body has an exact size of zero (`routing/route.rs`,
+        // `set_content_length`), so the router-visible header would always be
+        // `0` and say nothing about this module. On the wire hyper drops it
+        // for `304` regardless (`can_have_content_length` in
+        // `proto/h1/role.rs`), and RFC 9110 §8.6 only allows a `304`
+        // `Content-Length` equal to the hypothetical 200 length — so omitting
+        // it is what the client actually sees.
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            header::IF_NONE_MATCH,
+            etag.parse().expect("etag must be a valid header value"),
+        );
+        let response =
+            super::ui_handler(Method::GET, "/".parse().expect("uri"), request_headers).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            header_str(&response, header::CONTENT_LENGTH),
+            None,
+            "a 304 must not carry a Content-Length"
+        );
+    }
+
+    #[tokio::test]
+    async fn if_none_match_reads_every_header_line() {
+        if !has_asset("index.html") {
+            return;
+        }
+
+        let etag = header_str(&get("/", None).await, header::ETAG).expect("etag");
+
+        // The match may sit on the second `If-None-Match` line; reading only
+        // the first one would answer `200`.
+        let response = send(request_with(
+            "/",
+            "GET",
+            &[
+                ("if-none-match", "\"stale-validator\""),
+                ("if-none-match", &etag),
+            ],
+        ))
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "a match on the second If-None-Match line must hit"
+        );
+
+        // Whitespace around the commas of a single line is tolerated too.
+        let padded = format!("\"stale-validator\" ,\t{etag}");
+        let response = send(request_with("/", "GET", &[("if-none-match", &padded)])).await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        // Sanity: two non-matching lines must not produce a `304`.
+        let response = send(request_with(
+            "/",
+            "GET",
+            &[("if-none-match", "\"a\""), ("if-none-match", "\"b\"")],
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1063,6 +1158,39 @@ mod tests {
     #[folder = "tests/fixtures/embed/"]
     #[exclude = "*.map"]
     struct FixtureAssets;
+
+    #[test]
+    fn looks_like_asset_covers_json_and_webmanifest() {
+        // `postbuild-compress.mjs` compresses `.json` / `.webmanifest` as text
+        // assets, so a build may emit them at the root; a probe for one must
+        // 404 instead of getting the SPA shell.
+        assert!(super::looks_like_asset("manifest.json"));
+        assert!(super::looks_like_asset("site.webmanifest"));
+        assert!(super::looks_like_asset("MANIFEST.JSON"), "case-insensitive");
+
+        // Regression guard for the removed `path != "/"` condition: the
+        // trimmed `/` is `""`, which carries no extension.
+        assert!(!super::looks_like_asset(""));
+        // A dotted client-side route stays a route.
+        assert!(!super::looks_like_asset("providers/v1.2"));
+    }
+
+    #[tokio::test]
+    async fn missing_json_probe_returns_404() {
+        // Guaranteed-absent name, same trick as `missing_root_file_returns_404`.
+        let response = send(request_with(
+            "/__missing__.json",
+            "GET",
+            &[("accept", "*/*")],
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_string(response).await;
+        assert!(
+            !body.to_ascii_lowercase().contains("<!doctype"),
+            "got {body}"
+        );
+    }
 
     #[test]
     fn exclude_attribute_drops_sourcemaps() {
