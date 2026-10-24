@@ -45,7 +45,7 @@ const targets = ref<TargetItem[]>(
 onMounted(() => {
   for (const t of targets.value) {
     if (t.provider && !routeStore.providerModels[t.provider]) {
-      routeStore.loadProviderModels(t.provider, providerStore.providers)
+      void routeStore.loadProviderModels(t.provider, providerStore.providers)
     }
   }
 })
