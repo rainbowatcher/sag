@@ -111,7 +111,7 @@ CI 的版本门禁（`.github/workflows/release.yml`）同样从根 `Cargo.toml`
 - UI fallback 永远不经过 `build_router` 的中间件栈；其 `Content-Encoding` / `Vary` / `Cache-Control` 由 `ui_handler` 自己设置
 - UI 静态资源缓存头按 `assets/` 前缀分档：`assets/**` 为 `public, max-age=31536000, immutable`，`index.html`（及未来根级无 hash 文件）为 `no-cache` 且带 `ETag`，`If-None-Match` 命中返空 body `304`；ETag 取自**实际下发表示**（`.br`/`.gz` sibling 与 identity 各自独立）
 - 兜底顺序不可调换：`api/` / `v1/` 前缀先返 404 JSON（`NOT_FOUND`，与已注册路由同形），静态面的 `405 + Allow: GET, HEAD` 与 `404` 只在非 API 命名空间生效；`assets/` 前缀永远不回 shell
-- 「子资源探针」的判定是静态扩展名白名单（`ASSET_EXTENSIONS`，24 项），不是「末段含点」：带点的客户端路由（`/providers/v1.2`）必须仍能拿到 shell，否则非浏览器客户端会被 404
+- 「子资源探针」的判定是静态扩展名白名单（`ASSET_EXTENSIONS`，26 项，与 `postbuild-compress.mjs` 的 `TEXT_EXTENSIONS` 对齐），不是「末段含点」：带点的客户端路由（`/providers/v1.2`）必须仍能拿到 shell，否则非浏览器客户端会被 404
 - `*.br` / `*.gz` 预压缩件不可作为独立资源访问（404），且仅在收益 ≥ 2% 时才随构建产出
 
 ## 测试策略

@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # UI 管理面板 — 规格
@@ -43,13 +43,15 @@ updated: 2026-10-23
 - [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
 - [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）
 - [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
-- [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries）
+- [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries；新增走浮窗批量选择）
+- [sag-ui/src/components/routes/TargetPickerDialog.vue](../../../sag-ui/src/components/routes/TargetPickerDialog.vue) — Target 浮窗选择器（搜索 + 分组多选 + 差异化确认；Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
 
 ### 工具函数与类型
 
 - [sag-ui/src/lib/client.ts](../../../sag-ui/src/lib/client.ts) — 共享 axios 实例（Authorization header 由 connection store 同步）
 - [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
+- [sag-ui/src/lib/targetPicker.ts](../../../sag-ui/src/lib/targetPicker.ts) — Target 浮窗的纯选择逻辑：`provider+model` 集合键、分组构建（含禁用/orphan）、搜索过滤、勾选集合 ↔ target 行的 diff 与合并（type-only import，可被 node test runner 直接加载）
 - [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
 - [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
 - [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
@@ -58,7 +60,7 @@ updated: 2026-10-23
 ### 多语言（i18n）
 
 - [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
-- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，539 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，559 key），key 为稳定英文标识符
 - [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
 - [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
 - [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
@@ -326,6 +328,8 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **弹框形态**：应用层模态必须经 `useResponsiveModal()`，不得在组件里直接引入 `Dialog*` / `Drawer*` 原语；断点固定 768px（`md`），且必须与 `AppLayout.vue` 的 `isMobile`、`SidebarProvider` 内部断点保持一致。Popover 类浮层（Combobox / SearchSelect / DateRangePicker）不适用该规则
 - **抽屉内边距**：`DrawerContent` 无默认 padding，而 `DialogContent` 有 `p-6`。需要左右内边距的正文区写成 `px-4 sm:px-0`；若写成 `px-4 sm:px-6`，仅在它不属于 `DialogContent` 直接子元素时才不会与 `p-6` 叠成双重内边距
 - **[&>div]:h-full 高度传递**：表格的外层 `<div class="rounded-lg border">` 使用 `[&>div]:h-full` 将高度约束传递给 `<Table>` 组件的包裹 div（`overflow-auto`），使其成为 sticky 表头的滚动参照点。不使用此模式时外层 div 不得设置 overflow，否则会创建多余滚动上下文导致 sticky 失效
+- **Target 选择单位是 provider+model 对**：同一模型名在两个 provider 下是两个选项，集合键固定为 `provider\0model`（`optionKey`），不得用裸模型名作键。浮窗无法表示的行（provider 或 model 为空）必须原样保留，不得因未勾选而被删除
+- **`providerModelsLoading` 由在途计数派生**：`routes` store 的 loading 标志是 `computed(() => providerModelsPending > 0)`，不得改回单一 boolean——浮窗会并发探测所有 provider，单一 boolean 会被先完成的请求提前清零
 - **i18n 文案单一来源**：`src/**/*.{ts,vue}` 中不得出现中文字面量（`src/lib/i18n/zh.ts` 除外）。文案一律经 `t(key)` 获取，key 必须同时存在于 `en.ts` 与 `zh.ts`——由 `just ui-i18n-check` 在 `verify-ui` 链路强制
 - **i18n 响应式绑定**：所有随语言变化的字符串必须在渲染/求值时重新调用 `t()`，不得在模块加载或组件 setup 时求值一次后缓存。具体形态：TanStack 列定义的表头一律写 `header: () => t(...)`（字符串头会在语言切换时冻结）；标签映射（如 `strategyLabels`）用 `computed`；TanStack Form 的 `validators` 用 `get validators()` getter 使 Zod schema 与其 `t()` 消息在校验时重建
 - **locale 白名单**：`localStorage` 的 `sag-ui-lang` 值必须经 `normalizeLocale` 校验（仅 `en` / `zh`），脏值写回默认语言。`t()` 不得因持久化值异常而抛错
@@ -363,6 +367,8 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
 
 ## 变更记录
+- [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)
+- [0006 路由 Target 改为浮窗搜索多选](changes/0006-target-picker-dialog.md)
 - [0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](changes/0005-build-chunk-splitting-and-favicon.md)
 - [0004 UI 多语言支持（i18n，第一版 en/zh）](changes/0004-ui-i18n-language-switching.md)
 - [0003 移动端弹框统一为底部抽屉](changes/0003-responsive-modal-drawer.md)

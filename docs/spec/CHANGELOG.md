@@ -1,13 +1,17 @@
 ---
 created: 2026-06-03
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
 
+- **2026-10-25** · **routing**：[0006 拒绝 `session_sticky` + `pipeline = "image"`，admin 侧补齐 prune](routing/changes/0006-session-sticky-image-rejection-and-admin-prune.md) — image 管线丢弃 `session_writeback`，该组合永远不会记录 pin，改为在 `validate_routes` fail-fast（替代策略提示），避免静默退化为纯加权随机；admin `prune_stale_routing_state` 补 `session_affinity.retain_sticky_routes`，与 dispatch 侧同一套 keep 规则（策略切走 / 路由删除 / 精确路由遮蔽通配符 → 丢弃 pin），并新增 admin prune 集成测试；同时把 `RouteCounters` 从 `DispatchRuntime` 提升为 `AppState` 共享句柄（`sag-state` 新增 `RouteCounters` 类型与 `retain_resolving_route_keys` 唯一清理实现、`DispatchRuntime::with_shared_state` 增参、`sag-gateway` 装配同一 `Arc`、`sag-router` re-export），admin 与 dispatch 两侧的 `fill_first_orders` / `route_counters` 清理从此同源——删除 `round_robin` 路由后计数器立即被清，不再等下一次请求观察到 `routes_version` 变化
+- **2026-10-25** · **routing**：[0005 会话墓碑集合上限与全局 epoch 递增](routing/changes/0005-session-affinity-tombstone-budget.md) — generation 墓碑此前只增不减（键域客户端可控 + LRU 驱逐每个键一条），改为每 space `max(session_max_entries, 1024)` 封顶，溢出时整批清空并在同一临界区递增全局 epoch（只清墓碑会因 ABA 放行陈旧写回）；`clear` / `clear_model` / `clear_all` / `retain_sticky_routes` / LRU 驱逐统一走 `bump_generation` 并回写局部 epoch
+- **2026-10-24** · **UI**：[0006 路由 Target 改为浮窗搜索多选](ui/changes/0006-target-picker-dialog.md) — 新增 `TargetPickerDialog` + 纯逻辑 `lib/targetPicker.ts`：选择单位是 provider+model 对（同模型两 provider 是两个选项），已有行预勾选、取消勾选即删除、新勾选追加默认值行、未动过的行保留 priority/retries/extra；搜索同时匹配 provider 名与模型名，禁用 provider / orphan 行有标记，键盘 ↑↓/Enter/空格/Esc 与 `aria-activedescendant` 维护；store 的 `providerModelsLoading` 改为在途计数派生（并发探测不会被提前清零）并新增按 provider 的错误表，`loadProviderModels` 改 async
 - **2026-10-23** · **架构**：[0004 内嵌 UI 静态服务（收尾）](architecture/changes/0004-ui-static-cache-and-fallback.md) — 子资源探针判定由「末段含点」收紧为 24 项扩展名白名单（`/providers/v1.2` 由 404 改回 shell，`/gone.js` 仍 404）、sourcemap 排除改用 fixture 非空转验证、release profile 开 `lto="thin"`/`codegen-units=1`/`strip="symbols"`（本机 25.7 MB → 21.3 MB；当时 `codegen-units=1` 被 `.cargo/config.toml` 的 `codegen-units=16` 覆盖，本地与 CI 均未生效，体积收益全部来自 `strip`，覆盖行已在返修中删除）、`chart.js` 拆出 `vendor-chart`（`AnalyticsPage` 258 kB → 95.5 kB）、删除 `/vite.svg` 死引用；e2e 矩阵按新产物复测（`index.html` 1783 B、新 ETag）
+- **2026-10-23** · **UI**：[0007 Provider 列表删除 Status 列](ui/changes/0007-provider-list-drop-status-column.md) — 只读的 enabled/disabled Badge 与 Actions 列真正生效的 Switch 表达同一状态，删掉 Status 列（启停能力不变，仍由 Switch 直接切换）
 - **2026-10-23** · **UI**：[0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](ui/changes/0005-build-chunk-splitting-and-favicon.md) — rolldown `codeSplitting.groups` 拆 `vendor-chart`（chart.js / vue-chartjs，`includeDependenciesRecursively: false`），首屏 `modulepreload` 仍 11 条；`index.html` 删 `/vite.svg` 死引用（1845 → 1783 B）
 
 - **2026-10-22** · **架构**：[0004 内嵌 UI 静态服务：缓存分档、兜底收窄、零拷贝与 ETag](architecture/changes/0004-ui-static-cache-and-fallback.md) — `assets/**` 一年 `immutable`、`index.html` 保持 `no-cache` 并补 `ETag`/`304`；兜底按 `api/`→`v1/`→方法→`resolve`→`assets/`→`Accept`→末段带点的顺序收窄（未注册 API 路径 200 HTML → 404 JSON，静态面只接受 `GET`/`HEAD`，缺失资源 404 不回 shell）；`Body::from(file.data)` 去掉 `into_owned()` 的每次请求全量 memcpy；全部响应补 `nosniff`，`UiAssets` 排除 `*.map`

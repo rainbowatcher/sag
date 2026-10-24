@@ -29,7 +29,7 @@ type: 优化
 
 | 文件 | 变更 |
 |------|------|
-| [`sag-gateway/src/ui_routes/mod.rs`](../../../../sag-gateway/src/ui_routes/mod.rs) | 兜底判定改为顺序规则：`api/`、`v1/` 前缀先返 404 JSON（`{"error":{"code":"NOT_FOUND",...}}`，与 `AppError::NotFound` 同形）→ 非 `GET`/`HEAD` 返 405 + `Allow: GET, HEAD` → `resolve` 命中即下发 → `assets/` 前缀与「末段扩展名属 `ASSET_EXTENSIONS` 白名单且 `Accept` 不含 `text/html`」返 404 → 其余回 shell（带点的前端路由靠 `Accept: text/html` 或非白名单扩展名兜住）。`Cache-Control` 分两档（`assets/**` → `public, max-age=31536000, immutable`，其余 → `no-cache`），`cache_control_for` 返回 `&'static str`；全部响应（含 `304`）补 `X-Content-Type-Options: nosniff`，404/405 有意不设 `Cache-Control`。`Body::from(file.data)` 走 `Cow<'static, [u8]>` 的 `from_static` 分支，去掉 `into_owned()`。`no-cache` 档补强 `ETag`（取自**实际下发表示**的构建期 sha256，`.br`/`.gz` 与 identity 各自独立），`If-None-Match`（`*`、`W/` 前缀、逗号列表）命中返空 body `304`（`304` 仍带 `nosniff`，并显式设 `Content-Length: 0`）。`UiAssets` 加 `#[exclude = "*.map"]`。收尾把 `looks_like_asset` 从「末段含点」改为 24 项扩展名白名单（见「后续收尾」）。 |
+| [`sag-gateway/src/ui_routes/mod.rs`](../../../../sag-gateway/src/ui_routes/mod.rs) | 兜底判定改为顺序规则：`api/`、`v1/` 前缀先返 404 JSON（`{"error":{"code":"NOT_FOUND",...}}`，与 `AppError::NotFound` 同形）→ 非 `GET`/`HEAD` 返 405 + `Allow: GET, HEAD` → `resolve` 命中即下发 → `assets/` 前缀与「末段扩展名属 `ASSET_EXTENSIONS` 白名单且 `Accept` 不含 `text/html`」返 404 → 其余回 shell（带点的前端路由靠 `Accept: text/html` 或非白名单扩展名兜住）。`Cache-Control` 分两档（`assets/**` → `public, max-age=31536000, immutable`，其余 → `no-cache`），`cache_control_for` 返回 `&'static str`；全部响应（含 `304`）补 `X-Content-Type-Options: nosniff`，404/405 有意不设 `Cache-Control`。`Body::from(file.data)` 走 `Cow<'static, [u8]>` 的 `from_static` 分支，去掉 `into_owned()`。`no-cache` 档补强 `ETag`（取自**实际下发表示**的构建期 sha256，`.br`/`.gz` 与 identity 各自独立），`If-None-Match`（`*`、`W/` 前缀、逗号列表、多行 header）命中返空 body `304`（`304` 仍带 `nosniff`，不设 `Content-Length`）。`UiAssets` 加 `#[exclude = "*.map"]`。收尾把 `looks_like_asset` 从「末段含点」改为 26 项扩展名白名单（见「后续收尾」）。 |
 | [`sag-gateway/tests/fixtures/embed/`](../../../../sag-gateway/tests/fixtures/embed/) | 测试专用 fixture `sample.js` + `sample.js.map`，让 `#[exclude = "*.map"]` 的断言非空转 |
 | [`Cargo.toml`](../../../../Cargo.toml) | `[profile.release]` 新增 `lto = "thin"` / `codegen-units = 1` / `strip = "symbols"`（收尾，决策 D4） |
 | [`sag-ui/vite.config.ts`](../../../../sag-ui/vite.config.ts) | rolldown `codeSplitting.groups` 拆出 `vendor-chart`（chart.js / vue-chartjs，收尾） |
@@ -68,7 +68,7 @@ type: 优化
 
 ### 1. `looks_like_asset` 收窄为扩展名白名单（**行为变化**）
 
-原判定「末段含 `.`」在 `Accept: */*` 下把带点的客户端路由（`/providers/v1.2`）也判成子资源探针，直接 404 —— 非浏览器客户端访问带点路由拿不到 shell。收尾改为白名单 `ASSET_EXTENSIONS`（24 项：`js`/`mjs`/`cjs`/`css`/`map`/`svg`/`png`/`jpg`/`jpeg`/`gif`/`webp`/`avif`/`ico`/`bmp`/`woff`/`woff2`/`ttf`/`otf`/`eot`/`txt`/`xml`/`wasm`/`br`/`gz`，扩展名大小写不敏感），末段扩展名命中白名单才判为子资源探针。
+原判定「末段含 `.`」在 `Accept: */*` 下把带点的客户端路由（`/providers/v1.2`）也判成子资源探针，直接 404 —— 非浏览器客户端访问带点路由拿不到 shell。收尾改为白名单 `ASSET_EXTENSIONS`（26 项：`js`/`mjs`/`cjs`/`css`/`map`/`svg`/`png`/`jpg`/`jpeg`/`gif`/`webp`/`avif`/`ico`/`bmp`/`woff`/`woff2`/`ttf`/`otf`/`eot`/`txt`/`xml`/`json`/`webmanifest`/`wasm`/`br`/`gz`，扩展名大小写不敏感，与 `postbuild-compress.mjs` 的 `TEXT_EXTENSIONS` 对齐），末段扩展名命中白名单才判为子资源探针。
 
 | 请求 | 收窄前 | 收窄后 |
 |---|---|---|
@@ -143,7 +143,7 @@ chart.js 只被 `/analytics` 路由的 `V2TrendChart` 使用，拆开后两 chun
 
 两点记录：
 
-- 304 上的 `Content-Length: 0` 由 handler 层显式设置，hyper 按 RFC 9110 对 `304` 剥离该头，**线上不可见** —— 单元测试断言的是 handler 层（`hyper-1.12.0/src/proto/h1/role.rs:541-547` 的 `can_have_content_length` 对 `304` 返回 `false`）。设了却没发出去是协议要求，不是 bug。
+- `304` 不设 `Content-Length`：RFC 9110 §8.6 只允许 `304` 的 `Content-Length` 等于假想 `200` 的长度，hyper 对 `304` 也会剥离该头（`hyper/src/proto/h1/role.rs` 的 `can_have_content_length` 返回 `false`）—— 显式设置只会让响应对象与线上不一致，故省略；对应断言走 handler 输出而非 router 输出（axum 顶层路由会按 body 的精确长度 0 补回 `Content-Length: 0`）。
 - 旧实例（`build-info.json` 的 `binary_mtime` 早于本次 4 个 commit）上 `POST /api/unknown` 仍为 `200 text/html`；`just build-test` 后同一请求变 `404 application/json`，印证 e2e 验收确已在新二进制上执行。
 
 ## 后续项（不在本次范围）

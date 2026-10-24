@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-21
+updated: 2026-10-25
 ---
 
 # 路由
@@ -41,11 +41,16 @@ updated: 2026-10-21
    fall-through 到加权随机基底；失败不写回，failover 成功后**重绑**到实际成功目标。
 4. 会话 pin 按 `session_ttl_secs` **滑动续期**（命中刷新计时，`0` = 永不过期），
    超容量按 LRU 淘汰；管理员可经 `GET|DELETE /api/session-affinity` 观测与清除。
+   驱逐/清除留下的 generation 墓碑有上限（每 space `max(session_max_entries, 1024)`）；
+   溢出时整批清空并在同一临界区递增全局 epoch，代价是可能拒绝一次在途写回
+   （宁可丢一次写回，不泄漏内存）。
 5. 会话键只以**哈希**形式存在于状态、管理端快照与 `call_logs.session_key`；
    凡识别出会话，`call_logs.session_key` **不区分路由策略**一律记录（NULL 仅表示
    「请求未携带可识别的会话标识」）。
 6. **仅支持 `pipeline = "chat"`**：image 管线不做会话写回，`session_sticky` +
-   `pipeline = "image"` 在配置校验阶段直接报错，不静默退化为纯加权随机。
+   `pipeline = "image"` 在配置校验阶段直接报错，不静默退化为纯加权随机；
+   `session_max_entries = 0` 同样在校验阶段报错（容量 0 使 pin 永不生效，
+   效果等价于静默退化），合法范围为 `> 0`，未配置时取内置默认 10000。
 
 ### 加权随机基底（priority 即权重）
 
@@ -124,3 +129,5 @@ updated: 2026-10-21
 - [0002 目标模型有效性校验与 Provider 变更联动感知](changes/0002-target-model-validity-and-provider-sync.md)
 - [0003 会话粘性路由与 priority 加权随机基底](changes/0003-session-affinity-weighted-random.md)
 - [0004 call_logs 会话哈希不区分策略记录](changes/0004-session-hash-for-every-strategy.md)
+- [0005 会话墓碑集合上限与全局 epoch 递增](changes/0005-session-affinity-tombstone-budget.md)
+- [0006 拒绝 `session_sticky` + `pipeline = "image"`，admin 侧补齐 prune](changes/0006-session-sticky-image-rejection-and-admin-prune.md)

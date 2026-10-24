@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # UI 管理面板
@@ -65,7 +65,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 
 ### Provider 管理
 
-- 列表页以 TanStack Table 展示：Name、Base URL、Models Endpoint、Type、Keys 数量、Status（开关）、Actions（编辑/删除）
+- 列表页以 TanStack Table 展示：Name、Base URL、Models Endpoint、Type、Keys 数量、Actions（编辑/删除）；启用状态由 Actions 列的 Switch 直接切换，不单独占用 Status 列
 - 筛选：按 model 名称（Combobox 模糊搜索）、provider type（OpenAI / Anthropic）、排序（Name A-Z / 默认）
 - 添加：`ProviderAddForm` 组件，根据 provider_type 动态展示不同表单字段
 - 编辑：`ProviderEditForm`，视口 ≥768px（`md`）为 Dialog、<768px 为底部抽屉（drawer），由 `useResponsiveModal` 统一提供
@@ -75,6 +75,10 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 ### Route 管理
 
 - 列表页以 TanStack Table 展示：Model Name、Endpoint、Strategy（彩色标签）、Targets 数量、Actions
+- 新增 target：浮窗批量选择（`TargetPickerDialog`）——按 provider 分组的模型列表 + 搜索（同时匹配 provider 名与模型名）+ 多选；选择单位是 provider+model 对（同一模型在两个 provider 是两个选项），已有 target 预勾选，取消勾选即删除该行，新勾选追加为新行并带默认值（priority/retries 为 0），未动过的行保留原有 priority/retries/extra；确认按钮预览差异（Add N / Remove N / Add A remove R），无差异时仅关闭
+- 浮窗选项列表：被禁用 provider 的组带 Disabled 标记；provider 已被删除（或模型列表加载失败）但被现有 target 引用时，补一个尾部组并以 orphan 标记展示，这些行不可勾选但也不会消失；provider 模型列表加载失败按 provider 汇总为一条错误提示，不影响其他组
+- 浮窗键盘操作：↑/↓ 移动高亮、Enter/空格切换勾选（IME 组合输入时不响应）、Esc 关闭且不应用；过滤后高亮行消失时重锚到首个可见项，`aria-activedescendant` 不指向未渲染的行
+- 新建路由表单不预置空白 target 行（空白行会以「target provider required」挡住提交）
 - 标记引用了已禁用 provider 的 target：行变灰 + Targets 列显示琥珀色警告
 - 支持列排序（点击表头）
 - 编辑：弹框内嵌 `RouteEditForm`，可修改 targets、strategy 等；视口 ≥768px 为 Dialog、<768px 为底部抽屉
@@ -152,7 +156,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 断点：`md`（768px），与 `AppLayout.vue` 的 `isMobile` 和 `SidebarProvider` 内部断点一致——整站只保留一个「移动端」定义
 - 视口 ≥768px：弹框使用 Dialog（居中卡片）；<768px：使用底部抽屉（vaul Drawer，`direction=bottom`，可下拉关闭）
 - 形态切换由 `useResponsiveModal()` 统一提供，组件不得自行写 `useMediaQuery` + 条件组件映射
-- 属于「弹框」并适用该规则：Provider 新增/编辑、Route 新增/编辑/删除确认、清除 Active Target 与重置 Fill-First 确认、Models 列表的快捷建单确认
+- 属于「弹框」并适用该规则：Provider 新增/编辑、Route 新增/编辑/删除确认、清除 Active Target 与重置 Fill-First 确认、Models 列表的快捷建单确认、Route target 选择浮窗
 - 不属于「弹框」：Popover 类浮层（`Combobox`、`SearchSelect`、`DateRangePicker`）、Tooltip、移动端侧边栏（已是 Sheet）、`ProviderList` 的行内删除确认条
 - 布局约定：抽屉内没有默认内边距（`DrawerContent` 无 padding），正文区自行加 `px-4 sm:px-0`——对话框一侧已有 `DialogContent` 的 `p-6`，`sm:px-0` 避免叠加成双重内边距
 
@@ -196,6 +200,8 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)
+- [0006 路由 Target 改为浮窗搜索多选](changes/0006-target-picker-dialog.md)
 - [0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](changes/0005-build-chunk-splitting-and-favicon.md)
 - [0001 初始化](changes/0001-initial.md)
 - [0002 表格固定表头与玻璃拟态效果](changes/0002-sticky-header.md)

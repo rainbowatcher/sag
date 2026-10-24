@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-08-25
+updated: 2026-10-25
 ---
 
 # 路由 — 规格
@@ -99,6 +99,23 @@ sequenceDiagram
 - **pipeline 约束**：image 管线（`dispatch_image`）丢弃 `session_writeback`，因此
   `session_sticky` + `pipeline = "image"` 在 `validate_routes` 即报错（fail-fast，
   避免静默退化为纯加权随机）。
+- **容量约束**：`session_max_entries = 0` 在 `validate_routes` 即报错——容量 0 会在
+  每次写入后立刻驱逐，pin 永不生效，同样会静默退化为纯加权随机；合法范围为 `> 0`
+  （未配置 → 内置默认 10000）。
+- **管理面清理**：`DELETE /api/session-affinity` 的 scope 优先级为 `all` > `key` >
+  `model`（首个命中生效，`{"all": true, "key": …}` 按全量清理处理，多余字段忽略而非
+  报错，但仍需 `confirm: true`）。admin 路由变更后的 prune 与 dispatch 侧
+  `prune_stale_entries` 对齐，同时清理四份路由记忆：`fill_first_orders` /
+  `route_counters` 按请求模型键控，键仍解析到任意路由即保留；`active_targets` 同样按
+  请求模型键控，但条目记录 `route_model`，键须仍解析到那条 `sticky_failover` 路由；
+  `session_affinity` 按请求模型分 space、space 内按 `map_id` 会话键，pin 的键仍解析到
+  记录它的 `session_sticky` 路由即保留。
+- **prune 双路径**：路由变更后的 pin 清理有两条入口——dispatch 侧
+  `DispatchRuntime::prune_stale_entries`（`routes_version` 变化时惰性触发）与 admin 侧
+  `prune_stale_routing_state`（提交后立即触发），两者共用同一组保留规则
+  （`fill_first_orders` / `route_counters` 走 `sag_state::retain_resolving_route_keys`，
+  `active_targets` / `session_affinity` 走 `retain_sticky_routes`）。admin 侧缺失时管理端快照会展示
+  已失效路由的会话，且只读管理实例不会自愈。
 - **事实 vs 行为**：`call_logs.session_key` 记录会话归属（事实），不随路由策略
   闸门开关——所有策略、image pipeline、pre-resolve 失败行一律记录哈希，
   NULL 仅表示未识别出会话（0004）。
@@ -109,6 +126,7 @@ sequenceDiagram
 - `priority = 0` 是合法值，不是"未配置"（与 `retries = 0` 不同，后者被 validator 拒绝）
 - 通配符路由只能有一个（validator 未强制，但行为上只有第一个被使用）
 - `api_endpoint` 必须以 `/` 开头
+- `session_max_entries` 必须是正数（`0` 被 validator 拒绝，见上）
 - `session_sticky` 不能与 `pipeline = "image"` 组合（image 管线无会话写回）
 
 ## 测试策略
@@ -123,3 +141,5 @@ sequenceDiagram
 - [0002 目标模型有效性校验与 Provider 变更联动感知](changes/0002-target-model-validity-and-provider-sync.md)
 - [0003 会话粘性路由与 priority 加权随机基底](changes/0003-session-affinity-weighted-random.md)
 - [0004 call_logs 会话哈希不区分策略记录](changes/0004-session-hash-for-every-strategy.md)
+- [0005 会话墓碑集合上限与全局 epoch 递增](changes/0005-session-affinity-tombstone-budget.md)
+- [0006 拒绝 `session_sticky` + `pipeline = "image"`，admin 侧补齐 prune](changes/0006-session-sticky-image-rejection-and-admin-prune.md)
