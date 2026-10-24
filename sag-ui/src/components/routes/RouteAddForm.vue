@@ -30,16 +30,9 @@ const routeStore = useRouteStore()
 const adding = ref(false)
 const apiError = ref("")
 
-const targets = ref<TargetItem[]>([
-  {
-    id: 1,
-    provider: "",
-    real_model: "",
-    priority: 0,
-    retries: 0,
-    extra: "",
-  },
-])
+// No seeded empty row: the target picker adds provider+model rows in bulk,
+// and a stray blank row would block submission ("target provider required").
+const targets = ref<TargetItem[]>([])
 
 const form = useForm({
   defaultValues: {

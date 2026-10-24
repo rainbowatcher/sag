@@ -356,6 +356,21 @@ export const zh: Record<keyof typeof en, string> = {
   "routes.targetEditor.providerNotFound": "{name}（未找到）",
   "routes.targetEditor.modelUnavailable": "{model}（不可用 / 不在供应商中）",
 
+  // ── Routes › Target picker ─────────────────────────────────────
+  "routes.targetPicker.title": "添加 Target",
+  "routes.targetPicker.description": "勾选供应商与模型（可多选），已选中的目标已预勾选。",
+  "routes.targetPicker.search": "搜索供应商或模型...",
+  "routes.targetPicker.empty": "没有匹配的模型",
+  "routes.targetPicker.noModels": "没有可选的模型",
+  "routes.targetPicker.loading": "正在加载模型...",
+  "routes.targetPicker.loadError": "以下供应商的模型加载失败：{providers}",
+  "routes.targetPicker.selectedCount": "已选 {count} 项",
+  "routes.targetPicker.confirmAdd": "新增 {count} 条",
+  "routes.targetPicker.confirmRemove": "移除 {count} 条",
+  "routes.targetPicker.confirmBoth": "新增 {add} 条 / 移除 {remove} 条",
+  "routes.targetPicker.orphan": "不在模型列表",
+  "routes.targetPicker.providerDisabled": "已禁用",
+
   // ── Analytics › V2 panel ─────────────────────────────────────
   "analytics.v2.columns.actualModel": "实际模型",
   "analytics.v2.columns.attempts": "尝试次数",

@@ -2,6 +2,7 @@
 import { ArrowDown, ArrowUp, EllipsisVertical, Plus, Trash2 } from "@lucide/vue"
 import { computed, ref } from "vue"
 import Combobox, { type ComboboxOption } from "@/components/Combobox.vue"
+import TargetPickerDialog from "@/components/routes/TargetPickerDialog.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -45,6 +46,9 @@ const sortDirection = ref<"desc" | "asc">("desc")
 // --- Expand state: which target's config bar is open (tracked by id, stable across sorts) ---
 const expandedId = ref<number | null>(null)
 const frozenOrder = ref<TargetItem[] | null>(null)
+
+// --- Target picker (batch add/remove by provider+model pair) ---
+const pickerOpen = ref(false)
 
 // --- Display order: frozen while editing, sorted by priority when collapsed ---
 const displayTargets = computed(() => {
@@ -167,17 +171,7 @@ function updateTarget(index: number, patch: Partial<TargetItem>) {
 }
 
 function addTarget() {
-  updateTargets([
-    ...props.modelValue,
-    {
-      id: nextId.value,
-      provider: "",
-      real_model: "",
-      priority: 0,
-      retries: 0,
-      extra: "",
-    },
-  ])
+  pickerOpen.value = true
 }
 
 function removeTarget(index: number) {
@@ -193,7 +187,15 @@ function removeTarget(index: number) {
 
 function onProviderChange(index: number, value: string) {
   updateTarget(index, { provider: value, real_model: "" })
-  routeStore.loadProviderModels(value, props.providers)
+  void routeStore.loadProviderModels(value, props.providers)
+}
+
+function onPickerConfirm(next: TargetItem[]) {
+  // The batch edit can drop the row whose config bar is open; collapse it so
+  // the frozen display order cannot resurrect a removed row.
+  expandedId.value = null
+  frozenOrder.value = null
+  updateTargets(next)
 }
 
 // --- Extra validation ---
@@ -208,6 +210,15 @@ function onProviderChange(index: number, value: string) {
         {{ $t("routes.targetEditor.addTarget") }}
       </Button>
     </div>
+
+    <TargetPickerDialog
+      v-model:open="pickerOpen"
+      :targets="modelValue"
+      :providers="providers"
+      :provider-models="providerModels"
+      :next-id="nextId"
+      @confirm="onPickerConfirm"
+    />
 
     <div class="rounded-lg border">
       <Table class="table-fixed">

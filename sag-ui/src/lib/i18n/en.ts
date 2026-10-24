@@ -376,6 +376,22 @@ export const en = {
   "routes.targetEditor.providerNotFound": "{name} (Not Found)",
   "routes.targetEditor.modelUnavailable": "{model} (Unavailable / Not in provider)",
 
+  // ── Routes › Target picker ─────────────────────────────────────
+  "routes.targetPicker.title": "Add Targets",
+  "routes.targetPicker.description":
+    "Pick provider + model pairs. Existing targets are pre-ticked.",
+  "routes.targetPicker.search": "Search providers or models...",
+  "routes.targetPicker.empty": "No matching models",
+  "routes.targetPicker.noModels": "No models available",
+  "routes.targetPicker.loading": "Loading models...",
+  "routes.targetPicker.loadError": "Failed to load models for: {providers}",
+  "routes.targetPicker.selectedCount": "{count} selected",
+  "routes.targetPicker.confirmAdd": "Add {count}",
+  "routes.targetPicker.confirmRemove": "Remove {count}",
+  "routes.targetPicker.confirmBoth": "Add {add} / remove {remove}",
+  "routes.targetPicker.orphan": "not in model list",
+  "routes.targetPicker.providerDisabled": "Disabled",
+
   // ── Analytics › V2 panel ────────────────────────────────────────
   "analytics.v2.columns.actualModel": "Actual Model",
   "analytics.v2.columns.attempts": "Attempts",
