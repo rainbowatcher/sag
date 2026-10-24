@@ -4,9 +4,11 @@
 //! `prune_stale_routing_state` must keep every shared routing cache in step
 //! with the new config *on the admin protocol surface* — not only on the
 //! dispatch path (which re-prunes lazily on the next request when
-//! `routes_version` changed). This file covers the session-affinity half:
-//! deleting a `session_sticky` route must drop the pins recorded under it,
-//! and must leave the pins of every other live session-sticky route alone.
+//! `routes_version` changed). This file covers the two request-model-keyed
+//! halves — session-affinity pins (deleting a `session_sticky` route must
+//! drop the pins recorded under it, and must leave the pins of every other
+//! live session-sticky route alone) and round-robin counters (same rule for
+//! `route_counters`).
 //!
 //! These tests cross crate boundaries (admin API → coordinator → shared
 //! `AppState` memory) and drive the full request lifecycle, so they live in
@@ -71,6 +73,15 @@ fn session_sticky_route(model_name: &str) -> RouteConfig {
             extra: HashMap::new(),
             capabilities: None,
         }],
+    }
+}
+
+/// Same route shape as [`session_sticky_route`] but on `round_robin`, the
+/// only strategy that maintains a `route_counters` entry.
+fn round_robin_route(model_name: &str) -> RouteConfig {
+    RouteConfig {
+        strategy: Strategy::RoundRobin,
+        ..session_sticky_route(model_name)
     }
 }
 
@@ -178,6 +189,45 @@ async fn strategy_switch_prunes_session_affinity_pins() {
     assert!(
         pinned_models(&state).await.is_empty(),
         "pins of a route that switched away from session_sticky must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn delete_route_prunes_round_robin_counters() {
+    let (state, app) = test_state_and_app(vec![
+        round_robin_route("gpt-4o"),
+        round_robin_route("gpt-4o-mini"),
+    ])
+    .await;
+
+    // Seed the counters the dispatch side would have produced for both
+    // routes' request models.
+    {
+        let mut counters = state.route_counters.write().await;
+        counters.insert("gpt-4o".into(), 3);
+        counters.insert("gpt-4o-mini".into(), 1);
+    }
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/routes")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model_name":"gpt-4o"}"#))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The deleted route's counter is gone; the surviving round_robin
+    // route's counter is untouched (no over-pruning).
+    let counters = state.route_counters.read().await;
+    assert!(
+        !counters.contains_key("gpt-4o"),
+        "a deleted route's round-robin counter must be pruned, got {counters:?}"
+    );
+    assert_eq!(
+        counters.get("gpt-4o-mini"),
+        Some(&1),
+        "a live route's round-robin counter must survive the prune"
     );
 }
 

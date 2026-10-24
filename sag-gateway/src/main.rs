@@ -147,6 +147,10 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     // Session-affinity memory for `session_sticky` routes. Shared the same
     // way so admin handlers can observe and clear session pins.
     let session_affinity: sag_state::SessionAffinity = Arc::default();
+    // Round-robin counters. Shared the same way so the admin-side route
+    // prune drops a deleted route's counters immediately, instead of waiting
+    // for the next dispatch request to observe the `routes_version` change.
+    let route_counters: sag_router::RouteCounters = Arc::default();
 
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
@@ -158,15 +162,18 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         circuit_breaker: circuit_breaker.clone(),
         active_targets: active_targets.clone(),
         fill_first_orders: fill_first_orders.clone(),
+        route_counters: route_counters.clone(),
         session_affinity: session_affinity.clone(),
     };
     // `with_shared_state` shares the same Arcs (rather than creating
     // defaults) so AppState and DispatchRuntime observe the same breaker,
-    // the same sticky memory, and the same fill-first order cache.
+    // the same sticky memory, the same fill-first order cache, and the same
+    // round-robin counters.
     let dispatch_runtime = sag_router::DispatchRuntime::with_shared_state(
         circuit_breaker.clone(),
         active_targets,
         fill_first_orders,
+        route_counters,
         session_affinity,
     );
 

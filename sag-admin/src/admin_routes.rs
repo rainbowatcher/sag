@@ -165,22 +165,30 @@ fn validate_targets(
 ///   wildcard route and are therefore kept. Still-resolving caches are left
 ///   untouched — `order_fill_first` self-heals any targets mismatch by
 ///   re-shuffling on next use, so a live fill-first order is never broken.
+/// - drop `route_counters` entries under the same rule (same
+///   [`sag_state::retain_resolving_route_keys`] helper the dispatch prune
+///   uses), so a deleted route's round-robin counter does not survive until
+///   the next request observes a `routes_version` change.
 /// - drop `session_affinity` pins whose request-model key no longer resolves
 ///   to the [`Strategy::SessionSticky`] route that recorded them — the
 ///   session analogue of the `active_targets` rule (a strategy switch, a
 ///   route removal, or an exact route shadowing a wildcard leaves pins the
 ///   current config would never consult).
 ///
-/// Mirrors `sag_dispatch::DispatchRuntime::prune_stale_entries`'s fill-first
-/// and session-affinity rules. Runs with no config read guard held across
+/// Mirrors `sag_dispatch::DispatchRuntime::prune_stale_entries`'s four
+/// routing memories (fill-first orders, round-robin counters, active
+/// targets, session pins). Runs with no config read guard held across
 /// the writes (routes are cloned first), so it cannot deadlock against
 /// dispatch or the coordinator.
 async fn prune_stale_routing_state(state: &AppState) {
     let routes = state.config.read().await.routes.clone();
-    let resolves_to = |k: &str| sag_config::resolve_model_route(&routes, k).is_some();
     {
         let mut orders = state.fill_first_orders.write().await;
-        orders.retain(|k, _| resolves_to(k));
+        sag_state::retain_resolving_route_keys(&mut orders, &routes);
+    }
+    {
+        let mut counters = state.route_counters.write().await;
+        sag_state::retain_resolving_route_keys(&mut counters, &routes);
     }
     state
         .active_targets

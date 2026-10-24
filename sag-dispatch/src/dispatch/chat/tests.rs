@@ -2856,6 +2856,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.route_counters.clone(),
         state.session_affinity.clone(),
     );
     let req = build_request("gpt-4o", false);
@@ -2945,6 +2946,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.route_counters.clone(),
         state.session_affinity.clone(),
     );
     let req = build_request("gpt-4o", false);
@@ -3112,6 +3114,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.route_counters.clone(),
         state.session_affinity.clone(),
     );
     let req = build_request("gpt-4o", false);
@@ -3642,6 +3645,7 @@ fn shared_runtime(state: &AppState) -> DispatchRuntime {
         state.circuit_breaker.clone(),
         state.active_targets.clone(),
         state.fill_first_orders.clone(),
+        state.route_counters.clone(),
         state.session_affinity.clone(),
     )
 }

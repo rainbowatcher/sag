@@ -448,6 +448,29 @@ pub struct CachedOrder {
 /// sticky-failover.
 pub type FillFirstOrders = Arc<RwLock<HashMap<String, CachedOrder>>>;
 
+/// Shared handle for the round-robin counters keyed by **request** model.
+/// Shared between [`AppState`] and `DispatchRuntime` via the same `Arc` so
+/// the admin-side route prune can drop the counters of a deleted route at
+/// the same moment it drops the other routing caches — dispatch would
+/// otherwise only clean them on the next request that observes a
+/// `routes_version` change.
+pub type RouteCounters = Arc<RwLock<HashMap<String, u64>>>;
+
+/// Drop the entries of a routing cache whose key is a **request model** that
+/// no longer resolves to any route in `routes`.
+///
+/// Single implementation of the prune rule shared by both prune paths — the
+/// dispatch side ([`RouteCounters`] / [`FillFirstOrders`] in
+/// `DispatchRuntime::prune_stale_entries`) and the admin side
+/// (`sag_admin::admin_routes::prune_stale_routing_state`). Validity is
+/// judged by re-resolving the key against the current route table, never by
+/// membership in the config's `model_name` set: a wildcard route's caches
+/// live under concrete request models, which still resolve to the wildcard
+/// route and are therefore kept.
+pub fn retain_resolving_route_keys<V>(map: &mut HashMap<String, V>, routes: &[RouteConfig]) {
+    map.retain(|key, _| sag_config::resolve_model_route(routes, key).is_some());
+}
+
 /// Shared application state for all Axum handlers.
 ///
 /// Holds only the cross-cutting resources that every handler family
@@ -501,6 +524,12 @@ pub struct AppState {
     /// order so the next request re-shuffles, the fill-first analogue of
     /// clearing `active_targets`.
     pub fill_first_orders: FillFirstOrders,
+    /// Round-robin counters keyed by request model, shared with
+    /// `DispatchRuntime` via the same `Arc`. Dispatch increments them when
+    /// ordering a `round_robin` route; both prune paths drop the entries
+    /// whose request model no longer resolves to any route (see
+    /// [`retain_resolving_route_keys`]).
+    pub route_counters: RouteCounters,
     /// Session-affinity memory for `strategy = "session_sticky"` routes,
     /// shared with `DispatchRuntime` via the same `Arc`. Dispatch reads the
     /// session pin in `order_targets` (hoisting the pinned target when it
@@ -658,6 +687,7 @@ pub mod testing {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            route_counters: Arc::default(),
             session_affinity: Arc::default(),
         }
     }

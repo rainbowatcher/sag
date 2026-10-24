@@ -91,12 +91,14 @@ impl DispatchRuntime {
         circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
         active_targets: sag_state::ActiveTargets,
         fill_first_orders: sag_state::FillFirstOrders,
+        route_counters: sag_state::RouteCounters,
         session_affinity: sag_state::SessionAffinity,
     ) -> Self {
         Self {
             circuit_breaker,
             active_targets,
             fill_first_orders,
+            route_counters,
             session_affinity,
             ..Default::default()
         }
@@ -107,11 +109,15 @@ impl DispatchRuntime {
     /// `resolve_route` when the `routes_version` has changed, to prevent
     /// unbounded growth from create/delete route cycles.
     ///
-    /// All three maps are keyed by the **request** model — for a wildcard
+    /// All four maps are keyed by the **request** model — for a wildcard
     /// route that is any concrete model the route has served — so validity is
     /// judged by re-resolving the key against the current route table, never
     /// by checking membership in the config's `model_name` set (which may
-    /// only contain `"*"`). Active entries additionally record the route that
+    /// only contain `"*"`). The two request-model-keyed caches
+    /// (`fill_first_orders`, `route_counters`) are pruned by the shared
+    /// [`sag_state::retain_resolving_route_keys`] rule — the same one the
+    /// admin-side prune uses after a committed route mutation. Active entries
+    /// additionally record the route that
     /// created them (`ActiveTargetEntry::route_model`); an entry is kept only
     /// while its key still resolves to that same route **and** the resolved
     /// route is still [`sag_config::Strategy::StickyFailover`] (see
@@ -125,16 +131,13 @@ impl DispatchRuntime {
     ///   FillFirst) is dropped, so no stale active target lingers after a
     ///   strategy change.
     pub async fn prune_stale_entries(&self, routes: &[sag_config::RouteConfig]) {
-        let resolves_to = |request_model: &str| -> Option<&str> {
-            sag_config::resolve_model_route(routes, request_model).map(|r| r.model_name.as_str())
-        };
         {
             let mut guard = self.fill_first_orders.write().await;
-            guard.retain(|k, _| resolves_to(k).is_some());
+            sag_state::retain_resolving_route_keys(&mut guard, routes);
         }
         {
             let mut guard = self.route_counters.write().await;
-            guard.retain(|k, _| resolves_to(k).is_some());
+            sag_state::retain_resolving_route_keys(&mut guard, routes);
         }
         {
             let mut guard = self.active_targets.write().await;

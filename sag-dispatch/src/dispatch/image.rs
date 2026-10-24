@@ -1192,6 +1192,7 @@ mod tests {
             circuit_breaker: Arc::new(RwLock::new(sag_core::RouteCircuitBreaker::default())),
             active_targets: Arc::default(),
             fill_first_orders: Arc::default(),
+            route_counters: Arc::default(),
             session_affinity: Arc::default(),
         };
         (state, pool)
