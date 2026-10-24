@@ -327,6 +327,10 @@ onBeforeUnmount(() => {
               aria-hidden="true"
             />
             <span class="min-w-0 flex-1 truncate font-mono">{{ option.model }}</span>
+            <!-- Provider stays visible while filtering hides the group headings -->
+            <span class="text-muted-foreground max-w-[150px] shrink-0 truncate text-xs">
+              {{ option.provider }}
+            </span>
             <span v-if="option.orphan" class="shrink-0 text-xs text-amber-600 dark:text-amber-400">
               {{ $t("routes.targetPicker.orphan") }}
             </span>
