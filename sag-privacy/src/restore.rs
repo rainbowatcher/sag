@@ -24,8 +24,14 @@ use serde_json::Value;
 
 use crate::placeholder::PlaceholderMap;
 
-/// SSE frame separator. Frames are forwarded together with it.
-const FRAME_SEP: &[u8] = b"\n\n";
+/// SSE frame separators. Frames are forwarded together with theirs.
+///
+/// The SSE grammar allows `\r\n`, `\n` or `\r` line endings, so a blank line
+/// (the frame terminator) is `\r\n\r\n` or `\n\n`; both are recognized. A
+/// bare-CR terminator (`\r\r`) is not, because no encoder in the request path
+/// emits one. Each separator is matched as a whole, so a chunk boundary inside
+/// one of them (`...\r\n\r` | `\n`) never splits a frame early.
+const FRAME_SEPS: [&[u8]; 2] = [b"\n\n", b"\r\n\r\n"];
 
 /// Prefix marking a data frame.
 const DATA_PREFIX: &[u8] = b"data:";
@@ -49,16 +55,17 @@ impl RestoreWriter {
     /// Feed the next chunk of the stream, returning the bytes that are ready
     /// to be sent downstream.
     ///
-    /// Every complete frame (up to and including its `\n\n` separator) is
-    /// emitted; a trailing partial frame stays buffered until [`Self::push`]
-    /// or [`Self::finish`] completes it.
+    /// Every complete frame (up to and including its `\n\n` or `\r\n\r\n`
+    /// separator) is emitted; a trailing partial frame stays buffered until
+    /// [`Self::push`] or [`Self::finish`] completes it.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(chunk.len());
         let mut start = 0;
-        while let Some(rel) = find_sep(&self.buf[start..]) {
-            let end = start + rel + FRAME_SEP.len();
-            match self.restore_frame(&self.buf[start..end]) {
+        while let Some((rel, sep_len)) = find_sep(&self.buf[start..]) {
+            let end = start + rel + sep_len;
+            let sep = &self.buf[start + rel..end];
+            match self.restore_frame(&self.buf[start..end], sep) {
                 Some(restored) => out.extend_from_slice(&restored),
                 None => out.extend_from_slice(&self.buf[start..end]),
             }
@@ -78,7 +85,10 @@ impl RestoreWriter {
 
     /// Restore one complete frame, or `None` when it must be forwarded as-is
     /// (not a `data:` frame, not JSON, or no placeholder inside).
-    fn restore_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// `sep` is the frame separator `frame` ends with; the restored frame is
+    /// re-terminated with the same one.
+    fn restore_frame(&self, frame: &[u8], sep: &[u8]) -> Option<Vec<u8>> {
         if self.map.is_empty() {
             return None;
         }
@@ -91,17 +101,25 @@ impl RestoreWriter {
         // Keys may be reordered by the round-trip; that is harmless for JSON
         // consumers and keeps this path allocation-simple.
         let json = serde_json::to_string(&value).ok()?;
-        let mut restored = Vec::with_capacity(prefix.len() + json.len() + FRAME_SEP.len());
+        let mut restored = Vec::with_capacity(prefix.len() + json.len() + sep.len());
         restored.extend_from_slice(prefix);
         restored.extend_from_slice(json.as_bytes());
-        restored.extend_from_slice(FRAME_SEP);
+        restored.extend_from_slice(sep);
         Some(restored)
     }
 }
 
-/// Position of the first `\n\n` in `bytes`.
-fn find_sep(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(FRAME_SEP.len()).position(|w| w == FRAME_SEP)
+/// Position and length of the earliest frame separator in `bytes`.
+fn find_sep(bytes: &[u8]) -> Option<(usize, usize)> {
+    FRAME_SEPS
+        .iter()
+        .filter_map(|sep| {
+            bytes
+                .windows(sep.len())
+                .position(|window| window == *sep)
+                .map(|pos| (pos, sep.len()))
+        })
+        .min_by_key(|(pos, _)| *pos)
 }
 
 /// Split a `data:` frame into the literal prefix (`data:` plus the optional
@@ -172,6 +190,21 @@ mod tests {
             .expect("data prefix")
             .strip_suffix("\n\n")
             .expect("frame separator");
+        serde_json::from_str(payload).expect("json payload")
+    }
+
+    /// Build a complete SSE data frame terminated with `\r\n\r\n`.
+    fn crlf_frame(payload: &str) -> Vec<u8> {
+        format!("data: {payload}\r\n\r\n").into_bytes()
+    }
+
+    /// Parse a restored frame terminated by either supported separator.
+    fn parse_frame_any(frame: &[u8]) -> Value {
+        let text = std::str::from_utf8(frame).expect("utf-8 frame");
+        let payload = text
+            .strip_prefix("data: ")
+            .expect("data prefix")
+            .trim_end_matches(['\r', '\n']);
         serde_json::from_str(payload).expect("json payload")
     }
 
@@ -358,6 +391,97 @@ mod tests {
 
         assert_eq!(writer.push(&first), first);
         assert_eq!(writer.push(&second), second);
+        assert!(writer.finish().is_empty());
+    }
+
+    #[test]
+    fn restores_frames_separated_by_crlf() {
+        let (map, placeholder) = map_with("email", "alice@example.com");
+        let mut writer = RestoreWriter::new(map);
+
+        let frame = crlf_frame(&format!(r#"{{"content":"{placeholder}"}}"#));
+        let out = writer.push(&frame);
+        assert_eq!(
+            parse_frame_any(&out)["content"].as_str(),
+            Some("alice@example.com")
+        );
+        // The frame keeps its own CRLF terminator.
+        assert!(out.ends_with(b"\r\n\r\n"), "out: {out:?}");
+        assert!(writer.finish().is_empty());
+
+        // A CRLF frame without a placeholder is forwarded byte for byte.
+        let plain = crlf_frame(r#"{"content":"plain"}"#);
+        assert_eq!(writer.push(&plain), plain);
+    }
+
+    #[test]
+    fn restores_mixed_lf_and_crlf_frames() {
+        let (map, placeholder) = map_with("email", "alice@example.com");
+        let mut writer = RestoreWriter::new(map);
+
+        let mut chunk = data_frame(&format!(r#"{{"n":1,"content":"{placeholder}"}}"#));
+        chunk.extend_from_slice(&crlf_frame(&format!(
+            r#"{{"n":2,"content":"{placeholder}"}}"#
+        )));
+        chunk.extend_from_slice(&data_frame(&format!(
+            r#"{{"n":3,"content":"{placeholder}"}}"#
+        )));
+
+        let out = writer.push(&chunk);
+        let text = std::str::from_utf8(&out).expect("utf-8");
+        // Split on both separators: three frames came back, each restored.
+        let frames: Vec<&str> = text
+            .split("\r\n\r\n")
+            .flat_map(|part| part.split("\n\n"))
+            .filter(|frame| !frame.is_empty())
+            .collect();
+        assert_eq!(frames.len(), 3, "frames: {frames:?}");
+        for (i, frame) in frames.iter().enumerate() {
+            let value: Value = serde_json::from_str(
+                frame
+                    .strip_prefix("data: ")
+                    .unwrap_or_else(|| panic!("frame {i}: {frame}")),
+            )
+            .expect("json payload");
+            assert_eq!(value["content"].as_str(), Some("alice@example.com"));
+        }
+        assert!(writer.finish().is_empty());
+    }
+
+    #[test]
+    fn separator_split_across_chunks_waits_for_the_rest() {
+        let (map, placeholder) = map_with("email", "alice@example.com");
+        let mut writer = RestoreWriter::new(map);
+
+        let payload = format!(r#"{{"content":"{placeholder}"}}"#);
+
+        // `\r\n\r` | `\n`: the half separator must not terminate the frame.
+        let mut head = format!("data: {payload}\r\n\r").into_bytes();
+        assert!(writer.push(&head).is_empty());
+        let out = writer.push(b"\n");
+        assert_eq!(
+            parse_frame_any(&out)["content"].as_str(),
+            Some("alice@example.com")
+        );
+        assert!(out.ends_with(b"\r\n\r\n"), "out: {out:?}");
+
+        // `\r\n` | `\r\n` is the same separator, still no early split.
+        head = format!("data: {payload}\r\n").into_bytes();
+        assert!(writer.push(&head).is_empty());
+        let out = writer.push(b"\r\n");
+        assert_eq!(
+            parse_frame_any(&out)["content"].as_str(),
+            Some("alice@example.com")
+        );
+
+        // `\n` | `\n` behaves the same way.
+        head = format!("data: {payload}\n").into_bytes();
+        assert!(writer.push(&head).is_empty());
+        let out = writer.push(b"\n");
+        assert_eq!(
+            parse_frame(&out)["content"].as_str(),
+            Some("alice@example.com")
+        );
         assert!(writer.finish().is_empty());
     }
 

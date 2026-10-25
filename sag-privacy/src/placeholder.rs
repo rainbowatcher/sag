@@ -37,10 +37,12 @@ pub fn make(kind: &str, text: &str, salt: &str) -> String {
 
 /// Length in bytes of the placeholder rendered for `kind`.
 ///
-/// `[[` + KIND + `_` + 12 hex + `]]`. The uppercased kind is assumed to have
-/// the same byte length as `kind` itself (true for ASCII detector kinds).
+/// `[[` + KIND + `_` + 12 hex + `]]`. The length is measured on the
+/// *uppercased* kind, exactly as [`make`] renders it: uppercasing can change
+/// the byte length (`ß` becomes `SS`, `ﬁ` becomes `FI`), so `kind.len()`
+/// would be off for non-ASCII kinds.
 pub fn placeholder_len(kind: &str) -> usize {
-    2 + kind.len() + 1 + HASH_HEX_LEN + 2
+    2 + kind.to_uppercase().len() + 1 + HASH_HEX_LEN + 2
 }
 
 /// Reverse index from placeholder to the plaintext it stands for.
@@ -53,6 +55,20 @@ impl PlaceholderMap {
     /// Record that `placeholder` stands for `plaintext`.
     pub fn insert(&mut self, placeholder: String, plaintext: String) {
         self.inner.insert(placeholder, plaintext);
+    }
+
+    /// Merge every entry of `other` into `self`.
+    ///
+    /// Placeholders are deterministic ([`make`] derives them from kind +
+    /// plaintext + salt), so a key collision means both maps recorded the
+    /// same plaintext; the entry already present in `self` is kept either
+    /// way, which makes the merge order-independent.
+    pub fn extend(&mut self, other: &PlaceholderMap) {
+        for (placeholder, plaintext) in &other.inner {
+            self.inner
+                .entry(placeholder.clone())
+                .or_insert_with(|| plaintext.clone());
+        }
     }
 
     /// Number of recorded placeholders.
@@ -164,6 +180,50 @@ mod tests {
             assert_eq!(make(kind, "value", "salt").len(), placeholder_len(kind));
         }
         assert_eq!(placeholder_len("email"), 2 + 5 + 1 + 12 + 2);
+    }
+
+    #[test]
+    fn placeholder_len_counts_bytes_of_the_uppercased_kind() {
+        // Non-ASCII kinds: `to_uppercase` may change the byte length, so the
+        // length must be taken from the rendered placeholder, not `kind`.
+        for kind in ["工号", "straße", "ﬁle", "ÉMAIL", "π"] {
+            let rendered = make(kind, "value", "salt");
+            assert_eq!(rendered.len(), placeholder_len(kind), "kind {kind}");
+        }
+        // `工号` is 6 bytes: 2 + 6 + 1 + 12 + 2.
+        assert_eq!(placeholder_len("工号"), 23);
+    }
+
+    #[test]
+    fn extend_merges_maps_and_keeps_existing_entries() {
+        let alice = make("email", "alice@example.com", "s");
+        let bob = make("email", "bob@example.com", "s");
+
+        let mut left = PlaceholderMap::default();
+        left.insert(alice.clone(), "alice@example.com".to_string());
+
+        let mut right = PlaceholderMap::default();
+        right.insert(bob.clone(), "bob@example.com".to_string());
+        right.insert(alice.clone(), "alice@example.com".to_string());
+
+        left.extend(&right);
+        assert_eq!(left.len(), 2);
+        let (out, hits) = left.replace_in(&format!("{alice} {bob}"));
+        assert_eq!(out, "alice@example.com bob@example.com");
+        assert_eq!(hits, 2);
+
+        // An empty source changes nothing, and merging into an empty map
+        // copies everything over.
+        let before = left.len();
+        left.extend(&PlaceholderMap::default());
+        assert_eq!(left.len(), before);
+
+        let mut empty = PlaceholderMap::default();
+        empty.extend(&right);
+        assert_eq!(empty.len(), 2);
+        let (out, hits) = empty.replace_in(&alice);
+        assert_eq!(out, "alice@example.com");
+        assert_eq!(hits, 1);
     }
 
     #[test]

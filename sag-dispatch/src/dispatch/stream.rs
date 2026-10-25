@@ -492,6 +492,13 @@ struct StreamState<S, E> {
     /// Privacy reverse-map restorer for the client-visible bytes (`None` when
     /// the request carried no placeholders or restoring is disabled).
     privacy_restore: Option<RestoreWriter>,
+    /// Set when the terminal privacy tail was yielded on the previous poll:
+    /// the client now holds every byte, so the next poll writes the terminal
+    /// (`call_logs` + analytics event) and ends the body. This keeps the
+    /// terminal bookkeeping strictly *after* the last client-visible byte
+    /// (`unfold` yields one item per poll, so it cannot both yield the tail
+    /// and finish the terminal in the same step).
+    terminal_pending: bool,
     // Declared before the guard so it drops first; the guard's own
     // `Arc` clone keeps the shared data alive regardless. The guard
     // field is never read — it exists solely for its `Drop` (client
@@ -583,6 +590,7 @@ fn make_stream_state<S, E>(
         loss_summary,
         session_key,
         privacy_restore,
+        terminal_pending: false,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
     }
@@ -964,6 +972,12 @@ where
         if state.done {
             return None;
         }
+        // The terminal privacy tail was delivered on the previous poll, so
+        // the client's last byte is out: the terminal goes last.
+        if state.terminal_pending {
+            finish_stream_terminal(&mut state).await;
+            return None;
+        }
         loop {
             match state.stream.next().await {
                 // Usage / Error / End are protocol-control events: merge /
@@ -982,14 +996,23 @@ where
                     record_stream_error(&mut state, msg);
                 }
                 Some(IrStreamEvent::End) | None => {
+                    // Every terminating path of this loop (explicit `End`, an
+                    // upstream stream that just ends — including one that
+                    // ended right after an `Error` — and the `done`
+                    // short-circuit) funnels through here, so the privacy
+                    // tail is always flushed before the terminal.
+                    //
                     // Flush the privacy restorer: bytes still buffered never
                     // formed a complete frame, so they are forwarded as-is
                     // (a placeholder split across frames is not restored —
-                    // see `RestoreWriter`'s documented limitation).
+                    // see `RestoreWriter`'s documented limitation). The tail
+                    // is yielded *before* the terminal bookkeeping: it is the
+                    // client's last visible byte, so `finish_stream_terminal`
+                    // is deferred to the next poll via `terminal_pending`.
                     if let Some(writer) = state.privacy_restore.as_mut() {
                         let tail = writer.finish();
                         if !tail.is_empty() {
-                            finish_stream_terminal(&mut state).await;
+                            state.terminal_pending = true;
                             return Some((
                                 Ok::<_, std::io::Error>(axum::body::Bytes::from(tail)),
                                 state,
@@ -1437,6 +1460,145 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].call_count, 1);
         assert_eq!(rows[0].error_count, 0);
+    }
+
+    // ─── Privacy restore: tail flush precedes the terminal ──────────
+
+    /// Reverse map with one recorded placeholder (email → plaintext).
+    fn email_placeholder_map() -> sag_privacy::PlaceholderMap {
+        let mut map = sag_privacy::PlaceholderMap::default();
+        map.insert(
+            "[[EMAIL_0123456789ab]]".to_string(),
+            "alice@example.com".to_string(),
+        );
+        map
+    }
+
+    /// Streaming response with a privacy restorer and the same default
+    /// identity / timing args as `stream_response`.
+    fn privacy_stream_response<S>(
+        state: &AppState,
+        stream: S,
+        privacy_restore: RestoreWriter,
+    ) -> axum::response::Response<axum::body::Body>
+    where
+        S: Stream<Item = IrStreamEvent> + Send + Unpin + 'static,
+    {
+        build_streaming_response(
+            state,
+            stream,
+            encode_chat,
+            "test-route",
+            "openai",
+            "gpt-4o",
+            "gpt-4o",
+            Uuid::new_v4(),
+            Instant::now(),
+            Instant::now(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(privacy_restore),
+        )
+    }
+
+    /// Drain the collector and count the `call_logs` rows written so far.
+    async fn call_log_count(state: &AppState) -> usize {
+        state.collector.flush().await;
+        state
+            .collector
+            .store()
+            .query_logs(LogFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// A stream ending with a partial frame: the flushed privacy tail is the
+    /// client's last byte, so the terminal `call_logs` row must only be
+    /// written *after* that byte was yielded.
+    #[tokio::test]
+    async fn privacy_tail_flushes_before_terminal_bookkeeping() {
+        let state = build_state().await;
+        let chunks = vec![
+            // Complete frame: restored before it reaches the client.
+            StreamChunk::Data(b"data: {\"content\":\"[[EMAIL_0123456789ab]]\"}\n\n".to_vec()),
+            // Partial frame: buffered by the writer, flushed at the terminal.
+            StreamChunk::Data(b"data: {\"content\":\"tail".to_vec()),
+            StreamChunk::Done,
+        ];
+        let mut resp = privacy_stream_response(
+            &state,
+            ir_stream(chunks),
+            RestoreWriter::new(email_placeholder_map()),
+        );
+
+        // First frame: the complete frame, placeholder restored.
+        let first = resp.body_mut().frame().await.unwrap().unwrap();
+        assert_eq!(
+            first.into_data().unwrap().as_ref(),
+            b"data: {\"content\":\"alice@example.com\"}\n\n"
+        );
+
+        // Second frame: the flushed tail, forwarded as-is (never formed a
+        // complete frame, so nothing is restored in it).
+        let tail = resp.body_mut().frame().await.unwrap().unwrap();
+        assert_eq!(
+            tail.into_data().unwrap().as_ref(),
+            b"data: {\"content\":\"tail"
+        );
+
+        // The tail is already visible to the client, so the terminal must
+        // not be written yet.
+        assert_eq!(
+            call_log_count(&state).await,
+            0,
+            "terminal call_logs row must follow the flushed tail"
+        );
+
+        // Next poll ends the body, and only now is the terminal written.
+        assert!(resp.body_mut().frame().await.is_none());
+        assert_eq!(call_log_count(&state).await, 1);
+    }
+
+    /// An upstream stream that ends right after an `Error` (no explicit
+    /// `End`) still flushes the privacy tail before the terminal.
+    #[tokio::test]
+    async fn privacy_tail_flushes_when_upstream_errors_out() {
+        let state = build_state().await;
+        let events = vec![
+            IrStreamEvent::Raw(b"data: {\"content\":\"tail".to_vec()),
+            IrStreamEvent::Error("upstream reset".into()),
+        ];
+        let stream = Box::pin(stream::iter(events));
+        let mut resp =
+            privacy_stream_response(&state, stream, RestoreWriter::new(email_placeholder_map()));
+
+        let tail = resp.body_mut().frame().await.unwrap().unwrap();
+        assert_eq!(
+            tail.into_data().unwrap().as_ref(),
+            b"data: {\"content\":\"tail"
+        );
+        assert_eq!(
+            call_log_count(&state).await,
+            0,
+            "terminal call_logs row must follow the flushed tail"
+        );
+
+        assert!(resp.body_mut().frame().await.is_none());
+        let log = latest_call_log(&state).await;
+        assert_eq!(log.error.as_deref(), Some("upstream reset"));
     }
 
     // ─── Plan §2.3 — TTFT and upstream_duration_ms population ──────

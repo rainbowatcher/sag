@@ -43,7 +43,8 @@ pub enum Checksum {
     /// Bank card numbers: 13–19 digits passing the Luhn check.
     Luhn,
     /// Mainland-China resident ID: 18 chars with the GB 11643 weighted
-    /// check digit, or the 15-char legacy form (boundary check only).
+    /// check digit, or the 15-char legacy form (digits plus a plausible
+    /// 19YYMMDD birth date, but no check digit).
     IdCardCn,
     /// IBAN: ISO 13616 mod-97 check (`mod 97 == 1`).
     Iban,
@@ -57,6 +58,20 @@ impl Checksum {
             Checksum::Luhn => luhn_ok(matched),
             Checksum::IdCardCn => id_card_cn_ok(matched),
             Checksum::Iban => iban_ok(matched),
+        }
+    }
+
+    /// Whether the part of [`Self::verify`] that `matched` had to satisfy is a
+    /// real *check digit* (a value derived from the other characters), as
+    /// opposed to a structural filter.
+    ///
+    /// [`crate::engine`] uses this to break ties between two rules that matched
+    /// the exact same span: a Luhn-verified 15-digit card number outranks the
+    /// 15-char legacy ID form, which has no check digit at all.
+    pub fn verifies_check_digit(self, matched: &str) -> bool {
+        match self {
+            Checksum::IdCardCn => matched.len() == 18,
+            Checksum::Luhn | Checksum::Iban => true,
         }
     }
 }
@@ -164,11 +179,12 @@ const ID_CARD_CN_WEIGHTS: [u32; 17] = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 
 /// Check character indexed by `weighted_sum % 11`.
 const ID_CARD_CN_CHECK_CHARS: &[u8; 11] = b"10X98765432";
 
-/// GB 11643 check: 18-char form verified, 15-char legacy form accepted as-is.
+/// GB 11643 check: 18-char form verified, 15-char legacy form requires
+/// digits plus a valid birth date (see [`legacy_birth_date_ok`]).
 fn id_card_cn_ok(matched: &str) -> bool {
     let bytes = matched.as_bytes();
     match bytes.len() {
-        15 => bytes.iter().all(u8::is_ascii_digit),
+        15 => bytes.iter().all(u8::is_ascii_digit) && legacy_birth_date_ok(&bytes[6..12]),
         18 => {
             if !bytes[..17].iter().all(u8::is_ascii_digit) {
                 return false;
@@ -182,6 +198,40 @@ fn id_card_cn_ok(matched: &str) -> bool {
             bytes[17].to_ascii_uppercase() == expected
         }
         _ => false,
+    }
+}
+
+/// Whether `yymmdd` (bytes 6..12 of a 15-char legacy ID) is a real date.
+///
+/// The legacy form carries no check digit, so without this filter any 15-digit
+/// run would be reported as an ID number. The two-digit year is read as `19YY`
+/// — the legacy format was issued in the 20th century — which also makes the
+/// leap-year rule deterministic (`1900` is not a leap year, `2000` would be).
+fn legacy_birth_date_ok(yymmdd: &[u8]) -> bool {
+    if yymmdd.len() != 6 || !yymmdd.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let number = |slice: &[u8]| -> u32 {
+        slice
+            .iter()
+            .fold(0, |acc, byte| acc * 10 + u32::from(byte - b'0'))
+    };
+    let year = 1900 + number(&yymmdd[..2]);
+    let month = number(&yymmdd[2..4]);
+    let day = number(&yymmdd[4..6]);
+    day >= 1 && day <= days_in_month(year, month)
+}
+
+/// Number of days in `month` of `year`, or `0` for a month outside `1..=12`.
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
     }
 }
 
@@ -235,9 +285,39 @@ mod tests {
         assert!(id_card_cn_ok("11010119900307416x"));
         // Wrong check digit.
         assert!(!id_card_cn_ok("110101199003074136"));
-        // 15-char legacy form: boundary check only.
+        // 15-char legacy form: digits + valid birth date, no check digit.
         assert!(id_card_cn_ok("110101900307413"));
         assert!(!id_card_cn_ok("11010190030741"));
+        assert!(!id_card_cn_ok("11010190030741X"));
+    }
+
+    #[test]
+    fn legacy_id_needs_a_plausible_birth_date() {
+        // Month 13 / month 00.
+        assert!(!id_card_cn_ok("110101901307413"));
+        assert!(!id_card_cn_ok("110101900007413"));
+        // Day 32 / day 00.
+        assert!(!id_card_cn_ok("110101900332413"));
+        assert!(!id_card_cn_ok("110101900300413"));
+        // 30 February, and leap years read as 19YY (1900 is not a leap year).
+        assert!(!id_card_cn_ok("110101900230413"));
+        assert!(!id_card_cn_ok("110101900229413"));
+        assert!(id_card_cn_ok("110101920229413"));
+        assert!(id_card_cn_ok("110101900228413"));
+        // 31 December is fine.
+        assert!(id_card_cn_ok("110101901231413"));
+        // An 18-char ID number keeps its check-digit behaviour: the date is
+        // not re-validated, so an impossible one still passes the checksum.
+        assert!(id_card_cn_ok("110101199003074135"));
+    }
+
+    #[test]
+    fn verifies_check_digit_separates_check_digits_from_filters() {
+        assert!(Checksum::Luhn.verifies_check_digit("4111111111111111"));
+        assert!(Checksum::Iban.verifies_check_digit("GB82WEST12345698765432"));
+        // The 18-char ID form has a check digit, the 15-char one does not.
+        assert!(Checksum::IdCardCn.verifies_check_digit("110101199003074135"));
+        assert!(!Checksum::IdCardCn.verifies_check_digit("110101900307413"));
     }
 
     #[test]

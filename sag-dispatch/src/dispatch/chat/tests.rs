@@ -10,7 +10,7 @@ use sag_config::{CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayC
 use sag_core::AppError;
 use sag_core::IrStreamEvent;
 use sag_core::types::{ChatCompletionRequest, ChatCompletionResponse, StreamChunk, Usage};
-use sag_providers::{ChatCompletionsCodec, LlmProvider};
+use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, LlmProvider};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -195,6 +195,69 @@ impl LlmProvider for AnthropicStreamProvider {
         Ok(Box::pin(
             futures_util::stream::iter(chunks).chain(futures_util::stream::pending()),
         ))
+    }
+}
+
+/// Provider serving a **native Anthropic** non-streaming call and recording
+/// the encoded body. The translated lane encodes from the (masked) IR, so the
+/// body is the only place IR-only request fields are observable.
+struct AnthropicRecordingProvider {
+    name: String,
+    response: serde_json::Value,
+    seen_body: Mutex<Option<serde_json::Value>>,
+}
+
+impl AnthropicRecordingProvider {
+    fn new(name: &str, response: serde_json::Value) -> Self {
+        Self {
+            name: name.to_string(),
+            response,
+            seen_body: Mutex::new(None),
+        }
+    }
+
+    /// Last Anthropic body the dispatcher encoded from the IR.
+    fn last_body(&self) -> Option<serde_json::Value> {
+        self.seen_body.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicRecordingProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn chat(
+        &self,
+        _request: &ChatCompletionRequest,
+        _real_model: &str,
+        _api_endpoint: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<ChatCompletionResponse> {
+        unreachable!("AnthropicRecordingProvider only serves anthropic_messages")
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: &ChatCompletionRequest,
+        _real_model: &str,
+        _api_endpoint: &str,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        unreachable!("AnthropicRecordingProvider only serves anthropic_messages")
+    }
+
+    async fn anthropic_messages(
+        &self,
+        body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        *self.seen_body.lock().unwrap() = Some(body);
+        Ok(self.response.clone())
     }
 }
 
@@ -1728,6 +1791,121 @@ async fn dispatch_chat_masks_fields_outside_messages() {
     );
     let sent = serde_json::to_string(&seen).expect("request serializes");
     assert!(!sent.contains(email), "upstream saw: {sent}");
+}
+
+/// Privacy `mask` mode: the IR is a **second** masking source. On the Anthropic
+/// ingress the IR is decoded from the raw body, so it carries text the
+/// synthesized Chat request never held (an unknown top-level key kept in
+/// `ir.raw`, a `Reasoning` block's thinking text). Those placeholders are only
+/// in `mask_ir`'s report, so dropping it left them unrestorable: a model that
+/// echoed one handed the client a raw `[[EMAIL_…]]` marker. The dispatcher
+/// merges the two maps (`PlaceholderMap::extend`), which this test pins.
+#[tokio::test]
+async fn dispatch_chat_restores_ir_only_placeholders() {
+    // `message_email` sits in the message text (both scans see it); the other
+    // two live in IR-only fields.
+    let message_email = "alice@example.com";
+    let raw_email = "bob@example.com";
+    let thinking_email = "carol@example.com";
+    let message_ph = sag_privacy::placeholder::make("email", message_email, "");
+    let raw_ph = sag_privacy::placeholder::make("email", raw_email, "");
+    let thinking_ph = sag_privacy::placeholder::make("email", thinking_email, "");
+
+    // `/v1/messages`-shaped body decoded to IR exactly as `routes.rs` does for
+    // the Anthropic ingress: the unknown top-level key and the `thinking`
+    // block survive only in the IR.
+    let ingress_body = json!({
+        "model": "claude-3",
+        "max_tokens": 64,
+        "x-trace-note": raw_email,
+        "messages": [
+            {"role": "user", "content": format!("write to {message_email}")},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": format!("{thinking_email} is the contact")},
+                {"type": "text", "text": "noted"},
+            ]},
+        ],
+    });
+    let ir = AnthropicMessagesCodec::decode_request(&ingress_body);
+
+    // The upstream echoes every placeholder it saw — including the two the
+    // Chat request never carried.
+    let mock = Arc::new(AnthropicRecordingProvider::new(
+        "claude",
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3",
+            "content": [{
+                "type": "text",
+                "text": format!("{message_ph} / {raw_ph} / {thinking_ph}"),
+            }],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 7},
+        }),
+    ));
+    let state = build_state_with_privacy(
+        vec![mock.clone()],
+        sag_config::PrivacyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let rt = crate::testing::test_dispatch_runtime();
+    // The synthesized Chat request (the only thing `mask_request` sees) holds
+    // the message text alone: no `x-trace-note`, no reasoning block.
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": format!("write to {message_email}")}],
+    }))
+    .expect("valid test request");
+    let targets = vec![ResolvedTarget {
+        upstream_protocol: sag_core::ApiKind::AnthropicMessages,
+        ..target("claude", "claude-3", 0)
+    }];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    ctx.ir = Some(&ir);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // (a) The masked IR is encoded in place: the assistant turn still carries
+    // a `thinking` block (no downgrade to `text`), and the unknown top-level
+    // key round-trips.
+    let body = mock.last_body().expect("provider was called");
+    let blocks = body["messages"][1]["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("assistant content must be blocks: {body}"));
+    assert_eq!(blocks[0]["type"], "thinking", "body: {body}");
+    assert_eq!(
+        blocks[0]["thinking"],
+        json!(format!("{thinking_ph} is the contact")),
+        "body: {body}"
+    );
+    assert_eq!(body["x-trace-note"], json!(raw_ph), "body: {body}");
+
+    // (b) Every occurrence is a placeholder — no plaintext left the gateway.
+    let sent = serde_json::to_string(&body).expect("body serializes");
+    for email in [message_email, raw_email, thinking_email] {
+        assert!(!sent.contains(email), "upstream saw {email}: {sent}");
+    }
+
+    // (c) The client gets all three plaintexts back — including the two whose
+    // placeholders only `mask_ir` recorded (proof the maps were merged).
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+    for email in [message_email, raw_email, thinking_email] {
+        assert!(text.contains(email), "client missed {email}: {text}");
+    }
+    for ph in [&message_ph, &raw_ph, &thinking_ph] {
+        assert!(
+            !text.contains(ph.as_str()),
+            "client saw placeholder {ph}: {text}"
+        );
+    }
 }
 
 #[tokio::test]

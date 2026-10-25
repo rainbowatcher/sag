@@ -221,12 +221,26 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     // decode below needs the same masked source.
                     None => ChatCompletionsCodec::decode_request(&candidate),
                 };
-                engine.mask_ir(&mut masked_ir);
+                // The IR is a **second** masking source, not a mirror of the
+                // Chat request: on the Anthropic / Responses ingresses the IR
+                // is decoded from the raw body, so it carries protocol-only
+                // fields (message `raw`, unknown top-level keys, `Reasoning`
+                // text) that the synthesized Chat request never held. Those
+                // placeholders exist only in `mask_ir`'s report, so the maps
+                // must be merged — otherwise a model echoing such a
+                // placeholder reaches the client unmasked. Only the maps are
+                // merged: `hits` stay as `mask_request` counted them, since
+                // both scans cover the shared text and merging would
+                // double-count it.
+                let mut restore_map = report.map;
+                if let PrivacyOutcome::Masked(ir_report) = engine.mask_ir(&mut masked_ir) {
+                    restore_map.extend(&ir_report.map);
+                }
                 privacy_ir = Some(masked_ir);
                 // The reverse map is only useful when the response is
                 // restored; `restore = false` forwards placeholders as-is.
-                if privacy_cfg.restore && !report.map.is_empty() {
-                    privacy_map = Some(report.map);
+                if privacy_cfg.restore && !restore_map.is_empty() {
+                    privacy_map = Some(restore_map);
                 }
                 privacy_request = Some(candidate);
             }

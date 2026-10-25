@@ -34,8 +34,11 @@
 //!
 //! Every rule reports all of its candidates (rules overlap freely: an ID
 //! number contains phone-shaped digits). [`PrivacyEngine::scan`] then sorts by
-//! `(start asc, end desc)` and greedily takes non-overlapping spans, so the
-//! leftmost *and longest* candidate wins and no text is masked twice.
+//! `(start asc, end desc)`, breaking a tie on identical spans in favour of the
+//! candidate that passed a *check digit* (a Luhn-valid 15-digit card number
+//! outranks the check-digit-less 15-char legacy ID), then by configuration
+//! order. The sorted candidates are then taken greedily, so the leftmost *and
+//! longest* candidate wins and no text is masked twice.
 
 use aho_corasick::AhoCorasick;
 use regex::RegexBuilder;
@@ -74,6 +77,23 @@ const UNSCANNED_KEYS: &[&str] = &[
     "file_data",
     "url",
 ];
+
+/// One candidate span, before the greedy non-overlap pass.
+struct Candidate {
+    /// Match start (byte offset).
+    start: usize,
+    /// Match end (byte offset, exclusive).
+    end: usize,
+    /// Collection order: rule index first, custom words last.
+    order: usize,
+    /// Whether the rule's checksum is a real check digit (see
+    /// [`Checksum::verifies_check_digit`]).
+    check_digit: bool,
+    /// Detector kind reported for the span.
+    kind: String,
+    /// The matched text.
+    matched: String,
+}
 
 /// A compiled privacy filter, ready to scan requests.
 #[derive(Debug)]
@@ -250,55 +270,78 @@ impl PrivacyEngine {
     /// Each entry is `(start, end, kind, matched)`. Candidates are collected
     /// from every rule (and from `custom_words`), filtered by the allowlist,
     /// then resolved greedily: leftmost first, longest at the same start, and
-    /// — for identical spans — the detector configured first.
+    /// — for identical spans — a rule that verified a check digit before one
+    /// that did not, and only then the detector configured first.
     pub fn scan(&self, text: &str) -> Vec<(usize, usize, String, String)> {
-        let mut found: Vec<(usize, usize, String, String)> = Vec::new();
+        let mut found: Vec<Candidate> = Vec::new();
 
         for rule in &self.rules {
             for m in rule.re.find_iter(text) {
                 if m.start() == m.end() || !rule.accepts(text, m.start(), m.end()) {
                     continue;
                 }
-                found.push((
-                    m.start(),
-                    m.end(),
-                    rule.kind.clone(),
-                    m.as_str().to_string(),
-                ));
+                // `accepts` already ran the checksum, so a rule with a check
+                // that got this far has passed it; all that is left is
+                // classifying *what* passed.
+                let check_digit = rule
+                    .check
+                    .is_some_and(|check| check.verifies_check_digit(m.as_str()));
+                found.push(Candidate {
+                    start: m.start(),
+                    end: m.end(),
+                    order: found.len(),
+                    check_digit,
+                    kind: rule.kind.clone(),
+                    matched: m.as_str().to_string(),
+                });
             }
         }
 
         // Overlapping iteration: the greedy pass below decides which of two
         // overlapping words survives, so none may be dropped up front.
         for m in self.words.find_overlapping_iter(text) {
-            found.push((
-                m.start(),
-                m.end(),
-                self.word_kind.clone(),
-                text[m.start()..m.end()].to_string(),
-            ));
+            found.push(Candidate {
+                start: m.start(),
+                end: m.end(),
+                order: found.len(),
+                check_digit: false,
+                kind: self.word_kind.clone(),
+                matched: text[m.start()..m.end()].to_string(),
+            });
         }
 
-        found.retain(|(_, _, _, matched)| {
+        found.retain(|candidate| {
             !self
                 .allow
                 .iter()
-                .any(|allowed| allowed.as_str() == matched.as_str())
+                .any(|allowed| allowed.as_str() == candidate.matched.as_str())
         });
 
-        // Stable sort: identical spans keep collection order, so the more
-        // specific detector (an ID number is pushed before the bank-card rule)
-        // wins over a generic one that happens to match the same text.
-        found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        // Leftmost first, longest at the same start; for identical spans a
+        // verified check digit wins, and configuration order breaks the rest
+        // (so the more specific detector — an ID number is pushed before the
+        // generic bank-card rule — wins when neither has one).
+        found.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| b.end.cmp(&a.end))
+                .then_with(|| b.check_digit.cmp(&a.check_digit))
+                .then_with(|| a.order.cmp(&b.order))
+        });
 
         let mut out = Vec::with_capacity(found.len());
         let mut cursor = 0;
-        for span in found {
-            if span.0 < cursor {
+        for candidate in found {
+            if candidate.start < cursor {
                 continue;
             }
-            cursor = span.1;
-            out.push(span);
+            cursor = candidate.end;
+            out.push((
+                candidate.start,
+                candidate.end,
+                candidate.kind,
+                candidate.matched,
+            ));
         }
         out
     }
@@ -680,13 +723,47 @@ mod tests {
         );
         // Wrong check digit.
         assert!(engine.scan("id 110101199003074136").is_empty());
-        // 15-char legacy form: boundary check only.
+        // 15-char legacy form: digits plus a plausible birth date.
         assert_eq!(
             kinds(&engine.scan("id 110101900307413")),
             vec!["id_card_cn"]
         );
+        // 15 digits with an impossible birth date (month 13) is not an ID.
+        assert!(engine.scan("id 110101901307413").is_empty());
         // 19 digits is not an ID number.
         assert!(engine.scan("id 1101011990030741355").is_empty());
+    }
+
+    #[test]
+    fn luhn_verified_fifteen_digits_beat_the_legacy_id_rule() {
+        // 15 digits, valid birth date (`900307`) *and* Luhn-valid: both
+        // detectors accept the exact same span, so the check digit wins.
+        let engine = engine_with(|_| {});
+        let spans = engine.scan("card 110101900307003 ok");
+        assert_eq!(kinds(&spans), vec!["bank_card"]);
+        assert_eq!(spans[0].3, "110101900307003");
+
+        // Same number, legacy ID rule only: the date filter accepts it.
+        let engine = only("id_card_cn");
+        assert_eq!(
+            kinds(&engine.scan("card 110101900307003 ok")),
+            vec!["id_card_cn"]
+        );
+
+        // Luhn-valid but the birth date is impossible: only the card rule
+        // matches, so there is no tie to break.
+        let engine = engine_with(|_| {});
+        assert_eq!(
+            kinds(&engine.scan("card 110101901307002 ok")),
+            vec!["bank_card"]
+        );
+
+        // Valid birth date, not Luhn-valid: the legacy ID rule wins on its own.
+        let engine = engine_with(|_| {});
+        assert_eq!(
+            kinds(&engine.scan("card 110101900307000 ok")),
+            vec!["id_card_cn"]
+        );
     }
 
     #[test]
