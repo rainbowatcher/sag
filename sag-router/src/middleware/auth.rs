@@ -1,12 +1,73 @@
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
+    http::header,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use sag_core::AppError;
+use std::net::SocketAddr;
 use tracing::warn;
 
 use sag_state::AppState;
+
+/// Maximum number of `User-Agent` characters kept in the missing-auth warning.
+/// Real client UAs are well below this; the cap only bounds a hostile header.
+const USER_AGENT_MAX_CHARS: usize = 128;
+
+/// Placeholder logged when a diagnostic field is unavailable.
+const UNKNOWN_FIELD: &str = "-";
+
+/// Keep at most `max_chars` characters of `value` (never splits a char).
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((end, _)) => value[..end].to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// Client IP used only for diagnostics in the missing-auth warning.
+///
+/// `ConnectInfo<SocketAddr>` wins when the server is started with
+/// `into_make_service_with_connect_info` (it is not today — see
+/// `sag-gateway/src/main.rs`). Otherwise the reverse-proxy headers are used,
+/// in the same precedence as the chat handlers (`x-forwarded-for` first value,
+/// then `x-real-ip`), and `"-"` when neither is present.
+fn client_ip_for_log(request: &Request) -> String {
+    if let Some(ConnectInfo(addr)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return addr.ip().to_string();
+    }
+
+    let headers = request.headers();
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let real_ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    forwarded
+        .or(real_ip)
+        .map(str::to_string)
+        .unwrap_or_else(|| UNKNOWN_FIELD.to_string())
+}
+
+/// `User-Agent` used only for diagnostics, truncated to
+/// [`USER_AGENT_MAX_CHARS`] characters; `"-"` when absent (or not ASCII).
+fn user_agent_for_log(request: &Request) -> String {
+    request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| truncate_chars(v, USER_AGENT_MAX_CHARS))
+        .unwrap_or_else(|| UNKNOWN_FIELD.to_string())
+}
 
 /// Whether this request path accepts Anthropic SDK `x-api-key` auth (D9).
 ///
@@ -66,7 +127,15 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
                     let provided_key = match auth_header.or(x_api_key) {
                         Some(key) => key,
                         None => {
-                            warn!(path = %path, "request missing Authorization header");
+                            // Diagnostics for unauthenticated traffic: which
+                            // peer and which client, never which credential
+                            // (there is none — that is the point of the log).
+                            warn!(
+                                path = %path,
+                                client_ip = %client_ip_for_log(&request),
+                                user_agent = %user_agent_for_log(&request),
+                                "request missing Authorization header"
+                            );
                             let err = AppError::Unauthorized(if is_messages {
                                 "missing x-api-key or Authorization header".into()
                             } else {
@@ -265,6 +334,136 @@ mod tests {
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── missing-Authorization warning carries client_ip / user_agent ──
+
+    /// Minimal `MakeWriter` that appends every formatted event to a buffer.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+
+        /// The captured missing-Authorization warning line.
+        fn missing_auth_line(&self) -> String {
+            let text = self.text();
+            text.lines()
+                .find(|l| l.contains("request missing Authorization header"))
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("no missing-auth warning captured:\n{text}"))
+        }
+    }
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Scoped (thread-local) subscriber: `tracing::subscriber::set_default`
+    /// keeps the capture off the process-global dispatch, so the other tests
+    /// in this binary are unaffected.
+    fn capture_warnings() -> (Capture, tracing::subscriber::DefaultGuard) {
+        let capture = Capture::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish(),
+        );
+        (capture, guard)
+    }
+
+    #[tokio::test]
+    async fn missing_auth_warns_with_client_ip_and_user_agent() {
+        let state = test_state(Some(vec!["secret".into()])).await;
+        let app = test_app(state);
+        let (capture, _guard) = capture_warnings();
+
+        let request = Request::builder()
+            .uri("/test")
+            .header(header::USER_AGENT, "probe-agent/1.0")
+            .header("x-forwarded-for", "203.0.113.9, 70.41.3.18")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let line = capture.missing_auth_line();
+        assert!(
+            line.contains("client_ip=203.0.113.9"),
+            "first X-Forwarded-For value must be logged: {line}"
+        );
+        assert!(
+            line.contains("user_agent=probe-agent/1.0"),
+            "User-Agent must be logged: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_auth_warns_with_placeholders_when_absent() {
+        let state = test_state(Some(vec!["secret".into()])).await;
+        let app = test_app(state);
+        let (capture, _guard) = capture_warnings();
+
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let line = capture.missing_auth_line();
+        // The fmt layer prints the message first and the fields after it, so
+        // a placeholder field can also end the line — compare whole tokens.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            fields.contains(&"client_ip=-"),
+            "missing peer headers must log a placeholder: {line}"
+        );
+        assert!(
+            fields.contains(&"user_agent=-"),
+            "missing User-Agent must log a placeholder: {line}"
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_x_real_ip() {
+        let request = Request::builder()
+            .uri("/test")
+            .header("x-real-ip", "198.51.100.4")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(client_ip_for_log(&request), "198.51.100.4");
+    }
+
+    #[test]
+    fn user_agent_is_truncated_to_the_cap() {
+        let long_ua = "u".repeat(USER_AGENT_MAX_CHARS + 40);
+        let request = Request::builder()
+            .uri("/test")
+            .header(header::USER_AGENT, &long_ua)
+            .body(Body::empty())
+            .unwrap();
+        let logged = user_agent_for_log(&request);
+        assert_eq!(logged.chars().count(), USER_AGENT_MAX_CHARS);
+        assert!(long_ua.starts_with(&logged));
     }
 }
 
