@@ -62,6 +62,14 @@ class ParseConventionalTest(unittest.TestCase):
         self.assertEqual(parsed.scope, "analytics")
         self.assertEqual(parsed.subject, "重构 X")
 
+    def test_empty_scope_is_normalized_to_none(self) -> None:
+        """`feat(): x` 的空 scope 归一为 None（渲染时不输出 `()`）。"""
+        parsed = rn.parse_conventional("feat(): x")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None  # for type checkers
+        self.assertIsNone(parsed.scope)
+        self.assertEqual(parsed.subject, "x")
+
     def test_merge_commit_is_not_conventional(self) -> None:
         self.assertIsNone(rn.parse_conventional("Merge pull request #12"))
 
@@ -94,6 +102,15 @@ class ClassifyTest(unittest.TestCase):
         for type_ in ("build", "ci", "chore", "test"):
             with self.subTest(type_=type_):
                 self.assertEqual(rn.classify(type_), "misc")
+
+    def test_uppercase_type_classifies_but_keeps_case(self) -> None:
+        """`classify()` 对 type 大小写宽容；但解析结果保留原文大小写。"""
+        self.assertEqual(rn.classify("FEAT"), "feature")
+        self.assertEqual(rn.classify("Fix"), "fix")
+        parsed = rn.parse_conventional("FEAT(ui): x")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None  # for type checkers
+        self.assertEqual(parsed.type, "FEAT", msg="解析层不应改写大小写")
 
     def test_unknown_type_goes_to_misc(self) -> None:
         self.assertEqual(rn.classify("perf"), "misc")
@@ -206,6 +223,12 @@ class HasBreakingFooterTest(unittest.TestCase):
         self.assertFalse(rn.has_breaking_footer("breaking change: drop v1"))
         self.assertFalse(rn.has_breaking_footer("Breaking-Change: drop v1"))
 
+    def test_breaking_footer_with_crlf_body(self) -> None:
+        """CRLF body（未在 `git()` 处归一化时）也要命中 footer。"""
+        self.assertTrue(rn.has_breaking_footer("intro\r\nBREAKING CHANGE: drop\r\n"))
+        self.assertTrue(rn.has_breaking_footer("BREAKING-CHANGE: drop\r\n"))
+        self.assertFalse(rn.has_breaking_footer("plain body\r\nRefs: #12\r\n"))
+
     def test_token_must_start_the_line(self) -> None:
         self.assertFalse(rn.has_breaking_footer("not a BREAKING CHANGE: here"))
 
@@ -249,6 +272,18 @@ class RenderNotesTest(unittest.TestCase):
             "(https://github.com/owner/name/compare/v0.6.0...v0.7.0)\n"
         )
         self.assertEqual(body, expected)
+
+    def test_uppercase_type_renders_head_verbatim(self) -> None:
+        """大写 type 进「新增」组，但渲染行保留原文大写（不归一为小写）。"""
+        body = rn.render_notes(
+            [rn.Commit(sha=SHA_A, subject="FEAT(ui): x")],
+            version="v0.7.0",
+            prev_tag=None,
+            date="2024-05-06",
+        )
+        self.assertIn("### ✨ 新增", body)
+        self.assertIn("- FEAT(ui): x", body)
+        self.assertNotIn("- feat(ui): x", body)
 
     def test_group_order_is_fixed(self) -> None:
         # 输入故意打乱，输出必须按 GROUP_ORDER 排列。

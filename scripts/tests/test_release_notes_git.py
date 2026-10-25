@@ -51,9 +51,16 @@ GIT = shutil.which("git")
 # 表现不同（CI 的 test job 就带着这两个变量）。
 _LEAKY_GITHUB_VARS = ("GITHUB_REF_NAME", "GITHUB_REPOSITORY", "GITHUB_ACTIONS")
 
-# CI / 开发机上不允许依赖任何用户级或系统级 git 配置，也不继承 GITHUB_* 变量。
+# git 的仓库定位变量：从 hook / rebase / submodule 上下文里跑测试时它们会残留，
+# 此时 `git -C <tmp>` 照样被重定向到外部仓库，fixture 会全线崩溃且报错难懂。
+_LEAKY_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+
+# 需要从子进程 env 与 os.environ 两侧对称摘除的全部变量。
+_LEAKY_ENV_VARS = _LEAKY_GITHUB_VARS + _LEAKY_GIT_VARS
+
+# CI / 开发机上不允许依赖任何用户级或系统级 git 配置，也不继承 GITHUB_* / GIT_* 变量。
 _GIT_ENV = {
-    key: value for key, value in os.environ.items() if key not in _LEAKY_GITHUB_VARS
+    key: value for key, value in os.environ.items() if key not in _LEAKY_ENV_VARS
 }
 _GIT_ENV.update(
     {
@@ -69,8 +76,8 @@ _GIT_ENV.update(
 
 @contextmanager
 def _sanitized_github_env() -> Iterator[None]:
-    """临时把 GITHUB_* 变量从 `os.environ` 里摘掉，模拟干净的本地环境。"""
-    saved = {key: os.environ.pop(key) for key in _LEAKY_GITHUB_VARS if key in os.environ}
+    """临时把 GITHUB_* 与 GIT_* 定位变量从 `os.environ` 里摘掉，模拟干净的本地环境。"""
+    saved = {key: os.environ.pop(key) for key in _LEAKY_ENV_VARS if key in os.environ}
     try:
         yield
     finally:
@@ -123,11 +130,25 @@ class GitRepoTestCase(unittest.TestCase):
         )
         return proc.stdout
 
-    def _commit(self, subject: str, date: str, body: str | None = None) -> None:
+    def _commit(
+        self,
+        subject: str,
+        date: str,
+        body: str | None = None,
+        *,
+        full_date: str | None = None,
+    ) -> None:
+        """建一个空提交。
+
+        `date` 是 `YYYY-MM-DD`，默认展开成当天 `12:00:00 +0000`（UTC 正午，避开
+        换日歧义）；需要钉住「committer 时区日历日 ≠ UTC 日」时用 `full_date`
+        传完整时间戳（git 的 `GIT_*_DATE` 格式，如 `2024-01-07T02:00:00 +0800`）。
+        """
+        stamp = full_date or f"{date}T12:00:00 +0000"
         env = {
             **_GIT_ENV,
-            "GIT_AUTHOR_DATE": f"{date}T12:00:00 +0000",
-            "GIT_COMMITTER_DATE": f"{date}T12:00:00 +0000",
+            "GIT_AUTHOR_DATE": stamp,
+            "GIT_COMMITTER_DATE": stamp,
         }
         message_args = ["-m", subject]
         if body is not None:
@@ -286,6 +307,32 @@ class GitIntegrationTest(GitRepoTestCase):
         self.assertEqual(code, 0, msg=self.last_stderr)
         self.assertIn("feat(api): add models endpoint", self.last_stdout)
         self.assertNotIn("feat(api)!:", self.last_stdout)
+
+    def test_title_date_uses_committer_timezone_not_utc(self) -> None:
+        """标题日期取 committer 时区下的日历日，不是 UTC 日（可复现性不变量）。
+
+        commit 的 `+0800` 本地时间是 2024-01-07T02:00，对应的 UTC 日历日是
+        2024-01-06T18:00（前一天）；标题必须是 2024-01-07 —— 任何「转 UTC 再
+        取日期」或「用 CI 当天日期」的实现都会在这里翻车。
+        """
+        self._commit(
+            "feat(api): midnight commit",
+            "2024-01-07",
+            full_date="2024-01-07T02:00:00 +0800",
+        )
+        self._git("tag", "v0.2.0")
+
+        # 用例前提：该 commit 的 UTC 日历日确实与 committer 日历日不同
+        iso = self._git("log", "-1", "--format=%cI", "v0.2.0").strip()
+        self.assertEqual(iso, "2024-01-07T02:00:00+08:00")
+
+        code = self._run_main("--tag", "v0.2.0")
+
+        self.assertEqual(code, 0, msg=self.last_stderr)
+        body = self.last_stdout
+        self.assertTrue(body.startswith("## sag v0.2.0 (2024-01-07)\n"), msg=body)
+        self.assertNotIn("2024-01-06", body.split("\n")[0])
+        self.assertIn("feat(api): midnight commit", body)
 
     def test_explicit_range_overrides_tag_discovery(self) -> None:
         """`--range` 完全接管范围：全历史（4 条）而非自动发现的 2 条。"""
