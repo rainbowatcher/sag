@@ -110,13 +110,29 @@ const anthropic = provider({ name: "anthropic", enabled: false, enabled_models: 
   assert.equal(isPickedRow(target({ id: 9 })), true)
 }
 
-// ── buildPickerGroups: empty providers are dropped ────────────────
+// ── buildPickerGroups: empty providers keep their section ────────
 {
   const groups = buildPickerGroups([openai, provider({ name: "empty" })], {}, [])
   assert.deepEqual(
     groups.map((g) => g.provider),
+    ["openai", "empty"],
+    "a provider without any model still renders its section (empty state)",
+  )
+  assert.deepEqual(groups[1].options, [], "the empty provider offers no options")
+  assert.deepEqual(
+    flattenOptions(groups).map((o) => o.model),
     [],
-    "providers without any model do not render an empty section",
+    "option-less groups contribute nothing to the navigation order",
+  )
+  assert.deepEqual(
+    filterPickerGroups(groups, "").map((g) => g.provider),
+    ["openai", "empty"],
+    "the empty section survives an empty query so its hint stays visible",
+  )
+  assert.deepEqual(
+    filterPickerGroups(groups, "empty").map((g) => g.provider),
+    [],
+    "an option-less group is dropped while filtering (nothing can match)",
   )
 }
 

@@ -391,6 +391,7 @@ export const en = {
   "routes.targetPicker.confirmBoth": "Add {add} / remove {remove}",
   "routes.targetPicker.orphan": "not in model list",
   "routes.targetPicker.providerDisabled": "Disabled",
+  "routes.targetPicker.providerNoModels": "No models available for this provider",
 
   // ── Analytics › V2 panel ────────────────────────────────────────
   "analytics.v2.columns.actualModel": "Actual Model",
@@ -637,6 +638,8 @@ export const en = {
   "logs.filter.searchRealModel": "Search real model...",
   "logs.filter.status": "status",
   "logs.filter.session": "session key (hashed)",
+  "logs.filter.sessionChip": "session filter",
+  "logs.filter.sessionClear": "Clear session filter",
   "logs.filter.searchStatus": "Search status...",
   "logs.status.non2xx": "Non-2xx (All Errors)",
   "logs.status.4xx": "4xx (Client Errors)",

@@ -60,8 +60,9 @@ export const useRouteStore = defineStore("routes", () => {
 
   /**
    * Resolve one provider's model list: the curated `enabled_models` when the
-   * provider declares one (synchronous), otherwise the upstream `/models`
-   * probe. Always awaits the probe so callers never depend on that split.
+   * provider declares one (synchronous), otherwise ask the admin API for that
+   * provider's models — that endpoint only echoes the config, so the answer can
+   * be empty. Always awaits the request so callers never depend on that split.
    */
   async function loadProviderModels(providerName: string, providers: Provider[]) {
     const p = providers.find((p) => p.name === providerName)

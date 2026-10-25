@@ -50,6 +50,14 @@ export const useAnalyticsStore = defineStore("analytics", () => {
   const logsLimit = ref(DEFAULT_LOG_LIMIT)
   const hasMoreLogs = ref(false)
   const activeLogFilter = ref<LogFilter>({})
+  /**
+   * Generation guard for the logs list, mirroring the v2 query guards. Only the
+   * newest `fetchLogs` call may write `logs`/`logsTotal`/`hasMoreLogs`/
+   * `logsOffset`/`logsLimit`; a slow response from a superseded page or filter
+   * (rapid paging, re-filtering, pasting a session key) is dropped instead of
+   * overwriting the newer page.
+   */
+  const logsGuard = createQueryGuard()
 
   /**
    * Apply a new filter, reset offset to page 0, and fetch. Called by the
@@ -73,8 +81,14 @@ export const useAnalyticsStore = defineStore("analytics", () => {
    * `offset` for pagination). When called with no arguments the offset
    * falls back to `logsOffset.value`, so a bare `fetchLogs()` reloads the
    * current page in place — used by the "Refresh" button.
+   *
+   * Only the request holding the current generation token may write state: a
+   * late response/error from a superseded page or filter is dropped, so the
+   * list can never snap back to an older page or show a stale error over
+   * freshly loaded rows.
    */
   async function fetchLogs(overrides: LogFilter = {}) {
+    const token = logsGuard.next()
     logsLoading.value = true
     logsError.value = null
     try {
@@ -90,6 +104,7 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       params.set("offset", String(targetOffset))
       params.set("limit", String(effectiveLimit))
       const { data } = await api.get<LogsResponse>(`/api/logs?${params}`)
+      if (!logsGuard.isCurrent(token)) return
       logs.value = data.data ?? []
       logsTotal.value = data.total ?? 0
       hasMoreLogs.value = targetOffset + logs.value.length < logsTotal.value
@@ -97,9 +112,10 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       logsLimit.value = effectiveLimit
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
+      if (!logsGuard.isCurrent(token)) return
       logsError.value = getErrorMessage(e, "Failed to load call logs")
     } finally {
-      logsLoading.value = false
+      if (logsGuard.isCurrent(token)) logsLoading.value = false
     }
   }
 

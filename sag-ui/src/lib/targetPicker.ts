@@ -35,7 +35,13 @@ export interface PickerOption extends ModelOption {
   disabledProvider: boolean
 }
 
-/** One provider section of the picker list. */
+/**
+ * One provider section of the picker list. A group may have zero options: the
+ * provider is still listed (with an empty-state hint) so the picker keeps its
+ * "browse every provider" promise instead of hiding providers whose model list
+ * is empty — `/api/providers/{name}/models` only echoes the configured
+ * `enabled_models`, so an empty list is a reachable state, not a failure.
+ */
 export interface PickerGroup {
   provider: string
   disabledProvider: boolean
@@ -78,7 +84,9 @@ export function selectedKeysFromTargets(targets: TargetItem[]): string[] {
 /**
  * Build the provider-grouped option list.
  *
- * Provider order follows the config order; a provider referenced only by an
+ * Provider order follows the config order; every configured provider gets a
+ * group even when it serves no models, so its section renders with an empty
+ * state rather than silently disappearing. A provider referenced only by an
  * existing target (deleted provider, or a model list that failed to load)
  * gets an extra group at the end so those rows stay un-tickable instead of
  * becoming unremovable. Existing target models that the provider no longer
@@ -131,7 +139,7 @@ export function buildPickerGroups(
     push(group(target.provider), target.real_model, true)
   }
 
-  return groups.filter((g) => g.options.length > 0)
+  return groups
 }
 
 /** Flatten the groups into list order (the keyboard navigation order). */
@@ -143,8 +151,10 @@ export function flattenOptions(groups: PickerGroup[]): PickerOption[] {
 
 /**
  * Filter by provider name *or* model name. An empty query returns the groups
- * unchanged (so group headings stay visible); otherwise empty groups are
- * dropped. A provider-name hit keeps all of that provider's models.
+ * unchanged (so group headings — including the empty-provider ones — stay
+ * visible); otherwise option-less groups are dropped, since an empty section
+ * cannot match a needle. A provider-name hit keeps all of that provider's
+ * models.
  */
 export function filterPickerGroups(groups: PickerGroup[], query: string): PickerGroup[] {
   const needle = query.trim().toLowerCase()

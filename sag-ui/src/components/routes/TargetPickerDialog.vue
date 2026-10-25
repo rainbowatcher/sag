@@ -119,9 +119,11 @@ const errorText = computed(() =>
 )
 
 /**
- * Load every provider's model list: the curated `enabled_models` when the
- * provider declares one, otherwise the upstream `/models` probe. Cached lists
- * are reused so reopening the picker does not re-hit the API.
+ * Load every provider's model list. `/api/providers/{name}/models` only
+ * echoes the configured `enabled_models` (no upstream probe), so a provider
+ * with an empty list stays empty — the picker still renders its section with
+ * an empty-state hint. Cached lists are reused so reopening the picker does
+ * not re-hit the API.
  */
 async function loadModels() {
   if (props.providers.length === 0) return
@@ -173,7 +175,11 @@ function onKeydown(event: KeyboardEvent) {
     activeIndex.value = Math.min(last, Math.max(0, activeIndex.value + delta))
     return
   }
-  if (event.key === "Enter") {
+  if (event.key === "Enter" || event.key === " ") {
+    // Space is the documented toggle key (0006). It cannot double as a typed
+    // space here: the filter is a single substring match, so a literal space in
+    // the needle gains nothing, while `preventDefault` keeps the page/list from
+    // scrolling under the dialog.
     const option = flatOptions.value[activeIndex.value]
     if (!option || event.isComposing) return
     event.preventDefault()
@@ -301,6 +307,18 @@ onBeforeUnmount(() => {
             <Badge v-if="group.disabledProvider" variant="outline" class="shrink-0 text-[10px]">
               {{ $t("routes.targetPicker.providerDisabled") }}
             </Badge>
+          </div>
+
+          <!--
+            A provider without models keeps its section so it stays discoverable
+            instead of silently vanishing; the hint waits for loading to settle so
+            it never reads as a result before the models arrive.
+          -->
+          <div
+            v-if="group.options.length === 0 && !loading"
+            class="text-muted-foreground px-2 py-1.5 text-xs"
+          >
+            {{ $t("routes.targetPicker.providerNoModels") }}
           </div>
 
           <div

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertCircle, Loader2, ChevronLeft, ChevronRight } from "@lucide/vue"
+import { AlertCircle, Loader2, ChevronLeft, ChevronRight, X } from "@lucide/vue"
 import type { AcceptableValue } from "reka-ui"
 import { ref, onMounted, computed } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
@@ -80,6 +80,16 @@ async function refreshLogs() {
   })
 }
 
+/**
+ * Drop the applied session filter. The input box itself is xl-only, so on a
+ * narrow viewport this chip is the only way to see and clear that filter.
+ * The remaining filters are re-applied (and the page reset) by the store.
+ */
+async function clearSessionFilter() {
+  logsFilterSession.value = ""
+  await store.applyLogsFilter({ ...store.activeLogFilter, session: undefined })
+}
+
 /** Refresh the current page in place without resetting the offset. */
 async function refreshCurrentPage() {
   await store.fetchLogs()
@@ -90,7 +100,7 @@ const showingStart = computed(() => (store.logsTotal === 0 ? 0 : store.logsOffse
 const showingEnd = computed(() => Math.min(store.logsOffset + store.logs.length, store.logsTotal))
 
 function onPageChange(page: number) {
-  store.setLogsPage(page)
+  void store.setLogsPage(page)
 }
 
 function statusBadgeClass(code: number): string {
@@ -115,16 +125,16 @@ onMounted(() => {
 
   // Load provider and model data for SearchSelect options if not already loaded.
   if (providerStore.providers.length === 0) {
-    providerStore.fetchProviders()
+    void providerStore.fetchProviders()
   }
   if (providerStore.allProviderModels.length === 0) {
-    providerStore.fetchAllProviderModels()
+    void providerStore.fetchAllProviderModels()
   }
   if (routeStore.routes.length === 0) {
-    routeStore.fetchRoutes()
+    void routeStore.fetchRoutes()
   }
 
-  store.fetchLogs()
+  void store.fetchLogs()
 })
 
 function formatTs(iso: string): string {
@@ -231,6 +241,27 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           class="hidden xl:ml-auto xl:inline-flex xl:shrink-0"
           @click="refreshCurrentPage()"
         />
+      </div>
+      <!-- Applied session filter, visible on every viewport (its input is xl-only) -->
+      <div v-if="store.activeLogFilter.session" class="flex flex-wrap items-center gap-2">
+        <Badge variant="outline" class="max-w-full gap-1.5 py-1 text-xs">
+          <span class="text-muted-foreground">{{ $t("logs.filter.sessionChip") }}</span>
+          <span
+            class="max-w-[24ch] min-w-0 truncate font-mono"
+            :title="store.activeLogFilter.session"
+          >
+            {{ store.activeLogFilter.session }}
+          </span>
+          <button
+            type="button"
+            class="hover:text-destructive focus-visible:ring-ring inline-flex shrink-0 items-center rounded-sm focus-visible:ring-2 focus-visible:outline-none"
+            :aria-label="$t('logs.filter.sessionClear')"
+            :title="$t('logs.filter.sessionClear')"
+            @click="clearSessionFilter()"
+          >
+            <X class="size-3" />
+          </button>
+        </Badge>
       </div>
       <Alert v-if="store.logsError" variant="destructive">
         <AlertCircle class="h-4 w-4" />

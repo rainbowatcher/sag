@@ -76,7 +76,7 @@ function openCreateRoute(model: string) {
   routeToCreate.value = model
   customRouteName.value = props.providerName ? `${props.providerName}/${model}` : model
   if (routeStore.routes.length === 0) {
-    routeStore.fetchRoutes()
+    void routeStore.fetchRoutes()
   }
 }
 

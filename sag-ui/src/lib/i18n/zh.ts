@@ -370,6 +370,7 @@ export const zh: Record<keyof typeof en, string> = {
   "routes.targetPicker.confirmBoth": "新增 {add} 条 / 移除 {remove} 条",
   "routes.targetPicker.orphan": "不在模型列表",
   "routes.targetPicker.providerDisabled": "已禁用",
+  "routes.targetPicker.providerNoModels": "该供应商暂无可用模型",
 
   // ── Analytics › V2 panel ─────────────────────────────────────
   "analytics.v2.columns.actualModel": "实际模型",
@@ -601,6 +602,8 @@ export const zh: Record<keyof typeof en, string> = {
   "logs.filter.searchRealModel": "搜索实际模型...",
   "logs.filter.status": "状态",
   "logs.filter.session": "会话键（哈希）",
+  "logs.filter.sessionChip": "会话过滤",
+  "logs.filter.sessionClear": "清除会话过滤",
   "logs.filter.searchStatus": "搜索状态...",
   "logs.status.non2xx": "非 2xx（全部错误）",
   "logs.status.4xx": "4xx（客户端错误）",
