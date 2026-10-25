@@ -529,6 +529,24 @@ impl GatewayConfig {
                 ));
             }
 
+            // ── session_sticky × wildcard route ──
+            // A wildcard route matches every request model, and session
+            // affinity keeps one "space" per **request model** (each space
+            // holding up to `session_max_entries` pins plus
+            // `max(capacity, 1024)` tombstones). Nothing bounds the number of
+            // spaces, so on a wildcard route the key domain is whatever model
+            // names clients send: memory grows as models × capacity with no
+            // ceiling. Reject the combination instead of accepting an
+            // unbounded key domain (same fail-fast rationale as the image ×
+            // session_sticky rule above); an explicit route per model keeps
+            // the space count finite.
+            if route.strategy == Strategy::SessionSticky && route.model_name == "*" {
+                errors.push(format!(
+                    "routes[{i}] (model='{}'): strategy = \"session_sticky\" is not supported on a wildcard route — the route matches every request model, so the session-affinity space keyed by the request model grows with the client-controlled model-name domain (each space holds up to session_max_entries pins plus tombstones) and memory is unbounded; add an explicit route per model, or use \"sticky_failover\", \"fill_first\", or \"round_robin\" on the wildcard route",
+                    route.model_name
+                ));
+            }
+
             if let Some(retries) = route.retries
                 && retries > 10
             {
@@ -3348,6 +3366,93 @@ targets = [{ provider = "openai" }]
                 "positive session_max_entries must validate"
             );
             assert_eq!(config.routes[0].session_max_entries, Some(500));
+        }
+
+        #[test]
+        fn rejects_session_sticky_on_wildcard_route() {
+            // A wildcard route matches every request model, so the
+            // session-affinity space (keyed by request model) would grow
+            // with the client-controlled model-name domain — unbounded
+            // memory. Reject the combination instead of degrading.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "*"
+strategy = "session_sticky"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains(
+                    "strategy = \"session_sticky\" is not supported on a wildcard route"
+                ) && e.contains("session_max_entries")),
+                "wildcard route with session_sticky must error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_non_sticky_strategy_on_wildcard_route() {
+            // Only `session_sticky` keys state by request model; the other
+            // strategies keep no per-model space, so the wildcard stays
+            // legal for them.
+            for strategy in ["fill_first", "round_robin", "sticky_failover"] {
+                let config: GatewayConfig = toml::from_str(&format!(
+                    r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = {{ chat_completions = {{ base_url = "https://api.openai.com/v1" }} }}
+
+[[routes]]
+model_name = "*"
+strategy = "{strategy}"
+targets = [{{ provider = "openai" }}]
+"#
+                ))
+                .unwrap();
+                assert!(
+                    config.validate().is_ok(),
+                    "wildcard route with strategy = {strategy} must validate"
+                );
+            }
+        }
+
+        #[test]
+        fn accepts_session_sticky_on_explicit_route_beside_wildcard() {
+            // The wildcard × session_sticky rule must not over-reject: an
+            // explicit model route keeps the space count finite, so it stays
+            // legal even when a non-sticky wildcard route follows it.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+strategy = "session_sticky"
+targets = [{ provider = "openai" }]
+
+[[routes]]
+model_name = "*"
+strategy = "fill_first"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "explicit session_sticky route beside a wildcard route must validate"
+            );
+            assert_eq!(config.routes[0].strategy, Strategy::SessionSticky);
         }
 
         #[test]
