@@ -10,8 +10,10 @@ use tracing::warn;
 
 use sag_state::AppState;
 
-/// Maximum number of `User-Agent` characters kept in the missing-auth warning.
-/// Real client UAs are well below this; the cap only bounds a hostile header.
+/// Maximum number of characters kept for a header-derived diagnostic field in
+/// the auth warnings (`User-Agent`, and the proxy IP headers via
+/// [`client_ip_for_log`]). Real client values are well below this; the cap only
+/// bounds a hostile header.
 const USER_AGENT_MAX_CHARS: usize = 128;
 
 /// Placeholder logged when a diagnostic field is unavailable.
@@ -32,6 +34,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// `sag-gateway/src/main.rs`). Otherwise the reverse-proxy headers are used,
 /// in the same precedence as the chat handlers (`x-forwarded-for` first value,
 /// then `x-real-ip`), and `"-"` when neither is present.
+///
+/// The value comes straight from a client-controllable header, so it is capped
+/// at [`USER_AGENT_MAX_CHARS`] like the `User-Agent` — an unauthenticated
+/// caller must not be able to inflate every warning line.
 fn client_ip_for_log(request: &Request) -> String {
     if let Some(ConnectInfo(addr)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
         return addr.ip().to_string();
@@ -52,7 +58,7 @@ fn client_ip_for_log(request: &Request) -> String {
 
     forwarded
         .or(real_ip)
-        .map(str::to_string)
+        .map(|value| truncate_chars(value, USER_AGENT_MAX_CHARS))
         .unwrap_or_else(|| UNKNOWN_FIELD.to_string())
 }
 
@@ -159,7 +165,14 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
     };
 
     if !key_valid {
-        warn!(path = %path, "invalid gateway API key");
+        // Same attribution as the missing-header branch: invalid keys are the
+        // brute-force signal, so the peer and client matter even more here.
+        warn!(
+            path = %path,
+            client_ip = %client_ip_for_log(&request),
+            user_agent = %user_agent_for_log(&request),
+            "invalid gateway API key"
+        );
         let err = AppError::Unauthorized("invalid API key".into());
         return if is_messages {
             err.into_anthropic_response()
@@ -451,6 +464,22 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(client_ip_for_log(&request), "198.51.100.4");
+    }
+
+    #[test]
+    fn client_ip_is_truncated_to_the_cap() {
+        // `x-forwarded-for` is client-controllable: an unauthenticated caller
+        // must not be able to inflate every warning line, so the same cap as
+        // `User-Agent` applies.
+        let long_ip = "1".repeat(USER_AGENT_MAX_CHARS + 40);
+        let request = Request::builder()
+            .uri("/test")
+            .header("x-forwarded-for", &long_ip)
+            .body(Body::empty())
+            .unwrap();
+        let logged = client_ip_for_log(&request);
+        assert_eq!(logged.chars().count(), USER_AGENT_MAX_CHARS);
+        assert!(long_ip.starts_with(&logged));
     }
 
     #[test]

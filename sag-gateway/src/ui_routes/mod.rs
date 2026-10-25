@@ -32,12 +32,13 @@
 //! 5. `/` → shell.
 //! 6. `Accept: text/html` → shell (a browser hard-refreshing a dotted route
 //!    such as `/providers/glm-4.6` must still get the SPA).
-//! 7. last segment carries a known static-asset extension (see
+//! 7. last *non-empty* segment carries a known static-asset extension (see
 //!    [`ASSET_EXTENSIONS`]) → `404` (favicon / `*.map` / image / font probes).
 //!    Deliberately narrower than the plan's step 6 ("last segment contains
 //!    `.`"): that also 404'd dotted client-side routes such as
 //!    `/providers/v1.2` for a non-browser client sending `Accept: */*`. The
-//!    intent is unchanged — a missing *subresource* must not get the shell.
+//!    intent is unchanged — a missing *subresource* must not get the shell,
+//!    including when it is probed with a trailing slash (`/gone.js/`).
 //! 8. otherwise → shell.
 //!
 //! # Cache-Control is tiered by path, not by file type
@@ -161,10 +162,17 @@ pub(crate) async fn ui_handler(method: Method, uri: Uri, headers: HeaderMap) -> 
             .into_response();
     }
 
+    // `Accept-Encoding` may be split over several field lines (RFC 9110 §5.5),
+    // so every line is folded into one list before negotiating. Reading only
+    // the first line would silently drop a coding the client accepts.
     let accept_encoding = headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|value| value.to_str().ok());
-    let encoding = negotiate::negotiate(accept_encoding);
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let encoding =
+        negotiate::negotiate((!accept_encoding.is_empty()).then_some(accept_encoding.as_str()));
 
     // Never serve a raw pre-compressed sibling as a standalone resource: the
     // browser would treat `foo.js.br` as a file of its own.
@@ -289,13 +297,16 @@ const ASSET_EXTENSIONS: &[&str] = &[
 /// `foo.js.map`, `logo.svg`) — i.e. its extension is in
 /// [`ASSET_EXTENSIONS`]. Used to answer subresource probes with a 404 instead
 /// of the SPA shell; dotted routes (`/providers/v1.2`) are *not* assets.
+///
+/// The last *non-empty* segment decides, so a trailing slash does not turn a
+/// missing subresource (`/gone.js/`) back into a client-side route.
 #[cfg(feature = "embed-ui")]
 fn looks_like_asset(path: &str) -> bool {
-    let Some((_, extension)) = path
+    let last = path
         .rsplit('/')
-        .next()
-        .and_then(|last| last.rsplit_once('.'))
-    else {
+        .find(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let Some((_, extension)) = last.rsplit_once('.') else {
         return false;
     };
     ASSET_EXTENSIONS
@@ -371,6 +382,7 @@ fn revalidate(request_headers: &HeaderMap, response: Response) -> Response {
     builder.body(Body::empty()).unwrap_or_else(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF)],
             "failed to build 304 response",
         )
             .into_response()
@@ -458,6 +470,7 @@ fn file_response(
     builder.body(Body::from(file.data)).unwrap_or_else(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF)],
             "failed to build response for embedded asset",
         )
             .into_response()
@@ -843,6 +856,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trailing_slash_probe_returns_404() {
+        // `/gone.js/` names the same missing subresource as `/gone.js`; the
+        // last *non-empty* segment decides, so a trailing slash must not fall
+        // back to the SPA shell.
+        let response = send(request_with("/gone.js/", "GET", &[("accept", "*/*")])).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = body_string(response).await;
+        assert!(
+            !body.to_ascii_lowercase().contains("<!doctype"),
+            "got {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn non_get_method_is_rejected() {
         let response = send(request_with("/", "POST", &[])).await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -1058,6 +1085,29 @@ mod tests {
         ))
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn accept_encoding_reads_every_header_line() {
+        if !has_asset("index.html") || !has_asset("index.html.br") {
+            return;
+        }
+
+        // RFC 9110 §5.5 lets the list be split across field lines: reading only
+        // the first one would serve gzip (or identity) to a client that also
+        // accepts brotli.
+        let response = send(request_with(
+            "/",
+            "GET",
+            &[("accept-encoding", "gzip"), ("accept-encoding", "br")],
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_str(&response, header::CONTENT_ENCODING).as_deref(),
+            Some("br"),
+            "a coding on the second Accept-Encoding line must be negotiated"
+        );
     }
 
     #[tokio::test]
