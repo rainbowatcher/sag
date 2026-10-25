@@ -81,7 +81,22 @@ const form = useForm({
             v.session_max_entries.trim() === "" ||
             /^[1-9]\d*$/.test(v.session_max_entries.trim()),
           { message: t("routes.form.sessionMaxEntriesInvalid"), path: ["session_max_entries"] },
-        ),
+        )
+        // Rejected by the backend (`sag-config` route validation) instead of
+        // being stored: a wildcard route matches every request model, so the
+        // session-affinity space keyed by request model is unbounded.
+        .refine(
+          (v) =>
+            v.strategy !== "session_sticky" ||
+            (v.model_name || targets.value[0]?.real_model || "") !== "*",
+          { message: t("routes.form.wildcardSessionStickyUnsupported"), path: ["strategy"] },
+        )
+        // Also a backend rejection: image dispatch performs no session
+        // write-back, so a pin would never be recorded.
+        .refine((v) => !(v.strategy === "session_sticky" && v.pipeline === "image"), {
+          message: t("routes.form.imageSessionStickyUnsupported"),
+          path: ["pipeline"],
+        }),
     }
   },
   onSubmit: async ({ value }) => {
@@ -214,6 +229,7 @@ async function handleSubmit(event: Event) {
               >
                 {{ $t("routes.form.strategySessionStickyHint") }}
               </p>
+              <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>
 
@@ -236,6 +252,7 @@ async function handleSubmit(event: Event) {
               <p class="text-muted-foreground text-[10px]">
                 {{ $t("routes.form.pipelineHint") }}
               </p>
+              <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>
 

@@ -95,6 +95,18 @@ async function refreshCurrentPage() {
   await store.fetchLogs()
 }
 
+/** Number of leading session-key chars shown in the table (full key stays in `title`). */
+const SESSION_KEY_SHOWN = 8
+
+/**
+ * Clicking a row's session cell applies that key to the session filter, reusing
+ * the same state the filter input and the applied-filter chip operate on.
+ */
+async function applySessionFilter(sessionKey: string) {
+  logsFilterSession.value = sessionKey
+  await refreshLogs()
+}
+
 const logsCurrentPage = computed(() => Math.floor(store.logsOffset / store.logsLimit) + 1)
 const showingStart = computed(() => (store.logsTotal === 0 ? 0 : store.logsOffset + 1))
 const showingEnd = computed(() => Math.min(store.logsOffset + store.logs.length, store.logsTotal))
@@ -298,6 +310,9 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                 <TableHead class="min-w-[140px] text-left">{{
                   $t("logs.columns.client")
                 }}</TableHead>
+                <TableHead class="min-w-[80px] text-left">{{
+                  $t("logs.columns.session")
+                }}</TableHead>
                 <TableHead class="min-w-[100px] text-left xl:min-w-[130px]">{{
                   $t("common.model")
                 }}</TableHead>
@@ -341,6 +356,18 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
                   <span v-if="!row.user_agent && !row.client_ip" class="text-muted-foreground">
                     —
                   </span>
+                </TableCell>
+                <TableCell class="font-mono text-xs">
+                  <button
+                    v-if="row.session_key"
+                    type="button"
+                    :title="row.session_key"
+                    class="text-muted-foreground hover:text-foreground focus-visible:ring-ring cursor-pointer rounded-sm underline-offset-2 hover:underline focus-visible:ring-2 focus-visible:outline-none"
+                    @click="applySessionFilter(row.session_key)"
+                  >
+                    {{ row.session_key.slice(0, SESSION_KEY_SHOWN) }}
+                  </button>
+                  <span v-else class="text-muted-foreground">—</span>
                 </TableCell>
                 <TableCell class="font-mono text-xs">
                   <div>{{ row.model }}</div>

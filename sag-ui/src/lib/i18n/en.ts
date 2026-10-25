@@ -337,6 +337,23 @@ export const en = {
   "routeList.editTitle": "Edit Route",
   "routeList.editDescLead": "Modify routing rule for ",
 
+  // ── Session affinity pins (session_sticky) ──────────────────────
+  "sessionAffinity.button": "Session affinity pins",
+  "sessionAffinity.title": "Session pins",
+  "sessionAffinity.count": "{count} pins",
+  "sessionAffinity.loading": "Loading session pins…",
+  "sessionAffinity.empty": "No session pins for this model",
+  "sessionAffinity.age": "age {age}",
+  "sessionAffinity.expiresIn": "expires in {time}",
+  "sessionAffinity.neverExpires": "never expires",
+  "sessionAffinity.clearEntry": "Clear this session",
+  "sessionAffinity.clearModel": "Clear all for this model",
+  "sessionAffinity.confirmClearModel": "Clear all {count} pins of this model?",
+  "sessionAffinity.clearing": "Clearing…",
+  "sessionAffinity.toast.entryCleared": "Cleared session {key}",
+  "sessionAffinity.toast.modelCleared": 'Cleared {count} session pins for "{model}"',
+  "sessionAffinity.toast.clearFailed": "Failed to clear session pins",
+
   // ── Routes: add / edit forms ────────────────────────────────────
   "routes.form.routeAlias": "Route Alias",
   "routes.form.routeAliasHint": "Leave empty to use the first target's real_model",
@@ -355,6 +372,10 @@ export const en = {
   "routes.form.sessionMaxEntriesHint":
     "Pins kept per request model, must be ≥ 1; leave empty for the default (10000).",
   "routes.form.sessionMaxEntriesInvalid": "Must be a whole number ≥ 1",
+  "routes.form.wildcardSessionStickyUnsupported":
+    "Session-sticky is not supported on a wildcard (*) route: add an explicit route per model, or use another strategy",
+  "routes.form.imageSessionStickyUnsupported":
+    "Session-sticky is not supported with the image pipeline: use sticky_failover, fill_first, or round_robin",
   "routes.form.pipeline": "Pipeline",
   "routes.form.pipelineChat": "Chat",
   "routes.form.pipelineImage": "Image",
@@ -674,6 +695,7 @@ export const en = {
   "logs.empty": "No call logs match the current filter.",
   "logs.columns.time": "Time",
   "logs.columns.client": "Client",
+  "logs.columns.session": "Session",
   "logs.columns.prompt": "Prompt",
   "logs.columns.completion": "Completion",
   "logs.columns.reasoning": "Reasoning",

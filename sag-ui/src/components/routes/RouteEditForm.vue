@@ -97,7 +97,19 @@ const form = useForm({
             v.session_max_entries.trim() === "" ||
             /^[1-9]\d*$/.test(v.session_max_entries.trim()),
           { message: t("routes.form.sessionMaxEntriesInvalid"), path: ["session_max_entries"] },
-        ),
+        )
+        // Rejected by the backend (`sag-config` route validation). The model
+        // name is fixed on edit, so the wildcard is read from the route.
+        .refine((v) => v.strategy !== "session_sticky" || props.route.model_name !== "*", {
+          message: t("routes.form.wildcardSessionStickyUnsupported"),
+          path: ["strategy"],
+        })
+        // Also a backend rejection: image dispatch performs no session
+        // write-back, so a pin would never be recorded.
+        .refine((v) => !(v.strategy === "session_sticky" && v.pipeline === "image"), {
+          message: t("routes.form.imageSessionStickyUnsupported"),
+          path: ["pipeline"],
+        }),
     }
   },
   onSubmit: async ({ value }) => {
@@ -255,6 +267,9 @@ async function handleSubmit(event: Event) {
             </ToggleGroup>
             <p class="text-muted-foreground mt-1 text-[10px]">
               {{ $t("routes.form.pipelineHint") }}
+            </p>
+            <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
+              {{ field.state.meta.errors[0] }}
             </p>
           </Field>
         </form.Field>

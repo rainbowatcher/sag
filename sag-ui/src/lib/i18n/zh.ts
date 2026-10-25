@@ -318,6 +318,23 @@ export const zh: Record<keyof typeof en, string> = {
   "routeList.editTitle": "编辑路由",
   "routeList.editDescLead": "修改路由规则：",
 
+  // ── Session affinity pins (session_sticky) ──────────────────────
+  "sessionAffinity.button": "会话亲和 Pin",
+  "sessionAffinity.title": "会话 Pin",
+  "sessionAffinity.count": "{count} 条",
+  "sessionAffinity.loading": "加载会话 pin…",
+  "sessionAffinity.empty": "此模型暂无会话 pin",
+  "sessionAffinity.age": "存活 {age}",
+  "sessionAffinity.expiresIn": "{time} 后过期",
+  "sessionAffinity.neverExpires": "永不过期",
+  "sessionAffinity.clearEntry": "清除此会话",
+  "sessionAffinity.clearModel": "清空此模型全部",
+  "sessionAffinity.confirmClearModel": "清空此模型的全部 {count} 条 pin？",
+  "sessionAffinity.clearing": "清除中…",
+  "sessionAffinity.toast.entryCleared": "已清除会话 {key}",
+  "sessionAffinity.toast.modelCleared": '已清空 "{model}" 的 {count} 条会话 pin',
+  "sessionAffinity.toast.clearFailed": "清除会话 pin 失败",
+
   // ── Routes: add / edit forms ─────────────────────────────────
   "routes.form.routeAlias": "路由别名",
   "routes.form.routeAliasHint": "留空则使用第一个 target 的 real_model",
@@ -335,6 +352,10 @@ export const zh: Record<keyof typeof en, string> = {
   "routes.form.sessionMaxEntriesHint":
     "每个请求模型保留的 pin 数量，必须不小于 1；留空使用默认值（10000）。",
   "routes.form.sessionMaxEntriesInvalid": "必须是不小于 1 的整数",
+  "routes.form.wildcardSessionStickyUnsupported":
+    "通配路由(*)不支持会话粘性策略：请为每个模型单独配置路由，或改用其他策略",
+  "routes.form.imageSessionStickyUnsupported":
+    "会话粘性策略不支持图像管道：请改用 sticky_failover / fill_first / round_robin",
   "routes.form.pipeline": "流水线",
   "routes.form.pipelineChat": "Chat",
   "routes.form.pipelineImage": "Image",
@@ -637,6 +658,7 @@ export const zh: Record<keyof typeof en, string> = {
   "logs.empty": "没有符合当前筛选条件的调用日志。",
   "logs.columns.time": "时间",
   "logs.columns.client": "客户端",
+  "logs.columns.session": "会话",
   "logs.columns.prompt": "输入",
   "logs.columns.completion": "输出",
   "logs.columns.reasoning": "推理",

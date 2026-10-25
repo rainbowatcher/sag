@@ -16,7 +16,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 | 层面 | 技术 |
 |------|------|
 | 页面路由 | Vue Router，6 个路由：Dashboard（`/`）、Providers（`/providers`）、Routes（`/routes`）、Analytics（`/analytics`）、Logs（`/logs`）、Connect（`/connect`） |
-| 状态管理 | Pinia stores：`connection`、`health`、`providers`、`routes`、`analytics` |
+| 状态管理 | Pinia stores：`connection`、`health`、`providers`、`routes`、`analytics`、`sessionAffinity` |
 | 组件库 | shadcn-vue + Tailwind CSS v4 |
 | 图表 | Chart.js via vue-chartjs |
 | 构建 | Vite 6，产物通过 `rust-embed` 内嵌到 gateway 二进制；`chart.js` / `vue-chartjs` 单独拆为 `vendor-chart` chunk，只随 `/analytics` 路由懒加载（不进首屏 preload） |
@@ -81,12 +81,16 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 新建路由表单不预置空白 target 行（空白行会以「target provider required」挡住提交）
 - 策略选择含四个值：sticky-failover、fill-first、round-robin、session-sticky；选中 session-sticky 时展开「会话 TTL（秒，整数 ≥ 0，`0` = 永不过期）」与「每请求模型会话容量（整数 ≥ 1）」两个数字输入，留空 = 不发送该字段、使用后端默认值；两个输入仅在 session-sticky 下显示，也只有在该策略下参与校验（切回其它策略后残留输入不再挡住提交）
 - 会话参数（`session_ttl_secs` / `session_max_entries`）的 update 语义为「省略 = 保留」，编辑表单因此不提供清空交互（清空输入框等价于省略，保持当前值）
-- 跨字段组合校验留给后端：通配路由（`model_name = "*"`）× session-sticky、session-sticky + `pipeline = "image"` 两类组合由 `validate_routes` 拒绝，表单顶部错误条直接展示 400 消息原文（前端不复述、不翻译）
+- 跨字段组合校验留给后端：通配路由（`model_name = "*"`）× session-sticky、session-sticky + `pipeline = "image"` 两类组合由 `validate_routes` 拒绝，表单顶部错误条直接展示 400 消息原文（前端不复述、不翻译）（**此口径已由 0009 部分反案**：这两类组合改为表单前置校验，见下文「表单前置校验」条目；其它组合规则仍由后端拒绝）
 - 标记引用了已禁用 provider 的 target：行变灰 + Targets 列显示琥珀色警告
 - 支持列排序（点击表头）
 - 编辑：弹框内嵌 `RouteEditForm`，可修改 targets、strategy 等；视口 ≥768px 为 Dialog、<768px 为底部抽屉
 - 删除：二次确认弹框，同上双轨形态
 - 清除 Active Target / 重置 Fill-First 顺序：点击 Active Target 单元格触发二次确认，同上双轨形态
+- 会话 pin 观测：`strategy = session_sticky` 的路由在 Active Target 单元格的 target 按钮右侧另挂一个图标按钮（`KeyRound`），点击打开会话 pin 浮层；其它策略不渲染该按钮，该路由没有 active target（单元格显示 `-`）时按钮仍然存在
+- 会话 pin 浮层按该行的 `model_name` 拉 `GET /api/session-affinity?model=<model>`：头部显示模型空间名与 pin 条数，每条列出 `provider/real_model`、会话 key 前 8 位（`title` 保留全量 32 位）、来源 `source`、存活时长（`age_secs`）、剩余有效期（`expires_in_secs`；`session_ttl_secs = 0` 即 `expires_in_secs = null` 时显示「永不过期」）；加载中 / 无 pin / 请求失败各有提示，列表区限高滚动
+- 会话 pin 清除有两条路径：逐条清除走 `DELETE /api/session-affinity {"key": …}`；「清空此模型全部」为两步确认（第一步按钮替换为「清空 N 条？」+ Cancel/清空），确认后走 `DELETE {"model": …}`。两条路径成功后均 toast（逐条显示 key 前 8 位，按模型显示 `deleted` 条数）、重新拉取该模型空间的 pin，并回调列表重拉 active targets（pin 被清后下一跳目标会变）；失败 toast 展示后端错误消息
+- 表单前置校验（0008 的「组合规则全留给后端」就此两类反案）：通配路由（`model_name = "*"`）× session-sticky、session-sticky × `pipeline = "image"` 由表单对象级 refine 直接拒绝，规则与后端 `sag-config` 的 `validate_routes` 等价；错误分别挂在 `strategy` 与 `pipeline` 字段上就地展示（新建表单的通配判定取 `model_name` 或首个 target 的 `real_model`，编辑表单取路由自身的 `model_name`），不再等提交后看顶部错误条。其余组合规则（容量为 `0` 等）仍只由后端拒绝
 - Models 列表中的「Create route」快捷建单：确认弹框，也使用同一双轨形态（移动端会出现抽屉套抽屉）
 
 ### Analytics
@@ -107,6 +111,9 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - Model 列在 `real_model ≠ model` 时显示子行
 - 分页：Prev / Next 按钮，显示当前页码和行数
 - 客户端对 status_code 输入做 NaN 校验，避免向后端发送无效值
+- Session 列位于 Client 列之后：显示 `session_key` 前 8 位（`title` 保留全量 32 位哈希），该行没有会话记录时显示 `—`
+- 点击 Session 单元格把完整 `session_key` 写入会话筛选并立即重查——与筛选输入框、已应用筛选 chip、清除按钮共用同一状态（`logsFilterSession`），点击后 chip 出现同一 key，清除即回到无会话筛选
+- 列数口径：本节上文的「12 列」是 0001 时的列口径，此后 Client 列与本列均在其后追加，现共 15 列
 
 ### 固定高度布局与容器内滚动
 
@@ -172,12 +179,12 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 ### 包含
 
 - 6 个页面路由（Dashboard、Providers、Routes、Analytics、Logs）+ Connect 入口
-- Pinia 状态管理（connection、health、providers、routes、analytics）
+- Pinia 状态管理（connection、health、providers、routes、analytics、sessionAffinity）
 - shadcn-vue 组件库集成
 - Chart.js 图表（折线图、饼图）
 - 亮/暗主题切换
 - 多语言支持（en / zh）：语言偏好可切换、可持久化，文案统一收敛到字典
-- 与 SAG 管理 API 的 HTTP 通信
+- 与 SAG 管理 API 的 HTTP 通信（含会话亲和观测/清除：`GET|DELETE /api/session-affinity`）
 - 固定高度布局：页面整体固定为视口高度，仅表格和图表容器内部滚动，页面头部和筛选栏保持可见
 - 大屏幕（`xl:`、`2xl:` 断点）响应式优化
 - 移动端（<768px）弹框以底部抽屉呈现，桌面端保持 Dialog
@@ -203,6 +210,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
 - [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)
 - [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)
 - [0006 路由 Target 改为浮窗搜索多选](changes/0006-target-picker-dialog.md)

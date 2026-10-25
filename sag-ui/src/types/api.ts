@@ -399,6 +399,8 @@ export interface CallLog {
   upstream_protocol?: string
   /** Lane of the attempt ("native" | "translated"). */
   lane?: string
+  /** Hashed session identity (`call_logs.session_key`, 32-char hex); absent when unstamped. */
+  session_key?: string | null
 }
 
 /** Query parameters accepted by `GET /api/logs`. */
@@ -469,6 +471,37 @@ export interface ActiveTargetEntry {
   fill_first_cache_age_secs: number | null
   /** `shuffle_cache_ttl_secs` config; `0` = never expire. `null` when none. */
   fill_first_cache_ttl_secs: number | null
+}
+
+/** One live session pin returned by `GET /api/session-affinity`. */
+export interface SessionAffinityEntry {
+  /** Hashed session identity (32 hex chars) — safe to display and to DELETE by. */
+  key: string
+  /** Request-model space the session is scoped to (the space key). */
+  model: string
+  /** Extraction-chain source: "meta" | "top" | "pc" | "fb". */
+  source: string
+  provider: string
+  /** Resolved real model that last served the session. */
+  real_model: string
+  /** Config route `model_name` that recorded the pin ("*" for wildcard). */
+  route_model: string
+  /** Seconds since the pin was last hit (TTL sliding clock). */
+  age_secs: number
+  /** Route `session_ttl_secs` (resolved); `0` = pins never expire. */
+  ttl_secs: number
+  /** Seconds until expiry; `null` when `ttl_secs == 0` (never). */
+  expires_in_secs: number | null
+}
+
+/** Response envelope returned by `GET /api/session-affinity`. */
+export interface SessionAffinityListResponse {
+  entries: SessionAffinityEntry[]
+}
+
+/** Result of `DELETE /api/session-affinity` — number of dropped pins. */
+export interface SessionAffinityDeletedResult {
+  deleted: number
 }
 
 // ═══════════════════════════════════════════════════════════════════

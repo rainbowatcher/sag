@@ -10,6 +10,7 @@ import {
 import { computed, h, onMounted, ref } from "vue"
 import { toast } from "vue-sonner"
 import RouteEditForm from "@/components/routes/RouteEditForm.vue"
+import SessionAffinityPopover from "@/components/routes/SessionAffinityPopover.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -382,14 +383,28 @@ const columns = [
       return Number(hasActive(b.original)) - Number(hasActive(a.original))
     },
     cell: (info) => {
-      const model = info.row.original.model_name
+      const route = info.row.original
+      const model = route.model_name
       const entries = activeTargetStore.targets
       const sticky = selectActiveTarget(entries, model)
       const fill = selectFillFirstTarget(entries, model)
       const active = sticky ?? fill
 
+      // Only `session_sticky` routes keep per-session pins, so only they get
+      // the popover; clearing a pin also refreshes the active-target column.
+      const affinityPins =
+        route.strategy === "session_sticky"
+          ? h(SessionAffinityPopover, {
+              model,
+              onChanged: () => void activeTargetStore.fetchActiveTargets(),
+            })
+          : null
+
       if (!active) {
-        return h("span", { class: "text-muted-foreground/50" }, "-")
+        return h("div", { class: "flex items-center gap-1.5" }, [
+          h("span", { class: "text-muted-foreground/50" }, "-"),
+          affinityPins,
+        ])
       }
 
       const isFillFirst = fill !== undefined && sticky === undefined
@@ -397,43 +412,46 @@ const columns = [
 
       // Status dot + provider label merged into one clickable button;
       // full details live in the aligned tooltip.
-      return h(Tooltip, null, () => [
-        h(TooltipTrigger, { asChild: true }, () =>
-          h(
-            Button,
-            {
-              variant: "ghost",
-              size: "sm",
-              class: "cursor-pointer gap-1.5 px-1 font-mono text-xs truncate max-w-[110px]",
-              onClick: () => openClearConfirm(active, isFillFirst),
-            },
-            () => [
-              h("span", { class: cn("h-2 w-2 shrink-0 rounded-full", dotClass) }),
-              h("span", { class: "truncate" }, active.provider),
-            ],
+      return h("div", { class: "flex items-center gap-1.5" }, [
+        h(Tooltip, null, () => [
+          h(TooltipTrigger, { asChild: true }, () =>
+            h(
+              Button,
+              {
+                variant: "ghost",
+                size: "sm",
+                class: "cursor-pointer gap-1.5 px-1 font-mono text-xs truncate max-w-[110px]",
+                onClick: () => openClearConfirm(active, isFillFirst),
+              },
+              () => [
+                h("span", { class: cn("h-2 w-2 shrink-0 rounded-full", dotClass) }),
+                h("span", { class: "truncate" }, active.provider),
+              ],
+            ),
           ),
-        ),
-        h(TooltipContent, { side: "left", class: "max-w-xs" }, () =>
-          h("div", { class: "space-y-1" }, [
-            tooltipRow(t("common.provider"), active.provider, true),
-            tooltipRow(t("common.model"), active.real_model, true),
-            tooltipRow(
-              t("common.status"),
-              isFillFirst ? t("routeList.fillFirstTarget") : active.status,
-            ),
-            tooltipRow(
-              isFillFirst ? t("routeList.tooltip.orderAge") : t("routeList.tooltip.pinAge"),
-              formatDuration(
-                (isFillFirst ? (active.fill_first_cache_age_secs ?? 0) : active.age_secs) * 1000,
+          h(TooltipContent, { side: "left", class: "max-w-xs" }, () =>
+            h("div", { class: "space-y-1" }, [
+              tooltipRow(t("common.provider"), active.provider, true),
+              tooltipRow(t("common.model"), active.real_model, true),
+              tooltipRow(
+                t("common.status"),
+                isFillFirst ? t("routeList.fillFirstTarget") : active.status,
               ),
-              true,
-            ),
-            tooltipRow(
-              t("routeList.tooltip.action"),
-              isFillFirst ? t("routeList.clickToReset") : t("routeList.clickToClear"),
-            ),
-          ]),
-        ),
+              tooltipRow(
+                isFillFirst ? t("routeList.tooltip.orderAge") : t("routeList.tooltip.pinAge"),
+                formatDuration(
+                  (isFillFirst ? (active.fill_first_cache_age_secs ?? 0) : active.age_secs) * 1000,
+                ),
+                true,
+              ),
+              tooltipRow(
+                t("routeList.tooltip.action"),
+                isFillFirst ? t("routeList.clickToReset") : t("routeList.clickToClear"),
+              ),
+            ]),
+          ),
+        ]),
+        affinityPins,
       ])
     },
     meta: { class: "xl:min-w-[220px]" },

@@ -25,6 +25,7 @@ updated: 2026-10-25
 - [sag-ui/src/stores/providers.ts](../../../sag-ui/src/stores/providers.ts) — Provider CRUD + 上游模型拉取 + 乐观删除+回滚
 - [sag-ui/src/stores/routes.ts](../../../sag-ui/src/stores/routes.ts) — Route CRUD + provider models 懒加载
 - [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — Stats、Logs、Cache、Trend、Distribution 查询 + 分页状态管理
+- [sag-ui/src/stores/sessionAffinity.ts](../../../sag-ui/src/stores/sessionAffinity.ts) — 会话亲和 pin 的查询（`GET /api/session-affinity`）与清除（按 `key` / 按 `model`）；查询带单调 `generation` 竞态 token，删除自身不 refetch
 
 ### 页面
 
@@ -32,7 +33,7 @@ updated: 2026-10-25
 - [sag-ui/src/pages/ProvidersPage.vue](../../../sag-ui/src/pages/ProvidersPage.vue) — Provider 列表页（组合 ProviderList + ProviderAddForm）
 - [sag-ui/src/pages/RoutesPage.vue](../../../sag-ui/src/pages/RoutesPage.vue) — Route 列表页（组合 RouteList + RouteAddForm）
 - [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) — 用量统计（Stats + Cache 双 Tab）
-- [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（12 列表格 + 筛选 + 分页）
+- [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（表格 + 筛选 + 分页；Client 列之后为 Session 列，点击单元格即套用会话筛选）
 - [sag-ui/src/pages/ConnectPage.vue](../../../sag-ui/src/pages/ConnectPage.vue) — 连接配置页面
 
 ### 核心组件
@@ -45,6 +46,7 @@ updated: 2026-10-25
 - [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
 - [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries；新增走浮窗批量选择）
 - [sag-ui/src/components/routes/TargetPickerDialog.vue](../../../sag-ui/src/components/routes/TargetPickerDialog.vue) — Target 浮窗选择器（搜索 + 分组多选 + 差异化确认；Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
+- [sag-ui/src/components/routes/SessionAffinityPopover.vue](../../../sag-ui/src/components/routes/SessionAffinityPopover.vue) — 会话 pin 浮层（props `model`，emit `changed`）：展示某请求模型空间的 pin（provider/real_model、key 前 8 位、source、age、剩余 TTL）+ 逐条清除 + 按模型两步确认清空
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
 
 ### 工具函数与类型
@@ -52,6 +54,7 @@ updated: 2026-10-25
 - [sag-ui/src/lib/client.ts](../../../sag-ui/src/lib/client.ts) — 共享 axios 实例（Authorization header 由 connection store 同步）
 - [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
 - [sag-ui/src/lib/targetPicker.ts](../../../sag-ui/src/lib/targetPicker.ts) — Target 浮窗的纯选择逻辑：`provider+model` 集合键、分组构建（含禁用/orphan）、搜索过滤、勾选集合 ↔ target 行的 diff 与合并（type-only import，可被 node test runner 直接加载）
+- [sag-ui/src/lib/sessionAffinity.ts](../../../sag-ui/src/lib/sessionAffinity.ts) — `shortSessionKey(key, length = 8)`：会话哈希的展示前缀（删除仍用全量 key）；纯函数，同 targetPicker 一样可被 node test runner 直接加载
 - [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
 - [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
 - [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
@@ -60,7 +63,7 @@ updated: 2026-10-25
 ### 多语言（i18n）
 
 - [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
-- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，571 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，589 key），key 为稳定英文标识符
 - [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
 - [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
 - [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
@@ -145,7 +148,7 @@ flowchart TD
 
     subgraph Logs[LogsPage]
         L_FIXED1[shrink-0: 标题 + 筛选栏]
-        L_SCROLL[flex-1 → [&>div]:h-full → Table wrapper overflow-auto<br/>日志表格 12 列: sticky 表头 + backdrop-blur]
+        L_SCROLL[flex-1 → [&>div]:h-full → Table wrapper overflow-auto<br/>日志表格 15 列（Client 后为 Session）: sticky 表头 + backdrop-blur]
         L_FIXED2[shrink-0: 分页控件]
     end
 
@@ -225,16 +228,39 @@ flowchart TD
 - ✅ 失败时回滚到旧列表，用户无感
 - ❌ 删除期间如果 API 成功但列表未刷新（其他数据变更），回滚逻辑只会恢复本地快照（实际上 `fetchRoutes()` 在成功后触发刷新，副作用可控）
 
-### 路由策略字段：只做格式校验，组合规则留给后端
+### 路由策略字段：只有格式校验 + 两条组合规则，其余留给后端
 
-`RouteAddForm` / `RouteEditForm` 只校验两个会话参数的**格式**（TTL `^\d+$`、容量 `^[1-9]\d*$`），且仅当 `strategy === "session_sticky"` 时生效；跨字段的合法性（通配路由 `*` × `session_sticky`、`session_sticky` + `pipeline = "image"`、容量为 `0`）不在前端复现，提交后由 `GatewayConfig::validate` → `validate_routes` 拒绝，400 消息经表单顶部错误条原文展示。
+（本节为 0009 修订后的实态；原口径「组合规则完全留给后端」见 [0009 changefile](changes/0009-session-affinity-pins-and-log-session-column.md) 与 requirements.md 里保留的旧条目。）
+
+`RouteAddForm` / `RouteEditForm` 校验两个会话参数的**格式**（TTL `^\d+$`、容量 `^[1-9]\d*$`），且仅当 `strategy === "session_sticky"` 时生效；另加两条对象级 `.refine`，与后端 `sag-config/src/config.rs` 的 `validate_routes` 等价：
+
+| 组合 | 错误挂载字段 | i18n key | 通配判定来源 |
+|------|-------------|----------|-------------|
+| `model_name = "*"` × `session_sticky` | `strategy` | `routes.form.wildcardSessionStickyUnsupported` | 新建：`model_name`，空时回退到首个 target 的 `real_model`；编辑：`props.route.model_name` |
+| `session_sticky` × `pipeline = "image"` | `pipeline` | `routes.form.imageSessionStickyUnsupported` | — |
+
+其余组合规则（容量为 `0` 等）仍不在前端复现，提交后由 `GatewayConfig::validate` → `validate_routes` 拒绝，400 消息经表单顶部错误条原文展示。
 
 **Trade-off**:
-- ✅ 组合规则单一来源：后端新增/调整约束时前端零改动，不会出现「前端放过、后端拒绝」或「前端拒绝、后端已放宽」的两套真相
-- ✅ 与既有 provider / route 表单一致：错误文案走 `getErrorMessage()` 直出，不需要为每条后端规则新增 i18n key 并翻译
-- ✅ 前端只拦「输入框里根本打不出合法值」的形态（非整数、负容量），交互反馈最快
-- ❌ 用户要到提交才知道组合非法（无前置高亮），失败前需多一次往返
-- ❌ 错误消息为后端原文（英文、带配置路径），比前端逐条文案生硬；由 session-sticky 的说明行（hint）部分补偿上下文
+- ✅ 两条最容易踩、且**无法从配置上修复**的组合（通配路由的 space 键域无界、image 管线不做会话写回）在表单里就地拦住，不再多一次 400 往返
+- ✅ 前端文案能说清「该换成什么」：通配提示改为「为每个模型单独配置路由，或改用其他策略」，image 提示列出可用策略（后端 400 只报违规事实）
+- ✅ 仍只镜像两条规则：其余约束仍单源于后端，不会因前端漏同步而产生「前端放过/后端拒绝」以外的两套真相
+- ❌ 规则有了两个实现（Rust + Zod refine）：后端放宽或收紧时前端必须同步修改，否则会出现「前端拒绝、后端已放宽」——缓解手段是两句 `.refine` 旁写死对应的后端出处注释
+- ❌ 通配判定未做 `trim()`：`model_name = " * "` 这类首尾空白的值前端会放过（后端仍会拒），已作为已知 minor 记在 0009 的评审结论里
+- ❌ 两个表单的错误渲染风格不一致：新建表单用 `FieldError`（与其它字段一致），编辑表单的 pipeline 字段用内联 `<p class="text-destructive">`，也是已知 minor
+- ✅ 前端仍只拦「输入框里根本打不出合法值」的形态（非整数、负容量）与上述两条组合，其余不插手
+- ❌ 其余组合（容量为 `0` 等）仍然要提交后才知道非法，错误消息为后端原文（英文、带配置路径），比本两条的前端文案生硬；由 session-sticky 的说明行（hint）部分补偿上下文
+
+### 会话 pin 浮层：共享 store + 客户端按 model 过滤 vs 每行独立 state
+
+`sessionAffinity` store 是单例：浮层打开时 `fetchEntries({ model })` 覆盖 store 的 `entries`，组件再按 `model === props.model` 过滤出自己那一行要显示的条目（`rows`）。同时用单调 `generation` token 保证「后发请求先返回」不会把旧的 entries 写回。
+
+**Trade-off**:
+- ✅ 一个请求面、一个错误面/loading 面，不需要为每一行路由创建一个 store 实例或用 `provide/inject` 做作用域
+- ✅ `generation` token 同时覆盖 `entries` 与 `loading` 的清零：慢的旧请求既写不进 entries，也不会把新请求的 loading 提前关掉
+- ✅ 页面同时不会有多个浮层处于打开态（reka-ui 的 popover 外部交互即关闭），所以「A 行刷新把 B 行的展示刷成空」的竞态在实践中不会发生
+- ❌ 过滤是客户端兜底而非作用域隔离：若将来允许同时打开多个浮层，必须改成 per-model 的 state 映射（或给 popover 传 `key` 强制重建）
+- ❌ 跨模型空间会瞬时陈旧：按 `key` 删除会连带删除其它空间里的同 key pin（`DELETE { key }` 不区分 space），但其它浮层已加载的条目要等下次打开才更新
 
 ### TanStack Table vs shadcn-vue Table
 
@@ -242,7 +268,7 @@ ProviderList 和 RouteList 使用 TanStack Table，LogsPage 和 AnalyticsPage �
 
 **Trade-off**:
 - ✅ TanStack Table：需要排序、复杂列定义（如 Status Switch、Actions 按钮组）、动态 cell render 的场景，TanStack 的 `createColumnHelper` + `h()` render 函数更灵活
-- ✅ shadcn-vue Table：纯展示型表格（Logs 12 列、Analytics Stats/Cache），用 Vue 模板 `<Table>` → `<TableHeader>` → `<TableBody>` 更直观、更少 boilerplate
+- ✅ shadcn-vue Table：纯展示型表格（Logs 15 列、Analytics Stats/Cache），用 Vue 模板 `<Table>` → `<TableHeader>` → `<TableBody>` 更直观、更少 boilerplate
 - ❌ 两套表格系统增加了认知负担——需要知道什么时候用哪个。但决策规则简单：需要排序或复杂交互 → TanStack；纯展示 → shadcn-vue
 
 ### Chart.js CSS 变量解析 via DOM Probe Element
@@ -348,6 +374,11 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **`analytics.v2.scopeTarget` / `logs.tooltip.ttft` 为刻意 verbatim 的技术 token**：zh 视图在迁移前也渲染同样的英文 token，两处字典值保持英文并在 `en.ts` 内注释说明，不视为漏译
 - **图表库单独分包**：`chart.js` / `vue-chartjs` 必须落在 `vendor-chart` 组且 `includeDependenciesRecursively: false`。若后者保持默认 `true`，vue runtime 会被拖进该组、入口静态依赖它，chart.js 反而进首屏 preload，分包目标失效
 - **`index.html` 不得引用不存在的静态资源**：`sag-ui/public/` 不存在，任何 `/xxx.svg` / `/xxx.ico` 式引用都会变成每次加载一个 404（内嵌服务下是 `text/plain` 的 404）
+- **会话 pin 只展示前缀，删除用全量 key**：浮层与 Session 列展示 `shortSessionKey()` 的前 8 位，但 `title` 与 `DELETE /api/session-affinity` 的 body 必须用完整 32 位哈希。不得把截断值回传给删除接口（会静默删不到或删错）
+- **`sessionAffinity` store 的 generation token**：`fetchEntries` 只有最新在飞的请求可以写 `entries` / `error`，也只能由它清 `loading`。修改时不得把 token 判定只加在 `entries` 上而漏掉 `finally` 里的 `loading` 清零
+- **pin 清除后必须重拉 active targets**：`SessionAffinityPopover` 的两条清除路径成功后均 `emit("changed")`，由 `RouteList` 的 `onChanged` 调 `activeTargetStore.fetchActiveTargets()`。漏掉这步会让 Active Target 列在 pin 已清后仍显示旧目标
+- **pin 浮层只在 session-sticky 行挂载**：`RouteList` 的 active target cell 用 `route.strategy === "session_sticky"` 判定后 `h(SessionAffinityPopover, …)`，其它策略必须为 `null`——否则无 pin 空间的路由会多发一次空查询
+- **Logs 会话筛选单一状态源**：Session 列点击必须走 `applySessionFilter()` → 写 `logsFilterSession` → `refreshLogs()`，与筛选输入框、chip、`clearSessionFilter()` 同源。不得为该列另建一套过滤状态（会出现 chip 与列不同步）
 
 ## 测试策略
 
@@ -355,7 +386,7 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 
 | 层面 | 方法 | 工具 |
 |------|------|------|
-| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界） | node test runner |
+| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界、`shortSessionKey` 截断边界） | node test runner |
 | i18n 门禁 | `just ui-i18n-check`（`pnpm -C sag-ui run check:i18n`） | node + check-i18n.mjs |
 | 类型检查 | `pnpm typecheck`（vue-tsc） | TypeScript 编译器 |
 | 代码风格 | `pnpm lint`（oxlint）、`pnpm format`（oxfmt） | oxlint / oxfmt |
@@ -376,9 +407,12 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 8. **弹框形态断点**：在 390px / 700px / 900px 三个视口分别打开 New Route、Edit Route、Delete Route 确认、Add/Edit Provider → 前两者应分别为 drawer（bottom）/ drawer / dialog；可用 `document.querySelectorAll('[data-slot=drawer-content]')` 与 `[data-slot=dialog-content]` 计数断言，并同时校验 `window.innerWidth` 与 `matchMedia('(min-width: 768px)')`
 9. **语言切换**：Settings → Language 选 English → 导航/表头/toast/表单校验消息即时变英文且 `<html lang>` 变 `en` → 刷新后仍为英文 → 切回中文同理；手动把 `localStorage["sag-ui-lang"]` 改为 `fr` 后刷新 → 界面回退中文且控制台无异常
 10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
-11. **session-sticky 路由**：新建路由选 session-sticky → 两个会话参数输入出现；留空提交 → Network 面板里 payload 不含 `session_ttl_secs` / `session_max_entries`；填 `-1` / `1.5` / 容量 `0` → 就地报错且无请求；编辑既有 session-sticky 路由 → 初值回填，不改则 payload 仍不含两字段（省略 = 保留）；`model_name = "*"` 或 `pipeline = "image"` 提交 → 顶部错误条显示后端 400 消息
+11. **session-sticky 路由**：新建路由选 session-sticky → 两个会话参数输入出现；留空提交 → Network 面板里 payload 不含 `session_ttl_secs` / `session_max_entries`；填 `-1` / `1.5` / 容量 `0` → 就地报错且无请求；编辑既有 session-sticky 路由 → 初值回填，不改则 payload 仍不含两字段（省略 = 保留）；`model_name = "*"` 或 `pipeline = "image"` 提交 → strategy / pipeline 字段就地报错（容量 `0` 仍为顶部错误条显示后端 400 消息）
+12. **会话 pin 浮层**：session-sticky 路由的 active target 单元格出现 pin 按钮（其它策略无）→ 打开浮层 → Network 面板显示 `GET /api/session-affinity?model=<model>` → 条目含 provider/real_model、key 前 8 位、source、age、expires；`session_ttl_secs = 0` 的路由显示「永不过期」→ 逐条清除 → `DELETE {"key": …}`（body 为全量 32 位）+ toast + 列表项消失 + active target 列重拉；按模型清空 → 首次点击仅将按钮换成确认文案（无请求）→ 确认后 `DELETE {"model": …}`
+13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 会话筛选 chip 出现同一全量 key 且表格立即重查 → 清除 chip 后回到无会话筛选的行集
 
 ## 变更记录
+- [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
 - [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)
 - [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)
 - [0006 路由 Target 改为浮窗搜索多选](changes/0006-target-picker-dialog.md)
