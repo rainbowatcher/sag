@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # 架构
@@ -54,7 +54,7 @@ Client → Router (auth → trace → http_log → rate_limit) → Dispatch
 - **SSE（`text/event-stream`）**：响应必须带 `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`，避免 nginx / CDN 类中间层缓冲或转码事件流导致 token 一次性倾倒。SSE 永不压缩。
 - **内嵌 UI 静态资源**：由 `sag-gateway/src/ui_routes/` 的 SPA fallback serve。UI 构建会为文本产物生成 `.br`（brotli q11）与 `.gz`（gzip 9）副本，handler 按 `Accept-Encoding` 直接下发预压缩件（`br` 优先于 `gzip`）并带 `Vary: Accept-Encoding`；无预压缩副本或客户端不支持时裸发兜底。运行期不压缩 UI。
   - **缓存分两档**：hash 化资产（`assets/**`）为 `public, max-age=31536000, immutable`；`index.html` 等根级文件为 `no-cache`，并带构建期 sha256 强 `ETag`（按**实际下发表示**取值，`If-None-Match` 命中返回空 body `304`）。
-  - **缺失资源返 404**：`assets/**` 与末段扩展名属静态扩展名白名单（`js` / `css` / `map` / `svg` / `ico` / `woff2` 等 24 项）的子资源探针返回 `404` 且**不**回 SPA shell；`*.br` / `.gz` 不作为独立资源可访问（`404`）。带点但不是静态文件的客户端路由（如 `/providers/v1.2`）仍回 shell。
+  - **缺失资源返 404**：`assets/**` 与末段扩展名属静态扩展名白名单（`js` / `css` / `map` / `svg` / `ico` / `woff2` 等 26 项）的子资源探针返回 `404` 且**不**回 SPA shell；`*.br` / `.gz` 不作为独立资源可访问（`404`）。带点但不是静态文件的客户端路由（如 `/providers/v1.2`）仍回 shell。
   - **方法限制**：静态面只接受 `GET` / `HEAD`，其它方法返回 `405` + `Allow: GET, HEAD`。
   - **API 命名空间**：**未注册**的 `/api/*`、`/v1/*` 返回 `404` JSON（`{"error":{"code":"NOT_FOUND",...}}`，已注册路由不经 fallback）；API 命名空间的未知路径永远先拿 `404`，不走 `405`。
   - **响应头**：所有响应（含 `304`）带 `X-Content-Type-Options: nosniff`。

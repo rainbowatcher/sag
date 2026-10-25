@@ -64,7 +64,7 @@
 
   | 暂存文件 | 执行的 recipe | 具体动作（全部只读） |
   |---|---|---|
-  | `*.rs` / `Cargo.toml` / `Cargo.lock` / `justfile` | `just verify-rust` | `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --no-fail-fast --tests` |
+  | `*.rs` / `Cargo.toml`（含 `**/Cargo.toml` 嵌套 manifest）/ `Cargo.lock` / `justfile` / `.cargo/*` + `.cargo/**/*` / `rust-toolchain.toml` | `just verify-rust` | `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --no-fail-fast --tests` |
   | `sag-ui/**` / `justfile` | `just verify-ui` | `oxfmt --check` → `oxlint` → `vue-tsc --noEmit` → 前端测试 |
   | `scripts/**` | `just test-scripts` | python unittest（`scripts/release_notes.py` 等的单元测试，当前仅 release_notes 有用例，只读） |
 

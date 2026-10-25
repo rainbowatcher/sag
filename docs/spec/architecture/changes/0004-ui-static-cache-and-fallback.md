@@ -1,6 +1,6 @@
 ---
 created: 2026-10-22
-updated: 2026-10-23
+updated: 2026-10-25
 type: 优化
 ---
 
@@ -22,7 +22,7 @@ type: 优化
   - 缺失静态资源（`assets/**`、末段扩展名属静态扩展名白名单的子资源探针）返 `404` 且不回 SPA shell。
   - 静态面只接受 `GET` / `HEAD`，其它方法 `405` + `Allow: GET, HEAD`。
   - **未注册**的 `/api/*`、`/v1/*` 路径由 `200` HTML 改为 `404` JSON（`{"error":{"code":"NOT_FOUND",...}}`；已注册路由不经 fallback，行为零变化）。
-  - 收尾（2026-10-23）后「子资源探针」的判定从「末段含点」收紧为 24 项静态扩展名白名单：`/providers/v1.2` 这类带点路由回到 shell，`/gone.js` 仍 404。
+  - 收尾（2026-10-23）后「子资源探针」的判定从「末段含点」收紧为 26 项静态扩展名白名单：`/providers/v1.2` 这类带点路由回到 shell，`/gone.js` 仍 404。
   - 所有响应（含 `304`）带 `X-Content-Type-Options: nosniff`。
 
 ## 代码变更
@@ -60,7 +60,7 @@ type: 优化
 
 ## 测试
 
-`ui_routes` 的 `#[cfg(all(test, feature = "embed-ui"))]` 测试区由 6 个增至 26 个：新增缓存分档 2、缺失资源 2、API 命名空间 3、带点路由 1、方法限制 2、`nosniff` 1、ETag/304 5（含 br 表示独立 ETag 与零拷贝字节回归）、sourcemap 排除 1；收尾再补 3（白名单收窄 2：`dotted_route_without_html_accept_gets_shell`、`missing_static_file_returns_404`；fixture 非空转 1：`exclude_attribute_drops_sourcemaps`）。`negotiate.rs` 的 12 个协商用例不变。`cargo test -p sag-gateway --features embed-ui` = 49 passed；无 feature = 23 passed。
+`ui_routes` 的 `#[cfg(all(test, feature = "embed-ui"))]` 测试区由 6 个增至 **32 个**（当前实际计数，下文按 commit 拆分）：`8007e47` +11（缓存分档 2、缺失资源 2、API 命名空间 3、带点路由 1、方法限制 2、`nosniff` 1）→ 17；`bc57fe6` +5（ETag/304，含 br 表示独立 ETag 与零拷贝字节回归）→ 22；`4f81f8b` +1（sourcemap 排除 `sourcemaps_are_not_embedded`）→ 23；收尾 `1f1e49e` +3（白名单收窄 2：`dotted_route_without_html_accept_gets_shell`、`missing_static_file_returns_404`；fixture 非空转 1：`exclude_attribute_drops_sourcemaps`）→ 26；`57d49c5` +4（`looks_like_asset_covers_json_and_webmanifest`、`missing_json_probe_returns_404`、`not_modified_omits_content_length`、`if_none_match_reads_every_header_line`）→ 30；本轮评审返工 +2（`trailing_slash_probe_returns_404`、`accept_encoding_reads_every_header_line`）→ 32。`negotiate.rs` 的 12 个协商用例不变。按 `#[test]` / `#[tokio::test]` 函数计数（未实跑）：`cargo test -p sag-gateway --features embed-ui` 共 55 = `ui_routes/mod.rs` 32 + `ui_routes/negotiate.rs` 12 + `main.rs` 11；无 feature 时后两者仍存在 = 23（与上文旧口径一致）。
 
 ## 后续收尾（2026-10-23）
 
@@ -68,7 +68,7 @@ type: 优化
 
 ### 1. `looks_like_asset` 收窄为扩展名白名单（**行为变化**）
 
-原判定「末段含 `.`」在 `Accept: */*` 下把带点的客户端路由（`/providers/v1.2`）也判成子资源探针，直接 404 —— 非浏览器客户端访问带点路由拿不到 shell。收尾改为白名单 `ASSET_EXTENSIONS`（26 项：`js`/`mjs`/`cjs`/`css`/`map`/`svg`/`png`/`jpg`/`jpeg`/`gif`/`webp`/`avif`/`ico`/`bmp`/`woff`/`woff2`/`ttf`/`otf`/`eot`/`txt`/`xml`/`json`/`webmanifest`/`wasm`/`br`/`gz`，扩展名大小写不敏感，与 `postbuild-compress.mjs` 的 `TEXT_EXTENSIONS` 对齐），末段扩展名命中白名单才判为子资源探针。
+原判定「末段含 `.`」在 `Accept: */*` 下把带点的客户端路由（`/providers/v1.2`）也判成子资源探针，直接 404 —— 非浏览器客户端访问带点路由拿不到 shell。收尾改为白名单 `ASSET_EXTENSIONS`（26 项：`js`/`mjs`/`cjs`/`css`/`map`/`svg`/`png`/`jpg`/`jpeg`/`gif`/`webp`/`avif`/`ico`/`bmp`/`woff`/`woff2`/`ttf`/`otf`/`eot`/`txt`/`xml`/`json`/`webmanifest`/`wasm`/`br`/`gz`，扩展名大小写不敏感，覆盖构建会产出的文件类型——含 `postbuild-compress.mjs` 的 `TEXT_EXTENSIONS` 及压缩脚本跳过的二进制类型），末段扩展名命中白名单才判为子资源探针。
 
 | 请求 | 收窄前 | 收窄后 |
 |---|---|---|
@@ -145,6 +145,30 @@ chart.js 只被 `/analytics` 路由的 `V2TrendChart` 使用，拆开后两 chun
 
 - `304` 不设 `Content-Length`：RFC 9110 §8.6 只允许 `304` 的 `Content-Length` 等于假想 `200` 的长度，hyper 对 `304` 也会剥离该头（`hyper/src/proto/h1/role.rs` 的 `can_have_content_length` 返回 `false`）—— 显式设置只会让响应对象与线上不一致，故省略；对应断言走 handler 输出而非 router 输出（axum 顶层路由会按 body 的精确长度 0 补回 `Content-Length: 0`）。
 - 旧实例（`build-info.json` 的 `binary_mtime` 早于本次 4 个 commit）上 `POST /api/unknown` 仍为 `200 text/html`；`just build-test` 后同一请求变 `404 application/json`，印证 e2e 验收确已在新二进制上执行。
+
+## 评审返工（2026-10-25）
+
+本轮评审在 0004 的静态面上又提出 3 项缺口，均为同一未发布变更的收尾，并入本记录（不另开编号）：
+
+### 1. 尾部斜杠归一（**行为变化**）
+
+`looks_like_asset` 原先取 `path.rsplit('/')` 的**最右段**（不做非空过滤），`GET /gone.js/` 的最右段是空串，于是回落到 SPA shell —— 一个缺失的子资源探针靠加尾斜杠就能拿到 `200 text/html`。现改为取**最后一个非空段**（`.rsplit('/').find(|s| !s.is_empty())`），`/gone.js/` 与 `/gone.js` 同归 404。模块文档的兜底顺序列表同步把 step 7 改为「last *non-empty* segment」，并显式点名尾斜杠情形。覆盖测试 `trailing_slash_probe_returns_404`。
+
+| 请求（`Accept: */*`） | 返工前 | 返工后 |
+|---|---|---|
+| `GET /gone.js/` | `200` HTML shell | `404 text/plain` |
+| `GET /gone.js` | `404` | `404`（不变） |
+| `GET /providers/v1.2` | `200` shell | `200` shell（不变） |
+
+### 2. `Accept-Encoding` 多行折叠
+
+RFC 9110 §5.5 允许列表型 header 跨多行，原实现只用 `headers.get(ACCEPT_ENCODING)` 读第一行（`Accept-Encoding: gzip` + 第二行 `br` → 只协商到 gzip）。现改为 `get_all` 取全部行、`", "` 折叠后再 `negotiate`，空列表仍传 `None`（等价「未提供」）。同模块对多行 `If-None-Match` 早已用 `get_all`，这次把两者的严谨度拉齐。覆盖测试 `accept_encoding_reads_every_header_line`。
+
+### 3. 两个 500 兜底补 `nosniff`
+
+`revalidate`（构造 304 失败）与 `file_response`（构造响应失败）的 `unwrap_or_else` 500 分支原先不带任何安全头，与「所有响应都带 `X-Content-Type-Options: nosniff`」的不变式不符。两处补上该头。
+
+此外同步订正本文件的两处计数失真：需求变更小节的「24 项」→ 26 项（`57d49c5` 补了 `json` / `webmanifest`），测试小节的口径刷新为当前函数计数（详见该节）。
 
 ## 后续项（不在本次范围）
 

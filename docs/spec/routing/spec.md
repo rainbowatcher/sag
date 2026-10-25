@@ -91,6 +91,8 @@ sequenceDiagram
   决策点捕获、成功写回三者全匹配才写；TTL 惰性过期不删、LRU 驱逐 bump generation。
   墓碑集合有上限（每 space `max(session_max_entries, 1024)`）：超限时清空墓碑并
   递增全局 epoch（同一临界区），旧 generation 的飞行写回由 epoch 检查拒绝。
+  注意这两个上限都在 **space 内部**：space 按请求模型分片，其数量等于配置的路由模型数——
+  该前提仅对**非通配**配置成立，通配情形已由下方的「通配约束」拒绝。
 - **排序**：`[会话 pin] ++ [A-Res 加权排列 of 其余]`；身份判定与
   `prepend_sticky_target` 同源（`target_matches_entry`），passthrough 与显式
   `real_model` 解析到同一生效模型也不互认。
@@ -99,6 +101,11 @@ sequenceDiagram
 - **pipeline 约束**：image 管线（`dispatch_image`）丢弃 `session_writeback`，因此
   `session_sticky` + `pipeline = "image"` 在 `validate_routes` 即报错（fail-fast，
   避免静默退化为纯加权随机）。
+- **通配约束**：`session_sticky` + `model_name = "*"` 同样在 `validate_routes` 即报错
+  （`sag-config/src/config.rs`）。`spaces` 是 `HashMap<请求模型, RouteSessionSpace>`，
+  通配路由下键域由客户端模型名控制，每模型一份 `session_max_entries` + 墓碑，
+  内存无上限；拒绝后 space 数量才等于配置的精确路由数。替代方案在错误信息里给出
+  （每个模型写精确路由，或通配路由改用 `sticky_failover` / `fill_first` / `round_robin`）。
 - **容量约束**：`session_max_entries = 0` 在 `validate_routes` 即报错——容量 0 会在
   每次写入后立刻驱逐，pin 永不生效，同样会静默退化为纯加权随机；合法范围为 `> 0`
   （未配置 → 内置默认 10000）。
@@ -128,6 +135,8 @@ sequenceDiagram
 - `api_endpoint` 必须以 `/` 开头
 - `session_max_entries` 必须是正数（`0` 被 validator 拒绝，见上）
 - `session_sticky` 不能与 `pipeline = "image"` 组合（image 管线无会话写回）
+- `session_sticky` 不能与通配路由（`model_name = "*"`）组合（space 键域随请求模型
+  无界增长，见上）
 
 ## 测试策略
 

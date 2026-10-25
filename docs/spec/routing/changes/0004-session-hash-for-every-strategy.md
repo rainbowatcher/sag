@@ -1,6 +1,6 @@
 ---
 created: 2026-10-21
-updated: 2026-10-21
+updated: 2026-10-25
 type: 修改
 ---
 
@@ -23,9 +23,9 @@ type: 修改
 
 | 文件 | 变更 |
 |------|------|
-| [`sag-dispatch/src/dispatch/chat/mod.rs`](sag-dispatch/src/dispatch/chat/mod.rs) | 去掉 `session_log_key` 的 strategy 闸门，所有策略记录哈希 |
-| [`sag-dispatch/src/dispatch/image.rs`](sag-dispatch/src/dispatch/image.rs) | image pipeline 各终端行（成功/失败/熔断跳过/耗尽/取消）统一记录 |
-| [`sag-dispatch/src/dispatch/resolve.rs`](sag-dispatch/src/dispatch/resolve.rs) | pre-resolve 失败行（`__no_route__` / `__all_disabled__`）统一记录 |
+| [`sag-dispatch/src/dispatch/chat/mod.rs`](../../../../sag-dispatch/src/dispatch/chat/mod.rs) | 去掉 `session_log_key` 的 strategy 闸门，所有策略记录哈希 |
+| [`sag-dispatch/src/dispatch/image.rs`](../../../../sag-dispatch/src/dispatch/image.rs) | image pipeline 各终端行（成功/失败/熔断跳过/耗尽/取消）统一记录 |
+| [`sag-dispatch/src/dispatch/resolve.rs`](../../../../sag-dispatch/src/dispatch/resolve.rs) | pre-resolve 失败行（`__no_route__` / `__all_disabled__`）统一记录 |
 
 ## 测试
 

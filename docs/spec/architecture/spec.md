@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-23
+updated: 2026-10-25
 ---
 
 # 架构 — 规格
@@ -57,7 +57,7 @@ flowchart TD
 
 ### 发布二进制体积：release profile + UI 分包
 
-根 `Cargo.toml` 的 `[profile.release]` 取 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`：内嵌 UI 后单二进制体积是第一观感，`strip` 去符号表、cgu=1 让跨 crate 内联更充分。代价是构建变慢（决策阶段单次采样：体积 −34%、构建时长 +31.6%）与 panic backtrace 无符号名。注意 `.cargo/config.toml` 曾把 `[profile.release] codegen-units` 设为 16 **覆盖** manifest 的同名字段（cargo 配置优先级高于 manifest），使 cgu=1 在本地与 CI 均失效；该覆盖行已删除，cgu=1 现生效。
+根 `Cargo.toml` 的 `[profile.release]` 取 `lto = "thin"`、`codegen-units = 1`、`strip = "symbols"`：内嵌 UI 后单二进制体积是第一观感，`strip` 去符号表、cgu=1 让跨 crate 内联更充分。代价是构建变慢（决策阶段单次采样：体积 −34%、构建时长 +31.6%）与 panic backtrace 无符号名。注意 `.cargo/config.toml` 曾把 `[profile.release] codegen-units` 设为 16 **覆盖** manifest 的同名字段（cargo 配置优先级高于 manifest），使 cgu=1 在本地与 CI 均失效；该覆盖行已删除，cgu=1 现生效。`.cargo/config.toml` 现已不含**任何** `[profile.release]` 覆盖（连重复写一遍的 `lto = "thin"` 也已删除），release 调优的唯一来源是根 `Cargo.toml`——改体积只需改 manifest。文件里保留的 `[profile.dev] codegen-units = 256` 是开发构建专用（加快本地链接），manifest 无同名字段可被遮盖。
 
 前端侧对应的是 chunk 结构：`sag-ui/vite.config.ts` 用 rolldown 的 `output.codeSplitting.groups` 把 chart.js / vue-chartjs 拆成独立 `vendor-chart`（`AnalyticsPage` 258 kB → 95.52 kB，`vendor-chart` 162.76 kB），两 chunk 各带 content hash —— 改页面不再让图表库缓存失效（`assets/**` 是 `immutable` 一年）。首屏 `modulepreload` 仍为 11 条，`vendor-chart` 不在其中。
 
@@ -111,7 +111,7 @@ CI 的版本门禁（`.github/workflows/release.yml`）同样从根 `Cargo.toml`
 - UI fallback 永远不经过 `build_router` 的中间件栈；其 `Content-Encoding` / `Vary` / `Cache-Control` 由 `ui_handler` 自己设置
 - UI 静态资源缓存头按 `assets/` 前缀分档：`assets/**` 为 `public, max-age=31536000, immutable`，`index.html`（及未来根级无 hash 文件）为 `no-cache` 且带 `ETag`，`If-None-Match` 命中返空 body `304`；ETag 取自**实际下发表示**（`.br`/`.gz` sibling 与 identity 各自独立）
 - 兜底顺序不可调换：`api/` / `v1/` 前缀先返 404 JSON（`NOT_FOUND`，与已注册路由同形），静态面的 `405 + Allow: GET, HEAD` 与 `404` 只在非 API 命名空间生效；`assets/` 前缀永远不回 shell
-- 「子资源探针」的判定是静态扩展名白名单（`ASSET_EXTENSIONS`，26 项，与 `postbuild-compress.mjs` 的 `TEXT_EXTENSIONS` 对齐），不是「末段含点」：带点的客户端路由（`/providers/v1.2`）必须仍能拿到 shell，否则非浏览器客户端会被 404
+- 「子资源探针」的判定是静态扩展名白名单（`ASSET_EXTENSIONS`，26 项，覆盖构建会产出的文件类型——含 `postbuild-compress.mjs` 的 `TEXT_EXTENSIONS` 及压缩脚本跳过的二进制类型），不是「末段含点」：带点的客户端路由（`/providers/v1.2`）必须仍能拿到 shell，否则非浏览器客户端会被 404；判定取路径的**最后一个非空段**，所以 `/gone.js/` 这类带尾斜杠的探针同样 404
 - `*.br` / `*.gz` 预压缩件不可作为独立资源访问（404），且仅在收益 ≥ 2% 时才随构建产出
 
 ## 测试策略

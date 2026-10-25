@@ -43,7 +43,9 @@ updated: 2026-10-25
    超容量按 LRU 淘汰；管理员可经 `GET|DELETE /api/session-affinity` 观测与清除。
    驱逐/清除留下的 generation 墓碑有上限（每 space `max(session_max_entries, 1024)`）；
    溢出时整批清空并在同一临界区递增全局 epoch，代价是可能拒绝一次在途写回
-   （宁可丢一次写回，不泄漏内存）。
+   （宁可丢一次写回，不泄漏内存）。上述两个上限只在 space 数量本身有界时才构成内存
+   总量上限——**space 数量 = 配置的路由模型数**这一前提仅对非通配配置成立，通配情形
+   已被第 7 条校验拒绝。
 5. 会话键只以**哈希**形式存在于状态、管理端快照与 `call_logs.session_key`；
    凡识别出会话，`call_logs.session_key` **不区分路由策略**一律记录（NULL 仅表示
    「请求未携带可识别的会话标识」）。
@@ -51,6 +53,10 @@ updated: 2026-10-25
    `pipeline = "image"` 在配置校验阶段直接报错，不静默退化为纯加权随机；
    `session_max_entries = 0` 同样在校验阶段报错（容量 0 使 pin 永不生效，
    效果等价于静默退化），合法范围为 `> 0`，未配置时取内置默认 10000。
+7. **不得与通配路由组合**：`session_sticky` 的 pin 按**请求模型**分片存放，通配路由
+   （`model_name = "*"`）匹配任意请求模型，使分片键域由客户端模型名控制而不设上限；
+   因此 `session_sticky` + `model_name = "*"` 在配置校验阶段直接报错（需为每个模型写
+   精确路由，或改用 `sticky_failover` / `fill_first` / `round_robin`）。
 
 ### 加权随机基底（priority 即权重）
 
