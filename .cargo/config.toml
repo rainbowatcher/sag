@@ -17,8 +17,10 @@ incremental = true
 [profile.test.package."*"]
 opt-level = 0
 
-# Release size tuning lives in the root `Cargo.toml` (`codegen-units = 1`,
-# `lto = "thin"`, `strip = "symbols"`). Never set `codegen-units` here: cargo
-# config wins over the manifest and would silently disable that tuning.
-[profile.release]
-lto = "thin"
+# Release size tuning lives only in the root `Cargo.toml` (`codegen-units = 1`,
+# `lto = "thin"`, `strip = "symbols"`). Keep this file free of any
+# `[profile.release]` override: cargo config wins over the manifest, so a setting
+# here would silently replace the manifest's one — the old
+# `codegen-units = 16` override here did exactly that. The dev-side
+# `codegen-units` above is intentional (faster local builds) and has no
+# manifest counterpart to shadow.

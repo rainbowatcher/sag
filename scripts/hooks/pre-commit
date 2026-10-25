@@ -2,7 +2,8 @@
 # SAG pre-commit hook —— 提交门禁：fmt-check + lint + test
 #
 # 按暂存文件类型分轨执行（改文档不会拖起 cargo test）：
-#   Rust 轨 (*.rs / Cargo.toml / Cargo.lock / justfile)  → just verify-rust
+#   Rust 轨 (*.rs / Cargo.toml（含各 crate）/ Cargo.lock / justfile /
+#            .cargo/** / rust-toolchain.toml)             → just verify-rust
 #   前端轨 (sag-ui/** / justfile)                        → just verify-ui
 #   scripts 轨 (scripts/**)                              → just test-scripts
 # 三条轨相加 = `just verify`（= fmt-check + lint + test，前后端 + scripts/ 全量）。
@@ -51,7 +52,8 @@ run_step() {
     fi
 }
 
-if staged '*.rs' 'Cargo.toml' 'Cargo.lock' 'justfile' | grep -q .; then
+if staged '*.rs' 'Cargo.toml' '**/Cargo.toml' 'Cargo.lock' 'justfile' \
+    '.cargo/*' '.cargo/**/*' 'rust-toolchain.toml' | grep -q .; then
     run_step "Rust: fmt-check + clippy + test (just verify-rust)" just verify-rust
 fi
 
