@@ -30,6 +30,12 @@ const emit = defineEmits<{
 const saving = ref(false)
 const apiError = ref("")
 const submitted = ref(false)
+
+/** Empty input → `undefined` so the field is omitted and the current value is kept. */
+function parseOptionalInt(raw: string): number | undefined {
+  const trimmed = raw.trim()
+  return trimmed === "" ? undefined : Number(trimmed)
+}
 const targets = ref<TargetItem[]>(
   props.route.targets.map((t, i) => ({
     id: i + 1,
@@ -55,6 +61,10 @@ const form = useForm({
     pipeline: props.route.pipeline ?? ("chat" as Pipeline),
     api_endpoint: props.route.api_endpoint ?? "",
     strategy: props.route.strategy,
+    session_ttl_secs:
+      props.route.session_ttl_secs === undefined ? "" : String(props.route.session_ttl_secs),
+    session_max_entries:
+      props.route.session_max_entries === undefined ? "" : String(props.route.session_max_entries),
   },
   // `validators` is a getter so the refine message re-resolves through `t()`
   // on every validation (form-core re-reads `options.validators` each run).
@@ -64,12 +74,30 @@ const form = useForm({
         .object({
           pipeline: z.enum(["chat", "image"]),
           api_endpoint: z.string(),
-          strategy: z.enum(["sticky_failover", "fill_first", "round_robin"]),
+          strategy: z.enum(["sticky_failover", "fill_first", "round_robin", "session_sticky"]),
+          session_ttl_secs: z.string(),
+          session_max_entries: z.string(),
         })
         .refine((v) => v.pipeline !== "image" || v.api_endpoint.trim().length > 0, {
           message: t("routes.form.apiEndpointRequired"),
           path: ["api_endpoint"],
-        }),
+        })
+        // Only validated for session_sticky: the inputs are hidden otherwise, so
+        // a leftover value must not silently block submission.
+        .refine(
+          (v) =>
+            v.strategy !== "session_sticky" ||
+            v.session_ttl_secs.trim() === "" ||
+            /^\d+$/.test(v.session_ttl_secs.trim()),
+          { message: t("routes.form.sessionTtlInvalid"), path: ["session_ttl_secs"] },
+        )
+        .refine(
+          (v) =>
+            v.strategy !== "session_sticky" ||
+            v.session_max_entries.trim() === "" ||
+            /^[1-9]\d*$/.test(v.session_max_entries.trim()),
+          { message: t("routes.form.sessionMaxEntriesInvalid"), path: ["session_max_entries"] },
+        ),
     }
   },
   onSubmit: async ({ value }) => {
@@ -86,6 +114,9 @@ const form = useForm({
         return
       }
 
+      const ttl = parseOptionalInt(value.session_ttl_secs)
+      const maxEntries = parseOptionalInt(value.session_max_entries)
+
       await routeStore.updateRoute({
         model_name: props.route.model_name,
         pipeline: value.pipeline,
@@ -93,6 +124,15 @@ const form = useForm({
         // route sends `null` to clear a previously saved one.
         api_endpoint: value.pipeline === "image" ? value.api_endpoint.trim() : null,
         strategy: value.strategy !== props.route.strategy ? value.strategy : undefined,
+        // Omitted → keep: the update DTO cannot clear these two back to
+        // "unset", so only a changed value is sent.
+        ...(value.strategy === "session_sticky"
+          ? {
+              session_ttl_secs: ttl !== props.route.session_ttl_secs ? ttl : undefined,
+              session_max_entries:
+                maxEntries !== props.route.session_max_entries ? maxEntries : undefined,
+            }
+          : {}),
         targets: targets.value.map((target) => {
           const entry: {
             provider: string
@@ -182,7 +222,16 @@ async function handleSubmit(event: Event) {
               <ToggleGroupItem value="round_robin">{{
                 $t("routes.form.strategyRoundRobin")
               }}</ToggleGroupItem>
+              <ToggleGroupItem value="session_sticky">{{
+                $t("routes.form.strategySessionSticky")
+              }}</ToggleGroupItem>
             </ToggleGroup>
+            <p
+              v-if="form.state.values.strategy === 'session_sticky'"
+              class="text-muted-foreground mt-1 text-[10px]"
+            >
+              {{ $t("routes.form.strategySessionStickyHint") }}
+            </p>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -229,6 +278,56 @@ async function handleSubmit(event: Event) {
               >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
               >{{ $t("routes.form.apiEndpointHintOr")
               }}<code>/v1beta/models/{model}:generateContent</code>
+            </p>
+            <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
+              {{ field.state.meta.errors[0] }}
+            </p>
+          </Field>
+        </form.Field>
+
+        <form.Field name="session_ttl_secs" #default="{ field }">
+          <Field v-if="form.state.values.strategy === 'session_sticky'">
+            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
+              $t("routes.form.sessionTtlLabel")
+            }}</FieldLabel>
+            <Input
+              :id="field.name"
+              type="number"
+              min="0"
+              :model-value="field.state.value"
+              placeholder="0"
+              class="font-mono text-sm"
+              :aria-invalid="field.state.meta.errors.length > 0"
+              @blur="field.handleBlur"
+              @input="field.handleChange(($event.target as HTMLInputElement).value)"
+            />
+            <p class="text-muted-foreground mt-1 text-[10px]">
+              {{ $t("routes.form.sessionTtlHint") }}
+            </p>
+            <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
+              {{ field.state.meta.errors[0] }}
+            </p>
+          </Field>
+        </form.Field>
+
+        <form.Field name="session_max_entries" #default="{ field }">
+          <Field v-if="form.state.values.strategy === 'session_sticky'">
+            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
+              $t("routes.form.sessionMaxEntriesLabel")
+            }}</FieldLabel>
+            <Input
+              :id="field.name"
+              type="number"
+              min="1"
+              :model-value="field.state.value"
+              placeholder="10000"
+              class="font-mono text-sm"
+              :aria-invalid="field.state.meta.errors.length > 0"
+              @blur="field.handleBlur"
+              @input="field.handleChange(($event.target as HTMLInputElement).value)"
+            />
+            <p class="text-muted-foreground mt-1 text-[10px]">
+              {{ $t("routes.form.sessionMaxEntriesHint") }}
             </p>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}

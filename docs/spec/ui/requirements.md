@@ -79,6 +79,9 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 浮窗选项列表：被禁用 provider 的组带 Disabled 标记；provider 已被删除（或模型列表加载失败）但被现有 target 引用时，补一个尾部组并以 orphan 标记展示，这些行不可勾选但也不会消失；provider 模型列表加载失败按 provider 汇总为一条错误提示，不影响其他组
 - 浮窗键盘操作：↑/↓ 移动高亮、Enter/空格切换勾选（IME 组合输入时不响应）、Esc 关闭且不应用；过滤后高亮行消失时重锚到首个可见项，`aria-activedescendant` 不指向未渲染的行
 - 新建路由表单不预置空白 target 行（空白行会以「target provider required」挡住提交）
+- 策略选择含四个值：sticky-failover、fill-first、round-robin、session-sticky；选中 session-sticky 时展开「会话 TTL（秒，整数 ≥ 0，`0` = 永不过期）」与「每请求模型会话容量（整数 ≥ 1）」两个数字输入，留空 = 不发送该字段、使用后端默认值；两个输入仅在 session-sticky 下显示，也只有在该策略下参与校验（切回其它策略后残留输入不再挡住提交）
+- 会话参数（`session_ttl_secs` / `session_max_entries`）的 update 语义为「省略 = 保留」，编辑表单因此不提供清空交互（清空输入框等价于省略，保持当前值）
+- 跨字段组合校验留给后端：通配路由（`model_name = "*"`）× session-sticky、session-sticky + `pipeline = "image"` 两类组合由 `validate_routes` 拒绝，表单顶部错误条直接展示 400 消息原文（前端不复述、不翻译）
 - 标记引用了已禁用 provider 的 target：行变灰 + Targets 列显示琥珀色警告
 - 支持列排序（点击表头）
 - 编辑：弹框内嵌 `RouteEditForm`，可修改 targets、strategy 等；视口 ≥768px 为 Dialog、<768px 为底部抽屉
@@ -200,6 +203,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)
 - [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)
 - [0006 路由 Target 改为浮窗搜索多选](changes/0006-target-picker-dialog.md)
 - [0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](changes/0005-build-chunk-splitting-and-favicon.md)

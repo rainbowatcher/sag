@@ -60,7 +60,7 @@ updated: 2026-10-25
 ### 多语言（i18n）
 
 - [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
-- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，559 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，571 key），key 为稳定英文标识符
 - [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
 - [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
 - [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
@@ -225,6 +225,17 @@ flowchart TD
 - ✅ 失败时回滚到旧列表，用户无感
 - ❌ 删除期间如果 API 成功但列表未刷新（其他数据变更），回滚逻辑只会恢复本地快照（实际上 `fetchRoutes()` 在成功后触发刷新，副作用可控）
 
+### 路由策略字段：只做格式校验，组合规则留给后端
+
+`RouteAddForm` / `RouteEditForm` 只校验两个会话参数的**格式**（TTL `^\d+$`、容量 `^[1-9]\d*$`），且仅当 `strategy === "session_sticky"` 时生效；跨字段的合法性（通配路由 `*` × `session_sticky`、`session_sticky` + `pipeline = "image"`、容量为 `0`）不在前端复现，提交后由 `GatewayConfig::validate` → `validate_routes` 拒绝，400 消息经表单顶部错误条原文展示。
+
+**Trade-off**:
+- ✅ 组合规则单一来源：后端新增/调整约束时前端零改动，不会出现「前端放过、后端拒绝」或「前端拒绝、后端已放宽」的两套真相
+- ✅ 与既有 provider / route 表单一致：错误文案走 `getErrorMessage()` 直出，不需要为每条后端规则新增 i18n key 并翻译
+- ✅ 前端只拦「输入框里根本打不出合法值」的形态（非整数、负容量），交互反馈最快
+- ❌ 用户要到提交才知道组合非法（无前置高亮），失败前需多一次往返
+- ❌ 错误消息为后端原文（英文、带配置路径），比前端逐条文案生硬；由 session-sticky 的说明行（hint）部分补偿上下文
+
 ### TanStack Table vs shadcn-vue Table
 
 ProviderList 和 RouteList 使用 TanStack Table，LogsPage 和 AnalyticsPage 使用 shadcn-vue Table 组件。
@@ -365,8 +376,10 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 8. **弹框形态断点**：在 390px / 700px / 900px 三个视口分别打开 New Route、Edit Route、Delete Route 确认、Add/Edit Provider → 前两者应分别为 drawer（bottom）/ drawer / dialog；可用 `document.querySelectorAll('[data-slot=drawer-content]')` 与 `[data-slot=dialog-content]` 计数断言，并同时校验 `window.innerWidth` 与 `matchMedia('(min-width: 768px)')`
 9. **语言切换**：Settings → Language 选 English → 导航/表头/toast/表单校验消息即时变英文且 `<html lang>` 变 `en` → 刷新后仍为英文 → 切回中文同理；手动把 `localStorage["sag-ui-lang"]` 改为 `fr` 后刷新 → 界面回退中文且控制台无异常
 10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
+11. **session-sticky 路由**：新建路由选 session-sticky → 两个会话参数输入出现；留空提交 → Network 面板里 payload 不含 `session_ttl_secs` / `session_max_entries`；填 `-1` / `1.5` / 容量 `0` → 就地报错且无请求；编辑既有 session-sticky 路由 → 初值回填，不改则 payload 仍不含两字段（省略 = 保留）；`model_name = "*"` 或 `pipeline = "image"` 提交 → 顶部错误条显示后端 400 消息
 
 ## 变更记录
+- [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)
 - [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)
 - [0006 路由 Target 改为浮窗搜索多选](changes/0006-target-picker-dialog.md)
 - [0005 构建侧收尾：`vendor-chart` 分包与删除 favicon 死引用](changes/0005-build-chunk-splitting-and-favicon.md)

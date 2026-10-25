@@ -318,6 +318,7 @@ export const en = {
   "routeList.strategy.stickyFailover": "sticky-failover",
   "routeList.strategy.fillFirst": "fill-first",
   "routeList.strategy.roundRobin": "round-robin",
+  "routeList.strategy.sessionSticky": "session-sticky",
   "routeList.noMatch": "No routes match the current filters.",
   "routeList.resetFillFirstTitle": "Reset Fill-First Order",
   "routeList.clearActiveTitle": "Clear Active Target",
@@ -343,6 +344,17 @@ export const en = {
   "routes.form.strategyStickyFailover": "Sticky-failover",
   "routes.form.strategyFillFirst": "Fill-first",
   "routes.form.strategyRoundRobin": "Round-robin",
+  "routes.form.strategySessionSticky": "Session-sticky",
+  "routes.form.strategySessionStickyHint":
+    "Sticks one session to one provider: requests carrying a session identity reuse the target that last served them successfully, and a fallback rebinds the pin.",
+  "routes.form.sessionTtlLabel": "Session TTL (s)",
+  "routes.form.sessionTtlHint":
+    "How long a session pin survives. 0 means it never expires; leave empty for the default.",
+  "routes.form.sessionTtlInvalid": "Must be a whole number ≥ 0",
+  "routes.form.sessionMaxEntriesLabel": "Session capacity",
+  "routes.form.sessionMaxEntriesHint":
+    "Pins kept per request model, must be ≥ 1; leave empty for the default (10000).",
+  "routes.form.sessionMaxEntriesInvalid": "Must be a whole number ≥ 1",
   "routes.form.pipeline": "Pipeline",
   "routes.form.pipelineChat": "Chat",
   "routes.form.pipelineImage": "Image",

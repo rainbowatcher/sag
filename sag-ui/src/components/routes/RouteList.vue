@@ -258,12 +258,15 @@ const strategyStyles: Record<string, string> = {
     "bg-emerald-500/10 text-emerald-700 border-emerald-500/20 dark:bg-emerald-400/15 dark:text-emerald-300 dark:border-emerald-400/25",
   round_robin:
     "bg-sky-500/10 text-sky-700 border-sky-500/20 dark:bg-sky-400/15 dark:text-sky-300 dark:border-sky-400/25",
+  session_sticky:
+    "bg-fuchsia-500/10 text-fuchsia-700 border-fuchsia-500/20 dark:bg-fuchsia-400/15 dark:text-fuchsia-300 dark:border-fuchsia-400/25",
 }
 
 const strategyLabels = computed<Record<string, string>>(() => ({
   sticky_failover: t("routeList.strategy.stickyFailover"),
   fill_first: t("routeList.strategy.fillFirst"),
   round_robin: t("routeList.strategy.roundRobin"),
+  session_sticky: t("routeList.strategy.sessionSticky"),
 }))
 
 // headers must stay functions: () => t(...) — string headers freeze on locale switch (see review-p1-p2 Minor-2)

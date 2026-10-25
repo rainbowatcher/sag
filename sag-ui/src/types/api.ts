@@ -293,10 +293,14 @@ export interface RouteConfig {
   api_endpoint: string | null
   strategy: Strategy
   retries?: number
+  /** Session pin TTL in seconds (`0` = pins never expire); omitted → backend default. */
+  session_ttl_secs?: number
+  /** Per-space session pin capacity; omitted → backend default. `0` is rejected by the backend. */
+  session_max_entries?: number
   targets: RouteTarget[]
 }
 
-export type Strategy = "sticky_failover" | "fill_first" | "round_robin"
+export type Strategy = "sticky_failover" | "fill_first" | "round_robin" | "session_sticky"
 
 export interface CreateRoutePayload {
   model_name: string
@@ -305,6 +309,10 @@ export interface CreateRoutePayload {
   api_endpoint?: string
   strategy?: Strategy
   retries?: number
+  /** Only meaningful with `strategy = "session_sticky"`. */
+  session_ttl_secs?: number
+  /** Only meaningful with `strategy = "session_sticky"`. */
+  session_max_entries?: number
   targets: Array<{
     provider: string
     real_model?: string
@@ -322,6 +330,10 @@ export interface UpdateRoutePayload {
   api_endpoint?: string | null
   strategy?: Strategy
   retries?: number
+  /** Omitted → keep the current TTL (the backend cannot clear it). */
+  session_ttl_secs?: number
+  /** Omitted → keep the current capacity (the backend cannot clear it). */
+  session_max_entries?: number
   targets?: Array<{
     provider: string
     real_model?: string
@@ -445,7 +457,7 @@ export interface ActiveTargetEntry {
   age_secs: number
   /** "idle" | "pinned" | "expired" */
   status: string
-  /** Route strategy: "sticky_failover" | "fill_first" | "round_robin". */
+  /** Route strategy: "sticky_failover" | "fill_first" | "round_robin" | "session_sticky". */
   strategy: string
   /**
    * Position of this target in the cached fill-first shuffled order — `0`
