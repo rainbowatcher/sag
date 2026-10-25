@@ -62,6 +62,15 @@ pub struct CreateRouteRequest {
     /// Per-target retry count override for this entire route.
     #[serde(default)]
     pub retries: Option<u32>,
+    /// Session pin TTL in seconds (`0` = pins never expire). Omitted means
+    /// the built-in default (`sag_state::DEFAULT_SESSION_TTL_SECS`).
+    #[serde(default)]
+    pub session_ttl_secs: Option<u64>,
+    /// Per-space session pin capacity. Omitted means the built-in default
+    /// (`sag_state::DEFAULT_SESSION_MAX_ENTRIES`); `0` is rejected by
+    /// `GatewayConfig::validate` on commit (400 via config error path).
+    #[serde(default)]
+    pub session_max_entries: Option<usize>,
     pub targets: Vec<RouteTargetInput>,
 }
 
@@ -81,6 +90,12 @@ pub struct UpdateRouteRequest {
     /// Per-target retry count override for this route.
     #[serde(default)]
     pub retries: Option<u32>,
+    /// Omitted/`null` keeps the current session TTL.
+    #[serde(default)]
+    pub session_ttl_secs: Option<u64>,
+    /// Omitted/`null` keeps the current session capacity.
+    #[serde(default)]
+    pub session_max_entries: Option<usize>,
     #[serde(default)]
     pub targets: Option<Vec<RouteTargetInput>>,
 }
@@ -104,7 +119,8 @@ pub struct DeleteRouteRequest {
 
 /// Borrowing response item for `GET /api/routes` that ensures `pipeline`
 /// and `api_endpoint` always appear in the JSON response, even when they
-/// equal the defaults (`chat` / `null`).
+/// equal the defaults (`chat` / `null`). The optional overrides (`retries`,
+/// `session_ttl_secs`, `session_max_entries`) are omitted when unset.
 #[derive(Serialize)]
 pub struct RouteResponseItem<'a> {
     model_name: &'a str,
@@ -113,6 +129,10 @@ pub struct RouteResponseItem<'a> {
     strategy: Strategy,
     #[serde(skip_serializing_if = "Option::is_none")]
     retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_max_entries: Option<usize>,
     targets: &'a [RouteTarget],
 }
 
@@ -214,6 +234,8 @@ pub async fn list_routes(State(state): State<AppState>) -> impl IntoResponse {
             api_endpoint: r.api_endpoint.as_deref(),
             strategy: r.strategy,
             retries: r.retries,
+            session_ttl_secs: r.session_ttl_secs,
+            session_max_entries: r.session_max_entries,
             targets: &r.targets,
         })
         .collect();
@@ -239,8 +261,8 @@ pub async fn create_route(
     }
 
     let route = RouteConfig {
-        session_ttl_secs: None,
-        session_max_entries: None,
+        session_ttl_secs: req.session_ttl_secs,
+        session_max_entries: req.session_max_entries,
         model_name: req.model_name.clone(),
         pipeline: req.pipeline,
         api_endpoint: req.api_endpoint,
@@ -314,6 +336,15 @@ pub async fn update_route(
         }
         if let Some(retries) = req.retries {
             route.retries = Some(retries);
+        }
+        // Same "omitted = keep" merge as `retries`: an admin patch can set
+        // these session fields but never clear them (a JSON `null` is
+        // indistinguishable from an absent field here).
+        if let Some(ttl_secs) = req.session_ttl_secs {
+            route.session_ttl_secs = Some(ttl_secs);
+        }
+        if let Some(max_entries) = req.session_max_entries {
+            route.session_max_entries = Some(max_entries);
         }
         if let Some(targets) = req.targets {
             route.targets = targets.into_iter().map(Into::into).collect();
@@ -989,6 +1020,230 @@ mod tests {
             orders.contains_key("gpt-4.1"),
             "wildcard concrete request key keeps its cache"
         );
+    }
+
+    // ── Session-affinity field surface (session_ttl_secs / max_entries) ──
+
+    /// `POST /api/routes` must persist both session fields and expose them
+    /// in the `GET /api/routes` snapshot (they used to be hardcoded `None`).
+    #[tokio::test]
+    async fn create_route_round_trips_session_fields() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model_name": "sticky-route",
+                            "strategy": "session_sticky",
+                            "session_ttl_secs": 600,
+                            "session_max_entries": 500,
+                            "targets": [{"provider": "openai", "real_model": "gpt-4o"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        {
+            let cfg = state.config.read().await;
+            let r = cfg
+                .routes
+                .iter()
+                .find(|r| r.model_name == "sticky-route")
+                .expect("route persisted");
+            assert_eq!(r.session_ttl_secs, Some(600));
+            assert_eq!(r.session_max_entries, Some(500));
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let route = body["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model_name"] == "sticky-route")
+            .expect("route present in listing");
+        assert_eq!(route["session_ttl_secs"], serde_json::json!(600));
+        assert_eq!(route["session_max_entries"], serde_json::json!(500));
+    }
+
+    /// A route that never set the session fields must not grow them in the
+    /// listing (`skip_serializing_if = "Option::is_none"`).
+    #[tokio::test]
+    async fn list_routes_omits_unset_session_fields() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let route = &body["routes"][0];
+        assert!(route.get("session_ttl_secs").is_none());
+        assert!(route.get("session_max_entries").is_none());
+    }
+
+    /// `PUT` with both session fields set must overwrite the stored values.
+    #[tokio::test]
+    async fn update_route_sets_session_fields() {
+        let (providers, routes) = one_provider_config("openai", vec![("gpt-4o", "gpt-4o", 1)]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        for (ttl, cap) in [(600u64, 500usize), (120, 42)] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/routes")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model_name": "gpt-4o",
+                                "session_ttl_secs": ttl,
+                                "session_max_entries": cap,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let cfg = state.config.read().await;
+            let r = cfg
+                .routes
+                .iter()
+                .find(|r| r.model_name == "gpt-4o")
+                .unwrap();
+            assert_eq!(r.session_ttl_secs, Some(ttl));
+            assert_eq!(r.session_max_entries, Some(cap));
+        }
+    }
+
+    /// An update that omits the session fields keeps the stored values
+    /// (same "omitted = keep" merge as `retries`).
+    #[tokio::test]
+    async fn update_route_keeps_session_fields_when_omitted() {
+        let (providers, _) = one_provider_config("openai", vec![]);
+        let route = RouteConfig {
+            session_ttl_secs: Some(600),
+            session_max_entries: Some(500),
+            model_name: "gpt-4o".into(),
+            pipeline: Pipeline::Chat,
+            api_endpoint: None,
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::SessionSticky,
+            targets: vec![RouteTarget {
+                provider: "openai".into(),
+                real_model: Some("gpt-4o".into()),
+                retries: None,
+                timeout_secs: None,
+                priority: 1,
+                extra: HashMap::new(),
+                capabilities: None,
+            }],
+        };
+        let state = build_state(providers, vec![route]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"gpt-4o","targets":[{"provider":"openai","real_model":"gpt-4o","priority":5}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let r = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "gpt-4o")
+            .unwrap();
+        assert_eq!(r.session_ttl_secs, Some(600), "omitted ttl must be kept");
+        assert_eq!(
+            r.session_max_entries,
+            Some(500),
+            "omitted capacity must be kept"
+        );
+        assert_eq!(r.targets[0].priority, 5);
+    }
+
+    /// `session_max_entries = 0` is rejected by the coordinator's full
+    /// config validation on commit → 400 (no admin-side duplicate check).
+    #[tokio::test]
+    async fn create_route_zero_session_max_entries_is_400() {
+        let (providers, routes) = one_provider_config("openai", vec![]);
+        let state = build_state(providers, routes).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model_name": "zero-cap",
+                            "strategy": "session_sticky",
+                            "session_max_entries": 0,
+                            "targets": [{"provider": "openai", "real_model": "gpt-4o"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Nothing committed.
+        let cfg = state.config.read().await;
+        assert!(!cfg.routes.iter().any(|r| r.model_name == "zero-cap"));
     }
 
     // ── M7 rework: target capabilities round-trip + illegal enum ──

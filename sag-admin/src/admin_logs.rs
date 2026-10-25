@@ -93,7 +93,6 @@ pub async fn list_logs(
             .into_response(),
         (Err(e), _) | (_, Err(e)) => {
             error!(?e, "logs query or count failed");
-            eprintln!("DEBUG logs failure: {e:?}");
             AppError::Internal(e.to_string()).into_response()
         }
     }

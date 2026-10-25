@@ -176,8 +176,12 @@ pub async fn delete_session_affinity(
                 )
                     .into_response();
             }
-            let before = state.session_affinity.read().await.snapshot().len();
-            state.session_affinity.write().await.clear_all();
+            // Count and clear inside a single write-lock critical section:
+            // a pin inserted between a separate read-lock count and the
+            // write-lock clear would be deleted but not reported.
+            let mut guard = state.session_affinity.write().await;
+            let before = guard.snapshot().len();
+            guard.clear_all();
             before
         }
         (false, Some(key), _) => {
@@ -364,6 +368,32 @@ mod tests {
         assert_eq!(body["deleted"], 2);
         let body = get(&app, "/api/session-affinity").await;
         assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+    }
+
+    /// `deleted` counts every pin across every space, and the count is read
+    /// inside the same write-lock critical section as the clear itself.
+    #[tokio::test]
+    async fn delete_all_counts_pins_across_spaces() {
+        let state = build_state(HashMap::new(), vec![]).await;
+        seed(&state, "gpt-4o", "c1", "first").await;
+        seed(&state, "gpt-4o", "c2", "first").await;
+        seed(&state, "claude", "c3", "second").await;
+        seed(&state, "claude", "c4", "second").await;
+        seed(&state, "gemini", "c5", "third").await;
+        let app = test_app(state);
+
+        let (status, body) =
+            delete(&app, serde_json::json!({ "all": true, "confirm": true })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"], 5);
+        let body = get(&app, "/api/session-affinity").await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+
+        // Idempotent: a second clear reports zero.
+        let (status, body) =
+            delete(&app, serde_json::json!({ "all": true, "confirm": true })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"], 0);
     }
 
     #[tokio::test]
