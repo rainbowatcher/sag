@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// - `circuit_breaker`: `CircuitBreakerConfig::default()` (quota 1h, rate 10s, generic 60s)
 /// - `logging`: `LoggingConfig::default()` (info, compact)
 /// - `shuffle_cache_ttl_secs`: 7200
+/// - `privacy`: `PrivacyConfig::default()` (disabled, mask mode)
 /// - `analytics`, `providers`, `routes`: empty
 #[macro_export]
 macro_rules! gateway_config_base {
@@ -42,6 +43,7 @@ macro_rules! gateway_config_base {
             sticky_failover_reset_secs: 7200,
             circuit_breaker: $crate::CircuitBreakerConfig::default(),
             proxy_url: ::std::option::Option::None,
+            privacy: $crate::PrivacyConfig::default(),
         }
     };
 }
@@ -86,6 +88,10 @@ pub struct GatewayConfig {
     /// `https://` URLs are supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// Privacy filtering: mask / warn / block sensitive values before a
+    /// request reaches an upstream provider. Disabled by default.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 /// Result of removing a provider from the configuration, describing which
@@ -198,6 +204,7 @@ impl GatewayConfig {
         self.validate_backoff(&mut errors, &mut warnings);
         self.validate_providers(normalized_global_proxy.as_ref(), &mut errors, &mut warnings);
         self.validate_routes(&mut errors, &mut warnings);
+        self.validate_privacy(&mut errors);
 
         // Log warnings
         for w in &warnings {
@@ -444,6 +451,27 @@ impl GatewayConfig {
             if provider.key_strategy == KeyStrategy::RoundRobin && provider.api_keys.len() == 1 {
                 warnings.push(format!(
                     "provider '{name}': RoundRobin strategy with a single API key behaves the same as FillFirst"
+                ));
+            }
+        }
+    }
+
+    /// ── Privacy validation ──
+    ///
+    /// Custom regex patterns are compiled **regardless of `privacy.enabled`**:
+    /// a config that would only fail once filtering is switched on is rejected
+    /// up front instead of at the first request.
+    fn validate_privacy(&self, errors: &mut Vec<String>) {
+        for (i, regex) in self.privacy.custom_regexes.iter().enumerate() {
+            if regex.kind.trim().is_empty() {
+                errors.push(format!(
+                    "privacy.custom_regexes[{i}]: kind must not be empty"
+                ));
+            }
+            if let Err(e) = regex::Regex::new(&regex.pattern) {
+                errors.push(format!(
+                    "privacy.custom_regexes[{i}]: invalid regex pattern '{}': {e}",
+                    regex.pattern
                 ));
             }
         }
@@ -994,6 +1022,130 @@ pub fn resolve_effective_proxy(
         }),
         ProxyMode::Disabled => Ok(None),
     }
+}
+
+/// How the privacy filter treats a detected sensitive value.
+///
+/// Serde values are `mask` / `warn` / `block`. Unknown values follow the
+/// same strict pattern as the other config enums ([`ProxyMode`],
+/// [`Strategy`]) — they fail config parsing rather than silently falling
+/// back to `mask`, which would change what leaves the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// Replace the detected value with a deterministic placeholder
+    /// (default). The original value never leaves the gateway.
+    #[default]
+    Mask,
+    /// Forward the request unchanged and only log a warning.
+    Warn,
+    /// Reject the request instead of forwarding it upstream.
+    Block,
+}
+
+/// Privacy filtering configuration (the `[privacy]` section).
+///
+/// Every field has a default, so an empty `[privacy]` table is valid and
+/// leaves filtering **disabled**. Unknown fields are tolerated like
+/// everywhere else in the config; unknown [`PrivacyMode`] values are not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyConfig {
+    /// Master switch. Default: `false` (no filtering at all).
+    pub enabled: bool,
+    /// How a detected value is handled. Default: [`PrivacyMode::Mask`].
+    pub mode: PrivacyMode,
+    /// Whether masked placeholders are restored in the upstream response.
+    /// Default: `true`.
+    pub restore: bool,
+    /// Salt mixed into the masking hash so placeholders cannot be reversed
+    /// with a precomputed table. Empty means an unkeyed hash. Default: `""`.
+    pub salt: String,
+    /// Built-in detector toggles. Default: every detector enabled.
+    pub builtins: PrivacyBuiltins,
+    /// User-supplied regex detectors. Patterns are compiled by
+    /// [`GatewayConfig::validate`], so an invalid one is a config error.
+    pub custom_regexes: Vec<PrivacyCustomRegex>,
+    /// User-supplied literal words to mask. Default: empty.
+    pub custom_words: PrivacyWordList,
+    /// Words that must never be masked, even when a detector matches them.
+    /// Default: empty.
+    pub allowlist: PrivacyWordList,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: PrivacyMode::Mask,
+            restore: true,
+            salt: String::new(),
+            builtins: PrivacyBuiltins::default(),
+            custom_regexes: Vec::new(),
+            custom_words: PrivacyWordList::default(),
+            allowlist: PrivacyWordList::default(),
+        }
+    }
+}
+
+/// Built-in sensitive-value detectors, each individually toggleable.
+///
+/// Every detector defaults to `true`, so an empty `[privacy.builtins]` table
+/// keeps them all on; set a single key to `false` to disable just that
+/// detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyBuiltins {
+    /// Email addresses.
+    pub email: bool,
+    /// Phone numbers.
+    pub phone: bool,
+    /// Mainland-China resident ID numbers (18 digits, checksum verified).
+    pub id_card_cn: bool,
+    /// Bank card numbers (13–19 digits, Luhn-checked).
+    pub bank_card: bool,
+    /// IBAN account numbers.
+    pub iban: bool,
+    /// API keys / tokens (`sk-…`, `ghp_…`, …).
+    pub api_key: bool,
+    /// PEM private key blocks.
+    pub private_key: bool,
+}
+
+impl Default for PrivacyBuiltins {
+    fn default() -> Self {
+        Self {
+            email: true,
+            phone: true,
+            id_card_cn: true,
+            bank_card: true,
+            iban: true,
+            api_key: true,
+            private_key: true,
+        }
+    }
+}
+
+/// A user-supplied regex detector (a `[[privacy.custom_regexes]]` entry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrivacyCustomRegex {
+    /// Regular expression source. Compiled by [`GatewayConfig::validate`];
+    /// a pattern that fails to compile is a config error.
+    pub pattern: String,
+    /// Label attached to matches so the placeholder can name the kind of
+    /// value (e.g. `employee_id`). Must not be empty.
+    pub kind: String,
+    /// Compile the pattern case-insensitively. Default: `false`.
+    #[serde(default)]
+    pub case_insensitive: bool,
+}
+
+/// A list of literal words — used by both `custom_words` and `allowlist`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PrivacyWordList {
+    /// The words themselves. Default: empty.
+    #[serde(default)]
+    pub items: Vec<String>,
 }
 
 /// 单个上游 API 节（`[providers.<name>.apis.<key>]`）：地址 + 协议相关覆盖。
@@ -3837,6 +3989,204 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
             let config: GatewayConfig = toml::from_str(&toml).unwrap();
             assert_eq!(config.routes[0].model_name, "gpt-4o");
             assert_eq!(config.routes[0].targets.len(), 1);
+        }
+    }
+
+    mod privacy_tests {
+        use super::*;
+
+        /// Minimal valid gateway config with `privacy_section` appended.
+        fn config_with(privacy_section: &str) -> Result<GatewayConfig, toml::de::Error> {
+            let toml_str = format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = {{ chat_completions = {{ base_url = "https://api.openai.com/v1" }} }}
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{{ provider = "openai" }}]
+{privacy_section}
+"#
+            );
+            toml::from_str(&toml_str)
+        }
+
+        #[test]
+        fn empty_privacy_table_yields_defaults() {
+            let config = config_with("[privacy]").unwrap();
+            let privacy = &config.privacy;
+            assert!(!privacy.enabled, "privacy is opt-in");
+            assert_eq!(privacy.mode, PrivacyMode::Mask);
+            assert!(privacy.restore);
+            assert_eq!(privacy.salt, "");
+            assert_eq!(privacy.builtins, PrivacyBuiltins::default());
+            assert_eq!(
+                privacy.builtins,
+                PrivacyBuiltins {
+                    email: true,
+                    phone: true,
+                    id_card_cn: true,
+                    bank_card: true,
+                    iban: true,
+                    api_key: true,
+                    private_key: true,
+                }
+            );
+            assert!(privacy.custom_regexes.is_empty());
+            assert!(privacy.custom_words.items.is_empty());
+            assert!(privacy.allowlist.items.is_empty());
+        }
+
+        #[test]
+        fn missing_privacy_section_yields_defaults() {
+            let config = config_with("").unwrap();
+            assert_eq!(config.privacy, PrivacyConfig::default());
+        }
+
+        #[test]
+        fn full_privacy_section_round_trips() {
+            let config = config_with(
+                r#"
+[privacy]
+enabled = true
+mode = "block"
+restore = false
+salt = "s3cret"
+
+[privacy.builtins]
+email = false
+phone = true
+id_card_cn = false
+bank_card = true
+iban = false
+api_key = true
+private_key = false
+
+[[privacy.custom_regexes]]
+pattern = 'EMP-\d{6}'
+kind = "employee_id"
+case_insensitive = true
+
+[[privacy.custom_regexes]]
+pattern = 'ACME_[A-Z]+'
+kind = "acme_code"
+
+[privacy.custom_words]
+items = ["alice@example.com", "bob"]
+
+[privacy.allowlist]
+items = ["public@example.com"]
+"#,
+            )
+            .unwrap();
+            let privacy = &config.privacy;
+            assert!(privacy.enabled);
+            assert_eq!(privacy.mode, PrivacyMode::Block);
+            assert!(!privacy.restore);
+            assert_eq!(privacy.salt, "s3cret");
+            assert!(!privacy.builtins.email);
+            assert!(privacy.builtins.phone);
+            assert!(!privacy.builtins.private_key);
+            assert_eq!(privacy.custom_regexes.len(), 2);
+            assert_eq!(privacy.custom_regexes[0].pattern, "EMP-\\d{6}");
+            assert_eq!(privacy.custom_regexes[0].kind, "employee_id");
+            assert!(privacy.custom_regexes[0].case_insensitive);
+            assert!(
+                !privacy.custom_regexes[1].case_insensitive,
+                "case_insensitive defaults to false"
+            );
+            assert_eq!(privacy.custom_words.items, vec!["alice@example.com", "bob"]);
+            assert_eq!(privacy.allowlist.items, vec!["public@example.com"]);
+
+            // Serialize the section back to TOML and parse it again: the
+            // round-trip must preserve every field.
+            let serialized = toml::to_string(privacy).unwrap();
+            let reparsed: PrivacyConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(&reparsed, privacy);
+        }
+
+        #[test]
+        fn unknown_privacy_mode_is_rejected() {
+            // Enum values are strict (AGENTS.md: 枚举严格、字段容忍).
+            let err = config_with("[privacy]\nmode = \"strict\"").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("strict") && msg.contains("mode"),
+                "unknown privacy mode must fail to parse, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn unknown_privacy_fields_are_tolerated() {
+            let config = config_with(
+                "[privacy]\nenabled = true\nsome_future_field = 1\n\n[privacy.builtins]\ncrypto_wallet = true\n",
+            )
+            .unwrap();
+            assert!(config.privacy.enabled);
+            assert_eq!(config.privacy.mode, PrivacyMode::Mask);
+            assert_eq!(config.privacy.builtins, PrivacyBuiltins::default());
+        }
+
+        #[test]
+        fn invalid_custom_regex_is_rejected() {
+            let config = config_with(
+                r#"
+[privacy]
+enabled = false
+
+[[privacy.custom_regexes]]
+pattern = "EMP-(\\d{6}"
+kind = "employee_id"
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("privacy.custom_regexes[0]") && e.contains("EMP-(\\d{6}")),
+                "invalid custom regex must be reported with index and pattern, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn empty_custom_regex_kind_is_rejected() {
+            let config = config_with(
+                r#"
+[privacy]
+
+[[privacy.custom_regexes]]
+pattern = "EMP-\\d{6}"
+kind = ""
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("privacy.custom_regexes[0]") && e.contains("kind")),
+                "empty regex kind must be reported, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn valid_custom_regex_passes_validation() {
+            let config = config_with(
+                r#"
+[privacy]
+enabled = true
+
+[[privacy.custom_regexes]]
+pattern = "EMP-\\d{6}"
+kind = "employee_id"
+"#,
+            )
+            .unwrap();
+            assert!(config.validate().is_ok());
         }
     }
 }

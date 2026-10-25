@@ -47,6 +47,9 @@ struct MockProvider {
     stream_queue: Mutex<VecDeque<StreamBehavior>>,
     chat_calls: AtomicU32,
     stream_calls: AtomicU32,
+    /// Last request `chat` received — lets a test assert what actually
+    /// crossed the gateway boundary (e.g. privacy placeholders).
+    seen_request: Mutex<Option<ChatCompletionRequest>>,
 }
 
 impl MockProvider {
@@ -57,6 +60,7 @@ impl MockProvider {
             stream_queue: Mutex::new(VecDeque::new()),
             chat_calls: AtomicU32::new(0),
             stream_calls: AtomicU32::new(0),
+            seen_request: Mutex::new(None),
         }
     }
     fn push_chat(&self, b: ChatBehavior) {
@@ -71,6 +75,9 @@ impl MockProvider {
     fn stream_calls(&self) -> u32 {
         self.stream_calls.load(Ordering::SeqCst)
     }
+    fn last_request(&self) -> Option<ChatCompletionRequest> {
+        self.seen_request.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -81,13 +88,14 @@ impl LlmProvider for MockProvider {
 
     async fn chat(
         &self,
-        _request: &ChatCompletionRequest,
+        request: &ChatCompletionRequest,
         _real_model: &str,
         _api_endpoint: &str,
         _target_extra: &HashMap<String, serde_json::Value>,
         _timeout_secs: u64,
     ) -> sag_core::Result<ChatCompletionResponse> {
         self.chat_calls.fetch_add(1, Ordering::SeqCst);
+        *self.seen_request.lock().unwrap() = Some(request.clone());
         match self.chat_queue.lock().unwrap().pop_front() {
             Some(ChatBehavior::Ok(r)) => Ok(r),
             Some(ChatBehavior::Retryable(e)) | Some(ChatBehavior::NonRetryable(e)) => Err(e),
@@ -378,6 +386,26 @@ async fn build_state_with_cb(
             api_keys: vec!["k".into()],
         }),
         circuit_breaker,
+        ..sag_config::gateway_config_base!()
+    };
+    let handle = ConfigHandle::from_config(config);
+    crate::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
+}
+
+/// Like [`build_state`] but with an explicit `[privacy]` section.
+async fn build_state_with_privacy(
+    providers: Vec<Arc<dyn LlmProvider>>,
+    privacy: sag_config::PrivacyConfig,
+) -> AppState {
+    let mut registry: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
+    for p in providers {
+        registry.insert(p.name().to_string(), p);
+    }
+    let config = GatewayConfig {
+        gateway_auth: Some(GatewayAuthConfig {
+            api_keys: vec!["k".into()],
+        }),
+        privacy,
         ..sag_config::gateway_config_base!()
     };
     let handle = ConfigHandle::from_config(config);
@@ -1525,6 +1553,181 @@ async fn dispatch_chat_non_streaming_success() {
     assert_eq!(rows[0].total_prompt_tokens, 5);
     assert_eq!(rows[0].total_completion_tokens, 7);
     assert_eq!(rows[0].total_tokens, 12);
+}
+
+/// Privacy `mask` mode: the provider receives placeholders (the plaintext
+/// never leaves the gateway) and the client gets its own data back — the
+/// non-streaming egress restores every placeholder in the response body.
+#[tokio::test]
+async fn dispatch_chat_masks_request_and_restores_response() {
+    let email = "alice@example.com";
+    // The placeholder is deterministic: `[[{KIND}_{h12}]]` of kind + text +
+    // salt, so the test can predict what the upstream will echo back.
+    let placeholder = sag_privacy::placeholder::make("email", email, "");
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(build_response_with_content(
+        "gpt-4o",
+        None,
+        &format!("your address is {placeholder}"),
+    )));
+    let state = build_state_with_privacy(
+        vec![mock.clone()],
+        sag_config::PrivacyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("write to {email}")}],
+    }))
+    .expect("valid test request");
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Upstream side: placeholder only, never the address.
+    let seen = mock.last_request().expect("provider was called");
+    let sent = seen.messages[0].content.to_string();
+    assert!(sent.contains(&placeholder), "upstream saw: {sent}");
+    assert!(!sent.contains(email), "upstream saw: {sent}");
+
+    // Client side: the plaintext is restored, the placeholder is gone.
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+    assert!(text.contains(email), "client saw: {text}");
+    assert!(!text.contains(&placeholder), "client saw: {text}");
+}
+
+/// Privacy `mask` mode on a streaming response: the restorer rewrites the
+/// placeholder inside each SSE frame, so the client reads its own data while
+/// the upstream only ever saw the marker.
+#[tokio::test]
+async fn dispatch_chat_restores_placeholders_in_stream() {
+    let email = "alice@example.com";
+    let placeholder = sag_privacy::placeholder::make("email", email, "");
+    let frame =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{placeholder}\"}}}}]}}\n\n");
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(frame.into_bytes()),
+        StreamChunk::Done,
+    ]));
+    let state = build_state_with_privacy(
+        vec![mock.clone()],
+        sag_config::PrivacyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("write to {email}")}],
+        "stream": true,
+    }))
+    .expect("valid test request");
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, true, &mut errors)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+    assert!(text.contains(email), "client saw: {text}");
+    assert!(!text.contains(&placeholder), "client saw: {text}");
+}
+
+/// Privacy `block` mode: the request is rejected before any provider call and
+/// the error body names detector kinds + counts only — never the value.
+#[tokio::test]
+async fn dispatch_chat_blocks_request_in_block_mode() {
+    let email = "alice@example.com";
+    let mock = Arc::new(MockProvider::new("openai"));
+    let state = build_state_with_privacy(
+        vec![mock.clone()],
+        sag_config::PrivacyConfig {
+            enabled: true,
+            mode: sag_config::PrivacyMode::Block,
+            ..Default::default()
+        },
+    )
+    .await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("write to {email}")}],
+    }))
+    .expect("valid test request");
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(mock.chat_calls(), 0, "no provider call in block mode");
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(value["error"]["code"], "privacy_violation");
+    let message = value["error"]["message"].as_str().expect("message");
+    assert!(message.contains("email=1"), "message: {message}");
+    assert!(!message.contains(email), "message: {message}");
+}
+
+/// Privacy `mask` mode covers the fields **outside** `messages`: PII moved into
+/// `metadata`, a top-level unknown field (the `extra` catch-all) or
+/// `messages[].name` never reaches the provider in plaintext.
+#[tokio::test]
+async fn dispatch_chat_masks_fields_outside_messages() {
+    let email = "alice@example.com";
+    let placeholder = sag_privacy::placeholder::make("email", email, "");
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(build_response_with_content(
+        "gpt-4o", None, "ok",
+    )));
+    let state = build_state_with_privacy(
+        vec![mock.clone()],
+        sag_config::PrivacyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello", "name": email}],
+        "metadata": {"notes": email},
+        // Unknown top-level field: lands in `ChatCompletionRequest::extra`.
+        "notes": email,
+    }))
+    .expect("valid test request");
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let resp = dispatch_chat(make_ctx(&state, &rt, &req, &targets, false, &mut errors)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let seen = mock.last_request().expect("provider was called");
+    assert_eq!(
+        seen.metadata.as_ref().expect("metadata forwarded")["notes"],
+        json!(placeholder),
+        "metadata must be masked"
+    );
+    assert_eq!(
+        seen.extra["notes"],
+        json!(placeholder),
+        "top-level extras must be masked"
+    );
+    assert_eq!(
+        seen.messages[0].name.as_deref(),
+        Some(placeholder.as_str()),
+        "message name must be masked"
+    );
+    let sent = serde_json::to_string(&seen).expect("request serializes");
+    assert!(!sent.contains(email), "upstream saw: {sent}");
 }
 
 #[tokio::test]

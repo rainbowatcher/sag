@@ -22,6 +22,7 @@ sag-core = { path = "../sag-core" }
 sag-config = { path = "../sag-config" }
 sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
+sag-privacy = { path = "../sag-privacy" }
 sag-state = { path = "../sag-state" }
 
 [dev-dependencies]

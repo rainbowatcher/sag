@@ -17,3 +17,4 @@ async-trait = { workspace = true }
 sag-core = { path = "../sag-core" }
 url = { workspace = true }
 indexmap = { workspace = true }
+regex = { workspace = true }

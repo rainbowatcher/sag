@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-06-26
+updated: 2026-10-25
 ---
 
 # 技术规格
@@ -32,3 +32,4 @@ updated: 2026-06-26
 | [管理 API](/spec/admin/requirements) | REST 端点、CRUD 语义 |
 | [UI](/spec/ui/requirements) | 管理面板前端、响应式布局、主题切换 |
 | [Body Override](/spec/body-override/requirements) | 三层请求体字段覆盖（全局 / 模型级 / 路由目标级） |
+| [隐私过滤](/spec/privacy/requirements) | 敏感值检测与脱敏、占位符响应还原 |

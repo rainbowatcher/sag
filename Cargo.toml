@@ -9,6 +9,7 @@ members = [
   "sag-dispatch",
   "sag-admin",
   "sag-state",
+  "sag-privacy",
 ]
 resolver = "2"
 
@@ -52,6 +53,8 @@ http-body-util = "0.1"
 fastrand = "2"
 futures-util = "0.3"
 indexmap = { version = "2", features = ["serde"] }
+regex = "1"
+aho-corasick = "1"
 sqlx = { version = "0.8", features = [
   "runtime-tokio",
   "sqlite",

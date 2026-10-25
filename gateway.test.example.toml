@@ -42,6 +42,38 @@
 # rate_limited_secs = 10
 # generic_secs = 60
 
+# Privacy filtering — mask / warn / block sensitive values (emails, phone
+# numbers, ID / bank card numbers, IBANs, API keys, private keys) before a
+# request reaches an upstream provider. Disabled by default.
+# [privacy]
+# enabled = false             # master switch; default false
+# mode = "mask"               # "mask" | "warn" | "block"; default "mask"
+# restore = true              # restore masked values in the response; default true
+# salt = "change-me"          # salt for the mask hash; empty = unkeyed
+#
+# Built-in detectors (all default true; set one to false to disable it).
+# [privacy.builtins]
+# email = true
+# phone = true
+# id_card_cn = true
+# bank_card = true
+# iban = true
+# api_key = true
+# private_key = true
+#
+# Custom regex detectors. `pattern` must compile (validated on load, even when
+# `enabled = false`) and `kind` labels the match — neither may be empty.
+# [[privacy.custom_regexes]]
+# pattern = 'EMP-\d{6}'
+# kind = "employee_id"
+# case_insensitive = false    # default false
+#
+# Literal words to mask / words that must never be masked (both default empty).
+# [privacy.custom_words]
+# items = ["alice@example.com"]
+# [privacy.allowlist]
+# items = ["public@example.com"]
+
 # Logging configuration (optional, defaults below).
 # The RUST_LOG environment variable, if set, takes precedence over level.
 [logging]

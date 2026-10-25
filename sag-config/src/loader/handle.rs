@@ -9,7 +9,7 @@ use crate::config::GatewayConfig;
 use crate::loader::save::save_config_to_file;
 
 #[cfg(test)]
-use crate::config::{BackoffConfig, CircuitBreakerConfig, ServerConfig};
+use crate::config::{BackoffConfig, CircuitBreakerConfig, PrivacyConfig, ServerConfig};
 #[cfg(test)]
 use std::collections::HashMap;
 
@@ -106,6 +106,7 @@ mod tests {
             sticky_failover_reset_secs: 7200,
             circuit_breaker: CircuitBreakerConfig::default(),
             proxy_url: None,
+            privacy: PrivacyConfig::default(),
         };
         let h1 = ConfigHandle::from_config(config);
         let h2 = h1.clone();

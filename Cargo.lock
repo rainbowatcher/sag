@@ -1778,6 +1778,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2056,6 +2068,7 @@ dependencies = [
  "async-trait",
  "indexmap",
  "notify",
+ "regex",
  "sag-core",
  "serde",
  "serde_ignored",
@@ -2099,6 +2112,7 @@ dependencies = [
  "sag-analytics",
  "sag-config",
  "sag-core",
+ "sag-privacy",
  "sag-providers",
  "sag-state",
  "serde",
@@ -2134,6 +2148,18 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sag-privacy"
+version = "0.8.1"
+dependencies = [
+ "aho-corasick",
+ "regex",
+ "sag-config",
+ "sag-core",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

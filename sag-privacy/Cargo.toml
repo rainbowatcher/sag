@@ -1,0 +1,16 @@
+[package]
+name = "sag-privacy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Privacy placeholder primitives and streaming SSE restore for SAG"
+
+[dependencies]
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+aho-corasick = { workspace = true }
+sag-config = { path = "../sag-config" }
+sag-core = { path = "../sag-core" }

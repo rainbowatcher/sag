@@ -10,7 +10,9 @@ use futures_util::StreamExt;
 use sag_analytics::AnalyticsEvent;
 use sag_core::{ApiKind, IngressProtocol, Lane};
 use sag_core::{AppError, FailureReason, FinalStatus, RequestResultFact, TargetAttemptFact};
+use sag_privacy::{Outcome as PrivacyOutcome, PlaceholderMap, PrivacyEngine};
 use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, ResponsesCodec};
+use serde_json::json;
 
 use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
@@ -171,6 +173,76 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         mut session_writeback,
     } = ctx;
 
+    // ── Privacy filter ─────────────────────────────────────────────────
+    // Snapshot the config once per request (the privacy section here, the
+    // retry schedule and the circuit-breaker lookups below all read from the
+    // same consistent view: a hot-reload mid-dispatch must not change the
+    // schedule for an in-flight request).
+    let config = state.config.read().await.clone();
+    let privacy_cfg = config.privacy.clone();
+    // Disabled (the default) changes nothing else: no engine compilation, no
+    // scan, no response rewriting.
+    let mut privacy_request: Option<sag_core::ChatCompletionRequest> = None;
+    let mut privacy_ir: Option<sag_core::IrRequest> = None;
+    let mut privacy_map: Option<PlaceholderMap> = None;
+    if privacy_cfg.enabled {
+        // Fail closed: an engine that cannot be compiled must never let an
+        // unmasked request through. The client message stays generic (no
+        // regex detail); the diagnostic goes to the log.
+        let engine = match PrivacyEngine::compile(&privacy_cfg) {
+            Ok(engine) => engine,
+            Err(err) => {
+                tracing::error!(error = %err, "privacy engine init failed");
+                return privacy_unavailable_response();
+            }
+        };
+        // The ingress request is borrowed immutably (route identity, session
+        // key, analytics all read it), so the filter works on a copy.
+        let mut candidate = request.clone();
+        match engine.mask_request(&mut candidate) {
+            PrivacyOutcome::Blocked(report) => {
+                tracing::warn!(hits = %render_hits(&report.hits), "privacy: request blocked");
+                return privacy_violation_response(&report.hits);
+            }
+            PrivacyOutcome::Masked(report) => {
+                tracing::info!(hits = %render_hits(&report.hits), "privacy: request masked");
+                // The IR is the encode source for translated lanes, so the
+                // placeholders must reach it too. Mask the IR **in place**:
+                // re-decoding it from the masked Chat request would rebuild
+                // the whole IR through the Chat codec and lose the ingress
+                // protocol's structure (`routes.rs` decodes Anthropic /
+                // Responses bodies directly) — `Reasoning` would be
+                // downgraded to `Text`, `ToolResult` split into `role: "tool"`
+                // messages, and the loss silent (the clone keeps `ir.loss`).
+                // `mask_ir` keeps every block variant and only rewrites text.
+                let mut masked_ir = match ir {
+                    Some(original) => original.clone(),
+                    // Direct test constructions pass `ir: None`; the fallback
+                    // decode below needs the same masked source.
+                    None => ChatCompletionsCodec::decode_request(&candidate),
+                };
+                engine.mask_ir(&mut masked_ir);
+                privacy_ir = Some(masked_ir);
+                // The reverse map is only useful when the response is
+                // restored; `restore = false` forwards placeholders as-is.
+                if privacy_cfg.restore && !report.map.is_empty() {
+                    privacy_map = Some(report.map);
+                }
+                privacy_request = Some(candidate);
+            }
+            PrivacyOutcome::Detected(report) => {
+                tracing::warn!(
+                    hits = %render_hits(&report.hits),
+                    "privacy: sensitive values detected (warn mode, forwarded unchanged)"
+                );
+            }
+            PrivacyOutcome::Clean => {}
+        }
+    }
+    // From here on the masked copy (when there is one) is the request every
+    // provider call and every egress path sees.
+    let request = privacy_request.as_ref().unwrap_or(request);
+
     // Hashed session identity for the `call_logs` row: recorded for
     // **every** strategy — the session grouping is a request fact, the
     // stickiness is a routing behavior, and a fact column must not depend
@@ -184,11 +256,16 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     // identity continues to read from `request` for exact parity with the
     // pre-M4 path (`request.model` is the route identity).
     let ir_fallback;
-    let ir = match ir {
-        Some(ir) => ir,
-        None => {
-            ir_fallback = ChatCompletionsCodec::decode_request(request);
-            &ir_fallback
+    let ir = if let Some(masked) = privacy_ir.as_ref() {
+        // A masked request must be encoded from its masked IR (see above).
+        masked
+    } else {
+        match ir {
+            Some(ir) => ir,
+            None => {
+                ir_fallback = ChatCompletionsCodec::decode_request(request);
+                &ir_fallback
+            }
         }
     };
     let is_anthropic_ingress = matches!(ingress_protocol, IngressProtocol::AnthropicMessages);
@@ -242,11 +319,8 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         session_log_key.clone(),
     );
 
-    // Snapshot the backoff config once so the per-target retry loop doesn't
-    // hold the config read lock and so all targets within one request share
-    // a consistent view (a hot-reload mid-dispatch shouldn't change the
-    // schedule for an in-flight request).
-    let config = state.config.read().await.clone();
+    // Backoff / circuit-breaker knobs come from the config snapshot taken at
+    // the top of the dispatch (see the privacy block).
     let backoff = config.backoff.clone();
     let retry_on_empty = backoff.retry_on_empty_response;
     let circuit_breaker_cfg = config.circuit_breaker.clone();
@@ -894,6 +968,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 // drop guard; the dispatch guard must not fire on the
                 // normal return.
                 cancel_guard.mark_done();
+                // Privacy: the placeholders a masked request left in the
+                // upstream payload come back inside the SSE frames; the
+                // writer rewrites them frame by frame (both the translated
+                // and the native lane go through `encode`). `None` (privacy
+                // off, no hits, or `restore = false`) passes bytes through.
+                let mut privacy_restore = privacy_map.clone().map(sag_privacy::RestoreWriter::new);
                 // Ingress stream encoder: Chat → Chat codec (Raw passthrough);
                 // Anthropic → per-response stateful Anthropic SSE encoder
                 // (Raw passthrough, block lifecycle, [DONE] suppressed);
@@ -922,6 +1002,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(target.lane.as_str().to_string()),
                         encode_aware_loss_summary(),
                         session_log_key.clone(),
+                        privacy_restore.take(),
                     );
                 }
                 if is_responses_ingress {
@@ -947,6 +1028,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         Some(target.lane.as_str().to_string()),
                         encode_aware_loss_summary(),
                         session_log_key.clone(),
+                        privacy_restore.take(),
                     );
                 }
                 return build_streaming_response(
@@ -971,6 +1053,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     Some(target.lane.as_str().to_string()),
                     encode_aware_loss_summary(),
                     session_log_key.clone(),
+                    privacy_restore.take(),
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {
@@ -1060,19 +1143,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                 //   translated arms still encode from IR (stateless subset).
                 if is_anthropic_ingress {
                     if let Some(raw) = att.raw_responses.as_ref() {
-                        return (StatusCode::OK, Json(raw.clone())).into_response();
+                        return privacy_restored_response(raw.clone(), privacy_map.as_ref());
                     }
                     let body = AnthropicMessagesCodec::encode_response(&att.ir);
-                    return (StatusCode::OK, Json(body)).into_response();
+                    return privacy_restored_response(body, privacy_map.as_ref());
                 }
                 if is_responses_ingress {
                     if let Some(raw) = att.raw_responses.as_ref() {
-                        return (StatusCode::OK, Json(raw.clone())).into_response();
+                        return privacy_restored_response(raw.clone(), privacy_map.as_ref());
                     }
                     let body = ResponsesCodec::encode_response(&att.ir);
-                    return (StatusCode::OK, Json(body)).into_response();
+                    return privacy_restored_response(body, privacy_map.as_ref());
                 }
-                return (StatusCode::OK, Json(att.resp)).into_response();
+                return privacy_restored_response(att.resp, privacy_map.as_ref());
             }
         }
     }
@@ -1134,4 +1217,108 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
     )
     .await;
     response
+}
+
+/// Render a `(kind, occurrences)` hit list as `kind=count,kind=count`.
+///
+/// Only detector kinds and counts ever leave the gateway — a matched value
+/// must never reach a log line or an error body.
+fn render_hits(hits: &[(String, usize)]) -> String {
+    hits.iter()
+        .map(|(kind, count)| format!("{kind}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `400` for a request the privacy filter refused (`mode = "block"`).
+///
+/// The message carries detector kinds and counts only: the caller learns
+/// *what kind* of sensitive value tripped the filter, never the value.
+fn privacy_violation_response(hits: &[(String, usize)]) -> Response<Body> {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "code": "privacy_violation",
+                "message": format!(
+                    "request rejected by the privacy filter: sensitive values detected ({})",
+                    render_hits(hits)
+                ),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// `503` for a privacy engine that failed to compile (fail-closed).
+///
+/// The message is deliberately generic: a compile failure names the offending
+/// user regex, which must not be echoed to the client (the detail is logged).
+fn privacy_unavailable_response() -> Response<Body> {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "privacy engine initialization failed; the request was not forwarded",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Restore placeholders in every string of `value`, returning whether any hit
+/// occurred.
+///
+/// Mirrors the SSE restorer's traversal (string values only — a placeholder
+/// never appears as an object key) for the non-streaming egress.
+fn restore_value(map: &PlaceholderMap, value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            let (restored, hits) = map.replace_in(text);
+            if hits == 0 {
+                return false;
+            }
+            *text = restored;
+            true
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= restore_value(map, item);
+            }
+            changed
+        }
+        serde_json::Value::Object(fields) => {
+            let mut changed = false;
+            for field in fields.values_mut() {
+                changed |= restore_value(map, field);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Non-streaming egress: return `body` as a JSON response, restoring every
+/// placeholder when the privacy filter left a reverse map.
+///
+/// `map == None` (privacy off, no hits, or `restore = false`) keeps the exact
+/// pre-privacy behavior — the typed body goes straight to `Json` and its bytes
+/// are untouched.
+fn privacy_restored_response<T: serde::Serialize>(
+    body: T,
+    map: Option<&PlaceholderMap>,
+) -> Response<Body> {
+    let Some(map) = map else {
+        return (StatusCode::OK, Json(body)).into_response();
+    };
+    let mut value = match serde_json::to_value(&body) {
+        Ok(value) => value,
+        // Response bodies are plain data; a serialization failure cannot
+        // happen in practice, and the typed body is the safer fallback.
+        Err(_) => return (StatusCode::OK, Json(body)).into_response(),
+    };
+    restore_value(map, &mut value);
+    (StatusCode::OK, Json(value)).into_response()
 }

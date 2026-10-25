@@ -11,6 +11,7 @@ use sag_core::{
     CallLog, FailureReason, FinalStatus, IrStreamEvent, RequestResultFact, TargetAttemptFact,
     TargetStatus, Usage,
 };
+use sag_privacy::RestoreWriter;
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -488,6 +489,9 @@ struct StreamState<S, E> {
     loss_summary: Option<String>,
     /// Hashed session identity for the terminal `call_logs` row.
     session_key: Option<String>,
+    /// Privacy reverse-map restorer for the client-visible bytes (`None` when
+    /// the request carried no placeholders or restoring is disabled).
+    privacy_restore: Option<RestoreWriter>,
     // Declared before the guard so it drops first; the guard's own
     // `Arc` clone keeps the shared data alive regardless. The guard
     // field is never read — it exists solely for its `Drop` (client
@@ -564,6 +568,7 @@ fn make_stream_state<S, E>(
     client_ip: Option<String>,
     loss_summary: Option<String>,
     session_key: Option<String>,
+    privacy_restore: Option<RestoreWriter>,
 ) -> StreamState<S, E> {
     StreamState {
         stream,
@@ -577,6 +582,7 @@ fn make_stream_state<S, E>(
         client_ip,
         loss_summary,
         session_key,
+        privacy_restore,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
     }
@@ -901,6 +907,14 @@ pub fn build_streaming_response<S, E>(
     lane: Option<String>,
     loss_summary: Option<String>,
     session_key: Option<String>,
+    // Privacy reverse-map restorer for the client-visible bytes: `Some` only
+    // when the request was masked and `privacy.restore` is on, so every
+    // encoded chunk is pushed through it before it reaches the client and a
+    // placeholder the upstream echoed back becomes the original plaintext
+    // again. The writer buffers a frame split across chunks (a chunk may
+    // yield no bytes yet; the tail is flushed at the terminal). `None` yields
+    // the encoded bytes unchanged.
+    privacy_restore: Option<RestoreWriter>,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -943,6 +957,7 @@ where
         client_ip,
         loss_summary,
         session_key,
+        privacy_restore,
     );
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -967,6 +982,20 @@ where
                     record_stream_error(&mut state, msg);
                 }
                 Some(IrStreamEvent::End) | None => {
+                    // Flush the privacy restorer: bytes still buffered never
+                    // formed a complete frame, so they are forwarded as-is
+                    // (a placeholder split across frames is not restored —
+                    // see `RestoreWriter`'s documented limitation).
+                    if let Some(writer) = state.privacy_restore.as_mut() {
+                        let tail = writer.finish();
+                        if !tail.is_empty() {
+                            finish_stream_terminal(&mut state).await;
+                            return Some((
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from(tail)),
+                                state,
+                            ));
+                        }
+                    }
                     finish_stream_terminal(&mut state).await;
                     return None;
                 }
@@ -975,6 +1004,18 @@ where
                     // stamp TTFT on the first non-empty yielded byte —
                     // a 0-byte encode is not a first byte.
                     let bytes = (state.encode)(&ev);
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    // Privacy: rewrite placeholders back to plaintext before
+                    // the client sees the frame. The writer returns only
+                    // complete frames, so an empty result means "nothing to
+                    // send yet" — the buffered bytes go out with a later
+                    // chunk (or the terminal flush).
+                    let bytes = match state.privacy_restore.as_mut() {
+                        Some(writer) => writer.push(&bytes),
+                        None => bytes,
+                    };
                     if bytes.is_empty() {
                         continue;
                     }
@@ -1106,6 +1147,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -1433,6 +1475,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1655,6 +1698,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1782,6 +1826,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1872,6 +1917,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // The disconnect: drop the response without polling the body. The
@@ -1949,6 +1995,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2050,6 +2097,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         drop(resp);
@@ -2126,6 +2174,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2240,6 +2289,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2335,6 +2385,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -2406,6 +2457,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2522,6 +2574,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2627,6 +2680,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -2705,6 +2759,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -2935,6 +2990,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -3055,6 +3111,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -3127,6 +3184,7 @@ mod tests {
             chrono::Utc::now(),
             chrono::Utc::now(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -3210,6 +3268,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut body = resp.into_body();
@@ -3284,6 +3343,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let mut body = resp.into_body();
         assert_eq!(drain_until_pending(&mut body), 1);
@@ -3336,6 +3396,7 @@ mod tests {
                 chrono::Utc::now(),
                 chrono::Utc::now(),
                 Vec::new(),
+                None,
                 None,
                 None,
                 None,

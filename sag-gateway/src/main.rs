@@ -1386,6 +1386,7 @@ mod tests {
             routes: Vec::new(),
             logging: sag_config::LoggingConfig::default(),
             proxy_url: None,
+            privacy: sag_config::PrivacyConfig::default(),
         })
     }
 
