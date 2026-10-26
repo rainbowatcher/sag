@@ -136,10 +136,10 @@ export const zh: Record<keyof typeof en, string> = {
   "providers.advanced.headerKeyPlaceholder": "Header-Name",
   "providers.advanced.bodyOverridesTitle": "Body Overrides",
   "providers.advanced.bodyOverridesDescription":
-    '在上游 JSON body 中覆盖的键值对。值会按 JSON 解析（例如 <code>4096</code>、<code>true</code>、<code>"text"</code>）。',
+    '在上游 JSON body 中覆盖的键值对。值会按 JSON 解析：数字 4096、布尔 true、字符串 "text"（双引号需一并输入）。',
   "providers.advanced.stripFieldsTitle": "移除字段",
   "providers.advanced.stripFieldsDescription":
-    "发送前从上游 JSON body 中移除的顶层字段。最后应用，在所有覆盖之后。用于上游拒绝的字段（例如 pydantic <code>extra=forbid</code> 下的 <code>chat_template_kwargs</code>）。",
+    "发送前从上游 JSON body 中移除的顶层字段。最后应用，在所有覆盖之后。用于上游拒绝的字段（例如 pydantic extra=forbid 下的 chat_template_kwargs）。",
   "providers.advanced.addField": "添加字段",
   "providers.advanced.roleMappingsTitle": "Role Mappings",
   "providers.advanced.roleMappingsDescriptionDefault":

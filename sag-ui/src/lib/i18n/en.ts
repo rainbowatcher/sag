@@ -145,10 +145,10 @@ export const en = {
   "providers.advanced.headerKeyPlaceholder": "Header-Name",
   "providers.advanced.bodyOverridesTitle": "Body Overrides",
   "providers.advanced.bodyOverridesDescription":
-    'Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON (e.g. <code>4096</code>, <code>true</code>, <code>"text"</code>).',
+    'Key-value pairs overridden in the upstream JSON body. Values are parsed as JSON: numbers as 4096, booleans as true, strings as "text" (type the double quotes too).',
   "providers.advanced.stripFieldsTitle": "Strip Fields",
   "providers.advanced.stripFieldsDescription":
-    "Top-level fields to remove from the upstream JSON body before sending. Applied last, after all overrides. Use for fields the upstream rejects (e.g. <code>chat_template_kwargs</code> for pydantic <code>extra=forbid</code>).",
+    "Top-level fields to remove from the upstream JSON body before sending. Applied last, after all overrides. Use for fields the upstream rejects (e.g. chat_template_kwargs for pydantic extra=forbid).",
   "providers.advanced.addField": "Add Field",
   "providers.advanced.roleMappingsTitle": "Role Mappings",
   "providers.advanced.roleMappingsDescriptionDefault":
