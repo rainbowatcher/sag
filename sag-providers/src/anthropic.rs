@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use sag_core::{
     ApiKind, AppError, ChatCompletionRequest, ChatCompletionResponse, IrStreamEvent, StreamChunk,
+    api::anthropic::{AnthropicContentBlock, AnthropicMessagesResponse},
 };
 use tokio::sync::mpsc;
 use tracing::{error, instrument, trace, warn};
@@ -242,10 +243,12 @@ impl AnthropicProvider {
         enable_cache_control: bool,
     ) -> serde_json::Value {
         let ir = ChatCompletionsCodec::decode_request(request);
-        let (mut body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, real_model);
+        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, real_model);
         if !loss.is_empty() {
             warn!(loss = ?loss.entries, "anthropic encode recorded losses");
         }
+        let mut body = serde_json::to_value(&body)
+            .expect("AnthropicMessagesRequest always serializes to JSON");
         if enable_cache_control {
             inject_cache_control_value(&mut body);
         }
@@ -255,7 +258,7 @@ impl AnthropicProvider {
     /// Convert an Anthropic response to the standard Chat format
     /// (via Anthropic → IR → Chat codec).
     fn from_anthropic_response(body: &serde_json::Value, model: &str) -> ChatCompletionResponse {
-        let mut ir = AnthropicMessagesCodec::decode_response(body);
+        let mut ir = AnthropicMessagesCodec::decode_response(&parse_anthropic_response(body));
         // Chat egress reports the real_model we requested (parity with
         // pre-refactor behavior); upstream id/content/usage stay intact.
         if !model.is_empty() {
@@ -539,6 +542,65 @@ impl AnthropicProvider {
         });
         Ok(Box::pin(stream))
     }
+}
+
+/// Deserialize an upstream Anthropic message body into the typed DTO.
+///
+/// The previous `Value`-based path never failed, so a body that does not match
+/// the schema is decoded leniently instead of yielding an empty message: the
+/// envelope fields are read directly, every content block that cannot be
+/// parsed rides through as `Unknown` (the codec turns it into a loss + `Raw`),
+/// and the unmodelled top-level fields stay in `extra` — the fallback fires
+/// exactly when the body carries a shape the DTO cannot express, so it must not
+/// be the path that drops fields.
+fn parse_anthropic_response(body: &serde_json::Value) -> AnthropicMessagesResponse {
+    if let Ok(parsed) = serde_json::from_value::<AnthropicMessagesResponse>(body.clone()) {
+        return parsed;
+    }
+    warn!("upstream anthropic body does not match the typed schema; decoding leniently");
+
+    // NOTE: mirrors `decode_anthropic_response` in
+    // `sag-dispatch/src/dispatch/chat/mod.rs` — keep the two in sync (the
+    // duplication is known; a shared helper is a separate change). Both keep
+    // the whole body in `extra`; the overlap with typed fields is harmless
+    // because `decode_response` re-inserts only the fields it typed and
+    // `encode_response` skips the known keys, while the dispatch twin needs the
+    // full body anyway for the native passthrough lane (`ir.raw`).
+
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    AnthropicMessagesResponse {
+        id: text("id").unwrap_or_default(),
+        kind: text("type").unwrap_or_else(|| "message".to_string()),
+        role: text("role").unwrap_or_else(|| "assistant".to_string()),
+        content: body
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| blocks.iter().cloned().map(lenient_content_block).collect())
+            .unwrap_or_default(),
+        model: text("model").unwrap_or_default(),
+        stop_reason: text("stop_reason"),
+        stop_sequence: text("stop_sequence"),
+        stop_details: body
+            .get("stop_details")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        container: body
+            .get("container")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        usage: body
+            .get("usage")
+            .and_then(|u| serde_json::from_value(u.clone()).ok()),
+        extra: body.as_object().cloned().unwrap_or_default(),
+    }
+}
+
+/// Parse one content block, keeping the raw payload when the DTO cannot
+/// express it.
+fn lenient_content_block(value: serde_json::Value) -> AnthropicContentBlock {
+    serde_json::from_value(value.clone()).unwrap_or(AnthropicContentBlock::Unknown(value))
 }
 
 /// Emit a Usage chunk from an Anthropic usage object (native stream path).
@@ -1131,8 +1193,65 @@ mod tests {
         }
     }
 
-    // ── 200-delivered upstream error detection in SSE frames ────
+    /// The typed response parse must not turn a schema mismatch into an empty
+    /// message: a body whose `usage` has wrong types still surfaces its text.
+    #[test]
+    fn from_anthropic_response_decodes_leniently_on_schema_mismatch() {
+        let raw = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [{"type": "text", "text": "still here"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": "10", "output_tokens": "5"}
+        });
+        let chat = AnthropicProvider::from_anthropic_response(&raw, "m");
+        assert_eq!(chat.id, "msg_1");
+        assert_eq!(
+            chat.choices[0].message.content,
+            serde_json::json!("still here")
+        );
+        assert_eq!(chat.choices[0].finish_reason.as_deref(), Some("stop"));
+    }
 
+    /// The lenient fallback fires exactly when the body carries a shape the
+    /// DTO cannot express, so it must not be the path that drops fields:
+    /// `container`, `stop_details` and unmodelled top-level keys must all reach
+    /// `ir.raw` (they used to be hardcoded to `None` / dropped with `extra`).
+    #[test]
+    fn parse_anthropic_response_lenient_path_keeps_unmodelled_fields() {
+        let raw = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [{"type": "text", "text": "still here"}],
+            "stop_reason": "end_turn",
+            "container": {"id": "c_1"},
+            "stop_details": {"type": "refusal", "category": "x"},
+            "some_future_field": {"k": 1},
+            "usage": {"input_tokens": "10", "output_tokens": "5"}
+        });
+        let ir = AnthropicMessagesCodec::decode_response(&parse_anthropic_response(&raw));
+        assert_eq!(
+            ir.raw.get("container"),
+            Some(&serde_json::json!({"id": "c_1"})),
+            "container must survive the lenient path"
+        );
+        assert_eq!(
+            ir.raw.get("stop_details"),
+            Some(&serde_json::json!({"type": "refusal", "category": "x"})),
+            "stop_details must survive the lenient path"
+        );
+        assert_eq!(
+            ir.raw.get("some_future_field"),
+            Some(&serde_json::json!({"k": 1})),
+            "unmodelled top-level keys must survive the lenient path"
+        );
+    }
+
+    // ── 200-delivered upstream error detection in SSE frames ────
     #[test]
     fn anthropic_sse_error_event_surfaces_in_stream_error() {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();

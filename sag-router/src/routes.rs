@@ -328,8 +328,33 @@ async fn anthropic_messages(
         }
     };
 
+    // Typed parse first: the raw body already cleared JSON syntax above, so
+    // a shape mismatch here is a semantic 422 `invalid_request_error` in the
+    // Anthropic envelope (same contract as the chat handler's typed
+    // `Json<ChatCompletionRequest>` rejection).
+    let typed = match serde_json::from_value::<sag_core::api::anthropic::AnthropicMessagesRequest>(
+        raw_body.clone(),
+    ) {
+        Ok(typed) => typed,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!(
+                            "Failed to deserialize the JSON body into the target type: {err}"
+                        ),
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Decode Anthropic body → IR (structural drops recorded on ir.loss).
-    let ir = sag_providers::AnthropicMessagesCodec::decode_request(&raw_body);
+    let ir = sag_providers::AnthropicMessagesCodec::decode_request(&typed);
     // Session identity for session-sticky routing (design §4.1 chain).
     let session_key =
         crate::session::extract_session_key(crate::session::BodyView::Raw(&raw_body), Some(&ir));
@@ -430,6 +455,16 @@ async fn anthropic_messages(
     render_anthropic_error(response).await
 }
 
+/// Render a decode-layer [`sag_core::AppError`] as a 422 with the OpenAI
+/// error envelope, keeping the pre-typed `BadRequest` message verbatim.
+fn unprocessable_app_error(err: &sag_core::AppError) -> Response<Body> {
+    let message = match err {
+        sag_core::AppError::BadRequest(m) => m.clone(),
+        other => other.to_string(),
+    };
+    unprocessable(message)
+}
+
 /// Build an HTTP 422 response with the OpenAI error envelope (§8.2)
 /// used by the Responses (and Chat) ingress paths.
 fn unprocessable(message: impl Into<String>) -> Response<Body> {
@@ -505,16 +540,24 @@ async fn responses(
             sag_providers::StatefulMode::Reject
         }
     };
-    let ir = match sag_providers::ResponsesCodec::decode_request_with_mode(&raw_body, stateful_mode)
-    {
+    // R2 ordering: the stateful/background pre-check runs on the **raw**
+    // value before the typed parse, so its 422 messages are byte-identical to
+    // the pre-typed handler even for bodies the DTO cannot represent (e.g.
+    // `store: "true"` string form).
+    if let Err(err) = sag_providers::reject_unsupported_mode(&raw_body, stateful_mode) {
+        return unprocessable_app_error(&err);
+    }
+    // Typed parse: a body that is valid JSON but does not fit the DTO is a
+    // semantic 422 (never a silent loss).
+    let typed = match serde_json::from_value::<sag_core::api::responses::ResponsesRequest>(
+        raw_body.clone(),
+    ) {
+        Ok(typed) => typed,
+        Err(err) => return unprocessable(err.to_string()),
+    };
+    let ir = match sag_providers::ResponsesCodec::decode_request_with_mode(&typed, stateful_mode) {
         Ok(ir) => ir,
-        Err(err) => {
-            let message = match &err {
-                sag_core::AppError::BadRequest(m) => m.clone(),
-                other => other.to_string(),
-            };
-            return unprocessable(message);
-        }
+        Err(err) => return unprocessable_app_error(&err),
     };
     // Synthesize a ChatCompletionRequest so resolve_route / cancel_guard /
     // analytics have model / stream / reasoning_effort / tools (plan M5-C).

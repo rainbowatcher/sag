@@ -1826,7 +1826,9 @@ async fn dispatch_chat_restores_ir_only_placeholders() {
             ]},
         ],
     });
-    let ir = AnthropicMessagesCodec::decode_request(&ingress_body);
+    let typed: sag_core::api::anthropic::AnthropicMessagesRequest =
+        serde_json::from_value(ingress_body.clone()).expect("valid Anthropic body");
+    let ir = AnthropicMessagesCodec::decode_request(&typed);
 
     // The upstream echoes every placeholder it saw — including the two the
     // Chat request never carried.
@@ -4822,4 +4824,161 @@ async fn responses_bridge_synthesizes_completed_without_finish() {
     }
     assert_eq!(non_compliant.stream_calls(), 1);
     assert_eq!(compliant.stream_calls(), 1);
+}
+
+// ─── typed upstream body → IR boundary ─────────────────────────
+
+/// A proxy that stringifies the usage counters fails the typed
+/// `AnthropicMessagesResponse` parse. The pre-typed `decode_response(&Value)`
+/// still surfaced the generated text, so the lenient fallback must keep it
+/// (only the mistyped `usage` is dropped) instead of reporting an empty
+/// response.
+#[test]
+fn decode_anthropic_response_decodes_leniently_on_schema_mismatch() {
+    let raw = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3",
+        "content": [{"type": "text", "text": "still here"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": "5", "output_tokens": "7"},
+    });
+    let ir = decode_anthropic_response(&raw);
+    assert_eq!(
+        ir.output,
+        vec![sag_core::IrOutputItem::Text {
+            text: "still here".into()
+        }],
+        "readable content must survive a schema mismatch"
+    );
+    assert_eq!(ir.id, "msg_1");
+    assert_eq!(
+        ir.finish_reason,
+        Some(sag_core::IrFinishReason::Stop),
+        "stop_reason still decodes"
+    );
+}
+
+/// The lenient fallback fires exactly when the body carries a shape the DTO
+/// cannot express, so it must not be the path that drops fields: `container`,
+/// `stop_details` and unmodelled top-level keys all survive into `raw`, and
+/// re-encoding must not emit the known keys a second time.
+#[test]
+fn decode_anthropic_response_lenient_path_keeps_unmodelled_fields() {
+    let raw = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3",
+        "content": [{"type": "text", "text": "still here"}],
+        "stop_reason": "end_turn",
+        "container": {"id": "c_1"},
+        "stop_details": {"type": "refusal", "category": "x"},
+        "some_future_field": {"k": 1},
+        "usage": {"input_tokens": "5", "output_tokens": "7"},
+    });
+    let ir = decode_anthropic_response(&raw);
+    assert_eq!(
+        ir.raw.get("container"),
+        Some(&json!({"id": "c_1"})),
+        "container must survive the lenient path"
+    );
+    assert_eq!(
+        ir.raw.get("stop_details"),
+        Some(&json!({"type": "refusal", "category": "x"})),
+        "stop_details must survive the lenient path"
+    );
+    assert_eq!(
+        ir.raw.get("some_future_field"),
+        Some(&json!({"k": 1})),
+        "unmodelled top-level keys must survive the lenient path"
+    );
+
+    let encoded = serde_json::to_string(&AnthropicMessagesCodec::encode_response(&ir))
+        .expect("typed body always serializes");
+    for (needle, key) in [
+        ("\"id\":\"msg_1\"", "id"),
+        ("\"container\"", "container"),
+        ("\"some_future_field\"", "some_future_field"),
+    ] {
+        assert_eq!(
+            encoded.matches(needle).count(),
+            1,
+            "{key} must be emitted exactly once, got: {encoded}"
+        );
+    }
+}
+
+/// A 200-delivered upstream error object carries no `content`, so it decodes
+/// to an output-less IR response (never classified empty — there is no usage,
+/// exactly like the old `Value` path) with the original body preserved in
+/// `raw` for the native passthrough lane.
+#[test]
+fn decode_anthropic_response_keeps_200_error_body_in_raw() {
+    let raw = json!({
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "busy"},
+    });
+    let ir = decode_anthropic_response(&raw);
+    assert!(ir.output.is_empty(), "no content is readable");
+    assert!(
+        !is_empty_ir_response(&ir),
+        "no usage ⇒ never classified empty (same as the old Value path)"
+    );
+    assert_eq!(
+        ir.raw
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str()),
+        Some("overloaded_error"),
+        "the original body must ride in raw (native passthrough lane)"
+    );
+}
+
+/// The typed happy path stays byte-faithful: text/usage survive.
+#[test]
+fn decode_anthropic_response_decodes_typed_body() {
+    let raw = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 7},
+    });
+    let ir = decode_anthropic_response(&raw);
+    assert!(!is_empty_ir_response(&ir));
+    assert_eq!(ir.id, "msg_1");
+    assert_eq!(
+        ir.usage.as_ref().map(|u| u.completion_tokens),
+        Some(7),
+        "typed usage must reach IR"
+    );
+}
+
+/// Same contract for Responses: a mistyped `created_at` fails the typed parse,
+/// so the lenient fallback keeps the envelope and decodes the `output` items
+/// (native egress uses the untouched `raw_responses` either way).
+#[test]
+fn decode_responses_response_decodes_leniently_on_schema_mismatch() {
+    let raw = json!({
+        "id": "resp_1",
+        "created_at": "nope",
+        "status": "completed",
+        "model": "gpt-5",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi", "annotations": []}],
+        }],
+    });
+    let ir = decode_responses_response(&raw);
+    assert_eq!(ir.id, "resp_1", "the readable envelope survives");
+    assert_eq!(
+        ir.output,
+        vec![sag_core::IrOutputItem::Text { text: "hi".into() }],
+        "readable output items must survive a schema mismatch"
+    );
 }

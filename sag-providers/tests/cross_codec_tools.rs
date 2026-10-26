@@ -28,7 +28,10 @@
 
 use serde_json::{Value, json};
 
-use sag_core::{ChatCompletionRequest, IrRequest, LossInventory, LossReason, LossScope};
+use sag_core::{
+    ChatCompletionRequest, IrRequest, LossInventory, LossReason, LossScope,
+    api::{anthropic::AnthropicMessagesRequest, responses::ResponsesRequest},
+};
 use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, ResponsesCodec};
 
 const TOOL_EXTRA_KEY: &str = "__tool_extra";
@@ -43,8 +46,16 @@ fn chat_request(body: Value) -> ChatCompletionRequest {
     serde_json::from_value(body).expect("valid chat request")
 }
 
+fn responses_request(body: Value) -> ResponsesRequest {
+    serde_json::from_value(body).expect("valid responses request")
+}
+
 fn responses_ir(body: Value) -> IrRequest {
-    ResponsesCodec::decode_request(&body).expect("valid responses request")
+    ResponsesCodec::decode_request(&responses_request(body)).expect("valid responses request")
+}
+
+fn anthropic_request(body: Value) -> AnthropicMessagesRequest {
+    serde_json::from_value(body).expect("valid anthropic request")
 }
 
 /// IR → Chat wire JSON + loss.
@@ -61,33 +72,38 @@ fn responses_to_chat(body: Value) -> (Value, LossInventory) {
 
 /// Anthropic body → IR → Chat wire.
 fn anthropic_to_chat(body: Value) -> (Value, LossInventory) {
-    chat_json(&AnthropicMessagesCodec::decode_request(&body))
+    chat_json(&AnthropicMessagesCodec::decode_request(&anthropic_request(
+        body,
+    )))
 }
 
 /// Chat body → IR → Responses wire.
 fn chat_to_responses(body: Value) -> Value {
     let ir = ChatCompletionsCodec::decode_request(&chat_request(body));
-    ResponsesCodec::encode_request(&ir)
+    serde_json::to_value(ResponsesCodec::encode_request(&ir)).expect("responses request serializes")
 }
 
 /// Chat body → IR → Anthropic wire.
 fn chat_to_anthropic(body: Value) -> (Value, LossInventory) {
     let ir = ChatCompletionsCodec::decode_request(&chat_request(body));
-    AnthropicMessagesCodec::encode_request_with_loss(&ir, ANTHROPIC_MODEL)
+    let (req, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, ANTHROPIC_MODEL);
+    let wire = serde_json::to_value(&req).expect("anthropic request serializes");
+    (wire, loss)
 }
 
 /// Responses → Chat → Responses (two hops through the Chat wire).
 fn responses_chat_responses(body: Value) -> Value {
     let (chat_wire, _) = responses_to_chat(body);
     let ir = ChatCompletionsCodec::decode_request(&chat_request(chat_wire));
-    ResponsesCodec::encode_request(&ir)
+    serde_json::to_value(ResponsesCodec::encode_request(&ir)).expect("responses request serializes")
 }
 
 /// Anthropic → Chat → Anthropic (two hops through the Chat wire).
 fn anthropic_chat_anthropic(body: Value) -> Value {
     let (chat_wire, _) = anthropic_to_chat(body);
     let ir = ChatCompletionsCodec::decode_request(&chat_request(chat_wire));
-    AnthropicMessagesCodec::encode_request(&ir)
+    serde_json::to_value(AnthropicMessagesCodec::encode_request(&ir))
+        .expect("anthropic request serializes")
 }
 
 /// Reserved `__`-prefixed markers are IR-internal: they must never reach

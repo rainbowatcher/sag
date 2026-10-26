@@ -8,6 +8,7 @@
 //! logic is co-located in [`error`] (`AppError::circuit_hint`), so the two
 //! halves of the circuit-breaker feature share one crate.
 
+pub mod api;
 pub mod circuit_breaker;
 pub mod error;
 pub mod http_client;

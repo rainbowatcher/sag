@@ -11,11 +11,18 @@
 
 use std::cell::RefCell;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use sag_core::{
     IrContentBlock, IrFinishReason, IrMessage, IrOutputItem, IrRequest, IrResponse, IrResponseMeta,
     IrRole, IrStreamEvent, IrTool, IrToolCall, LossReason, LossScope, Reasoning, Sampling, Usage,
+    api::anthropic::{
+        AnthropicContentBlock, AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicUsage,
+        MessageContent, MessageParam, SystemPrompt, TextBlock, ThinkingBlock, ThinkingConfig,
+        ToolChoice, ToolUnion,
+    },
 };
 
 use super::tool_raw;
@@ -104,14 +111,32 @@ fn finish_to_stop(reason: Option<&IrFinishReason>) -> String {
 }
 
 /// Extract Anthropic usage → IR [`Usage`].
+///
+/// Stream frames still carry raw JSON, so this delegates to the typed
+/// conversion and degrades **per field** when the typed parse fails (a
+/// malformed usage must never abort a stream, and one ill-typed sub-object
+/// must never zero the counters that parsed fine).
 fn anthropic_usage(value: &Value) -> Usage {
+    match serde_json::from_value::<AnthropicUsage>(value.clone()) {
+        Ok(usage) => usage_from_typed(&usage),
+        Err(_) => usage_from_value_lenient(value),
+    }
+}
+
+/// Per-field usage read used when the typed parse fails.
+///
+/// Mirrors the pre-typed `anthropic_usage` semantics field by field: a
+/// missing counter is `0`, a present-but-ill-typed counter is skipped, and
+/// the cache counters default to `Some(0)` whenever `input_tokens > 0`
+/// (they were reported as "known zero" for real requests).
+fn usage_from_value_lenient(value: &Value) -> Usage {
     let input = value
         .get("input_tokens")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
     let output = value
         .get("output_tokens")
-        .and_then(|v| v.as_u64())
+        .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
     Usage {
         prompt_tokens: input,
@@ -119,36 +144,161 @@ fn anthropic_usage(value: &Value) -> Usage {
         total_tokens: input.saturating_add(output),
         cached_tokens: value
             .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
+            .and_then(Value::as_u64)
             .map(|v| v as u32)
             .or((input > 0).then_some(0)),
         cache_creation_tokens: value
             .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
+            .and_then(Value::as_u64)
             .map(|v| v as u32)
             .or((input > 0).then_some(0)),
+        // Same precedence as [`usage_from_typed`]: documented nested location
+        // first, legacy root-level `thinking_tokens` second.
         reasoning_tokens: value
-            .get("thinking_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .or_else(|| {
+                value
+                    .get("thinking_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+            }),
+    }
+}
+
+/// Typed Anthropic usage → IR [`Usage`].
+fn usage_from_typed(usage: &AnthropicUsage) -> Usage {
+    let input = usage.input_tokens as u32;
+    let output = usage.output_tokens as u32;
+    Usage {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: input.saturating_add(output),
+        cached_tokens: usage
+            .cache_read_input_tokens
+            .map(|v| v as u32)
+            .or((input > 0).then_some(0)),
+        cache_creation_tokens: usage
+            .cache_creation_input_tokens
+            .map(|v| v as u32)
+            .or((input > 0).then_some(0)),
+        // Root-level `thinking_tokens` is not modelled by the DTO (it rides in
+        // `extra`); `output_tokens_details` is the documented location.
+        reasoning_tokens: usage
+            .output_tokens_details
+            .as_ref()
+            .map(|d| d.thinking_tokens as u32)
+            .or_else(|| {
+                usage
+                    .extra
+                    .get("thinking_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+            }),
     }
 }
 
 /// IR [`Usage`] → Anthropic usage object.
-fn usage_to_anthropic(usage: &Usage) -> Value {
-    let mut m = Map::new();
-    m.insert("input_tokens".into(), json!(usage.prompt_tokens));
-    m.insert("output_tokens".into(), json!(usage.completion_tokens));
-    if let Some(c) = usage.cached_tokens {
-        m.insert("cache_read_input_tokens".into(), json!(c));
-    }
-    if let Some(c) = usage.cache_creation_tokens {
-        m.insert("cache_creation_input_tokens".into(), json!(c));
-    }
+fn usage_to_anthropic(usage: &Usage) -> AnthropicUsage {
+    let mut extra = Map::new();
+    // Root-level `thinking_tokens` (not `output_tokens_details`) is the shape
+    // [`usage_from_typed`] reads back — keep the round-trip symmetric.
     if let Some(r) = usage.reasoning_tokens {
-        m.insert("thinking_tokens".into(), json!(r));
+        extra.insert("thinking_tokens".into(), json!(r));
     }
-    Value::Object(m)
+    AnthropicUsage {
+        input_tokens: u64::from(usage.prompt_tokens),
+        output_tokens: u64::from(usage.completion_tokens),
+        cache_creation_input_tokens: usage.cache_creation_tokens.map(u64::from),
+        cache_read_input_tokens: usage.cached_tokens.map(u64::from),
+        cache_creation: None,
+        output_tokens_details: None,
+        server_tool_use: None,
+        service_tier: None,
+        inference_geo: None,
+        extra,
+    }
+}
+
+// ── typed ↔ value bridges ─────────────────────────────────────────
+//
+// Encode-side shaping stays `Value`-shaped: `cache_control` merging, chat
+// image URL conversion, and Audio/Raw passthrough all work on JSON objects.
+// Parsing the shaped object back into the typed union keeps a single lossless
+// path, with the `Unknown(Value)` variant as the escape hatch for anything the
+// DTO cannot express.
+
+/// Parse a raw value into a typed DTO, keeping it verbatim in the caller's
+/// `Unknown` variant unless the typed form round-trips unchanged.
+///
+/// Several DTO variants carry `#[serde(default)]` fields, so a plain parse
+/// can grow fields the caller never sent (`allowed_tools` / `vector_store_ids`
+/// on the Responses side). The round-trip check keeps the wire shape intact
+/// (R3): a body that would not survive a typed round-trip lands in `Unknown`
+/// verbatim. Same guard as `parse_faithful` on the Responses side
+/// (`codec/responses.rs`).
+///
+/// `tool_use` / `server_tool_use` no longer rely on this guard: their `input`
+/// is an `Option`, so "absent" and "explicitly empty" stay distinct and both
+/// round-trip unchanged. The guard still matters for the remaining
+/// `#[serde(default)]` fields.
+fn parse_faithful<T>(value: &Value) -> Option<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let parsed = serde_json::from_value::<T>(value.clone()).ok()?;
+    (serde_json::to_value(&parsed).ok()? == *value).then_some(parsed)
+}
+
+/// Shaped content-block object → typed union (verbatim `Unknown` fallback).
+fn content_block_from_value(value: Value) -> AnthropicContentBlock {
+    parse_faithful(&value).unwrap_or(AnthropicContentBlock::Unknown(value))
+}
+
+/// Typed content block → JSON object (for `ir.raw` / loss payloads).
+fn content_block_to_value(block: &AnthropicContentBlock) -> Value {
+    serde_json::to_value(block).unwrap_or(Value::Null)
+}
+
+/// Shaped `tools[]` object → typed union (verbatim `Unknown` fallback).
+fn tool_union_from_value(value: Value) -> ToolUnion {
+    parse_faithful(&value).unwrap_or(ToolUnion::Unknown(value))
+}
+
+/// Typed tool → JSON object (hosted detection / extras merging work on it).
+fn tool_union_to_value(tool: &ToolUnion) -> Value {
+    serde_json::to_value(tool).unwrap_or(Value::Null)
+}
+
+/// Shaped `tool_choice` object → typed union (verbatim `Unknown` fallback).
+fn tool_choice_from_value(value: Value) -> ToolChoice {
+    parse_faithful(&value).unwrap_or(ToolChoice::Unknown(value))
+}
+
+/// Shaped `thinking` object → typed union (verbatim `Unknown` fallback).
+fn thinking_config_from_value(value: Value) -> ThinkingConfig {
+    parse_faithful(&value).unwrap_or(ThinkingConfig::Unknown(value))
+}
+
+/// Put a raw field back on the typed body: into `slot` when it is still empty
+/// and the value fits, otherwise verbatim into `extra` (never dropped).
+///
+/// Mirrors the old `Value`-based `body.entry(k).or_insert(v)` rule: a field the
+/// IR already produced always wins over `raw`.
+fn restore<T: DeserializeOwned>(
+    slot: &mut Option<T>,
+    extra: &mut Map<String, Value>,
+    key: &str,
+    value: &Value,
+) {
+    if slot.is_none() {
+        if let Ok(parsed) = serde_json::from_value(value.clone()) {
+            *slot = Some(parsed);
+            return;
+        }
+        extra.insert(key.to_string(), value.clone());
+    }
 }
 
 impl AnthropicMessagesCodec {
@@ -158,61 +308,44 @@ impl AnthropicMessagesCodec {
 
     /// Decode an Anthropic Messages request body into IR.
     ///
-    /// Tolerates unknown fields (kept in `raw`); structural drops push
-    /// onto `loss`.
-    pub fn decode_request(body: &Value) -> IrRequest {
+    /// Fields the DTO does not model ride in `req.extra`; typed fields without
+    /// an IR home are copied into `raw` as well, so the native passthrough
+    /// chain (body → `ir.raw` → upstream body) stays lossless. Structural
+    /// drops push onto `loss`.
+    pub fn decode_request(req: &AnthropicMessagesRequest) -> IrRequest {
         let mut loss = sag_core::LossInventory::default();
-        let mut raw = Map::new();
 
-        // Preserve unknown top-level fields for encode round-trip.
-        const KNOWN: &[&str] = &[
-            "model",
-            "messages",
-            "system",
-            "tools",
-            "max_tokens",
-            "stream",
-            "temperature",
-            "top_p",
-            "stop_sequences",
-            "thinking",
-            "metadata",
-            "tool_choice",
-            "top_k",
-        ];
-        if let Some(obj) = body.as_object() {
-            for (k, v) in obj {
-                if !KNOWN.contains(&k.as_str()) {
-                    raw.insert(k.clone(), v.clone());
-                }
-            }
+        // Preserve every unmodelled top-level field for encode round-trip.
+        let mut raw = req.extra.clone();
+        if let Some(v) = &req.output_config {
+            raw.insert("output_config".into(), json!(v));
+        }
+        if let Some(v) = &req.cache_control {
+            raw.insert("cache_control".into(), json!(v));
+        }
+        if let Some(v) = &req.container {
+            raw.insert("container".into(), json!(v));
+        }
+        if let Some(v) = &req.service_tier {
+            raw.insert("service_tier".into(), json!(v));
+        }
+        if let Some(v) = &req.inference_geo {
+            raw.insert("inference_geo".into(), json!(v));
         }
 
-        let model = body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let model = req.model.clone();
 
-        // system (string | blocks) → leading system message.
+        // system (string | text blocks) → leading system message.
         let mut messages = Vec::new();
-        if let Some(system) = body.get("system").filter(|s| !s.is_null()) {
+        if let Some(system) = &req.system {
             let content = match system {
-                Value::String(s) => vec![IrContentBlock::Text { text: s.clone() }],
-                Value::Array(blocks) => blocks
+                SystemPrompt::Text(text) => vec![IrContentBlock::Text { text: text.clone() }],
+                SystemPrompt::Blocks(blocks) => blocks
                     .iter()
-                    .enumerate()
-                    .map(|(i, b)| decode_request_block(b, "system", i, &mut loss))
+                    .map(|b| IrContentBlock::Text {
+                        text: b.text.clone(),
+                    })
                     .collect(),
-                other => {
-                    loss.push_loss(
-                        LossScope::Request,
-                        "system",
-                        LossReason::UnsupportedByIr,
-                        other.clone(),
-                    );
-                    vec![IrContentBlock::Raw(other.clone())]
-                }
             };
             messages.push(IrMessage {
                 role: IrRole::System,
@@ -224,129 +357,55 @@ impl AnthropicMessagesCodec {
             });
         }
 
-        if let Some(arr) = body.get("messages").and_then(|v| v.as_array()) {
-            for (mi, m) in arr.iter().enumerate() {
-                decode_request_message(m, mi, &mut messages, &mut loss);
-            }
-        } else if body.get("messages").is_some_and(|v| !v.is_null()) {
-            loss.push_loss(
-                LossScope::Request,
-                "messages",
-                LossReason::UnsupportedByIr,
-                body.get("messages").cloned().unwrap_or(Value::Null),
-            );
+        for (mi, m) in req.messages.iter().enumerate() {
+            decode_request_message(m, mi, &mut messages, &mut loss);
         }
 
         // max_tokens (required by Anthropic; present on wire → IR).
-        let max_tokens = body
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u32::try_from(n).ok());
+        let max_tokens = req.max_tokens;
 
         // thinking → Reasoning (budget + derived effort for capability).
         let mut reasoning = Reasoning::default();
-        if let Some(thinking) = body.get("thinking").filter(|t| !t.is_null()) {
-            reasoning.thinking = Some(thinking.clone());
-            if thinking.get("type").and_then(|t| t.as_str()) == Some("enabled") {
-                if let Some(budget) = thinking
-                    .get("budget_tokens")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| u32::try_from(n).ok())
-                {
-                    reasoning.budget_tokens = Some(budget);
-                    reasoning.effort = Some(effort_for_budget(budget).to_string());
-                }
-            } else if thinking.get("type").and_then(|t| t.as_str()) == Some("disabled") {
-                // Explicitly disabled: keep the object in thinking for
-                // round-trip but no effort/budget (encode restores it).
+        if let Some(thinking) = &req.thinking {
+            reasoning.thinking = Some(json!(thinking));
+            // Explicitly `disabled` keeps the object for round-trip but
+            // carries no effort/budget (encode restores it).
+            if let ThinkingConfig::Enabled(enabled) = thinking {
+                reasoning.budget_tokens = Some(enabled.budget_tokens);
+                reasoning.effort = Some(effort_for_budget(enabled.budget_tokens).to_string());
             }
         }
 
         // tools (input_schema) → IrTool. M8: Anthropic hosted
         // `web_search` tools (`type: "web_search_20250305"`) keep their
         // type in `raw` for round-trip.
-        let tools = match body.get("tools") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(arr)) => arr
+        let tools = match &req.tools {
+            None => Vec::new(),
+            Some(unions) => unions
                 .iter()
                 .enumerate()
-                .filter_map(|(i, t)| {
-                    let tool_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    let is_web_search = tool_type.starts_with("web_search");
-                    let name = t.get("name").and_then(|v| v.as_str()).map(String::from);
-                    let name = match name {
-                        Some(n) => n,
-                        None if is_web_search => "web_search".to_string(),
-                        None => {
-                            loss.push_loss(
-                                LossScope::Request,
-                                format!("tools[{i}].name"),
-                                LossReason::UnsupportedByIr,
-                                t.clone(),
-                            );
-                            return None;
-                        }
-                    };
-                    let description = t
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let input_schema = if is_web_search {
-                        Value::Null
-                    } else {
-                        t.get("input_schema")
-                            .cloned()
-                            .unwrap_or_else(|| json!({"type": "object"}))
-                    };
-                    // Tool-level extras (cache_control, type, …) for round-trip.
-                    let mut tool_raw = Map::new();
-                    if let Some(obj) = t.as_object() {
-                        for (k, v) in obj {
-                            if !matches!(k.as_str(), "name" | "description" | "input_schema") {
-                                tool_raw.insert(k.clone(), v.clone());
-                            }
-                        }
-                    }
-                    Some(IrTool {
-                        name,
-                        description,
-                        input_schema,
-                        raw: tool_raw,
-                    })
-                })
+                .filter_map(|(i, t)| decode_tool(t, i, &mut loss))
                 .collect(),
-            Some(other) => {
-                loss.push_loss(
-                    LossScope::Request,
-                    "tools",
-                    LossReason::UnsupportedByIr,
-                    other.clone(),
-                );
-                Vec::new()
-            }
         };
 
-        let stop: Vec<String> = body
-            .get("stop_sequences")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let stop = req.stop_sequences.clone().unwrap_or_default();
 
-        let metadata = body.get("metadata").cloned().unwrap_or(Value::Null);
-        let tool_choice = body.get("tool_choice").cloned().unwrap_or(Value::Null);
+        let metadata = req
+            .metadata
+            .as_ref()
+            .map(|m| json!(m))
+            .unwrap_or(Value::Null);
+        let tool_choice = req
+            .tool_choice
+            .as_ref()
+            .map(|c| json!(c))
+            .unwrap_or(Value::Null);
 
         // Sampling: temperature / top_p / top_k.
         let sampling = Sampling {
-            temperature: body.get("temperature").and_then(|v| v.as_f64()),
-            top_p: body.get("top_p").and_then(|v| v.as_f64()),
-            top_k: body
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .and_then(|n| u32::try_from(n).ok()),
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
             seed: None,
             presence_penalty: None,
             frequency_penalty: None,
@@ -354,10 +413,7 @@ impl AnthropicMessagesCodec {
         };
 
         // stream → IR (also kept out of raw; encode re-derives).
-        let stream = body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let stream = req.stream.unwrap_or(false);
 
         IrRequest {
             model,
@@ -384,12 +440,12 @@ impl AnthropicMessagesCodec {
     ///
     /// `cache_control` is **not** injected here (not IR) — the provider
     /// layer applies [`inject_cache_control_value`] when enabled.
-    pub fn encode_request(ir: &IrRequest) -> Value {
+    pub fn encode_request(ir: &IrRequest) -> AnthropicMessagesRequest {
         Self::encode_request_for_model(ir, &ir.model)
     }
 
     /// Encode IR → Anthropic body with an explicit model (real_model override).
-    pub fn encode_request_for_model(ir: &IrRequest, model: &str) -> Value {
+    pub fn encode_request_for_model(ir: &IrRequest, model: &str) -> AnthropicMessagesRequest {
         // Work on a mutable loss clone so max_tokens / thinking failures
         // can be recorded without `&mut IrRequest`. Callers that need the
         // loss entries re-run decode; the provider path logs via
@@ -404,48 +460,54 @@ impl AnthropicMessagesCodec {
     pub fn encode_request_with_loss(
         ir: &IrRequest,
         model: &str,
-    ) -> (Value, sag_core::LossInventory) {
+    ) -> (AnthropicMessagesRequest, sag_core::LossInventory) {
         let mut loss = ir.loss.clone();
-        let value = Self::encode_request_inner(ir, model, &mut loss);
-        (value, loss)
+        let body = Self::encode_request_inner(ir, model, &mut loss);
+        (body, loss)
     }
 
     fn encode_request_inner(
         ir: &IrRequest,
         model: &str,
         loss: &mut sag_core::LossInventory,
-    ) -> Value {
-        let mut body = Map::new();
-        body.insert("model".into(), json!(model));
-
+    ) -> AnthropicMessagesRequest {
         // system: all leading System messages → Anthropic `system` field
         // (string when a single pure-text block; blocks otherwise).
         let (system_msgs, chat_msgs): (Vec<&IrMessage>, Vec<&IrMessage>) =
             ir.messages.iter().partition(|m| m.role == IrRole::System);
+        let mut system_blocks: Vec<TextBlock> = Vec::new();
         if !system_msgs.is_empty() {
-            let blocks: Vec<Value> = system_msgs
+            for (bi, b) in system_msgs
                 .iter()
                 .flat_map(|m| m.content.iter())
                 .enumerate()
-                .map(|(bi, b)| encode_content_block(b, &format!("system.content[{bi}]"), loss))
-                .collect();
-            // Single pure-text block → bare string (Anthropic accepts both).
-            if blocks.len() == 1 && blocks[0].get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(t) = blocks[0].get("text").and_then(|t| t.as_str()) {
-                    body.insert("system".into(), json!(t));
-                } else {
-                    body.insert("system".into(), Value::Array(blocks));
+            {
+                let path = format!("system.content[{bi}]");
+                match encode_content_block(b, &path, loss) {
+                    AnthropicContentBlock::Text(text) => system_blocks.push(text),
+                    // Anthropic's `system` field only accepts text blocks;
+                    // anything else is recorded and dropped rather than sent
+                    // as a foreign shape.
+                    other => loss.push_loss(
+                        LossScope::ContentBlock,
+                        path,
+                        LossReason::UnsupportedByTarget,
+                        content_block_to_value(&other),
+                    ),
                 }
-            } else {
-                body.insert("system".into(), Value::Array(blocks));
             }
         }
+        let system = match system_blocks.len() {
+            // Single pure-text block → bare string (Anthropic accepts both).
+            1 => Some(SystemPrompt::Text(system_blocks[0].text.clone())),
+            0 => None,
+            _ => Some(SystemPrompt::Blocks(system_blocks)),
+        };
 
         // messages: non-system → Anthropic user/assistant turns.
         // Tool-role messages and ToolResult blocks collapse into the
         // adjacent user turn as `tool_result` blocks (Anthropic shape).
-        let anthropic_messages = encode_messages(&chat_msgs, loss);
-        body.insert("messages".into(), Value::Array(anthropic_messages));
+        let messages = encode_messages(&chat_msgs, loss);
 
         // max_tokens: IR → raw → documented default (always with loss).
         let max_tokens = match ir.max_tokens {
@@ -472,57 +534,87 @@ impl AnthropicMessagesCodec {
                 }
             },
         };
-        body.insert("max_tokens".into(), json!(max_tokens));
 
-        if ir.stream {
-            body.insert("stream".into(), json!(true));
-        }
-        if let Some(t) = ir.sampling.temperature {
-            body.insert("temperature".into(), json!(t));
-        }
-        if let Some(p) = ir.sampling.top_p {
-            body.insert("top_p".into(), json!(p));
-        }
-        if let Some(k) = ir.sampling.top_k {
-            body.insert("top_k".into(), json!(k));
-        }
-        if !ir.stop.is_empty() {
-            body.insert("stop_sequences".into(), json!(ir.stop));
-        }
+        let mut body = AnthropicMessagesRequest {
+            model: model.to_string(),
+            max_tokens: Some(max_tokens),
+            messages,
+            system,
+            metadata: None,
+            stop_sequences: (!ir.stop.is_empty()).then(|| ir.stop.clone()),
+            stream: ir.stream.then_some(true),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            output_config: None,
+            cache_control: None,
+            container: None,
+            service_tier: None,
+            inference_geo: None,
+            temperature: ir.sampling.temperature,
+            top_p: ir.sampling.top_p,
+            top_k: ir.sampling.top_k,
+            extra: Map::new(),
+        };
+
         if !ir.metadata.is_null() {
-            body.insert("metadata".into(), ir.metadata.clone());
+            restore(
+                &mut body.metadata,
+                &mut body.extra,
+                "metadata",
+                &ir.metadata,
+            );
         }
         if let Some(v) = encode_tool_choice_for_anthropic(&ir.tool_choice, loss) {
-            body.insert("tool_choice".into(), v);
+            body.tool_choice = Some(tool_choice_from_value(v));
         }
 
         // tools: prefer original raw when present (decode failure path);
         // else rebuild from IrTool.
-        let tools_value = match ir.raw.get("tools").cloned() {
-            Some(v) => Some(v),
-            None if !ir.tools.is_empty() => Some(encode_tools(&ir.tools)),
-            None => None,
-        };
-        if let Some(v) = tools_value {
-            body.insert("tools".into(), v);
+        match ir.raw.get("tools") {
+            Some(Value::Array(arr)) => {
+                body.tools = Some(arr.iter().cloned().map(tool_union_from_value).collect());
+            }
+            Some(other) => {
+                body.extra.insert("tools".into(), other.clone());
+            }
+            None if !ir.tools.is_empty() => body.tools = Some(encode_tools(&ir.tools)),
+            None => {}
         }
 
         // thinking from Reasoning — never silently disabled (§1.3 defect 8).
         if let Some(thinking_value) = Self::encode_thinking(ir, max_tokens, loss) {
-            body.insert("thinking".into(), thinking_value);
+            body.thinking = Some(thinking_config_from_value(thinking_value));
         }
 
         // Unknown raw fields round-trip (do not overwrite known keys).
+        let mut extra = std::mem::take(&mut body.extra);
         for (k, v) in &ir.raw {
-            // Consumed above (mapped / loss-recorded / intentionally
-            // omitted); never re-inject a foreign shape from raw.
-            if k == "max_tokens" || k == "tool_choice" {
-                continue;
+            match k.as_str() {
+                // Consumed above (mapped / loss-recorded / intentionally
+                // omitted); never re-inject a foreign shape from raw.
+                "max_tokens" | "tool_choice" | "tools" | "model" | "messages" => {}
+                "system" => restore(&mut body.system, &mut extra, k, v),
+                "metadata" => restore(&mut body.metadata, &mut extra, k, v),
+                "stop_sequences" => restore(&mut body.stop_sequences, &mut extra, k, v),
+                "stream" => restore(&mut body.stream, &mut extra, k, v),
+                "thinking" => restore(&mut body.thinking, &mut extra, k, v),
+                "output_config" => restore(&mut body.output_config, &mut extra, k, v),
+                "cache_control" => restore(&mut body.cache_control, &mut extra, k, v),
+                "container" => restore(&mut body.container, &mut extra, k, v),
+                "service_tier" => restore(&mut body.service_tier, &mut extra, k, v),
+                "inference_geo" => restore(&mut body.inference_geo, &mut extra, k, v),
+                "temperature" => restore(&mut body.temperature, &mut extra, k, v),
+                "top_p" => restore(&mut body.top_p, &mut extra, k, v),
+                "top_k" => restore(&mut body.top_k, &mut extra, k, v),
+                _ => {
+                    extra.entry(k.clone()).or_insert_with(|| v.clone());
+                }
             }
-            body.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        body.extra = extra;
 
-        Value::Object(body)
+        body
     }
 
     /// Build the `thinking` object from IR Reasoning.
@@ -629,101 +721,72 @@ impl AnthropicMessagesCodec {
     /// Keeps **all** content blocks (text / tool_use / thinking) —
     /// fixes §1.3 defects 1 and 4 (tool_use loss, hardcoded stop,
     /// fabricated `created`).
-    pub fn decode_response(body: &Value) -> IrResponse {
+    pub fn decode_response(resp: &AnthropicMessagesResponse) -> IrResponse {
         let mut loss = sag_core::LossInventory::default();
-        let mut raw = Map::new();
         let mut output = Vec::new();
 
-        let id = body
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let model = body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let id = resp.id.clone();
+        let model = resp.model.clone();
 
-        // Unknown top-level fields → raw (passthrough, no loss).
-        const KNOWN: &[&str] = &[
-            "id",
-            "type",
-            "role",
-            "model",
-            "content",
-            "stop_reason",
-            "stop_sequence",
-            "usage",
-        ];
-        if let Some(obj) = body.as_object() {
-            for (k, v) in obj {
-                if !KNOWN.contains(&k.as_str()) {
-                    raw.insert(k.clone(), v.clone());
+        // Fields the DTO does not model (plus typed fields without an IR home)
+        // → raw (passthrough, no loss).
+        let mut raw = resp.extra.clone();
+        if let Some(v) = &resp.stop_sequence {
+            raw.insert("stop_sequence".into(), json!(v));
+        }
+        if let Some(v) = &resp.stop_details {
+            raw.insert("stop_details".into(), json!(v));
+        }
+        if let Some(v) = &resp.container {
+            raw.insert("container".into(), json!(v));
+        }
+
+        for (i, block) in resp.content.iter().enumerate() {
+            match block {
+                AnthropicContentBlock::Text(t) => {
+                    output.push(IrOutputItem::Text {
+                        text: t.text.clone(),
+                    });
+                }
+                AnthropicContentBlock::Thinking(t) => {
+                    output.push(IrOutputItem::Reasoning {
+                        text: t.thinking.clone(),
+                    });
+                }
+                AnthropicContentBlock::RedactedThinking(t) => {
+                    output.push(IrOutputItem::Reasoning {
+                        text: t.data.clone(),
+                    });
+                }
+                AnthropicContentBlock::ToolUse(t) => {
+                    let tc = IrToolCall {
+                        id: t.id.clone(),
+                        name: t.name.clone(),
+                        // IR has no "arguments absent" state, so a missing
+                        // `input` materialises as `{}` here (same rule as the
+                        // egress side, which always emits `input`).
+                        arguments: Value::Object(t.input.clone().unwrap_or_default()),
+                        index: Some(output.len() as u32),
+                    };
+                    output.push(IrOutputItem::ToolCall(tc));
+                }
+                _ => {
+                    // Unknown block (server_tool_use, …) — Raw + loss.
+                    let value = content_block_to_value(block);
+                    loss.push_loss(
+                        LossScope::Response,
+                        format!("content[{i}]"),
+                        LossReason::UnsupportedByIr,
+                        value.clone(),
+                    );
+                    output.push(IrOutputItem::Raw(value));
                 }
             }
         }
 
-        if let Some(arr) = body.get("content").and_then(|v| v.as_array()) {
-            for (i, block) in arr.iter().enumerate() {
-                match block.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        let text = block
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        output.push(IrOutputItem::Text { text });
-                    }
-                    Some("thinking") | Some("redacted_thinking") => {
-                        let text = block
-                            .get("thinking")
-                            .or_else(|| block.get("data"))
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        output.push(IrOutputItem::Reasoning { text });
-                    }
-                    Some("tool_use") => {
-                        let tc = IrToolCall {
-                            id: block
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
-                            index: Some(output.len() as u32),
-                        };
-                        output.push(IrOutputItem::ToolCall(tc));
-                    }
-                    _ => {
-                        // Unknown block (server_tool_use, …) — Raw + loss.
-                        loss.push_loss(
-                            LossScope::Response,
-                            format!("content[{i}]"),
-                            LossReason::UnsupportedByIr,
-                            block.clone(),
-                        );
-                        output.push(IrOutputItem::Raw(block.clone()));
-                    }
-                }
-            }
-        }
+        let finish_reason = resp.stop_reason.as_deref().map(stop_to_finish);
 
-        let finish_reason = body
-            .get("stop_reason")
-            .and_then(|v| v.as_str())
-            .map(stop_to_finish);
-
-        let usage = body
-            .get("usage")
-            .filter(|u| !u.is_null())
-            .map(anthropic_usage);
+        let usage = resp.usage.as_ref().map(usage_from_typed);
 
         // `created` intentionally None — Anthropic has no timestamp; never
         // fabricate one (§1.3 defect 1).
@@ -744,59 +807,72 @@ impl AnthropicMessagesCodec {
     // ═══════════════════════════════════════════════════════════
 
     /// Encode IR → Anthropic Messages response JSON (ingress egress).
-    pub fn encode_response(ir: &IrResponse) -> Value {
-        let mut content: Vec<Value> = Vec::new();
+    pub fn encode_response(ir: &IrResponse) -> AnthropicMessagesResponse {
+        let mut content: Vec<AnthropicContentBlock> = Vec::new();
         for item in &ir.output {
             match item {
                 IrOutputItem::Text { text } => {
-                    content.push(json!({"type": "text", "text": text}));
+                    content.push(AnthropicContentBlock::Text(TextBlock {
+                        kind: "text".into(),
+                        text: text.clone(),
+                        citations: None,
+                        cache_control: None,
+                        extra: Map::new(),
+                    }));
                 }
                 IrOutputItem::Reasoning { text } => {
-                    content.push(json!({"type": "thinking", "thinking": text}));
+                    content.push(AnthropicContentBlock::Thinking(ThinkingBlock {
+                        kind: "thinking".into(),
+                        thinking: text.clone(),
+                        signature: None,
+                        extra: Map::new(),
+                    }));
                 }
                 IrOutputItem::ToolCall(tc) => {
-                    content.push(json!({
+                    content.push(content_block_from_value(json!({
                         "type": "tool_use",
                         "id": tc.id,
                         "name": tc.name,
                         "input": tc.arguments,
-                    }));
+                    })));
                 }
-                IrOutputItem::Raw(v) => content.push(v.clone()),
+                IrOutputItem::Raw(v) => content.push(content_block_from_value(v.clone())),
             }
         }
 
-        let mut body = Map::new();
-        body.insert("id".into(), json!(ir.id));
-        body.insert("type".into(), json!("message"));
-        body.insert("role".into(), json!("assistant"));
-        body.insert("content".into(), Value::Array(content));
-        body.insert(
-            "stop_reason".into(),
-            json!(finish_to_stop(ir.finish_reason.as_ref())),
-        );
-        if let Some(usage) = &ir.usage {
-            body.insert("usage".into(), usage_to_anthropic(usage));
-        } else {
-            body.insert(
-                "usage".into(),
-                json!({"input_tokens": 0, "output_tokens": 0}),
-            );
-        }
-        // model: prefer IR model; empty → omit? Anthropic always includes it.
-        body.insert("model".into(), json!(ir.model));
+        let mut body = AnthropicMessagesResponse {
+            id: ir.id.clone(),
+            kind: "message".into(),
+            role: "assistant".into(),
+            content,
+            model: ir.model.clone(),
+            stop_reason: Some(finish_to_stop(ir.finish_reason.as_ref())),
+            stop_sequence: None,
+            stop_details: None,
+            container: None,
+            usage: Some(match &ir.usage {
+                Some(usage) => usage_to_anthropic(usage),
+                None => usage_to_anthropic(&Usage::default()),
+            }),
+            extra: Map::new(),
+        };
 
-        // Unknown raw fields round-trip.
+        // Unknown raw fields round-trip (do not overwrite known keys).
+        let mut extra = Map::new();
         for (k, v) in &ir.raw {
-            if !matches!(
-                k.as_str(),
-                "id" | "type" | "role" | "model" | "content" | "stop_reason" | "usage"
-            ) {
-                body.entry(k.clone()).or_insert_with(|| v.clone());
+            match k.as_str() {
+                "id" | "type" | "role" | "model" | "content" | "stop_reason" | "usage" => {}
+                "stop_sequence" => restore(&mut body.stop_sequence, &mut extra, k, v),
+                "stop_details" => restore(&mut body.stop_details, &mut extra, k, v),
+                "container" => restore(&mut body.container, &mut extra, k, v),
+                _ => {
+                    extra.entry(k.clone()).or_insert_with(|| v.clone());
+                }
             }
         }
+        body.extra = extra;
 
-        Value::Object(body)
+        body
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1276,40 +1352,23 @@ impl StreamEncodeState {
 // ── request helpers ───────────────────────────────────────────────
 
 fn decode_request_message(
-    m: &Value,
+    m: &MessageParam,
     mi: usize,
     messages: &mut Vec<IrMessage>,
     loss: &mut sag_core::LossInventory,
 ) {
-    let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-    let role = IrRole::from_raw(role);
+    let role = IrRole::from_raw(&m.role);
 
-    let mut raw = Map::new();
-    if let Some(obj) = m.as_object() {
-        for (k, v) in obj {
-            if k != "role" && k != "content" {
-                raw.insert(k.clone(), v.clone());
-            }
-        }
-    }
+    // Message-level extras (unmodelled per-message fields) for round-trip.
+    let raw = m.extra.clone();
 
-    let content = match m.get("content") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(s)) => vec![IrContentBlock::Text { text: s.clone() }],
-        Some(Value::Array(blocks)) => blocks
+    let content = match &m.content {
+        MessageContent::Text(s) => vec![IrContentBlock::Text { text: s.clone() }],
+        MessageContent::Blocks(blocks) => blocks
             .iter()
             .enumerate()
             .map(|(bi, b)| decode_request_block(b, &format!("messages[{mi}]"), bi, loss))
             .collect(),
-        Some(other) => {
-            loss.push_loss(
-                LossScope::ContentBlock,
-                format!("messages[{mi}].content"),
-                LossReason::UnsupportedByIr,
-                other.clone(),
-            );
-            vec![IrContentBlock::Raw(other.clone())]
-        }
     };
 
     // tool_use blocks in an assistant message also populate tool_calls
@@ -1341,79 +1400,122 @@ fn decode_request_message(
     });
 }
 
+/// Decode one `tools[]` entry into an [`IrTool`].
+///
+/// Hosted-tool detection (`type` starting with `web_search`), `input_schema`
+/// defaulting and extras splitting all work on the tool's JSON object, so the
+/// union is normalised to `Value` first.
+fn decode_tool(t: &ToolUnion, i: usize, loss: &mut sag_core::LossInventory) -> Option<IrTool> {
+    let value = tool_union_to_value(t);
+    let tool_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let is_web_search = tool_type.starts_with("web_search");
+    let name = value.get("name").and_then(|v| v.as_str()).map(String::from);
+    let name = match name {
+        Some(n) => n,
+        None if is_web_search => "web_search".to_string(),
+        None => {
+            loss.push_loss(
+                LossScope::Request,
+                format!("tools[{i}].name"),
+                LossReason::UnsupportedByIr,
+                value.clone(),
+            );
+            return None;
+        }
+    };
+    let description = value
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let input_schema = if is_web_search {
+        Value::Null
+    } else {
+        value
+            .get("input_schema")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}))
+    };
+    // Tool-level extras (cache_control, type, …) for round-trip.
+    let mut tool_raw = Map::new();
+    if let Some(obj) = value.as_object() {
+        for (k, v) in obj {
+            if !matches!(k.as_str(), "name" | "description" | "input_schema") {
+                tool_raw.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Some(IrTool {
+        name,
+        description,
+        input_schema,
+        raw: tool_raw,
+    })
+}
+
 fn decode_request_block(
-    b: &Value,
+    b: &AnthropicContentBlock,
     path: &str,
     bi: usize,
     loss: &mut sag_core::LossInventory,
 ) -> IrContentBlock {
-    match b.get("type").and_then(|t| t.as_str()) {
-        Some("text") => IrContentBlock::Text {
-            text: b
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
+    match b {
+        AnthropicContentBlock::Text(t) => IrContentBlock::Text {
+            text: t.text.clone(),
         },
-        Some("image") => IrContentBlock::Image { data: b.clone() },
-        Some("document") | Some("file") | Some("pdf") => {
-            IrContentBlock::Document { data: b.clone() }
-        }
-        Some("tool_use") => IrContentBlock::ToolUse {
-            id: b
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            name: b
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            arguments: b.get("input").cloned().unwrap_or_else(|| json!({})),
+        AnthropicContentBlock::Image(_) => IrContentBlock::Image {
+            data: content_block_to_value(b),
         },
-        Some("tool_result") => {
-            let content = match b.get("content") {
-                None | Some(Value::Null) => Vec::new(),
-                Some(Value::String(s)) => vec![IrContentBlock::Text { text: s.clone() }],
-                Some(Value::Array(arr)) => arr
+        AnthropicContentBlock::Document(_) => IrContentBlock::Document {
+            data: content_block_to_value(b),
+        },
+        AnthropicContentBlock::ToolUse(t) => IrContentBlock::ToolUse {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            // Same as `decode_response`: IR carries arguments, not their
+            // absence, so a missing `input` becomes `{}`.
+            arguments: Value::Object(t.input.clone().unwrap_or_default()),
+        },
+        AnthropicContentBlock::ToolResult(t) => {
+            let content = match &t.content {
+                None => Vec::new(),
+                Some(sag_core::api::anthropic::ToolResultContent::Text(s)) => {
+                    vec![IrContentBlock::Text { text: s.clone() }]
+                }
+                Some(sag_core::api::anthropic::ToolResultContent::Blocks(blocks)) => blocks
                     .iter()
                     .enumerate()
                     .map(|(i, inner)| decode_request_block(inner, path, i, loss))
                     .collect(),
-                Some(other) => vec![IrContentBlock::Raw(other.clone())],
             };
             IrContentBlock::ToolResult {
-                id: b
-                    .get("tool_use_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| b.get("id").and_then(|v| v.as_str()).map(String::from)),
-                tool_call_id: b
-                    .get("tool_use_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                id: Some(t.tool_use_id.clone()),
+                tool_call_id: t.tool_use_id.clone(),
                 content,
-                is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                is_error: t.is_error.unwrap_or(false),
             }
         }
-        Some("thinking") | Some("redacted_thinking") => IrContentBlock::Reasoning {
-            text: b
-                .get("thinking")
-                .or_else(|| b.get("data"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
+        AnthropicContentBlock::Thinking(t) => IrContentBlock::Reasoning {
+            text: t.thinking.clone(),
         },
-        _ => {
+        AnthropicContentBlock::RedactedThinking(t) => IrContentBlock::Reasoning {
+            text: t.data.clone(),
+        },
+        // Legacy tags outside the documented block union keep mapping to
+        // Document (parity with the previous `Value` path).
+        AnthropicContentBlock::Unknown(v)
+            if matches!(v.get("type").and_then(|t| t.as_str()), Some("file" | "pdf")) =>
+        {
+            IrContentBlock::Document { data: v.clone() }
+        }
+        other => {
+            let value = content_block_to_value(other);
             loss.push_loss(
                 LossScope::ContentBlock,
                 format!("{path}.content[{bi}]"),
                 LossReason::UnsupportedByIr,
-                b.clone(),
+                value.clone(),
             );
-            IrContentBlock::Raw(b.clone())
+            IrContentBlock::Raw(value)
         }
     }
 }
@@ -1425,10 +1527,10 @@ fn decode_request_block(
 /// - Assistant `ToolUse` blocks / `tool_calls` become `tool_use` blocks.
 /// - Non-user/assistant roles default to `user` (Anthropic has only two).
 /// - Unsupported blocks (e.g. Audio) record a loss entry in `loss`.
-fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> Vec<Value> {
+fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> Vec<MessageParam> {
     // First pass: collect pending tool_results to merge into user turns.
-    let mut out: Vec<Value> = Vec::new();
-    let mut pending_tool_results: Vec<Value> = Vec::new();
+    let mut out: Vec<MessageParam> = Vec::new();
+    let mut pending_tool_results: Vec<AnthropicContentBlock> = Vec::new();
 
     for (mi, msg) in msgs.iter().enumerate() {
         // Tool-role message → tool_result block (merge into next user).
@@ -1447,18 +1549,11 @@ fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> V
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let mut block = Map::new();
-            block.insert("type".into(), json!("tool_result"));
-            block.insert("tool_use_id".into(), json!(tool_call_id));
-            block.insert("content".into(), json!(text));
-            if is_error {
-                block.insert("is_error".into(), json!(true));
-            }
-            pending_tool_results.push(Value::Object(block));
+            pending_tool_results.push(tool_result_block(&tool_call_id, &text, is_error));
             continue;
         }
 
-        let mut blocks: Vec<Value> = Vec::new();
+        let mut blocks: Vec<AnthropicContentBlock> = Vec::new();
 
         // Pending tool_results attach to this user turn first.
         if msg.role == IrRole::User && !pending_tool_results.is_empty() {
@@ -1482,14 +1577,7 @@ fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> V
                         _ => None,
                     })
                     .collect();
-                let mut tr = Map::new();
-                tr.insert("type".into(), json!("tool_result"));
-                tr.insert("tool_use_id".into(), json!(tool_call_id));
-                tr.insert("content".into(), json!(text));
-                if *is_error {
-                    tr.insert("is_error".into(), json!(true));
-                }
-                blocks.push(Value::Object(tr));
+                blocks.push(tool_result_block(tool_call_id, &text, *is_error));
             } else {
                 blocks.push(encode_content_block(
                     block,
@@ -1514,31 +1602,27 @@ fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> V
             if content_tool_use_ids.contains(tc.id.as_str()) {
                 continue;
             }
-            blocks.push(json!({
+            blocks.push(content_block_from_value(json!({
                 "type": "tool_use",
                 "id": tc.id,
                 "name": tc.name,
                 "input": tc.arguments,
-            }));
+            })));
         }
 
         if blocks.is_empty() {
             // Empty content — Anthropic rejects empty turns; emit empty text.
-            blocks.push(json!({"type": "text", "text": ""}));
+            blocks.push(content_block_from_value(
+                json!({"type": "text", "text": ""}),
+            ));
         }
 
         // Single pure-text block → Anthropic accepts string content.
-        let content = if blocks.len() == 1
-            && blocks[0].get("type").and_then(|t| t.as_str()) == Some("text")
-            && blocks[0].get("cache_control").is_none()
-        {
-            blocks[0]
-                .get("text")
-                .and_then(|t| t.as_str())
-                .map(|t| json!(t))
-                .unwrap_or_else(|| Value::Array(blocks))
-        } else {
-            Value::Array(blocks)
+        let content = match blocks.as_slice() {
+            [AnthropicContentBlock::Text(text)] if text.cache_control.is_none() => {
+                MessageContent::Text(text.text.clone())
+            }
+            _ => MessageContent::Blocks(blocks),
         };
 
         let anthropic_role = if msg.role == IrRole::Assistant {
@@ -1547,21 +1631,46 @@ fn encode_messages(msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> V
             "user"
         };
 
-        out.push(json!({"role": anthropic_role, "content": content}));
+        out.push(MessageParam {
+            role: anthropic_role.to_string(),
+            content,
+            extra: Map::new(),
+        });
     }
 
     // Trailing tool_results with no following user turn → append a user turn.
     if !pending_tool_results.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": Value::Array(pending_tool_results),
-        }));
+        out.push(MessageParam {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(pending_tool_results),
+            extra: Map::new(),
+        });
     }
 
     out
 }
 
+/// Build an Anthropic `tool_result` content block.
+fn tool_result_block(tool_call_id: &str, text: &str, is_error: bool) -> AnthropicContentBlock {
+    let mut block = Map::new();
+    block.insert("type".into(), json!("tool_result"));
+    block.insert("tool_use_id".into(), json!(tool_call_id));
+    block.insert("content".into(), json!(text));
+    if is_error {
+        block.insert("is_error".into(), json!(true));
+    }
+    content_block_from_value(Value::Object(block))
+}
+
 fn encode_content_block(
+    block: &IrContentBlock,
+    path: &str,
+    loss: &mut sag_core::LossInventory,
+) -> AnthropicContentBlock {
+    content_block_from_value(encode_content_block_value(block, path, loss))
+}
+
+fn encode_content_block_value(
     block: &IrContentBlock,
     path: &str,
     loss: &mut sag_core::LossInventory,
@@ -1736,8 +1845,13 @@ fn encode_tool_choice_for_anthropic(
     }
 }
 
-fn encode_tools(tools: &[IrTool]) -> Value {
-    let arr: Vec<Value> = tools
+/// Rebuild `tools[]` from IR.
+///
+/// Extras merging, hosted-tool detection and `type` normalisation all operate
+/// on the tool's JSON object, so each shaped tool is parsed back into the typed
+/// union (`Unknown` keeps anything the DTO cannot express).
+fn encode_tools(tools: &[IrTool]) -> Vec<ToolUnion> {
+    tools
         .iter()
         .map(|t| {
             // M8 hosted web_search: official Anthropic shape is
@@ -1759,7 +1873,7 @@ fn encode_tools(tools: &[IrTool]) -> Value {
                 // the original type (pinned above), input_schema, or the
                 // chat-only reserved markers.
                 tool_raw::merge_hosted_extras(&mut tool, t, &["type", "input_schema"]);
-                return Value::Object(tool);
+                return tool_union_from_value(Value::Object(tool));
             }
             let mut tool = Map::new();
             tool.insert("name".into(), json!(t.name));
@@ -1782,10 +1896,9 @@ fn encode_tools(tools: &[IrTool]) -> Value {
             ) {
                 tool.remove("type");
             }
-            Value::Object(tool)
+            tool_union_from_value(Value::Object(tool))
         })
-        .collect();
-    Value::Array(arr)
+        .collect()
 }
 
 /// Inject `cache_control` markers into an Anthropic request **Value**
@@ -1864,6 +1977,43 @@ pub fn inject_cache_control_value(body: &mut Value) {
 mod tests {
     use super::*;
 
+    // ── typed test helpers ──────────────────────────────────────
+
+    /// Deserialize a `json!` body into the typed DTO, then decode it.
+    fn decode_req(body: Value) -> IrRequest {
+        let req: AnthropicMessagesRequest =
+            serde_json::from_value(body).expect("body must deserialize into the typed request");
+        AnthropicMessagesCodec::decode_request(&req)
+    }
+
+    /// Encode, then serialize back to JSON for wire-shape assertions.
+    fn encode_json(ir: &IrRequest) -> Value {
+        serde_json::to_value(AnthropicMessagesCodec::encode_request(ir))
+            .expect("encoded request must serialize")
+    }
+
+    /// [`AnthropicMessagesCodec::encode_request_with_loss`] + serialization.
+    fn encode_json_with_loss(ir: &IrRequest, model: &str) -> (Value, sag_core::LossInventory) {
+        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(ir, model);
+        (
+            serde_json::to_value(body).expect("encoded request must serialize"),
+            loss,
+        )
+    }
+
+    /// Deserialize a `json!` body into the typed DTO, then decode it.
+    fn decode_resp(body: Value) -> IrResponse {
+        let resp: AnthropicMessagesResponse =
+            serde_json::from_value(body).expect("body must deserialize into the typed response");
+        AnthropicMessagesCodec::decode_response(&resp)
+    }
+
+    /// Encode, then serialize back to JSON for wire-shape assertions.
+    fn encode_resp_json(ir: &IrResponse) -> Value {
+        serde_json::to_value(AnthropicMessagesCodec::encode_response(ir))
+            .expect("encoded response must serialize")
+    }
+
     // ── resolve_budget (migrated from anthropic.rs) ─────────────
 
     #[test]
@@ -1932,12 +2082,12 @@ mod tests {
                 {"role": "user", "content": "hello"}
             ]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         assert_eq!(ir.model, "claude-sonnet-4");
         assert_eq!(ir.max_tokens, Some(1024));
         assert_eq!(ir.messages.len(), 1);
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["model"], "claude-sonnet-4");
         assert_eq!(back["max_tokens"], 1024);
         assert_eq!(back["messages"][0]["content"], "hello");
@@ -1954,11 +2104,11 @@ mod tests {
             ],
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         assert_eq!(ir.messages[0].role, IrRole::System);
         assert_eq!(ir.messages[0].content.len(), 2);
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["system"].as_array().unwrap().len(), 2);
         assert_eq!(back["system"][0]["text"], "be brief");
     }
@@ -1985,7 +2135,7 @@ mod tests {
                 "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
             }]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         // tool_use → ToolUse block + tool_calls
         assert!(matches!(
@@ -2004,7 +2154,7 @@ mod tests {
         assert_eq!(ir.tools[0].name, "get_weather");
         assert!(ir.tools[0].input_schema.get("properties").is_some());
 
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         // tool_use preserved exactly once (no double-write from tool_calls mirror).
         let assistant_content = back["messages"][1]["content"]
             .as_array()
@@ -2067,12 +2217,12 @@ mod tests {
                 "input_schema": {"type": "object"}
             }]
         });
-        let ir1 = AnthropicMessagesCodec::decode_request(&body);
+        let ir1 = decode_req(body);
         assert!(ir1.loss.is_empty(), "loss: {:?}", ir1.loss);
         assert_eq!(ir1.messages[1].content.len(), 1);
         assert_eq!(ir1.messages[1].tool_calls.len(), 1);
 
-        let enc1 = AnthropicMessagesCodec::encode_request(&ir1);
+        let enc1 = encode_json(&ir1);
         let msgs1 = enc1["messages"].as_array().expect("messages array");
         assert_eq!(msgs1.len(), 7, "message count must not grow on encode");
         // First tool_use turn: content has exactly one tool_use.
@@ -2086,10 +2236,10 @@ mod tests {
         assert_eq!(msgs1[6]["content"][0]["tool_use_id"], "tu_2");
 
         // Second round: encode → decode must be stable (no growth).
-        let ir2 = AnthropicMessagesCodec::decode_request(&enc1);
+        let ir2 = decode_req(enc1.clone());
         assert!(ir2.loss.is_empty(), "loss: {:?}", ir2.loss);
         assert_eq!(ir2.messages.len(), ir1.messages.len());
-        let enc2 = AnthropicMessagesCodec::encode_request(&ir2);
+        let enc2 = encode_json(&ir2);
         assert_eq!(enc1, enc2, "second encode must equal first encode");
     }
 
@@ -2106,13 +2256,13 @@ mod tests {
                 ]
             }]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         assert!(matches!(
             ir.messages[0].content[1],
             IrContentBlock::Image { .. }
         ));
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["messages"][0]["content"][1]["type"], "image");
         assert_eq!(
             back["messages"][0]["content"][1]["source"]["url"],
@@ -2128,12 +2278,12 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 8192},
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(ir.reasoning.budget_tokens.is_some());
         assert_eq!(ir.reasoning.budget_tokens, Some(8192));
         assert_eq!(ir.reasoning.effort.as_deref(), Some("high"));
         assert!(ir.reasoning.thinking.is_some());
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["thinking"]["type"], "enabled");
         assert_eq!(back["thinking"]["budget_tokens"], 8192);
     }
@@ -2146,11 +2296,56 @@ mod tests {
             "service_tier": "auto",
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(ir.loss.is_empty());
         assert_eq!(ir.raw.get("service_tier"), Some(&json!("auto")));
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["service_tier"], "auto");
+    }
+
+    /// R1: every typed field without an IR home (plus unmodelled keys) must
+    /// survive `decode → ir.raw → encode` so native passthrough stays intact.
+    #[test]
+    fn request_typed_fields_without_ir_home_roundtrip() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "auto",
+            "inference_geo": "us",
+            "cache_control": {"type": "ephemeral"},
+            "container": "container_1",
+            "output_config": {"effort": "high"},
+            "unknown_top": {"x": 1}
+        });
+        let ir = decode_req(body);
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        for key in [
+            "service_tier",
+            "inference_geo",
+            "cache_control",
+            "container",
+            "output_config",
+            "unknown_top",
+        ] {
+            assert!(ir.raw.contains_key(key), "{key} must ride in ir.raw");
+        }
+
+        let back = encode_json(&ir);
+        assert_eq!(back["service_tier"], "auto");
+        assert_eq!(back["inference_geo"], "us");
+        assert_eq!(back["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(back["container"], "container_1");
+        assert_eq!(back["output_config"], json!({"effort": "high"}));
+        assert_eq!(back["unknown_top"], json!({"x": 1}));
+
+        // Second round: the restored typed slots keep the chain lossless.
+        let ir2 = decode_req(back);
+        assert_eq!(
+            ir2.raw.get("output_config"),
+            Some(&json!({"effort": "high"}))
+        );
+        assert_eq!(ir2.raw.get("service_tier"), Some(&json!("auto")));
     }
 
     #[test]
@@ -2165,7 +2360,7 @@ mod tests {
             max_tokens: None,
             ..Default::default()
         };
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "m");
+        let (body, loss) = encode_json_with_loss(&ir, "m");
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
         assert!(!loss.is_empty(), "missing max_tokens must record a loss");
         assert_eq!(loss.entries[0].field, "max_tokens");
@@ -2184,7 +2379,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "m");
+        let (body, loss) = encode_json_with_loss(&ir, "m");
         assert!(
             body.get("thinking").is_none(),
             "thinking must be omitted when no budget fits"
@@ -2208,7 +2403,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "m");
+        let (body, loss) = encode_json_with_loss(&ir, "m");
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
         assert!(loss.is_empty());
@@ -2229,7 +2424,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "m");
+        let (body, loss) = encode_json_with_loss(&ir, "m");
         assert_eq!(body["thinking"]["budget_tokens"], 2048);
         let entry = loss
             .entries
@@ -2353,7 +2548,7 @@ mod tests {
             tool_choice: json!({"type": "function", "function": {"name": "f"}}),
             ..Default::default()
         };
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "m");
+        let (body, loss) = encode_json_with_loss(&ir, "m");
         assert_eq!(body["tool_choice"], json!({"type": "tool", "name": "f"}));
         assert!(
             loss.entries.iter().any(|e| e.field == "tool_choice"),
@@ -2368,7 +2563,7 @@ mod tests {
         };
         ir2.raw
             .insert("tool_choice".into(), json!({"type": "web_search"}));
-        let (body2, loss2) = AnthropicMessagesCodec::encode_request_with_loss(&ir2, "m");
+        let (body2, loss2) = encode_json_with_loss(&ir2, "m");
         assert!(
             body2.get("tool_choice").is_none(),
             "omitted shape must not re-enter via raw; got {:?}",
@@ -2404,7 +2599,7 @@ mod tests {
                 "thinking_tokens": 2
             }
         });
-        let ir = AnthropicMessagesCodec::decode_response(&body);
+        let ir = decode_resp(body);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         assert_eq!(ir.id, "msg_1");
         assert_eq!(ir.model, "claude-sonnet-4");
@@ -2421,7 +2616,7 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, Some(1));
         assert_eq!(usage.reasoning_tokens, Some(2));
 
-        let back = AnthropicMessagesCodec::encode_response(&ir);
+        let back = encode_resp_json(&ir);
         assert_eq!(back["id"], "msg_1");
         assert_eq!(back["type"], "message");
         assert_eq!(back["stop_reason"], "tool_use");
@@ -2449,9 +2644,235 @@ mod tests {
                 "stop_reason": stop,
                 "usage": {"input_tokens": 1, "output_tokens": 1}
             });
-            let ir = AnthropicMessagesCodec::decode_response(&body);
+            let ir = decode_resp(body);
             assert_eq!(ir.finish_reason, Some(expect.clone()), "stop={stop}");
         }
+    }
+
+    /// R1: typed response fields without an IR home must survive
+    /// `decode → ir.raw → encode` (native passthrough).
+    #[test]
+    fn response_typed_fields_without_ir_home_roundtrip() {
+        let body = json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "t"}],
+            "stop_reason": "stop_sequence",
+            "stop_sequence": "END",
+            "container": {"id": "c_1"},
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let ir = decode_resp(body);
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        for key in ["stop_sequence", "container", "stop_details"] {
+            assert!(ir.raw.contains_key(key), "{key} must ride in ir.raw");
+        }
+
+        let back = encode_resp_json(&ir);
+        assert_eq!(back["stop_sequence"], "END");
+        assert_eq!(back["container"], json!({"id": "c_1"}));
+        assert_eq!(
+            back["stop_details"],
+            json!({"type": "refusal", "category": "cyber"})
+        );
+        assert_eq!(back["usage"]["input_tokens"], 1);
+    }
+
+    // ── usage fidelity ──────────────────────────────────────────
+
+    /// M3: one ill-typed `usage` sub-object must not zero the counters that
+    /// parsed fine (per-field degradation, old `Value`-based semantics).
+    #[test]
+    fn usage_degrades_per_field_when_subobject_is_malformed() {
+        let usage = anthropic_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 4,
+            "cache_creation_input_tokens": 6,
+            // String where a u64 is documented → typed parse fails.
+            "cache_creation": {"ephemeral_5m_input_tokens": "1"},
+            "server_tool_use": {"web_search_requests": "1"},
+            "output_tokens_details": {"thinking_tokens": 7}
+        }));
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 30);
+        assert_eq!(usage.cached_tokens, Some(4));
+        assert_eq!(usage.cache_creation_tokens, Some(6));
+        assert_eq!(usage.reasoning_tokens, Some(7));
+    }
+
+    /// M3: the degraded path keeps the old defaults — missing counters are 0,
+    /// cache counters are "known zero" once `input_tokens > 0`, and a legacy
+    /// root-level `thinking_tokens` is still read.
+    #[test]
+    fn usage_degraded_path_keeps_old_defaults() {
+        let usage = anthropic_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_creation": {"ephemeral_1h_input_tokens": false},
+            "thinking_tokens": 5
+        }));
+        assert_eq!(usage.total_tokens, 30);
+        assert_eq!(usage.cached_tokens, Some(0));
+        assert_eq!(usage.cache_creation_tokens, Some(0));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+
+        // No counters at all → all-zero, cache counters unknown.
+        let empty = anthropic_usage(&json!({"cache_creation": []}));
+        assert_eq!(empty.prompt_tokens, 0);
+        assert_eq!(empty.cached_tokens, None);
+        assert_eq!(empty.cache_creation_tokens, None);
+        assert_eq!(empty.reasoning_tokens, None);
+    }
+
+    // ── faithful round-trip guards (R3) ────────────────────────
+
+    /// M5: a missing `input` must survive the ingress egress unchanged, and an
+    /// explicit `"input": {}` must survive as an empty object. The DTOs carry
+    /// `input` as an `Option`, so absent and explicitly-empty stay distinct
+    /// and both keep their wire shape through the typed bridge.
+    #[test]
+    fn tool_use_block_without_input_keeps_wire_shape() {
+        for value in [
+            json!({"type": "tool_use", "id": "tu_1", "name": "fn"}),
+            json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"}),
+        ] {
+            let block = content_block_from_value(value.clone());
+            let back = serde_json::to_value(&block).expect("block must serialize");
+            assert_eq!(back, value, "wire shape must not grow `input`");
+        }
+
+        // Explicit empty `input` → typed variant, empty object preserved.
+        for value in [
+            json!({"type": "tool_use", "id": "tu_1", "name": "fn", "input": {}}),
+            json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                   "input": {}}),
+        ] {
+            let block = content_block_from_value(value.clone());
+            assert!(
+                !matches!(block, AnthropicContentBlock::Unknown(_)),
+                "explicit empty input must stay typed: {value}"
+            );
+            let back = serde_json::to_value(&block).expect("block must serialize");
+            assert_eq!(back, value, "explicit empty `input` must survive verbatim");
+        }
+
+        // `input` present → the typed variant is still taken.
+        let typed = content_block_from_value(
+            json!({"type": "tool_use", "id": "tu_1", "name": "fn", "input": {"a": 1}}),
+        );
+        assert!(matches!(typed, AnthropicContentBlock::ToolUse(_)));
+    }
+
+    /// M5: the ingress egress (`IrOutputItem::Raw` → `encode_response`) must
+    /// not fabricate `input` either.
+    #[test]
+    fn response_raw_block_without_input_keeps_wire_shape() {
+        let ir = IrResponse {
+            id: "msg_1".into(),
+            created: None,
+            model: "m".into(),
+            output: vec![IrOutputItem::Raw(
+                json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"}),
+            )],
+            finish_reason: None,
+            usage: None,
+            raw: Map::new(),
+            loss: sag_core::LossInventory::default(),
+        };
+        let back = encode_resp_json(&ir);
+        let block = &back["content"][0];
+        assert_eq!(block["type"], "server_tool_use");
+        assert!(
+            block.get("input").is_none(),
+            "encode must not fabricate `input`: {block}"
+        );
+    }
+
+    /// M5 follow-up (reviewer §6, plan B): `decode_response`'s Raw arm
+    /// serializes the **typed** block via `content_block_to_value`, bypassing
+    /// `parse_faithful`. With `input` defaulted but not skipped, the typed
+    /// parse fabricated `"input": {}` before that arm ran, so the guard could
+    /// not help — the pollution was client-visible on every translated lane.
+    /// The full typed round-trip must now keep the upstream wire shape, in both
+    /// directions: absent stays absent, explicit `{}` stays `{}`.
+    #[test]
+    fn decode_response_typed_path_does_not_grow_server_tool_use_input() {
+        let ir = decode_resp(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }));
+        let out = encode_resp_json(&ir);
+        let block = &out["content"][0];
+        assert_eq!(block["type"], "server_tool_use");
+        assert!(
+            block.get("input").is_none(),
+            "typed decode path must not fabricate `input`: {block}"
+        );
+
+        // Explicit `"input": {}` upstream must come back as `"input": {}` —
+        // the Raw arm re-serializes the typed block, so the DTO has to keep the
+        // empty object instead of collapsing it into "absent".
+        let ir = decode_resp(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                 "input": {}}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }));
+        let out = encode_resp_json(&ir);
+        let block = &out["content"][0];
+        assert_eq!(block["type"], "server_tool_use");
+        assert_eq!(
+            block.get("input"),
+            Some(&json!({})),
+            "explicit empty `input` must survive the typed decode path: {block}"
+        );
+
+        // A `tool_use` block *is* IR-native (`IrToolCall`), so the egress
+        // synthesizes `input` from `arguments` — an empty map means "no
+        // arguments" and is a property of the IR contract, not of the serde
+        // default. Pin that distinction so it is not mistaken for the bug.
+        let ir = decode_resp(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "fn", "input": {"a": 1}},
+                {"type": "tool_use", "id": "tu_2", "name": "noargs"}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }));
+        let out = encode_resp_json(&ir);
+        assert_eq!(out["content"][0]["input"], json!({"a": 1}));
+        assert_eq!(out["content"][1]["input"], json!({}));
+    }
+
+    /// M5: the faithful guard does not disturb well-formed unions.
+    #[test]
+    fn faithful_guard_keeps_well_formed_unions_typed() {
+        assert!(matches!(
+            tool_union_from_value(json!({"name": "fn", "input_schema": {"type": "object"}})),
+            ToolUnion::Custom(_)
+        ));
+        assert!(matches!(
+            tool_union_from_value(json!({"type": "web_search_20250305", "name": "web_search"})),
+            ToolUnion::Builtin(_)
+        ));
+        assert!(matches!(
+            tool_choice_from_value(json!({"type": "tool", "name": "fn"})),
+            ToolChoice::Tool(_)
+        ));
+        assert!(matches!(
+            thinking_config_from_value(json!({"type": "enabled", "budget_tokens": 2048})),
+            ThinkingConfig::Enabled(_)
+        ));
     }
 
     // ── stream decode table ─────────────────────────────────────
@@ -2660,7 +3081,7 @@ mod tests {
             },
         });
         ir.max_tokens = Some(64);
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let (body, loss) = encode_json_with_loss(&ir, "claude");
         assert_eq!(body["tools"][0]["type"], "web_search_20250305");
         assert_eq!(body["tools"][0]["name"], "web_search");
         assert_eq!(body["tools"][0]["max_uses"], 5);
@@ -2686,7 +3107,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert_eq!(ir.tools.len(), 1);
         assert_eq!(ir.tools[0].name, "web_search");
         assert_eq!(
@@ -2694,7 +3115,7 @@ mod tests {
             Some("web_search_20250305")
         );
         assert_eq!(ir.tools[0].raw.get("max_uses"), Some(&json!(3)));
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["tools"][0]["type"], "web_search_20250305");
         assert_eq!(back["tools"][0]["max_uses"], 3);
     }
@@ -2714,12 +3135,12 @@ mod tests {
                 ]
             }]
         });
-        let ir = AnthropicMessagesCodec::decode_request(&body);
+        let ir = decode_req(body);
         assert!(
             matches!(ir.messages[0].content[1], IrContentBlock::Document { .. }),
             "document block → Document"
         );
-        let back = AnthropicMessagesCodec::encode_request(&ir);
+        let back = encode_json(&ir);
         assert_eq!(back["messages"][0]["content"][1]["type"], "document");
         assert_eq!(
             back["messages"][0]["content"][1]["source"]["media_type"],
@@ -2749,7 +3170,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (back, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let (back, loss) = encode_json_with_loss(&ir, "claude");
         assert!(
             !loss.is_empty(),
             "audio encode must record a loss entry (got empty inventory)"
@@ -2802,7 +3223,7 @@ mod tests {
                 m
             },
         });
-        let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let (body, _) = encode_json_with_loss(&ir, "claude");
         assert!(
             body["tools"][0].get("type").is_none(),
             "`function` type is omitted (adjudication: value-based mapping), and the tool must not be remapped to hosted web_search: {}",
@@ -2841,7 +3262,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             raw,
         });
-        let (body, loss) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let (body, loss) = encode_json_with_loss(&ir, "claude");
         let tool = &body["tools"][0];
         assert!(
             tool.get("type").is_none(),
@@ -2888,7 +3309,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             raw,
         });
-        let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+        let (body, _) = encode_json_with_loss(&ir, "claude");
         let tool = &body["tools"][0];
         assert_eq!(tool["type"], json!("custom"));
         assert_eq!(tool["cache_control"], json!({"type": "ephemeral"}));
@@ -2929,7 +3350,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 raw,
             });
-            let (body, _) = AnthropicMessagesCodec::encode_request_with_loss(&ir, "claude");
+            let (body, _) = encode_json_with_loss(&ir, "claude");
             let tool = &body["tools"][0];
             assert_eq!(
                 tool.get("type").and_then(|v| v.as_str()),

@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-19
+updated: 2026-10-26
 ---
 
 # 供应商
@@ -39,6 +39,19 @@ updated: 2026-10-19
 5. **`strict` 位置由协议决定**：chat 为 `function.strict`，Responses 为工具根部；跨协议时按目标协议落位
 6. **出站禁止内部伪字段**：`__tool_extra` / `__function_extra` 仅存在于 IR，任何出站 JSON 都不得包含它们
 7. **hosted 工具丢弃必须记 loss**：hosted `web_search*` 工具的目标协议不支持时丢弃，并记 `LossReason::UnsupportedByTarget` 进 `CallLog`；禁止静默丢弃，也禁止压成假 function 形状
+
+### 上游协议请求/响应体 typed 化
+
+Responses API 与 Anthropic Messages API 的请求体/响应体由 `sag_core::api` 下的 typed DTO 承载，规则与 chat 路径一致：
+
+1. **DTO 只建模数据，不含映射逻辑**：DTO 只描述 wire 形状（字段、可选性、多态变体），字段翻译仍全部在 `sag-providers/src/codec/*` 中
+2. **未知字段无损透传**：DTO 不使用 `deny_unknown_fields`，每个结构体带 `extra` 兜底；未建模字段（含上游已弃用字段）在反序列化 → 序列化往返中原样保留
+3. **多态联合未知变体无损透传**：每个 `type` 判别联合都有 `Unknown(Value)` 兜底，未知 tag 或无法解析的载荷逐字保留，不报错、不丢弃
+4. **`ir.raw` 仍双向承载无 IR 归宿的字段**：decode 侧把「typed 但 IR 无对应槽位」的字段与 `extra` 一并写入 `ir.raw`，encode 侧优先回填 typed 槽位、其余落 `extra`；native 透传链（body → `ir.raw` → 上游 body）保持无损
+5. **语义校验先于 typed 解析**：`/v1/messages` 与 `/v1/responses` 的 handler 先做 JSON 语法检查，再跑能力预检查（Responses 的 `previous_response_id` / `store` / `background` 仍在 raw `Value` 上判定），最后才 typed 解析；形状不匹配返回 422，错误消息与既有文本一致（Anthropic 信封 / OpenAI 信封各自沿用）
+6. **SSE 流式不 typed 化**：流式帧仍按 `Value` 逐帧处理，typed DTO 只覆盖非流式请求/响应体
+7. **上游响应降级无损**：typed 解析失败时不得报错、也不得丢字段——`stop_details` / `container` 照常还原，未建模字段与未知顶层键全部进 `extra`/`ir.raw`，正文与 usage 仍尽量还原；同一降级路径下 usage 按字段降级，单个类型写错的子对象不得把整包计数归零
+8. **容错输入保留**：input message 的 `role` 缺失或非字符串一律按 `"user"` 兜底后继续 typed 分派，禁止因必填字段不合法而丢弃消息内容
 
 ### 响应翻译（Anthropic → OpenAI）
 
@@ -139,6 +152,7 @@ updated: 2026-10-19
 
 ## 变更记录
 
+- [0008 Responses / Anthropic 请求响应体 typed 化（无损透传）](changes/0008-typed-wire-dtos-responses-anthropic.md)
 - [0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](changes/0007-tool-raw-cross-codec-fidelity.md)
 - [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)
 - [0002 Anthropic reasoning_effort 翻译](changes/0002-anthropic-reasoning-effort.md)

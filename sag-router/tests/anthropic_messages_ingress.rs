@@ -312,6 +312,36 @@ async fn messages_malformed_json_returns_anthropic_error_envelope() {
     assert_eq!(json["error"]["type"], "invalid_request_error");
 }
 
+#[tokio::test]
+async fn messages_typed_shape_mismatch_returns_anthropic_error_envelope() {
+    // Valid JSON, but `model` does not fit the typed DTO → semantic 422 in the
+    // Anthropic envelope (same contract as the chat typed `Json<T>` 422).
+    let state = build_state("http://127.0.0.1:1", "msg-key").await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{
+        "model": 123,
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "hi"}]
+    }"#;
+    let resp = app
+        .oneshot(messages_request_x_api_key(body, "msg-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("deserialize"),
+        "message must describe the parse failure: {msg}"
+    );
+    // Must NOT be the OpenAI envelope.
+    assert!(json.get("error").and_then(|e| e.get("code")).is_none());
+}
+
 // ── Auth cross-path security on the real router ───────────────────
 
 #[tokio::test]

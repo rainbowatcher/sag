@@ -238,6 +238,49 @@ async fn background_rejected_422() {
 }
 
 #[tokio::test]
+async fn typed_shape_mismatch_rejected_422() {
+    // Valid JSON, but `model` does not fit the typed DTO → semantic 422 in the
+    // OpenAI envelope (never a silent loss, never a dispatch attempt).
+    assert_422(r#"{"model":123,"input":"hi"}"#).await;
+}
+
+#[tokio::test]
+async fn stateful_reject_runs_before_typed_parse() {
+    // R2: the raw-value stateful pre-check wins over the typed parse, so the
+    // wire message still names the unsupported capability even when the body
+    // also fails typed deserialization (`model` is a number here).
+    for (body, needle) in [
+        (
+            r#"{"model":123,"previous_response_id":"resp_abc","input":"hi"}"#,
+            "previous_response_id",
+        ),
+        (r#"{"model":123,"store":"true","input":"hi"}"#, "store=true"),
+        (
+            r#"{"model":123,"background":true,"input":"hi"}"#,
+            "background",
+        ),
+    ] {
+        let state = build_state("http://127.0.0.1:1", "resp-key", Upstream::Chat).await;
+        let app = build_router(state, DispatchRuntime::default());
+        let resp = app
+            .oneshot(responses_request(body, "resp-key"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "body={body}"
+        );
+        let json = body_json(resp).await;
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains(needle) && msg.contains("not supported"),
+            "stateful pre-check must run before typed parse: {msg}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn store_false_allows_request_to_dispatch() {
     // store=false must pass decode and reach route resolution (404 for an
     // unknown model would also prove it got past decode; use a known route

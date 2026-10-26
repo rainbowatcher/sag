@@ -8,7 +8,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use sag_analytics::AnalyticsEvent;
-use sag_core::{ApiKind, IngressProtocol, Lane};
+use sag_core::{
+    ApiKind, IngressProtocol, Lane,
+    api::{
+        anthropic::{AnthropicContentBlock, AnthropicMessagesResponse},
+        responses::{OutputItem, ResponsesResponse},
+    },
+};
 use sag_core::{AppError, FailureReason, FinalStatus, RequestResultFact, TargetAttemptFact};
 use sag_privacy::{Outcome as PrivacyOutcome, PlaceholderMap, PrivacyEngine};
 use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, ResponsesCodec};
@@ -471,7 +477,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     }
                                 }
                                 provider
-                                    .anthropic_messages_stream(body, &target_extra)
+                                    .anthropic_messages_stream(body_to_value(&body)?, &target_extra)
                                     .await?
                             } else if use_responses {
                                 let (body, loss) =
@@ -491,7 +497,11 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     }
                                 }
                                 provider
-                                    .responses_stream_native(body, &target_extra, &api_endpoint)
+                                    .responses_stream_native(
+                                        body_to_value(&body)?,
+                                        &target_extra,
+                                        &api_endpoint,
+                                    )
                                     .await?
                             } else {
                                 provider
@@ -650,9 +660,13 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 }
                             }
                             let raw = provider
-                                .anthropic_messages(body, &target_extra, timeout_secs)
+                                .anthropic_messages(
+                                    body_to_value(&body)?,
+                                    &target_extra,
+                                    timeout_secs,
+                                )
                                 .await?;
-                            let mut ir_resp = AnthropicMessagesCodec::decode_response(&raw);
+                            let mut ir_resp = decode_anthropic_response(&raw);
                             // Chat egress reports the real_model we requested
                             // (parity with the legacy AnthropicProvider::chat
                             // path); Anthropic leaves `model` unset when the
@@ -696,14 +710,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 }
                             }
                             let raw = provider
-                                .responses_native(body, &target_extra, &api_endpoint, timeout_secs)
+                                .responses_native(
+                                    body_to_value(&body)?,
+                                    &target_extra,
+                                    &api_endpoint,
+                                    timeout_secs,
+                                )
                                 .await?;
                             // Decode only for empty/usage/CallLog — the raw
                             // JSON is the sole egress source (B1 plan A:
                             // never decode→encode round-trip on Responses
                             // ingress, which drops instructions/tools/
                             // temperature/text/item ids/annotations).
-                            let ir_resp = ResponsesCodec::decode_response(&raw);
+                            let ir_resp = decode_responses_response(&raw);
                             if retry_on_empty && is_empty_ir_response(&ir_resp) {
                                 return Err(AppError::EmptyResponse {
                                     provider: provider_name.clone(),
@@ -1279,6 +1298,128 @@ fn privacy_unavailable_response() -> Response<Body> {
         })),
     )
         .into_response()
+}
+
+/// Serialize a codec-encoded typed body for the provider trait boundary.
+///
+/// The codecs hand back typed DTOs (`AnthropicMessagesRequest` /
+/// `ResponsesRequest`); `LlmProvider`'s native methods still take raw JSON, so
+/// the conversion happens here and nowhere else. The DTOs are plain data, so a
+/// failure cannot happen in practice — surface it as an internal error rather
+/// than panicking mid-dispatch.
+fn body_to_value<T: serde::Serialize>(body: &T) -> sag_core::Result<serde_json::Value> {
+    serde_json::to_value(body)
+        .map_err(|err| AppError::Internal(format!("encode request body to JSON: {err}")))
+}
+
+/// Parse an upstream Anthropic body into the typed DTO, then decode it to IR.
+///
+/// The pre-typed `decode_response(&Value)` never failed: a body that did not
+/// match the schema still yielded an IR response with whatever fields were
+/// readable. Keep that contract — a body the typed schema rejects is decoded
+/// leniently instead of surfacing a hard error: strings are read directly,
+/// every content block that does not fit the DTO rides through as `Unknown`
+/// (the codec turns it into a loss + `Raw`), and the untouched body is kept in
+/// `extra` so the native passthrough lane still egresses the original JSON.
+fn decode_anthropic_response(raw: &serde_json::Value) -> sag_core::IrResponse {
+    if let Ok(typed) = serde_json::from_value::<AnthropicMessagesResponse>(raw.clone()) {
+        return AnthropicMessagesCodec::decode_response(&typed);
+    }
+    tracing::warn!("upstream anthropic body does not match the typed schema; decoding leniently");
+
+    // NOTE: mirrors `parse_anthropic_response` in `sag-providers/src/anthropic.rs`
+    // — keep the two in sync (the duplication is known; a shared helper is a
+    // separate change). Both keep the whole body in `extra`; the overlap with
+    // typed fields is harmless because `decode_response` re-inserts only the
+    // fields it typed and `encode_response` skips the known keys. This twin
+    // needs the full body regardless: `ir.raw` is what the native passthrough
+    // lane egresses, so nothing may be dropped here.
+
+    let text = |key: &str| {
+        raw.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let content = raw
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .cloned()
+                .map(|block| {
+                    serde_json::from_value(block.clone())
+                        .unwrap_or(AnthropicContentBlock::Unknown(block))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let typed = AnthropicMessagesResponse {
+        id: text("id").unwrap_or_default(),
+        kind: text("type").unwrap_or_else(|| "message".to_string()),
+        role: text("role").unwrap_or_else(|| "assistant".to_string()),
+        content,
+        model: text("model").unwrap_or_default(),
+        stop_reason: text("stop_reason"),
+        stop_sequence: text("stop_sequence"),
+        stop_details: raw
+            .get("stop_details")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        container: raw
+            .get("container")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        usage: raw
+            .get("usage")
+            .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
+        extra: raw.as_object().cloned().unwrap_or_default(),
+    };
+    AnthropicMessagesCodec::decode_response(&typed)
+}
+
+/// Parse an upstream Responses body into the typed DTO, then decode it to IR.
+///
+/// Same contract as [`decode_anthropic_response`]: `ResponsesResponse` is
+/// almost fully optional, so a schema mismatch only happens when a typed field
+/// carries an unexpected shape. The lenient fallback keeps the readable
+/// envelope fields and lets each `output` item that does not fit the DTO ride
+/// through as `Unknown`, rather than reporting an empty response to the client.
+fn decode_responses_response(raw: &serde_json::Value) -> sag_core::IrResponse {
+    if let Ok(typed) = serde_json::from_value::<ResponsesResponse>(raw.clone()) {
+        return ResponsesCodec::decode_response(&typed);
+    }
+    tracing::warn!("upstream responses body does not match the typed schema; decoding leniently");
+
+    let text = |key: &str| {
+        raw.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let output = raw
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .cloned()
+                .map(|item| {
+                    serde_json::from_value(item.clone()).unwrap_or(OutputItem::Unknown(item))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let typed = ResponsesResponse {
+        id: text("id").unwrap_or_default(),
+        model: text("model"),
+        created_at: raw.get("created_at").and_then(serde_json::Value::as_u64),
+        status: text("status"),
+        output,
+        usage: raw
+            .get("usage")
+            .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
+        extra: raw.as_object().cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    ResponsesCodec::decode_response(&typed)
 }
 
 /// Restore placeholders in every string of `value`, returning whether any hit

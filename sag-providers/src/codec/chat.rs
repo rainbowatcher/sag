@@ -1469,6 +1469,8 @@ mod tests {
                 "input_schema": {"type": "object"}
             }]
         });
+        let anth: sag_core::api::anthropic::AnthropicMessagesRequest =
+            serde_json::from_value(anth).expect("typed anthropic request");
         let ir = crate::codec::AnthropicMessagesCodec::decode_request(&anth);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         let (req, loss) = ChatCompletionsCodec::encode_request_with_loss(&ir);

@@ -17,15 +17,30 @@
 //! `previous_response_id` / `store=true` into `IrRequest.raw` so the
 //! **native** Responses lane re-emits them on encode. `background` is
 //! still always rejected (M8 does not implement background execution).
+//!
+//! Request/response bodies are typed ([`ResponsesRequest`] /
+//! [`ResponsesResponse`]); only the SSE segment still works on raw
+//! `serde_json::Value`. Unknown fields travel through the DTOs' `extra` maps
+//! instead of an allow-list filter, and `IrRequest::raw` / `IrResponse::raw`
+//! keep carrying them so encode can put them back (R1 / R5).
 
 use std::cell::RefCell;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use sag_core::{
     AppError, IrContentBlock, IrFinishReason, IrMessage, IrOutputItem, IrRequest, IrResponse,
     IrResponseMeta, IrRole, IrStreamEvent, IrTool, IrToolCall, LossReason, LossScope, Reasoning,
     Sampling, Usage,
+    api::responses::{
+        FunctionCallItem, IncompleteDetails, InputContentPart, InputItem, MessageContent,
+        OutputContentPart, OutputItem, OutputMessage, OutputTextContent, ReasoningItem,
+        ReasoningParam, ReasoningSummaryPart, ResponseInputTokensDetails,
+        ResponseOutputTokensDetails, ResponseUsage, ResponsesInput, ResponsesRequest,
+        ResponsesResponse, ResponsesTool, ToolChoiceParam,
+    },
 };
 
 use super::tool_raw;
@@ -60,18 +75,72 @@ pub enum StatefulMode {
 /// `mode == Allow` skips the `previous_response_id` / `store=true` /
 /// bare-response-id-input rejects (M8 native passthrough) but still
 /// rejects `background`.
+///
+/// The `/v1/responses` handler runs this on the **raw** JSON before typed
+/// parsing, so the 422 messages and their ordering are unchanged (R2);
+/// [`ResponsesCodec::decode_request_with_mode`] re-checks the same fields on
+/// the typed body through the shared [`reject_stateful`] core.
 pub fn reject_unsupported_mode(body: &Value, mode: StatefulMode) -> Result<(), AppError> {
-    if mode == StatefulMode::Reject
-        && body
-            .get("previous_response_id")
-            .is_some_and(|v| !v.is_null())
-    {
+    reject_stateful(StatefulProbe::from_value(body), mode)
+}
+
+/// Reject stateful / background features with [`StatefulMode::Reject`]
+/// (default ingress path for translated-only routes).
+pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
+    reject_unsupported_mode(body, StatefulMode::Reject)
+}
+
+/// The stateful-relevant slice of a request body.
+///
+/// Built either from the raw JSON (handler-side pre-check) or from the typed
+/// [`ResponsesRequest`] (codec-side re-check).
+struct StatefulProbe<'a> {
+    /// `previous_response_id` present and non-null.
+    previous_response_id: bool,
+    /// Raw `store` value, kept untyped on purpose (boolish, see N1).
+    store: Option<&'a Value>,
+    /// Raw `background` value, kept untyped on purpose (boolish).
+    background: Option<&'a Value>,
+    /// `input` as a bare string — the stateful response-id form.
+    input_text: Option<&'a str>,
+}
+
+impl<'a> StatefulProbe<'a> {
+    fn from_value(body: &'a Value) -> Self {
+        Self {
+            previous_response_id: body
+                .get("previous_response_id")
+                .is_some_and(|v| !v.is_null()),
+            store: body.get("store"),
+            background: body.get("background"),
+            input_text: body.get("input").and_then(|v| v.as_str()),
+        }
+    }
+
+    fn from_request(req: &'a ResponsesRequest) -> Self {
+        Self {
+            // Typed: a non-null value always deserialises into `Some`.
+            previous_response_id: req.previous_response_id.is_some(),
+            store: req.store.as_ref(),
+            background: req.background.as_ref(),
+            input_text: match &req.input {
+                Some(ResponsesInput::Text(text)) => Some(text.as_str()),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Shared stateful/background reject core (messages are wire-visible — do not
+/// reword).
+fn reject_stateful(probe: StatefulProbe<'_>, mode: StatefulMode) -> Result<(), AppError> {
+    if mode == StatefulMode::Reject && probe.previous_response_id {
         return Err(reject(
             "previous_response_id is not supported (stateless Responses only)",
         ));
     }
     if mode == StatefulMode::Reject
-        && let Some(store) = body.get("store")
+        && let Some(store) = probe.store
     {
         // Reject bool true and the string form "true" (N1).
         let is_true = store.as_bool() == Some(true)
@@ -85,8 +154,8 @@ pub fn reject_unsupported_mode(body: &Value, mode: StatefulMode) -> Result<(), A
         }
     }
     // background is always rejected (M8 does not execute background work).
-    if body
-        .get("background")
+    if probe
+        .background
         .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
     {
         return Err(reject(
@@ -96,8 +165,7 @@ pub fn reject_unsupported_mode(body: &Value, mode: StatefulMode) -> Result<(), A
     // input as a bare response id string (stateful form) — only when
     // stateful is not allowed for this route.
     if mode == StatefulMode::Reject
-        && let Some(input) = body.get("input").filter(|v| !v.is_null())
-        && let Value::String(s) = input
+        && let Some(s) = probe.input_text
         && (s.starts_with("resp_") || s.starts_with("response_"))
         && !s.contains(char::is_whitespace)
         && s.len() > 8
@@ -113,71 +181,136 @@ pub fn reject_unsupported_mode(body: &Value, mode: StatefulMode) -> Result<(), A
     Ok(())
 }
 
-/// Reject stateful / background features with [`StatefulMode::Reject`]
-/// (default ingress path for translated-only routes).
-pub fn reject_unsupported(body: &Value) -> Result<(), AppError> {
-    reject_unsupported_mode(body, StatefulMode::Reject)
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // helpers
 // ═══════════════════════════════════════════════════════════════════
 
+/// Serialize a typed DTO slice for passthrough snapshots (never panics).
+fn to_value_or_null<T: Serialize + ?Sized>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// Copy a typed field into the IR `raw` passthrough map (encode puts it back).
+fn put_raw<T: Serialize>(raw: &mut Map<String, Value>, key: &str, value: &Option<T>) {
+    if let Some(value) = value
+        && let Ok(value) = serde_json::to_value(value)
+    {
+        raw.insert(key.to_string(), value);
+    }
+}
+
+/// Move a `raw` passthrough value back into its typed slot.
+///
+/// Returns `false` when the key has no typed home (or the value does not fit),
+/// so the caller keeps it in `extra` instead of dropping it.
+fn absorb<T: DeserializeOwned>(slot: &mut Option<T>, value: &Value) -> bool {
+    if slot.is_some() {
+        return true;
+    }
+    match serde_json::from_value(value.clone()) {
+        Ok(parsed) => {
+            *slot = Some(parsed);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Responses usage object → IR [`Usage`].
+///
+/// SSE frames are still raw JSON, so streaming parses the object on demand and
+/// both paths share [`usage_from_responses`].
+///
+/// A single ill-typed sub-object (e.g. `input_tokens_details.cached_tokens`
+/// sent as a string) fails the whole typed parse, so the fallback reads every
+/// counter independently instead of reporting all-zero usage.
 fn responses_usage(value: &Value) -> Usage {
-    let input = value
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let output = value
-        .get("output_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let total = value
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or_else(|| input.saturating_add(output));
-    let input_details = value.get("input_tokens_details");
-    let output_details = value.get("output_tokens_details");
+    match serde_json::from_value::<ResponseUsage>(value.clone()) {
+        Ok(usage) => usage_from_responses(&usage),
+        Err(_) => {
+            let input = value
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let output = value
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let total = value
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or_else(|| input.saturating_add(output));
+            Usage {
+                prompt_tokens: input,
+                completion_tokens: output,
+                total_tokens: total,
+                // Same known-miss/unknown split as the typed arm: a present
+                // `input_tokens` with no readable details means "no cache
+                // hit" (`Some(0)`), not "unknown" (`None`).
+                cached_tokens: value
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .or((input > 0).then_some(0)),
+                cache_creation_tokens: None,
+                reasoning_tokens: value
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+            }
+        }
+    }
+}
+
+/// Typed [`ResponseUsage`] → IR [`Usage`].
+fn usage_from_responses(usage: &ResponseUsage) -> Usage {
+    let input = usage.input_tokens as u32;
+    let output = usage.output_tokens as u32;
+    // `total_tokens` is `#[serde(default)]` on the DTO, so a missing value is
+    // indistinguishable from an explicit 0 — fall back to the sum in that case.
+    let total = if usage.total_tokens > 0 {
+        usage.total_tokens as u32
+    } else {
+        input.saturating_add(output)
+    };
     Usage {
         prompt_tokens: input,
         completion_tokens: output,
         total_tokens: total,
-        cached_tokens: input_details
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
+        cached_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens as u32)
             .or((input > 0).then_some(0)),
         cache_creation_tokens: None,
-        reasoning_tokens: output_details
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+        reasoning_tokens: usage
+            .output_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens as u32),
     }
 }
 
 /// IR [`Usage`] → Responses usage object.
-fn usage_to_responses(usage: &Usage) -> Value {
-    let mut m = Map::new();
-    m.insert("input_tokens".into(), json!(usage.prompt_tokens));
-    m.insert("output_tokens".into(), json!(usage.completion_tokens));
-    m.insert("total_tokens".into(), json!(usage.total_tokens));
-    let mut in_d = Map::new();
-    if let Some(c) = usage.cached_tokens {
-        in_d.insert("cached_tokens".into(), json!(c));
+fn usage_to_responses(usage: &Usage) -> ResponseUsage {
+    ResponseUsage {
+        input_tokens: u64::from(usage.prompt_tokens),
+        output_tokens: u64::from(usage.completion_tokens),
+        total_tokens: u64::from(usage.total_tokens),
+        input_tokens_details: usage
+            .cached_tokens
+            .map(|cached| ResponseInputTokensDetails {
+                cached_tokens: u64::from(cached),
+                ..Default::default()
+            }),
+        output_tokens_details: usage.reasoning_tokens.map(|reasoning| {
+            ResponseOutputTokensDetails {
+                reasoning_tokens: u64::from(reasoning),
+                ..Default::default()
+            }
+        }),
+        ..Default::default()
     }
-    if !in_d.is_empty() {
-        m.insert("input_tokens_details".into(), Value::Object(in_d));
-    }
-    let mut out_d = Map::new();
-    if let Some(r) = usage.reasoning_tokens {
-        out_d.insert("reasoning_tokens".into(), json!(r));
-    }
-    if !out_d.is_empty() {
-        m.insert("output_tokens_details".into(), Value::Object(out_d));
-    }
-    Value::Object(m)
 }
 
 /// Responses `status` / `incomplete_details` → [`IrFinishReason`].
@@ -205,17 +338,107 @@ fn status_to_finish(
 }
 
 /// Opaque-passthrough `tool_choice` validation (C6): any string or object
-/// shape is kept byte-identical in `ir.tool_choice`; only illegal JSON
-/// types (number / array / bool) are rejected (422).
-fn decode_tool_choice(v: &Value) -> Result<Value, AppError> {
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::String(_) | Value::Object(_) => Ok(v.clone()),
-        // numbers / arrays / bools are not legal tool_choice shapes — reject loudly.
-        _ => Err(reject(
-            "tool_choice must be a string or object (auto/none/required/function/…)",
-        )),
+/// shape is kept in `ir.tool_choice`; only illegal JSON types (number /
+/// array / bool) are rejected (422).
+fn decode_tool_choice(choice: &ToolChoiceParam) -> Result<Value, AppError> {
+    let value = match choice {
+        // `Unknown` holds shapes no modelled variant reproduces exactly: a
+        // string/object is legal opaque passthrough, anything else (number /
+        // array / bool) is not a legal `tool_choice` at all.
+        ToolChoiceParam::Unknown(Value::String(_) | Value::Object(_)) => to_value_or_null(choice),
+        ToolChoiceParam::Unknown(_) => {
+            return Err(reject(
+                "tool_choice must be a string or object (auto/none/required/function/…)",
+            ));
+        }
+        other => to_value_or_null(other),
+    };
+    Ok(normalize_tool_choice(value))
+}
+
+/// Drop the `allowed_tools: []` that `ToolChoiceAllowed` grows as the union's
+/// object catch-all (`#[serde(default)]` without `skip_serializing_if`), so a
+/// `{"type": "function", "name": …}` selector is re-emitted unchanged (C6).
+fn normalize_tool_choice(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut()
+        && obj.get("type").and_then(Value::as_str) != Some("allowed_tools")
+        && obj
+            .get("allowed_tools")
+            .and_then(Value::as_array)
+            .is_some_and(|allowed| allowed.is_empty())
+    {
+        obj.remove("allowed_tools");
     }
+    value
+}
+
+/// Parse a raw value into a typed DTO, keeping it verbatim in the caller's
+/// `Unknown` variant unless the typed form round-trips unchanged.
+///
+/// Several DTO variants carry `#[serde(default)]` fields without
+/// `skip_serializing_if` (e.g. `tool_choice.allowed_tools`,
+/// `file_search.vector_store_ids`), so a plain parse would grow fields the
+/// caller never sent. The round-trip check keeps the wire shape intact (R3).
+fn parse_faithful<T>(value: &Value) -> Option<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let parsed = serde_json::from_value::<T>(value.clone()).ok()?;
+    (to_value_or_null(&parsed) == *value).then_some(parsed)
+}
+
+/// Parse a typed `tool_choice` back out of a raw IR value.
+fn tool_choice_from_value(value: Value) -> ToolChoiceParam {
+    parse_faithful(&value).unwrap_or(ToolChoiceParam::Unknown(value))
+}
+
+/// Parse a raw `tools[]` entry into the typed union (`Unknown` keeps the
+/// original object verbatim).
+fn responses_tool_from_value(value: Value) -> ResponsesTool {
+    parse_faithful(&value).unwrap_or(ResponsesTool::Unknown(value))
+}
+
+/// Parse a raw `input[]` entry into the typed union.
+fn input_item_from_value(value: Value) -> InputItem {
+    parse_faithful(&value).unwrap_or(InputItem::Unknown(value))
+}
+
+/// Parse a raw `output[]` entry into the typed union.
+fn output_item_from_value(value: Value) -> OutputItem {
+    parse_faithful(&value).unwrap_or(OutputItem::Unknown(value))
+}
+
+/// Parse `incomplete_details` from a raw IR passthrough value.
+fn incomplete_details_from_value(value: Value) -> IncompleteDetails {
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| IncompleteDetails {
+        extra: value.as_object().cloned().unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
+/// `arguments` is a JSON-encoded string on the wire; parse it back unless it
+/// is plain text (then keep the string verbatim).
+fn parse_arguments(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .filter(|value| !value.is_string())
+        .unwrap_or_else(|| Value::String(arguments.to_string()))
+}
+
+/// Concatenated reasoning text (`summary` plus the unmodelled `content`).
+fn reasoning_text(item: &ReasoningItem) -> String {
+    let mut text = String::new();
+    for part in &item.summary {
+        text.push_str(&part.text);
+    }
+    if let Some(parts) = item.extra.get("content").and_then(Value::as_array) {
+        for part in parts {
+            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                text.push_str(t);
+            }
+        }
+    }
+    text
 }
 
 /// Validate a `tools[]` entry. M8: `type:"function"`, `type:"web_search"`
@@ -287,6 +510,24 @@ fn decode_content_part(
     }
 }
 
+/// Typed input content part → IR content block.
+fn decode_input_part(
+    part: &InputContentPart,
+    path: &str,
+    loss: &mut sag_core::LossInventory,
+) -> IrContentBlock {
+    match part {
+        InputContentPart::Text(text) => IrContentBlock::Text {
+            text: text.text.clone(),
+        },
+        // Media parts are forwarded verbatim as IR payloads; the shape-based
+        // mapper keeps working on their serialized form.
+        InputContentPart::Image(_) | InputContentPart::File(_) | InputContentPart::Unknown(_) => {
+            decode_content_part(&to_value_or_null(part), path, loss)
+        }
+    }
+}
+
 impl ResponsesCodec {
     // ═══════════════════════════════════════════════════════════
     // request decode (ingress): Responses body → IrRequest
@@ -296,82 +537,71 @@ impl ResponsesCodec {
     ///
     /// Returns [`AppError::BadRequest`] (rendered as 422 by the handler)
     /// for D1-unsupported features and unsupported tools.
-    pub fn decode_request(body: &Value) -> sag_core::Result<IrRequest> {
-        Self::decode_request_with_mode(body, StatefulMode::Reject)
+    pub fn decode_request(req: &ResponsesRequest) -> sag_core::Result<IrRequest> {
+        Self::decode_request_with_mode(req, StatefulMode::Reject)
     }
 
     /// M8: decode allowing stateful fields (`previous_response_id` /
     /// `store=true`) into `IrRequest.raw` for native Responses passthrough.
     /// `background` is still rejected.
-    pub fn decode_request_allow_stateful(body: &Value) -> sag_core::Result<IrRequest> {
-        Self::decode_request_with_mode(body, StatefulMode::Allow)
+    pub fn decode_request_allow_stateful(req: &ResponsesRequest) -> sag_core::Result<IrRequest> {
+        Self::decode_request_with_mode(req, StatefulMode::Allow)
     }
 
     /// Decode with an explicit [`StatefulMode`].
     pub fn decode_request_with_mode(
-        body: &Value,
+        req: &ResponsesRequest,
         mode: StatefulMode,
     ) -> sag_core::Result<IrRequest> {
-        reject_unsupported_mode(body, mode)?;
+        reject_stateful(StatefulProbe::from_request(req), mode)?;
 
         let mut loss = sag_core::LossInventory::default();
-        let mut raw = Map::new();
+        // Unknown fields ride the typed `extra` map — the old allow-list
+        // filter is gone (R1).
+        let mut raw = req.extra.clone();
 
-        // Typed non-IR fields → raw for encode round-trip.
-        const KNOWN: &[&str] = &[
-            "model",
-            "instructions",
-            "input",
-            "stream",
-            "tools",
-            "max_output_tokens",
-            "temperature",
-            "top_p",
-            "tool_choice",
-            "parallel_tool_calls",
-            "text",
-            "reasoning",
-            // D1 rejects above; store=false still round-trips via raw.
-            "store",
-            "background",
-            "previous_response_id",
-        ];
-        if let Some(obj) = body.as_object() {
-            for (k, v) in obj {
-                // Unknown fields and `store` (even when false) round-trip via
-                // raw. In Allow mode `previous_response_id` also lands in raw
-                // so encode_request re-emits it for the native lane.
-                let keep = !KNOWN.contains(&k.as_str())
-                    || k == "store"
-                    || (mode == StatefulMode::Allow && k == "previous_response_id");
-                if keep {
-                    raw.insert(k.clone(), v.clone());
-                }
-            }
+        // Typed fields without an IR home round-trip via `raw`; encode moves
+        // them back into their typed slot. `store` always round-trips and
+        // `previous_response_id` is re-emitted for the native lane only (R5).
+        if let Some(store) = &req.store {
+            raw.insert("store".into(), store.clone());
         }
+        if mode == StatefulMode::Allow
+            && let Some(previous) = &req.previous_response_id
+        {
+            raw.insert("previous_response_id".into(), json!(previous));
+        }
+        put_raw(&mut raw, "parallel_tool_calls", &req.parallel_tool_calls);
+        put_raw(&mut raw, "text", &req.text);
+        put_raw(&mut raw, "reasoning", &req.reasoning);
+        put_raw(&mut raw, "metadata", &req.metadata);
+        put_raw(&mut raw, "service_tier", &req.service_tier);
+        put_raw(&mut raw, "include", &req.include);
+        put_raw(&mut raw, "top_logprobs", &req.top_logprobs);
+        put_raw(&mut raw, "max_tool_calls", &req.max_tool_calls);
+        put_raw(&mut raw, "stream_options", &req.stream_options);
+        put_raw(&mut raw, "prompt", &req.prompt);
+        put_raw(&mut raw, "conversation", &req.conversation);
+        put_raw(&mut raw, "prompt_cache_key", &req.prompt_cache_key);
+        put_raw(&mut raw, "prompt_cache_options", &req.prompt_cache_options);
+        put_raw(&mut raw, "safety_identifier", &req.safety_identifier);
+        put_raw(&mut raw, "context_management", &req.context_management);
+        put_raw(&mut raw, "moderation", &req.moderation);
+        put_raw(&mut raw, "access_programs", &req.access_programs);
 
-        let model = body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let stream = body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
+        let model = req.model.clone().unwrap_or_default();
+        let stream = req.stream.unwrap_or(false);
         let mut messages = Vec::new();
 
         // instructions → leading system message (multi-segment preserved).
-        if let Some(instr) = body.get("instructions").filter(|v| !v.is_null()) {
-            let content = match instr {
-                Value::String(s) => vec![IrContentBlock::Text { text: s.clone() }],
-                Value::Array(parts) => parts
+        if let Some(instructions) = &req.instructions {
+            let content = match instructions {
+                MessageContent::Text(text) => vec![IrContentBlock::Text { text: text.clone() }],
+                MessageContent::Parts(parts) => parts
                     .iter()
-                    .map(|p| decode_content_part(p, "instructions", &mut loss))
+                    .map(|part| decode_input_part(part, "instructions", &mut loss))
                     .collect(),
-                other => {
+                MessageContent::Unknown(other) => {
                     loss.push_loss(
                         LossScope::Request,
                         "instructions",
@@ -392,24 +622,24 @@ impl ResponsesCodec {
         }
 
         // input → messages / tool results / assistant tool_calls.
-        match body.get("input") {
-            None | Some(Value::Null) => {}
-            Some(Value::String(s)) => {
+        match &req.input {
+            None => {}
+            Some(ResponsesInput::Text(text)) => {
                 messages.push(IrMessage {
                     role: IrRole::User,
-                    content: vec![IrContentBlock::Text { text: s.clone() }],
+                    content: vec![IrContentBlock::Text { text: text.clone() }],
                     name: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
                     raw: Map::new(),
                 });
             }
-            Some(Value::Array(items)) => {
+            Some(ResponsesInput::Items(items)) => {
                 for (ii, item) in items.iter().enumerate() {
                     decode_input_item(item, ii, &mut messages, &mut loss);
                 }
             }
-            Some(other) => {
+            Some(ResponsesInput::Unknown(other)) => {
                 loss.push_loss(
                     LossScope::Request,
                     "input",
@@ -424,15 +654,13 @@ impl ResponsesCodec {
             }
         }
 
-        // tools: type:"function" and type:"web_search" (M8).
+        // tools: type:"function" and type:"web_search" (M8). The shape checks
+        // stay on the wire form because `IrTool.raw` keeps the original object.
         let mut tools = Vec::new();
-        if let Some(arr) = body
-            .get("tools")
-            .filter(|v| !v.is_null())
-            .and_then(|v| v.as_array())
-        {
-            for (i, t) in arr.iter().enumerate() {
-                if let Some(err) = tool_reject(t) {
+        if let Some(list) = &req.tools {
+            for (i, tool) in list.iter().enumerate() {
+                let t = to_value_or_null(tool);
+                if let Some(err) = tool_reject(&t) {
                     return Err(err);
                 }
                 let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
@@ -510,33 +738,23 @@ impl ResponsesCodec {
         }
 
         // sampling / limits.
-        let temperature = body.get("temperature").and_then(|v| v.as_f64());
-        let top_p = body.get("top_p").and_then(|v| v.as_f64());
-        let max_tokens = body
-            .get("max_output_tokens")
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u32::try_from(n).ok());
+        let temperature = req.temperature;
+        let top_p = req.top_p;
+        let max_tokens = req.max_output_tokens.and_then(|n| u32::try_from(n).ok());
 
-        let tool_choice = match body.get("tool_choice") {
-            None | Some(Value::Null) => Value::Null,
-            Some(v) => decode_tool_choice(v)?,
+        let tool_choice = match &req.tool_choice {
+            None => Value::Null,
+            Some(choice) => decode_tool_choice(choice)?,
         };
-
-        if let Some(v) = body.get("parallel_tool_calls") {
-            raw.insert("parallel_tool_calls".into(), v.clone());
-        }
-        if let Some(v) = body.get("text") {
-            raw.insert("text".into(), v.clone());
-        }
 
         // reasoning: best-effort effort mapping + raw passthrough.
         let mut reasoning = Reasoning::default();
-        if let Some(r) = body.get("reasoning").filter(|v| !v.is_null()) {
-            raw.insert("reasoning".into(), r.clone());
-            if let Some(effort) = r.get("effort").and_then(|v| v.as_str()) {
-                reasoning.effort = Some(effort.to_string());
+        if let Some(param) = &req.reasoning {
+            if let Some(effort) = &param.effort {
+                reasoning.effort = Some(effort.clone());
             }
-            if let Some(b) = r.get("budget_tokens").and_then(|v| v.as_u64())
+            // `budget_tokens` is not modelled by the DTO → read it from `extra`.
+            if let Some(b) = param.extra.get("budget_tokens").and_then(Value::as_u64)
                 && let Ok(b) = u32::try_from(b)
             {
                 reasoning.budget_tokens = Some(b);
@@ -573,12 +791,12 @@ impl ResponsesCodec {
     // ═══════════════════════════════════════════════════════════
 
     /// Encode IR → Responses body using `ir.model`.
-    pub fn encode_request(ir: &IrRequest) -> Value {
+    pub fn encode_request(ir: &IrRequest) -> ResponsesRequest {
         Self::encode_request_with_loss(ir, &ir.model).0
     }
 
     /// Encode IR → Responses body with an explicit model (real_model override).
-    pub fn encode_request_for_model(ir: &IrRequest, model: &str) -> Value {
+    pub fn encode_request_for_model(ir: &IrRequest, model: &str) -> ResponsesRequest {
         Self::encode_request_with_loss(ir, model).0
     }
 
@@ -588,7 +806,7 @@ impl ResponsesCodec {
     pub fn encode_request_with_loss(
         ir: &IrRequest,
         model: &str,
-    ) -> (Value, sag_core::LossInventory) {
+    ) -> (ResponsesRequest, sag_core::LossInventory) {
         let mut loss = ir.loss.clone();
         let body = Self::encode_request_inner(ir, model, &mut loss);
         (body, loss)
@@ -598,9 +816,11 @@ impl ResponsesCodec {
         ir: &IrRequest,
         model: &str,
         loss: &mut sag_core::LossInventory,
-    ) -> Value {
-        let mut body = Map::new();
-        body.insert("model".into(), json!(model));
+    ) -> ResponsesRequest {
+        let mut body = ResponsesRequest {
+            model: Some(model.to_string()),
+            ..Default::default()
+        };
 
         // system messages → instructions (joined; multi/long preserved).
         // Non-Text system blocks cannot live on a bare string → loss (S1).
@@ -617,44 +837,54 @@ impl ResponsesCodec {
                                 LossScope::ContentBlock,
                                 format!("system[{si}].content[{bi}]"),
                                 LossReason::UnsupportedByIr,
-                                serde_json::to_value(other).unwrap_or(Value::Null),
+                                to_value_or_null(other),
                             );
                         }
                     }
                 }
             }
             if !text.is_empty() {
-                body.insert("instructions".into(), json!(text));
+                body.instructions = Some(MessageContent::Text(text));
             }
         }
 
-        let input = encode_input_items(&chat_msgs, loss);
-        body.insert("input".into(), Value::Array(input));
+        body.input = Some(ResponsesInput::Items(encode_input_items(&chat_msgs, loss)));
 
         if ir.stream {
-            body.insert("stream".into(), json!(true));
+            body.stream = Some(true);
         }
-        if let Some(t) = ir.sampling.temperature {
-            body.insert("temperature".into(), json!(t));
-        }
-        if let Some(p) = ir.sampling.top_p {
-            body.insert("top_p".into(), json!(p));
-        }
-        if let Some(m) = ir.max_tokens {
-            body.insert("max_output_tokens".into(), json!(m));
-        }
+        body.temperature = ir.sampling.temperature;
+        body.top_p = ir.sampling.top_p;
+        body.max_output_tokens = ir.max_tokens.map(u64::from);
         if !ir.tool_choice.is_null() {
-            body.insert("tool_choice".into(), ir.tool_choice.clone());
+            body.tool_choice = Some(tool_choice_from_value(ir.tool_choice.clone()));
         }
 
         // tools: prefer original raw when present; else rebuild.
-        let tools_value = match ir.raw.get("tools").cloned() {
-            Some(v) => Some(v),
-            None if !ir.tools.is_empty() => Some(encode_tools(&ir.tools)),
-            None => None,
-        };
-        if let Some(v) = tools_value {
-            body.insert("tools".into(), v);
+        match ir.raw.get("tools") {
+            Some(value) => {
+                if let Some(entries) = value.as_array() {
+                    body.tools = Some(
+                        entries
+                            .iter()
+                            .cloned()
+                            .map(responses_tool_from_value)
+                            .collect(),
+                    );
+                }
+            }
+            None if !ir.tools.is_empty() => {
+                if let Some(entries) = encode_tools(&ir.tools).as_array() {
+                    body.tools = Some(
+                        entries
+                            .iter()
+                            .cloned()
+                            .map(responses_tool_from_value)
+                            .collect(),
+                    );
+                }
+            }
+            None => {}
         }
 
         // reasoning effort → Responses reasoning object (best-effort).
@@ -662,18 +892,24 @@ impl ResponsesCodec {
             && effort != "none"
             && !ir.raw.contains_key("reasoning")
         {
-            body.insert("reasoning".into(), json!({"effort": effort}));
+            body.reasoning = Some(ReasoningParam {
+                effort: Some(effort.to_string()),
+                ..Default::default()
+            });
         }
 
-        // Unknown raw fields round-trip (do not overwrite known keys).
+        // Raw fields round-trip: back into their typed slot when one exists
+        // (never overwriting a value synthesized above), else into `extra`.
         for (k, v) in &ir.raw {
             if k == "tools" {
                 continue; // consumed above
             }
-            body.entry(k.clone()).or_insert_with(|| v.clone());
+            if !absorb_request(&mut body, k, v) {
+                body.extra.entry(k.clone()).or_insert_with(|| v.clone());
+            }
         }
 
-        Value::Object(body)
+        body
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -681,183 +917,114 @@ impl ResponsesCodec {
     // ═══════════════════════════════════════════════════════════
 
     /// Decode a non-stream Responses body into IR.
-    pub fn decode_response(body: &Value) -> IrResponse {
+    pub fn decode_response(body: &ResponsesResponse) -> IrResponse {
         let mut loss = sag_core::LossInventory::default();
-        let mut raw = Map::new();
-        let mut output = Vec::new();
-
-        let id = body
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let model = body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let created = body.get("created_at").and_then(|v| v.as_u64());
-
         // Unknown top-level fields → raw (passthrough, no loss).
-        const KNOWN: &[&str] = &[
-            "id",
-            "object",
-            "created_at",
-            "status",
-            "error",
-            "incomplete_details",
-            "instructions",
-            "max_output_tokens",
-            "model",
-            "output",
-            "parallel_tool_calls",
-            "previous_response_id",
-            "store",
-            "temperature",
-            "text",
-            "tool_choice",
-            "tools",
-            "top_p",
-            "truncation",
-            "usage",
-            "user",
-            "metadata",
-        ];
-        if let Some(obj) = body.as_object() {
-            for (k, v) in obj {
-                if !KNOWN.contains(&k.as_str()) {
-                    raw.insert(k.clone(), v.clone());
-                }
-            }
-        }
+        let mut raw = body.extra.clone();
+
         // Preserve status/incomplete for finish_reason encode round-trip.
-        if let Some(s) = body.get("status") {
-            raw.insert("__status".into(), s.clone());
+        if let Some(status) = &body.status {
+            raw.insert("__status".into(), json!(status));
         }
-        if let Some(s) = body.get("incomplete_details") {
-            raw.insert("__incomplete_details".into(), s.clone());
+        if let Some(details) = &body.incomplete_details {
+            raw.insert("__incomplete_details".into(), to_value_or_null(details));
         }
+        // Typed echo fields that `encode_response` does not synthesize stay on
+        // the raw passthrough lane (same set the old allow-list skipped).
+        put_raw(&mut raw, "completed_at", &body.completed_at);
+        put_raw(&mut raw, "output_text", &body.output_text);
+        put_raw(&mut raw, "max_tool_calls", &body.max_tool_calls);
+        put_raw(&mut raw, "reasoning", &body.reasoning);
+        put_raw(&mut raw, "top_logprobs", &body.top_logprobs);
+        put_raw(&mut raw, "service_tier", &body.service_tier);
+        put_raw(&mut raw, "conversation", &body.conversation);
+        put_raw(&mut raw, "prompt", &body.prompt);
+        put_raw(&mut raw, "prompt_cache_key", &body.prompt_cache_key);
+        put_raw(&mut raw, "prompt_cache_options", &body.prompt_cache_options);
+        put_raw(
+            &mut raw,
+            "prompt_cache_diagnostics",
+            &body.prompt_cache_diagnostics,
+        );
+        put_raw(&mut raw, "safety_identifier", &body.safety_identifier);
+        put_raw(&mut raw, "access_programs", &body.access_programs);
+        put_raw(&mut raw, "background", &body.background);
 
         let mut has_function_call = false;
-        if let Some(arr) = body.get("output").and_then(|v| v.as_array()) {
-            for (i, item) in arr.iter().enumerate() {
-                match item.get("type").and_then(|t| t.as_str()) {
-                    Some("message") => {
-                        // content parts → Text (annotations preserved in raw item skip).
-                        if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
-                            for (pi, part) in parts.iter().enumerate() {
-                                match part.get("type").and_then(|t| t.as_str()) {
-                                    Some("output_text") | Some("text") => {
-                                        // Non-empty annotations cannot live on
-                                        // IrOutputItem::Text — record loss.
-                                        if let Some(anns) = part
-                                            .get("annotations")
-                                            .and_then(|a| a.as_array())
-                                            .filter(|a| !a.is_empty())
-                                        {
-                                            loss.push_loss(
-                                                LossScope::Response,
-                                                format!("output[{i}].content[{pi}].annotations"),
-                                                LossReason::UnsupportedByIr,
-                                                Value::Array(anns.clone()),
-                                            );
-                                        }
-                                        output.push(IrOutputItem::Text {
-                                            text: part
-                                                .get("text")
-                                                .and_then(|t| t.as_str())
-                                                .unwrap_or("")
-                                                .to_string(),
-                                        });
-                                    }
-                                    _ => {
-                                        loss.push_loss(
-                                            LossScope::Response,
-                                            format!("output[{i}].content[{pi}]"),
-                                            LossReason::UnsupportedByIr,
-                                            part.clone(),
-                                        );
-                                        output.push(IrOutputItem::Raw(part.clone()));
-                                    }
+        let mut output = Vec::new();
+        for (i, item) in body.output.iter().enumerate() {
+            match item {
+                OutputItem::Message(message) => {
+                    for (pi, part) in message.content.iter().enumerate() {
+                        match part {
+                            OutputContentPart::OutputText(text) => {
+                                // Non-empty annotations cannot live on
+                                // IrOutputItem::Text — record loss.
+                                if !text.annotations.is_empty() {
+                                    loss.push_loss(
+                                        LossScope::Response,
+                                        format!("output[{i}].content[{pi}].annotations"),
+                                        LossReason::UnsupportedByIr,
+                                        to_value_or_null(&text.annotations),
+                                    );
                                 }
+                                output.push(IrOutputItem::Text {
+                                    text: text.text.clone(),
+                                });
                             }
-                        } else if let Some(t) = item.get("content").and_then(|c| c.as_str()) {
-                            output.push(IrOutputItem::Text {
-                                text: t.to_string(),
-                            });
-                        }
-                    }
-                    Some("function_call") => {
-                        has_function_call = true;
-                        let arguments = match item.get("arguments") {
-                            Some(Value::String(s)) => serde_json::from_str::<Value>(s)
-                                .ok()
-                                .filter(|v| !v.is_string())
-                                .unwrap_or_else(|| Value::String(s.clone())),
-                            Some(other) => other.clone(),
-                            None => json!({}),
-                        };
-                        output.push(IrOutputItem::ToolCall(IrToolCall {
-                            id: item
-                                .get("call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: item
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
-                            arguments,
-                            index: Some(output.len() as u32),
-                        }));
-                    }
-                    Some("reasoning") => {
-                        // summary / content text → Reasoning.
-                        let mut text = String::new();
-                        for key in ["summary", "content"] {
-                            if let Some(parts) = item.get(key).and_then(|p| p.as_array()) {
-                                for p in parts {
-                                    if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                                        text.push_str(t);
-                                    }
-                                }
+                            other => {
+                                let value = to_value_or_null(other);
+                                loss.push_loss(
+                                    LossScope::Response,
+                                    format!("output[{i}].content[{pi}]"),
+                                    LossReason::UnsupportedByIr,
+                                    value.clone(),
+                                );
+                                output.push(IrOutputItem::Raw(value));
                             }
                         }
-                        output.push(IrOutputItem::Reasoning { text });
                     }
-                    _ => {
-                        // Unknown (web_search_call, …) → Raw + loss.
-                        loss.push_loss(
-                            LossScope::Response,
-                            format!("output[{i}]"),
-                            LossReason::UnsupportedByIr,
-                            item.clone(),
-                        );
-                        output.push(IrOutputItem::Raw(item.clone()));
-                    }
+                }
+                OutputItem::FunctionCall(call) => {
+                    has_function_call = true;
+                    output.push(IrOutputItem::ToolCall(IrToolCall {
+                        id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: parse_arguments(&call.arguments),
+                        index: Some(output.len() as u32),
+                    }));
+                }
+                OutputItem::Reasoning(reasoning) => {
+                    output.push(IrOutputItem::Reasoning {
+                        text: reasoning_text(reasoning),
+                    });
+                }
+                other => {
+                    // Unknown (web_search_call, …) → Raw + loss.
+                    let value = to_value_or_null(other);
+                    loss.push_loss(
+                        LossScope::Response,
+                        format!("output[{i}]"),
+                        LossReason::UnsupportedByIr,
+                        value.clone(),
+                    );
+                    output.push(IrOutputItem::Raw(value));
                 }
             }
         }
 
-        let status = body
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("completed");
+        let status = body.status.as_deref().unwrap_or("completed");
         let incomplete_reason = body
-            .pointer("/incomplete_details/reason")
-            .and_then(|v| v.as_str());
+            .incomplete_details
+            .as_ref()
+            .and_then(|details| details.reason.as_deref());
         let finish_reason = status_to_finish(status, incomplete_reason, has_function_call);
-
-        let usage = body
-            .get("usage")
-            .filter(|u| !u.is_null())
-            .map(responses_usage);
+        let usage = body.usage.as_ref().map(usage_from_responses);
 
         IrResponse {
-            id,
-            created,
-            model,
+            id: body.id.clone(),
+            created: body.created_at,
+            model: body.model.clone().unwrap_or_default(),
             output,
             finish_reason,
             usage,
@@ -871,16 +1038,17 @@ impl ResponsesCodec {
     // ═══════════════════════════════════════════════════════════
 
     /// Encode IR → Responses non-stream response (`object:"response"`).
-    pub fn encode_response(ir: &IrResponse) -> Value {
-        let mut body = Map::new();
-        body.insert("id".into(), json!(ir.id));
-        body.insert("object".into(), json!("response"));
-        if let Some(c) = ir.created {
-            body.insert("created_at".into(), json!(c));
-        }
+    pub fn encode_response(ir: &IrResponse) -> ResponsesResponse {
+        let mut body = ResponsesResponse {
+            id: ir.id.clone(),
+            object: Some("response".to_string()),
+            created_at: ir.created,
+            model: Some(ir.model.clone()),
+            ..Default::default()
+        };
 
         // status: prefer raw (round-trip) else derive from finish_reason.
-        let status = match ir.raw.get("__status").and_then(|v| v.as_str()) {
+        let status = match ir.raw.get("__status").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None => match ir.finish_reason.as_ref() {
                 Some(IrFinishReason::Length | IrFinishReason::ContentFilter) => "incomplete".into(),
@@ -889,81 +1057,41 @@ impl ResponsesCodec {
                 _ => "completed".into(),
             },
         };
-        body.insert("status".into(), json!(status));
-        if let Some(inc) = ir.raw.get("__incomplete_details") {
-            body.insert("incomplete_details".into(), inc.clone());
+        if let Some(details) = ir.raw.get("__incomplete_details") {
+            body.incomplete_details = Some(incomplete_details_from_value(details.clone()));
         } else if status == "incomplete" {
             let reason = match ir.finish_reason.as_ref() {
                 Some(IrFinishReason::Length) => "max_output_tokens",
                 Some(IrFinishReason::ContentFilter) => "content_filter",
                 _ => "max_output_tokens",
             };
-            body.insert("incomplete_details".into(), json!({"reason": reason}));
+            body.incomplete_details = Some(IncompleteDetails {
+                reason: Some(reason.to_string()),
+                ..Default::default()
+            });
         }
+        body.status = Some(status);
 
-        body.insert("model".into(), json!(ir.model));
+        body.output = ir
+            .output
+            .iter()
+            .filter_map(|item| encode_output_item(item, &ir.id))
+            .collect();
 
-        let mut output: Vec<Value> = Vec::new();
-        for item in &ir.output {
-            match item {
-                IrOutputItem::Text { text } => {
-                    output.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "id": format!("msg_{}", ir.id),
-                        "status": "completed",
-                        "content": [{
-                            "type": "output_text",
-                            "text": text,
-                            "annotations": [],
-                        }],
-                    }));
-                }
-                IrOutputItem::Reasoning { text } => {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    output.push(json!({
-                        "type": "reasoning",
-                        "id": format!("rs_{}", ir.id),
-                        "summary": [{
-                            "type": "summary_text",
-                            "text": text,
-                        }],
-                    }));
-                }
-                IrOutputItem::ToolCall(tc) => {
-                    let arguments = match &tc.arguments {
-                        Value::String(s) => s.clone(),
-                        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".into()),
-                    };
-                    output.push(json!({
-                        "type": "function_call",
-                        "id": format!("fc_{}", tc.id),
-                        "call_id": tc.id,
-                        "name": tc.name,
-                        "arguments": arguments,
-                        "status": "completed",
-                    }));
-                }
-                IrOutputItem::Raw(v) => output.push(v.clone()),
-            }
-        }
-        body.insert("output".into(), Value::Array(output));
+        body.usage = ir.usage.as_ref().map(usage_to_responses);
 
-        if let Some(u) = &ir.usage {
-            body.insert("usage".into(), usage_to_responses(u));
-        }
-
-        // Unknown raw fields round-trip (skip codec-private keys).
+        // Raw fields round-trip (codec-private `__` keys excepted), back into
+        // their typed slot when one exists.
         for (k, v) in &ir.raw {
             if k.starts_with("__") {
                 continue;
             }
-            body.entry(k.clone()).or_insert_with(|| v.clone());
+            if !absorb_response(&mut body, k, v) {
+                body.extra.entry(k.clone()).or_insert_with(|| v.clone());
+            }
         }
 
-        Value::Object(body)
+        body
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1569,44 +1697,32 @@ fn encode_completed(finish: Option<&IrFinishReason>) -> Vec<u8> {
 // ═══════════════════════════════════════════════════════════════════
 
 fn decode_input_item(
-    item: &Value,
+    item: &InputItem,
     ii: usize,
     messages: &mut Vec<IrMessage>,
     loss: &mut sag_core::LossInventory,
 ) {
-    match item.get("type").and_then(|t| t.as_str()) {
-        Some("message") | None => {
-            // Bare object with role is also a message.
-            if item.get("type").is_none() && item.get("role").is_none() {
-                loss.push_loss(
-                    LossScope::Message,
-                    format!("input[{ii}]"),
-                    LossReason::UnsupportedByIr,
-                    item.clone(),
-                );
-                return;
-            }
-            let role =
-                IrRole::from_raw(item.get("role").and_then(|v| v.as_str()).unwrap_or("user"));
-            let mut raw = Map::new();
-            if let Some(obj) = item.as_object() {
-                for (k, v) in obj {
-                    if !matches!(k.as_str(), "type" | "role" | "content") {
-                        raw.insert(k.clone(), v.clone());
-                    }
+    match item {
+        InputItem::Message(message) => {
+            let role = IrRole::from_raw(message.role.as_str());
+            // Typed fields without an IR home round-trip via the message raw.
+            let mut raw = message.extra.clone();
+            put_raw(&mut raw, "phase", &message.phase);
+            put_raw(&mut raw, "status", &message.status);
+            put_raw(&mut raw, "id", &message.id);
+            let content = match &message.content {
+                None => Vec::new(),
+                Some(MessageContent::Text(text)) => {
+                    vec![IrContentBlock::Text { text: text.clone() }]
                 }
-            }
-            let content = match item.get("content") {
-                None | Some(Value::Null) => Vec::new(),
-                Some(Value::String(s)) => vec![IrContentBlock::Text { text: s.clone() }],
-                Some(Value::Array(parts)) => parts
+                Some(MessageContent::Parts(parts)) => parts
                     .iter()
                     .enumerate()
-                    .map(|(pi, p)| {
-                        decode_content_part(p, &format!("input[{ii}].content[{pi}]"), loss)
+                    .map(|(pi, part)| {
+                        decode_input_part(part, &format!("input[{ii}].content[{pi}]"), loss)
                     })
                     .collect(),
-                Some(other) => {
+                Some(MessageContent::Unknown(other)) => {
                     loss.push_loss(
                         LossScope::ContentBlock,
                         format!("input[{ii}].content"),
@@ -1625,128 +1741,113 @@ fn decode_input_item(
                 raw,
             });
         }
-        Some("function_call_output") => {
-            let call_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let output_text = match item.get("output") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(parts)) => {
+        InputItem::FunctionCallOutput(item) => {
+            let output_text = match &item.output {
+                None => String::new(),
+                Some(MessageContent::Text(text)) => text.clone(),
+                Some(MessageContent::Parts(parts)) => {
                     let mut text = String::new();
-                    for (pi, p) in parts.iter().enumerate() {
-                        if let Some(t) = p
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .or_else(|| p.as_str())
-                        {
-                            text.push_str(t);
-                        } else {
-                            // Non-text part discarded → loss (S2).
-                            loss.push_loss(
+                    for (pi, part) in parts.iter().enumerate() {
+                        let piece = match part {
+                            InputContentPart::Text(part) => Some(part.text.as_str()),
+                            // Unmodelled parts still expose `text` (or are a
+                            // bare string) — keep those, drop the rest (S2).
+                            InputContentPart::Unknown(value) => value
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .or_else(|| value.as_str()),
+                            InputContentPart::Image(_) | InputContentPart::File(_) => None,
+                        };
+                        match piece {
+                            Some(piece) => text.push_str(piece),
+                            None => loss.push_loss(
                                 LossScope::ContentBlock,
                                 format!("input[{ii}].output[{pi}]"),
                                 LossReason::UnsupportedByIr,
-                                p.clone(),
-                            );
+                                to_value_or_null(part),
+                            ),
                         }
                     }
                     text
                 }
-                Some(other) => serde_json::to_string(other).unwrap_or_default(),
-                None => String::new(),
-            };
-            let mut raw = Map::new();
-            if let Some(obj) = item.as_object() {
-                for (k, v) in obj {
-                    if !matches!(k.as_str(), "type" | "call_id" | "output") {
-                        raw.insert(k.clone(), v.clone());
-                    }
+                Some(MessageContent::Unknown(other)) => {
+                    serde_json::to_string(other).unwrap_or_default()
                 }
-            }
+            };
+            let mut raw = item.extra.clone();
+            put_raw(&mut raw, "status", &item.status);
+            put_raw(&mut raw, "id", &item.id);
             messages.push(IrMessage {
                 role: IrRole::Tool,
                 content: vec![IrContentBlock::Text { text: output_text }],
                 name: None,
-                tool_call_id: Some(call_id),
+                tool_call_id: Some(item.call_id.clone()),
                 tool_calls: Vec::new(),
                 raw,
             });
         }
-        Some("function_call") => {
-            let call_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let name = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let arguments = match item.get("arguments") {
-                Some(Value::String(s)) => serde_json::from_str::<Value>(s)
-                    .ok()
-                    .filter(|v| !v.is_string())
-                    .unwrap_or_else(|| Value::String(s.clone())),
-                Some(other) => other.clone(),
-                None => json!({}),
-            };
-            let mut raw = Map::new();
-            if let Some(obj) = item.as_object() {
-                for (k, v) in obj {
-                    if !matches!(k.as_str(), "type" | "call_id" | "name" | "arguments") {
-                        raw.insert(k.clone(), v.clone());
-                    }
-                }
-            }
+        InputItem::FunctionCall(item) => {
+            let mut raw = item.extra.clone();
+            put_raw(&mut raw, "namespace", &item.namespace);
+            put_raw(&mut raw, "id", &item.id);
+            put_raw(&mut raw, "status", &item.status);
             messages.push(IrMessage {
                 role: IrRole::Assistant,
                 content: Vec::new(),
                 name: None,
                 tool_call_id: None,
                 tool_calls: vec![IrToolCall {
-                    id: call_id,
-                    name,
-                    arguments,
+                    id: item.call_id.clone(),
+                    name: item.name.clone(),
+                    arguments: parse_arguments(&item.arguments),
                     index: Some(0),
                 }],
                 raw,
             });
         }
-        Some("reasoning") => {
-            let mut text = String::new();
-            for key in ["summary", "content"] {
-                if let Some(parts) = item.get(key).and_then(|p| p.as_array()) {
-                    for p in parts {
-                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                            text.push_str(t);
-                        }
-                    }
-                }
-            }
+        InputItem::Reasoning(item) => {
             messages.push(IrMessage {
                 role: IrRole::Assistant,
-                content: vec![IrContentBlock::Reasoning { text }],
+                content: vec![IrContentBlock::Reasoning {
+                    text: reasoning_text(item),
+                }],
                 ..Default::default()
             });
         }
-        Some(other) => {
+        // `role` is required by the typed `MessageItem` but was optional for
+        // the old value-based decoder, which defaulted it to `user`. Keep
+        // tolerating the non-spec `{"type": "message"}` shape — and a
+        // non-string `role` — instead of dropping user content.
+        InputItem::Unknown(Value::Object(obj))
+            if obj.get("type").and_then(Value::as_str) == Some("message")
+                && !obj.get("role").is_some_and(Value::is_string) =>
+        {
+            let mut patched = obj.clone();
+            patched.insert("role".into(), json!("user"));
+            decode_input_item(
+                &input_item_from_value(Value::Object(patched)),
+                ii,
+                messages,
+                loss,
+            );
+        }
+        other => {
             // Unknown item type → structural drop with loss (raw preserved
             // on the loss entry value snapshot).
             loss.push_loss(
                 LossScope::Message,
                 format!("input[{ii}]"),
                 LossReason::UnsupportedByIr,
-                item.clone(),
+                to_value_or_null(other),
             );
-            let _ = other;
         }
     }
 }
 
-fn encode_input_items(chat_msgs: &[&IrMessage], loss: &mut sag_core::LossInventory) -> Vec<Value> {
+fn encode_input_items(
+    chat_msgs: &[&IrMessage],
+    loss: &mut sag_core::LossInventory,
+) -> Vec<InputItem> {
     let mut out = Vec::new();
     for (mi, msg) in chat_msgs.iter().enumerate() {
         match msg.role {
@@ -1823,7 +1924,7 @@ fn encode_input_items(chat_msgs: &[&IrMessage], loss: &mut sag_core::LossInvento
             _ => out.push(encode_message_item(msg, mi, loss)),
         }
     }
-    out
+    out.into_iter().map(input_item_from_value).collect()
 }
 
 fn encode_message_item(
@@ -1959,12 +2060,174 @@ fn encode_tools(tools: &[IrTool]) -> Value {
     Value::Array(arr)
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// response helpers
+// ═══════════════════════════════════════════════════════════════════
+
+/// IR output item → typed Responses output item (`None` drops empty
+/// reasoning items, matching the previous behaviour).
+fn encode_output_item(item: &IrOutputItem, response_id: &str) -> Option<OutputItem> {
+    match item {
+        IrOutputItem::Text { text } => Some(OutputItem::Message(OutputMessage {
+            kind: "message".to_string(),
+            id: Some(format!("msg_{response_id}")),
+            role: Some("assistant".to_string()),
+            status: Some("completed".to_string()),
+            content: vec![OutputContentPart::OutputText(OutputTextContent {
+                kind: "output_text".to_string(),
+                text: text.clone(),
+                annotations: Vec::new(),
+                logprobs: None,
+                extra: Map::new(),
+            })],
+            ..Default::default()
+        })),
+        IrOutputItem::Reasoning { text } => {
+            if text.is_empty() {
+                return None;
+            }
+            Some(OutputItem::Reasoning(ReasoningItem {
+                kind: "reasoning".to_string(),
+                id: Some(format!("rs_{response_id}")),
+                summary: vec![ReasoningSummaryPart {
+                    kind: "summary_text".to_string(),
+                    text: text.clone(),
+                    extra: Map::new(),
+                }],
+                ..Default::default()
+            }))
+        }
+        IrOutputItem::ToolCall(call) => Some(OutputItem::FunctionCall(FunctionCallItem {
+            kind: "function_call".to_string(),
+            id: Some(format!("fc_{}", call.id)),
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: match &call.arguments {
+                Value::String(s) => s.clone(),
+                other => serde_json::to_string(other).unwrap_or_else(|_| "{}".into()),
+            },
+            status: Some("completed".to_string()),
+            ..Default::default()
+        })),
+        IrOutputItem::Raw(value) => Some(output_item_from_value(value.clone())),
+    }
+}
+
+/// Move a raw passthrough value back into its typed request slot.
+///
+/// Returns `false` when the key has no typed home (or the value does not fit),
+/// so the caller keeps it in `extra` instead of dropping it.
+fn absorb_request(body: &mut ResponsesRequest, key: &str, value: &Value) -> bool {
+    match key {
+        "model" => absorb(&mut body.model, value),
+        "input" => absorb(&mut body.input, value),
+        "instructions" => absorb(&mut body.instructions, value),
+        "tools" => absorb(&mut body.tools, value),
+        "tool_choice" => absorb(&mut body.tool_choice, value),
+        "text" => absorb(&mut body.text, value),
+        "reasoning" => absorb(&mut body.reasoning, value),
+        "temperature" => absorb(&mut body.temperature, value),
+        "top_p" => absorb(&mut body.top_p, value),
+        "top_logprobs" => absorb(&mut body.top_logprobs, value),
+        "max_output_tokens" => absorb(&mut body.max_output_tokens, value),
+        "max_tool_calls" => absorb(&mut body.max_tool_calls, value),
+        "stream" => absorb(&mut body.stream, value),
+        "stream_options" => absorb(&mut body.stream_options, value),
+        "store" => absorb(&mut body.store, value),
+        "metadata" => absorb(&mut body.metadata, value),
+        "previous_response_id" => absorb(&mut body.previous_response_id, value),
+        "conversation" => absorb(&mut body.conversation, value),
+        "parallel_tool_calls" => absorb(&mut body.parallel_tool_calls, value),
+        "service_tier" => absorb(&mut body.service_tier, value),
+        "prompt" => absorb(&mut body.prompt, value),
+        "prompt_cache_key" => absorb(&mut body.prompt_cache_key, value),
+        "prompt_cache_options" => absorb(&mut body.prompt_cache_options, value),
+        "safety_identifier" => absorb(&mut body.safety_identifier, value),
+        "context_management" => absorb(&mut body.context_management, value),
+        "include" => absorb(&mut body.include, value),
+        "moderation" => absorb(&mut body.moderation, value),
+        "access_programs" => absorb(&mut body.access_programs, value),
+        "background" => absorb(&mut body.background, value),
+        _ => false,
+    }
+}
+
+/// Move a raw passthrough value back into its typed response slot.
+fn absorb_response(body: &mut ResponsesResponse, key: &str, value: &Value) -> bool {
+    match key {
+        // Always synthesized by `encode_response`; never duplicated.
+        "id" | "object" | "output" => true,
+        "model" => absorb(&mut body.model, value),
+        "created_at" => absorb(&mut body.created_at, value),
+        "status" => absorb(&mut body.status, value),
+        "incomplete_details" => absorb(&mut body.incomplete_details, value),
+        "usage" => absorb(&mut body.usage, value),
+        "completed_at" => absorb(&mut body.completed_at, value),
+        "output_text" => absorb(&mut body.output_text, value),
+        "error" => absorb(&mut body.error, value),
+        "instructions" => absorb(&mut body.instructions, value),
+        "max_output_tokens" => absorb(&mut body.max_output_tokens, value),
+        "max_tool_calls" => absorb(&mut body.max_tool_calls, value),
+        "parallel_tool_calls" => absorb(&mut body.parallel_tool_calls, value),
+        "previous_response_id" => absorb(&mut body.previous_response_id, value),
+        "reasoning" => absorb(&mut body.reasoning, value),
+        "temperature" => absorb(&mut body.temperature, value),
+        "top_p" => absorb(&mut body.top_p, value),
+        "top_logprobs" => absorb(&mut body.top_logprobs, value),
+        "text" => absorb(&mut body.text, value),
+        "tools" => absorb(&mut body.tools, value),
+        "tool_choice" => absorb(&mut body.tool_choice, value),
+        "service_tier" => absorb(&mut body.service_tier, value),
+        "conversation" => absorb(&mut body.conversation, value),
+        "metadata" => absorb(&mut body.metadata, value),
+        "prompt" => absorb(&mut body.prompt, value),
+        "prompt_cache_key" => absorb(&mut body.prompt_cache_key, value),
+        "prompt_cache_options" => absorb(&mut body.prompt_cache_options, value),
+        "prompt_cache_diagnostics" => absorb(&mut body.prompt_cache_diagnostics, value),
+        "safety_identifier" => absorb(&mut body.safety_identifier, value),
+        "access_programs" => absorb(&mut body.access_programs, value),
+        "background" => absorb(&mut body.background, value),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Typed request body from a JSON fixture (the handler parses before the
+    /// codec runs, so tests mirror that order).
+    fn request(body: Value) -> ResponsesRequest {
+        serde_json::from_value(body).expect("typed responses request")
+    }
+
     fn decode(body: Value) -> IrRequest {
-        ResponsesCodec::decode_request(&body).expect("valid responses request")
+        ResponsesCodec::decode_request(&request(body)).expect("valid responses request")
+    }
+
+    /// Decode expected to fail with a 422-class error.
+    fn try_decode(body: Value) -> sag_core::Result<IrRequest> {
+        ResponsesCodec::decode_request(&request(body))
+    }
+
+    /// M8 native-lane decode (stateful fields allowed).
+    fn allow_stateful(body: Value) -> sag_core::Result<IrRequest> {
+        ResponsesCodec::decode_request_allow_stateful(&request(body))
+    }
+
+    /// Serialize the typed encode output back to JSON for assertions.
+    fn encode_request(ir: &IrRequest) -> Value {
+        to_value_or_null(&ResponsesCodec::encode_request(ir))
+    }
+
+    fn decode_response(body: Value) -> IrResponse {
+        let typed: ResponsesResponse =
+            serde_json::from_value(body).expect("typed responses response");
+        ResponsesCodec::decode_response(&typed)
+    }
+
+    fn encode_response(ir: &IrResponse) -> Value {
+        to_value_or_null(&ResponsesCodec::encode_response(ir))
     }
 
     // ── request round-trips ─────────────────────────────────────
@@ -1999,7 +2262,7 @@ mod tests {
         assert_eq!(ir.tools.len(), 1);
         assert_eq!(ir.tools[0].name, "get_weather");
 
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["model"], "gpt-4o");
         assert_eq!(back["instructions"], "Be brief.");
         assert_eq!(back["max_output_tokens"], 256);
@@ -2033,7 +2296,7 @@ mod tests {
         assert_eq!(ir.messages[2].role, IrRole::Tool);
         assert_eq!(ir.messages[2].tool_call_id.as_deref(), Some("call_1"));
 
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         let input = back["input"].as_array().expect("input array");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["call_id"], "call_1");
@@ -2063,7 +2326,7 @@ mod tests {
         }));
         assert_eq!(ir.raw.get("prompt_cache_key"), Some(&json!("pk-1")));
         assert_eq!(ir.raw.get("store"), Some(&json!(false)));
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["prompt_cache_key"], "pk-1");
         assert_eq!(back["store"], false);
     }
@@ -2078,7 +2341,7 @@ mod tests {
         }));
         assert_eq!(ir.raw.get("parallel_tool_calls"), Some(&json!(true)));
         assert_eq!(ir.reasoning.effort.as_deref(), Some("high"));
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["parallel_tool_calls"], true);
         // effort re-encoded when not in raw... reasoning is in raw, restored.
         assert_eq!(back["reasoning"]["effort"], "high");
@@ -2088,7 +2351,7 @@ mod tests {
 
     #[test]
     fn reject_previous_response_id() {
-        let err = ResponsesCodec::decode_request(&json!({
+        let err = try_decode(json!({
             "model": "m",
             "previous_response_id": "resp_abc",
             "input": "hi"
@@ -2103,7 +2366,7 @@ mod tests {
 
     #[test]
     fn reject_store_true() {
-        let err = ResponsesCodec::decode_request(&json!({
+        let err = try_decode(json!({
             "model": "m",
             "store": true,
             "input": "hi"
@@ -2118,13 +2381,13 @@ mod tests {
             json!({"model": "m", "store": false, "input": "hi"}),
             json!({"model": "m", "input": "hi"}),
         ] {
-            ResponsesCodec::decode_request(&body).expect("store=false/absent must pass");
+            try_decode(body).expect("store=false/absent must pass");
         }
     }
 
     #[test]
     fn reject_background() {
-        let err = ResponsesCodec::decode_request(&json!({
+        let err = try_decode(json!({
             "model": "m",
             "background": true,
             "input": "hi"
@@ -2132,7 +2395,7 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("background is not supported"));
         // background: false is tolerated (explicit non-background).
-        ResponsesCodec::decode_request(&json!({
+        try_decode(json!({
             "model": "m",
             "background": false,
             "input": "hi"
@@ -2143,7 +2406,7 @@ mod tests {
     #[test]
     fn reject_hosted_tool_types() {
         for ty in ["hosted", "custom", "file_search"] {
-            let err = ResponsesCodec::decode_request(&json!({
+            let err = try_decode(json!({
                 "model": "m",
                 "input": [],
                 "tools": [{"type": ty, "name": "x"}]
@@ -2173,7 +2436,7 @@ mod tests {
             ir.tools[0].raw.get("type").and_then(|v| v.as_str()),
             Some("web_search")
         );
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["tools"][0]["type"], "web_search");
         assert_eq!(back["tools"][0]["name"], "web_search");
     }
@@ -2193,7 +2456,7 @@ mod tests {
                 Some(ty),
                 "raw type must round-trip: {ty}"
             );
-            let back = ResponsesCodec::encode_request(&ir);
+            let back = encode_request(&ir);
             assert_eq!(back["tools"][0]["type"], ty);
             assert_eq!(back["tools"][0]["name"], "web_search");
         }
@@ -2208,7 +2471,7 @@ mod tests {
             "tool_choice": complex
         }));
         assert_eq!(ir.tool_choice, complex, "complex shape kept opaque");
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["tool_choice"], complex, "re-emitted unchanged");
 
         // flat Responses-style function shape also passes through.
@@ -2219,12 +2482,12 @@ mod tests {
             "tool_choice": flat
         }));
         assert_eq!(ir.tool_choice, flat, "flat shape kept opaque");
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["tool_choice"], flat, "flat re-emitted unchanged");
 
         // strings and simple objects still pass.
         for tc in [json!("auto"), json!("required"), json!({"type": "none"})] {
-            ResponsesCodec::decode_request(&json!({
+            try_decode(json!({
                 "model": "m", "input": [], "tool_choice": tc
             }))
             .unwrap_or_else(|e| panic!("tool_choice {tc} must pass: {e}"));
@@ -2232,7 +2495,7 @@ mod tests {
 
         // illegal JSON types still reject.
         for tc in [json!(1), json!(true), json!(["auto"])] {
-            let err = ResponsesCodec::decode_request(&json!({
+            let err = try_decode(json!({
                 "model": "m", "input": [], "tool_choice": tc
             }))
             .unwrap_err();
@@ -2245,7 +2508,7 @@ mod tests {
 
     #[test]
     fn reject_input_as_response_id() {
-        let err = ResponsesCodec::decode_request(&json!({
+        let err = try_decode(json!({
             "model": "m",
             "input": "resp_1234567890abcdef"
         }))
@@ -2255,8 +2518,7 @@ mod tests {
                 .contains("previous response id is not supported")
         );
         // Ordinary prose input must pass.
-        ResponsesCodec::decode_request(&json!({"model": "m", "input": "hello world"}))
-            .expect("prose input ok");
+        try_decode(json!({"model": "m", "input": "hello world"})).expect("prose input ok");
     }
 
     // ── unknown item → loss ─────────────────────────────────────
@@ -2273,6 +2535,37 @@ mod tests {
         assert!(!ir.loss.is_empty());
         assert_eq!(ir.loss.entries[0].field, "input[0]");
         assert_eq!(ir.messages.len(), 1, "known item still decoded");
+    }
+
+    /// A non-spec `{"type": "message"}` without `role` used to default to a
+    /// user message; the typed DTO requires `role`, so the codec restores the
+    /// default instead of dropping the content.
+    #[test]
+    fn message_item_without_role_defaults_to_user() {
+        let ir = decode(json!({
+            "model": "m",
+            "input": [{"type": "message", "content": "hi"}]
+        }));
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].role, IrRole::User);
+        assert!(
+            matches!(&ir.messages[0].content[0], IrContentBlock::Text { text } if text == "hi")
+        );
+    }
+
+    #[test]
+    fn message_item_with_non_string_role_defaults_to_user() {
+        let ir = decode(json!({
+            "model": "m",
+            "input": [{"type": "message", "role": 123, "content": "hi"}]
+        }));
+        assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
+        assert_eq!(ir.messages.len(), 1);
+        assert_eq!(ir.messages[0].role, IrRole::User);
+        assert!(
+            matches!(&ir.messages[0].content[0], IrContentBlock::Text { text } if text == "hi")
+        );
     }
 
     // ── response round-trips ────────────────────────────────────
@@ -2301,7 +2594,7 @@ mod tests {
                 "output_tokens_details": {"reasoning_tokens": 2}
             }
         });
-        let ir = ResponsesCodec::decode_response(&body);
+        let ir = decode_response(body);
         assert!(ir.loss.is_empty(), "loss: {:?}", ir.loss);
         assert_eq!(ir.id, "resp_1");
         assert_eq!(ir.created, Some(1700000000));
@@ -2318,7 +2611,7 @@ mod tests {
         assert_eq!(u.cached_tokens, Some(3));
         assert_eq!(u.reasoning_tokens, Some(2));
 
-        let back = ResponsesCodec::encode_response(&ir);
+        let back = encode_response(&ir);
         assert_eq!(back["id"], "resp_1");
         assert_eq!(back["object"], "response");
         assert_eq!(back["status"], "completed");
@@ -2359,7 +2652,7 @@ mod tests {
                             "content": [{"type": "output_text", "text": "t"}]}],
                 "usage": {"input_tokens": 1, "output_tokens": 1}
             });
-            let ir = ResponsesCodec::decode_response(&body);
+            let ir = decode_response(body);
             assert_eq!(ir.finish_reason, Some(expect.clone()), "status={status}");
         }
     }
@@ -2371,11 +2664,11 @@ mod tests {
             "output": [{"type": "web_search_call", "id": "ws_1"}],
             "usage": null
         });
-        let ir = ResponsesCodec::decode_response(&body);
+        let ir = decode_response(body);
         assert!(!ir.loss.is_empty());
         assert!(matches!(ir.output[0], IrOutputItem::Raw(_)));
         // Raw round-trips on encode.
-        let back = ResponsesCodec::encode_response(&ir);
+        let back = encode_response(&ir);
         assert_eq!(back["output"][0]["type"], "web_search_call");
     }
 
@@ -2490,6 +2783,55 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(raw.contains("response.completed"), "{raw}");
+    }
+
+    #[test]
+    fn usage_degrades_per_field_when_details_are_ill_typed() {
+        // `cached_tokens` as a string fails the typed `ResponseUsage` parse;
+        // the counters must still be read individually (not all-zero).
+        let usage = responses_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": "64"}
+        }));
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 30);
+        assert_eq!(usage.cached_tokens, Some(0));
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn usage_keeps_cached_tokens_unknown_when_input_is_zero() {
+        // The `Some(0)` fallback only applies when `input_tokens` is known and
+        // non-zero; with no input there is nothing to classify, so the value
+        // stays `None` (unknown) for the analytics rollup.
+        let usage = responses_usage(&json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "input_tokens_details": {"cached_tokens": "64"}
+        }));
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.cached_tokens, None);
+    }
+
+    #[test]
+    fn stream_completed_keeps_usage_when_details_are_ill_typed() {
+        let events = ResponsesCodec::decode_stream_frame(&frame(json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1", "status": "completed",
+                "usage": {
+                    "input_tokens": 7, "output_tokens": 3,
+                    "output_tokens_details": {"reasoning_tokens": "3"}
+                }
+            }
+        })));
+        assert!(matches!(events[1], IrStreamEvent::Usage(ref u)
+            if u.prompt_tokens == 7
+                && u.completion_tokens == 3
+                && u.total_tokens == 10
+                && u.reasoning_tokens.is_none()));
     }
 
     #[test]
@@ -2655,18 +2997,18 @@ mod tests {
             "store": true,
             "input": "hi"
         });
-        let ir = ResponsesCodec::decode_request_allow_stateful(&body)
+        let ir = ResponsesCodec::decode_request_allow_stateful(&request(body))
             .expect("Allow mode must accept previous_response_id/store=true");
         assert_eq!(ir.raw.get("previous_response_id"), Some(&json!("resp_abc")));
         assert_eq!(ir.raw.get("store"), Some(&json!(true)));
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["previous_response_id"], "resp_abc");
         assert_eq!(back["store"], true);
     }
 
     #[test]
     fn allow_stateful_still_rejects_background() {
-        let err = ResponsesCodec::decode_request_allow_stateful(&json!({
+        let err = allow_stateful(json!({
             "model": "m",
             "background": true,
             "input": "hi"
@@ -2677,7 +3019,7 @@ mod tests {
 
     #[test]
     fn reject_mode_still_rejects_stateful() {
-        let err = ResponsesCodec::decode_request(&json!({
+        let err = try_decode(json!({
             "model": "m",
             "previous_response_id": "resp_abc",
             "input": "hi"
@@ -2717,7 +3059,7 @@ mod tests {
             matches!(ir.messages[0].content[2], IrContentBlock::Audio { .. }),
             "input_audio → Audio"
         );
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         let parts = back["input"][0]["content"].as_array().expect("parts");
         assert_eq!(parts[1]["type"], "input_file");
         assert_eq!(parts[2]["type"], "input_audio");
@@ -2735,7 +3077,7 @@ mod tests {
             ir.tools[0].raw.get("type").and_then(|v| v.as_str()),
             Some("web_search")
         );
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         assert_eq!(back["tools"][0]["type"], "web_search");
         assert_eq!(back["tools"][0]["max_uses"], 5);
     }
@@ -2766,7 +3108,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         let tool = &back["tools"][0];
         assert_eq!(tool["type"], json!("function"));
         assert_eq!(tool["name"], json!("fn"));
@@ -2805,12 +3147,193 @@ mod tests {
             }],
             ..Default::default()
         };
-        let back = ResponsesCodec::encode_request(&ir);
+        let back = encode_request(&ir);
         let tool = &back["tools"][0];
         assert_eq!(tool["type"], json!("function"));
         assert!(tool.get("parameters").is_none());
         for k in tool.as_object().expect("tool object").keys() {
             assert!(!tool_raw::is_reserved_key(k), "reserved marker leaked: {k}");
         }
+    }
+
+    // ── typed DTO boundary (R2 / R4 / R5) ───────────────────────
+
+    /// The handler runs the semantic pre-check on the **raw** JSON before
+    /// typed parsing, so these messages and their ordering must not change.
+    #[test]
+    fn reject_unsupported_keeps_value_layer_messages() {
+        for (body, message) in [
+            (
+                json!({"previous_response_id": "resp_abc"}),
+                "previous_response_id is not supported",
+            ),
+            (json!({"store": true}), "store=true is not supported"),
+            (json!({"store": "true"}), "store=true is not supported"),
+            (json!({"store": "TRUE"}), "store=true is not supported"),
+            (json!({"background": true}), "background is not supported"),
+            (json!({"background": "true"}), "background is not supported"),
+            (
+                json!({"input": "resp_1234567890abcdef"}),
+                "previous response id is not supported",
+            ),
+        ] {
+            let err = reject_unsupported(&body).unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{body}");
+            assert!(err.to_string().contains(message), "{body}: {err}");
+            // The typed codec path re-checks the same fields.
+            let err = ResponsesCodec::decode_request(&request(body.clone())).unwrap_err();
+            assert!(err.to_string().contains(message), "typed {body}: {err}");
+        }
+
+        // Allow mode accepts the stateful pair but still rejects `background`.
+        reject_unsupported_mode(
+            &json!({"store": true, "previous_response_id": "resp_1"}),
+            StatefulMode::Allow,
+        )
+        .expect("allow mode accepts stateful fields");
+        assert!(
+            reject_unsupported_mode(&json!({"background": true}), StatefulMode::Allow).is_err()
+        );
+    }
+
+    /// Typed fields without an IR home round-trip through `raw` instead of
+    /// being dropped by the old allow-list filter.
+    #[test]
+    fn request_typed_echo_fields_roundtrip_through_raw() {
+        let typed = request(json!({
+            "model": "m",
+            "input": "hi",
+            "metadata": {"k": "v"},
+            "service_tier": "flex",
+            "include": ["reasoning.encrypted_content"],
+            "parallel_tool_calls": true,
+            "prompt_cache_key": "pk-1"
+        }));
+        assert!(
+            typed.extra.is_empty(),
+            "all fields are typed: {:?}",
+            typed.extra
+        );
+        let ir = ResponsesCodec::decode_request(&typed).expect("decode");
+        assert_eq!(ir.raw.get("service_tier"), Some(&json!("flex")));
+        let back = encode_request(&ir);
+        assert_eq!(back["metadata"], json!({"k": "v"}));
+        assert_eq!(back["service_tier"], "flex");
+        assert_eq!(back["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(back["parallel_tool_calls"], true);
+        assert_eq!(back["prompt_cache_key"], "pk-1");
+    }
+
+    /// `phase` / `status` / `id` are typed on `MessageItem` but have no IR
+    /// home — they ride `IrMessage.raw` so encode re-emits them.
+    #[test]
+    fn input_message_typed_extras_roundtrip() {
+        let ir = decode(json!({
+            "model": "m",
+            "input": [{
+                "type": "message", "role": "user", "content": "hi",
+                "phase": "final_answer", "status": "completed", "id": "msg_1"
+            }]
+        }));
+        assert_eq!(
+            ir.messages[0].raw.get("phase"),
+            Some(&json!("final_answer"))
+        );
+        assert_eq!(ir.messages[0].raw.get("id"), Some(&json!("msg_1")));
+        let back = encode_request(&ir);
+        assert_eq!(back["input"][0]["phase"], "final_answer");
+        assert_eq!(back["input"][0]["id"], "msg_1");
+        assert_eq!(back["input"][0]["status"], "completed");
+    }
+
+    /// `ToolChoiceAllowed` is the union's object catch-all and would grow an
+    /// `allowed_tools: []` field; both directions must keep the shape intact.
+    #[test]
+    fn tool_choice_allowed_tools_shape_preserved() {
+        let allowed = json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "allowed_tools": [{"type": "function", "name": "f"}],
+        });
+        let ir = decode(json!({"model": "m", "input": [], "tool_choice": allowed}));
+        assert_eq!(ir.tool_choice, allowed);
+        let back = encode_request(&ir);
+        assert_eq!(back["tool_choice"], allowed);
+    }
+
+    /// Response echoes the IR does not synthesize survive via `raw`, including
+    /// the deprecated `truncation` that now rides `extra`.
+    #[test]
+    fn response_echo_fields_and_incomplete_details_roundtrip() {
+        let ir = decode_response(json!({
+            "id": "resp_1", "object": "response", "created_at": 7, "completed_at": 9,
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "model": "m",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "t", "annotations": []}]}],
+            "output_text": "t",
+            "service_tier": "flex",
+            "truncation": "auto",
+            "usage": {"input_tokens": 2, "output_tokens": 1}
+        }));
+        assert_eq!(ir.finish_reason, Some(IrFinishReason::Length));
+        assert_eq!(ir.usage.as_ref().map(|u| u.total_tokens), Some(3));
+        let back = encode_response(&ir);
+        assert_eq!(back["status"], "incomplete");
+        assert_eq!(
+            back["incomplete_details"],
+            json!({"reason": "max_output_tokens"})
+        );
+        assert_eq!(back["created_at"], 7);
+        assert_eq!(back["completed_at"], 9);
+        assert_eq!(back["output_text"], "t");
+        assert_eq!(back["service_tier"], "flex");
+        assert_eq!(back["truncation"], "auto");
+        assert_eq!(back["usage"]["total_tokens"], 3);
+    }
+
+    /// R4: typed parsing turns what used to be a silent IR loss into a 422 at
+    /// the handler boundary, while unknown fields still pass through `extra`.
+    #[test]
+    fn malformed_values_are_parse_errors_but_unknown_fields_pass() {
+        assert!(
+            serde_json::from_value::<ResponsesRequest>(json!({
+                "model": "m", "input": "hi", "temperature": "0.7"
+            }))
+            .is_err(),
+            "temperature must be a number"
+        );
+        // Unions stay lossless: a variant whose fields do not parse falls back
+        // to `Unknown` instead of failing the whole body (R1) …
+        let typed: ResponsesResponse = serde_json::from_value(json!({
+            "id": "r", "output": [{"type": "function_call", "call_id": "c",
+                                  "name": "f", "arguments": {"a": 1}}]
+        }))
+        .expect("union falls back to Unknown");
+        assert!(matches!(typed.output[0], OutputItem::Unknown(_)));
+        // … and the codec records a loss + raw item instead of accepting the
+        // object as `arguments` verbatim (R4: typed narrowing).
+        let ir = ResponsesCodec::decode_response(&typed);
+        assert!(matches!(ir.output[0], IrOutputItem::Raw(_)));
+        assert!(!ir.loss.is_empty());
+        assert!(
+            serde_json::from_value::<ResponsesRequest>(json!({
+                "model": "m", "input": "hi", "brand_new_field": {"x": 1}
+            }))
+            .is_ok(),
+            "unknown fields are tolerated"
+        );
+
+        // A message whose `content` is a scalar (non-spec upstream shape) no
+        // longer decodes to `IrOutputItem::Text`: it is carried verbatim as a
+        // raw item plus a loss, so the client-visible bytes are unchanged.
+        let ir = decode_response(json!({
+            "id": "r", "status": "completed", "model": "m",
+            "output": [{"type": "message", "role": "assistant", "content": "t"}]
+        }));
+        assert!(matches!(ir.output[0], IrOutputItem::Raw(_)));
+        assert!(!ir.loss.is_empty());
+        assert_eq!(encode_response(&ir)["output"][0]["content"], "t");
     }
 }
