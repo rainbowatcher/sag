@@ -378,7 +378,7 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **`sessionAffinity` store 的 generation token**：`fetchEntries` 只有最新在飞的请求可以写 `entries` / `error`，也只能由它清 `loading`。修改时不得把 token 判定只加在 `entries` 上而漏掉 `finally` 里的 `loading` 清零
 - **pin 清除后必须重拉 active targets**：`SessionAffinityPopover` 的两条清除路径成功后均 `emit("changed")`，由 `RouteList` 的 `onChanged` 调 `activeTargetStore.fetchActiveTargets()`。漏掉这步会让 Active Target 列在 pin 已清后仍显示旧目标
 - **pin 浮层只在 session-sticky 行挂载**：`RouteList` 的 active target cell 用 `route.strategy === "session_sticky"` 判定后 `h(SessionAffinityPopover, …)`，其它策略必须为 `null`——否则无 pin 空间的路由会多发一次空查询
-- **Logs 会话筛选单一状态源**：Session 列点击必须走 `applySessionFilter()` → 写 `logsFilterSession` → `refreshLogs()`，与筛选输入框、chip、`clearSessionFilter()` 同源。不得为该列另建一套过滤状态（会出现 chip 与列不同步）
+- **Logs 会话筛选单一状态源**：Session 列点击必须走 `applySessionFilter()` → 写 `logsFilterSession` → `refreshLogs()`，与筛选栏内的会话过滤控件（空态内嵌输入框、有值内联显示 + 清空 X）、`clearSessionFilter()` 同源。不得为该列另建一套过滤状态（会出现控件与列不同步）
 
 ## 测试策略
 
@@ -409,9 +409,10 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
 11. **session-sticky 路由**：新建路由选 session-sticky → 两个会话参数输入出现；留空提交 → Network 面板里 payload 不含 `session_ttl_secs` / `session_max_entries`；填 `-1` / `1.5` / 容量 `0` → 就地报错且无请求；编辑既有 session-sticky 路由 → 初值回填，不改则 payload 仍不含两字段（省略 = 保留）；`model_name = "*"` 或 `pipeline = "image"` 提交 → strategy / pipeline 字段就地报错（容量 `0` 仍为顶部错误条显示后端 400 消息）
 12. **会话 pin 浮层**：session-sticky 路由的 active target 单元格出现 pin 按钮（其它策略无）→ 打开浮层 → Network 面板显示 `GET /api/session-affinity?model=<model>` → 条目含 provider/real_model、key 前 8 位、source、age、expires；`session_ttl_secs = 0` 的路由显示「永不过期」→ 逐条清除 → `DELETE {"key": …}`（body 为全量 32 位）+ toast + 列表项消失 + active target 列重拉；按模型清空 → 首次点击仅将按钮换成确认文案（无请求）→ 确认后 `DELETE {"model": …}`
-13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 会话筛选 chip 出现同一全量 key 且表格立即重查 → 清除 chip 后回到无会话筛选的行集
+13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 筛选栏内的会话过滤控件原地变成同一全量 key（截断显示、`title` 为全量）且表格立即重查 → 点控件内 X 后控件回到空态输入框（placeholder）且回到无会话筛选的行集
 
 ## 变更记录
+- [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)
 - [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
 - [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)
 - [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)

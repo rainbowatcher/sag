@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { AlertCircle, Loader2, ChevronLeft, ChevronRight, X } from "@lucide/vue"
 import type { AcceptableValue } from "reka-ui"
-import { ref, onMounted, computed } from "vue"
+import { ref, onMounted, computed, nextTick } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import SearchSelect from "@/components/SearchSelect.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import {
   Pagination,
   PaginationContent,
@@ -43,6 +42,9 @@ const logsFilterRealModel = ref("")
 const logsFilterStatusCode = ref("")
 // Hashed session identity — paste from the session-affinity snapshot.
 const logsFilterSession = ref("")
+// The session control shows its value as text unless the user is editing it.
+const sessionEditing = ref(false)
+const sessionInputRef = ref<HTMLInputElement>()
 
 const statusCodeOptions = computed(() => [
   { value: "non_2xx", label: t("logs.status.non2xx") },
@@ -81,13 +83,20 @@ async function refreshLogs() {
 }
 
 /**
- * Drop the applied session filter. The input box itself is xl-only, so on a
- * narrow viewport this chip is the only way to see and clear that filter.
+ * Drop the applied session filter and hand the control back to its input state.
  * The remaining filters are re-applied (and the page reset) by the store.
  */
 async function clearSessionFilter() {
   logsFilterSession.value = ""
+  sessionEditing.value = true
+  void nextTick(() => sessionInputRef.value?.focus())
   await store.applyLogsFilter({ ...store.activeLogFilter, session: undefined })
+}
+
+/** Swap the session control back to its input so the value can be edited. */
+function editSessionFilter() {
+  sessionEditing.value = true
+  void nextTick(() => sessionInputRef.value?.focus())
 }
 
 /** Refresh the current page in place without resetting the offset. */
@@ -100,7 +109,7 @@ const SESSION_KEY_SHOWN = 8
 
 /**
  * Clicking a row's session cell applies that key to the session filter, reusing
- * the same state the filter input and the applied-filter chip operate on.
+ * the same state the session filter control operates on.
  */
 async function applySessionFilter(sessionKey: string) {
   logsFilterSession.value = sessionKey
@@ -242,38 +251,44 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
           class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
           @update:model-value="refreshLogs()"
         />
-        <Input
-          v-model="logsFilterSession"
-          :placeholder="$t('logs.filter.session')"
-          class="hidden min-h-[2rem] xl:flex xl:min-w-0 xl:flex-1"
-          @keyup.enter="refreshLogs()"
-        />
+        <!-- Session filter: same trigger styling as SearchSelect, value inlined -->
+        <div
+          class="border-input bg-background focus-within:border-ring focus-within:ring-ring/50 flex min-h-[2rem] min-w-0 flex-1 flex-nowrap items-center gap-1 rounded-md border px-3 py-1 shadow-sm focus-within:ring-3 focus-within:outline-none"
+        >
+          <span
+            v-if="logsFilterSession && !sessionEditing"
+            :title="logsFilterSession"
+            class="min-w-0 flex-1 cursor-text truncate font-mono text-sm"
+            @click="editSessionFilter()"
+          >
+            {{ logsFilterSession }}
+          </span>
+          <input
+            v-else
+            ref="sessionInputRef"
+            v-model="logsFilterSession"
+            :placeholder="$t('logs.filter.session')"
+            class="placeholder:text-muted-foreground min-w-[60px] flex-1 bg-transparent font-mono text-sm outline-none"
+            @focus="sessionEditing = true"
+            @blur="sessionEditing = false"
+            @keyup.enter="refreshLogs()"
+          />
+          <button
+            v-if="logsFilterSession"
+            type="button"
+            class="text-muted-foreground/60 hover:text-muted-foreground shrink-0 cursor-pointer"
+            :aria-label="$t('logs.filter.sessionClear')"
+            :title="$t('logs.filter.sessionClear')"
+            @click.stop="clearSessionFilter()"
+          >
+            <X :size="14" />
+          </button>
+        </div>
         <RefreshButton
           :loading="store.logsLoading"
           class="hidden xl:ml-auto xl:inline-flex xl:shrink-0"
           @click="refreshCurrentPage()"
         />
-      </div>
-      <!-- Applied session filter, visible on every viewport (its input is xl-only) -->
-      <div v-if="store.activeLogFilter.session" class="flex flex-wrap items-center gap-2">
-        <Badge variant="outline" class="max-w-full gap-1.5 py-1 text-xs">
-          <span class="text-muted-foreground">{{ $t("logs.filter.sessionChip") }}</span>
-          <span
-            class="max-w-[24ch] min-w-0 truncate font-mono"
-            :title="store.activeLogFilter.session"
-          >
-            {{ store.activeLogFilter.session }}
-          </span>
-          <button
-            type="button"
-            class="hover:text-destructive focus-visible:ring-ring inline-flex shrink-0 items-center rounded-sm focus-visible:ring-2 focus-visible:outline-none"
-            :aria-label="$t('logs.filter.sessionClear')"
-            :title="$t('logs.filter.sessionClear')"
-            @click="clearSessionFilter()"
-          >
-            <X class="size-3" />
-          </button>
-        </Badge>
       </div>
       <Alert v-if="store.logsError" variant="destructive">
         <AlertCircle class="h-4 w-4" />

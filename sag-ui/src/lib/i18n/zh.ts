@@ -635,7 +635,6 @@ export const zh: Record<keyof typeof en, string> = {
   "logs.filter.searchRealModel": "搜索实际模型...",
   "logs.filter.status": "状态",
   "logs.filter.session": "会话键（哈希）",
-  "logs.filter.sessionChip": "会话过滤",
   "logs.filter.sessionClear": "清除会话过滤",
   "logs.filter.searchStatus": "搜索状态...",
   "logs.status.non2xx": "非 2xx（全部错误）",

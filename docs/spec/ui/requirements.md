@@ -112,7 +112,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 分页：Prev / Next 按钮，显示当前页码和行数
 - 客户端对 status_code 输入做 NaN 校验，避免向后端发送无效值
 - Session 列位于 Client 列之后：显示 `session_key` 前 8 位（`title` 保留全量 32 位哈希），该行没有会话记录时显示 `—`
-- 点击 Session 单元格把完整 `session_key` 写入会话筛选并立即重查——与筛选输入框、已应用筛选 chip、清除按钮共用同一状态（`logsFilterSession`），点击后 chip 出现同一 key，清除即回到无会话筛选
+- 点击 Session 单元格把完整 `session_key` 写入会话筛选并立即重查——与筛选栏内的会话过滤控件、清除按钮共用同一状态（`logsFilterSession`），点击后控件内联显示同一 key，清除即回到无会话筛选；会话过滤控件与其它过滤器同宽同高，值以截断文本（`title` 保留全量）内联显示在控件内，不额外占用筛选栏下方空间
 - 列数口径：本节上文的「12 列」是 0001 时的列口径，此后 Client 列与本列均在其后追加，现共 15 列
 
 ### 固定高度布局与容器内滚动
@@ -210,6 +210,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)
 - [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
 - [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)
 - [0007 Provider 列表删除 Status 列](changes/0007-provider-list-drop-status-column.md)

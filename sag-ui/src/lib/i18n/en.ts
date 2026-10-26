@@ -672,7 +672,6 @@ export const en = {
   "logs.filter.searchRealModel": "Search real model...",
   "logs.filter.status": "status",
   "logs.filter.session": "session key (hashed)",
-  "logs.filter.sessionChip": "session filter",
   "logs.filter.sessionClear": "Clear session filter",
   "logs.filter.searchStatus": "Search status...",
   "logs.status.non2xx": "Non-2xx (All Errors)",
