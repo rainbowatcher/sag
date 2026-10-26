@@ -234,9 +234,20 @@ async function handleSubmit(event: Event) {
         </div>
         <form.Field name="strategy" #default="{ field }">
           <Field>
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
-              $t("routes.form.strategy")
-            }}</FieldLabel>
+            <FieldLabel
+              :for="field.name"
+              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
+            >
+              {{ $t("routes.form.strategy") }}
+              <Tooltip v-if="form.state.values.strategy === 'session_sticky'">
+                <TooltipTrigger as-child>
+                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                </TooltipTrigger>
+                <TooltipContent side="top" class="max-w-xs font-normal">
+                  {{ $t("routes.form.strategySessionStickyHint") }}
+                </TooltipContent>
+              </Tooltip>
+            </FieldLabel>
             <Select
               :model-value="field.state.value ?? 'sticky_failover'"
               @update:model-value="(v) => field.handleChange(v as Strategy)"
@@ -261,14 +272,6 @@ async function handleSubmit(event: Event) {
                 }}</SelectItem>
               </SelectContent>
             </Select>
-            <Tooltip v-if="form.state.values.strategy === 'session_sticky'">
-              <TooltipTrigger as-child>
-                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
-              </TooltipTrigger>
-              <TooltipContent side="top" class="max-w-xs font-normal">
-                {{ $t("routes.form.strategySessionStickyHint") }}
-              </TooltipContent>
-            </Tooltip>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -277,9 +280,20 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="pipeline" #default="{ field }">
           <Field>
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
-              $t("routes.form.pipeline")
-            }}</FieldLabel>
+            <FieldLabel
+              :for="field.name"
+              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
+            >
+              {{ $t("routes.form.pipeline") }}
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                </TooltipTrigger>
+                <TooltipContent side="top" class="max-w-xs font-normal">
+                  {{ $t("routes.form.pipelineHint") }}
+                </TooltipContent>
+              </Tooltip>
+            </FieldLabel>
             <ToggleGroup
               :model-value="field.state.value ?? 'chat'"
               @update:model-value="(v) => field.handleChange(v as Pipeline)"
@@ -290,9 +304,6 @@ async function handleSubmit(event: Event) {
               <ToggleGroupItem value="chat">{{ $t("routes.form.pipelineChat") }}</ToggleGroupItem>
               <ToggleGroupItem value="image">{{ $t("routes.form.pipelineImage") }}</ToggleGroupItem>
             </ToggleGroup>
-            <p class="text-muted-foreground mt-1 text-[10px]">
-              {{ $t("routes.form.pipelineHint") }}
-            </p>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
