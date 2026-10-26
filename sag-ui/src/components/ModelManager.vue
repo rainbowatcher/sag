@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { GitBranch, Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
+import { GitBranch, Info, Loader2, Plus, RefreshCw, Trash2, Zap } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import Combobox from "@/components/Combobox.vue"
@@ -349,14 +349,24 @@ function removeModel(name: string) {
     >
       <component :is="Modal.Content" class="sm:max-w-md">
         <component :is="Modal.Header">
-          <component :is="Modal.Title">{{
-            $t("providers.models.createRouteDialogTitle")
-          }}</component>
-          <component :is="Modal.Description">
-            {{ $t("providers.models.createRouteDescLead")
-            }}<span class="text-foreground font-mono font-medium"
-              >{{ providerName }}/{{ routeToCreate }}</span
-            >{{ $t("providers.models.createRouteDescTail") }}
+          <component :is="Modal.Title" class="flex items-center gap-1.5">
+            {{ $t("providers.models.createRouteDialogTitle") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+                {{ $t("providers.models.createRouteDescLead")
+                }}<span class="text-foreground font-mono font-medium"
+                  >{{ providerName }}/{{ routeToCreate }}</span
+                >{{ $t("providers.models.createRouteDescTail") }}
+              </TooltipContent>
+            </Tooltip>
+          </component>
+          <!-- Visually hidden, keeps the dialog description for assistive tech. -->
+          <component :is="Modal.Description" class="sr-only">
+            {{ $t("providers.models.createRouteDescLead") }}{{ providerName }}/{{ routeToCreate
+            }}{{ $t("providers.models.createRouteDescTail") }}
           </component>
         </component>
 

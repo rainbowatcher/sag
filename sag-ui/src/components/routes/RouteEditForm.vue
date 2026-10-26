@@ -312,9 +312,23 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="api_endpoint" #default="{ field }">
           <Field v-if="form.state.values.pipeline === 'image'">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
-              $t("routes.form.apiEndpointLabel")
-            }}</FieldLabel>
+            <FieldLabel
+              :for="field.name"
+              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
+            >
+              {{ $t("routes.form.apiEndpointLabel") }}
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                </TooltipTrigger>
+                <TooltipContent side="top" class="max-w-xs font-normal">
+                  {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
+                  >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
+                  >{{ $t("routes.form.apiEndpointHintOr")
+                  }}<code>/v1beta/models/{model}:generateContent</code>
+                </TooltipContent>
+              </Tooltip>
+            </FieldLabel>
             <Input
               :id="field.name"
               :model-value="field.state.value"
@@ -324,12 +338,6 @@ async function handleSubmit(event: Event) {
               @blur="field.handleBlur"
               @input="field.handleChange(($event.target as HTMLInputElement).value)"
             />
-            <p class="text-muted-foreground mt-1 text-[10px]">
-              {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
-              >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
-              >{{ $t("routes.form.apiEndpointHintOr")
-              }}<code>/v1beta/models/{model}:generateContent</code>
-            </p>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -338,9 +346,20 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="session_ttl_secs" #default="{ field }">
           <Field v-if="form.state.values.strategy === 'session_sticky'">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
-              $t("routes.form.sessionTtlLabel")
-            }}</FieldLabel>
+            <FieldLabel
+              :for="field.name"
+              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
+            >
+              {{ $t("routes.form.sessionTtlLabel") }}
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                </TooltipTrigger>
+                <TooltipContent side="top" class="max-w-xs font-normal">
+                  {{ $t("routes.form.sessionTtlHint") }}
+                </TooltipContent>
+              </Tooltip>
+            </FieldLabel>
             <Input
               :id="field.name"
               type="number"
@@ -352,9 +371,6 @@ async function handleSubmit(event: Event) {
               @blur="field.handleBlur"
               @input="field.handleChange(($event.target as HTMLInputElement).value)"
             />
-            <p class="text-muted-foreground mt-1 text-[10px]">
-              {{ $t("routes.form.sessionTtlHint") }}
-            </p>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -363,9 +379,20 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="session_max_entries" #default="{ field }">
           <Field v-if="form.state.values.strategy === 'session_sticky'">
-            <FieldLabel :for="field.name" class="text-muted-foreground text-xs font-medium">{{
-              $t("routes.form.sessionMaxEntriesLabel")
-            }}</FieldLabel>
+            <FieldLabel
+              :for="field.name"
+              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
+            >
+              {{ $t("routes.form.sessionMaxEntriesLabel") }}
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                </TooltipTrigger>
+                <TooltipContent side="top" class="max-w-xs font-normal">
+                  {{ $t("routes.form.sessionMaxEntriesHint") }}
+                </TooltipContent>
+              </Tooltip>
+            </FieldLabel>
             <Input
               :id="field.name"
               type="number"
@@ -377,9 +404,6 @@ async function handleSubmit(event: Event) {
               @blur="field.handleBlur"
               @input="field.handleChange(($event.target as HTMLInputElement).value)"
             />
-            <p class="text-muted-foreground mt-1 text-[10px]">
-              {{ $t("routes.form.sessionMaxEntriesHint") }}
-            </p>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Info } from "@lucide/vue"
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -6,7 +7,7 @@ import {
   PointElement,
   LineElement,
   Filler,
-  Tooltip,
+  Tooltip as ChartTooltip,
   Legend,
 } from "chart.js"
 import { computed, ref } from "vue"
@@ -18,6 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useChartTheme } from "@/composables/useChartTheme"
 import { t } from "@/lib/i18n"
 import type {
@@ -28,7 +30,15 @@ import type {
 } from "@/types/api"
 import { groupKeyLabel, populationLabel } from "./v2"
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip, Legend)
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Filler,
+  ChartTooltip,
+  Legend,
+)
 
 const props = defineProps<{
   trend: AnalyticsTrendResponse
@@ -276,7 +286,17 @@ const chartOptions = computed(() => ({
 <template>
   <div>
     <div class="mb-2 flex items-center gap-2">
-      <span class="text-muted-foreground text-xs">{{ $t("analytics.v2.metricLabel") }}</span>
+      <span class="text-muted-foreground flex items-center gap-1.5 text-xs">
+        {{ $t("analytics.v2.metricLabel") }}
+        <Tooltip v-if="overallOnly">
+          <TooltipTrigger as-child>
+            <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+          </TooltipTrigger>
+          <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+            {{ $t("analytics.overallOnlyMetric") }}
+          </TooltipContent>
+        </Tooltip>
+      </span>
       <Select :model-value="metric" @update:model-value="(v) => (metric = v as MetricKey)">
         <SelectTrigger class="h-7 w-44 text-xs">
           <SelectValue>{{ metricLabels[metric] }}</SelectValue>
@@ -287,9 +307,6 @@ const chartOptions = computed(() => ({
           </SelectItem>
         </SelectContent>
       </Select>
-      <p v-if="overallOnly" class="text-muted-foreground text-xs">
-        {{ $t("analytics.overallOnlyMetric") }}
-      </p>
     </div>
     <div class="h-64 xl:h-72">
       <Line :data="chartData" :options="chartOptions" />

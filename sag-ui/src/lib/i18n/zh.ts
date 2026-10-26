@@ -160,6 +160,7 @@ export const zh: Record<keyof typeof en, string> = {
   "providers.apis.chunkTimeout": "分块超时（秒）",
   "providers.apis.ttfbTimeout": "TTFB 超时（秒）",
   "providers.apis.atLeastOneSection": "至少需要一个 API section。",
+  "providers.apis.fallbackProtocol": "回退协议",
   "providers.apis.selectFallback": "请选择回退协议（在协议 API section 上选择单选框）。",
   "providers.apis.protocolProbeSupport": "协议探测支持",
   "providers.apis.validate.atLeastOneSection": "至少需要一个 API section（例如 chat_completions）",

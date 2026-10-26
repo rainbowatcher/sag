@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { X } from "@lucide/vue"
+import { Info, X } from "@lucide/vue"
 import KvEditor from "@/components/KvEditor.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 interface KvPair {
   key: string
@@ -57,14 +58,6 @@ function addStripField() {
 </script>
 
 <template>
-  <p class="text-muted-foreground text-xs">
-    {{ $t("providers.advanced.introLead")
-    }}<strong>{{ $t("providers.advanced.introApisTab") }}</strong
-    >{{ $t("providers.advanced.introMid")
-    }}<strong>{{ $t("providers.advanced.introFullyReplaces") }}</strong
-    >{{ $t("providers.advanced.introTail") }}
-  </p>
-
   <KvEditor
     :model-value="headers"
     :title="$t('providers.advanced.headersTitle')"
@@ -102,10 +95,24 @@ function addStripField() {
   <Separator />
 
   <div>
-    <FieldLabel>{{ $t("providers.advanced.stripFieldsTitle") }}</FieldLabel>
-    <p class="text-muted-foreground mb-2 text-xs">
-      {{ $t("providers.advanced.stripFieldsDescription") }}
-    </p>
+    <FieldLabel class="mb-2 flex items-center gap-1.5">
+      {{ $t("providers.advanced.stripFieldsTitle") }}
+      <Tooltip>
+        <TooltipTrigger as-child>
+          <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+        </TooltipTrigger>
+        <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+          <span class="block">{{ $t("providers.advanced.stripFieldsDescription") }}</span>
+          <span class="mt-1.5 block">
+            {{ $t("providers.advanced.introLead")
+            }}<strong>{{ $t("providers.advanced.introApisTab") }}</strong
+            >{{ $t("providers.advanced.introMid")
+            }}<strong>{{ $t("providers.advanced.introFullyReplaces") }}</strong
+            >{{ $t("providers.advanced.introTail") }}
+          </span>
+        </TooltipContent>
+      </Tooltip>
+    </FieldLabel>
     <div v-for="(_, idx) in stripFields" :key="idx" class="mb-2 flex items-center gap-2">
       <Input
         :model-value="stripFields[idx]"

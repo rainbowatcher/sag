@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { Plus, X } from "@lucide/vue"
+import { Info, Plus, X } from "@lucide/vue"
 import { computed } from "vue"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 
 defineOptions({
@@ -67,12 +68,17 @@ function updateValue(idx: number, value: string) {
   <div class="space-y-1">
     <p
       v-if="title"
-      class="text-sm leading-none font-medium peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+      class="flex items-center gap-1.5 text-sm leading-none font-medium peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
     >
       {{ title }}
-    </p>
-    <p v-if="description" class="text-muted-foreground text-xs">
-      {{ description }}
+      <Tooltip v-if="description">
+        <TooltipTrigger as-child>
+          <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+        </TooltipTrigger>
+        <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+          {{ description }}
+        </TooltipContent>
+      </Tooltip>
     </p>
     <div v-for="(pair, idx) in modelValue" :key="idx" class="mb-1 flex items-center gap-2">
       <Input

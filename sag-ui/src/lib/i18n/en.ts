@@ -169,6 +169,7 @@ export const en = {
   "providers.apis.chunkTimeout": "Chunk Timeout (secs)",
   "providers.apis.ttfbTimeout": "TTFB Timeout (secs)",
   "providers.apis.atLeastOneSection": "At least one API section is required.",
+  "providers.apis.fallbackProtocol": "Fallback protocol",
   "providers.apis.selectFallback": "Select a fallback protocol (radio on a protocol API section).",
   "providers.apis.protocolProbeSupport": "Protocol Probe Support",
   "providers.apis.validate.atLeastOneSection":

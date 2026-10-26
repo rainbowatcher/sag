@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2 } from "@lucide/vue"
+import { Info, Loader2 } from "@lucide/vue"
 import { ref } from "vue"
 import { toast } from "vue-sonner"
 import ApisEditor from "@/components/providers/ApisEditor.vue"
@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useProviderProbe } from "@/composables/useProviderProbe"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { t } from "@/lib/i18n"
@@ -190,10 +191,19 @@ async function handleSubmit() {
   <component :is="Modal.Root" :open="open" @update:open="onOpenChange">
     <component :is="Modal.Content" class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
       <component :is="Modal.Header" class="shrink-0">
-        <component :is="Modal.Title">
+        <component :is="Modal.Title" class="flex items-center gap-1.5">
           {{ provider.name }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              {{ $t("providers.editForm.description") }}
+            </TooltipContent>
+          </Tooltip>
         </component>
-        <component :is="Modal.Description">
+        <!-- Visually hidden, keeps the dialog description for assistive tech. -->
+        <component :is="Modal.Description" class="sr-only">
           {{ $t("providers.editForm.description") }}
         </component>
       </component>

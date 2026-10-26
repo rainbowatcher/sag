@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Info } from "@lucide/vue"
 import { computed } from "vue"
 import ApiKeyEditor from "@/components/ApiKeyEditor.vue"
 import { FieldLabel } from "@/components/ui/field"
@@ -9,6 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 import type { ProxyMode } from "@/types/api"
 
@@ -62,7 +64,17 @@ const proxyModeLabels = computed<Record<ProxyMode, string>>(() => ({
   </div>
 
   <div class="space-y-1">
-    <FieldLabel>{{ $t("providers.form.proxyMode") }}</FieldLabel>
+    <FieldLabel class="flex items-center gap-1.5">
+      {{ $t("providers.form.proxyMode") }}
+      <Tooltip>
+        <TooltipTrigger as-child>
+          <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+        </TooltipTrigger>
+        <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+          {{ $t("providers.form.proxyModeHelp") }}
+        </TooltipContent>
+      </Tooltip>
+    </FieldLabel>
     <Select
       :model-value="proxyMode"
       @update:model-value="(v) => emit('update:proxyMode', v as ProxyMode)"
@@ -76,8 +88,5 @@ const proxyModeLabels = computed<Record<ProxyMode, string>>(() => ({
         <SelectItem value="disabled">{{ $t("common.disabled") }}</SelectItem>
       </SelectContent>
     </Select>
-    <p class="text-muted-foreground text-xs">
-      {{ $t("providers.form.proxyModeHelp") }}
-    </p>
   </div>
 </template>

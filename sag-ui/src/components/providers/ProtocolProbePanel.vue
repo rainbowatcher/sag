@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2, Search } from "@lucide/vue"
+import { Info, Loader2, Search } from "@lucide/vue"
 import { computed, ref, watch } from "vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -14,6 +14,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 import { useProviderStore } from "@/stores/providers"
 import type { ProbeResult, ProbeVerdict, ProtocolApiKind, ProxyMode } from "@/types/api"
@@ -152,10 +153,6 @@ function applyBackfill() {
 
 <template>
   <div class="min-w-0 space-y-3 rounded-md border p-3">
-    <p class="text-muted-foreground text-xs">
-      {{ $t("providers.probe.description") }}
-    </p>
-
     <div class="space-y-2">
       <div v-for="kind in PROTOCOL_KINDS" :key="kind" class="space-y-1">
         <div class="flex items-center justify-between gap-2">
@@ -215,10 +212,6 @@ function applyBackfill() {
       </Button>
     </div>
 
-    <p class="text-muted-foreground text-xs">
-      {{ $t("providers.probe.modelHintLead") }}<strong>{{ $t("providers.probe.applyAll") }}</strong
-      >{{ $t("providers.probe.modelHintTail") }}
-    </p>
     <p v-if="!hasKeys" class="text-muted-foreground text-xs">
       {{ $t("providers.probe.addKeyFirst") }}
     </p>
@@ -226,7 +219,17 @@ function applyBackfill() {
     <p v-if="store.probeError" class="text-destructive text-xs">{{ store.probeError }}</p>
 
     <Alert v-if="results.length > 0" variant="default" class="min-w-0">
-      <AlertTitle>{{ $t("providers.probe.resultsTitle") }}</AlertTitle>
+      <AlertTitle class="flex items-center gap-1.5">
+        {{ $t("providers.probe.resultsTitle") }}
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+          </TooltipTrigger>
+          <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+            {{ $t("providers.probe.backfillHint") }}
+          </TooltipContent>
+        </Tooltip>
+      </AlertTitle>
       <AlertDescription class="min-w-0">
         <div class="w-full min-w-0 overflow-x-auto">
           <Table class="w-max min-w-full">
@@ -256,9 +259,6 @@ function applyBackfill() {
             </TableBody>
           </Table>
         </div>
-        <p class="text-muted-foreground mt-2 text-xs">
-          {{ $t("providers.probe.backfillHint") }}
-        </p>
       </AlertDescription>
     </Alert>
   </div>

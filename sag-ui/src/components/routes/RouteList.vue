@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, ArrowUpDown, GitBranch, Loader2, Pen, Trash2 } from "@lucide/vue"
+import { AlertTriangle, ArrowUpDown, GitBranch, Info, Loader2, Pen, Trash2 } from "@lucide/vue"
 import {
   FlexRender,
   createColumnHelper,
@@ -571,24 +571,40 @@ const table = useVueTable({
   <component :is="Modal.Root" :open="confirmOpen" @update:open="onConfirmOpenChange">
     <component :is="Modal.Content" class="sm:max-w-md">
       <component :is="Modal.Header">
-        <component :is="Modal.Title">
+        <component :is="Modal.Title" class="flex items-center gap-1.5">
           {{
             confirmFillFirst
               ? $t("routeList.resetFillFirstTitle")
               : $t("routeList.clearActiveTitle")
           }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              <template v-if="confirmFillFirst">
+                {{ $t("routeList.resetFillFirstDescLead")
+                }}<span class="font-mono font-medium">{{ confirmEntry?.model }}</span
+                >{{ $t("routeList.resetFillFirstDescTail") }}
+              </template>
+              <template v-else>
+                {{ $t("routeList.clearActiveDescLead")
+                }}<span class="font-mono font-medium"
+                  >{{ confirmEntry?.provider }}/{{ confirmEntry?.real_model }}</span
+                >{{ $t("routeList.clearActiveDescTail") }}
+              </template>
+            </TooltipContent>
+          </Tooltip>
         </component>
-        <component :is="Modal.Description">
+        <component :is="Modal.Description" class="sr-only">
           <template v-if="confirmFillFirst">
-            {{ $t("routeList.resetFillFirstDescLead")
-            }}<span class="font-mono font-medium">{{ confirmEntry?.model }}</span
-            >{{ $t("routeList.resetFillFirstDescTail") }}
+            {{ $t("routeList.resetFillFirstDescLead") }}{{ confirmEntry?.model
+            }}{{ $t("routeList.resetFillFirstDescTail") }}
           </template>
           <template v-else>
-            {{ $t("routeList.clearActiveDescLead")
-            }}<span class="font-mono font-medium"
-              >{{ confirmEntry?.provider }}/{{ confirmEntry?.real_model }}</span
-            >{{ $t("routeList.clearActiveDescTail") }}
+            {{ $t("routeList.clearActiveDescLead") }}{{ confirmEntry?.provider }}/{{
+              confirmEntry?.real_model
+            }}{{ $t("routeList.clearActiveDescTail") }}
           </template>
         </component>
       </component>
@@ -624,11 +640,21 @@ const table = useVueTable({
   <component :is="Modal.Root" :open="deleteDialogOpen" @update:open="onDeleteOpenChange">
     <component :is="Modal.Content" class="sm:max-w-md">
       <component :is="Modal.Header">
-        <component :is="Modal.Title">{{ $t("routeList.deleteTitle") }}</component>
-        <component :is="Modal.Description">
-          {{ $t("routeList.deleteDescLead")
-          }}<span class="font-mono font-medium">{{ deleteTarget }}</span
-          >{{ $t("routeList.deleteDescTail") }}
+        <component :is="Modal.Title" class="flex items-center gap-1.5">
+          {{ $t("routeList.deleteTitle") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              {{ $t("routeList.deleteDescLead")
+              }}<span class="font-mono font-medium">{{ deleteTarget }}</span
+              >{{ $t("routeList.deleteDescTail") }}
+            </TooltipContent>
+          </Tooltip>
+        </component>
+        <component :is="Modal.Description" class="sr-only">
+          {{ $t("routeList.deleteDescLead") }}{{ deleteTarget }}{{ $t("routeList.deleteDescTail") }}
         </component>
       </component>
       <component :is="Modal.Footer">
@@ -647,10 +673,20 @@ const table = useVueTable({
   <component :is="Modal.Root" :open="editingRoute !== null" @update:open="onEditOpenChange">
     <component :is="Modal.Content" class="flex max-h-[90vh] flex-col overflow-hidden sm:max-w-3xl">
       <component :is="Modal.Header" class="shrink-0">
-        <component :is="Modal.Title">{{ $t("routeList.editTitle") }}</component>
-        <component :is="Modal.Description">
-          {{ $t("routeList.editDescLead")
-          }}<span class="font-mono font-medium">{{ editingRoute?.model_name }}</span>
+        <component :is="Modal.Title" class="flex items-center gap-1.5">
+          {{ $t("routeList.editTitle") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              {{ $t("routeList.editDescLead")
+              }}<span class="font-mono font-medium">{{ editingRoute?.model_name }}</span>
+            </TooltipContent>
+          </Tooltip>
+        </component>
+        <component :is="Modal.Description" class="sr-only">
+          {{ $t("routeList.editDescLead") }}{{ editingRoute?.model_name }}
         </component>
       </component>
       <div class="min-h-0 flex-1 overflow-y-auto px-4 pb-4 sm:px-0">

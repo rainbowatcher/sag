@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertCircle, Loader2, Plus, Search } from "@lucide/vue"
+import { AlertCircle, Info, Loader2, Plus, Search } from "@lucide/vue"
 import { refDebounced } from "@vueuse/core"
 import { onMounted, ref } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
@@ -7,6 +7,7 @@ import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
@@ -88,8 +89,18 @@ onMounted(refreshPage)
         class="flex max-h-[85vh] flex-col overflow-hidden px-4 sm:max-w-3xl sm:px-6"
       >
         <component :is="Modal.Header" class="shrink-0">
-          <component :is="Modal.Title">{{ $t("routes.addForm.title") }}</component>
-          <component :is="Modal.Description">
+          <component :is="Modal.Title" class="flex items-center gap-1.5">
+            {{ $t("routes.addForm.title") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+                {{ $t("routes.addForm.description") }}
+              </TooltipContent>
+            </Tooltip>
+          </component>
+          <component :is="Modal.Description" class="sr-only">
             {{ $t("routes.addForm.description") }}
           </component>
         </component>

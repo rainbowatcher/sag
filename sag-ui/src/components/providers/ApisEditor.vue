@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronDown, ChevronRight, Plus, X } from "@lucide/vue"
+import { ChevronDown, ChevronRight, Info, Plus, X } from "@lucide/vue"
 import { computed, ref } from "vue"
 import KvEditor from "@/components/KvEditor.vue"
 import ProtocolProbePanel from "@/components/providers/ProtocolProbePanel.vue"
@@ -16,6 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 import type { ApiConfig, ApiKind, ProtocolApiKind, ProxyMode } from "@/types/api"
 
@@ -382,6 +383,18 @@ defineExpose({ validate })
       </Button>
     </div>
 
+    <div class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium">
+      {{ $t("providers.apis.fallbackProtocol") }}
+      <Tooltip v-if="protocolKeys.length > 1 && !fallbackValue">
+        <TooltipTrigger as-child>
+          <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+        </TooltipTrigger>
+        <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">{{
+          $t("providers.apis.selectFallback")
+        }}</TooltipContent>
+      </Tooltip>
+    </div>
+
     <RadioGroup
       :model-value="radioGroupValue"
       class="space-y-3"
@@ -590,9 +603,6 @@ defineExpose({ validate })
     <p v-if="sections.length === 0" class="text-destructive text-xs">
       {{ $t("providers.apis.atLeastOneSection") }}
     </p>
-    <p v-else-if="protocolKeys.length > 1 && !fallbackValue" class="text-muted-foreground text-xs">
-      {{ $t("providers.apis.selectFallback") }}
-    </p>
 
     <Separator />
 
@@ -603,7 +613,22 @@ defineExpose({ validate })
         class="w-full justify-between px-2"
         @click="probeOpen = !probeOpen"
       >
-        <span>{{ $t("providers.apis.protocolProbeSupport") }}</span>
+        <span class="flex items-center gap-1.5">
+          {{ $t("providers.apis.protocolProbeSupport") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" @click.stop />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              <span class="block">{{ $t("providers.probe.description") }}</span>
+              <span class="mt-1.5 block">
+                {{ $t("providers.probe.modelHintLead")
+                }}<strong>{{ $t("providers.probe.applyAll") }}</strong
+                >{{ $t("providers.probe.modelHintTail") }}
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        </span>
         <ChevronDown v-if="probeOpen" class="h-3.5 w-3.5" />
         <ChevronRight v-else class="h-3.5 w-3.5" />
       </Button>

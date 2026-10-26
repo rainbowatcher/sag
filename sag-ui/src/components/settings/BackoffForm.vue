@@ -93,7 +93,17 @@ async function handleSave() {
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-3">
         <div class="space-y-2">
-          <Label for="backoff-retries">{{ $t("settings.backoff.labelRetries") }}</Label>
+          <Label for="backoff-retries" class="flex items-center gap-1.5">
+            {{ $t("settings.backoff.labelRetries") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.backoff.hintRetries") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="backoff-retries"
             v-model.number="retries"
@@ -103,10 +113,19 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">{{ $t("settings.backoff.hintRetries") }}</p>
         </div>
         <div class="space-y-2">
-          <Label for="backoff-base">{{ $t("settings.backoff.labelBase") }}</Label>
+          <Label for="backoff-base" class="flex items-center gap-1.5">
+            {{ $t("settings.backoff.labelBase") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.backoff.hintBase") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="backoff-base"
             v-model.number="baseMs"
@@ -116,10 +135,19 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">{{ $t("settings.backoff.hintBase") }}</p>
         </div>
         <div class="space-y-2">
-          <Label for="backoff-max">{{ $t("settings.backoff.labelMax") }}</Label>
+          <Label for="backoff-max" class="flex items-center gap-1.5">
+            {{ $t("settings.backoff.labelMax") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.backoff.hintMax") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="backoff-max"
             v-model.number="maxMs"
@@ -129,27 +157,36 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">{{ $t("settings.backoff.hintMax") }}</p>
         </div>
       </div>
 
       <div class="max-w-3xl space-y-3 border-t pt-4">
         <div class="flex items-center justify-between gap-4">
-          <div class="space-y-0.5">
-            <Label for="backoff-jitter">{{ $t("settings.backoff.labelJitter") }}</Label>
-            <p class="text-muted-foreground text-xs">
-              {{ $t("settings.backoff.hintJitter") }}
-            </p>
-          </div>
+          <Label for="backoff-jitter" class="flex items-center gap-1.5">
+            {{ $t("settings.backoff.labelJitter") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.backoff.hintJitter") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Switch id="backoff-jitter" v-model="jitter" :disabled="store.saving" />
         </div>
         <div class="flex items-center justify-between gap-4">
-          <div class="space-y-0.5">
-            <Label for="backoff-empty">{{ $t("settings.backoff.labelRetryOnEmpty") }}</Label>
-            <p class="text-muted-foreground text-xs">
-              {{ $t("settings.backoff.hintRetryOnEmpty") }}
-            </p>
-          </div>
+          <Label for="backoff-empty" class="flex items-center gap-1.5">
+            {{ $t("settings.backoff.labelRetryOnEmpty") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.backoff.hintRetryOnEmpty") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Switch id="backoff-empty" v-model="retryOnEmpty" :disabled="store.saving" />
         </div>
       </div>

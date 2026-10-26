@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { Check, Loader2, Search } from "@lucide/vue"
+import { Check, Info, Loader2, Search } from "@lucide/vue"
 import type { ComponentPublicInstance } from "vue"
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { t } from "@/lib/i18n"
 import {
@@ -241,8 +242,18 @@ onBeforeUnmount(() => {
       class="flex max-h-[85vh] flex-col gap-3 overflow-hidden p-0 sm:max-w-2xl"
     >
       <component :is="Modal.Header" class="px-4 pt-4">
-        <component :is="Modal.Title">{{ $t("routes.targetPicker.title") }}</component>
-        <component :is="Modal.Description">
+        <component :is="Modal.Title" class="flex items-center gap-1.5">
+          {{ $t("routes.targetPicker.title") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              {{ $t("routes.targetPicker.description") }}
+            </TooltipContent>
+          </Tooltip>
+        </component>
+        <component :is="Modal.Description" class="sr-only">
           {{ $t("routes.targetPicker.description") }}
         </component>
       </component>

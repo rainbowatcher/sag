@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Loader2 } from "@lucide/vue"
+import { Info, Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
 import { useMediaQuery } from "@vueuse/core"
 import { computed, ref } from "vue"
@@ -31,6 +31,7 @@ import {
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useProviderProbe } from "@/composables/useProviderProbe"
 import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
@@ -217,8 +218,19 @@ async function handleSubmit(event: Event) {
   <component :is="Modal.Root" :open="open ?? true" @update:open="onOpenChange">
     <component :is="Modal.Content" class="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
       <component :is="Modal.Header" class="shrink-0">
-        <component :is="Modal.Title">{{ $t("providers.addForm.title") }}</component>
-        <component :is="Modal.Description">
+        <component :is="Modal.Title" class="flex items-center gap-1.5">
+          {{ $t("providers.addForm.title") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+              {{ $t("providers.addForm.description") }}
+            </TooltipContent>
+          </Tooltip>
+        </component>
+        <!-- Visually hidden, keeps the dialog description for assistive tech. -->
+        <component :is="Modal.Description" class="sr-only">
           {{ $t("providers.addForm.description") }}
         </component>
       </component>

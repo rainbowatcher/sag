@@ -383,10 +383,15 @@ function keyFingerprint(key: string): string {
                       <TooltipTrigger as-child>
                         <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
                       </TooltipTrigger>
-                      <TooltipContent side="top" class="max-w-xs font-normal">
+                      <TooltipContent
+                        side="top"
+                        class="max-w-xs font-normal break-words whitespace-normal"
+                      >
                         {{ $t("settings.proxy.descriptionLead") }}<code>inherit</code
                         >{{ $t("settings.proxy.descriptionMid") }}<code>enabled</code
                         >{{ $t("settings.proxy.descriptionTail") }}
+                        <br />
+                        {{ $t("settings.proxy.hint") }}
                       </TooltipContent>
                     </Tooltip>
                   </CardTitle>
@@ -407,7 +412,7 @@ function keyFingerprint(key: string): string {
                 {{ $t("settings.loadingSettings") }}
               </div>
 
-              <div class="max-w-2xl space-y-2 xl:max-w-3xl">
+              <div class="max-w-2xl xl:max-w-3xl">
                 <Input
                   v-model="proxyUrl"
                   :disabled="store.loading || proxySaving"
@@ -415,9 +420,6 @@ function keyFingerprint(key: string): string {
                   class="font-mono"
                   @keydown.enter.prevent="handleProxySave"
                 />
-                <p class="text-muted-foreground text-xs">
-                  {{ $t("settings.proxy.hint") }}
-                </p>
               </div>
 
               <div
@@ -677,7 +679,12 @@ function keyFingerprint(key: string): string {
               :badge="$t('settings.info.requiresRestart')"
               :icon="Server"
               :rows="serverRows"
-            />
+            >
+              <template #note>
+                {{ $t("settings.system.restartNoteLead") }}<code>gateway.toml</code
+                >{{ $t("settings.system.restartNoteTail") }}
+              </template>
+            </SystemInfoCard>
             <SystemInfoCard
               :title="$t('settings.system.loggingTitle')"
               :description="$t('settings.system.loggingDescription')"
@@ -685,10 +692,6 @@ function keyFingerprint(key: string): string {
               :icon="ScrollText"
               :rows="loggingRows"
             />
-            <p class="text-muted-foreground max-w-3xl text-xs">
-              {{ $t("settings.system.restartNoteLead") }}<code>gateway.toml</code
-              >{{ $t("settings.system.restartNoteTail") }}
-            </p>
           </template>
         </TabsContent>
 

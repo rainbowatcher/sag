@@ -68,8 +68,12 @@ function rowClass(row: SystemInfoRow): string {
               <TooltipTrigger as-child>
                 <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
               </TooltipTrigger>
-              <TooltipContent side="top" class="max-w-xs font-normal">
+              <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
                 {{ props.description }}
+                <template v-if="$slots.note">
+                  <br />
+                  <slot name="note" />
+                </template>
               </TooltipContent>
             </Tooltip>
           </CardTitle>

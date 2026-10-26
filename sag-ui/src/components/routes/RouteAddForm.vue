@@ -203,7 +203,17 @@ async function handleSubmit(event: Event) {
         <div class="grid grid-cols-2 gap-4">
           <form.Field name="model_name" #default="{ field }">
             <Field>
-              <FieldLabel :for="field.name">{{ $t("routes.form.routeAlias") }}</FieldLabel>
+              <FieldLabel :for="field.name" class="flex items-center gap-1.5">
+                {{ $t("routes.form.routeAlias") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.routeAliasHint") }}
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
               <Input
                 :id="field.name"
                 :model-value="field.state.value"
@@ -212,9 +222,6 @@ async function handleSubmit(event: Event) {
                 @blur="field.handleBlur"
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
-              <p class="text-muted-foreground text-[10px]">
-                {{ $t("routes.form.routeAliasHint") }}
-              </p>
             </Field>
           </form.Field>
 
@@ -291,7 +298,20 @@ async function handleSubmit(event: Event) {
 
           <form.Field name="api_endpoint" #default="{ field }">
             <Field v-if="form.state.values.pipeline === 'image'">
-              <FieldLabel :for="field.name">{{ $t("routes.form.apiEndpointLabel") }}</FieldLabel>
+              <FieldLabel :for="field.name" class="flex items-center gap-1.5">
+                {{ $t("routes.form.apiEndpointLabel") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
+                    >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
+                    >{{ $t("routes.form.apiEndpointHintOr")
+                    }}<code>/v1beta/models/{model}:generateContent</code>
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
               <Input
                 :id="field.name"
                 :model-value="field.state.value"
@@ -301,19 +321,23 @@ async function handleSubmit(event: Event) {
                 @blur="field.handleBlur"
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
-              <p class="text-muted-foreground text-[10px]">
-                {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
-                >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
-                >{{ $t("routes.form.apiEndpointHintOr")
-                }}<code>/v1beta/models/{model}:generateContent</code>
-              </p>
               <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>
 
           <form.Field name="session_ttl_secs" #default="{ field }">
             <Field v-if="form.state.values.strategy === 'session_sticky'">
-              <FieldLabel :for="field.name">{{ $t("routes.form.sessionTtlLabel") }}</FieldLabel>
+              <FieldLabel :for="field.name" class="flex items-center gap-1.5">
+                {{ $t("routes.form.sessionTtlLabel") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.sessionTtlHint") }}
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
               <Input
                 :id="field.name"
                 type="number"
@@ -325,18 +349,23 @@ async function handleSubmit(event: Event) {
                 @blur="field.handleBlur"
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
-              <p class="text-muted-foreground text-[10px]">
-                {{ $t("routes.form.sessionTtlHint") }}
-              </p>
               <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>
 
           <form.Field name="session_max_entries" #default="{ field }">
             <Field v-if="form.state.values.strategy === 'session_sticky'">
-              <FieldLabel :for="field.name">{{
-                $t("routes.form.sessionMaxEntriesLabel")
-              }}</FieldLabel>
+              <FieldLabel :for="field.name" class="flex items-center gap-1.5">
+                {{ $t("routes.form.sessionMaxEntriesLabel") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.sessionMaxEntriesHint") }}
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
               <Input
                 :id="field.name"
                 type="number"
@@ -348,9 +377,6 @@ async function handleSubmit(event: Event) {
                 @blur="field.handleBlur"
                 @input="field.handleChange(($event.target as HTMLInputElement).value)"
               />
-              <p class="text-muted-foreground text-[10px]">
-                {{ $t("routes.form.sessionMaxEntriesHint") }}
-              </p>
               <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>

@@ -105,7 +105,17 @@ async function handleSave() {
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div class="space-y-2">
-          <Label for="breaker-quota">{{ $t("settings.circuitBreaker.labelQuota") }}</Label>
+          <Label for="breaker-quota" class="flex items-center gap-1.5">
+            {{ $t("settings.circuitBreaker.labelQuota") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.circuitBreaker.hintQuota") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="breaker-quota"
             v-model.number="quotaExhaustedSecs"
@@ -115,12 +125,19 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">
-            {{ $t("settings.circuitBreaker.hintQuota") }}
-          </p>
         </div>
         <div class="space-y-2">
-          <Label for="breaker-rate">{{ $t("settings.circuitBreaker.labelRate") }}</Label>
+          <Label for="breaker-rate" class="flex items-center gap-1.5">
+            {{ $t("settings.circuitBreaker.labelRate") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.circuitBreaker.hintRate") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="breaker-rate"
             v-model.number="rateLimitedSecs"
@@ -130,12 +147,19 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">
-            {{ $t("settings.circuitBreaker.hintRate") }}
-          </p>
         </div>
         <div class="space-y-2">
-          <Label for="breaker-generic">{{ $t("settings.circuitBreaker.labelGeneric") }}</Label>
+          <Label for="breaker-generic" class="flex items-center gap-1.5">
+            {{ $t("settings.circuitBreaker.labelGeneric") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.circuitBreaker.hintGeneric") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="breaker-generic"
             v-model.number="genericSecs"
@@ -145,12 +169,19 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">
-            {{ $t("settings.circuitBreaker.hintGeneric") }}
-          </p>
         </div>
         <div class="space-y-2">
-          <Label for="breaker-probe">{{ $t("settings.circuitBreaker.labelProbe") }}</Label>
+          <Label for="breaker-probe" class="flex items-center gap-1.5">
+            {{ $t("settings.circuitBreaker.labelProbe") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal">
+                {{ $t("settings.circuitBreaker.hintProbe") }}
+              </TooltipContent>
+            </Tooltip>
+          </Label>
           <Input
             id="breaker-probe"
             v-model.number="probeIntervalSecs"
@@ -160,9 +191,6 @@ async function handleSave() {
             class="font-mono"
             :disabled="store.saving"
           />
-          <p class="text-muted-foreground text-xs">
-            {{ $t("settings.circuitBreaker.hintProbe") }}
-          </p>
         </div>
       </div>
 

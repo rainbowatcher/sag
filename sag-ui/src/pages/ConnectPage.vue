@@ -56,8 +56,13 @@ async function handleConnect() {
             <TooltipTrigger as-child>
               <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
             </TooltipTrigger>
-            <TooltipContent side="top" class="max-w-xs font-normal">
+            <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
               {{ $t("connect.subtitle") }}
+              <br />
+              {{ $t("connect.configuredIn")
+              }}<code class="bg-muted rounded px-1 text-[10px]">gateway.toml</code
+              >{{ $t("connect.configuredArrow")
+              }}<code class="bg-muted rounded px-1 text-[10px]">[gateway_auth]</code>
             </TooltipContent>
           </Tooltip>
         </h1>
@@ -118,13 +123,6 @@ async function handleConnect() {
           {{ store.connecting ? $t("connect.connecting") : $t("connect.connect") }}
         </button>
       </form>
-
-      <p class="text-muted-foreground mt-4 text-center text-[10px]">
-        {{ $t("connect.configuredIn")
-        }}<code class="bg-muted rounded px-1 text-[10px]">gateway.toml</code
-        >{{ $t("connect.configuredArrow")
-        }}<code class="bg-muted rounded px-1 text-[10px]">[gateway_auth]</code>
-      </p>
     </div>
   </div>
 </template>

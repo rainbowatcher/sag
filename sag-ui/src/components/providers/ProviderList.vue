@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Copy, Loader2, Pen, Plus, Search, Trash2 } from "@lucide/vue"
+import { Copy, Info, Loader2, Pen, Plus, Search, Trash2 } from "@lucide/vue"
 import { FlexRender, createColumnHelper, getCoreRowModel, useVueTable } from "@tanstack/vue-table"
 import { computed, h, onMounted, ref, watch } from "vue"
 import { toast } from "vue-sonner"
@@ -588,11 +588,25 @@ const table = useVueTable({
     <component :is="Modal.Root" :open="copyingProvider !== null" @update:open="onCopyOpenChange">
       <component :is="Modal.Content" class="sm:max-w-md">
         <component :is="Modal.Header">
-          <component :is="Modal.Title">{{ $t("providers.list.copyTitle") }}</component>
-          <component :is="Modal.Description">
-            {{ $t("providers.list.copyDescLead")
-            }}<span class="text-foreground font-mono font-medium">{{ copyingProvider?.name }}</span
-            >{{ $t("providers.list.copyDescTail") }}
+          <component :is="Modal.Title" class="flex items-center gap-1.5">
+            {{ $t("providers.list.copyTitle") }}
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+              </TooltipTrigger>
+              <TooltipContent side="top" class="max-w-xs font-normal break-words whitespace-normal">
+                {{ $t("providers.list.copyDescLead")
+                }}<span class="text-foreground font-mono font-medium">{{
+                  copyingProvider?.name
+                }}</span
+                >{{ $t("providers.list.copyDescTail") }}
+              </TooltipContent>
+            </Tooltip>
+          </component>
+          <!-- Visually hidden, keeps the dialog description for assistive tech. -->
+          <component :is="Modal.Description" class="sr-only">
+            {{ $t("providers.list.copyDescLead") }}{{ copyingProvider?.name
+            }}{{ $t("providers.list.copyDescTail") }}
           </component>
         </component>
 
