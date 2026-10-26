@@ -1,14 +1,22 @@
 <script setup lang="ts">
-import { Loader2 } from "@lucide/vue"
+import { Info, Loader2 } from "@lucide/vue"
 import { useForm } from "@tanstack/vue-form"
-import { ref } from "vue"
+import { computed, ref } from "vue"
 import { toast } from "vue-sonner"
 import { z } from "zod"
 import TargetEditor from "@/components/routes/TargetEditor.vue"
 import { Button } from "@/components/ui/button"
 import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
@@ -29,6 +37,17 @@ const routeStore = useRouteStore()
 
 const adding = ref(false)
 const apiError = ref("")
+
+// reka-ui captures each `SelectItem`'s textContent once at mount and `SelectValue`
+// renders that frozen string, so its default output never re-translates on a
+// locale switch. This locale-reactive map feeds `SelectValue` an explicit slot
+// label (same `t()` keys as the items) instead of the captured text.
+const strategyLabels = computed<Record<Strategy, string>>(() => ({
+  sticky_failover: t("routes.form.strategyStickyFailover"),
+  fill_first: t("routes.form.strategyFillFirst"),
+  round_robin: t("routes.form.strategyRoundRobin"),
+  session_sticky: t("routes.form.strategySessionSticky"),
+}))
 
 /** Empty input → `undefined` so the field is omitted and the backend default applies. */
 function parseOptionalInt(raw: string): number | undefined {
@@ -202,33 +221,38 @@ async function handleSubmit(event: Event) {
           <form.Field name="strategy" #default="{ field }">
             <Field>
               <FieldLabel :for="field.name">{{ $t("routes.form.strategy") }}</FieldLabel>
-              <ToggleGroup
+              <Select
                 :model-value="field.state.value ?? 'sticky_failover'"
                 @update:model-value="(v) => field.handleChange(v as Strategy)"
-                type="single"
-                variant="outline"
-                size="sm"
-                class="justify-start"
               >
-                <ToggleGroupItem value="sticky_failover">{{
-                  $t("routes.form.strategyStickyFailover")
-                }}</ToggleGroupItem>
-                <ToggleGroupItem value="fill_first">{{
-                  $t("routes.form.strategyFillFirst")
-                }}</ToggleGroupItem>
-                <ToggleGroupItem value="round_robin">{{
-                  $t("routes.form.strategyRoundRobin")
-                }}</ToggleGroupItem>
-                <ToggleGroupItem value="session_sticky">{{
-                  $t("routes.form.strategySessionSticky")
-                }}</ToggleGroupItem>
-              </ToggleGroup>
-              <p
-                v-if="form.state.values.strategy === 'session_sticky'"
-                class="text-muted-foreground text-[10px]"
-              >
-                {{ $t("routes.form.strategySessionStickyHint") }}
-              </p>
+                <SelectTrigger :id="field.name" class="w-full">
+                  <SelectValue>{{
+                    strategyLabels[field.state.value ?? "sticky_failover"]
+                  }}</SelectValue>
+                </SelectTrigger>
+                <SelectContent class="w-(--reka-select-trigger-width)">
+                  <SelectItem value="sticky_failover">{{
+                    $t("routes.form.strategyStickyFailover")
+                  }}</SelectItem>
+                  <SelectItem value="fill_first">{{
+                    $t("routes.form.strategyFillFirst")
+                  }}</SelectItem>
+                  <SelectItem value="round_robin">{{
+                    $t("routes.form.strategyRoundRobin")
+                  }}</SelectItem>
+                  <SelectItem value="session_sticky">{{
+                    $t("routes.form.strategySessionSticky")
+                  }}</SelectItem>
+                </SelectContent>
+              </Select>
+              <Tooltip v-if="form.state.values.strategy === 'session_sticky'">
+                <TooltipTrigger as-child>
+                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                </TooltipTrigger>
+                <TooltipContent side="top" class="max-w-xs font-normal">
+                  {{ $t("routes.form.strategySessionStickyHint") }}
+                </TooltipContent>
+              </Tooltip>
               <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>

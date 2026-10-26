@@ -6,6 +6,7 @@ import {
   Eye,
   EyeOff,
   Globe,
+  Info,
   KeyRound,
   Languages,
   Loader2,
@@ -31,7 +32,7 @@ import StrategyTimersForm from "@/components/settings/StrategyTimersForm.vue"
 import SystemInfoCard, { type SystemInfoRow } from "@/components/settings/SystemInfoCard.vue"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
@@ -42,6 +43,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { themeMode } from "@/composables/useTheme"
 import { useI18n, type Locale } from "@/lib/i18n"
 import { isSettingsTab, resolveSettingsTab } from "@/lib/settingsTabs"
@@ -304,12 +306,17 @@ function keyFingerprint(key: string): string {
   <div class="flex h-full flex-col">
     <div class="shrink-0">
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="min-w-0">
-          <h1 class="text-lg font-semibold xl:text-xl">{{ $t("nav.settings") }}</h1>
-          <p class="text-muted-foreground text-sm">
-            {{ $t("settings.page.description") }}
-          </p>
-        </div>
+        <h1 class="flex items-center gap-1.5 text-lg font-semibold xl:text-xl">
+          {{ $t("nav.settings") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal">
+              {{ $t("settings.page.description") }}
+            </TooltipContent>
+          </Tooltip>
+        </h1>
         <RefreshButton :loading="store.loading" @click="refreshPage" />
       </div>
     </div>
@@ -372,12 +379,17 @@ function keyFingerprint(key: string): string {
                   <CardTitle class="flex items-center gap-2">
                     <Globe class="h-4 w-4" />
                     {{ $t("settings.proxy.title") }}
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" class="max-w-xs font-normal">
+                        {{ $t("settings.proxy.descriptionLead") }}<code>inherit</code
+                        >{{ $t("settings.proxy.descriptionMid") }}<code>enabled</code
+                        >{{ $t("settings.proxy.descriptionTail") }}
+                      </TooltipContent>
+                    </Tooltip>
                   </CardTitle>
-                  <CardDescription>
-                    {{ $t("settings.proxy.descriptionLead") }}<code>inherit</code
-                    >{{ $t("settings.proxy.descriptionMid") }}<code>enabled</code
-                    >{{ $t("settings.proxy.descriptionTail") }}
-                  </CardDescription>
                 </div>
                 <Badge variant="outline" class="shrink-0 text-[10px]">
                   {{
@@ -444,12 +456,17 @@ function keyFingerprint(key: string): string {
                   <CardTitle class="flex items-center gap-2">
                     <KeyRound class="h-4 w-4" />
                     {{ $t("settings.auth.title") }}
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" class="max-w-xs font-normal">
+                        {{ $t("settings.auth.descriptionLead")
+                        }}<code>Authorization: Bearer &lt;key&gt;</code
+                        >{{ $t("settings.auth.descriptionTail") }}
+                      </TooltipContent>
+                    </Tooltip>
                   </CardTitle>
-                  <CardDescription>
-                    {{ $t("settings.auth.descriptionLead")
-                    }}<code>Authorization: Bearer &lt;key&gt;</code
-                    >{{ $t("settings.auth.descriptionTail") }}
-                  </CardDescription>
                 </div>
                 <Badge
                   variant="secondary"
@@ -683,10 +700,15 @@ function keyFingerprint(key: string): string {
                 <CardTitle class="flex items-center gap-2">
                   <Palette class="h-4 w-4" />
                   {{ $t("settings.appearance.themeTitle") }}
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" class="max-w-xs font-normal">
+                      {{ $t("settings.appearance.themeDescription") }}
+                    </TooltipContent>
+                  </Tooltip>
                 </CardTitle>
-                <CardDescription>
-                  {{ $t("settings.appearance.themeDescription") }}
-                </CardDescription>
               </div>
             </CardHeader>
             <CardContent class="max-w-2xl space-y-2 xl:max-w-3xl">
@@ -712,10 +734,15 @@ function keyFingerprint(key: string): string {
                 <CardTitle class="flex items-center gap-2">
                   <Languages class="h-4 w-4" />
                   {{ t("settings.language.title") }}
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" class="max-w-xs font-normal">
+                      {{ t("settings.language.description") }}
+                    </TooltipContent>
+                  </Tooltip>
                 </CardTitle>
-                <CardDescription>
-                  {{ t("settings.language.description") }}
-                </CardDescription>
               </div>
             </CardHeader>
             <CardContent class="max-w-2xl space-y-2 xl:max-w-3xl">

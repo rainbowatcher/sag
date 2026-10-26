@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { AlertCircle, Loader2, Save, Zap } from "@lucide/vue"
+import { AlertCircle, Info, Loader2, Save, Zap } from "@lucide/vue"
 import { ref, watch } from "vue"
 import { toast } from "vue-sonner"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 import { useGatewayConfigStore } from "@/stores/gatewayConfig"
 
@@ -90,10 +91,15 @@ async function handleSave() {
         <CardTitle class="flex items-center gap-2">
           <Zap class="h-4 w-4" />
           {{ $t("settings.circuitBreaker.formTitle") }}
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal">
+              {{ $t("settings.circuitBreaker.formDescription") }}
+            </TooltipContent>
+          </Tooltip>
         </CardTitle>
-        <CardDescription>
-          {{ $t("settings.circuitBreaker.formDescription") }}
-        </CardDescription>
       </div>
     </CardHeader>
     <CardContent class="space-y-4">

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { Loader2, Plug, Server, Key, AlertCircle } from "@lucide/vue"
+import { Loader2, Plug, Server, Key, AlertCircle, Info } from "@lucide/vue"
 import { ref, onMounted } from "vue"
 import { useRoute, useRouter } from "vue-router"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
 import { useConnectionStore } from "@/stores/connection"
 
@@ -49,8 +50,17 @@ async function handleConnect() {
         >
           S
         </div>
-        <h1 class="text-xl font-bold tracking-tight">SAG Gateway</h1>
-        <p class="text-muted-foreground mt-1 text-sm">{{ $t("connect.subtitle") }}</p>
+        <h1 class="flex items-center justify-center gap-1.5 text-xl font-bold tracking-tight">
+          SAG Gateway
+          <Tooltip>
+            <TooltipTrigger as-child>
+              <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+            </TooltipTrigger>
+            <TooltipContent side="top" class="max-w-xs font-normal">
+              {{ $t("connect.subtitle") }}
+            </TooltipContent>
+          </Tooltip>
+        </h1>
       </div>
 
       <!-- Form card -->
