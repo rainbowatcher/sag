@@ -400,11 +400,12 @@ const columns = [
             })
           : null
 
+      // A route without an active target shows no target text. `session_sticky`
+      // routes render only their sticky-pin popover, while other strategies
+      // keep the "-" placeholder so the column does not go blank.
       if (!active) {
-        return h("div", { class: "flex items-center gap-1.5" }, [
-          h("span", { class: "text-muted-foreground/50" }, "-"),
-          affinityPins,
-        ])
+        if (route.strategy === "session_sticky") return affinityPins
+        return h("span", { class: "text-muted-foreground/50" }, "-")
       }
 
       const isFillFirst = fill !== undefined && sticky === undefined

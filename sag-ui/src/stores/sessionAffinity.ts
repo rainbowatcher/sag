@@ -1,6 +1,7 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api } from "@/lib/client"
+import { mergeSessionEntries, type SessionAffinityError } from "@/lib/sessionAffinity"
 import { getErrorMessage } from "@/lib/utils"
 import type { SessionAffinityDeletedResult, SessionAffinityEntry } from "@/types/api"
 import { useConnectionStore } from "./connection"
@@ -24,27 +25,41 @@ export interface SessionAffinityQuery {
 export const useSessionAffinityStore = defineStore("sessionAffinity", () => {
   const entries = ref<SessionAffinityEntry[]>([])
   const loading = ref(false)
-  const error = ref<string | null>(null)
+  // The store is shared by every route row, so a failure is tagged with the
+  // model space it belongs to: a failed `{ model: B }` fetch must not turn
+  // row A's list into B's error text.
+  const error = ref<SessionAffinityError | null>(null)
 
   // Monotonic token: only the latest in-flight fetch may write state, so a
   // slow earlier request cannot overwrite a newer one.
   let generation = 0
 
+  /** Drop the stored failure only when it belongs to the scope being fetched. */
+  function clearError(scope?: string) {
+    if (error.value !== null && error.value.scope === scope) error.value = null
+  }
+
   async function fetchEntries(params: SessionAffinityQuery = {}) {
     const token = ++generation
+    const scope = params.model
     loading.value = true
-    error.value = null
+    clearError(scope)
     try {
       const { data } = await api.get<{ entries: SessionAffinityEntry[] }>("/api/session-affinity", {
         params,
       })
       if (token !== generation) return
-      entries.value = data.entries
+      // A `{ model }` fetch only owns its own slice of the shared list; the other
+      // rows' pins must survive so they do not render as a false "no pins".
+      entries.value = mergeSessionEntries(entries.value, data.entries, scope)
+      clearError(scope)
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       if (token !== generation) return
-      entries.value = []
-      error.value = getErrorMessage(e, "Failed to load session pins")
+      // A failed fetch is not an empty result: keep the last successful data so
+      // the other rows (and this one) do not render as a false "no pins". The
+      // scoped `error` is what tells this row's caller the refresh failed.
+      error.value = { scope, message: getErrorMessage(e, "Failed to load session pins") }
     } finally {
       if (token === generation) loading.value = false
     }

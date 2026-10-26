@@ -25,7 +25,7 @@ updated: 2026-10-26
 - [sag-ui/src/stores/providers.ts](../../../sag-ui/src/stores/providers.ts) — Provider CRUD + 上游模型拉取 + 乐观删除+回滚
 - [sag-ui/src/stores/routes.ts](../../../sag-ui/src/stores/routes.ts) — Route CRUD + provider models 懒加载
 - [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — Stats、Logs、Cache、Trend、Distribution 查询 + 分页状态管理
-- [sag-ui/src/stores/sessionAffinity.ts](../../../sag-ui/src/stores/sessionAffinity.ts) — 会话亲和 pin 的查询（`GET /api/session-affinity`）与清除（按 `key` / 按 `model`）；查询带单调 `generation` 竞态 token，删除自身不 refetch
+- [sag-ui/src/stores/sessionAffinity.ts](../../../sag-ui/src/stores/sessionAffinity.ts) — 会话亲和 pin 的查询（`GET /api/session-affinity`）与清除（按 `key` / 按 `model`）；查询带单调 `generation` 竞态 token，成功路径经 `mergeSessionEntries` 按 model 换桶（`{ model }` 只替换该 model 的桶，全量拉取整体替换），失败路径保留上一次成功数据、只写该次 fetch 作用域的 `error`（`{ scope?: string; message: string } | null`，`scope` 为 `params.model`，全量拉取为 `undefined`；启动 / 成功只清除同 scope）；删除自身不 refetch
 
 ### 页面
 
@@ -42,11 +42,11 @@ updated: 2026-10-26
 - [sag-ui/src/components/providers/ProviderList.vue](../../../sag-ui/src/components/providers/ProviderList.vue) — Provider 列表（TanStack Table）
 - [sag-ui/src/components/providers/ProviderAddForm.vue](../../../sag-ui/src/components/providers/ProviderAddForm.vue) — Provider 添加表单
 - [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
-- [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）
+- [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）；active target 单元格在 session_sticky 行无 active target 时不再渲染 `-` 占位，只返回该行的 pin 浮层（非 session_sticky 行无 active target 时仍渲染 `-`，其 pin 浮层为 `null`）
 - [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
 - [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries；新增走浮窗批量选择）
 - [sag-ui/src/components/routes/TargetPickerDialog.vue](../../../sag-ui/src/components/routes/TargetPickerDialog.vue) — Target 浮窗选择器（搜索 + 分组多选 + 差异化确认；Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
-- [sag-ui/src/components/routes/SessionAffinityPopover.vue](../../../sag-ui/src/components/routes/SessionAffinityPopover.vue) — 会话 pin 浮层（props `model`，emit `changed`）：展示某请求模型空间的 pin（provider/real_model、key 前 8 位、source、age、剩余 TTL）+ 逐条清除 + 按模型两步确认清空
+- [sag-ui/src/components/routes/SessionAffinityPopover.vue](../../../sag-ui/src/components/routes/SessionAffinityPopover.vue) — 会话 pin 浮层（props `model`，emit `changed`）：展示某请求模型空间的 pin（provider/real_model、key 前 8 位、source、age、剩余 TTL）+ 逐条清除 + 按模型两步确认清空；钥匙 icon 另包一层 `Tooltip :disabled="open"`（`@mouseenter="ensureFresh" @focus="ensureFresh"`）做只读 hover/聚焦预览（`side="left"`，无清除入口），两份列表共用 `sortedRows`（活跃顶置、过期置灰），hover/聚焦拉取受 `HOVER_REFRESH_MS = 3000` 节流；错误态按 scope 取值（`errorForModel(store.error, props.model)`）且 **rows 优先渲染**：`rows.length > 0` 时始终出列表，同 scope 错误降级为列表下方非阻塞小字提示，`rows` 为空才走 loading → 同 scope error → 空态
 - [sag-ui/src/components/SessionInfoCard.vue](../../../sag-ui/src/components/SessionInfoCard.vue) — 会话信息卡（props `session` / `sessionKey`）：会话键 + 来源徽标 + 会话 ID + 首条消息，首末时间在来源 tooltip；`session === null` 时降级为「只有会话键 + 降级文案」
 - [sag-ui/src/lib/sessionInfo.ts](../../../sag-ui/src/lib/sessionInfo.ts) — 会话卡的展示纯函数：来源收窄、空值占位（`—`）、preview 折叠与截断、时间格式化
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
@@ -56,7 +56,7 @@ updated: 2026-10-26
 - [sag-ui/src/lib/client.ts](../../../sag-ui/src/lib/client.ts) — 共享 axios 实例（Authorization header 由 connection store 同步）
 - [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
 - [sag-ui/src/lib/targetPicker.ts](../../../sag-ui/src/lib/targetPicker.ts) — Target 浮窗的纯选择逻辑：`provider+model` 集合键、分组构建（含禁用/orphan）、搜索过滤、勾选集合 ↔ target 行的 diff 与合并（type-only import，可被 node test runner 直接加载）
-- [sag-ui/src/lib/sessionAffinity.ts](../../../sag-ui/src/lib/sessionAffinity.ts) — `shortSessionKey(key, length = 8)`：会话哈希的展示前缀（删除仍用全量 key）；纯函数，同 targetPicker 一样可被 node test runner 直接加载
+- [sag-ui/src/lib/sessionAffinity.ts](../../../sag-ui/src/lib/sessionAffinity.ts) — 会话 pin 的纯函数：`shortSessionKey(key, length = 8)`（展示前缀，删除仍用全量 key）、`isPinActive(entry)`（`expires_in_secs === null || > 0` 为活跃）、`sortPins(entries)`（活跃组在前、组内 stable，返回新数组不改入参）、`mergeSessionEntries(prev, incoming, model?)`（共享 store 的换桶语义：`model` 未指定时整体替换、给定则只替换该 model 的桶并保留其他行数据，返回新数组不改入参）、`errorForModel(error, model)`（按 fetch 作用域取值：`error.scope === model` 时返回文案、否则 `null`——全量拉取的 `undefined` scope 不匹配任何单行视图）；同 targetPicker 一样可被 node test runner 直接加载
 - [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
 - [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
 - [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
@@ -255,14 +255,20 @@ flowchart TD
 
 ### 会话 pin 浮层：共享 store + 客户端按 model 过滤 vs 每行独立 state
 
-`sessionAffinity` store 是单例：浮层打开时 `fetchEntries({ model })` 覆盖 store 的 `entries`，组件再按 `model === props.model` 过滤出自己那一行要显示的条目（`rows`）。同时用单调 `generation` token 保证「后发请求先返回」不会把旧的 entries 写回。
+`sessionAffinity` store 是单例：浮层打开时 `fetchEntries({ model })` **只替换 store 的 `entries` 里该 model 的桶**（`mergeSessionEntries`），组件再按 `model === props.model` 过滤出自己那一行要显示的条目（`rows`）。同时用单调 `generation` token 保证「后发请求先返回」不会把旧的 entries 写回。
+
+0012 把「看」与「改」拆开后，hover 预览复用**同一个**共享 store 快照：`ensureFresh()` 只在 `store.loading` 为假且距上次拉取完成满 `HOVER_REFRESH_MS`（3000ms）时才 `refresh()`，点击打开浮层则无条件重新拉取。
 
 **Trade-off**:
 - ✅ 一个请求面、一个错误面/loading 面，不需要为每一行路由创建一个 store 实例或用 `provide/inject` 做作用域
 - ✅ `generation` token 同时覆盖 `entries` 与 `loading` 的清零：慢的旧请求既写不进 entries，也不会把新请求的 loading 提前关掉
-- ✅ 页面同时不会有多个浮层处于打开态（reka-ui 的 popover 外部交互即关闭），所以「A 行刷新把 B 行的展示刷成空」的竞态在实践中不会发生
+- ✅ 单 model 拉取只换自己那一桶：「A 行刷新把 B 行刷成空」不会发生。0012 返工前的整体覆盖会让 hover 相邻行即可复现——行 B 的响应把行 A 的条目刷掉，A 假「无 pin」、已打开的浮层被清空且不自愈
+- ✅ 失败不清空：拉取失败只写该作用域的 `error`，行上仍显示上一次成功的 pin 列表（失败 ≠ 空列表）
+- ✅ 错误面也按作用域收窄：`error` 带 `scope`（= 该次 fetch 的 `params.model`），组件用 `errorForModel()` 只取自己 scope 的那条，因此「行 B 失败」不会让行 A 的预览变成 B 的错误文案（初版是全局单槽 + error 优先于 rows，属同一失效类别）
+- ✅ hover 预览不引入第二个数据面：指针沿一列路由扫过只会在节流窗口外发请求，破坏性动作仍只在点击后的浮层里（预览不含清除入口）
 - ❌ 过滤是客户端兜底而非作用域隔离：若将来允许同时打开多个浮层，必须改成 per-model 的 state 映射（或给 popover 传 `key` 强制重建）
 - ❌ 跨模型空间会瞬时陈旧：按 `key` 删除会连带删除其它空间里的同 key pin（`DELETE { key }` 不区分 space），但其它浮层已加载的条目要等下次打开才更新
+- ❌ 节流窗口内看到的可能是 ≤3 秒前的数据：hover 预览是「顺手看一眼」的近似值，需要当下状态时点击打开浮层（后者总是重新拉取）；代价换指针扫过整列时不按行发请求
 
 ### TanStack Table vs shadcn-vue Table
 
@@ -378,8 +384,13 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **`index.html` 不得引用不存在的静态资源**：`sag-ui/public/` 不存在，任何 `/xxx.svg` / `/xxx.ico` 式引用都会变成每次加载一个 404（内嵌服务下是 `text/plain` 的 404）
 - **会话 pin 只展示前缀，删除用全量 key**：浮层与 Session 列展示 `shortSessionKey()` 的前 8 位，但 `title` 与 `DELETE /api/session-affinity` 的 body 必须用完整 32 位哈希。不得把截断值回传给删除接口（会静默删不到或删错）
 - **`sessionAffinity` store 的 generation token**：`fetchEntries` 只有最新在飞的请求可以写 `entries` / `error`，也只能由它清 `loading`。修改时不得把 token 判定只加在 `entries` 上而漏掉 `finally` 里的 `loading` 清零
+- **`fetchEntries` 只换自己那一桶，失败不清空**：成功路径必须走 `mergeSessionEntries(entries, data.entries, params.model)`——`model` 给定只替换该 model 的桶，`undefined` 才整体替换；失败路径只写 `error`，不得把 `entries` 置空。理由：store 被所有行共享，整体覆盖会让 hover 过的行 B 把行 A 的数据刷掉（A 假「无 pin」、打开中的浮层被清空且不自愈），而把「请求失败」当成「没有 pin」同样会清掉仍然有效的展示
+- **错误状态按 fetch 作用域记账，他行失败不得盖住本行数据（rows 优先渲染）**：store 的 `error` 为 `{ scope?: string; message: string } | null`，`scope` 是该次 fetch 的 `params.model`（全量拉取为 `undefined`）；启动 / 成功只清除同 scope 的错误，失败只写自己 scope。组件（Tooltip 与 Popover 两处）在 `rows.length > 0` 时**必须始终渲染列表**，同 scope 的错误降级为列表下方非阻塞小字提示；只有 `rows` 为空时才走 loading → 同 scope error → 空态。理由：共享 store 只有一个错误槽、且渲染链 error 优先于 rows 时，任一行 fetch 失败会用错误文案盖住所有行保留下来的 pin 数据——Tooltip 显示他行的错误文案且条数与列表自相矛盾，打开中的浮层也不自愈；这与「整体覆盖 entries」是同一失效类别
 - **pin 清除后必须重拉 active targets**：`SessionAffinityPopover` 的两条清除路径成功后均 `emit("changed")`，由 `RouteList` 的 `onChanged` 调 `activeTargetStore.fetchActiveTargets()`。漏掉这步会让 Active Target 列在 pin 已清后仍显示旧目标
 - **pin 浮层只在 session-sticky 行挂载**：`RouteList` 的 active target cell 用 `route.strategy === "session_sticky"` 判定后 `h(SessionAffinityPopover, …)`，其它策略必须为 `null`——否则无 pin 空间的路由会多发一次空查询
+- **只读预览不得出现清除入口**：`SessionAffinityPopover` 的 `TooltipContent` 只读（标题 + 条数 + 三态 + pin 列表），清除按钮只存在于 `PopoverContent`。不得把逐条清除 / 按模型清空搬进 hover 预览——指针扫过时误点就会丢掉活跃会话
+- **pin 活跃判定固定为 `expires_in_secs === null || > 0`**：由 `lib/sessionAffinity.ts` 的 `isPinActive()` 单点定义，Tooltip 与浮层的排序（`sortPins`）和置灰共用它。不得写成 `>= 0`：倒计时为 0 的 pin 已经过期，显示为活跃会让运维误判会话仍粘在该目标上
+- **hover 拉取必须节流，浮层打开必须重拉**：`ensureFresh()` 在 `store.loading` 或距上次拉取完成不足 `HOVER_REFRESH_MS`（3000ms）时直接返回，`watch(open)` 走的 `refresh()` 不受节流限制。取数触发点固定为 `@mouseenter` 与 `@focus` 两个（键盘 Tab 聚焦钥匙 icon 同样拉取）——去掉节流会让指针扫过一列路由按行发请求；把浮层打开也纳入节流则可能展示 ≤3 秒前的陈旧 pin；漏掉 `@focus` 会让键盘用户永远停在占位态
 - **Logs 会话筛选单一状态源**：Session 列点击必须走 `applySessionFilter()` → 写 `logsFilterSession` → `refreshLogs()`，与筛选栏内的会话过滤控件（空态内嵌输入框、有值内联显示 + 清空 X）、`clearSessionFilter()` 同源。不得为该列另建一套过滤状态（会出现控件与列不同步）
 
 ## 测试策略
@@ -388,7 +399,7 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 
 | 层面 | 方法 | 工具 |
 |------|------|------|
-| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界、`shortSessionKey` 截断边界） | node test runner |
+| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界、`shortSessionKey` 截断边界、`isPinActive` 存活性边界、`sortPins` 活跃顶置与组内 stable、`mergeSessionEntries` 按 model 换桶 / 全量替换 / 空桶 / 不改入参、`errorForModel` 按 scope 取值：同 scope 命中 / 他行 scope 不命中 / 全量拉取的 `undefined` scope 不命中单行 / `error` 为 `null`） | node test runner |
 | i18n 门禁 | `just ui-i18n-check`（`pnpm -C sag-ui run check:i18n`） | node + check-i18n.mjs |
 | 类型检查 | `pnpm typecheck`（vue-tsc） | TypeScript 编译器 |
 | 代码风格 | `pnpm lint`（oxlint）、`pnpm format`（oxfmt） | oxlint / oxfmt |
@@ -410,11 +421,12 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 9. **语言切换**：Settings → Language 选 English → 导航/表头/toast/表单校验消息即时变英文且 `<html lang>` 变 `en` → 刷新后仍为英文 → 切回中文同理；手动把 `localStorage["sag-ui-lang"]` 改为 `fr` 后刷新 → 界面回退中文且控制台无异常
 10. **i18n 门禁**：在任一 `.vue` 里塞入一句中文字面量 → `just ui-i18n-check` 应 exit 1 并打印文件名与行；从 `zh.ts` 删除一个 key → `pnpm typecheck` 应报错
 11. **session-sticky 路由**：新建路由选 session-sticky → 两个会话参数输入出现；留空提交 → Network 面板里 payload 不含 `session_ttl_secs` / `session_max_entries`；填 `-1` / `1.5` / 容量 `0` → 就地报错且无请求；编辑既有 session-sticky 路由 → 初值回填，不改则 payload 仍不含两字段（省略 = 保留）；`model_name = "*"` 或 `pipeline = "image"` 提交 → strategy / pipeline 字段就地报错（容量 `0` 仍为顶部错误条显示后端 400 消息）
-12. **会话 pin 浮层**：session-sticky 路由的 active target 单元格出现 pin 按钮（其它策略无）→ 打开浮层 → Network 面板显示 `GET /api/session-affinity?model=<model>` → 条目含 provider/real_model、key 前 8 位、source、age、expires；`session_ttl_secs = 0` 的路由显示「永不过期」→ 逐条清除 → `DELETE {"key": …}`（body 为全量 32 位）+ toast + 列表项消失 + active target 列重拉；按模型清空 → 首次点击仅将按钮换成确认文案（无请求）→ 确认后 `DELETE {"model": …}`
+12. **会话 pin 浮层**：session-sticky 路由的 active target 单元格出现 pin 按钮（其它策略无）；该行无 active target 时单元格只剩该按钮（无 `-`）→ hover 或 Tab 聚焦该按钮出现左侧只读预览（无清除入口，指针在相邻行间扫动时 3 秒内复用快照、不按行发请求；按 A → B → A 的顺序扫过两行后，A 的预览仍显示自己的 pin，不被 B 的响应刷成空）→ 打开浮层 → 预览消失且 Network 面板显示 `GET /api/session-affinity?model=<model>` → 条目含 provider/real_model、key 前 8 位、source、age、expires；活跃 pin 在上、过期残留在下且置灰、TTL 显示「已过期」；`session_ttl_secs = 0` 的路由显示「永不过期」→ 逐条清除 → `DELETE {"key": …}`（body 为全量 32 位）+ toast + 列表项消失 + active target 列重拉；按模型清空 → 首次点击仅将按钮换成确认文案（无请求）→ 确认后 `DELETE {"model": …}`；只让行 B 的 `GET /api/session-affinity?model=B` 失败 → 行 A 的 Tooltip 与浮层仍显示 A 自己的 pin 与条数（不被 B 的错误文案盖住），B 自己的视图则保留上一次列表、错误只在列表下方以非阻塞小字提示
 13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 筛选栏内的会话过滤控件原地变成同一全量 key（截断显示、`title` 为全量）且表格立即重查 → 点控件内 X 后控件回到空态输入框（placeholder）且回到无会话筛选的行集
 14. **会话信息卡三态**：点一条有注册表记录的 Session 列 → 筛选栏与表格之间出现卡片，会话键前 8 位与全量 `title` 与所点行一致、来源徽标 hover 显示首次 / 最近出现、会话 ID 与首条消息为明文 → 点另一段对话的 Session 列 → 新响应返回前卡片已回到降级形态（不会把上一段对话的首条消息显示在新哈希下）→ 粘贴一个无记录的 key 回车 → 卡片仍显示该 key，但只剩会话键 + 降级文案 → 点 X 清除会话过滤 → 卡片整张消失（`v-if`）
 
 ## 变更记录
+- [0012 会话 pin 图标 hover 预览与活跃 pin 置顶/置灰](changes/0012-session-pin-tooltip-and-active-pin-ordering.md)
 - [0011 日志页会话信息卡](changes/0011-logs-session-info-card.md)
 - [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)
 - [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
