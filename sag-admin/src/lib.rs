@@ -15,11 +15,13 @@
 //!   `POST /api/circuit-breaker/close`.
 //! - [`admin_active_targets`] — `GET|DELETE /api/active-targets`.
 //! - [`admin_session_affinity`] — `GET|DELETE /api/session-affinity`.
+//! - [`admin_inflight`] — `GET /api/inflight` (SSE per-route in-flight counters).
 
 pub mod admin;
 pub mod admin_active_targets;
 pub mod admin_circuit_breaker;
 pub mod admin_config;
+pub mod admin_inflight;
 pub mod admin_logs;
 pub mod admin_providers;
 pub mod admin_routes;

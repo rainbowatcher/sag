@@ -12,6 +12,7 @@ use sag_core::{
     TargetStatus, Usage,
 };
 use sag_privacy::RestoreWriter;
+use sag_state::InFlightGuard;
 use std::sync::Mutex;
 use tracing::{info, warn};
 
@@ -505,6 +506,13 @@ struct StreamState<S, E> {
     // disconnect terminal), hence the underscore name.
     analytics: Arc<StreamAnalytics>,
     _guard: TerminalGuard,
+    /// Per-route in-flight guard handed over from the dispatch entry. The
+    /// streamed body owns it from here on: its `Drop` releases the route's
+    /// in-flight count when this state is dropped — normal stream completion
+    /// **and** a client disconnect (body drop) both land here. Declared last
+    /// so the release follows the terminal bookkeeping; it is never released
+    /// manually.
+    _in_flight: InFlightGuard,
 }
 
 /// Construct the shared [`StreamAnalytics`] for one streamed response from
@@ -576,6 +584,7 @@ fn make_stream_state<S, E>(
     loss_summary: Option<String>,
     session_key: Option<String>,
     privacy_restore: Option<RestoreWriter>,
+    in_flight: InFlightGuard,
 ) -> StreamState<S, E> {
     StreamState {
         stream,
@@ -593,6 +602,7 @@ fn make_stream_state<S, E>(
         terminal_pending: false,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
+        _in_flight: in_flight,
     }
 }
 
@@ -923,6 +933,11 @@ pub fn build_streaming_response<S, E>(
     // yield no bytes yet; the tail is flushed at the terminal). `None` yields
     // the encoded bytes unchanged.
     privacy_restore: Option<RestoreWriter>,
+    // The dispatch entry's per-route in-flight guard, moved into the body
+    // state so the count stays held for the whole streamed response and is
+    // released exactly once by that state's `Drop` (client disconnect
+    // included). Never released manually.
+    in_flight: InFlightGuard,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -966,6 +981,7 @@ where
         loss_summary,
         session_key,
         privacy_restore,
+        in_flight,
     );
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -1179,6 +1195,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         )
     }
 
@@ -1507,6 +1524,7 @@ mod tests {
             None,
             None,
             Some(privacy_restore),
+            state.in_flight.acquire("test-route"),
         )
     }
 
@@ -1638,6 +1656,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1861,6 +1880,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1989,6 +2009,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2080,6 +2101,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         // The disconnect: drop the response without polling the body. The
@@ -2166,6 +2188,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2260,6 +2283,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         drop(resp);
@@ -2345,6 +2369,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2452,6 +2477,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2548,6 +2574,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -2628,6 +2655,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         // Drive the body exactly ONE frame with a noop waker: the first poll
@@ -2737,6 +2765,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2843,6 +2872,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -2930,6 +2960,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -3153,6 +3184,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -3274,6 +3306,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -3355,6 +3388,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -3431,6 +3465,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
 
         let mut body = resp.into_body();
@@ -3506,6 +3541,7 @@ mod tests {
             None,
             None,
             None,
+            state.in_flight.acquire("test-route"),
         );
         let mut body = resp.into_body();
         assert_eq!(drain_until_pending(&mut body), 1);
@@ -3567,6 +3603,7 @@ mod tests {
                 None,
                 None,
                 None,
+                state.in_flight.acquire("test-route"),
             );
             let mut body = resp.into_body();
             assert_eq!(drain_until_pending(&mut body), 1, "{encode_name}");

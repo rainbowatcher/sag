@@ -810,6 +810,7 @@ mod tests {
             fill_first_orders: Arc::default(),
             route_counters: Arc::default(),
             session_affinity: Arc::default(),
+            in_flight: Arc::default(),
         };
         let runtime = DispatchRuntime::default();
         (state, runtime, pool)

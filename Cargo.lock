@@ -2027,6 +2027,7 @@ version = "0.8.1"
 dependencies = [
  "axum",
  "chrono",
+ "futures-util",
  "http-body-util",
  "indexmap",
  "reqwest",
@@ -2035,6 +2036,7 @@ dependencies = [
  "sag-core",
  "sag-dispatch",
  "sag-providers",
+ "sag-router",
  "sag-state",
  "serde",
  "serde_json",

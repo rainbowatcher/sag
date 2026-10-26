@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { AlertCircle, Info, Loader2, Plus, Search } from "@lucide/vue"
 import { refDebounced } from "@vueuse/core"
-import { onMounted, ref } from "vue"
+import { onMounted, onUnmounted, ref } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
+import RouteActivityBar from "@/components/routes/RouteActivityBar.vue"
 import RouteAddForm from "@/components/routes/RouteAddForm.vue"
 import RouteList from "@/components/routes/RouteList.vue"
 import { Button } from "@/components/ui/button"
@@ -12,12 +13,14 @@ import { useResponsiveModal } from "@/composables/useResponsiveModal"
 import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useActiveTargetStore } from "@/stores/activeTarget"
+import { useInflightStore } from "@/stores/inflight"
 import { useProviderStore } from "@/stores/providers"
 import { useRouteStore } from "@/stores/routes"
 
 const routeStore = useRouteStore()
 const providerStore = useProviderStore()
 const activeTargetStore = useActiveTargetStore()
+const inflightStore = useInflightStore()
 
 // Dialog on desktop, bottom Drawer on mobile.
 const { Modal } = useResponsiveModal()
@@ -53,6 +56,11 @@ async function refreshPage() {
 }
 
 onMounted(refreshPage)
+
+// Live in-flight counters ride an SSE stream that only exists while this page is
+// mounted; the store keeps the last snapshot, so a remount repaints instantly.
+onMounted(() => inflightStore.start())
+onUnmounted(() => inflightStore.stop())
 </script>
 
 <template>
@@ -115,6 +123,10 @@ onMounted(refreshPage)
     </component>
 
     <div class="min-h-0 flex-1 pt-4 pb-4">
+      <!-- ── Live in-flight badges (above the table) ──────────────── -->
+      <div class="mb-3 shrink-0">
+        <RouteActivityBar />
+      </div>
       <div
         v-if="routeStore.routesLoading && routeStore.routes.length === 0"
         class="text-muted-foreground py-12 text-center"

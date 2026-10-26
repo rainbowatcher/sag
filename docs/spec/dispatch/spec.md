@@ -9,7 +9,7 @@ updated: 2026-10-22
 
 - [sag-dispatch/src/dispatch/chat/](../../../sag-dispatch/src/dispatch/chat/) — 聊天补全分发模块（主调度、尝试结果与事实构造、空响应校验、translated 终点帧桥接）
 - [sag-dispatch/src/dispatch/image.rs](../../../sag-dispatch/src/dispatch/image.rs) — 图片生成分发
-- [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理（`StreamAnalytics` 共享状态、`TerminalGuard` 三路终点分类）
+- [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理（`StreamAnalytics` 共享状态、`TerminalGuard` 三路终点分类、`StreamState._in_flight` 持 per-route 在途 guard）
 - [sag-core/src/protocol.rs](../../../sag-core/src/protocol.rs) — `is_client_terminal_frame`：三协议终点帧的字节级判定
 - [sag-dispatch/src/dispatch/mod.rs](../../../sag-dispatch/src/dispatch/mod.rs) — `failure_log`、`success_log` 等日志构造函数
 - [sag-dispatch/src/dispatch/retry.rs](../../../sag-dispatch/src/dispatch/retry.rs) — 重试退避逻辑 + `is_retryable_error` 错误分类判定
@@ -152,6 +152,7 @@ translated 路径（ingress 协议 ≠ upstream 协议）下，upstream 不会�
 - drop-as-success 行必须携带 usage / `ttft_ms` / `upstream_duration_ms`；error 与 cancel 行这些列保持 NULL
 - Anthropic `message_stop` / Responses `response.completed` 桥接（`#2` / `#3`）必须位于 empty-peek 之后；Chat `data: [DONE]` 桥接（`#1`）必须位于 peek 之前（靠 Empty 特判）；native 透传路径字节恒等
 - 桥接 `#2` / `#3` 仅在首个 `End` 且未见过 `Finish` 时合成 `Finish { finish_reason: None }`；合规上游不得因此多出 `message_delta` / `response.completed`
+- 每请求在途计数（`InFlightGuard`）在 `dispatch_chat` / `dispatch_image` 入口 acquire，只由 `Drop` 释放；流式路径必须把 guard 移交 `StreamState._in_flight`（`build_streaming_response` 的 `in_flight` 参数），不得留在 dispatch 栈帧上——否则响应返回即释放，整条流的传输时间不被计入。计数器与 `AppState` 共享同一 `Arc`（见 [admin 0003](../admin/changes/0003-per-route-in-flight-counters-sse.md)）
 
 ## 测试策略
 

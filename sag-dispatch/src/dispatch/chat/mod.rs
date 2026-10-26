@@ -179,6 +179,19 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         mut session_writeback,
     } = ctx;
 
+    // Per-route in-flight guard: `+1` for this request, held for the whole
+    // dispatch. Non-streaming / error paths drop it with this stack frame;
+    // the streaming path moves it into the response body state (see
+    // `build_streaming_response`), so a client disconnect releases it too.
+    // Counted under the route's `model_name` (`route_name`) from the start of
+    // privacy filtering / retry scheduling — the request is genuinely in
+    // flight even while backoff sleeps between targets.
+    //
+    // No underscore prefix: the streaming arm below moves the guard into the
+    // response body state; the non-streaming paths only ever drop it with
+    // this frame.
+    let in_flight = runtime.in_flight.acquire(route_name);
+
     // ── Privacy filter ─────────────────────────────────────────────────
     // Snapshot the config once per request (the privacy section here, the
     // retry schedule and the circuit-breaker lookups below all read from the
@@ -1067,6 +1080,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         encode_aware_loss_summary(),
                         session_log_key.clone(),
                         privacy_restore.take(),
+                        in_flight,
                     );
                 }
                 if is_responses_ingress {
@@ -1093,6 +1107,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         encode_aware_loss_summary(),
                         session_log_key.clone(),
                         privacy_restore.take(),
+                        in_flight,
                     );
                 }
                 return build_streaming_response(
@@ -1118,6 +1133,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     encode_aware_loss_summary(),
                     session_log_key.clone(),
                     privacy_restore.take(),
+                    in_flight,
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {

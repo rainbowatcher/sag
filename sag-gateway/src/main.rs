@@ -152,6 +152,11 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
     // for the next dispatch request to observe the `routes_version` change.
     let route_counters: sag_router::RouteCounters = Arc::default();
 
+    // Per-route in-flight counter. Shared the same way: dispatch acquires the
+    // guards and the management layer subscribes to the snapshot channel —
+    // both sides must hold the same registry, never two instances.
+    let in_flight: sag_state::InFlight = Arc::default();
+
     let app_state = sag_router::AppState {
         config: config_handle.clone(),
         providers: provider_registry,
@@ -164,17 +169,19 @@ async fn run(config_path: &str) -> anyhow::Result<()> {
         fill_first_orders: fill_first_orders.clone(),
         route_counters: route_counters.clone(),
         session_affinity: session_affinity.clone(),
+        in_flight: in_flight.clone(),
     };
     // `with_shared_state` shares the same Arcs (rather than creating
     // defaults) so AppState and DispatchRuntime observe the same breaker,
-    // the same sticky memory, the same fill-first order cache, and the same
-    // round-robin counters.
+    // the same sticky memory, the same fill-first order cache, the same
+    // round-robin counters, and the same in-flight registry.
     let dispatch_runtime = sag_router::DispatchRuntime::with_shared_state(
         circuit_breaker.clone(),
         active_targets,
         fill_first_orders,
         route_counters,
         session_affinity,
+        in_flight,
     );
 
     // 9. Start config hot-reload watcher with a coordinator-backed handler

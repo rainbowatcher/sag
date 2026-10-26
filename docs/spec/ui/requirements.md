@@ -16,7 +16,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 | 层面 | 技术 |
 |------|------|
 | 页面路由 | Vue Router，6 个路由：Dashboard（`/`）、Providers（`/providers`）、Routes（`/routes`）、Analytics（`/analytics`）、Logs（`/logs`）、Connect（`/connect`） |
-| 状态管理 | Pinia stores：`connection`、`health`、`providers`、`routes`、`analytics`、`sessionAffinity` |
+| 状态管理 | Pinia stores：`connection`、`health`、`providers`、`routes`、`analytics`、`sessionAffinity`、`inflight` |
 | 组件库 | shadcn-vue + Tailwind CSS v4 |
 | 图表 | Chart.js via vue-chartjs |
 | 构建 | Vite 6，产物通过 `rust-embed` 内嵌到 gateway 二进制；`chart.js` / `vue-chartjs` 单独拆为 `vendor-chart` chunk，只随 `/analytics` 路由懒加载（不进首屏 preload） |
@@ -90,6 +90,9 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 会话 pin 观测：`strategy = session_sticky` 的路由在 Active Target 单元格的 target 按钮右侧另挂一个图标按钮（`KeyRound`），点击打开会话 pin 浮层；其它策略不渲染该按钮，该路由没有 active target 时按钮仍然存在（**此口径已由 0012 修改**：session-sticky 行没有 active target 时单元格**只渲染钥匙 icon，不再渲染 `-` 占位**；其它策略该列仍为 `-`，列语义仍是「当前目标」，只是不再为 session-sticky 行补一个无信息的占位）
 - 会话 pin 浮层按该行的 `model_name` 拉 `GET /api/session-affinity?model=<model>`：头部显示模型空间名与 pin 条数，每条列出 `provider/real_model`、会话 key 前 8 位（`title` 保留全量 32 位）、来源 `source`、存活时长（`age_secs`）、剩余有效期（`expires_in_secs`；`session_ttl_secs = 0` 即 `expires_in_secs = null` 时显示「永不过期」）；加载中 / 无 pin / 请求失败各有提示，列表区限高滚动
 - 会话 pin 清除有两条路径：逐条清除走 `DELETE /api/session-affinity {"key": …}`；「清空此模型全部」为两步确认（第一步按钮替换为「清空 N 条？」+ Cancel/清空），确认后走 `DELETE {"model": …}`。两条路径成功后均 toast（逐条显示 key 前 8 位，按模型显示 `deleted` 条数）、重新拉取该模型空间的 pin，并回调列表重拉 active targets（pin 被清后下一跳目标会变）；失败 toast 展示后端错误消息
+- 路由表格上方常显一行实时活动徽章（数据来自 `GET /api/inflight` 的 SSE 流）：左侧 `◉ 处理中 N`（N = 快照 `total`）+ 标题内联 Info Tooltip，右侧为各活跃 route 的徽章（`model_name` 等宽字体、超长截断、Tooltip 显示全量，后跟 `×count`，带一个脉冲绿点）；**仅列出 `count > 0` 的 route**，按 `count` 降序
+- 快照确认全零（`routes` 为空且 `total === 0`）时显示「空闲 — 无正在处理的请求」占位；首帧到达前整行不渲染（没有快照时不声称 0）
+- 实时流的断开态：保留最后一份快照并标 `stale`——徽章置灰、绿点变灰、右侧显示「连接断开，重连中…」（Tooltip 说明计数可能过期），**计数不清零**；恢复后自动回到实时态。401/403 走共享 `handle401()` 并停止重连（不留在「重连中」无限重试）
 - 会话 pin hover 预览（0012）：钥匙 icon **hover 即出只读 Tooltip**（`side="left"`），内容与浮层同源——标题 + pin 条数 + 加载中 / 无 pin / 请求失败三态 + pin 列表（`provider/real_model`、key 前 8 位、`source`、剩余 TTL）；预览里**没有任何清除入口**，破坏性动作只在点击后的浮层里；浮层处于打开态时 Tooltip 被禁用，两者不同时出现
 - 会话 pin 排序与置灰（0012）：Tooltip 与浮层共用同一份排序，按存活性分组——活跃 pin（`expires_in_secs === null` 即 `session_ttl_secs = 0`、或 `> 0`）全部置顶，过期残留（`<= 0`）排在后面并置灰；组内保持后端返回的相对顺序（stable sort）。剩余有效期文案新增第四态：`<= 0` 显示「已过期」（复用既有 key `common.expired`，不新增 i18n key）
 - 会话 pin 预览的拉取节流（0012）：hover 触发的拉取有 **3 秒节流**——`store.loading` 中跳过、距上次拉取完成不足 `HOVER_REFRESH_MS`（3000ms）也跳过，因此指针扫过一整列路由不会一行发一个请求；点击打开浮层时**总是重新拉取**（不走节流），保证看到的是当下状态
@@ -184,12 +187,13 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 ### 包含
 
 - 6 个页面路由（Dashboard、Providers、Routes、Analytics、Logs）+ Connect 入口
-- Pinia 状态管理（connection、health、providers、routes、analytics、sessionAffinity）
+- Pinia 状态管理（connection、health、providers、routes、analytics、sessionAffinity、inflight）
 - shadcn-vue 组件库集成
 - Chart.js 图表（折线图、饼图）
 - 亮/暗主题切换
 - 多语言支持（en / zh）：语言偏好可切换、可持久化，文案统一收敛到字典
 - 与 SAG 管理 API 的 HTTP 通信（含会话亲和观测/清除：`GET|DELETE /api/session-affinity`）
+- 实时在途计数：路由页经 `GET /api/inflight` 的 SSE 长连接展示各路由在途请求数（只读，不写任何状态）
 - 固定高度布局：页面整体固定为视口高度，仅表格和图表容器内部滚动，页面头部和筛选栏保持可见
 - 大屏幕（`xl:`、`2xl:` 断点）响应式优化
 - 移动端（<768px）弹框以底部抽屉呈现，桌面端保持 Dialog
@@ -215,6 +219,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)
 - [0012 会话 pin 图标 hover 预览与活跃 pin 置顶/置灰](changes/0012-session-pin-tooltip-and-active-pin-ordering.md)
 - [0011 日志页会话信息卡](changes/0011-logs-session-info-card.md)
 - [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)

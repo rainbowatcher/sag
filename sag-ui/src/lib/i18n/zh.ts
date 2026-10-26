@@ -556,6 +556,13 @@ export const zh: Record<keyof typeof en, string> = {
   "routeList.loadFailed": "加载数据失败",
   "routeList.empty": "尚未配置路由。点击“添加路由”开始。",
 
+  "routeActivity.processing": "处理中 {count}",
+  "routeActivity.processingTitle": "全部路由的实时在途请求数",
+  "routeActivity.idle": "空闲 — 无正在处理的请求",
+  "routeActivity.reconnecting": "连接断开，重连中…",
+  "routeActivity.staleHint": "实时推送已断开，下方为最后一次收到的快照，可能已经过期。",
+  "routeActivity.routeTitle": "{model} — {count} 个在途请求",
+
   "settings.page.description": "代理与客户端认证的网关级配置。",
   "settings.loadingSettings": "加载设置中...",
   "settings.loadingConfig": "加载配置中...",

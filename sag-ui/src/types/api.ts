@@ -741,3 +741,27 @@ export interface AnalyticsV2Query {
   /** Trend only: leading series to keep (default 20, server cap 50). */
   top?: number
 }
+
+/**
+ * One route's live in-flight request count. Delivered by the
+ * `GET /api/inflight` SSE stream (`event: inflight`).
+ */
+export interface InflightRouteCount {
+  /** Route (request model) name, exactly as configured. */
+  model_name: string
+  /** Requests currently being served on this route (the UI shows only `> 0`). */
+  count: number
+}
+
+/**
+ * Full in-flight snapshot pushed on connect and again on every change, so the
+ * client can replace its local state instead of merging deltas.
+ */
+export interface InflightSnapshot {
+  /** Monotonic sequence number of this snapshot, shared by every connection. */
+  seq: number
+  /** Total in-flight requests across all routes. */
+  total: number
+  /** Per-route counts, already sorted by `count` descending by the backend. */
+  routes: InflightRouteCount[]
+}

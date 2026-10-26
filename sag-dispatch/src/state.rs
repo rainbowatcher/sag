@@ -57,6 +57,14 @@ pub struct DispatchRuntime {
     /// [`DispatchRuntime::with_shared_state`]) so admin mutations — e.g. a
     /// manual breaker close — are immediately visible to dispatch ordering.
     pub circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
+    /// Per-route in-flight request counter, shared with [`AppState`] via the
+    /// same `Arc` (injected through [`DispatchRuntime::with_shared_state`])
+    /// so the live-activity observer in the management layer sees the counts
+    /// dispatch acquires here. Dispatch acquires one guard per request at the
+    /// `dispatch_chat` / `dispatch_image` entry (keyed by the route's
+    /// `model_name`) and releases it through the guard's `Drop` — the stream
+    /// path moves it into the response body state.
+    pub in_flight: sag_state::InFlight,
     /// Last routes version seen by the prune guard. When this matches
     /// [`sag_config::ConfigHandle::routes_version`] the prune is skipped entirely,
     /// avoiding three write-lock acquisitions on every request.
@@ -71,28 +79,31 @@ impl Default for DispatchRuntime {
             active_targets: Arc::default(),
             session_affinity: Arc::default(),
             circuit_breaker: Arc::default(),
+            in_flight: Arc::default(),
             last_prune_version: Arc::new(AtomicU64::new(0)),
         }
     }
 }
 
 impl DispatchRuntime {
-    /// Construct a `DispatchRuntime` that shares the given circuit-breaker
-    /// and sticky-failover active-target `Arc`s (instead of creating its
-    /// own defaults). Used by `main.rs` so that `AppState` and
+    /// Construct a `DispatchRuntime` that shares the given circuit-breaker,
+    /// sticky-failover active-target, ordering-cache, round-robin-counter,
+    /// session-affinity and in-flight `Arc`s (instead of creating its own
+    /// defaults). Used by `main.rs` so that `AppState` and
     /// `DispatchRuntime` observe the *same* live breaker and the *same*
     /// sticky memory — admin mutations to `active_targets` (e.g. clearing
     /// sticky routing when a breaker is manually closed) are immediately
-    /// visible to dispatch ordering.
+    /// visible to dispatch ordering, and the in-flight counts dispatch
+    /// acquires here are the ones the live-activity endpoint publishes.
     ///
-    /// All other fields (counters, ordering cache, prune version) are
-    /// initialized to their defaults.
+    /// The prune version is the only field initialized to its default.
     pub fn with_shared_state(
         circuit_breaker: Arc<RwLock<RouteCircuitBreaker>>,
         active_targets: sag_state::ActiveTargets,
         fill_first_orders: sag_state::FillFirstOrders,
         route_counters: sag_state::RouteCounters,
         session_affinity: sag_state::SessionAffinity,
+        in_flight: sag_state::InFlight,
     ) -> Self {
         Self {
             circuit_breaker,
@@ -100,6 +111,7 @@ impl DispatchRuntime {
             fill_first_orders,
             route_counters,
             session_affinity,
+            in_flight,
             ..Default::default()
         }
     }
@@ -576,6 +588,46 @@ mod tests {
         assert!(rt.fill_first_orders.read().await.contains_key("gpt-4.1"));
         assert!(rt.route_counters.read().await.contains_key("gpt-4.1"));
         assert!(rt.active_targets.read().await.contains_key("gpt-4.1"));
+    }
+
+    // ── shared-state wiring tests ──────────────────────────────────
+
+    /// `main.rs` injects the **same** `Arc`s into `AppState` and
+    /// `DispatchRuntime` through [`DispatchRuntime::with_shared_state`]. This
+    /// locks that wiring contract for the in-flight registry: dispatch
+    /// acquires the guards, the management layer subscribes to the snapshot
+    /// channel — two separate registries would silently publish an
+    /// always-zero snapshot while requests are actually running.
+    #[tokio::test]
+    async fn with_shared_state_shares_the_in_flight_registry() {
+        let config = sag_config::GatewayConfig {
+            providers: HashMap::new(),
+            routes: vec![],
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let state =
+            sag_state::testing::test_app_state(handle, Arc::new(RwLock::new(HashMap::new()))).await;
+
+        let runtime = DispatchRuntime::with_shared_state(
+            state.circuit_breaker.clone(),
+            state.active_targets.clone(),
+            state.fill_first_orders.clone(),
+            state.route_counters.clone(),
+            state.session_affinity.clone(),
+            state.in_flight.clone(),
+        );
+
+        assert!(
+            Arc::ptr_eq(&state.in_flight, &runtime.in_flight),
+            "AppState and DispatchRuntime must observe the same in-flight registry"
+        );
+        // A guard acquired through the runtime must be visible on the state
+        // handle — the behaviour the shared `Arc` exists for.
+        let guard = runtime.in_flight.acquire("route-a");
+        assert_eq!(state.in_flight.snapshot().total, 1);
+        drop(guard);
+        assert_eq!(state.in_flight.snapshot().total, 0);
     }
 
     // ── stale_probe_threshold_from_config tests ────────────────────

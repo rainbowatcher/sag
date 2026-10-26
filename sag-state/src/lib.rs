@@ -22,6 +22,11 @@ use tokio::sync::RwLock;
 pub mod config_mutation;
 pub use config_mutation::{ConfigMutationCoordinator, FileRevision, MutationReport};
 
+pub mod inflight;
+pub use inflight::{
+    InFlight, InFlightGuard, InFlightRegistry, InFlightRouteCount, InFlightSnapshot,
+};
+
 pub mod session_affinity;
 pub use session_affinity::{
     DEFAULT_SESSION_MAX_ENTRIES, DEFAULT_SESSION_TTL_SECS, SessionAffinity, SessionAffinityInner,
@@ -537,6 +542,15 @@ pub struct AppState {
     /// generation-checked [`SessionWriteback`]; the admin layer observes
     /// and clears it through `/api/session-affinity`.
     pub session_affinity: SessionAffinity,
+    /// Per-route in-flight request counter, shared with `DispatchRuntime`
+    /// via the same `Arc`. Dispatch acquires a guard per request (streamed
+    /// responses move it into the body state, so a client disconnect
+    /// releases it) and publishes a snapshot on every change; the admin
+    /// layer observes it through [`InFlightRegistry::subscribe`] for the
+    /// live-activity endpoint. Counts are keyed by route `model_name` and
+    /// zero-count keys are removed, so the snapshot only lists routes with
+    /// requests actually in flight.
+    pub in_flight: InFlight,
 }
 
 impl AppState {
@@ -689,6 +703,7 @@ pub mod testing {
             fill_first_orders: Arc::default(),
             route_counters: Arc::default(),
             session_affinity: Arc::default(),
+            in_flight: Arc::default(),
         }
     }
 

@@ -29,6 +29,8 @@ updated: 2026-10-22
 
 **失败路径**在写入 `call_logs` 时携带 `request.reasoning_effort`，确保失败请求的推理意图可被审计——与成功路径一致。图片生成路径传 `None`（不适用）。
 
+**在途计数**：每次派发在入口对所属路由的 `model_name` 计一（早于隐私过滤与重试调度，含退避 sleep），整条生命周期结束时自动释放；流式请求把计数持有者交给响应体，客户端断连同样释放。计数是进程内只读观测设施，不进 `call_logs`、不影响路由选择，经 `GET /api/inflight` 对外（见 [管理 API → 0003](../admin/changes/0003-per-route-in-flight-counters-sse.md)）。
+
 ### 重试退避
 
 每次重试前等待指数退避延迟：
@@ -128,6 +130,7 @@ updated: 2026-10-22
 
 ## 变更记录
 
+- [0003 per-route 在途计数与 `GET /api/inflight` SSE 端点](../admin/changes/0003-per-route-in-flight-counters-sse.md)（跨模块：入口 acquire + 流式 guard 移交 `StreamState`）
 - [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — 终点帧转发后的客户端断连改记成功（499 计数下降、成功计数上升），并补 drop-as-success 行的 usage / TTFT / upstream 时长，以及三条 translated 终点帧桥接（`[DONE]` / `message_stop` / `response.completed`）与不合规上游的块闭合 / `stop_reason`
 - [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，保留非流式 request-level、流式 TTFB 和 chunk idle timeout
 - [0001 4xx Failover 归因策略](../failover-4xx-policy/changes/0001-4xx-attribution-policy.md)（跨模块：4xx 归因三分 + 403-quota 重分类）

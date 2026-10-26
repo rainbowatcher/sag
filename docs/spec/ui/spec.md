@@ -26,12 +26,13 @@ updated: 2026-10-26
 - [sag-ui/src/stores/routes.ts](../../../sag-ui/src/stores/routes.ts) — Route CRUD + provider models 懒加载
 - [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — Stats、Logs、Cache、Trend、Distribution 查询 + 分页状态管理
 - [sag-ui/src/stores/sessionAffinity.ts](../../../sag-ui/src/stores/sessionAffinity.ts) — 会话亲和 pin 的查询（`GET /api/session-affinity`）与清除（按 `key` / 按 `model`）；查询带单调 `generation` 竞态 token，成功路径经 `mergeSessionEntries` 按 model 换桶（`{ model }` 只替换该 model 的桶，全量拉取整体替换），失败路径保留上一次成功数据、只写该次 fetch 作用域的 `error`（`{ scope?: string; message: string } | null`，`scope` 为 `params.model`，全量拉取为 `undefined`；启动 / 成功只清除同 scope）；删除自身不 refetch
+- [sag-ui/src/stores/inflight.ts](../../../sag-ui/src/stores/inflight.ts) — 实时在途计数 store（`GET /api/inflight` SSE）：`snapshot` / `connected` / `stale` + 派生 `activeRoutes` / `total` / `hasTraffic`；`start()` 组装头（axios 默认头 + `x-api-key`）并只消费 `event === "inflight"` 帧，401/403 → `handle401()` 且停止重连；`stop()` 关闭流但保留快照；SSE client 存在闭包中（不进 reactive state）
 
 ### 页面
 
 - [sag-ui/src/pages/DashboardPage.vue](../../../sag-ui/src/pages/DashboardPage.vue) — 仪表板：统计卡片 + Token/Calls 趋势折线图 + 调用分布饼图
 - [sag-ui/src/pages/ProvidersPage.vue](../../../sag-ui/src/pages/ProvidersPage.vue) — Provider 列表页（组合 ProviderList + ProviderAddForm）
-- [sag-ui/src/pages/RoutesPage.vue](../../../sag-ui/src/pages/RoutesPage.vue) — Route 列表页（组合 RouteList + RouteAddForm）
+- [sag-ui/src/pages/RoutesPage.vue](../../../sag-ui/src/pages/RoutesPage.vue) — Route 列表页（组合 RouteActivityBar + RouteList + RouteAddForm；挂载时 `inflightStore.start()`、卸载时 `stop()`）
 - [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) — 用量统计（Stats + Cache 双 Tab）
 - [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（表格 + 筛选 + 分页；Client 列之后为 Session 列，点击单元格即套用会话筛选；应用会话过滤时在筛选栏与表格之间渲染 `SessionInfoCard`）
 - [sag-ui/src/pages/ConnectPage.vue](../../../sag-ui/src/pages/ConnectPage.vue) — 连接配置页面
@@ -42,6 +43,7 @@ updated: 2026-10-26
 - [sag-ui/src/components/providers/ProviderList.vue](../../../sag-ui/src/components/providers/ProviderList.vue) — Provider 列表（TanStack Table）
 - [sag-ui/src/components/providers/ProviderAddForm.vue](../../../sag-ui/src/components/providers/ProviderAddForm.vue) — Provider 添加表单
 - [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
+- [sag-ui/src/components/routes/RouteActivityBar.vue](../../../sag-ui/src/components/routes/RouteActivityBar.vue) — 表格上方的实时活动徽章行：`◉ 处理中 N` + 标题内联 Info Tooltip、逐 route 徽章（脉冲绿点 + 等宽 `model_name` 截断 + `×count`）、`stale` 置灰 + 「连接断开，重连中…」、全零时「空闲」占位、无快照时整行不渲染
 - [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）；active target 单元格在 session_sticky 行无 active target 时不再渲染 `-` 占位，只返回该行的 pin 浮层（非 session_sticky 行无 active target 时仍渲染 `-`，其 pin 浮层为 `null`）
 - [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
 - [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries；新增走浮窗批量选择）
@@ -49,6 +51,8 @@ updated: 2026-10-26
 - [sag-ui/src/components/routes/SessionAffinityPopover.vue](../../../sag-ui/src/components/routes/SessionAffinityPopover.vue) — 会话 pin 浮层（props `model`，emit `changed`）：展示某请求模型空间的 pin（provider/real_model、key 前 8 位、source、age、剩余 TTL）+ 逐条清除 + 按模型两步确认清空；钥匙 icon 另包一层 `Tooltip :disabled="open"`（`@mouseenter="ensureFresh" @focus="ensureFresh"`）做只读 hover/聚焦预览（`side="left"`，无清除入口），两份列表共用 `sortedRows`（活跃顶置、过期置灰），hover/聚焦拉取受 `HOVER_REFRESH_MS = 3000` 节流；错误态按 scope 取值（`errorForModel(store.error, props.model)`）且 **rows 优先渲染**：`rows.length > 0` 时始终出列表，同 scope 错误降级为列表下方非阻塞小字提示，`rows` 为空才走 loading → 同 scope error → 空态
 - [sag-ui/src/components/SessionInfoCard.vue](../../../sag-ui/src/components/SessionInfoCard.vue) — 会话信息卡（props `session` / `sessionKey`）：会话键 + 来源徽标 + 会话 ID + 首条消息，首末时间在来源 tooltip；`session === null` 时降级为「只有会话键 + 降级文案」
 - [sag-ui/src/lib/sessionInfo.ts](../../../sag-ui/src/lib/sessionInfo.ts) — 会话卡的展示纯函数：来源收窄、空值占位（`—`）、preview 折叠与截断、时间格式化
+- [sag-ui/src/lib/sse.ts](../../../sag-ui/src/lib/sse.ts) — 通用 SSE 客户端（`fetch` + `ReadableStream`）：`createSseParser`（跨 chunk 分帧、`: ping` 注释、多行 `data`、flush 尾帧）、`nextRetryDelay`（指数退避 + 封顶）、`headersFromDefaults`、`SseHttpError` / `isAuthFailure`（401/403）、`createSseClient`（单飞循环 + `stop()` abort + `running` 闸保证 stop 后零投递）
+- [sag-ui/src/lib/inflight.ts](../../../sag-ui/src/lib/inflight.ts) — 在途计数的纯函数：`emptyInflightState`、`parseInflightSnapshot`（容错解析 + 本地降序）、`applySnapshot`（整体替换 + 清 `stale`）、`markConnected` / `markDisconnected`（保留快照标 `stale`）、`activeRouteCounts`（仅 `count > 0`）、`resolveSseUrl`
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
 
 ### 工具函数与类型
@@ -65,7 +69,7 @@ updated: 2026-10-26
 ### 多语言（i18n）
 
 - [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
-- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，601 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，607 key），key 为稳定英文标识符
 - [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
 - [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
 - [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
@@ -270,6 +274,30 @@ flowchart TD
 - ❌ 跨模型空间会瞬时陈旧：按 `key` 删除会连带删除其它空间里的同 key pin（`DELETE { key }` 不区分 space），但其它浮层已加载的条目要等下次打开才更新
 - ❌ 节流窗口内看到的可能是 ≤3 秒前的数据：hover 预览是「顺手看一眼」的近似值，需要当下状态时点击打开浮层（后者总是重新拉取）；代价换指针扫过整列时不按行发请求
 
+### 实时在途计数：`fetch` + `ReadableStream` 自读 SSE vs `EventSource`
+
+`EventSource` 无法附加请求头，而 `/api/*` 需要 `Authorization: Bearer`。`lib/sse.ts` 用 `fetch`
+自读字节流并自己做分帧与重连，因此认证、退避、停止语义全部可控。
+
+**Trade-off**:
+- ✅ 能带认证头（`Authorization` 来自 axios 默认头，`x-api-key` 来自 connection store）
+- ✅ 401/403 可结构化地交给共享 `handle401()` 并**停止重连**；`EventSource` 只会不透明地自动重连，刷错的 key 会让页面永远停在「重连中」
+- ✅ `stop()` 能真正 abort 在飞请求与待触发的重试定时器，不留下僵尸连接
+- ✅ 分帧器可单测（node test runner 不需要浏览器）：跨 chunk 的 CRLF、`flush()` 尾帧、多行 `data` 都能钉住
+- ❌ 得自己实现规范里的一小块（分帧 + 退避），且 `Accept` 必须写在请求头 spread **之后**——axios 默认头里的 `Accept: application/json` 会盖掉 SSE 握手头（已由测试钉住）
+- ❌ 无浏览器原生「自动重连 + Last-Event-ID」语义，本端点每帧都是全量快照，因此刻意不使用 `Last-Event-ID`
+
+### 全量快照替换 vs 增量合并
+
+后端每帧都推完整快照，store 只做整体替换（`applySnapshot`），并在同一处清除 `stale`。
+
+**Trade-off**:
+- ✅ 丢帧、乱序、重连都不需要补偿逻辑，快照幂等
+- ✅ `stale` 的清除点只有一个（收到新快照 = 界面与网关重新一致的唯一证据），不会出现「连上了但还标着旧数据」
+- ✅ 断线时保留快照而不清零：重连中的面板显示 `0` 会误报「没有在途请求」
+- ❌ 每帧的渲染开销随活跃 route 数增长（数十条量级可忽略）
+- ❌ 无法用 `seq` 做局部更新，未来若改成增量事件需要同时维护两套消费路径
+
 ### TanStack Table vs shadcn-vue Table
 
 ProviderList 和 RouteList 使用 TanStack Table，LogsPage 和 AnalyticsPage 使用 shadcn-vue Table 组件。
@@ -391,6 +419,14 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **只读预览不得出现清除入口**：`SessionAffinityPopover` 的 `TooltipContent` 只读（标题 + 条数 + 三态 + pin 列表），清除按钮只存在于 `PopoverContent`。不得把逐条清除 / 按模型清空搬进 hover 预览——指针扫过时误点就会丢掉活跃会话
 - **pin 活跃判定固定为 `expires_in_secs === null || > 0`**：由 `lib/sessionAffinity.ts` 的 `isPinActive()` 单点定义，Tooltip 与浮层的排序（`sortPins`）和置灰共用它。不得写成 `>= 0`：倒计时为 0 的 pin 已经过期，显示为活跃会让运维误判会话仍粘在该目标上
 - **hover 拉取必须节流，浮层打开必须重拉**：`ensureFresh()` 在 `store.loading` 或距上次拉取完成不足 `HOVER_REFRESH_MS`（3000ms）时直接返回，`watch(open)` 走的 `refresh()` 不受节流限制。取数触发点固定为 `@mouseenter` 与 `@focus` 两个（键盘 Tab 聚焦钥匙 icon 同样拉取）——去掉节流会让指针扫过一列路由按行发请求；把浮层打开也纳入节流则可能展示 ≤3 秒前的陈旧 pin；漏掉 `@focus` 会让键盘用户永远停在占位态
+- **实时在途计数只展示 `count > 0` 的 route**：`activeRouteCounts()` 过滤是单点定义，徽章行不得渲染零计数项；后端已删零计数键，前端过滤是纵深防御
+- **首帧到达前不渲染徽章行**：`snapshot === null` 时整行 `v-if` 不成立。不得在没有快照时渲染「处理中 0」或「空闲」——那是把「未知」谎报成「没有流量」
+- **断线保留快照并标 `stale`，不清零**：`markDisconnected()` 保留 `snapshot` 且 `stale = snapshot !== null`；`stale` 只能在收到新快照（`applySnapshot`）时清除。流断开时徽章置灰 + 「连接断开，重连中…」，不得归零
+- **「空闲」需 `routes` 与 `total` 同时为零**：`RouteActivityBar` 的 `idle` 判定必须两者同时成立且 `!stale`。若一条 route 条目被解析丢弃，两个数字会不一致，此时必须显示「处理中 N」而不是自相矛盾地喊空闲
+- **SSE 请求头顺序**：`Accept: text/event-stream` 必须写在 caller headers 的 spread **之后**。写成 `{ Accept: ..., ...headers }` 会被 axios 默认的 `Accept: application/json` 盖掉，握手失败
+- **SSE 认证失败不得重连**：`isAuthFailure()` 判 401/403 → 先 `client.stop()` 再 `handle401()`，`onError` 直接返回。不得让 401 进入退避重试
+- **`stop()` 之后零投递**：`consume()` 内每个 `onEvent` 调用前必须过 `running` 闸。一个在 `stop()` 之后才 settle 的 `read()` 不得把已卸载的面板重新点亮（会清掉 `stale`）
+- **SSE client 不得放进 reactive state**：`createSseClient` 的实例是资源而非数据，存在 store 闭包里；放进 `ref` 会被 Vue 深度 proxy 包一层
 - **Logs 会话筛选单一状态源**：Session 列点击必须走 `applySessionFilter()` → 写 `logsFilterSession` → `refreshLogs()`，与筛选栏内的会话过滤控件（空态内嵌输入框、有值内联显示 + 清空 X）、`clearSessionFilter()` 同源。不得为该列另建一套过滤状态（会出现控件与列不同步）
 
 ## 测试策略
@@ -399,7 +435,7 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 
 | 层面 | 方法 | 工具 |
 |------|------|------|
-| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界、`shortSessionKey` 截断边界、`isPinActive` 存活性边界、`sortPins` 活跃顶置与组内 stable、`mergeSessionEntries` 按 model 换桶 / 全量替换 / 空桶 / 不改入参、`errorForModel` 按 scope 取值：同 scope 命中 / 他行 scope 不命中 / 全量拉取的 `undefined` scope 不命中单行 / `error` 为 `null`） | node test runner |
+| 单元测试 | `pnpm -C sag-ui test`（i18n 边界/回退/键齐平/脏 locale、表单校验消息 locale 切换、activeTarget 边界、`shortSessionKey` 截断边界、`isPinActive` 存活性边界、`sortPins` 活跃顶置与组内 stable、`mergeSessionEntries` 按 model 换桶 / 全量替换 / 空桶 / 不改入参、`errorForModel` 按 scope 取值：同 scope 命中 / 他行 scope 不命中 / 全量拉取的 `undefined` scope 不命中单行 / `error` 为 `null`、SSE 分帧器（单帧 / 跨 chunk / 一 chunk 多帧 / 心跳注释 / CRLF / 多行 data / flush 尾帧与尾随孤立 CR）、`nextRetryDelay` 退避表、`headersFromDefaults` 只取字符串头、连接循环（头转发与 `Accept` 覆盖 / 断线重连 / `stop()` 中止与零投递）、`parseInflightSnapshot` 容错（非法 JSON / 非对象 / 缺 `seq` / 坏条目跳过 / 未知字段 / `total` 兜底 / 本地降序）、`applySnapshot` 整体替换与清 `stale`、`markConnected` / `markDisconnected` 保留快照、`activeRouteCounts` 只留 `count > 0`、`resolveSseUrl` 拼接） | node test runner |
 | i18n 门禁 | `just ui-i18n-check`（`pnpm -C sag-ui run check:i18n`） | node + check-i18n.mjs |
 | 类型检查 | `pnpm typecheck`（vue-tsc） | TypeScript 编译器 |
 | 代码风格 | `pnpm lint`（oxlint）、`pnpm format`（oxfmt） | oxlint / oxfmt |
@@ -424,8 +460,11 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 12. **会话 pin 浮层**：session-sticky 路由的 active target 单元格出现 pin 按钮（其它策略无）；该行无 active target 时单元格只剩该按钮（无 `-`）→ hover 或 Tab 聚焦该按钮出现左侧只读预览（无清除入口，指针在相邻行间扫动时 3 秒内复用快照、不按行发请求；按 A → B → A 的顺序扫过两行后，A 的预览仍显示自己的 pin，不被 B 的响应刷成空）→ 打开浮层 → 预览消失且 Network 面板显示 `GET /api/session-affinity?model=<model>` → 条目含 provider/real_model、key 前 8 位、source、age、expires；活跃 pin 在上、过期残留在下且置灰、TTL 显示「已过期」；`session_ttl_secs = 0` 的路由显示「永不过期」→ 逐条清除 → `DELETE {"key": …}`（body 为全量 32 位）+ toast + 列表项消失 + active target 列重拉；按模型清空 → 首次点击仅将按钮换成确认文案（无请求）→ 确认后 `DELETE {"model": …}`；只让行 B 的 `GET /api/session-affinity?model=B` 失败 → 行 A 的 Tooltip 与浮层仍显示 A 自己的 pin 与条数（不被 B 的错误文案盖住），B 自己的视图则保留上一次列表、错误只在列表下方以非阻塞小字提示
 13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 筛选栏内的会话过滤控件原地变成同一全量 key（截断显示、`title` 为全量）且表格立即重查 → 点控件内 X 后控件回到空态输入框（placeholder）且回到无会话筛选的行集
 14. **会话信息卡三态**：点一条有注册表记录的 Session 列 → 筛选栏与表格之间出现卡片，会话键前 8 位与全量 `title` 与所点行一致、来源徽标 hover 显示首次 / 最近出现、会话 ID 与首条消息为明文 → 点另一段对话的 Session 列 → 新响应返回前卡片已回到降级形态（不会把上一段对话的首条消息显示在新哈希下）→ 粘贴一个无记录的 key 回车 → 卡片仍显示该 key，但只剩会话键 + 降级文案 → 点 X 清除会话过滤 → 卡片整张消失（`v-if`）
+15. **实时在途徽章**：打开路由页 → 首帧到达前徽章行不渲染，到达后显示 `◉ 处理中 N`（无流量时为「空闲 — 无正在处理的请求」）；发一个流式请求 → 对应 route 徽章出现（绿点脉冲、`×1`），结束后徽章消失并回到空闲；断开 gateway（或断网）→ 徽章置灰 + 「连接断开，重连中…」且计数**不归零**，恢复后自动回实时态；把 API key 改错后重连 → 跳转 `/connect` 而不是无限「重连中」
 
 ## 变更记录
+
+- [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)
 - [0012 会话 pin 图标 hover 预览与活跃 pin 置顶/置灰](changes/0012-session-pin-tooltip-and-active-pin-ordering.md)
 - [0011 日志页会话信息卡](changes/0011-logs-session-info-card.md)
 - [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)

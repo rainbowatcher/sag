@@ -12,6 +12,7 @@
 //! - [`crate::admin_circuit_breaker`] — `GET /api/circuit-breaker` and
 //!   `POST /api/circuit-breaker/close`
 //! - [`crate::admin_active_targets`] — `GET|DELETE /api/active-targets`
+//! - [`crate::admin_inflight`] — `GET /api/inflight` (SSE snapshot stream)
 //!
 //! All admin routes are intended to be wrapped in the `gateway_auth`
 //! middleware by the parent router in `routes.rs`.
@@ -21,6 +22,7 @@ use axum::{Router, routing::get, routing::post};
 use crate::admin_active_targets::{delete_active_target, list_active_targets};
 use crate::admin_circuit_breaker::{close_circuit_breaker, list_circuit_breakers};
 use crate::admin_config::{get_config, update_config};
+use crate::admin_inflight::stream_inflight;
 use crate::admin_logs::list_logs;
 use crate::admin_providers::{
     add_provider, delete_provider, list_provider_models, list_providers, update_provider,
@@ -65,5 +67,6 @@ pub fn build_admin_routes(state: AppState) -> Router<AppState> {
             "/session-affinity",
             get(list_session_affinity).delete(delete_session_affinity),
         )
+        .route("/inflight", get(stream_inflight))
         .with_state(state)
 }

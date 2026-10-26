@@ -55,9 +55,19 @@ updated: 2026-10-26
   - 注册表查询失败降级为 `session: null` 并记 `error!`：明细页是主载荷，不因装饰性会话卡片而 500。
   - 会话记录的字段语义、合并与保留期见 [分析 → 0009](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)。
 
+### 在途请求观测
+
+- `GET /api/inflight` — 以 `text/event-stream` 推送各路由的实时在途请求数，事件名 `inflight`
+  - 载荷为**全量快照** `{"seq": u64, "total": usize, "routes": [{"model_name": string, "count": u64}]}`：连接即发当前快照，此后每次计数变化再推一份；消费方整体替换，不做增量合并（丢帧不会失步，重连由下一帧自愈）。
+  - `routes` 按 `count` 降序（同数按 `model_name` 升序，帧内容确定）；`total` 恒为各 `count` 之和；`count` 归零的路由从快照中删除，因此快照只列出真正有在途请求的路由。
+  - 空闲时每 15s 发一行 `: ping` 注释心跳（过代理保活 + 给客户端存活信号）。
+  - 端点自身**不计数**：连接与断开都不占用任何在途槽位。
+  - 计数的键是路由的 `model_name`（不是请求里的 model）；计数区间覆盖整条派发生命周期（含重试退避与流式传输），流式请求由客户端断连（body drop）释放。
+  - 计数是进程内内存态，不写 `call_logs`、不影响路由选择。
+
 ### 认证
 
-所有管理端点使用与模型 API 相同的 Bearer token 认证。
+所有管理端点使用与模型 API 相同的 Bearer token 认证。`x-api-key` 仅解锁 `/v1/messages`，不放行任何 `/api/*` 端点（含 `/api/inflight`）。
 
 ## 功能边界
 
@@ -80,6 +90,7 @@ updated: 2026-10-26
 
 ## 变更记录
 
+- [0003 per-route 在途计数与 `GET /api/inflight` SSE 端点](changes/0003-per-route-in-flight-counters-sse.md)
 - [0009 会话注册表与 /api/logs 的 session 信封](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)
 - [0001 初始化](changes/0001-initial.md)
 - [0002 探针与模型测试的协议对齐](changes/0002-probe-model-test-protocol-alignment.md)

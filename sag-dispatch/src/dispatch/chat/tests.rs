@@ -3241,6 +3241,7 @@ async fn stale_writeback_after_clear_does_not_repin() {
         state.fill_first_orders.clone(),
         state.route_counters.clone(),
         state.session_affinity.clone(),
+        state.in_flight.clone(),
     );
     let req = build_request("gpt-4o", false);
     let trace_id = Uuid::new_v4();
@@ -3331,6 +3332,7 @@ async fn stale_writeback_after_config_mutation_does_not_repin() {
         state.fill_first_orders.clone(),
         state.route_counters.clone(),
         state.session_affinity.clone(),
+        state.in_flight.clone(),
     );
     let req = build_request("gpt-4o", false);
     let trace_id = Uuid::new_v4();
@@ -3499,6 +3501,7 @@ async fn stale_writeback_after_coordinator_mutation_does_not_repin() {
         state.fill_first_orders.clone(),
         state.route_counters.clone(),
         state.session_affinity.clone(),
+        state.in_flight.clone(),
     );
     let req = build_request("gpt-4o", false);
     let trace_id = Uuid::new_v4();
@@ -4030,6 +4033,7 @@ fn shared_runtime(state: &AppState) -> DispatchRuntime {
         state.fill_first_orders.clone(),
         state.route_counters.clone(),
         state.session_affinity.clone(),
+        state.in_flight.clone(),
     )
 }
 
@@ -5085,4 +5089,130 @@ fn decode_responses_response_decodes_leniently_on_schema_mismatch() {
         vec![sag_core::IrOutputItem::Text { text: "hi".into() }],
         "readable output items must survive a schema mismatch"
     );
+}
+
+// ─── Per-route in-flight counting ────────────────────────────
+
+/// Streaming: the guard lives in the response body state, so the route counts
+/// as in-flight for exactly as long as the body is alive — and a client
+/// disconnect (body drop) releases it without any manual bookkeeping.
+#[tokio::test]
+async fn dispatch_chat_streaming_counts_in_flight_until_body_drop() {
+    use http_body_util::BodyExt;
+
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::OkThenPending(vec![StreamChunk::Data(
+        b"data: hello\n\n".to_vec(),
+    )]));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The request is in flight for the route `route_name` while the streamed
+    // body is alive — counted once, under the route's model_name.
+    let snapshot = rt.in_flight.snapshot();
+    assert_eq!(snapshot.total, 1, "one request in flight");
+    assert_eq!(snapshot.routes.len(), 1);
+    assert_eq!(snapshot.routes[0].model_name, "test-route");
+    assert_eq!(snapshot.routes[0].count, 1);
+
+    // Read the forwarded chunk so the body has actually produced bytes (the
+    // stream then suspends), mirroring a live client mid-response.
+    let mut body = resp.into_body();
+    let frame = body
+        .frame()
+        .await
+        .expect("the first frame must be forwarded")
+        .expect("body frame must not error");
+    let data = frame.into_data().expect("first frame carries data");
+    assert_eq!(&data[..], b"data: hello\n\n");
+    assert_eq!(
+        rt.in_flight.snapshot().total,
+        1,
+        "reading the body must not release the count"
+    );
+
+    // Client disconnect: hyper drops the body → the body state's `Drop` runs
+    // the guard → the count is released exactly once.
+    drop(body);
+    let snapshot = rt.in_flight.snapshot();
+    assert_eq!(snapshot.total, 0, "body drop must release the count");
+    assert!(
+        snapshot.routes.is_empty(),
+        "a zero-count route must be dropped from the snapshot"
+    );
+}
+
+/// Non-streaming: the guard lives on the dispatch stack frame, so the count is
+/// already released by the time the response is returned to the caller.
+#[tokio::test]
+async fn dispatch_chat_non_streaming_releases_in_flight_on_return() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(build_response("gpt-4o", None)));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let snapshot = rt.in_flight.snapshot();
+    assert_eq!(
+        snapshot.total, 0,
+        "a returned response has no in-flight count"
+    );
+    assert!(snapshot.routes.is_empty());
+}
+
+/// The guard is acquired before the privacy filter / retry scheduling, so a
+/// request that fails (here: a non-retryable 4xx) still releases it — no
+/// early-return path may leak a count.
+#[tokio::test]
+async fn dispatch_chat_error_path_releases_in_flight() {
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::NonRetryable(AppError::BadRequest(
+        "bad".into(),
+    )));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("openai", "gpt-4o", 5)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(errors.len(), 1);
+
+    assert_eq!(
+        rt.in_flight.snapshot().total,
+        0,
+        "an error path must release the count too"
+    );
+}
+
+/// Two concurrent requests for different routes: the snapshot reports both,
+/// sorted by count, and the total is their sum.
+#[tokio::test]
+async fn in_flight_snapshot_reports_multiple_routes() {
+    let rt = crate::testing::test_dispatch_runtime();
+    let a1 = rt.in_flight.acquire("route-a");
+    let b1 = rt.in_flight.acquire("route-b");
+    let b2 = rt.in_flight.acquire("route-b");
+
+    let snapshot = rt.in_flight.snapshot();
+    assert_eq!(snapshot.total, 3);
+    assert_eq!(snapshot.routes[0].model_name, "route-b");
+    assert_eq!(snapshot.routes[0].count, 2);
+    assert_eq!(snapshot.routes[1].model_name, "route-a");
+    assert_eq!(snapshot.routes[1].count, 1);
+
+    drop((a1, b1, b2));
+    assert_eq!(rt.in_flight.snapshot().total, 0);
 }

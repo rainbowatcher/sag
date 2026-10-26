@@ -583,6 +583,15 @@ export const en = {
   "routeList.loadFailed": "Failed to load data",
   "routeList.empty": 'No routes configured. Click "Add Route" to get started.',
 
+  // ── Live in-flight counters (GET /api/inflight SSE) ────────────
+  "routeActivity.processing": "Processing {count}",
+  "routeActivity.processingTitle": "In-flight requests across all routes",
+  "routeActivity.idle": "Idle — no requests in flight",
+  "routeActivity.reconnecting": "Disconnected, reconnecting…",
+  "routeActivity.staleHint":
+    "The live stream dropped. The counts below are the last snapshot received and may be outdated.",
+  "routeActivity.routeTitle": "{model} — {count} in flight",
+
   // ── P3b: settings page + forms ──────────────────────────────────
   "settings.page.description": "Gateway-level configuration for proxy and client authentication.",
   "settings.loadingSettings": "Loading settings...",

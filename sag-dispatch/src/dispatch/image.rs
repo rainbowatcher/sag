@@ -64,6 +64,12 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
         session_writeback: _,
     } = ctx;
 
+    // Per-route in-flight guard: `+1` for this request, released by `Drop`
+    // when this dispatch returns (image generation is always non-streaming,
+    // so the guard simply lives on this stack frame — every return path,
+    // error and panic unwind included, releases exactly once).
+    let _in_flight = runtime.in_flight.acquire(route_name);
+
     // Hashed session identity for every `call_logs` row of this dispatch
     // (recorded regardless of strategy — a request fact, not a behavior).
     let session_log_key = session_key.as_ref().map(|k| k.map_id(&request.model));
@@ -1203,6 +1209,7 @@ mod tests {
             fill_first_orders: Arc::default(),
             route_counters: Arc::default(),
             session_affinity: Arc::default(),
+            in_flight: Arc::default(),
         };
         (state, pool)
     }
