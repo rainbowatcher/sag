@@ -50,22 +50,28 @@ export function sortPins(entries: SessionAffinityEntry[]): SessionAffinityEntry[
 }
 
 /**
- * A failed pin fetch, tagged with the model space it belongs to.
+ * The failure message that belongs to `model`, or `null` when there is none.
  *
- * The store is shared by every route row, so one row's failure must not be
- * rendered by another row: `scope` is the `model` the fetch asked for
- * (`undefined` for a full-space fetch) and only a matching row reads it.
+ * The store is shared by every route row, so failures are stored per fetch
+ * scope (`""` is the full-space fetch): one row's failure must never be
+ * rendered by another row, hence the plain key lookup.
+ *
+ * The lookup is own-property only: a bare `errors[model]` would walk the
+ * prototype chain, so a route model literally named `constructor` or
+ * `toString` would render a `Function` object as its failure message.
  */
-export interface SessionAffinityError {
-  scope?: string
-  message: string
+export function errorForModel(errors: Record<string, string>, model: string): string | null {
+  return Object.hasOwn(errors, model) ? errors[model] : null
 }
 
 /**
- * The failure message that belongs to `model`, or `null` when the stored
- * error came from another row's fetch (or there is none).
+ * Whether `model`'s fetch is in flight.
+ *
+ * Same per-scope lookup and the same own-property guard as `errorForModel`: a
+ * bare `loading[model] ?? false` would walk the prototype chain, so a route
+ * model literally named `constructor` / `toString` would read a `Function`
+ * (non-nullish, so `?? false` never kicks in) and spin forever.
  */
-export function errorForModel(error: SessionAffinityError | null, model: string): string | null {
-  if (error === null) return null
-  return error.scope === model ? error.message : null
+export function loadingForModel(loading: Record<string, boolean>, model: string): boolean {
+  return Object.hasOwn(loading, model) ? loading[model] : false
 }

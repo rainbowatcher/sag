@@ -12,7 +12,7 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check",
     "typecheck": "vue-tsc --noEmit",
-    "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
+    "test": "node --experimental-strip-types --import ./scripts/alias-loader.mjs --test \"src/**/*.test.ts\"",
     "test:active-target": "node --experimental-strip-types src/lib/activeTarget.test.ts",
     "check:i18n": "node --experimental-strip-types scripts/check-i18n.mjs",
     "story:dev": "histoire dev",

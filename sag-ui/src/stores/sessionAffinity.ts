@@ -1,7 +1,7 @@
 import { defineStore } from "pinia"
 import { ref } from "vue"
 import { api } from "@/lib/client"
-import { mergeSessionEntries, type SessionAffinityError } from "@/lib/sessionAffinity"
+import { mergeSessionEntries } from "@/lib/sessionAffinity"
 import { getErrorMessage } from "@/lib/utils"
 import type { SessionAffinityDeletedResult, SessionAffinityEntry } from "@/types/api"
 import { useConnectionStore } from "./connection"
@@ -15,6 +15,15 @@ export interface SessionAffinityQuery {
 }
 
 /**
+ * Key of one fetch scope: the request-model space it asked for, `""` for a
+ * full-space fetch. Every per-scope piece of state (in-flight flag, failure,
+ * generation token) is keyed by this so rows never overwrite each other.
+ */
+function scopeKeyOf(params: SessionAffinityQuery): string {
+  return params.model ?? ""
+}
+
+/**
  * Live session-affinity (session_sticky) pins, mirroring
  * `GET|DELETE /api/session-affinity`.
  *
@@ -24,44 +33,60 @@ export interface SessionAffinityQuery {
  */
 export const useSessionAffinityStore = defineStore("sessionAffinity", () => {
   const entries = ref<SessionAffinityEntry[]>([])
-  const loading = ref(false)
-  // The store is shared by every route row, so a failure is tagged with the
-  // model space it belongs to: a failed `{ model: B }` fetch must not turn
-  // row A's list into B's error text.
-  const error = ref<SessionAffinityError | null>(null)
+  // The store is shared by every route row, so the in-flight flag and the
+  // failure are per scope: one row's fetch must neither put another row into a
+  // spinner nor render its error text.
+  const loading = ref<Record<string, boolean>>({})
+  const errors = ref<Record<string, string>>({})
 
-  // Monotonic token: only the latest in-flight fetch may write state, so a
-  // slow earlier request cannot overwrite a newer one.
-  let generation = 0
+  // One monotonic token per scope: only the latest in-flight fetch of a scope
+  // may write that scope's state, so a slow earlier request cannot overwrite a
+  // newer one. A stale response skips its own scope's writes only.
+  const generations = new Map<string, number>()
 
-  /** Drop the stored failure only when it belongs to the scope being fetched. */
-  function clearError(scope?: string) {
-    if (error.value !== null && error.value.scope === scope) error.value = null
+  function isCurrent(scope: string, token: number): boolean {
+    return generations.get(scope) === token
+  }
+
+  /** Drop the stored failure of one scope only (`""` = the full-space fetch). */
+  function clearError(scope = "") {
+    if (!Object.hasOwn(errors.value, scope)) return
+    const { [scope]: _dropped, ...rest } = errors.value
+    errors.value = rest
   }
 
   async function fetchEntries(params: SessionAffinityQuery = {}) {
-    const token = ++generation
-    const scope = params.model
-    loading.value = true
-    clearError(scope)
+    const scope = scopeKeyOf(params)
+    const token = (generations.get(scope) ?? 0) + 1
+    generations.set(scope, token)
+    loading.value = { ...loading.value, [scope]: true }
+    // A retry keeps the previous failure visible until it succeeds or fails
+    // again: clearing it here flashed the loading/empty state of this row.
     try {
       const { data } = await api.get<{ entries: SessionAffinityEntry[] }>("/api/session-affinity", {
         params,
       })
-      if (token !== generation) return
+      if (!isCurrent(scope, token)) return
       // A `{ model }` fetch only owns its own slice of the shared list; the other
       // rows' pins must survive so they do not render as a false "no pins".
-      entries.value = mergeSessionEntries(entries.value, data.entries, scope)
+      entries.value = mergeSessionEntries(entries.value, data.entries, params.model)
       clearError(scope)
     } catch (e: any) {
       if (e?.response?.status === 401) useConnectionStore().handle401()
-      if (token !== generation) return
+      if (!isCurrent(scope, token)) return
       // A failed fetch is not an empty result: keep the last successful data so
       // the other rows (and this one) do not render as a false "no pins". The
-      // scoped `error` is what tells this row's caller the refresh failed.
-      error.value = { scope, message: getErrorMessage(e, "Failed to load session pins") }
+      // scoped `errors[scope]` is what tells this row's caller the refresh
+      // failed, without taking another row's message away.
+      errors.value = {
+        ...errors.value,
+        [scope]: getErrorMessage(e, "Failed to load session pins"),
+      }
     } finally {
-      if (token === generation) loading.value = false
+      if (isCurrent(scope, token)) {
+        const { [scope]: _done, ...rest } = loading.value
+        loading.value = rest
+      }
     }
   }
 
@@ -94,7 +119,7 @@ export const useSessionAffinityStore = defineStore("sessionAffinity", () => {
   return {
     entries,
     loading,
-    error,
+    errors,
     fetchEntries,
     deleteByKey,
     deleteByModel,

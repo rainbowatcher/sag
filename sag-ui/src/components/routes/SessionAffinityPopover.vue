@@ -6,7 +6,13 @@ import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
-import { errorForModel, isPinActive, shortSessionKey, sortPins } from "@/lib/sessionAffinity"
+import {
+  errorForModel,
+  isPinActive,
+  loadingForModel,
+  shortSessionKey,
+  sortPins,
+} from "@/lib/sessionAffinity"
 import { formatDuration, getErrorMessage } from "@/lib/utils"
 import { useSessionAffinityStore } from "@/stores/sessionAffinity"
 import type { SessionAffinityEntry } from "@/types/api"
@@ -25,6 +31,20 @@ const emit = defineEmits<{ changed: [] }>()
 const store = useSessionAffinityStore()
 
 const open = ref(false)
+/**
+ * The preview tooltip is fully controlled instead of `:disabled`-ing it while
+ * the popover is open: `disabled` unmounts reka's trigger listeners, which left
+ * its "pointer already opened" flag stuck, so a still pointer never brought the
+ * tooltip back after closing the popover.
+ */
+const hovering = ref(false)
+/**
+ * Keyboard focus on the trigger. It keeps the preview open on its own (blur
+ * hides it), which is also how reka's own trigger behaves — including the
+ * focus it hands back to the trigger when the popover closes.
+ */
+const focused = ref(false)
+const tooltipOpen = computed(() => (hovering.value || focused.value) && !open.value)
 const clearingKey = ref<string | null>(null)
 const clearingModel = ref(false)
 /** Two-step confirm for the "clear this model" destructive action. */
@@ -39,7 +59,13 @@ const sortedRows = computed(() => sortPins(rows.value))
  * The failure of *this* row's last fetch. The store is shared, so another
  * row's error must not replace this row's list with its message.
  */
-const refreshError = computed(() => errorForModel(store.error, props.model))
+const refreshError = computed(() => errorForModel(store.errors, props.model))
+/**
+ * Whether *this* row's fetch is in flight. The store is shared, so another
+ * row's request must not turn this row's tooltip into a spinner (own-key only,
+ * so a model named `constructor` cannot read an inherited `Function`).
+ */
+const loading = computed(() => loadingForModel(store.loading, props.model))
 
 // Hovering the icon fetches too, but only when the shared store is stale, so
 // sweeping the pointer across rows cannot fire a request per pixel.
@@ -67,9 +93,37 @@ async function refresh() {
  * time. Focus is included because keyboard Tab also opens the tooltip.
  */
 function ensureFresh() {
-  if (store.loading) return
   if (Date.now() - lastFetchedAt.value < HOVER_REFRESH_MS) return
+  // A slow request is still in flight: its response will refresh the row, so
+  // hovering/focusing again must not queue a second identical request.
+  if (loading.value) return
   void refresh()
+}
+
+/** Touch pointers are ignored, as reka's own trigger does, so a tap on the icon never pops the preview. */
+function onTriggerPointerEnter(event: PointerEvent) {
+  if (event.pointerType === "touch") return
+  hovering.value = true
+  ensureFresh()
+}
+
+function onTriggerPointerLeave() {
+  hovering.value = false
+}
+
+/**
+ * Keyboard focus only: a pointer- or touch-initiated focus must not pop the
+ * preview (the same guard reka exposes as `ignoreNonKeyboardFocus`).
+ */
+function onTriggerFocus(event: FocusEvent) {
+  const target = event.target as HTMLElement | null
+  if (target?.matches?.(":focus-visible") === false) return
+  focused.value = true
+  ensureFresh()
+}
+
+function onTriggerBlur() {
+  focused.value = false
 }
 
 /** Age / remaining-TTL labels reuse the shared duration formatter. */
@@ -86,11 +140,11 @@ function expiryLabel(entry: SessionAffinityEntry): string {
  * would drop below readable contrast, so it only dims.
  */
 function pinRowClass(entry: SessionAffinityEntry): string {
-  return isPinActive(entry) ? "" : "text-muted-foreground opacity-50"
+  return isPinActive(entry) ? "" : "text-muted-foreground opacity-60"
 }
 
 function tooltipRowClass(entry: SessionAffinityEntry): string {
-  return isPinActive(entry) ? "" : "opacity-50"
+  return isPinActive(entry) ? "" : "opacity-70"
 }
 
 async function clearEntry(entry: SessionAffinityEntry) {
@@ -125,7 +179,7 @@ async function clearModel() {
 
 <template>
   <Popover v-model:open="open">
-    <Tooltip :disabled="open">
+    <Tooltip :open="tooltipOpen">
       <TooltipTrigger as-child>
         <PopoverTrigger as-child>
           <Button
@@ -133,8 +187,10 @@ async function clearModel() {
             size="icon-sm"
             class="cursor-pointer"
             :aria-label="t('sessionAffinity.button')"
-            @mouseenter="ensureFresh"
-            @focus="ensureFresh"
+            @pointerenter="onTriggerPointerEnter"
+            @pointerleave="onTriggerPointerLeave"
+            @focus="onTriggerFocus"
+            @blur="onTriggerBlur"
           >
             <KeyRound class="h-3.5 w-3.5" />
           </Button>
@@ -167,7 +223,7 @@ async function clearModel() {
             <span class="break-words whitespace-normal">{{ refreshError }}</span>
           </div>
         </template>
-        <div v-else-if="store.loading" class="flex items-center gap-1.5">
+        <div v-else-if="loading" class="flex items-center gap-1.5">
           <Loader2 class="h-3 w-3 animate-spin" />
           {{ t("sessionAffinity.loading") }}
         </div>
@@ -241,7 +297,7 @@ async function clearModel() {
           </div>
         </template>
         <div
-          v-else-if="store.loading"
+          v-else-if="loading"
           class="text-muted-foreground flex items-center gap-1.5 px-3 py-4 text-xs"
         >
           <Loader2 class="h-3 w-3 animate-spin" />
@@ -262,7 +318,7 @@ async function clearModel() {
           variant="outline"
           size="sm"
           class="w-full"
-          :disabled="rows.length === 0 || store.loading"
+          :disabled="rows.length === 0 || loading"
           @click="confirmClearModel = true"
         >
           {{ t("sessionAffinity.clearModel") }}

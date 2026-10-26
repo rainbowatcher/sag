@@ -3,6 +3,7 @@ import type { SessionAffinityEntry } from "../types/api.ts"
 import {
   errorForModel,
   isPinActive,
+  loadingForModel,
   mergeSessionEntries,
   shortSessionKey,
   sortPins,
@@ -180,36 +181,124 @@ function entry(
   assert.deepEqual(incoming, incomingSnapshot, "mergeSessionEntries does not mutate incoming")
 }
 
-// ── scoping a fetch failure to its own row ─────────────────────────
-// The store is shared by every row, so a failed `{ model: B }` fetch must
-// only be readable by row B. These tests pin that a matching scope yields the
-// message and everything else yields `null` (so row A keeps its list).
+// ── reading one scope's fetch failure ──────────────────────────────
+// The store is shared by every row and keeps failures keyed by fetch scope
+// (`""` is the full-space fetch), so a failed `{ model: B }` fetch must only be
+// readable by row B — row A keeps its list instead of rendering B's message.
 
 {
-  const failure = { scope: "model-b", message: "boom" }
+  const errors = { "model-b": "boom" }
 
-  assert.equal(errorForModel(failure, "model-b"), "boom", "the failing row reads its message")
+  assert.equal(errorForModel(errors, "model-b"), "boom", "the failing row reads its message")
   assert.equal(
-    errorForModel(failure, "model-a"),
+    errorForModel(errors, "model-a"),
     null,
     "another row never reads someone else's failure",
   )
+  assert.equal(errorForModel(errors, ""), null, "a row never reads the full-space failure")
 }
 
 {
-  // A full-space fetch has no scope; no row can claim its message.
-  const failure = { message: "boom" }
+  // Two rows may fail at the same time: each keeps its own message.
+  const errors = { "model-a": "a failed", "model-b": "b failed" }
 
-  assert.equal(errorForModel(failure, "model-a"), null, "an unscoped failure belongs to no row")
-  assert.equal(errorForModel({ scope: undefined, message: "boom" }, ""), null)
+  assert.equal(errorForModel(errors, "model-a"), "a failed", "each scope keeps its own message")
+  assert.equal(errorForModel(errors, "model-b"), "b failed", "a later failure does not overwrite")
 }
 
 {
-  assert.equal(errorForModel(null, "model-a"), null, "no stored error yields null")
+  assert.equal(errorForModel({}, "model-a"), null, "an empty map yields null for every row")
+  assert.equal(errorForModel({}, ""), null, "an empty map yields null for the full-space scope")
+}
+
+{
   assert.equal(
-    errorForModel({ scope: "", message: "boom" }, ""),
+    errorForModel({ "model-a": "boom" }, "model-c"),
+    null,
+    "a model without a key yields null (no fallback to another scope)",
+  )
+  assert.equal(
+    errorForModel({ "": "full failed" }, ""),
+    "full failed",
+    "the empty key is the full-space scope, matched as a plain key",
+  )
+  assert.equal(
+    errorForModel({ "": "full failed" }, "model-a"),
+    null,
+    "a model row never reads the full-space failure",
+  )
+}
+
+// ── prototype keys are not failures ────────────────────────────────
+// The map is a plain object, so a bare `errors[model]` walks the prototype
+// chain: a route model literally named `constructor` / `toString` would render
+// a `Function` as its failure text. Only own keys are real failures.
+
+{
+  for (const inherited of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    assert.equal(
+      errorForModel({}, inherited),
+      null,
+      `an empty map yields null for the inherited key ${inherited}`,
+    )
+  }
+}
+
+{
+  assert.equal(
+    errorForModel({ constructor: "boom" }, "constructor"),
     "boom",
-    "an empty scope matches an empty model (strict equality, no coercion)",
+    "an own key named constructor is a real failure",
+  )
+  assert.equal(
+    errorForModel({ toString: "boom" }, "toString"),
+    "boom",
+    "an own key named toString is a real failure",
+  )
+  assert.equal(
+    errorForModel({ constructor: "boom" }, "model-a"),
+    null,
+    "an own prototype-named key is not readable by another row",
+  )
+}
+
+// ── reading one scope's in-flight flag ─────────────────────────────
+// The same shared map and the same own-property guard as `errorForModel`: a
+// bare `loading[model] ?? false` walks the prototype chain, so a route model
+// named `constructor` would read a `Function` and spin forever.
+{
+  const loading = { "model-b": true, "model-c": false }
+
+  assert.equal(loadingForModel(loading, "model-b"), true, "the fetching row is in flight")
+  assert.equal(loadingForModel(loading, "model-c"), false, "an explicit false stays false")
+  assert.equal(
+    loadingForModel(loading, "model-a"),
+    false,
+    "a row without a key is not in flight (another row's request does not spin it)",
+  )
+  assert.equal(loadingForModel(loading, ""), false, "the full-space scope has no key here")
+}
+
+{
+  for (const inherited of ["constructor", "toString", "__proto__"]) {
+    assert.equal(
+      loadingForModel({}, inherited),
+      false,
+      `an empty map is not in flight for the inherited key ${inherited}`,
+    )
+  }
+}
+
+{
+  assert.equal(
+    loadingForModel({ constructor: true }, "constructor"),
+    true,
+    "an own key named constructor is a real in-flight flag",
+  )
+  assert.equal(
+    loadingForModel({ constructor: true }, "model-a"),
+    false,
+    "an own prototype-named key does not spin another row",
   )
 }
 
