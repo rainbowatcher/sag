@@ -104,8 +104,8 @@ async function handleSave() {
     </CardHeader>
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <div class="space-y-2">
-          <Label for="breaker-quota" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="breaker-quota" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.circuitBreaker.labelQuota") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -122,12 +122,12 @@ async function handleSave() {
             type="number"
             min="1"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>
-        <div class="space-y-2">
-          <Label for="breaker-rate" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="breaker-rate" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.circuitBreaker.labelRate") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -144,12 +144,12 @@ async function handleSave() {
             type="number"
             min="1"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>
-        <div class="space-y-2">
-          <Label for="breaker-generic" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="breaker-generic" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.circuitBreaker.labelGeneric") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -166,12 +166,12 @@ async function handleSave() {
             type="number"
             min="1"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>
-        <div class="space-y-2">
-          <Label for="breaker-probe" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="breaker-probe" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.circuitBreaker.labelProbe") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -188,7 +188,7 @@ async function handleSave() {
             type="number"
             min="1"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>

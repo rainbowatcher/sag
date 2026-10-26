@@ -226,52 +226,60 @@ async function handleSubmit(event: Event) {
     </div>
     <form id="route-edit-form" @submit.prevent="handleSubmit">
       <div class="grid grid-cols-2 gap-3">
-        <div class="flex flex-col gap-3">
-          <FieldLabel class="text-muted-foreground text-xs font-medium">{{
+        <div class="flex items-center justify-between gap-4">
+          <FieldLabel class="text-muted-foreground shrink-0 text-xs font-medium">{{
             $t("routeList.columns.modelName")
           }}</FieldLabel>
-          <Input :model-value="route.model_name" disabled class="bg-muted text-muted-foreground" />
+          <Input
+            :model-value="route.model_name"
+            disabled
+            class="bg-muted text-muted-foreground w-full max-w-56 min-w-0"
+          />
         </div>
         <form.Field name="strategy" #default="{ field }">
           <Field>
-            <FieldLabel
-              :for="field.name"
-              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
-            >
-              {{ $t("routes.form.strategy") }}
-              <Tooltip v-if="form.state.values.strategy === 'session_sticky'">
-                <TooltipTrigger as-child>
-                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
-                </TooltipTrigger>
-                <TooltipContent side="top" class="max-w-xs font-normal">
-                  {{ $t("routes.form.strategySessionStickyHint") }}
-                </TooltipContent>
-              </Tooltip>
-            </FieldLabel>
-            <Select
-              :model-value="field.state.value ?? 'sticky_failover'"
-              @update:model-value="(v) => field.handleChange(v as Strategy)"
-            >
-              <SelectTrigger :id="field.name" class="w-full">
-                <SelectValue>{{
-                  strategyLabels[field.state.value ?? "sticky_failover"]
-                }}</SelectValue>
-              </SelectTrigger>
-              <SelectContent class="w-(--reka-select-trigger-width)">
-                <SelectItem value="sticky_failover">{{
-                  $t("routes.form.strategyStickyFailover")
-                }}</SelectItem>
-                <SelectItem value="fill_first">{{
-                  $t("routes.form.strategyFillFirst")
-                }}</SelectItem>
-                <SelectItem value="round_robin">{{
-                  $t("routes.form.strategyRoundRobin")
-                }}</SelectItem>
-                <SelectItem value="session_sticky">{{
-                  $t("routes.form.strategySessionSticky")
-                }}</SelectItem>
-              </SelectContent>
-            </Select>
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel
+                :for="field.name"
+                class="text-muted-foreground flex shrink-0 items-center gap-1.5 text-xs font-medium"
+              >
+                {{ $t("routes.form.strategy") }}
+                <Tooltip v-if="form.state.values.strategy === 'session_sticky'">
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.strategySessionStickyHint") }}
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
+              <div class="w-44">
+                <Select
+                  :model-value="field.state.value ?? 'sticky_failover'"
+                  @update:model-value="(v) => field.handleChange(v as Strategy)"
+                >
+                  <SelectTrigger :id="field.name" class="w-full">
+                    <SelectValue>{{
+                      strategyLabels[field.state.value ?? "sticky_failover"]
+                    }}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent class="w-(--reka-select-trigger-width)">
+                    <SelectItem value="sticky_failover">{{
+                      $t("routes.form.strategyStickyFailover")
+                    }}</SelectItem>
+                    <SelectItem value="fill_first">{{
+                      $t("routes.form.strategyFillFirst")
+                    }}</SelectItem>
+                    <SelectItem value="round_robin">{{
+                      $t("routes.form.strategyRoundRobin")
+                    }}</SelectItem>
+                    <SelectItem value="session_sticky">{{
+                      $t("routes.form.strategySessionSticky")
+                    }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -312,32 +320,34 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="api_endpoint" #default="{ field }">
           <Field v-if="form.state.values.pipeline === 'image'">
-            <FieldLabel
-              :for="field.name"
-              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
-            >
-              {{ $t("routes.form.apiEndpointLabel") }}
-              <Tooltip>
-                <TooltipTrigger as-child>
-                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
-                </TooltipTrigger>
-                <TooltipContent side="top" class="max-w-xs font-normal">
-                  {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
-                  >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
-                  >{{ $t("routes.form.apiEndpointHintOr")
-                  }}<code>/v1beta/models/{model}:generateContent</code>
-                </TooltipContent>
-              </Tooltip>
-            </FieldLabel>
-            <Input
-              :id="field.name"
-              :model-value="field.state.value"
-              placeholder="/images/generations"
-              class="font-mono text-sm"
-              :aria-invalid="field.state.meta.errors.length > 0"
-              @blur="field.handleBlur"
-              @input="field.handleChange(($event.target as HTMLInputElement).value)"
-            />
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel
+                :for="field.name"
+                class="text-muted-foreground flex shrink-0 items-center gap-1.5 text-xs font-medium"
+              >
+                {{ $t("routes.form.apiEndpointLabel") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.apiEndpointHintLead") }}<code>image</code
+                    >{{ $t("routes.form.apiEndpointHintMid") }}<code>/images/generations</code
+                    >{{ $t("routes.form.apiEndpointHintOr")
+                    }}<code>/v1beta/models/{model}:generateContent</code>
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
+              <Input
+                :id="field.name"
+                :model-value="field.state.value"
+                placeholder="/images/generations"
+                class="w-full max-w-56 min-w-0 font-mono text-sm"
+                :aria-invalid="field.state.meta.errors.length > 0"
+                @blur="field.handleBlur"
+                @input="field.handleChange(($event.target as HTMLInputElement).value)"
+              />
+            </div>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -346,31 +356,33 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="session_ttl_secs" #default="{ field }">
           <Field v-if="form.state.values.strategy === 'session_sticky'">
-            <FieldLabel
-              :for="field.name"
-              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
-            >
-              {{ $t("routes.form.sessionTtlLabel") }}
-              <Tooltip>
-                <TooltipTrigger as-child>
-                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
-                </TooltipTrigger>
-                <TooltipContent side="top" class="max-w-xs font-normal">
-                  {{ $t("routes.form.sessionTtlHint") }}
-                </TooltipContent>
-              </Tooltip>
-            </FieldLabel>
-            <Input
-              :id="field.name"
-              type="number"
-              min="0"
-              :model-value="field.state.value"
-              placeholder="0"
-              class="font-mono text-sm"
-              :aria-invalid="field.state.meta.errors.length > 0"
-              @blur="field.handleBlur"
-              @input="field.handleChange(($event.target as HTMLInputElement).value)"
-            />
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel
+                :for="field.name"
+                class="text-muted-foreground flex shrink-0 items-center gap-1.5 text-xs font-medium"
+              >
+                {{ $t("routes.form.sessionTtlLabel") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.sessionTtlHint") }}
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
+              <Input
+                :id="field.name"
+                type="number"
+                min="0"
+                :model-value="field.state.value"
+                placeholder="0"
+                class="w-24 font-mono text-sm"
+                :aria-invalid="field.state.meta.errors.length > 0"
+                @blur="field.handleBlur"
+                @input="field.handleChange(($event.target as HTMLInputElement).value)"
+              />
+            </div>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>
@@ -379,31 +391,33 @@ async function handleSubmit(event: Event) {
 
         <form.Field name="session_max_entries" #default="{ field }">
           <Field v-if="form.state.values.strategy === 'session_sticky'">
-            <FieldLabel
-              :for="field.name"
-              class="text-muted-foreground flex items-center gap-1.5 text-xs font-medium"
-            >
-              {{ $t("routes.form.sessionMaxEntriesLabel") }}
-              <Tooltip>
-                <TooltipTrigger as-child>
-                  <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
-                </TooltipTrigger>
-                <TooltipContent side="top" class="max-w-xs font-normal">
-                  {{ $t("routes.form.sessionMaxEntriesHint") }}
-                </TooltipContent>
-              </Tooltip>
-            </FieldLabel>
-            <Input
-              :id="field.name"
-              type="number"
-              min="1"
-              :model-value="field.state.value"
-              placeholder="10000"
-              class="font-mono text-sm"
-              :aria-invalid="field.state.meta.errors.length > 0"
-              @blur="field.handleBlur"
-              @input="field.handleChange(($event.target as HTMLInputElement).value)"
-            />
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel
+                :for="field.name"
+                class="text-muted-foreground flex shrink-0 items-center gap-1.5 text-xs font-medium"
+              >
+                {{ $t("routes.form.sessionMaxEntriesLabel") }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <Info class="text-muted-foreground h-3.5 w-3.5 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top" class="max-w-xs font-normal">
+                    {{ $t("routes.form.sessionMaxEntriesHint") }}
+                  </TooltipContent>
+                </Tooltip>
+              </FieldLabel>
+              <Input
+                :id="field.name"
+                type="number"
+                min="1"
+                :model-value="field.state.value"
+                placeholder="10000"
+                class="w-24 font-mono text-sm"
+                :aria-invalid="field.state.meta.errors.length > 0"
+                @blur="field.handleBlur"
+                @input="field.handleChange(($event.target as HTMLInputElement).value)"
+              />
+            </div>
             <p v-if="field.state.meta.errors.length" class="text-destructive mt-1 text-xs">
               {{ field.state.meta.errors[0] }}
             </p>

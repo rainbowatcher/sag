@@ -611,15 +611,19 @@ const table = useVueTable({
         </component>
 
         <div class="space-y-2 px-4 py-2 sm:px-0">
-          <FieldLabel for="copy-provider-name">{{ $t("providers.list.copyNameLabel") }}</FieldLabel>
-          <Input
-            id="copy-provider-name"
-            :model-value="copyName"
-            :placeholder="$t('providers.list.copyNamePlaceholder')"
-            class="font-mono text-sm"
-            @input="copyName = ($event.target as HTMLInputElement).value"
-            @keydown.enter.prevent="canConfirmCopy && confirmCopy()"
-          />
+          <div class="flex items-center justify-between gap-4">
+            <FieldLabel for="copy-provider-name" class="shrink-0">{{
+              $t("providers.list.copyNameLabel")
+            }}</FieldLabel>
+            <Input
+              id="copy-provider-name"
+              :model-value="copyName"
+              :placeholder="$t('providers.list.copyNamePlaceholder')"
+              class="w-full max-w-56 min-w-0 font-mono text-sm"
+              @input="copyName = ($event.target as HTMLInputElement).value"
+              @keydown.enter.prevent="canConfirmCopy && confirmCopy()"
+            />
+          </div>
           <p v-if="isCopyNameExisting" class="text-destructive text-xs">
             {{ $t("providers.list.copyExists", { name: copyName.trim() }) }}
           </p>

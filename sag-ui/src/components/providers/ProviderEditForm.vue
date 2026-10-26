@@ -226,16 +226,21 @@ async function handleSubmit() {
 
           <!-- ─── Tab: Basic ──────────────────────────────────── -->
           <TabsContent value="basic" class="grid grid-cols-2 gap-4">
-            <div>
-              <FieldLabel>{{ $t("common.name") }}</FieldLabel>
-              <Input :model-value="provider.name" disabled class="bg-muted text-muted-foreground" />
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel class="shrink-0">{{ $t("common.name") }}</FieldLabel>
+              <Input
+                :model-value="provider.name"
+                disabled
+                class="bg-muted text-muted-foreground w-full max-w-56 min-w-0"
+              />
             </div>
 
-            <div class="space-y-1">
-              <FieldLabel>{{ $t("providers.form.timeoutLabel") }}</FieldLabel>
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel class="shrink-0">{{ $t("providers.form.timeoutLabel") }}</FieldLabel>
               <Input
                 type="number"
                 :model-value="timeoutSecs"
+                class="w-24"
                 @input="timeoutSecs = Number(($event.target as HTMLInputElement).value)"
               />
             </div>

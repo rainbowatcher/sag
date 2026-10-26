@@ -92,8 +92,8 @@ async function handleSave() {
     </CardHeader>
     <CardContent class="space-y-4">
       <div class="grid max-w-3xl gap-4 sm:grid-cols-3">
-        <div class="space-y-2">
-          <Label for="backoff-retries" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="backoff-retries" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.backoff.labelRetries") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -110,12 +110,12 @@ async function handleSave() {
             type="number"
             min="1"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>
-        <div class="space-y-2">
-          <Label for="backoff-base" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="backoff-base" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.backoff.labelBase") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -132,12 +132,12 @@ async function handleSave() {
             type="number"
             min="0"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>
-        <div class="space-y-2">
-          <Label for="backoff-max" class="flex items-center gap-1.5">
+        <div class="flex items-center justify-between gap-4">
+          <Label for="backoff-max" class="flex shrink-0 items-center gap-1.5">
             {{ $t("settings.backoff.labelMax") }}
             <Tooltip>
               <TooltipTrigger as-child>
@@ -154,7 +154,7 @@ async function handleSave() {
             type="number"
             min="0"
             step="1"
-            class="font-mono"
+            class="w-24 font-mono"
             :disabled="store.saving"
           />
         </div>

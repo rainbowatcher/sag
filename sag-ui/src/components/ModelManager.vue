@@ -371,17 +371,19 @@ function removeModel(name: string) {
         </component>
 
         <div class="space-y-2 px-4 py-2 sm:px-0">
-          <FieldLabel for="quick-route-name">{{
-            $t("providers.models.routeNameLabel")
-          }}</FieldLabel>
-          <Input
-            id="quick-route-name"
-            :model-value="customRouteName"
-            :placeholder="$t('providers.models.routeNamePlaceholder')"
-            class="font-mono text-sm"
-            @input="customRouteName = ($event.target as HTMLInputElement).value"
-            @keydown.enter.prevent="canConfirmRoute && confirmCreateRoute()"
-          />
+          <div class="flex items-center justify-between gap-4">
+            <FieldLabel for="quick-route-name" class="shrink-0">{{
+              $t("providers.models.routeNameLabel")
+            }}</FieldLabel>
+            <Input
+              id="quick-route-name"
+              :model-value="customRouteName"
+              :placeholder="$t('providers.models.routeNamePlaceholder')"
+              class="w-full max-w-56 min-w-0 font-mono text-sm"
+              @input="customRouteName = ($event.target as HTMLInputElement).value"
+              @keydown.enter.prevent="canConfirmRoute && confirmCreateRoute()"
+            />
+          </div>
           <p v-if="isRouteExisting" class="text-destructive text-xs">
             {{ $t("providers.models.routeExists", { name: customRouteName.trim() }) }}
           </p>

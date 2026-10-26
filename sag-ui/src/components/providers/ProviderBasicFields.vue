@@ -47,24 +47,26 @@ const proxyModeLabels = computed<Record<ProxyMode, string>>(() => ({
     <ApiKeyEditor :api-keys="apiKeys" @update:api-keys="emit('update:apiKeys', $event)" />
   </div>
 
-  <div class="space-y-1">
-    <FieldLabel>{{ $t("providers.form.keyStrategy") }}</FieldLabel>
-    <Select
-      :model-value="keyStrategy"
-      @update:model-value="(v) => emit('update:keyStrategy', v as 'fill_first' | 'round_robin')"
-    >
-      <SelectTrigger>
-        <SelectValue>{{ keyStrategyLabels[keyStrategy] }}</SelectValue>
-      </SelectTrigger>
-      <SelectContent class="w-(--reka-select-trigger-width)">
-        <SelectItem value="fill_first">{{ $t("providers.form.fillFirst") }}</SelectItem>
-        <SelectItem value="round_robin">{{ $t("providers.form.roundRobin") }}</SelectItem>
-      </SelectContent>
-    </Select>
+  <div class="flex items-center justify-between gap-4">
+    <FieldLabel class="shrink-0">{{ $t("providers.form.keyStrategy") }}</FieldLabel>
+    <div class="w-44">
+      <Select
+        :model-value="keyStrategy"
+        @update:model-value="(v) => emit('update:keyStrategy', v as 'fill_first' | 'round_robin')"
+      >
+        <SelectTrigger class="w-full">
+          <SelectValue>{{ keyStrategyLabels[keyStrategy] }}</SelectValue>
+        </SelectTrigger>
+        <SelectContent class="w-(--reka-select-trigger-width)">
+          <SelectItem value="fill_first">{{ $t("providers.form.fillFirst") }}</SelectItem>
+          <SelectItem value="round_robin">{{ $t("providers.form.roundRobin") }}</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
   </div>
 
-  <div class="space-y-1">
-    <FieldLabel class="flex items-center gap-1.5">
+  <div class="flex items-center justify-between gap-4">
+    <FieldLabel class="flex shrink-0 items-center gap-1.5">
       {{ $t("providers.form.proxyMode") }}
       <Tooltip>
         <TooltipTrigger as-child>
@@ -75,18 +77,20 @@ const proxyModeLabels = computed<Record<ProxyMode, string>>(() => ({
         </TooltipContent>
       </Tooltip>
     </FieldLabel>
-    <Select
-      :model-value="proxyMode"
-      @update:model-value="(v) => emit('update:proxyMode', v as ProxyMode)"
-    >
-      <SelectTrigger>
-        <SelectValue>{{ proxyModeLabels[proxyMode] }}</SelectValue>
-      </SelectTrigger>
-      <SelectContent class="w-(--reka-select-trigger-width)">
-        <SelectItem value="inherit">{{ $t("common.inherit") }}</SelectItem>
-        <SelectItem value="enabled">{{ $t("common.enabled") }}</SelectItem>
-        <SelectItem value="disabled">{{ $t("common.disabled") }}</SelectItem>
-      </SelectContent>
-    </Select>
+    <div class="w-44">
+      <Select
+        :model-value="proxyMode"
+        @update:model-value="(v) => emit('update:proxyMode', v as ProxyMode)"
+      >
+        <SelectTrigger class="w-full">
+          <SelectValue>{{ proxyModeLabels[proxyMode] }}</SelectValue>
+        </SelectTrigger>
+        <SelectContent class="w-(--reka-select-trigger-width)">
+          <SelectItem value="inherit">{{ $t("common.inherit") }}</SelectItem>
+          <SelectItem value="enabled">{{ $t("common.enabled") }}</SelectItem>
+          <SelectItem value="disabled">{{ $t("common.disabled") }}</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
   </div>
 </template>

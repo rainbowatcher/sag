@@ -256,23 +256,28 @@ async function handleSubmit(event: Event) {
             <TabsContent value="basic" class="grid grid-cols-2 gap-4">
               <form.Field name="name" #default="{ field }">
                 <Field :data-invalid="isInvalid(field)">
-                  <FieldLabel :for="field.name">{{ $t("providers.form.nameLabel") }}</FieldLabel>
-                  <Input
-                    :id="field.name"
-                    :model-value="field.state.value"
-                    :placeholder="$t('providers.form.namePlaceholder')"
-                    :aria-invalid="isInvalid(field)"
-                    @blur="field.handleBlur"
-                    @input="field.handleChange(($event.target as HTMLInputElement).value)"
-                  />
+                  <div class="flex items-center justify-between gap-4">
+                    <FieldLabel :for="field.name" class="shrink-0">{{
+                      $t("providers.form.nameLabel")
+                    }}</FieldLabel>
+                    <Input
+                      :id="field.name"
+                      :model-value="field.state.value"
+                      :placeholder="$t('providers.form.namePlaceholder')"
+                      class="w-full max-w-56 min-w-0"
+                      :aria-invalid="isInvalid(field)"
+                      @blur="field.handleBlur"
+                      @input="field.handleChange(($event.target as HTMLInputElement).value)"
+                    />
+                  </div>
                   <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
                 </Field>
               </form.Field>
 
-              <div class="space-y-1">
-                <form.Field name="timeout_secs" #default="{ field }">
-                  <Field :data-invalid="isInvalid(field)">
-                    <FieldLabel :for="field.name">{{
+              <form.Field name="timeout_secs" #default="{ field }">
+                <Field :data-invalid="isInvalid(field)">
+                  <div class="flex items-center justify-between gap-4">
+                    <FieldLabel :for="field.name" class="shrink-0">{{
                       $t("providers.form.timeoutLabel")
                     }}</FieldLabel>
                     <Input
@@ -280,6 +285,7 @@ async function handleSubmit(event: Event) {
                       type="number"
                       :model-value="field.state.value"
                       :placeholder="$t('providers.addForm.timeoutPlaceholder')"
+                      class="w-24"
                       :aria-invalid="isInvalid(field)"
                       @blur="field.handleBlur"
                       @input="
@@ -290,10 +296,10 @@ async function handleSubmit(event: Event) {
                         )
                       "
                     />
-                    <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
-                  </Field>
-                </form.Field>
-              </div>
+                  </div>
+                  <FieldError v-if="isInvalid(field)" :errors="field.state.meta.errors" />
+                </Field>
+              </form.Field>
 
               <ProviderBasicFields
                 v-model:api-keys="apiKeys"

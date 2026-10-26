@@ -714,20 +714,30 @@ function keyFingerprint(key: string): string {
                 </CardTitle>
               </div>
             </CardHeader>
-            <CardContent class="max-w-2xl space-y-2 xl:max-w-3xl">
-              <FieldLabel for="ui-theme">
-                {{ $t("settings.appearance.themeLabel") }}
-              </FieldLabel>
-              <Select :model-value="themeMode" @update:model-value="setThemeMode">
-                <SelectTrigger id="ui-theme" class="w-48">
-                  <SelectValue>{{ themeLabels[themeMode] }}</SelectValue>
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="auto">{{ $t("settings.appearance.themeSystem") }}</SelectItem>
-                  <SelectItem value="light">{{ $t("settings.appearance.themeLight") }}</SelectItem>
-                  <SelectItem value="dark">{{ $t("settings.appearance.themeDark") }}</SelectItem>
-                </SelectContent>
-              </Select>
+            <CardContent class="max-w-2xl xl:max-w-3xl">
+              <div class="flex items-center justify-between gap-4">
+                <FieldLabel for="ui-theme" class="shrink-0">
+                  {{ $t("settings.appearance.themeLabel") }}
+                </FieldLabel>
+                <div class="w-44">
+                  <Select :model-value="themeMode" @update:model-value="setThemeMode">
+                    <SelectTrigger id="ui-theme" class="w-full">
+                      <SelectValue>{{ themeLabels[themeMode] }}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent class="w-(--reka-select-trigger-width)">
+                      <SelectItem value="auto">{{
+                        $t("settings.appearance.themeSystem")
+                      }}</SelectItem>
+                      <SelectItem value="light">{{
+                        $t("settings.appearance.themeLight")
+                      }}</SelectItem>
+                      <SelectItem value="dark">{{
+                        $t("settings.appearance.themeDark")
+                      }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
             </CardContent>
           </Card>
 
@@ -748,19 +758,23 @@ function keyFingerprint(key: string): string {
                 </CardTitle>
               </div>
             </CardHeader>
-            <CardContent class="max-w-2xl space-y-2 xl:max-w-3xl">
-              <FieldLabel for="ui-language">
-                {{ t("settings.language.label") }}
-              </FieldLabel>
-              <Select :model-value="locale" @update:model-value="(v) => setLocale(v as Locale)">
-                <SelectTrigger id="ui-language" class="w-48">
-                  <SelectValue>{{ languageLabels[locale] }}</SelectValue>
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="en">{{ t("settings.language.optionEnglish") }}</SelectItem>
-                  <SelectItem value="zh">{{ t("settings.language.optionChinese") }}</SelectItem>
-                </SelectContent>
-              </Select>
+            <CardContent class="max-w-2xl xl:max-w-3xl">
+              <div class="flex items-center justify-between gap-4">
+                <FieldLabel for="ui-language" class="shrink-0">
+                  {{ t("settings.language.label") }}
+                </FieldLabel>
+                <div class="w-44">
+                  <Select :model-value="locale" @update:model-value="(v) => setLocale(v as Locale)">
+                    <SelectTrigger id="ui-language" class="w-full">
+                      <SelectValue>{{ languageLabels[locale] }}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent class="w-(--reka-select-trigger-width)">
+                      <SelectItem value="en">{{ t("settings.language.optionEnglish") }}</SelectItem>
+                      <SelectItem value="zh">{{ t("settings.language.optionChinese") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
             </CardContent>
           </Card>
         </TabsContent>

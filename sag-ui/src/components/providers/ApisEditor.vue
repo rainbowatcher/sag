@@ -428,27 +428,27 @@ defineExpose({ validate })
         </div>
 
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div class="space-y-1">
-            <FieldLabel :for="`base-url-${d.uid}`">{{
+          <div class="flex items-center justify-between gap-4">
+            <FieldLabel :for="`base-url-${d.uid}`" class="shrink-0">{{
               $t("providers.apis.baseUrlLabel")
             }}</FieldLabel>
             <Input
               :id="`base-url-${d.uid}`"
               :model-value="d.base_url"
               :placeholder="BASE_URL_PLACEHOLDER"
-              class="font-mono text-sm"
+              class="w-full max-w-56 min-w-0 font-mono text-sm"
               @input="updateSection(d.uid, { base_url: ($event.target as HTMLInputElement).value })"
             />
           </div>
-          <div class="space-y-1">
-            <FieldLabel :for="`models-endpoint-${d.uid}`">{{
+          <div class="flex items-center justify-between gap-4">
+            <FieldLabel :for="`models-endpoint-${d.uid}`" class="shrink-0">{{
               $t("providers.apis.modelsEndpointLabel")
             }}</FieldLabel>
             <Input
               :id="`models-endpoint-${d.uid}`"
               :model-value="d.models_endpoint"
               :placeholder="DEFAULT_MODELS_ENDPOINT_HINTS[d.kind]"
-              class="font-mono text-sm"
+              class="w-full max-w-56 min-w-0 font-mono text-sm"
               @input="
                 updateSection(d.uid, { models_endpoint: ($event.target as HTMLInputElement).value })
               "
@@ -521,38 +521,41 @@ defineExpose({ validate })
 
           <Separator />
 
-          <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div class="space-y-1">
-              <FieldLabel :for="`cache-ctl-${d.uid}`">{{
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel :for="`cache-ctl-${d.uid}`" class="shrink-0">{{
                 $t("providers.apis.cacheControl")
               }}</FieldLabel>
-              <Select
-                :model-value="d.anthropic_cache_control"
-                @update:model-value="
-                  (v) =>
-                    updateSection(d.uid, {
-                      anthropic_cache_control: v as 'inherit' | 'enable' | 'disable',
-                    })
-                "
-              >
-                <SelectTrigger :id="`cache-ctl-${d.uid}`" class="w-full">
-                  <SelectValue>{{ cacheControlLabels[d.anthropic_cache_control] }}</SelectValue>
-                </SelectTrigger>
-                <SelectContent class="w-(--reka-select-trigger-width)">
-                  <SelectItem value="inherit">{{ $t("providers.apis.cacheInherit") }}</SelectItem>
-                  <SelectItem value="enable">{{ $t("common.enabled") }}</SelectItem>
-                  <SelectItem value="disable">{{ $t("common.disabled") }}</SelectItem>
-                </SelectContent>
-              </Select>
+              <div class="w-44">
+                <Select
+                  :model-value="d.anthropic_cache_control"
+                  @update:model-value="
+                    (v) =>
+                      updateSection(d.uid, {
+                        anthropic_cache_control: v as 'inherit' | 'enable' | 'disable',
+                      })
+                  "
+                >
+                  <SelectTrigger :id="`cache-ctl-${d.uid}`" class="w-full">
+                    <SelectValue>{{ cacheControlLabels[d.anthropic_cache_control] }}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent class="w-(--reka-select-trigger-width)">
+                    <SelectItem value="inherit">{{ $t("providers.apis.cacheInherit") }}</SelectItem>
+                    <SelectItem value="enable">{{ $t("common.enabled") }}</SelectItem>
+                    <SelectItem value="disable">{{ $t("common.disabled") }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
-            <div class="space-y-1">
-              <FieldLabel :for="`timeout-${d.uid}`">{{
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel :for="`timeout-${d.uid}`" class="shrink-0">{{
                 $t("providers.form.timeoutLabel")
               }}</FieldLabel>
               <Input
                 :id="`timeout-${d.uid}`"
                 type="number"
                 :model-value="d.timeout_secs"
+                class="w-24"
                 :placeholder="$t('common.inherit')"
                 @input="
                   updateSection(d.uid, {
@@ -561,14 +564,15 @@ defineExpose({ validate })
                 "
               />
             </div>
-            <div class="space-y-1">
-              <FieldLabel :for="`chunk-timeout-${d.uid}`">{{
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel :for="`chunk-timeout-${d.uid}`" class="shrink-0">{{
                 $t("providers.apis.chunkTimeout")
               }}</FieldLabel>
               <Input
                 :id="`chunk-timeout-${d.uid}`"
                 type="number"
                 :model-value="d.chunk_timeout_secs"
+                class="w-24"
                 :placeholder="$t('common.inherit')"
                 @input="
                   updateSection(d.uid, {
@@ -578,14 +582,15 @@ defineExpose({ validate })
                 "
               />
             </div>
-            <div class="space-y-1">
-              <FieldLabel :for="`ttfb-timeout-${d.uid}`">{{
+            <div class="flex items-center justify-between gap-4">
+              <FieldLabel :for="`ttfb-timeout-${d.uid}`" class="shrink-0">{{
                 $t("providers.apis.ttfbTimeout")
               }}</FieldLabel>
               <Input
                 :id="`ttfb-timeout-${d.uid}`"
                 type="number"
                 :model-value="d.ttfb_timeout_secs"
+                class="w-24"
                 :placeholder="$t('common.inherit')"
                 @input="
                   updateSection(d.uid, {
