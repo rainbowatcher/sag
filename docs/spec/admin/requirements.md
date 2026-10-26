@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-30
+updated: 2026-10-26
 ---
 
 # 管理 API
@@ -47,6 +47,13 @@ updated: 2026-09-30
 ### 日志查询
 
 - `GET /api/logs` — 查询调用日志，支持分页和过滤
+  - 查询参数：`provider` / `model` / `real_model` / `session` / `status_code` / `offset` / `limit`；缺省或空串均视为「未设置」而不是 400。`session` 对 `call_logs.session_key`（32 位哈希）做精确匹配。
+  - 响应信封 `{"data": [CallLog...], "total": n}`，并在带 `?session=<key>` 时额外携带 `session` 字段，三态：
+    - 未带 `session` 参数（或值为空串）—— **键不存在**，旧信封逐字保留；
+    - 带 `session` 但 `session_registry` 无该行 —— `null`（旧数据 / 已过保留期）；
+    - 带 `session` 且命中 —— 会话记录对象（`session_key` / `session_source` / `conversation_id` / `first_message_preview` / `first_seen` / `last_seen`）。
+  - 注册表查询失败降级为 `session: null` 并记 `error!`：明细页是主载荷，不因装饰性会话卡片而 500。
+  - 会话记录的字段语义、合并与保留期见 [分析 → 0009](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)。
 
 ### 认证
 
@@ -73,5 +80,6 @@ updated: 2026-09-30
 
 ## 变更记录
 
+- [0009 会话注册表与 /api/logs 的 session 信封](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)
 - [0001 初始化](changes/0001-initial.md)
 - [0002 探针与模型测试的协议对齐](changes/0002-probe-model-test-protocol-alignment.md)

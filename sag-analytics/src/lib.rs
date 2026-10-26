@@ -6,6 +6,7 @@ pub mod query;
 pub mod registry;
 pub mod rollup;
 pub mod rotate;
+pub mod session_registry;
 pub mod sqlite_store;
 pub mod store;
 
@@ -25,6 +26,9 @@ pub use rollup::{
 pub use rotate::{
     ALL_VIEW, ARCH_PREFIX, HOT_TABLE, HOT_VIEW, RoundOutcome, is_schema_change, refresh_views,
     retire_indexes, rotate_once, run_rotation_round, unique_archive_name,
+};
+pub use session_registry::{
+    SessionRegistryFact, get_session, prune_session_registry, upsert_session,
 };
 pub use sqlite_store::{MAX_LOG_LIMIT, SqliteLogStore};
 pub use store::*;

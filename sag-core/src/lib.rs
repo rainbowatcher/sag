@@ -16,6 +16,7 @@ pub mod ir;
 pub mod paths;
 pub mod protocol;
 pub mod session;
+pub mod session_preview;
 pub mod types;
 
 // Re-export key types at crate level for convenience
@@ -40,6 +41,10 @@ pub use protocol::{
     resolve_lane,
 };
 pub use session::{SessionKey, sha256_hex};
+pub use session_preview::{
+    CONVERSATION_ID_MAX_CHARS, PREVIEW_MAX_CHARS, SessionRegistryFact, build_session_fact,
+    first_user_preview, strip_markup, truncate_chars,
+};
 pub use types::{
     CallLog, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FailureReason,
     FinalStatus, ImageData, ImageGenerationRequest, ImageGenerationResponse, RequestResultFact,

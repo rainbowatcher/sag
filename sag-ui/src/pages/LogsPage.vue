@@ -4,6 +4,7 @@ import type { AcceptableValue } from "reka-ui"
 import { ref, onMounted, computed, nextTick } from "vue"
 import RefreshButton from "@/components/RefreshButton.vue"
 import SearchSelect from "@/components/SearchSelect.vue"
+import SessionInfoCard from "@/components/SessionInfoCard.vue"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -296,6 +297,14 @@ function formatProvider(raw: string): { label: string; isSentinel: boolean } {
         <AlertDescription class="break-words">{{ store.logsError }}</AlertDescription>
       </Alert>
     </div>
+
+    <!-- Session registry details for the active session filter -->
+    <SessionInfoCard
+      v-if="logsFilterSession"
+      :session="store.logsSessionKey === logsFilterSession ? store.logsSession : null"
+      :session-key="logsFilterSession"
+      class="mt-4 shrink-0"
+    />
 
     <div class="flex min-h-0 min-w-0 flex-1 flex-col pt-4">
       <div

@@ -68,6 +68,15 @@ pub async fn dispatch_image(ctx: DispatchCtx<'_>) -> Response<Body> {
     // (recorded regardless of strategy — a request fact, not a behavior).
     let session_log_key = session_key.as_ref().map(|k| k.map_id(&request.model));
 
+    // Session-registry fact for the log page's session info card: same key
+    // and route model as `session_log_key`, written exactly **once per
+    // request** (never in a terminal path). Image dispatch carries no IR, so
+    // only the preview is dropped — `conversation_id` is still recorded.
+    if let Some(key) = session_key.as_ref() {
+        let fact = sag_core::build_session_fact(key, &request.model, None, started_at);
+        state.collector.log_session(fact);
+    }
+
     // Client-disconnect terminal (image dispatch is non-streaming, so this
     // is the only cancellation detection point): if the handler future is
     // dropped before any normal terminal, emit `client_cancelled` — with a
@@ -1692,5 +1701,37 @@ mod tests {
                 log.reasoning_effort, log.provider,
             );
         }
+    }
+
+    // ── session registry fact ───────────────────────────
+
+    #[tokio::test]
+    async fn image_dispatch_writes_session_registry_fact_without_preview() {
+        // The image path has no IR, so the registry fact keeps the
+        // conversation id but drops the preview. One write per request.
+        let m1 = Arc::new(MockImageProvider::new("first"));
+        let state = build_state(vec![m1.clone()]).await;
+        let rt = crate::testing::test_dispatch_runtime();
+        let req = build_request_with_reasoning("dall-e-3");
+        let targets = vec![target("first", "dall-e-3", 0)];
+        let key = sag_core::SessionKey::new("meta", "conv-image");
+        let mut errors = Vec::new();
+        let mut ctx = make_ctx(&state, &rt, &req, &targets, &mut errors);
+        ctx.session_key = Some(key.clone());
+
+        let _ = dispatch_image(ctx).await;
+        state.collector.flush().await;
+
+        let rec = state
+            .collector
+            .store()
+            .get_session(&key.map_id("dall-e-3"))
+            .await
+            .unwrap()
+            .expect("session registry row for the image dispatch");
+        assert_eq!(rec.session_source, "meta");
+        assert_eq!(rec.conversation_id.as_deref(), Some("conv-image"));
+        assert_eq!(rec.first_message_preview, None, "image path has no IR");
+        assert_eq!(rec.first_seen, rec.last_seen, "single write per request");
     }
 }

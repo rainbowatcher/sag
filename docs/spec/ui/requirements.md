@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # UI 管理面板
@@ -114,6 +114,8 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - Session 列位于 Client 列之后：显示 `session_key` 前 8 位（`title` 保留全量 32 位哈希），该行没有会话记录时显示 `—`
 - 点击 Session 单元格把完整 `session_key` 写入会话筛选并立即重查——与筛选栏内的会话过滤控件、清除按钮共用同一状态（`logsFilterSession`），点击后控件内联显示同一 key，清除即回到无会话筛选；会话过滤控件与其它过滤器同宽同高，值以截断文本（`title` 保留全量）内联显示在控件内，不额外占用筛选栏下方空间
 - 列数口径：本节上文的「12 列」是 0001 时的列口径，此后 Client 列与本列均在其后追加，现共 15 列
+- 会话信息卡：应用会话过滤（`logsFilterSession` 非空）时，在筛选栏与表格之间渲染卡片（无过滤时不渲染）：会话键（前 8 位 + 全量 `title`）、来源徽标（`meta` / `top-level` / `prompt cache` / `content hash`）、会话 ID（`font-mono` 截断 + 全量 `title`）、首条消息预览；首次 / 最近出现时间放在来源徽标的 tooltip 内
+- 会话信息卡的降级形态：当前会话键在 `session_registry` 无记录（旧数据、已过保留期，或注册表查询失败）时卡片仍渲染，但只剩会话键一格 + 降级文案；卡片只在「记录的过滤键 === 当前过滤键」时展示记录，切换过滤时不会把上一段对话的信息挂在新哈希下
 
 ### 固定高度布局与容器内滚动
 
@@ -210,6 +212,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0011 日志页会话信息卡](changes/0011-logs-session-info-card.md)
 - [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)
 - [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
 - [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)

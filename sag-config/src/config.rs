@@ -757,6 +757,10 @@ pub struct AnalyticsConfig {
     /// rotated out of the hot table into archive partitions. 0 = disabled.
     #[serde(default = "default_call_log_retention_days")]
     pub call_log_retention_days: u32,
+    /// session_registry rows older than this many days are pruned. 0 = keep
+    /// forever (prune disabled).
+    #[serde(default = "default_session_retention_days")]
+    pub session_retention_days: u32,
 }
 
 fn default_storage_dsn() -> String {
@@ -772,6 +776,17 @@ pub const DEFAULT_CALL_LOG_RETENTION_DAYS: u32 = 90;
 
 fn default_call_log_retention_days() -> u32 {
     DEFAULT_CALL_LOG_RETENTION_DAYS
+}
+
+/// Default `session_retention_days`: 7 days.
+///
+/// The single definition of the default, shared by the serde fallback below
+/// and by callers that need the value without an `[analytics]` section (the
+/// gateway maintenance round's per-round session retention read).
+pub const DEFAULT_SESSION_RETENTION_DAYS: u32 = 7;
+
+fn default_session_retention_days() -> u32 {
+    DEFAULT_SESSION_RETENTION_DAYS
 }
 
 /// Gateway client authentication configuration.
@@ -1862,6 +1877,51 @@ call_log_retention_days = 0
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         let analytics = config.analytics.unwrap();
         assert_eq!(analytics.call_log_retention_days, 0);
+    }
+
+    #[test]
+    fn parse_analytics_session_retention_defaults_to_7() {
+        let toml_str = r#"
+[server]
+[analytics]
+enabled = true
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let analytics = config.analytics.unwrap();
+        assert_eq!(analytics.session_retention_days, 7);
+        assert_eq!(
+            analytics.session_retention_days,
+            DEFAULT_SESSION_RETENTION_DAYS
+        );
+    }
+
+    #[test]
+    fn parse_analytics_session_retention_explicit_value() {
+        let toml_str = r#"
+[server]
+[analytics]
+enabled = true
+session_retention_days = 3
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let analytics = config.analytics.unwrap();
+        assert_eq!(analytics.session_retention_days, 3);
+    }
+
+    #[test]
+    fn parse_analytics_session_retention_zero_keeps_forever() {
+        let toml_str = r#"
+[server]
+[analytics]
+enabled = true
+session_retention_days = 0
+[providers]
+"#;
+        let config: GatewayConfig = toml::from_str(toml_str).unwrap();
+        let analytics = config.analytics.unwrap();
+        assert_eq!(analytics.session_retention_days, 0);
     }
 
     #[test]

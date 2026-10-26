@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-17
+updated: 2026-10-26
 ---
 
 # 分析
@@ -139,11 +139,12 @@ updated: 2026-10-17
 - 已核实**无任何 JOIN 消费方**（facts / Rollup 链路不读 `call_logs`），也**没有按 `id` / `request_id` 查单条的端点**，因此轮转不影响其余链路。
 - 索引退役：冷表出生即无索引；对已退出窗口的冷表，其索引必须被回收（幂等巡检，窗内冷表的索引不碰）。
 - `call_log_retention_days` 语义：**0 = 禁用**（不轮转、不退役索引、视图覆盖全史），不是「保留 0 天」；`[analytics]` 段缺失时回退默认 90；配置每轮热读取，热重载在下一轮生效。
-- 维护任务（轮转 / 索引退役 / 视图重建）**永不 panic、永不让 gateway 启动失败**：DB 错误告警后下轮重试；且必须在正常关闭时先于分析事件排空停妥。
+- `session_registry`（日志页会话信息卡的数据源）有**独立的保留期**：`session_retention_days`（默认 7 天，`0` = 永久保留 / 关闭清理）；语义与 `call_log_retention_days` 的「0 = 关闭」一致，但非 0 时**直接删行、不归档**（该表没有冷表也没有视图）。它**不参与** `call_logs` 的冷热轮转：清理挂在每轮维护的末尾，一轮读一次热配置，轮转失败仍清理、清理失败不影响本轮结果；cutoff 为 UTC 滚动窗口（`last_seen < now - days × 24h`，边界行存活），天数按 3650 钳制。
+- 维护任务（轮转 / 索引退役 / 视图重建 / `session_registry` 清理）**永不 panic、永不让 gateway 启动失败**：DB 错误告警后下轮重试；且必须在正常关闭时先于分析事件排空停妥。
 
 ### API 与 UI
 
-- 保留 `/v1/analytics/stats` 与 `/api/logs` 作为**诊断接口**（按旧明细聚合，数据源 `call_logs_hot`，热窗口口径）；`/v1/analytics/{cache,trend,distribution}` **已下线**，时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
+- 保留 `/v1/analytics/stats` 与 `/api/logs` 作为**诊断接口**（按旧明细聚合，数据源 `call_logs_hot`，热窗口口径）；`/api/logs` 的信封向后兼容地新增可选 `session` 字段（未带 `?session=` 时键不存在，老客户端不受影响）；`/v1/analytics/{cache,trend,distribution}` **已下线**，时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
 - 两套口径的端点边界即契约边界：诊断接口是**近似且不稳定**的（可丢弃写入、`NULL` 当 0、失败率无分母剔除、随轮转缩水），分析接口是**可验收**的。两者数字对不上是预期行为，不得为了对齐而把诊断口径改造成事实口径。
 - 新增统一查询模型，通过 `scope=route|target` 选择统计层级；默认 route 视角，UI 提供 target 视角切换。
 - route 视角不提供 provider / actual_model 过滤；供应商与实际模型维度的过滤只在 target 视角提供。
@@ -158,6 +159,7 @@ updated: 2026-10-17
 enabled = true
 storage_dsn = "sqlite://analytics.db"   # 或 ":memory:"
 call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 禁用（不是"保留 0 天"）
+session_retention_days = 7              # session_registry 保留天数（日志页会话信息卡）；0 = 永久保留（关闭清理）
 ```
 
 相对 `sqlite://` 路径在启动时锚定到 `$XDG_DATA_HOME/sag`（XDG Base Directory 标准，默认 `~/.local/share/sag/analytics.db`）；绝对路径与 `:memory:` 原样使用。
@@ -181,6 +183,7 @@ call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 
 - 延迟 / Token / 缓存指标
 - UTC 小时分桶与 1 小时 Rollup
 - 统一查询 API 与 UI（route/target 视角切换）
+- 会话注册表 `session_registry`（日志页会话信息卡的展示事实，独立保留期）
 - 诊断接口保留（`/v1/analytics/stats` + `/api/logs`，热窗口口径）
 
 ### 不包含
@@ -202,6 +205,7 @@ call_log_retention_days = 90            # call_logs 热窗口保留天数；0 = 
 
 ## 变更记录
 
+- [0009 会话注册表 session_registry 与 /api/logs 的 session 信封](changes/0009-session-registry-and-logs-session-envelope.md)
 - [0008 退役旧分析端点，固化两套口径契约分层](changes/0008-retire-legacy-analytics-endpoints.md)
 - [0007 call_logs 保留窗口 + 表轮转（热窗口视图）](changes/0007-call-log-retention-rotation.md)
 - [0006 相对 sqlite:// DSN 锚定 XDG 数据目录 + create_if_missing 修复](../config/changes/0006-xdg-base-directories.md)

@@ -144,10 +144,17 @@ export interface CircuitBreakerConfigForm {
   probe_interval_secs: number
 }
 
-/** Analytics storage config; `null` when the section is absent. */
+/**
+ * Analytics storage config; `null` when the section is absent. Read-only:
+ * the `[analytics]` section applies at process startup.
+ */
 export interface AnalyticsConfig {
   enabled: boolean
   storage_dsn: string
+  /** `call_logs` hot-window retention in days; `0` = rotation disabled. */
+  call_log_retention_days?: number
+  /** `session_registry` prune horizon in days; `0` = keep forever. */
+  session_retention_days?: number
 }
 
 /** Gateway listen address (`[server]`); restart-required. */
@@ -403,6 +410,16 @@ export interface CallLog {
   session_key?: string | null
 }
 
+/** Session registry record for the active session filter (`GET /api/logs?session=`). */
+export interface SessionInfo {
+  session_key: string
+  session_source: string
+  conversation_id?: string | null
+  first_message_preview?: string | null
+  first_seen: string
+  last_seen: string
+}
+
 /** Query parameters accepted by `GET /api/logs`. */
 export interface LogFilter {
   provider?: string
@@ -419,6 +436,12 @@ export interface LogFilter {
 export interface LogsResponse {
   data: CallLog[]
   total: number
+  /**
+   * Session registry record for the requested `?session=` key. Omitted
+   * entirely when the request is not session-filtered; `null` when the key
+   * has no registry row.
+   */
+  session?: SessionInfo | null
 }
 
 /** Circuit breaker entry returned by `GET /api/circuit-breaker`. */

@@ -869,7 +869,76 @@ const ROTATION_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// A retention that large already means "keep everything", so clamping it to
 /// ten years keeps that semantic (rotation never fires) while logging the
 /// clamp at `debug!` instead of silently pretending the value was honored.
+///
+/// The same bound (and the same rationale) applies to `session_retention_days`:
+/// both knobs are day counts feeding a cutoff subtraction in the round.
 const MAX_CALL_LOG_RETENTION_DAYS: u32 = 3650;
+
+/// `source` label of the `session registry prune armed` line when the session
+/// retention is the built-in default — which is also the "key omitted" case,
+/// since `#[serde(default)]` cannot tell the two apart.
+const SESSION_RETENTION_SOURCE_DEFAULT: &str = "default";
+
+/// `source` label of the same line for an explicitly configured (non-default)
+/// session retention.
+const SESSION_RETENTION_SOURCE_CONFIG: &str = "config";
+
+/// Remembers the `(retention_days, source)` pair of the last emitted
+/// `session registry prune armed` line.
+///
+/// The round repeats on a fixed interval whose very first action is one round,
+/// so a stateless `info!` would either be a startup-only line an operator can
+/// never re-read or a once-a-day repeat. Tracking the last logged pair lets the
+/// line fire on the first round and on every change — exactly when the
+/// delete-vs-archive policy of `session_retention_days` changes under the
+/// operator's feet.
+#[derive(Debug, Default)]
+struct SessionPruneLogState {
+    last: Option<(u32, &'static str)>,
+}
+
+impl SessionPruneLogState {
+    /// Record what a round is about to use. Returns `true` when that differs
+    /// from the last logged pair (the caller emits the line), `false` when the
+    /// round merely repeats it.
+    fn observe(&mut self, retention_days: u32, source: &'static str) -> bool {
+        let current = (retention_days, source);
+        if self.last == Some(current) {
+            return false;
+        }
+        self.last = Some(current);
+        true
+    }
+}
+
+/// Map the live config onto the two retention knobs a round works with: the
+/// `call_logs` rotation cutoff, the session registry prune window, and the
+/// `source` label of the latter for the arm line.
+///
+/// A missing `[analytics]` section means every knob sits at its default. When
+/// the section is present, `#[serde(default)]` makes "key omitted" and "key
+/// spelled out with the default value" indistinguishable at the type level, so
+/// an explicit `7` is reported as the default. Coarse on purpose: the arm line
+/// surfaces *which policy is in force* (and that deletion is armed at all), it
+/// does not reconstruct the config file.
+fn round_retention(config: &sag_config::GatewayConfig) -> (u32, u32, &'static str) {
+    match config.analytics.as_ref() {
+        None => (
+            sag_config::DEFAULT_CALL_LOG_RETENTION_DAYS,
+            sag_config::DEFAULT_SESSION_RETENTION_DAYS,
+            SESSION_RETENTION_SOURCE_DEFAULT,
+        ),
+        Some(analytics) => (
+            analytics.call_log_retention_days,
+            analytics.session_retention_days,
+            if analytics.session_retention_days == sag_config::DEFAULT_SESSION_RETENTION_DAYS {
+                SESSION_RETENTION_SOURCE_DEFAULT
+            } else {
+                SESSION_RETENTION_SOURCE_CONFIG
+            },
+        ),
+    }
+}
 
 /// Spawn the `call_logs` rotation scheduler over the shared analytics pool.
 ///
@@ -898,8 +967,11 @@ fn spawn_rotation_scheduler(
 ) -> RotationSchedulerHandle {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
+        // Round-to-round log state: the session registry arm line fires on the
+        // first round and whenever the effective value changes after that.
+        let mut session_prune_log = SessionPruneLogState::default();
         // First action of the task: one complete round, immediately (§0).
-        rotation_round(&pool, &config).await;
+        rotation_round(&pool, &config, &mut session_prune_log).await;
 
         let mut ticker = tokio::time::interval(ROTATION_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -916,7 +988,7 @@ fn spawn_rotation_scheduler(
                 }
                 _ = ticker.tick() => {}
             }
-            rotation_round(&pool, &config).await;
+            rotation_round(&pool, &config, &mut session_prune_log).await;
         }
     });
     RotationSchedulerHandle { task, shutdown_tx }
@@ -941,16 +1013,36 @@ fn spawn_rotation_scheduler(
 /// rounds that rotate nothing, because the retention cutoff is a literal inside
 /// the view bodies — an un-refreshed window would never move forward.
 ///
+/// Session registry retention rides the same round: `session_registry` is
+/// *not* a rotation target (rotation only renames `call_logs` /
+/// `call_logs_arch_*`), so its rows are swept by
+/// [`sag_analytics::prune_session_registry`] at the end of every round, with
+/// its own `session_retention_days` re-read from the live config. `0` means
+/// "keep forever" there too — the prune then reports zero deletions and
+/// issues no DELETE. The two halves stay independent: a failed rotation still
+/// sweeps the registry, and a failed sweep never fails the round.
+///
+/// Because that sweep *deletes* rows instead of archiving them, the effective
+/// session retention and its source are announced once — on the first round and
+/// again on every change (see [`SessionPruneLogState`]). An omitted key falling
+/// back to the default 7-day window is otherwise invisible until the first
+/// sweep drops data.
+///
 /// Every failure is warned about and retried on the next round: maintenance
 /// never panics and never takes the gateway down.
-async fn rotation_round(pool: &sag_analytics::SqlitePool, config: &sag_config::ConfigHandle) {
-    let retention: u32 = config
-        .read()
-        .await
-        .analytics
-        .as_ref()
-        .map(|a| a.call_log_retention_days)
-        .unwrap_or(sag_config::DEFAULT_CALL_LOG_RETENTION_DAYS);
+async fn rotation_round(
+    pool: &sag_analytics::SqlitePool,
+    config: &sag_config::ConfigHandle,
+    session_prune_log: &mut SessionPruneLogState,
+) {
+    // One config read per round feeds both retention knobs: the rotation
+    // cutoff below and the session registry sweep at the end. It also tells the
+    // arm line below whether the session retention is the built-in default or
+    // an explicit setting.
+    let (retention, session_retention, session_retention_source) = {
+        let cfg = config.read().await;
+        round_retention(&cfg)
+    };
     // Clamp before the round computes its cutoff: the retention decides *when*
     // a row leaves the hot window, so a value beyond the clamp is already
     // "rotate nothing". The clamp keeps the cutoff in a sane domain (a
@@ -974,6 +1066,58 @@ async fn rotation_round(pool: &sag_analytics::SqlitePool, config: &sag_config::C
         // A failed round rolled back atomically; the next round retries every
         // step (retirement, rotation and refresh).
         Err(e) => tracing::warn!(error = %e, "rotation round failed; retrying next cycle"),
+    }
+
+    // Clamp the session retention with the rotation bound, for the same
+    // reason: the prune cutoff is `now - days * 1 day`, so keeping the day
+    // count in a sane domain keeps that subtraction bounded (the prune is
+    // saturating on top of this). `0` passes through untouched — it means
+    // "keep forever" and short-circuits inside the prune.
+    let effective_session_retention = session_retention.min(MAX_CALL_LOG_RETENTION_DAYS);
+    if effective_session_retention != session_retention {
+        tracing::debug!(
+            requested_days = session_retention,
+            effective_days = effective_session_retention,
+            "session_retention_days exceeds the supported maximum; clamping the prune cutoff"
+        );
+    }
+
+    // Announce the armed policy before the first sweep, and again whenever the
+    // effective value (or its source) changes under a hot reload / admin
+    // mutation. Rounds that repeat the same pair stay silent so the daily round
+    // is not noise; the per-round outcome below keeps its own log level.
+    if session_prune_log.observe(effective_session_retention, session_retention_source) {
+        tracing::info!(
+            retention_days = effective_session_retention,
+            source = session_retention_source,
+            // `0` is the one value that is *not* armed: it keeps rows forever.
+            keep_forever = effective_session_retention == 0,
+            "session registry prune armed"
+        );
+    }
+
+    match sag_analytics::prune_session_registry(
+        pool,
+        effective_session_retention,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        // Nothing expired (and always, for the `0` = keep-forever setting):
+        // stay at `debug!` so the daily round is not noise.
+        Ok(0) => tracing::debug!(
+            retention_days = effective_session_retention,
+            "no expired session_registry rows to prune"
+        ),
+        Ok(deleted) => tracing::info!(
+            deleted,
+            retention_days = effective_session_retention,
+            "pruned expired session_registry rows"
+        ),
+        // Independent of the rotation outcome above; retried next cycle.
+        Err(e) => {
+            tracing::warn!(error = %e, "session_registry prune failed; retrying next cycle")
+        }
     }
 }
 
@@ -1364,9 +1508,21 @@ mod tests {
     const DAY_MS: i64 = 86_400_000;
 
     /// Minimal config for maintenance tests: `analytics` is present so the
-    /// retention read (`call_log_retention_days`) is exercised; everything
-    /// else is the empty / default shape (no providers, no routes).
+    /// retention reads (`call_log_retention_days` / `session_retention_days`)
+    /// are exercised; everything else is the empty / default shape (no
+    /// providers, no routes).
     fn maintenance_config(retention_days: u32) -> sag_config::ConfigHandle {
+        maintenance_config_with_session_retention(
+            retention_days,
+            sag_config::DEFAULT_SESSION_RETENTION_DAYS,
+        )
+    }
+
+    /// [`maintenance_config`] with the session registry retention spelled out.
+    fn maintenance_config_with_session_retention(
+        call_log_retention_days: u32,
+        session_retention_days: u32,
+    ) -> sag_config::ConfigHandle {
         sag_config::ConfigHandle::from_config(sag_config::GatewayConfig {
             server: sag_config::ServerConfig {
                 host: "127.0.0.1".into(),
@@ -1375,7 +1531,8 @@ mod tests {
             analytics: Some(sag_config::AnalyticsConfig {
                 enabled: true,
                 storage_dsn: "sqlite://analytics.db".into(),
-                call_log_retention_days: retention_days,
+                call_log_retention_days,
+                session_retention_days,
             }),
             gateway_auth: None,
             providers: HashMap::new(),
@@ -1420,6 +1577,21 @@ mod tests {
             lane: None,
             loss_summary: None,
             session_key: None,
+        }
+    }
+
+    /// One `session_registry` fact seen at `at_ms` (source `meta`, no
+    /// conversation id / preview: only the timestamps matter to the prune).
+    fn session_fact(key: &str, at_ms: i64) -> sag_analytics::SessionRegistryFact {
+        use chrono::{TimeZone, Utc};
+        let at = Utc.timestamp_millis_opt(at_ms).unwrap();
+        sag_analytics::SessionRegistryFact {
+            session_key: key.to_string(),
+            session_source: "meta".to_string(),
+            conversation_id: None,
+            first_message_preview: None,
+            first_seen: at,
+            last_seen: at,
         }
     }
 
@@ -1682,7 +1854,12 @@ mod tests {
         collector.log(call_log("recent", unix_now_ms()));
         collector.flush().await;
 
-        rotation_round(&pool, &maintenance_config(u32::MAX)).await;
+        rotation_round(
+            &pool,
+            &maintenance_config(u32::MAX),
+            &mut SessionPruneLogState::default(),
+        )
+        .await;
 
         assert_eq!(
             scalar(
@@ -1731,7 +1908,8 @@ mod tests {
 
         // retention = 0 disables the round entirely.
         let config = maintenance_config(0);
-        rotation_round(&pool, &config).await;
+        let mut session_prune_log = SessionPruneLogState::default();
+        rotation_round(&pool, &config, &mut session_prune_log).await;
         assert_eq!(
             scalar(
                 &pool,
@@ -1754,8 +1932,9 @@ mod tests {
             enabled: true,
             storage_dsn: "sqlite://analytics.db".into(),
             call_log_retention_days: 90,
+            session_retention_days: sag_config::DEFAULT_SESSION_RETENTION_DAYS,
         });
-        rotation_round(&pool, &config).await;
+        rotation_round(&pool, &config, &mut session_prune_log).await;
         assert_eq!(
             scalar(
                 &pool,
@@ -1773,6 +1952,216 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    /// Session registry retention rides the same round: expired rows are
+    /// swept with the live `session_retention_days`, a hot reload to `0`
+    /// stops the sweep entirely (keep forever), and the sweep never reaches
+    /// the `call_logs` side of the round.
+    #[tokio::test]
+    async fn rotation_round_prunes_session_registry_from_live_config() {
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let collector = sag_analytics::CallLogCollector::new_shared(pool.clone())
+            .await
+            .unwrap();
+        // A 400-day-old call log must survive the round: `call_logs` retention
+        // is 0 (rotation disabled) and the session sweep touches a different
+        // table.
+        collector.log(call_log("backlog", unix_now_ms() - 400 * DAY_MS));
+        collector.flush().await;
+
+        let now = unix_now_ms();
+        sag_analytics::upsert_session(&pool, &session_fact("expired", now - 30 * DAY_MS))
+            .await
+            .unwrap();
+        sag_analytics::upsert_session(&pool, &session_fact("fresh", now))
+            .await
+            .unwrap();
+
+        // The round's per-round config read covers both retentions: 7 days
+        // puts the 30-day-old session outside the window.
+        let config = maintenance_config_with_session_retention(0, 7);
+        let mut session_prune_log = SessionPruneLogState::default();
+        rotation_round(&pool, &config, &mut session_prune_log).await;
+        assert!(
+            sag_analytics::get_session(&pool, "expired")
+                .await
+                .unwrap()
+                .is_none(),
+            "a session outside the retention window is pruned"
+        );
+        assert!(
+            sag_analytics::get_session(&pool, "fresh")
+                .await
+                .unwrap()
+                .is_some(),
+            "a session inside the window survives"
+        );
+        assert_eq!(
+            scalar(&pool, "SELECT COUNT(*) FROM call_logs").await,
+            1,
+            "the session sweep must not delete call_logs rows"
+        );
+
+        // Hot reload / admin mutation: same handle, `session_retention_days = 0`
+        // means "keep forever" — not even a row stamped at the epoch goes.
+        sag_analytics::upsert_session(&pool, &session_fact("ancient", 1))
+            .await
+            .unwrap();
+        config.write().await.analytics = Some(sag_config::AnalyticsConfig {
+            enabled: true,
+            storage_dsn: "sqlite://analytics.db".into(),
+            call_log_retention_days: 0,
+            session_retention_days: 0,
+        });
+        rotation_round(&pool, &config, &mut session_prune_log).await;
+        assert!(
+            sag_analytics::get_session(&pool, "ancient")
+                .await
+                .unwrap()
+                .is_some(),
+            "session_retention_days 0 must not prune"
+        );
+        assert!(
+            sag_analytics::get_session(&pool, "fresh")
+                .await
+                .unwrap()
+                .is_some(),
+            "an in-window session is untouched"
+        );
+
+        pool.close().await;
+    }
+
+    /// Session retention clamp: `u32::MAX` days must not panic on the cutoff
+    /// arithmetic, and clamping to the ten-year bound keeps the "effectively
+    /// keep everything" semantic (only rows older than ten years are swept).
+    #[tokio::test]
+    async fn rotation_round_clamps_extreme_session_retention_without_panicking() {
+        let pool = sag_analytics::open_analytics_pool(":memory:")
+            .await
+            .unwrap();
+        let now = unix_now_ms();
+        sag_analytics::upsert_session(&pool, &session_fact("recent", now))
+            .await
+            .unwrap();
+        sag_analytics::upsert_session(&pool, &session_fact("beyond-clamp", now - 4000 * DAY_MS))
+            .await
+            .unwrap();
+
+        rotation_round(
+            &pool,
+            &maintenance_config_with_session_retention(0, u32::MAX),
+            &mut SessionPruneLogState::default(),
+        )
+        .await;
+
+        assert!(
+            sag_analytics::get_session(&pool, "recent")
+                .await
+                .unwrap()
+                .is_some(),
+            "the clamped cutoff still covers recent sessions"
+        );
+        assert!(
+            sag_analytics::get_session(&pool, "beyond-clamp")
+                .await
+                .unwrap()
+                .is_none(),
+            "clamping to ten years sweeps rows the clamp cannot cover"
+        );
+
+        pool.close().await;
+    }
+
+    /// The arm line fires on the first round and then only on a change: the
+    /// repeating daily round must not re-announce the same policy, but a hot
+    /// reload that moves the window (or flips it to/from the default) must.
+    #[test]
+    fn session_prune_log_state_logs_first_round_and_each_change_only() {
+        let mut state = SessionPruneLogState::default();
+
+        assert!(
+            state.observe(7, SESSION_RETENTION_SOURCE_DEFAULT),
+            "the first round always announces the armed policy"
+        );
+        assert!(
+            !state.observe(7, SESSION_RETENTION_SOURCE_DEFAULT),
+            "an unchanged value stays silent so the daily round is not noise"
+        );
+        assert!(
+            state.observe(30, SESSION_RETENTION_SOURCE_CONFIG),
+            "a hot-reloaded retention is announced"
+        );
+        assert!(
+            !state.observe(30, SESSION_RETENTION_SOURCE_CONFIG),
+            "repeating the new value stays silent"
+        );
+        assert!(
+            state.observe(30, SESSION_RETENTION_SOURCE_DEFAULT),
+            "a change of source alone is a change of meaning"
+        );
+        assert!(
+            state.observe(7, SESSION_RETENTION_SOURCE_DEFAULT),
+            "returning to an earlier value is announced again, not deduped away"
+        );
+        assert!(
+            state.observe(0, SESSION_RETENTION_SOURCE_CONFIG),
+            "0 (keep forever) is announced: it is the difference between deleting and not"
+        );
+    }
+
+    /// The arm line's `source` field: an explicit non-default value is
+    /// `config`, the default (and a missing `[analytics]` section) is
+    /// `default` — the case an operator needs to spot, because omission
+    /// deletes rows after 7 days rather than archiving them.
+    #[tokio::test]
+    async fn round_retention_reports_the_session_retention_source() {
+        // Non-default explicit value → `config`.
+        let handle = maintenance_config_with_session_retention(0, 30);
+        let (_, session, source) = round_retention(&*handle.read().await);
+        assert_eq!(
+            (session, source),
+            (30, SESSION_RETENTION_SOURCE_CONFIG),
+            "an explicit non-default retention is reported as configured"
+        );
+
+        // `0` = keep forever is explicitly configured, not the default.
+        let handle = maintenance_config_with_session_retention(0, 0);
+        let (_, session, source) = round_retention(&*handle.read().await);
+        assert_eq!(
+            (session, source),
+            (0, SESSION_RETENTION_SOURCE_CONFIG),
+            "0 (keep forever) must not be mistaken for the default"
+        );
+
+        // Spelled-out default → indistinguishable from an omitted key.
+        let handle = maintenance_config(sag_config::DEFAULT_CALL_LOG_RETENTION_DAYS);
+        let (call_logs, session, source) = round_retention(&*handle.read().await);
+        assert_eq!(
+            (call_logs, session, source),
+            (
+                sag_config::DEFAULT_CALL_LOG_RETENTION_DAYS,
+                sag_config::DEFAULT_SESSION_RETENTION_DAYS,
+                SESSION_RETENTION_SOURCE_DEFAULT
+            ),
+            "an explicit default counts as default: omitted and default are indistinguishable"
+        );
+
+        // No `[analytics]` section at all → every knob at its default.
+        let mut config = maintenance_config(0).read().await.clone();
+        config.analytics = None;
+        assert_eq!(
+            round_retention(&config),
+            (
+                sag_config::DEFAULT_CALL_LOG_RETENTION_DAYS,
+                sag_config::DEFAULT_SESSION_RETENTION_DAYS,
+                SESSION_RETENTION_SOURCE_DEFAULT
+            ),
+            "no [analytics] section falls back to the defaults, deletions included"
+        );
     }
 
     /// Compute contract: the first run happens after one interval, claims

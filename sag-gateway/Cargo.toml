@@ -23,6 +23,9 @@ sag-providers = { path = "../sag-providers" }
 sag-analytics = { path = "../sag-analytics" }
 sag-state = { path = "../sag-state" }
 async-trait = { workspace = true }
+# Maintenance: `rotation_round` builds the session registry prune cutoff as a
+# `DateTime<Utc>` (the analytics crates expose no "now" helper).
+chrono = { workspace = true }
 
 # Optional deps for the `embed-ui` feature (see [features] below).
 # `include-exclude` powers the `#[exclude = "*.map"]` filter on `UiAssets`.
@@ -32,9 +35,8 @@ mime_guess = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Test-only: construct AnalyticsEvent fixtures (timestamps / ids) through
-# the formal public API instead of raw SQL.
-chrono = { workspace = true }
+# Test-only: construct AnalyticsEvent fixtures (ids) through the formal
+# public API instead of raw SQL.
 uuid = { workspace = true }
 # Test-only: assert on the raw `call_logs` / `sqlite_master` state that the
 # rotation scheduler produces (the crate has no other SQL surface).

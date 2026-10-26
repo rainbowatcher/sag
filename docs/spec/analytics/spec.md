@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-17
+updated: 2026-10-26
 ---
 
 # 分析 — 规格
@@ -26,7 +26,9 @@ updated: 2026-10-17
 
 - [sag-analytics/src/lib.rs](../../../sag-analytics/src/lib.rs) — `CallLogCollector` 等公共导出（现状）
 - [sag-analytics/src/store.rs](../../../sag-analytics/src/store.rs) — `LogStore` trait：`insert_batch` / `query_stats` / `query_logs` / `count_logs`（0008 起删除 `query_cache_stats` / `query_trend` / `query_distribution`）
-- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、诊断查询（`query_stats` / `query_logs` / `count_logs`）、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭；0007 起查询方法改读 `call_logs_hot` 视图并包 `with_schema_retry`，`new` / `from_pool` 在 `ensure_schema_consistency` 之后追加 `refresh_views(pool, None)`；0008 起删除 `query_cache_stats` / `query_trend` / `query_distribution`）
+- [sag-analytics/src/sqlite_store.rs](../../../sag-analytics/src/sqlite_store.rs) — SQLite 实现：连接池、`call_logs` 写入、诊断查询（`query_stats` / `query_logs` / `count_logs`）、`ensure_schema_consistency`（现状；0005 起新增 `from_pool` 共享池构造，`insert_batch` 整批 `BEGIN IMMEDIATE` 单事务，`shutdown` 仅拥有 pool 时关闭；0007 起查询方法改读 `call_logs_hot` 视图并包 `with_schema_retry`，`new` / `from_pool` 在 `ensure_schema_consistency` 之后追加 `refresh_views(pool, None)`；0008 起删除 `query_cache_stats` / `query_trend` / `query_distribution`；0009 起新增 `upsert_session` / `get_session`）
+- [sag-analytics/src/session_registry.rs](../../../sag-analytics/src/session_registry.rs) — `session_registry` 表读写（0009 新增）：`upsert_session`（最早请求者胜的合并 SQL）、`get_session`（主键点查）、`prune_session_registry`（`0` 短路、cutoff 严格小于、饱和运算）
+- [sag-core/src/session_preview.rs](../../../sag-core/src/session_preview.rs) — 会话展示事实（0009 新增）：`SessionRegistryFact` + `build_session_fact`（会话 id 截断 / 首条用户消息 preview 去 markup + 折叠空白 + 截断）、`CONVERSATION_ID_MAX_CHARS` / `PREVIEW_MAX_CHARS`
 - [sag-analytics/src/rotate.rs](../../../sag-analytics/src/rotate.rs) — 保留窗口与冷热轮转（0007 新增）：`rotate_once`（探测 + 单事务 6 步 DDL 捕获回放）、`refresh_views` / `build_views_in_tx`（两视图构建）、`retire_indexes`（索引退役巡检）、`unique_archive_name`、`is_schema_change`、`assert_replay_faithful`；常量 `HOT_TABLE` / `HOT_VIEW` / `ALL_VIEW` / `ARCH_PREFIX`
 - [sag-analytics/src/collector.rs](../../../sag-analytics/src/collector.rs) — `CallLogCollector`：bounded mpsc + 后台写入 + `try_send` 丢弃语义（现状，可丢弃链路；0005 起新增 `new_shared(pool)` 共享池构造）
 - [sag-analytics/migrations/](../../../sag-analytics/migrations/) — `call_logs` schema 迁移（现状，`.sqlite.sql` 后缀约定）
@@ -61,7 +63,7 @@ updated: 2026-10-17
 
 ### 配置与身份来源
 
-- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `AnalyticsConfig`（`enabled` / `storage_dsn`）、`RouteConfig`（`model_name` 即稳定业务身份）、`RouteTarget`（`provider` / `real_model`）
+- [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `AnalyticsConfig`（`enabled` / `storage_dsn` / `call_log_retention_days` / `session_retention_days`）、`RouteConfig`（`model_name` 即稳定业务身份）、`RouteTarget`（`provider` / `real_model`）
 - [sag-admin/src/admin_routes.rs](../../../sag-admin/src/admin_routes.rs) — route CRUD：`model_name` 为不可变主键（前端不可改 route name 的现状保证）
 
 ## 核心设计
@@ -502,7 +504,7 @@ stateDiagram-v2
 
 ### API 与 UI（目标实现，阶段 2）
 
-- 诊断接口保留、签名与行为不变：`GET /v1/analytics/stats`、`GET /api/logs`（旧明细聚合口径，不迁移为两级事实）；`GET /v1/analytics/{cache,trend,distribution}` 已下线（0008），时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
+- 诊断接口保留，信封向后兼容地新增可选 `session` 字段：`GET /v1/analytics/stats`、`GET /api/logs`（旧明细聚合口径，不迁移为两级事实；`/api/logs?session=<key>` 时信封额外携带 `session`，未带该参数时键不存在，老客户端形状不变）；`GET /v1/analytics/{cache,trend,distribution}` 已下线（0008），时间趋势与分布分析由 `/v1/analytics/v2/*` 承担。
 - 新统一查询接口（目标实现，query 参数风格，避免路径参数）：
 
 | 接口 | 参数 | 说明 |
@@ -555,6 +557,28 @@ COMMIT
 - 语句缓存容错 `with_schema_retry`：DDL 提升 schema cookie 后，连接上缓存过的 prepared statement 可能报 `database schema has changed`（`SQLITE_SCHEMA`，多连接池下尤其——DML 在连接 A、DDL 在连接 B）。查询层各查询方法（0008 后为 `query_stats` / `query_logs` / `count_logs`）+ `insert_batch` 都包这层 retry（**只重试一次**），仍失败则上抛（HTTP 500），不 panic。
 
 职责切分：`ensure_schema_consistency` 只对热表补列；`refresh_views` / `build_views_in_tx` 只读 pragma 建视图（不 ALTER 任何表）；`rotate_once` 只做 DDL 捕获回放（不补列——回放文本已含全部列）；冷表是轮转当天的 schema 快照，谁也不补它，列差异一律由视图 `NULL AS` 消化。store 打开顺序不可颠倒：`migrate` → `ensure_schema_consistency`（先补列）→ `refresh_views(pool, None)`（后取 pragma 建视图），否则视图会把补列前的形状烘死。启动路径的 `refresh_views(pool, None)` 只兜底视图存在性（全史形状是正确窗口的**超集**：只会多看到历史，不会丢行、不报错），窗口正确性由 spawn 后立即跑的首轮调度轮负责，亚秒级收敛。
+
+### 会话注册表 `session_registry`（已实现，0009）
+
+`call_logs.session_key` 只有哈希，管理面无法据此判断「这是哪段对话、开头问的是什么」。0009 起新增一张独立表存放可读的会话事实，日志页会话信息卡（[UI 0011](../ui/changes/0011-logs-session-info-card.md)）据此渲染。
+
+| 列 | 类型 | 语义 |
+| --- | --- | --- |
+| `session_key` | TEXT PRIMARY KEY | `SessionKey::map_id`（32 hex），与 `call_logs.session_key` 同域 |
+| `session_source` | TEXT NOT NULL | 抽取链来源：`meta` / `top` / `pc` / `fb` |
+| `conversation_id` | TEXT | 原始会话 id，≤128 字符；`pc` / `fb` 为 `NULL` |
+| `first_message_preview` | TEXT | 首条用户消息预览，≤160 字符（截断时追加 `…`） |
+| `first_seen` / `last_seen` | INTEGER NOT NULL | unix ms |
+
+另建 `idx_session_registry_last_seen` 供清理扫描；表**不参与** `call_logs` 轮转（轮转只改名 `call_logs` / `call_logs_arch_*`），因此不动 0007 的「热表 29 列 / 6 索引」不变量。
+
+合并语义是**最早请求者胜**（earliest-requester-wins）：`first_seen` 取 `MIN`、`last_seen` 取 `MAX`，`session_source` / `conversation_id` / `first_message_preview` 仅当新到 fact 的 `first_seen` 更早时覆盖（相等则保留已存值）。赢家由**请求时间戳**决定而不是写入顺序——collector 队列满/关时的直写兜底绕过 FIFO，同一会话的两个 fact 可能乱序落库，按到达顺序定赢家会让预览变成某条中途消息。
+
+写入点（每请求恰一次，**绝不**进 `success_log` / `failure_log` / 取消等终态，否则每次尝试都会重复写）：chat 派发（`ir` 确定之后、`cancel_guard` 之前）、image 派发（无 IR → 无 preview，`conversation_id` 照写）、`__no_route__` / `__all_disabled__` 两个 sentinel 终态（它们的 `CallLog` 行同样带 `session_key`）。写入走 `CallLogCollector::log_session`，与 `log` 共用同一 MPSC（FIFO 与 `flush` 覆盖两类写）；队列满 / 关闭时改为绕开队列的直写兜底而不丢弃——丢 opener 会让预览永久冻结在中途消息。
+
+**PII carve-out（用户裁定）**：脱敏只作用于发往上游的请求内容；`session_registry` 是本地管理面可见数据，因此存**原始** `conversation_id` 与**原始（未脱敏）**首条消息预览——采集点取 masking 之前的请求与 IR。这是 `sag_core::session.rs`「No PII ever leaves this type unhashed」不变式的唯一文档化例外，原始值仍不得进入 `CallLog`、会话亲和 map 或 admin snapshot。
+
+保留期与清理：`[analytics] session_retention_days`（默认 7，`0` = 永久保留 / 关闭清理），挂在每轮维护的**末尾**执行（与轮转同轮但相互独立：轮转失败仍清理，清理失败不影响本轮结果），每轮读一次热配置；cutoff 为 UTC 滚动窗口且严格小于（`last_seen < now - days × 24h`），天数按 3650 钳制。与 `call_logs` 相反，**超期直接删行、不归档**（没有冷表、没有视图）。每轮在首轮与有效值变化时输出 `session registry prune armed` 行（含有效天数与来源 `default` / `config`），删行数 0 走 `debug!`、非 0 走 `info!`。
 
 ### 两套口径契约分层（已实现，0008）
 
@@ -772,7 +796,7 @@ COMMIT
 - 未来对 `call_logs` 的迁移不得 `DROP TABLE call_logs`、不得改表名——两个视图与全部冷表的引用链都锚在 `call_logs` 这个名字上；`ALTER TABLE call_logs ADD COLUMN` 照旧安全（下次轮转捕获的 DDL 自然带上新列，冷表保持诞生时快照形状）
 
 ### API
-- 诊断端点只剩 `/v1/analytics/stats` 与 `/api/logs`，签名与行为不变；`/v1/analytics/{cache,trend,distribution}` 恒 404（不保留 410 / 301 壳）
+- 诊断端点只剩 `/v1/analytics/stats` 与 `/api/logs`（`/api/logs` 信封向后兼容地新增可选 `session` 字段，见 0009）；`/v1/analytics/{cache,trend,distribution}` 恒 404（不保留 410 / 301 壳）
 - 诊断口径与分析口径（`/v1/analytics/v2/*`）数字**不承诺可对比**，详见「两套口径契约分层」
 - `scope` 取值 ∈ `route|target`，默认 `route`；`from`/`to` 必填
 - route 视角查询不出现 `provider` / `actual_model` 过滤参数
@@ -824,6 +848,7 @@ COMMIT
 
 ## 变更记录
 
+- [0009 会话注册表 session_registry 与 /api/logs 的 session 信封](changes/0009-session-registry-and-logs-session-envelope.md)
 - [0008 退役旧分析端点，固化两套口径契约分层](changes/0008-retire-legacy-analytics-endpoints.md)
 
 - [0007 call_logs 保留窗口 + 表轮转（热窗口视图）](changes/0007-call-log-retention-rotation.md)

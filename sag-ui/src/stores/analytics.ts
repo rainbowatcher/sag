@@ -9,6 +9,7 @@ import type {
   CallLog,
   LogFilter,
   LogsResponse,
+  SessionInfo,
 } from "@/types/api"
 import { useConnectionStore } from "./connection"
 import { useProviderStore } from "./providers"
@@ -49,13 +50,25 @@ export const useAnalyticsStore = defineStore("analytics", () => {
   const logsOffset = ref(0)
   const logsLimit = ref(DEFAULT_LOG_LIMIT)
   const hasMoreLogs = ref(false)
+  /**
+   * Session registry record for the active `?session=` filter. `null` when the
+   * request was not session-filtered, or when the key has no registry row.
+   */
+  const logsSession = ref<SessionInfo | null>(null)
+  /**
+   * The `?session=` filter value that produced `logsSession`. The card only
+   * renders the record when this matches the filter it is displaying, so a
+   * freshly switched (or failed) filter can never show the previous key's
+   * registry row under the new hash.
+   */
+  const logsSessionKey = ref<string | null>(null)
   const activeLogFilter = ref<LogFilter>({})
   /**
    * Generation guard for the logs list, mirroring the v2 query guards. Only the
-   * newest `fetchLogs` call may write `logs`/`logsTotal`/`hasMoreLogs`/
-   * `logsOffset`/`logsLimit`; a slow response from a superseded page or filter
-   * (rapid paging, re-filtering, pasting a session key) is dropped instead of
-   * overwriting the newer page.
+   * newest `fetchLogs` call may write `logs`/`logsTotal`/`logsSession`/
+   * `logsSessionKey`/`hasMoreLogs`/`logsOffset`/`logsLimit`; a slow response from a superseded
+   * page or filter (rapid paging, re-filtering, pasting a session key) is
+   * dropped instead of overwriting the newer page.
    */
   const logsGuard = createQueryGuard()
 
@@ -107,6 +120,8 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (!logsGuard.isCurrent(token)) return
       logs.value = data.data ?? []
       logsTotal.value = data.total ?? 0
+      logsSession.value = data.session ?? null
+      logsSessionKey.value = filter.session ?? null
       hasMoreLogs.value = targetOffset + logs.value.length < logsTotal.value
       logsOffset.value = targetOffset
       logsLimit.value = effectiveLimit
@@ -114,6 +129,9 @@ export const useAnalyticsStore = defineStore("analytics", () => {
       if (e?.response?.status === 401) useConnectionStore().handle401()
       if (!logsGuard.isCurrent(token)) return
       logsError.value = getErrorMessage(e, "Failed to load call logs")
+      // A failed request must not leave any session record behind.
+      logsSession.value = null
+      logsSessionKey.value = null
     } finally {
       if (logsGuard.isCurrent(token)) logsLoading.value = false
     }
@@ -255,6 +273,8 @@ export const useAnalyticsStore = defineStore("analytics", () => {
     logsOffset,
     logsLimit,
     hasMoreLogs,
+    logsSession,
+    logsSessionKey,
     activeLogFilter,
     applyLogsFilter,
     fetchLogs,

@@ -319,6 +319,19 @@ async fn emit_no_route_failure(
         None,
         session_key.map(|k| k.map_id(&request.model)),
     );
+    // Session-registry fact: the sentinel CallLog row above carries
+    // `session_key`, so the log page's session card must resolve it too.
+    // No IR exists at this layer — only the preview is dropped;
+    // `conversation_id` is recorded as usual. Written once per request
+    // (this terminal is the only path taken).
+    if let Some(key) = session_key {
+        state.collector.log_session(sag_core::build_session_fact(
+            key,
+            &request.model,
+            None,
+            started_at,
+        ));
+    }
     // Formal analytics fact: no route matched → no route identity, no
     // target attempts. The sentinel `__no_route__` CallLog row above is
     // left untouched and must never leak into this fact.
@@ -396,6 +409,17 @@ async fn emit_all_disabled_failure(
         None,
         session_key.map(|k| k.map_id(&request.model)),
     );
+    // Session-registry fact for the sentinel CallLog row above (same key,
+    // same route model, same timestamp). No IR at this layer → no preview,
+    // `conversation_id` still recorded. One write per request.
+    if let Some(key) = session_key {
+        state.collector.log_session(sag_core::build_session_fact(
+            key,
+            &request.model,
+            None,
+            started_at,
+        ));
+    }
     // Formal analytics fact: the route matched but every target is
     // disabled → carry the real matched route name (never the
     // `__all_disabled__` sentinel); the writer resolves `route_id` from
@@ -1233,6 +1257,72 @@ mod tests {
         assert_eq!(log.model, "gpt-4o");
         assert_eq!(log.status_code, 502);
         assert_eq!(log.error_category.as_deref(), Some("all_exhausted"));
+    }
+
+    // ── session registry fact on the sentinel terminals ────────
+
+    /// Both sentinel terminals write a `CallLog` row keyed by `session_key`,
+    /// so they must write the matching registry fact too — otherwise the log
+    /// page's session card shows "no details" for a key the logs query
+    /// matched. No IR exists at this layer, so only the preview is missing.
+    #[tokio::test]
+    async fn sentinel_terminals_write_session_registry_fact() {
+        let key = sag_core::SessionKey::new("meta", "conv-sentinel");
+
+        let (state, runtime) = build_state_no_routes().await;
+        let req = test_request("gpt-4o");
+        let result = resolve_route(
+            &state,
+            &runtime,
+            &req,
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+            Some(&key),
+        )
+        .await;
+        assert!(result.is_err(), "expected ModelNotFound error");
+        state.collector.flush().await;
+        let rec = state
+            .collector
+            .store()
+            .get_session(&key.map_id("gpt-4o"))
+            .await
+            .unwrap()
+            .expect("no_route terminal must write a registry row");
+        assert_eq!(rec.session_source, "meta");
+        assert_eq!(rec.conversation_id.as_deref(), Some("conv-sentinel"));
+        assert_eq!(rec.first_message_preview, None, "no IR at this layer");
+        assert_eq!(rec.first_seen, rec.last_seen, "single write per request");
+
+        let (state, runtime) = build_state_all_disabled().await;
+        let result = resolve_route(
+            &state,
+            &runtime,
+            &req,
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+            Some(&key),
+        )
+        .await;
+        assert!(result.is_err(), "expected AllProvidersExhausted error");
+        state.collector.flush().await;
+        let rec = state
+            .collector
+            .store()
+            .get_session(&key.map_id("gpt-4o"))
+            .await
+            .unwrap()
+            .expect("all_disabled terminal must write a registry row");
+        assert_eq!(rec.conversation_id.as_deref(), Some("conv-sentinel"));
+        assert_eq!(rec.first_message_preview, None, "no IR at this layer");
     }
 
     // ── capability pre-check observability (B1) ─────────────────

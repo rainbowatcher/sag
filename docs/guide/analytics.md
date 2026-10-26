@@ -113,7 +113,17 @@ COMMIT;
 | 端点 | 返回 | 口径 |
 |---|---|---|
 | `GET /v1/analytics/stats` | 按 `(provider, model, real_model)` 分组的聚合行 | 热窗口 · 近似 |
-| `GET /api/logs` | 明细分页（`{"data": [CallLog...], "total": n}`，`offset` / `limit` 默认 50，支持 `provider` / `model` / `real_model` / `status_code` 过滤） | 热窗口 · 可丢行 |
+| `GET /api/logs` | 明细分页（`{"data": [CallLog...], "total": n}`，`offset` / `limit` 默认 50，支持 `provider` / `model` / `real_model` / `status_code` / `session` 过滤；带 `?session=` 时信封额外携带 `session` 字段） | 热窗口 · 可丢行 |
+
+`GET /api/logs` 的 `session` 参数是 32 位会话哈希（即日志表的 `session_key`），精确匹配；空串视同未传。带该参数时响应信封会多一个 `session` 字段，共三态：
+
+| 请求 | 响应里的 `session` |
+|---|---|
+| 未带 `?session=`（或值为空串） | **没有这个键**，信封就是老的 `{"data", "total"}` |
+| `?session=<key>`，但表里没这段会话 | `null`（旧数据、或已过保留期） |
+| `?session=<key>`，命中 | 会话对象：`session_key` / `session_source` / `conversation_id` / `first_message_preview` / `first_seen` / `last_seen` |
+
+会话对象来自 `session_registry` 表（日志页会话信息卡的数据源）：`session_source` 是哈希的抽取来源（`meta` / `top` / `pc` / `fb`），`conversation_id` 只在 `meta` / `top` 来源下存在（≤128 字符），`first_message_preview` 是首条用户消息的标题式预览（去 markup、折叠空白、≤160 字符）。这两列存的是**原始文本**：脱敏只作用于发往上游的请求内容，本地管理面看到的会话信息不做替换。
 
 ### GET /v1/analytics/stats
 
@@ -174,6 +184,8 @@ SAG 有两套互不兼容的数字口径。**它们对不上是预期行为，�
 ## 保留窗口与冷热轮转
 
 `call_logs` 默认只保留 **90 天**热数据（`[analytics] call_log_retention_days`，`0` = 禁用）。更早的行不会被删除：整张热表会被转成冷表，历史数据仍可用 SQL 查。
+
+会话信息表 `session_registry`（日志页会话信息卡的数据源）另有一档独立保留期：`[analytics] session_retention_days`，默认 **7 天**，`0` = 永久保留（关闭清理）。它只删除过期行、不归档，也不参与 `call_logs` 的冷热轮转，两者互不影响。
 
 ### 冷表命名与粒度
 

@@ -3,6 +3,8 @@ use chrono::{DateTime, Utc};
 use sag_core::CallLog;
 use serde::Serialize;
 
+use crate::session_registry::SessionRegistryFact;
+
 /// Persistence abstraction for analytics data.
 ///
 /// Implementations include [`crate::SqliteLogStore`] (local) and potentially
@@ -22,6 +24,15 @@ pub trait LogStore: Send + Sync {
 
     /// Count total call log entries matching the filter (for pagination metadata).
     async fn count_logs(&self, filter: LogFilter) -> sag_core::Result<u64>;
+
+    /// Upsert one `session_registry` row. First-write-wins: an existing row
+    /// only has its `last_seen` advanced.
+    async fn upsert_session(&self, fact: &SessionRegistryFact) -> sag_core::Result<()>;
+
+    /// Fetch the registry record for a hashed session identity
+    /// (`CallLog::session_key`). `None` when the session was never recorded,
+    /// predates the registry, or has already been pruned.
+    async fn get_session(&self, key: &str) -> sag_core::Result<Option<SessionRecord>>;
 
     /// Gracefully shut down the store, flushing any pending writes.
     async fn shutdown(&self);
@@ -82,6 +93,27 @@ pub struct LogFilter {
     pub status_code: Option<StatusCodeFilter>,
     pub offset: u64,
     pub limit: u64,
+}
+
+/// One `session_registry` row: the displayable side of a hashed session
+/// identity, written earliest-requester-wins by the collector and read back
+/// by the admin logs endpoint (`?session=` → envelope `session`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionRecord {
+    /// 32-hex-char `SessionKey::map_id` digest (also `call_logs.session_key`).
+    pub session_key: String,
+    /// Extraction-chain source prefix (`meta` / `top` / `pc` / `fb`).
+    pub session_source: String,
+    /// Plaintext conversation id, truncated to 128 chars. `None` for the
+    /// `pc` / `fb` sources, which carry no conversation id.
+    pub conversation_id: Option<String>,
+    /// Title-style preview of the session opener (first user message, markup
+    /// stripped, whitespace collapsed, truncated to 160 chars).
+    pub first_message_preview: Option<String>,
+    /// First request that observed this session.
+    pub first_seen: DateTime<Utc>,
+    /// Most recent request that observed this session.
+    pub last_seen: DateTime<Utc>,
 }
 
 /// Aggregated statistics row, grouped by `(provider, model, real_model)`.

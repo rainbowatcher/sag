@@ -1,6 +1,6 @@
 ---
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # 隐私过滤 — 规格
@@ -201,6 +201,16 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 
 **Trade-off**：现状是「被拒请求在统计里不可见」。好处是拒绝不会污染成功/失败率与供应商维度指标（没有 provider 被调用）；代价是运营方无法从 dashboard 看到「有多少请求被隐私策略挡掉」——已列入 v1.5 候选（补一条独立事件而非复用 `call_logs`）。
 
+### 掩码边界是上游出口，`session_registry` 是已批准的例外
+
+本模块只承诺「发往上游的内容」不含明文：掩码作用于 Chat 请求副本与 IR，还原作用于回客户端的响应；两者都是**请求链路**上的动作。网关本地管理面另有一张 `session_registry` 表（[analytics 0009](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)），按用户裁定存**掩码前**的 `conversation_id`（≤128，仅 `meta` / `top` 来源）与首条用户消息预览（≤160，被截断时追加 `…`），供日志页会话信息卡经 `GET /api/logs?session=` 读取。
+
+- **写入点在掩码之前**：`dispatch_chat` 在 `candidate = request.clone()` + `engine.mask_request(&mut candidate)` 之后、`privacy_request.unwrap_or(request)` 之前取 `registry_request` / `registry_ir`，因此开启 `mask` 不会把 `[[KIND_h12]]` 占位符写进注册表，也不会让注册表影响上游编码。
+- **保留期独立**：`[analytics] session_retention_days`，默认 7 天，`0` = 永久；超期直接删行不归档，不参与 `call_logs` 轮转。
+- **范围不外溢**：原始值仍不得进入 `CallLog`、会话亲和 map 或 admin 快照——这是 `sag_core::session.rs` 「No PII ever leaves this type unhashed」不变式的唯一文档化例外，覆盖范围仅为 `session_registry` 一张表。
+
+**Trade-off**：放弃「注册表也存占位符」——哈希是不可读的，卡片存在的意义就是给人看的会话身份；存占位符等于把卡片降级成另一种哈希。放弃「不存首条预览」——只给 `conversation_id` 无法回答「这段对话开头问的是什么」。代价是本地磁盘上有一段有期限的明文，靠独立保留期与「仅管理面可读」收束。
+
 ## 不变式
 
 - `PrivacyEngine::compile` **不读** `cfg.enabled`：是否构建引擎由调用方（`dispatch_chat`）判定
@@ -225,6 +235,7 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 - `RestoreWriter::push` 返回空字节表示「尚无完整帧」，流式循环必须 `continue` 且不得据此 stamp TTFT（TTFT 以实际下发字节为准）
 - 流式终点（`End` / `None` / `Error` 后无显式 `End`）必须调用 `finish()` 并下发残余字节，否则尾部帧会被丢弃；若尾缓冲非空，必须先置 `terminal_pending` 并 yield 尾字节，`finish_stream_terminal` 只能在下一次 poll 执行
 - `block` 的 400 与 `503` 的 body 不得包含明文、正则 pattern 或引擎错误详情
+- 掩码边界恒为「上游出口」：`mask_request` / `mask_ir` 产出的占位符只能出现在上游请求里，回客户端的响应只做还原；本地持久化面（`session_registry`）取的是掩码**前**的请求与 IR，不得写入占位符
 
 ## 测试策略
 
@@ -265,3 +276,4 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 
 - [0001 隐私过滤初始化](changes/0001-initial.md)
 - [0002 隐私过滤 Minor 项收敛](changes/0002-minor-fixes.md)
+- [0003 隐私边界与 `session_registry` PII 例外](changes/0003-pii-carve-out-boundary.md)

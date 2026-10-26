@@ -5,7 +5,8 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::collections::HashSet;
 use tracing::warn;
 
-use crate::store::{LogFilter, LogStore, StatsFilter, StatsRow, StatusCodeFilter};
+use crate::session_registry::SessionRegistryFact;
+use crate::store::{LogFilter, LogStore, SessionRecord, StatsFilter, StatsRow, StatusCodeFilter};
 
 /// Stage-0.4 extension columns added to `call_logs` beyond the original
 /// 13-column schema, plus the M7 protocol/lane dimensions. Each entry is
@@ -437,6 +438,22 @@ impl LogStore for SqliteLogStore {
         .map_err(|e| AppError::Internal(format!("count_logs failed: {e}")))?;
 
         Ok(count.max(0) as u64)
+    }
+
+    async fn get_session(&self, key: &str) -> sag_core::Result<Option<SessionRecord>> {
+        // `session_registry` is not part of the rotation (rotation only
+        // rewrites `call_logs` / `call_logs_arch_*`), but the shared pool also
+        // serves rotation-driven statements, so keep the same one-shot
+        // SQLITE_SCHEMA retry as the other reads.
+        with_schema_retry(|| crate::session_registry::get_session(&self.pool, key))
+            .await
+            .map_err(|e| AppError::Internal(format!("get_session failed: {e}")))
+    }
+
+    async fn upsert_session(&self, fact: &SessionRegistryFact) -> sag_core::Result<()> {
+        with_schema_retry(|| crate::session_registry::upsert_session(&self.pool, fact))
+            .await
+            .map_err(|e| AppError::Internal(format!("upsert_session failed: {e}")))
     }
 
     async fn shutdown(&self) {

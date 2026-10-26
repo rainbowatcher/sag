@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # UI 管理面板 — 规格
@@ -33,7 +33,7 @@ updated: 2026-10-25
 - [sag-ui/src/pages/ProvidersPage.vue](../../../sag-ui/src/pages/ProvidersPage.vue) — Provider 列表页（组合 ProviderList + ProviderAddForm）
 - [sag-ui/src/pages/RoutesPage.vue](../../../sag-ui/src/pages/RoutesPage.vue) — Route 列表页（组合 RouteList + RouteAddForm）
 - [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) — 用量统计（Stats + Cache 双 Tab）
-- [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（表格 + 筛选 + 分页；Client 列之后为 Session 列，点击单元格即套用会话筛选）
+- [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（表格 + 筛选 + 分页；Client 列之后为 Session 列，点击单元格即套用会话筛选；应用会话过滤时在筛选栏与表格之间渲染 `SessionInfoCard`）
 - [sag-ui/src/pages/ConnectPage.vue](../../../sag-ui/src/pages/ConnectPage.vue) — 连接配置页面
 
 ### 核心组件
@@ -47,6 +47,8 @@ updated: 2026-10-25
 - [sag-ui/src/components/routes/TargetEditor.vue](../../../sag-ui/src/components/routes/TargetEditor.vue) — Target 编辑器（provider + real_model + priority + retries；新增走浮窗批量选择）
 - [sag-ui/src/components/routes/TargetPickerDialog.vue](../../../sag-ui/src/components/routes/TargetPickerDialog.vue) — Target 浮窗选择器（搜索 + 分组多选 + 差异化确认；Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
 - [sag-ui/src/components/routes/SessionAffinityPopover.vue](../../../sag-ui/src/components/routes/SessionAffinityPopover.vue) — 会话 pin 浮层（props `model`，emit `changed`）：展示某请求模型空间的 pin（provider/real_model、key 前 8 位、source、age、剩余 TTL）+ 逐条清除 + 按模型两步确认清空
+- [sag-ui/src/components/SessionInfoCard.vue](../../../sag-ui/src/components/SessionInfoCard.vue) — 会话信息卡（props `session` / `sessionKey`）：会话键 + 来源徽标 + 会话 ID + 首条消息，首末时间在来源 tooltip；`session === null` 时降级为「只有会话键 + 降级文案」
+- [sag-ui/src/lib/sessionInfo.ts](../../../sag-ui/src/lib/sessionInfo.ts) — 会话卡的展示纯函数：来源收窄、空值占位（`—`）、preview 折叠与截断、时间格式化
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
 
 ### 工具函数与类型
@@ -63,7 +65,7 @@ updated: 2026-10-25
 ### 多语言（i18n）
 
 - [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
-- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，589 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，601 key），key 为稳定英文标识符
 - [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
 - [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
 - [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
@@ -410,8 +412,10 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 11. **session-sticky 路由**：新建路由选 session-sticky → 两个会话参数输入出现；留空提交 → Network 面板里 payload 不含 `session_ttl_secs` / `session_max_entries`；填 `-1` / `1.5` / 容量 `0` → 就地报错且无请求；编辑既有 session-sticky 路由 → 初值回填，不改则 payload 仍不含两字段（省略 = 保留）；`model_name = "*"` 或 `pipeline = "image"` 提交 → strategy / pipeline 字段就地报错（容量 `0` 仍为顶部错误条显示后端 400 消息）
 12. **会话 pin 浮层**：session-sticky 路由的 active target 单元格出现 pin 按钮（其它策略无）→ 打开浮层 → Network 面板显示 `GET /api/session-affinity?model=<model>` → 条目含 provider/real_model、key 前 8 位、source、age、expires；`session_ttl_secs = 0` 的路由显示「永不过期」→ 逐条清除 → `DELETE {"key": …}`（body 为全量 32 位）+ toast + 列表项消失 + active target 列重拉；按模型清空 → 首次点击仅将按钮换成确认文案（无请求）→ 确认后 `DELETE {"model": …}`
 13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 筛选栏内的会话过滤控件原地变成同一全量 key（截断显示、`title` 为全量）且表格立即重查 → 点控件内 X 后控件回到空态输入框（placeholder）且回到无会话筛选的行集
+14. **会话信息卡三态**：点一条有注册表记录的 Session 列 → 筛选栏与表格之间出现卡片，会话键前 8 位与全量 `title` 与所点行一致、来源徽标 hover 显示首次 / 最近出现、会话 ID 与首条消息为明文 → 点另一段对话的 Session 列 → 新响应返回前卡片已回到降级形态（不会把上一段对话的首条消息显示在新哈希下）→ 粘贴一个无记录的 key 回车 → 卡片仍显示该 key，但只剩会话键 + 降级文案 → 点 X 清除会话过滤 → 卡片整张消失（`v-if`）
 
 ## 变更记录
+- [0011 日志页会话信息卡](changes/0011-logs-session-info-card.md)
 - [0010 日志页会话键过滤项内联显示](changes/0010-logs-session-filter-inline-control.md)
 - [0009 UI 对接 session-affinity 观测与会话列/校验提示](changes/0009-session-affinity-pins-and-log-session-column.md)
 - [0008 UI 补齐 `session_sticky` 路由策略](changes/0008-session-sticky-route-strategy.md)

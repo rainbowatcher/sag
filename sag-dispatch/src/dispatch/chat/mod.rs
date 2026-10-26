@@ -259,6 +259,13 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             PrivacyOutcome::Clean => {}
         }
     }
+    // Registry preview source: the **raw** (pre-masking) request and IR,
+    // captured before the masked copies replace them below. `session_registry`
+    // is a local management surface — privacy masking exists to keep sensitive
+    // values out of the content sent upstream, so the registry keeps the
+    // original text (see `sag_core::session_preview`'s module docs).
+    let registry_request = request;
+    let registry_ir = ir;
     // From here on the masked copy (when there is one) is the request every
     // provider call and every egress path sees.
     let request = privacy_request.as_ref().unwrap_or(request);
@@ -288,6 +295,30 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
             }
         }
     };
+    // Session-registry fact for the log page's session info card: the
+    // display companion of `session_log_key` (same key, same route model,
+    // same `started_at`). Written exactly **once per request**, here, before
+    // the target loop — never in a terminal path (`success_log` /
+    // `failure_log` / cancel), which would repeat the write per attempt.
+    //
+    // The preview comes from the **raw** IR: the registry is a local
+    // management surface, so privacy masking (an upstream-bound concern) must
+    // not reach it. When the caller passed `ir: None`, decode the raw request
+    // for the same reason — the masked `ir` above is the encode source, not a
+    // display source.
+    if let Some(key) = session_key.as_ref() {
+        let registry_ir_fallback;
+        let preview_ir = match registry_ir {
+            Some(raw) => Some(raw),
+            None => {
+                registry_ir_fallback = ChatCompletionsCodec::decode_request(registry_request);
+                Some(&registry_ir_fallback)
+            }
+        };
+        let fact = sag_core::build_session_fact(key, &request.model, preview_ir, started_at);
+        state.collector.log_session(fact);
+    }
+
     let is_anthropic_ingress = matches!(ingress_protocol, IngressProtocol::AnthropicMessages);
     let is_responses_ingress = matches!(ingress_protocol, IngressProtocol::Responses);
     // M8: request-side LossInventory summary for CallLog terminals.

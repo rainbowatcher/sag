@@ -11,6 +11,17 @@
 //! - **The digest is content-addressed and stable** across restarts and
 //!   instances, so a sticky pin survives a process restart conceptually
 //!   (the LRU itself is in-memory, see the design doc's follow-ups).
+//!
+//! ## Approved PII exception: `session_registry`
+//!
+//! The log page's session info card needs a readable label for a hashed
+//! session key, so [`crate::session_preview::SessionRegistryFact`] stores a
+//! **truncated** conversation id (≤128 chars, `meta` / `top` sources only)
+//! and a title-style first-message preview (≤160 chars). That table is the
+//! one approved exception — it has its own retention policy and is pruned
+//! periodically. The invariant above still holds everywhere else: raw
+//! values must not enter `CallLog`, the session-affinity map, or the admin
+//! snapshot.
 
 use sha2::{Digest, Sha256};
 
@@ -27,6 +38,10 @@ pub struct SessionKey {
     pub source: &'static str,
     /// The raw value as found in the request. Never logged, never stored —
     /// only fed into [`SessionKey::map_id`].
+    ///
+    /// The single exception is the `session_registry` table (see the module
+    /// docs): it keeps a truncated form of this value for the log page's
+    /// session info card, never the value itself.
     pub value: String,
 }
 

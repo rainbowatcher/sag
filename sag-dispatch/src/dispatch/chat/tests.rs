@@ -4301,11 +4301,115 @@ async fn call_log_records_session_hash_for_every_strategy() {
     );
 }
 
+#[tokio::test]
+async fn session_registry_fact_is_written_once_per_request() {
+    // The registry fact is a request fact like `call_logs.session_key`: it is
+    // written exactly once per request (not once per target attempt), from
+    // the same key / route model / timestamp as the call log, and carries the
+    // opener preview built from the IR.
+    let m1 = Arc::new(MockProvider::new("first"));
+    let m2 = Arc::new(MockProvider::new("second"));
+    let state =
+        build_state_with_strategy(vec![m1.clone(), m2.clone()], Strategy::StickyFailover).await;
+    let rt = shared_runtime(&state);
+    let key = sag_core::SessionKey::new("meta", "conv-registry");
+    let req = build_request("gpt-4o", false);
+
+    let (resp, _) = run_session_request(&state, &rt, &req, Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    state.collector.flush().await;
+
+    let expected = key.map_id("gpt-4o");
+    let rec = state
+        .collector
+        .store()
+        .get_session(&expected)
+        .await
+        .unwrap()
+        .expect("session registry row for the extracted session");
+    assert_eq!(rec.session_source, "meta");
+    assert_eq!(rec.conversation_id.as_deref(), Some("conv-registry"));
+    assert_eq!(
+        rec.first_message_preview.as_deref(),
+        Some("hi"),
+        "preview comes from the first user message of the IR"
+    );
+    assert_eq!(rec.first_seen, rec.last_seen, "single write per request");
+
+    // Session-less request → no registry row at all.
+    let (resp, _) = run_session_request(&state, &rt, &req, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    state.collector.flush().await;
+    assert!(
+        state
+            .collector
+            .store()
+            .get_session(&key.map_id("gpt-4o"))
+            .await
+            .unwrap()
+            .is_some(),
+        "the first request's row survives the session-less request"
+    );
+}
+
+#[tokio::test]
+async fn session_registry_preview_keeps_raw_text_when_privacy_masks() {
+    // Decided scope of the privacy filter: masking protects the content sent
+    // to the upstream model. The `session_registry` table is a local
+    // management surface, so its preview keeps the original text instead of
+    // the `[[EMAIL_…]]` placeholder.
+    let email = "alice@example.com";
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(build_response_with_content(
+        "gpt-4o", None, "ok",
+    )));
+    let state = build_state_with_privacy(
+        vec![mock.clone()],
+        sag_config::PrivacyConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": format!("write to {email}")}],
+    }))
+    .expect("valid test request");
+    let key = sag_core::SessionKey::new("meta", "conv-privacy");
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    ctx.session_key = Some(key.clone());
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Upstream side unchanged: the plaintext never leaves the gateway.
+    let seen = mock.last_request().expect("provider was called");
+    let sent = seen.messages[0].content.to_string();
+    assert!(!sent.contains(email), "upstream saw: {sent}");
+
+    state.collector.flush().await;
+    let rec = state
+        .collector
+        .store()
+        .get_session(&key.map_id("gpt-4o"))
+        .await
+        .unwrap()
+        .expect("session registry row for the masked request");
+    let expected = format!("write to {email}");
+    assert_eq!(
+        rec.first_message_preview.as_deref(),
+        Some(expected.as_str()),
+        "registry keeps the raw text: masking is an upstream-bound concern"
+    );
+}
+
 // ─── Terminal-frame bridge regression ────────────────────────────
 // `.plan/stream-terminal-frame-race-fix.md` §6 cases 5 / 6: a client that
 // closes right after the client-visible terminal frame (upstream FIN tail
 // latency) must classify as success, never as `client_cancelled` / 499.
-
 /// One Anthropic SSE `data:` frame.
 fn anthropic_frame(payload: &str) -> StreamChunk {
     StreamChunk::Data(format!("data: {payload}\n\n").into_bytes())

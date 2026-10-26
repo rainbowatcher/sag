@@ -1,6 +1,6 @@
 ---
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-10-26
 ---
 
 # 隐私过滤
@@ -14,6 +14,10 @@ updated: 2026-10-25
 ### 检测范围
 
 网关检测请求中**所有会发往上游的字符串**，不限于消息正文——把 PII 从 `content` 挪到别的字段无法绕过脱敏：
+
+> 本模块的承诺边界是**上游出口**：脱敏只作用于发往 provider 的请求内容（以及回到客户端的响应还原）。
+> 网关本地管理面另有一处经过批准的 PII 例外（`session_registry` 表，见「与其它模块的交互 → 分析」），
+> 它不属于本模块的检测范围。
 
 - 消息 `content`：为字符串时整段检测；为内容块数组时检测其中每个字符串叶子（`{"type": "text"}` 的 `text`、未知块的 `body` 等）。
 - `messages[].name`、`messages[].extra` 的每个字符串叶子（`tool_calls[].function.arguments`、`reasoning_content`、`refusal`、`annotations` …）。
@@ -108,7 +112,8 @@ updated: 2026-10-25
 ### 事件日志与可观测性
 
 - 三类事件日志（masked / detected / blocked）只记录 `kind=count` 序列（如 `email=1,phone=2`），不记录明文，也不记录占位符。
-- 隐私过滤不新增 analytics 记录，也不修改既有 `call_logs` 行的字段；被 `block` 拒绝或 `503` 早退的请求不写 `call_logs`（见「不包含」）。
+- 隐私过滤不改写既有 `call_logs` 行的字段；被 `block` 拒绝或 `503` 早退的请求不写 `call_logs`（见「不包含」）。
+- **明文落盘的唯一例外**是 `session_registry` 表：`conversation_id`（≤128）与首条消息预览（≤160）存**掩码前**的原始值，仅供本地管理面的日志页会话信息卡读取，有独立保留期（`[analytics] session_retention_days`，默认 7 天，`0` = 永久）。开启脱敏**不会**让占位符进入该表，也不会让原始值进入 `call_logs` / 会话亲和 map / admin 快照。细节见「与其它模块的交互 → 分析」。
 - 流式响应的最后一批字节（含隐私尾缓冲的残余帧）先下发给客户端，`call_logs` / analytics 的终态记账随后：客户端看到最后一个字节时，该请求的统计尚未落库。这条顺序是有意的——「请求已结束」不应早于「响应已发完」。
 
 ## 配置 Schema
@@ -165,6 +170,7 @@ items = ["public@example.com"]
 - 图片 / 音频等不透明载荷（`data` / `file_data` / `url`）、模型名、`role` / `type` / 工具调用 id、请求头、对象键名的检测。
 - 图片生成路径（`/v1/images/*`）的隐私过滤。
 - `block` / `503` 早退的 analytics 记录（v1.5 候选）。
+- **本地管理面持久化的原始会话身份与首条消息预览**（`session_registry`，见下节）：这是经批准的 PII carve-out，不在本模块的掩码覆盖范围内。
 - 跨 SSE 帧被劈开的占位符还原：两半都不构成含完整占位符的 JSON 文档，因此都不还原。占位符是加盐摘要、不含明文，属显示瑕疵而非泄露。
 - 占位符加密或可逆加密：当前是加盐哈希 + 网关侧内存反向映射。
 - 占位符反向映射的跨请求持久化：映射只存活于单次请求；多轮对话靠「客户端重发明文 → 同文本同占位符」保持一致。
@@ -175,10 +181,17 @@ items = ["public@example.com"]
 - **配置**：`PrivacyConfig` / `PrivacyMode` / `PrivacyBuiltins` / `PrivacyCustomRegex` / `PrivacyWordList` 定义 schema；`GatewayConfig::validate_privacy` 在加载与保存时校验自定义正则。
 - **调度**：`dispatch_chat` 在解构 `DispatchCtx` 后、调用任何 provider 之前执行脱敏（Chat 请求副本 + IR 原地脱敏，不做编解码往返），并在非流式 / 流式出口执行还原。block 与 503 在分发循环之前早退。
 - **供应商**：无直接交互。provider 只看到占位符，不感知隐私过滤存在。
-- **分析**：隐私过滤不写入 analytics；block / 503 早退发生在 analytics 事件产生之前，因此不产生 `call_logs` 行。
+- **分析**：隐私过滤本身不写入 analytics；block / 503 早退发生在 analytics 事件产生之前，因此不产生 `call_logs` 行。
+  唯一例外是 `session_registry`（[analytics 0009](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)，文档化 PII carve-out）：
+  `conversation_id` 与 `first_message_preview` 存**掩码前**的原始值（≤128 / ≤160 字符），仅供本地管理面的
+  日志页会话信息卡经 `GET /api/logs?session=` 读取，独立保留期（`session_retention_days`，默认 7 天，`0` = 永久），
+  不参与 `call_logs` 轮转。采集点在掩码之前（`chat/mod.rs` 的 `registry_request` / `registry_ir`），因此开启 `mask`
+  也不会把 `[[KIND_h12]]` 占位符写进注册表。这是 `sag-core/src/session.rs` 中「No PII ever leaves this type unhashed」
+  不变式的**唯一**文档化例外；脱敏的承诺范围仍是「发往上游的内容」。
 - **日志**：通过 tracing 输出 `info` / `warn` / `error` 三类事件，遵循既有日志模块的滚动与级别约定。
 
 ## 变更记录
 
 - [0001 隐私过滤初始化](changes/0001-initial.md)
 - [0002 隐私过滤 Minor 项收敛](changes/0002-minor-fixes.md)
+- [0003 隐私边界与 `session_registry` PII 例外](changes/0003-pii-carve-out-boundary.md)

@@ -107,6 +107,8 @@ enabled = true
 storage_dsn = "sqlite://analytics-test.db"
 # 测试轨用 1 天，便于手动验证归档轮转；0 = 禁用归档清理。
 call_log_retention_days = 1
+# session_registry（日志页会话信息卡）保留天数；0 = 永久保留（关闭清理）。
+session_retention_days = 7
 
 # NOTE: [gateway_auth] intentionally NOT included — agent tools
 # (`.kilo/`, `.cline/`, `.kimchi/`) typically connect without Authorization.

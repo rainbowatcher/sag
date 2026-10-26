@@ -69,6 +69,10 @@ enabled = true
 # 相对 `sqlite://` 路径锚定到 $XDG_DATA_HOME/sag（默认 ~/.local/share/sag）。
 # 此处即解析为 ~/.local/share/sag/analytics.db；也可写绝对路径或 ":memory:"。
 storage_dsn = "sqlite://analytics.db"
+# session_registry（日志页会话信息卡的数据源）的保留天数，默认 7。
+# 省略该键就等于启用 7 天清理：超期的会话记录会被直接删行（不归档）。
+# 0 = 永久保留（关闭清理）；它不参与 call_logs 的冷热轮转。
+session_retention_days = 7
 
 # 网关客户端认证（可选 — 删除此段以关闭认证）
 [gateway_auth]

@@ -11,9 +11,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use sag_analytics::LogFilter;
-use sag_core::AppError;
-use serde_json::json;
+use sag_analytics::{LogFilter, SessionRecord};
+use sag_core::{AppError, CallLog};
 use tracing::{error, instrument};
 
 use sag_state::AppState;
@@ -67,9 +66,32 @@ fn build_filter(query: LogsQuery) -> LogFilter {
     }
 }
 
+/// Response envelope for `GET /api/logs`: `{ "data": [...], "total": n }`
+/// plus the optional `session` detail for a `?session=` filter.
+///
+/// The doubled `Option` encodes the three shapes the frontend must tell
+/// apart:
+///
+/// | request | `session` field |
+/// |---|---|
+/// | no `?session=`, or empty value | **absent** (legacy envelope preserved) |
+/// | `?session=<key>` with no registry row | `null` |
+/// | `?session=<key>` with a registry row | [`SessionRecord`] object |
+///
+/// Timestamps use the same `chrono::DateTime<Utc>` serde representation as
+/// [`CallLog::timestamp`] (RFC3339 / ISO8601).
+#[derive(Debug, serde::Serialize)]
+pub struct LogsResponse {
+    pub data: Vec<CallLog>,
+    pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<Option<SessionRecord>>,
+}
+
 /// GET `/api/logs` — return a page of recent call-log entries with
 /// optional filters. The response envelope `{ "data": [CallLog...], "total": total }`
-/// matches the shape expected by the frontend pagination.
+/// matches the shape expected by the frontend pagination, extended with the
+/// optional `session` field described on [`LogsResponse`].
 ///
 /// Rows are ordered `ORDER BY timestamp DESC` (newest first).
 #[instrument(skip(state))]
@@ -78,19 +100,38 @@ pub async fn list_logs(
     Query(params): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let filter = build_filter(params);
+    // Captured before `filter` is consumed by `count_logs`.
+    let session_key = filter.session.clone();
     let store = state.collector.store();
     let logs_res = store.query_logs(filter.clone()).await;
     let count_res = store.count_logs(filter).await;
 
     match (logs_res, count_res) {
-        (Ok(rows), Ok(total)) => (
-            StatusCode::OK,
-            Json(json!({
-                "data": rows,
-                "total": total,
-            })),
-        )
-            .into_response(),
+        (Ok(rows), Ok(total)) => {
+            // `?session=` present but unknown → `Some(None)` → `"session": null`.
+            // A registry lookup failure degrades to `null` as well: the page
+            // entry list is the primary payload and must not fail with the
+            // (decorative) session card.
+            let session = match session_key {
+                None => None,
+                Some(key) => match store.get_session(&key).await {
+                    Ok(record) => Some(record),
+                    Err(e) => {
+                        error!(?e, %key, "session registry lookup failed");
+                        Some(None)
+                    }
+                },
+            };
+            (
+                StatusCode::OK,
+                Json(LogsResponse {
+                    data: rows,
+                    total,
+                    session,
+                }),
+            )
+                .into_response()
+        }
         (Err(e), _) | (_, Err(e)) => {
             error!(?e, "logs query or count failed");
             AppError::Internal(e.to_string()).into_response()
@@ -107,6 +148,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use chrono::Utc;
+    use sag_analytics::SessionRegistryFact;
     use sag_core::{CallLog, Usage};
     use std::collections::HashMap;
     use tower::ServiceExt;
@@ -174,6 +216,61 @@ mod tests {
             .insert_batch(&logs)
             .await
             .expect("insert_batch must succeed for test setup");
+    }
+
+    /// Hashed session identity used by the session-detail tests. 32 hex
+    /// chars, matching the `SessionKey::map_id` shape.
+    const SESSION_KEY: &str = "a3f1c0de00000000000000000000beef";
+
+    fn make_session_log(session_key: &str, status_code: u16) -> CallLog {
+        CallLog {
+            session_key: Some(session_key.into()),
+            ..make_log("openai", "gpt-4o", "gpt-4o", status_code)
+        }
+    }
+
+    /// Seed one `session_registry` row, as the dispatch layer + collector
+    /// would on the session's first request.
+    async fn insert_session(state: &AppState, fact: &SessionRegistryFact) {
+        state
+            .collector
+            .store()
+            .upsert_session(fact)
+            .await
+            .expect("upsert_session must succeed for test setup");
+    }
+
+    fn session_fact() -> SessionRegistryFact {
+        let first_seen = Utc::now() - chrono::Duration::minutes(5);
+        SessionRegistryFact {
+            session_key: SESSION_KEY.into(),
+            session_source: "meta".into(),
+            conversation_id: Some("conv-8f21".into()),
+            first_message_preview: Some("Summarize this quarterly report".into()),
+            first_seen,
+            last_seen: first_seen + chrono::Duration::minutes(4),
+        }
+    }
+
+    async fn get_logs(state: AppState, uri: &str) -> serde_json::Value {
+        let app = test_app(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    /// State seeded with one logged request and its registry row, i.e. the
+    /// happy path a session filter runs against.
+    async fn seeded_state() -> AppState {
+        let state = build_state(HashMap::new(), vec![]).await;
+        insert_logs(&state, vec![make_session_log(SESSION_KEY, 200)]).await;
+        insert_session(&state, &session_fact()).await;
+        state
     }
 
     #[tokio::test]
@@ -459,5 +556,99 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(data.len(), 1, "empty filter must not exclude anything");
+    }
+
+    /// `?session=<known key>` → the envelope carries the registry record so
+    /// the logs page can render the session info card from one response.
+    #[tokio::test]
+    async fn list_logs_session_filter_includes_session_record() {
+        let body = get_logs(
+            seeded_state().await,
+            &format!("/api/logs?session={SESSION_KEY}"),
+        )
+        .await;
+
+        let data = body["data"].as_array().expect("data must be an array");
+        assert_eq!(data.len(), 1, "the session filter must match the row");
+        assert_eq!(body["total"], 1);
+
+        let session = body["session"]
+            .as_object()
+            .expect("session must be an object");
+        assert_eq!(session["session_key"], SESSION_KEY);
+        assert_eq!(session["session_source"], "meta");
+        assert_eq!(session["conversation_id"], "conv-8f21");
+        assert_eq!(
+            session["first_message_preview"],
+            "Summarize this quarterly report"
+        );
+        // Same ISO8601 shape as `CallLog::timestamp`.
+        for field in ["first_seen", "last_seen"] {
+            let raw = session[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be an ISO8601 string"));
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .unwrap_or_else(|e| panic!("{field} is not RFC3339 ({raw}): {e}"));
+        }
+        let first =
+            chrono::DateTime::parse_from_rfc3339(session["first_seen"].as_str().unwrap()).unwrap();
+        let last =
+            chrono::DateTime::parse_from_rfc3339(session["last_seen"].as_str().unwrap()).unwrap();
+        assert!(first < last, "first_seen must precede last_seen");
+    }
+
+    /// `?session=<unknown key>` → `"session": null` while the entry list
+    /// still comes back normally (old rows / pruned sessions).
+    #[tokio::test]
+    async fn list_logs_session_filter_unknown_key_yields_null_session() {
+        let state = build_state(HashMap::new(), vec![]).await;
+        // Log row present, registry row absent.
+        insert_logs(&state, vec![make_session_log(SESSION_KEY, 200)]).await;
+
+        let body = get_logs(state, &format!("/api/logs?session={SESSION_KEY}")).await;
+
+        let session = body
+            .get("session")
+            .expect("session key must be present when filtering");
+        assert!(session.is_null(), "unknown key must serialize as null");
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["total"], 1);
+    }
+
+    /// No `?session=` at all → the legacy `{ data, total }` envelope is
+    /// preserved byte-for-byte (no `session` key), keeping old clients and
+    /// the current dashboard working.
+    #[tokio::test]
+    async fn list_logs_without_session_filter_omits_session_field() {
+        let body = get_logs(seeded_state().await, "/api/logs").await;
+
+        assert!(
+            !body
+                .as_object()
+                .expect("envelope must be an object")
+                .contains_key("session"),
+            "no session filter must not add a session key: {body}"
+        );
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    }
+
+    /// `?session=` (empty value) keeps the existing "filter not set"
+    /// semantics: every row matches and no `session` key is added.
+    #[tokio::test]
+    async fn list_logs_empty_session_filter_is_treated_as_unset() {
+        let body = get_logs(seeded_state().await, "/api/logs?session=").await;
+
+        assert!(
+            !body
+                .as_object()
+                .expect("envelope must be an object")
+                .contains_key("session"),
+            "empty session filter must not add a session key: {body}"
+        );
+        assert_eq!(
+            body["data"].as_array().unwrap().len(),
+            1,
+            "empty session filter must not exclude anything"
+        );
     }
 }
