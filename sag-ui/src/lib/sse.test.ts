@@ -1,5 +1,14 @@
 import assert from "node:assert/strict"
 import {
+  applySnapshot,
+  emptyInflightState,
+  markDisconnected,
+  parseInflightSnapshot,
+} from "./inflight.ts"
+import {
+  SSE_MAX_DATA_LINES,
+  SSE_MAX_LINE_LENGTH,
+  SseFrameLimitError,
   SseHttpError,
   createSseClient,
   createSseParser,
@@ -122,6 +131,46 @@ import {
   assert.equal(events[0].data, "x")
 }
 
+// ── frame caps: an oversized frame is a broken stream, not a memory sink ──
+{
+  const parser = createSseParser()
+  assert.throws(
+    () => parser.push(`data: ${"x".repeat(SSE_MAX_LINE_LENGTH)}\n\n`),
+    SseFrameLimitError,
+    "a terminated line over the cap fails the frame",
+  )
+}
+{
+  const parser = createSseParser()
+  assert.throws(
+    () => parser.push("x".repeat(SSE_MAX_LINE_LENGTH + 1)),
+    SseFrameLimitError,
+    "a line that never terminates trips the cap through the buffer alone",
+  )
+}
+{
+  const parser = createSseParser()
+  const line = `data: ${"x".repeat(1024)}\n`
+  assert.throws(
+    () => {
+      for (let i = 0; i < 300; i++) parser.push(line)
+    },
+    SseFrameLimitError,
+    "the data of one frame is capped, however it is chunked",
+  )
+}
+{
+  const parser = createSseParser()
+  assert.throws(
+    () => {
+      // Empty data lines barely grow the length sum but multiply the line count.
+      for (let i = 0; i < SSE_MAX_DATA_LINES + 1; i++) parser.push("data:\n")
+    },
+    SseFrameLimitError,
+    "the number of data lines in one frame is capped",
+  )
+}
+
 // ── backoff schedule ───────────────────────────────────────────────
 {
   assert.equal(nextRetryDelay(0), 1000, "first retry waits one base delay")
@@ -158,6 +207,17 @@ function streamResponse(chunks: string[]): Response {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  })
+  return new Response(body, { status: 200 })
+}
+
+/** Serve raw byte chunks then close the body (lets a test split a UTF-8 char). */
+function byteResponse(chunks: Uint8Array[]): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk)
       controller.close()
     },
   })
@@ -382,6 +442,166 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
   assert.equal(reauths, 1, "the re-auth handler runs exactly once")
   assert.equal(failures.length, 1, "a 401 is not retried")
   assert.equal(calls.length, 1, "no second request is made")
+  assert.equal(client.isRunning(), false)
+  globalThis.fetch = realFetch
+}
+
+// ── accept header hardening ────────────────────────────────────────
+// `fetch`'s `Headers` merges keys that differ only in case, so a stray `accept`
+// copied from the axios defaults would otherwise be glued onto the handshake.
+{
+  const calls = stubFetch([streamResponse([])])
+  let errors = 0
+  const client = createSseClient({
+    url: "/api/inflight",
+    headers: {
+      accept: "application/json",
+      ACCEPT: "text/plain",
+      "Content-Type": "application/json",
+      Authorization: "Bearer sk-1",
+    },
+    baseDelayMs: 1000,
+    onEvent: () => {},
+    onError: () => {
+      errors += 1
+    },
+  })
+  client.start()
+  await until(() => errors >= 1, "the empty stream to end")
+  client.stop()
+
+  const wire = new Headers(calls[0].headers)
+  assert.equal(
+    wire.get("accept"),
+    "text/event-stream",
+    "every case variant of Accept is dropped, so Headers cannot merge them",
+  )
+  assert.equal(wire.get("content-type"), null, "a bodyless GET forwards no Content-Type")
+  assert.equal(wire.get("authorization"), "Bearer sk-1", "other headers still travel")
+  globalThis.fetch = realFetch
+}
+
+// ── UTF-8 across chunk boundaries ──────────────────────────────────
+// `TextDecoder` is used in streaming mode, so a multi-byte character split over
+// two `read()` results must not turn into U+FFFD.
+{
+  // The name is built from code points because the i18n gate forbids CJK
+  // literals outside `src/lib/i18n/`, and this test needs multi-byte characters.
+  const model = String.fromCharCode(0x6a21, 0x578b)
+  const frame = `event: inflight\ndata: {"model_name":"${model}-α"}\n\n`
+  const bytes = new TextEncoder().encode(frame)
+  const cjk = bytes.findIndex((byte) => byte >= 0x80)
+  assert.ok(cjk > 0, "the frame really contains a multi-byte character")
+  stubFetch([byteResponse([bytes.slice(0, cjk + 1), bytes.slice(cjk + 1)])])
+
+  const events: string[] = []
+  let errors = 0
+  const client = createSseClient({
+    url: "/api/inflight",
+    baseDelayMs: 1000,
+    onEvent: (event) => events.push(event.data),
+    onError: () => {
+      errors += 1
+    },
+  })
+  client.start()
+  await until(() => errors >= 1, "the stream to end")
+  client.stop()
+
+  assert.deepEqual(events, [`{"model_name":"${model}-α"}`], "the split character is reassembled")
+  globalThis.fetch = realFetch
+}
+
+// ── start() is single-flight ───────────────────────────────────────
+{
+  const calls = stubFetch([streamResponse([]), streamResponse([])])
+  let errors = 0
+  const client = createSseClient({
+    url: "/api/inflight",
+    // Long enough that the retry timer cannot fire while the assertions run.
+    baseDelayMs: 1000,
+    onEvent: () => {},
+    onError: () => {
+      errors += 1
+    },
+  })
+  client.start()
+  client.start()
+  client.start()
+  await until(() => errors >= 1, "the first stream to end")
+  assert.equal(calls.length, 1, "three start() calls open exactly one stream")
+  client.stop()
+  globalThis.fetch = realFetch
+}
+
+// stop() then more chunks: the open body stays silent
+{
+  let push = (_chunk: string): void => {}
+  globalThis.fetch = (async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (chunk) => controller.enqueue(new TextEncoder().encode(chunk))
+      },
+    })
+    return new Response(body, { status: 200 })
+  }) as typeof fetch
+
+  const events: string[] = []
+  let opens = 0
+  const client = createSseClient({
+    url: "/api/inflight",
+    baseDelayMs: 1000,
+    onOpen: () => {
+      opens += 1
+    },
+    onEvent: (event) => events.push(event.data),
+  })
+  client.start()
+  await until(() => opens === 1, "the stream to open")
+  client.stop()
+  push('event: inflight\ndata: {"seq":1}\n\n')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.deepEqual(events, [], "a chunk enqueued after stop() reaches nobody")
+  assert.equal(client.isRunning(), false)
+  globalThis.fetch = realFetch
+}
+
+// an oversized frame drops the connection: reconnect, no delivery, no clearing
+{
+  const calls = stubFetch([
+    streamResponse([
+      'event: inflight\ndata: {"seq":1}\n\n',
+      `data: ${"x".repeat(SSE_MAX_LINE_LENGTH)}\n\n`,
+    ]),
+    streamResponse([]),
+  ])
+  const events: string[] = []
+  const errors: unknown[] = []
+  // Replica of `stores/inflight.ts`: a frame replaces the state, any non-auth
+  // error only flags it stale. The snapshot must survive the reconnect — a
+  // broken stream is not proof that nothing is in flight.
+  let state = emptyInflightState()
+  const client = createSseClient({
+    url: "/api/inflight",
+    baseDelayMs: 5,
+    onEvent: (event) => {
+      events.push(event.data)
+      const parsed = parseInflightSnapshot(event.data)
+      if (parsed !== null) state = applySnapshot(state, parsed)
+    },
+    onError: (error) => {
+      errors.push(error)
+      state = markDisconnected(state)
+    },
+  })
+  client.start()
+  await until(() => calls.length >= 2, "the client to reconnect after the violation")
+  client.stop()
+
+  assert.ok(errors[0] instanceof SseFrameLimitError, "the cap surfaces as a stream error")
+  assert.deepEqual(events, ['{"seq":1}'], "frames before the violation are still delivered")
+  assert.deepEqual(state.snapshot, { seq: 1, total: 0, routes: [] }, "the snapshot is kept")
+  assert.equal(state.stale, true, "and flagged stale instead of being cleared")
   assert.equal(client.isRunning(), false)
   globalThis.fetch = realFetch
 }

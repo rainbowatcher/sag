@@ -61,7 +61,8 @@ pub struct InFlightSnapshot {
     /// Monotonic publication counter (starts at 0 for the empty registry).
     pub seq: u64,
     /// Sum of all per-route counts — the number of requests in flight.
-    pub total: usize,
+    /// Same width as [`InFlightRouteCount::count`], which it sums.
+    pub total: u64,
     /// Per-route counts, `count` descending. Empty when nothing is in flight.
     pub routes: Vec<InFlightRouteCount>,
 }
@@ -130,16 +131,23 @@ impl InFlightRegistry {
     /// Takes `self: &Arc<Self>` so the guard can own a strong handle: a
     /// streamed response moves the guard into a `'static` body state, which
     /// outlives the dispatch call stack.
+    ///
+    /// The guard is built **before** the increment and the publication, so the
+    /// `+1` has an owner the instant it lands: should `publish` panic (only
+    /// an OOM-grade failure), unwinding drops the guard, whose `Drop` recovers
+    /// the poisoned lock and gives the count back — no residual count that no
+    /// guard could ever release.
     #[must_use = "dropping the guard immediately releases the count"]
     pub fn acquire(self: &Arc<Self>, model_name: impl Into<String>) -> InFlightGuard {
         let model_name = model_name.into();
-        let mut inner = self.lock();
-        *inner.counts.entry(model_name.clone()).or_insert(0) += 1;
-        self.publish(&mut inner);
-        InFlightGuard {
+        let guard = InFlightGuard {
             registry: Arc::clone(self),
-            model_name,
-        }
+            model_name: model_name.clone(),
+        };
+        let mut inner = self.lock();
+        *inner.counts.entry(model_name).or_insert(0) += 1;
+        self.publish(&mut inner);
+        guard
     }
 
     /// Poisoned-lock recovery: a panic while holding the lock would only
@@ -168,7 +176,7 @@ impl InFlightRegistry {
                 .cmp(&a.count)
                 .then_with(|| a.model_name.cmp(&b.model_name))
         });
-        let total = routes.iter().map(|r| r.count as usize).sum();
+        let total = routes.iter().map(|r| r.count).sum();
         self.snapshot.send_replace(InFlightSnapshot {
             seq: inner.seq,
             total,
@@ -352,7 +360,7 @@ mod tests {
 
         let snapshot = registry.snapshot();
         let sum: u64 = snapshot.routes.iter().map(|r| r.count).sum();
-        assert_eq!(snapshot.total as u64, sum);
+        assert_eq!(snapshot.total, sum);
         assert_eq!(snapshot.total, 3);
     }
 
@@ -398,7 +406,7 @@ mod tests {
         // Every thread has acquired and is holding; nobody released yet.
         barrier.wait();
         let snapshot = registry.snapshot();
-        assert_eq!(snapshot.total, THREADS * PER_THREAD);
+        assert_eq!(snapshot.total, (THREADS * PER_THREAD) as u64);
         assert_eq!(snapshot.routes.len(), THREADS);
         for route in &snapshot.routes {
             assert_eq!(route.count, PER_THREAD as u64, "route {}", route.model_name);
@@ -411,6 +419,30 @@ mod tests {
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.total, 0, "every acquire must be released");
         assert!(snapshot.routes.is_empty(), "no residual zero-count keys");
+    }
+
+    /// A panic while a guard is alive must release the count on unwind — the
+    /// RAII guarantee the whole design rests on (non-streaming dispatches
+    /// keep the guard on the stack, so an unwind releases it).
+    #[test]
+    fn panic_unwind_releases_the_count() {
+        let registry: InFlight = Arc::default();
+        let observed = Arc::clone(&registry);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = observed.acquire("route-a");
+            assert_eq!(observed.snapshot().total, 1, "counted before the panic");
+            panic!("boom");
+        }));
+
+        assert!(result.is_err(), "the closure must have unwound");
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.total, 0, "unwind must release the count");
+        assert!(
+            snapshot.routes.is_empty(),
+            "no residual zero-count key after unwind, got {:?}",
+            snapshot.routes
+        );
     }
 
     #[tokio::test]

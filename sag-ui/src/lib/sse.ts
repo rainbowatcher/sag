@@ -6,7 +6,8 @@
  * byte stream itself instead: `createSseParser` turns decoded text chunks into
  * event frames (cross-chunk safe, `: ping` heartbeat comments ignored) and
  * `createSseClient` owns the connection loop — open, consume, and reconnect
- * with exponential backoff until `stop()`.
+ * with exponential backoff until `stop()`. Frames over the `SSE_MAX_*` caps are
+ * a stream error, not something to buffer.
  */
 
 /** One dispatched SSE frame. `event` defaults to `"message"` per the spec. */
@@ -23,6 +24,35 @@ export interface SseParser {
   push(chunk: string): SseEvent[]
   /** End of stream: flush a trailing frame that has no closing blank line. */
   flush(): SseEvent[]
+}
+
+/**
+ * Hard caps on a single stream frame. A gateway (or a proxy that mangles the
+ * stream) exceeding one of them is treated as a broken connection: the parser
+ * throws, the client reports the error and reconnects with backoff, and the
+ * caller keeps its last snapshot instead of clearing it.
+ *
+ * Lengths are counted in UTF-16 code units (`String#length`), a cheap proxy for
+ * bytes that never undercounts the ASCII the field syntax is made of.
+ */
+export const SSE_MAX_LINE_LENGTH = 64 * 1024
+/** Sum of the `data:` line lengths of one frame. */
+export const SSE_MAX_FRAME_LENGTH = 256 * 1024
+/** Number of `data:` lines in one frame. */
+export const SSE_MAX_DATA_LINES = 1024
+
+/**
+ * A stream frame broke one of the `SSE_MAX_*` caps.
+ *
+ * Thrown out of `SseParser.push`, which leaves the parser mid-frame: a caller
+ * that catches it must discard the parser, exactly as `createSseClient` does by
+ * building a fresh one per connection.
+ */
+export class SseFrameLimitError extends Error {
+  constructor(what: string) {
+    super(`SSE frame exceeds ${what}`)
+    this.name = "SseFrameLimitError"
+  }
 }
 
 /** Locate the next line break, or `null` when the line is still incomplete. */
@@ -49,10 +79,12 @@ export function createSseParser(): SseParser {
   let eventName = ""
   let lastId: string | null = null
   let dataLines: string[] = []
+  let frameLength = 0
 
   function resetFrame(): void {
     eventName = ""
     dataLines = []
+    frameLength = 0
   }
 
   function dispatch(out: SseEvent[]): void {
@@ -62,6 +94,7 @@ export function createSseParser(): SseParser {
   }
 
   function handleLine(line: string, out: SseEvent[]): void {
+    if (line.length > SSE_MAX_LINE_LENGTH) throw new SseFrameLimitError("the line length cap")
     if (line === "") {
       dispatch(out)
       return
@@ -77,6 +110,13 @@ export function createSseParser(): SseParser {
         eventName = value
         break
       case "data":
+        // Both caps are enforced before the line is stored, so a hostile stream
+        // cannot grow the frame past them by one more chunk.
+        frameLength += value.length + 1
+        if (frameLength > SSE_MAX_FRAME_LENGTH) throw new SseFrameLimitError("the frame length cap")
+        if (dataLines.length >= SSE_MAX_DATA_LINES) {
+          throw new SseFrameLimitError("the data line cap")
+        }
         dataLines.push(value)
         break
       case "id":
@@ -97,6 +137,9 @@ export function createSseParser(): SseParser {
         buffer = buffer.slice(end.index + end.length)
         handleLine(line, out)
       }
+      // A line that never terminates would otherwise grow the buffer for as long
+      // as the gateway keeps sending.
+      if (buffer.length > SSE_MAX_LINE_LENGTH) throw new SseFrameLimitError("the line length cap")
       return out
     },
     flush(): SseEvent[] {
@@ -139,6 +182,26 @@ export function headersFromDefaults(
     if (typeof value === "string" && value !== "") headers[name] = value
   }
   return headers
+}
+
+/**
+ * Drop the caller's content-negotiation headers, case-insensitively.
+ *
+ * `fetch`'s `Headers` merges keys that differ only in case, so a stray
+ * `accept`/`ACCEPT` copied out of the axios defaults would be glued onto the
+ * SSE handshake header (`"application/json, text/event-stream"`). The stream is
+ * a bodyless GET, so a `Content-Type` has nothing to describe either.
+ */
+function withoutContentNegotiation(
+  headers: Record<string, string> | undefined,
+): Record<string, string> {
+  const kept: Record<string, string> = {}
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    const lower = name.toLowerCase()
+    if (lower === "accept" || lower === "content-type") continue
+    kept[name] = value
+  }
+  return kept
 }
 
 /** Callbacks and knobs of `createSseClient`. */
@@ -245,6 +308,12 @@ export function createSseClient(options: SseClientOptions): SseClient {
       const tail = decoder.decode()
       emit(tail ? parser.push(tail) : [])
       emit(parser.flush())
+    } catch (error) {
+      // A frame over a cap leaves the body half-read: cancel it so the gateway
+      // stops sending instead of leaking one open connection per retry, then let
+      // `connect()` report the error and schedule the reconnect.
+      await reader.cancel().catch(() => {})
+      throw error
     } finally {
       reader.releaseLock()
     }
@@ -256,9 +325,11 @@ export function createSseClient(options: SseClientOptions): SseClient {
     try {
       const response = await fetch(options.url, {
         method: "GET",
-        // The SSE handshake header goes last: the caller's headers come from
-        // `api.defaults.headers.common`, which carries `Accept: application/json`.
-        headers: { ...options.headers, Accept: "text/event-stream" },
+        // The caller's headers come from `api.defaults.headers.common`, which
+        // carries `Accept: application/json`; every case variant of it (and of
+        // `Content-Type`) is stripped first so the handshake header below is the
+        // only one left for `Headers` to send.
+        headers: { ...withoutContentNegotiation(options.headers), Accept: "text/event-stream" },
         signal: controller.signal,
         cache: "no-store",
       })

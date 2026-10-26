@@ -143,11 +143,31 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  /**
+   * Drop the connection-scoped snapshots other stores hold (the in-flight
+   * counters), so the next gateway or account never inherits the previous
+   * one's data. Loaded dynamically: `stores/inflight.ts` imports this module, so
+   * a static import would be a cycle — the same reason `connect()` lazily loads
+   * the route/provider stores.
+   *
+   * Never rejects: a snapshot is a display cache, and failing to load the chunk
+   * must not block logout or the re-auth redirect.
+   */
+  async function clearConnectionScopedState(): Promise<void> {
+    try {
+      const { useInflightStore } = await import("./inflight")
+      useInflightStore().reset()
+    } catch {
+      // Intentionally ignored — see above.
+    }
+  }
+
   function disconnect() {
     connection.value = null
     validated.value = false
     api.defaults.baseURL = ""
     setBearer(null)
+    void clearConnectionScopedState()
   }
 
   async function handle401() {
@@ -155,6 +175,7 @@ export const useConnectionStore = defineStore("connection", () => {
     validated.value = false
     api.defaults.baseURL = ""
     setBearer(null)
+    await clearConnectionScopedState()
     if (_router) {
       _router.push("/connect?reason=expired")
     }

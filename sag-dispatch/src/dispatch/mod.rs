@@ -597,7 +597,11 @@ pub(crate) struct DispatchAnalytics {
     ///
     /// `std::sync::Mutex`: the guard's `Drop` cannot await, and the
     /// critical sections are a single set/clear with no await inside.
-    in_flight: std::sync::Mutex<Option<InFlightAttempt>>,
+    ///
+    /// Named `in_flight_attempt` to keep it distinct from the per-route
+    /// `sag_state::InFlight` request counter (`AppState::in_flight`) — this
+    /// is the attempt *marker*, not a count.
+    in_flight_attempt: std::sync::Mutex<Option<InFlightAttempt>>,
     /// Failure facts of targets whose retry sequence already terminated
     /// *before* the currently in-flight one (multi-target fallback: target
     /// A failed, target B is being tried). The dispatch loop appends each
@@ -661,7 +665,10 @@ impl DispatchAnalytics {
         upstream_protocol: Option<&str>,
         lane: Option<&str>,
     ) {
-        let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self
+            .in_flight_attempt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *slot = Some(InFlightAttempt {
             provider: provider.to_string(),
             real_model: real_model.to_string(),
@@ -676,7 +683,10 @@ impl DispatchAnalytics {
     /// reaches this line — the future is dropped with the marker still
     /// set, so the guard persists a `cancelled` attempt.
     fn end_attempt(&self) {
-        let mut slot = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self
+            .in_flight_attempt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *slot = None;
     }
 
@@ -732,7 +742,7 @@ impl DispatchCancelGuard {
                 client_ip,
                 session_key,
                 done: std::sync::atomic::AtomicBool::new(false),
-                in_flight: std::sync::Mutex::new(None),
+                in_flight_attempt: std::sync::Mutex::new(None),
                 completed: std::sync::Mutex::new(Vec::new()),
             }),
         }
@@ -778,7 +788,7 @@ impl Drop for DispatchCancelGuard {
         // fact — spec scenario 11.
         let in_flight = self
             .analytics
-            .in_flight
+            .in_flight_attempt
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();

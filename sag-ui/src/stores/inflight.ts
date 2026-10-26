@@ -110,7 +110,14 @@ export const useInflightStore = defineStore("inflight", () => {
     assign(markDisconnected(currentState()))
   }
 
-  /** Clear the snapshot (disconnect / logout). */
+  /**
+   * Close the stream and clear the snapshot.
+   *
+   * Called by the connection store on disconnect / 401 (`handle401`) so the
+   * previous gateway's or account's counters never linger as `stale` for a
+   * round-trip after the connection is gone. A plain `stop()` deliberately keeps
+   * the snapshot: a remount repaints instantly.
+   */
   function reset(): void {
     stop()
     assign(emptyInflightState())
