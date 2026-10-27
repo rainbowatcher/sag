@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-22
+updated: 2026-10-27
 ---
 
 # 调度
@@ -13,13 +13,13 @@ updated: 2026-10-22
 
 ### 分发流程
 
-1. 接收客户端请求（ChatCompletionRequest / ImageGenerationRequest）
+1. 接收客户端请求（ChatCompletionRequest / ImageGenerationRequest / SystemOneRequest）
 2. 检查 `routes_version`，仅在路由集发生变更时执行惰性缓存清理（`prune_stale_entries`），移除 config 路由中已不存在的 model_name 对应的 `fill_first_orders`、`route_counters`、`active_targets` 条目；版本未变则跳过，避免不必要的写锁竞争
 3. 匹配路由 → 按策略排序 targets
 4. 对每个 target，反复尝试至重试耗尽：
    a. 检查熔断器状态（冷却中则跳过）
    b. 检查 provider 是否 enabled
-   c. 调用 provider（chat / chat_stream / chat_image）
+   c. 调用 provider（chat / chat_stream / chat_image / systemone）
    d. 成功 → 返回响应
    e. 失败 → 根据错误类型决定重试或 fallthrough：
       - **客户端归因 4xx**（400/413/422/未知 4xx）：直接返客户端，不重试、不 failover、不挪 pin、不开熔断
@@ -77,6 +77,20 @@ updated: 2026-10-22
 - 调用 provider 的 `chat_image()` 方法
 - 响应只取 `data[0]`（单张图片），`created` 取 `SystemTime::now()` 或上游原值
 
+### SystemOne 决策接口
+
+入口 `POST /v1/systemone`（TypeSafe System One 决策协议，LiteLLM / OpenRouter / Ollama 以同一形状兼容）：请求 `{model, state, questions, assets?}`，响应 `{id?, model, answers, usage}`。`state` / `questions` / `answers` 与逐题概率字段**无法映射到 chat IR**，任何 decode → encode 往返都会丢字段，因此该协议与图片生成同属「无 IR 分发物种」——不走 `dispatch_chat`，而是调用 provider 的 `systemone()` 原生方法：
+
+- **原样透传**：`state` / `questions` / `assets` 与响应 `answers` / `id` / 各题型概率字段零解码、零改写；wire body 的唯一改动是把 `model` 改写为目标的 `real_model`（与 chat / image 一致）。`state` 的三种形态（字符串 / 对象 / 数组）与 `questions` 的动态键名原样保留
+- **完整复用分发骨架**：in-flight 计数、会话注册表 fact、熔断闸门、重试退避、跨目标降级与 analytics / `call_logs` 终态记账与 chat / image 一致，不做最小转发（裸转发会绕过这些设施，使决策路径运维不可见）
+- **校验边界（只校验路由所需）**：JSON 语法错 → `400`；body 非对象、`model` 非字符串、`questions` 非对象 → `422 unprocessable`（形状预检先于 carrier 构造与派发）；`pipeline = "image"` 的路由 → `422`。**不校验** `question.type` 与 `criteria` 形状——非法值由上游拒绝（请求体容忍未知值，严格性只保留给类型化配置枚举）
+- **presence 即能力**：SystemOne 既无 chat IR 也无 Translated lane，因此目标 provider 必须声明 `apis.systemone`。缺该节点的目标在解析阶段被 `filter_systemone_targets` 丢弃，`errors` 记 `"{provider}/{model}: lacks capability systemone"`，全部被丢弃时沿用 all-disabled / fallback-exhausted 的 `502` 信封并原样带出该原因
+- **错误信封**：统一走 SAG 的 `{ "error": { "code", "message" } }`（OpenAI 信封），不采用 TypeSafe 原生 `{detail}`。上游以 HTTP 200 内嵌的 `error` 对象按上游错误升格——rate-limit 特征 → `429`，其它 → `502`
+- **无流式**：协议没有 `stream` 字段，恒为一次性 JSON 响应；取消检测只走非流式 `DispatchCancelGuard` 路径
+- **analytics 口径**：`usage.input_tokens/output_tokens` → `prompt_tokens/completion_tokens`，缺失或形状不合法一律留 NULL（**不编造 0**）；每次请求照常计入 `in_flight`、写一次会话注册表 fact、按目标产生 `TargetAttemptFact` 并落 `call_logs` 终态（成功 / 客户端 4xx / 全耗尽 `502` 模型失败三路）
+- **`fallback` 只覆盖 chat IR 三协议**：`fallback` 的取值域与「是否需要 fallback」的判定只统计 `chat_completions` / `responses` / `anthropic_messages`。仅有 `apis.systemone` + 单个 chat 协议时仍不需要 `fallback`；显式 `fallback = "systemone"` 在配置校验阶段报错（`fallback='systemone' is not supported`）——静默回退会把决策协议当成 chat 翻译目标
+- **派生视图**：`GET /v1/models` 的 `ingress_protocols` 由 `ApiKind::protocols()` 派生，自动包含 `systemone`；`POST /api/providers/probe-protocols` 明确不支持该协议（`minimal_request` 返回 `None` → 调用方转 `400`），因为决策协议的请求形状与 chat 无关，无法用 chat 探针探测
+
 ### 超时错误区分
 
 网关在供给上游响应时发生的超时与"上游不可达"是不同的失败模式，需要可观测：
@@ -104,7 +118,7 @@ updated: 2026-10-22
 
 ### 包含
 
-- 请求分发（chat / stream / image）
+- 请求分发（chat / stream / image / SystemOne 决策）
 - 指数退避重试
 - 流式 SSE 透传
 - 错误聚合（返回所有失败原因）
@@ -120,6 +134,9 @@ updated: 2026-10-22
 - 请求缓存（由上游 Anthropic cache_control 处理）
 - 流式请求的总时长上限（当前仅 chunk 间空闲超时）
 - 超时错误的告警/通知（属于外部监控系统职责）
+- SystemOne 的流式响应（协议无 `stream` 字段，恒一次性 JSON）
+- SystemOne 请求体的语义校验（`question.type` / `criteria` 形状交给上游判定）
+- SystemOne 的 chat IR 往返或 translated 翻译（无 IR 物种，不存在翻译 lane）
 
 ## 与其它模块的交互
 
@@ -130,6 +147,7 @@ updated: 2026-10-22
 
 ## 变更记录
 
+- [0008 SystemOne 决策接口接入（原样透传 + 深度 dispatch）](changes/0008-systemone-ingress.md) — 新增 `POST /v1/systemone` 无 IR 分发路径：只校验路由所需字段（400 / 422）、body 与响应逐字透传（仅改写 `model`）、`apis.systemone` presence 即能力、错误统一 OpenAI 信封、恒非流式，`fallback` 取值域收窄为 chat IR 三协议
 - [0003 per-route 在途计数与 `GET /api/inflight` SSE 端点](../admin/changes/0003-per-route-in-flight-counters-sse.md)（跨模块：入口 acquire + 流式 guard 移交 `StreamState`）
 - [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — 终点帧转发后的客户端断连改记成功（499 计数下降、成功计数上升），并补 drop-as-success 行的 usage / TTFT / upstream 时长，以及三条 translated 终点帧桥接（`[DONE]` / `message_stop` / `response.completed`）与不合规上游的块闭合 / `stop_reason`
 - [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，保留非流式 request-level、流式 TTFB 和 chunk idle timeout

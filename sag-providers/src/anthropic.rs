@@ -796,6 +796,17 @@ impl LlmProvider for AnthropicProvider {
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         self.messages_stream_native(body, target_extra).await
     }
+
+    async fn systemone(
+        &self,
+        body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        self.base
+            .systemone_inner(body, target_extra, timeout_secs)
+            .await
+    }
 }
 
 #[cfg(test)]

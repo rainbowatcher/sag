@@ -9,6 +9,10 @@ pub enum IngressProtocol {
     ChatCompletions,
     Responses,
     AnthropicMessages,
+    /// `POST /v1/systemone`（TypeSafe System One 决策接口）。协议 key 是不带
+    /// 连字符的单词 `systemone`，故显式 rename 覆盖 `rename_all` 的产物。
+    #[serde(rename = "systemone")]
+    SystemOne,
 }
 
 impl IngressProtocol {
@@ -17,6 +21,7 @@ impl IngressProtocol {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::AnthropicMessages => "anthropic_messages",
+            Self::SystemOne => "systemone",
         }
     }
 
@@ -27,11 +32,12 @@ impl IngressProtocol {
             Self::ChatCompletions => ApiKind::ChatCompletions,
             Self::Responses => ApiKind::Responses,
             Self::AnthropicMessages => ApiKind::AnthropicMessages,
+            Self::SystemOne => ApiKind::SystemOne,
         }
     }
 }
 
-/// 协议目录 key：`apis` 表的键。三种协议 + `image`（非协议条目）。
+/// 协议目录 key：`apis` 表的键。四种协议 + `image`（非协议条目）。
 ///
 /// 未知 key 在反序列化层直接报错（枚举严格），与其余类型化配置枚举一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -40,16 +46,22 @@ pub enum ApiKind {
     ChatCompletions,
     Responses,
     AnthropicMessages,
+    /// TypeSafe System One 决策协议（`POST /v1/systemone`）。没有 chat IR 映射，
+    /// 也没有 Translated lane：目标 `apis` 里出现即代表能力（presence 即能力）。
+    /// 协议 key 是不带连字符的单词 `systemone`，故显式 rename 覆盖 `rename_all`。
+    #[serde(rename = "systemone")]
+    SystemOne,
     /// 非协议条目：不参与 lane 判定，路径唯一来源是 route.`api_endpoint`。
     Image,
 }
 
 impl ApiKind {
-    /// 三个协议 key 的固定集合（不含 `image`）。
-    pub const PROTOCOLS: [ApiKind; 3] = [
+    /// 四个协议 key 的固定集合（不含 `image`）。
+    pub const PROTOCOLS: [ApiKind; 4] = [
         ApiKind::ChatCompletions,
         ApiKind::Responses,
         ApiKind::AnthropicMessages,
+        ApiKind::SystemOne,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -57,6 +69,7 @@ impl ApiKind {
             Self::ChatCompletions => "chat_completions",
             Self::Responses => "responses",
             Self::AnthropicMessages => "anthropic_messages",
+            Self::SystemOne => "systemone",
             Self::Image => "image",
         }
     }
@@ -66,12 +79,12 @@ impl ApiKind {
         !matches!(self, Self::Image)
     }
 
-    /// 迭代三个协议 key（不含 `image`）。
+    /// 迭代四个协议 key（不含 `image`）。
     pub fn protocols() -> impl Iterator<Item = ApiKind> {
         Self::PROTOCOLS.into_iter()
     }
 
-    /// 三个协议 key 的集合（不含 `image`）。
+    /// 四个协议 key 的集合（不含 `image`）。
     pub fn protocol_set() -> HashSet<ApiKind> {
         Self::PROTOCOLS.into_iter().collect()
     }
@@ -188,6 +201,7 @@ pub fn protocol_path(kind: ApiKind) -> Option<&'static str> {
         ApiKind::ChatCompletions => Some("chat/completions"),
         ApiKind::Responses => Some("responses"),
         ApiKind::AnthropicMessages => Some("messages"),
+        ApiKind::SystemOne => Some("systemone"),
         ApiKind::Image => None,
     }
 }
@@ -275,10 +289,17 @@ mod tests {
             serde_json::to_value(IngressProtocol::AnthropicMessages).unwrap(),
             serde_json::json!("anthropic_messages")
         );
+        assert_eq!(
+            serde_json::to_value(IngressProtocol::SystemOne).unwrap(),
+            serde_json::json!("systemone")
+        );
         roundtrip(&IngressProtocol::ChatCompletions);
         roundtrip(&IngressProtocol::Responses);
         roundtrip(&IngressProtocol::AnthropicMessages);
+        roundtrip(&IngressProtocol::SystemOne);
         assert_eq!(IngressProtocol::Responses.as_str(), "responses");
+        // 协议 key 是单词形，`rename_all = "snake_case"` 会给 `system_one`。
+        assert_eq!(IngressProtocol::SystemOne.as_str(), "systemone");
     }
 
     #[test]
@@ -287,6 +308,7 @@ mod tests {
             (ApiKind::ChatCompletions, "chat_completions"),
             (ApiKind::Responses, "responses"),
             (ApiKind::AnthropicMessages, "anthropic_messages"),
+            (ApiKind::SystemOne, "systemone"),
             (ApiKind::Image, "image"),
         ] {
             assert_eq!(
@@ -303,6 +325,9 @@ mod tests {
     fn api_kind_rejects_unknown_value() {
         assert!(serde_json::from_str::<ApiKind>("\"nope\"").is_err());
         assert!(serde_json::from_str::<ApiKind>("\"protocol\"").is_err());
+        // 协议 key 是单词 `systemone`；`snake_case` 产物 `system_one` 不是合法值。
+        assert!(serde_json::from_str::<ApiKind>("\"system_one\"").is_err());
+        assert!(serde_json::from_str::<IngressProtocol>("\"system_one\"").is_err());
         assert!(serde_json::from_str::<IngressProtocol>("\"nope\"").is_err());
         assert!(serde_json::from_str::<Lane>("\"nope\"").is_err());
     }
@@ -312,15 +337,18 @@ mod tests {
         assert!(ApiKind::ChatCompletions.is_protocol());
         assert!(ApiKind::Responses.is_protocol());
         assert!(ApiKind::AnthropicMessages.is_protocol());
+        assert!(ApiKind::SystemOne.is_protocol());
         assert!(!ApiKind::Image.is_protocol());
 
         let protocols: Vec<ApiKind> = ApiKind::protocols().collect();
         assert_eq!(protocols, ApiKind::PROTOCOLS.to_vec());
-        assert_eq!(protocols.len(), 3);
+        assert_eq!(protocols.len(), 4);
+        assert!(protocols.contains(&ApiKind::SystemOne));
         assert!(!protocols.contains(&ApiKind::Image));
 
         let set = ApiKind::protocol_set();
-        assert_eq!(set.len(), 3);
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(&ApiKind::SystemOne));
         assert!(!set.contains(&ApiKind::Image));
 
         assert_eq!(
@@ -332,6 +360,7 @@ mod tests {
             IngressProtocol::AnthropicMessages.api_kind(),
             ApiKind::AnthropicMessages
         );
+        assert_eq!(IngressProtocol::SystemOne.api_kind(), ApiKind::SystemOne);
     }
 
     #[test]
@@ -342,6 +371,7 @@ mod tests {
         );
         assert_eq!(protocol_path(ApiKind::Responses), Some("responses"));
         assert_eq!(protocol_path(ApiKind::AnthropicMessages), Some("messages"));
+        assert_eq!(protocol_path(ApiKind::SystemOne), Some("systemone"));
         // image：非协议，路径唯一来源是 route.api_endpoint。
         assert_eq!(protocol_path(ApiKind::Image), None);
     }
@@ -360,7 +390,7 @@ mod tests {
         roundtrip(&Lane::Translated);
     }
 
-    /// lane 全矩阵：3 种 ingress × 协议集（空集 / 单协议 / 同址多协议 /
+    /// lane 全矩阵：4 种 ingress × 协议集（空集 / 单协议 / 同址多协议 /
     /// image-only / 含 image 的混合集 / 全集）。
     ///
     /// 公式：`lane = (ingress ∈ 协议 key 集) ? Native : Translated`。
@@ -380,6 +410,7 @@ mod tests {
                 IngressProtocol::ChatCompletions,
                 IngressProtocol::Responses,
                 IngressProtocol::AnthropicMessages,
+                IngressProtocol::SystemOne,
             ] {
                 // 空集 → Translated。
                 v.push((vec![], ingress, Lane::Translated));

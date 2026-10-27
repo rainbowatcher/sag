@@ -16,9 +16,14 @@ use tracing::info;
 ///
 /// - native lane → the ingress protocol;
 /// - translated lane → `fallback` (config validation guarantees it is one
-///   of the protocol keys), or the provider's single protocol key when
-///   `fallback` was left implicit;
+///   of the chat-IR protocol keys), or the provider's single chat-IR
+///   protocol key when `fallback` was left implicit;
 /// - undetermined (no provider / no protocol key) → `ChatCompletions`.
+///
+/// `SystemOne` is never a fallback candidate: it is a decision protocol
+/// with no chat IR and no translated lane, so an explicit
+/// `fallback = "systemone"` that slipped past config validation is ignored
+/// rather than trusted as the chat translation protocol.
 pub(crate) fn used_protocol(
     lane: Lane,
     ingress: IngressProtocol,
@@ -28,10 +33,15 @@ pub(crate) fn used_protocol(
     if lane == Lane::Native {
         return ingress.api_kind();
     }
-    if let Some(fb) = fallback {
+    if let Some(fb) = fallback
+        && fb != ApiKind::SystemOne
+    {
         return fb;
     }
-    let mut protocols = apis_keys.iter().copied().filter(|k| k.is_protocol());
+    let mut protocols = apis_keys
+        .iter()
+        .copied()
+        .filter(|k| k.is_protocol() && *k != ApiKind::SystemOne);
     match (protocols.next(), protocols.next()) {
         (Some(only), None) => only,
         _ => ApiKind::ChatCompletions,
@@ -142,6 +152,18 @@ pub fn target_capabilities(kind: ApiKind) -> Capabilities {
             hosted_tools: false,
             background: false,
         },
+        // SystemOne 是决策协议，没有 chat IR / 流式 / 工具语义 —— 一律不声明，
+        // 这样带 hard requirement 的 chat 请求永远不会落到 SystemOne-only 目标。
+        ApiKind::SystemOne => Capabilities {
+            streaming: false,
+            reasoning: false,
+            tools: false,
+            images: false,
+            documents: false,
+            stateful: false,
+            hosted_tools: false,
+            background: false,
+        },
     }
 }
 
@@ -181,6 +203,18 @@ fn missing_capability(required: Capabilities, provided: Capabilities) -> Option<
 /// `fallback`). Pushes `"{provider}/{model}: lacks capability X"` into
 /// `errors` for each drop (same style as disabled-provider filtering).
 ///
+/// A **presence** check runs first and unconditionally (no hard requirement
+/// needed): the actually-used protocol must be a declared `apis` node of the
+/// provider. Since `apis.systemone` alone became a valid config shape, a
+/// provider may declare no chat-IR node at all — `used_protocol` then falls
+/// back to `ChatCompletions`, which every chat target used to "have" by
+/// construction. Without this check such a target reaches
+/// `provider.chat()`, fails with `BadRequest` ("does not support chat
+/// completions") and is misclassified by `is_client_caused_4xx` as a
+/// client-caused terminal (400, no failover, no attempt row) — a config
+/// mistake blamed on the caller. Symmetric to the SystemOne-side
+/// [`super::resolve::filter_systemone_targets`].
+///
 /// Call **after** [`super::resolve::filter_enabled_targets`].
 pub fn filter_capable_targets(
     req: &ChatCompletionRequest,
@@ -190,18 +224,15 @@ pub fn filter_capable_targets(
     errors: &mut Vec<String>,
 ) -> Vec<RouteTarget> {
     let required = request_hard_requirements(req);
-    // Fast path: no hard requirements → no filtering.
-    if !(required.streaming
+    // No hard requirement → only the presence check below can drop a target.
+    let has_hard_requirements = required.streaming
         || required.tools
         || required.images
         || required.documents
         || required.reasoning
         || required.stateful
         || required.hosted_tools
-        || required.background)
-    {
-        return targets;
-    }
+        || required.background;
 
     targets
         .into_iter()
@@ -212,6 +243,30 @@ pub fn filter_capable_targets(
                 .unwrap_or_default();
             let lane = sag_core::resolve_lane(apis_keys.iter(), ingress);
             let used = used_protocol(lane, ingress, &apis_keys, pc.and_then(|p| p.fallback));
+            // Presence check (see the doc comment above): only for known
+            // providers — an unknown name is reported later by
+            // `resolve_provider` (`"{provider}: not found"`) and must stay
+            // failover-able here, not hard-dropped as "incapable".
+            if let Some(p) = pc
+                && !p.apis.contains_key(&used)
+            {
+                let model = t.real_model.as_deref().unwrap_or(&req.model);
+                info!(
+                    provider = %t.provider,
+                    model = %model,
+                    protocol = used.as_str(),
+                    "skipping target whose provider declares no apis node for the used protocol"
+                );
+                errors.push(format!(
+                    "{}/{model}: lacks capability {}",
+                    t.provider,
+                    used.as_str()
+                ));
+                return false;
+            }
+            if !has_hard_requirements {
+                return true;
+            }
             let mut provided = target_capabilities(used);
             if let Some(ov) = &t.capabilities {
                 ov.apply_to(&mut provided);
@@ -359,7 +414,9 @@ mod tests {
         }));
         assert!(request_hard_requirements(&r).reasoning);
 
-        for kind in ApiKind::protocols() {
+        // Chat-lane protocol rows only: SystemOne 没有 chat IR / lane，
+        // 不声明任何能力（见 `target_capabilities`）。
+        for kind in ApiKind::protocols().filter(|k| !matches!(k, ApiKind::SystemOne)) {
             let mut providers = HashMap::new();
             providers.insert("p".into(), provider(&[kind]));
             let (out, errors) = filter(
@@ -413,6 +470,16 @@ mod tests {
         assert!(
             !image.tools && !image.images && !image.documents,
             "non-protocol entry claims the minimal set"
+        );
+
+        let systemone = target_capabilities(ApiKind::SystemOne);
+        assert!(
+            !systemone.streaming
+                && !systemone.reasoning
+                && !systemone.tools
+                && !systemone.images
+                && !systemone.documents,
+            "SystemOne has no chat semantics — it claims nothing"
         );
     }
 
@@ -538,11 +605,147 @@ mod tests {
             ),
             ApiKind::AnthropicMessages
         );
+        // Translated lane: SystemOne never counts as a chat-IR candidate.
+        assert_eq!(
+            used_protocol(
+                Lane::Translated,
+                IngressProtocol::Responses,
+                &[ApiKind::SystemOne, ApiKind::ChatCompletions],
+                None
+            ),
+            ApiKind::ChatCompletions
+        );
+        // Translated lane: an explicit SystemOne fallback is ignored
+        // (defensive — config validation already rejects it).
+        assert_eq!(
+            used_protocol(
+                Lane::Translated,
+                IngressProtocol::Responses,
+                &[ApiKind::SystemOne, ApiKind::ChatCompletions],
+                Some(ApiKind::SystemOne)
+            ),
+            ApiKind::ChatCompletions
+        );
+        // Translated lane: only SystemOne configured → undetermined → chat.
+        assert_eq!(
+            used_protocol(
+                Lane::Translated,
+                IngressProtocol::Responses,
+                &[ApiKind::SystemOne],
+                Some(ApiKind::SystemOne)
+            ),
+            ApiKind::ChatCompletions
+        );
         // Undetermined → chat (the pre-catalog default).
         assert_eq!(
             used_protocol(Lane::Translated, IngressProtocol::Responses, &[], None),
             ApiKind::ChatCompletions
         );
+    }
+
+    #[test]
+    fn presence_check_drops_target_without_the_used_protocol_node() {
+        // `apis = { systemone }` alone is a legal config shape (SystemOne is a
+        // decision protocol). A chat request routed to it has no chat-IR node,
+        // so `used_protocol` falls back to `ChatCompletions` — the presence
+        // check must drop it here instead of letting `provider.chat()` fail
+        // with a `BadRequest` that dispatch misclassifies as a client-caused
+        // terminal (400, no failover, no attempt row).
+        let r = req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let mut providers = HashMap::new();
+        providers.insert("so".into(), provider(&[ApiKind::SystemOne]));
+
+        let (out, errors) = filter(
+            &r,
+            &providers,
+            target("so"),
+            IngressProtocol::ChatCompletions,
+        );
+        assert!(
+            out.is_empty(),
+            "systemone-only provider must be dropped on the chat path"
+        );
+        assert_eq!(errors.len(), 1, "one pre-drop reason: {errors:?}");
+        assert!(
+            errors[0].contains("so/m: lacks capability chat_completions"),
+            "got: {}",
+            errors[0]
+        );
+
+        // Mixed route: the chat-capable target survives, the incapable one is
+        // dropped, so dispatch still has a target to fail over to.
+        providers.insert("oa".into(), provider(&[ApiKind::ChatCompletions]));
+        let mut errors = Vec::new();
+        let kept = filter_capable_targets(
+            &r,
+            &providers,
+            vec![target("so"), target("oa")],
+            IngressProtocol::ChatCompletions,
+            &mut errors,
+        );
+        assert_eq!(kept.len(), 1, "only the capable target survives");
+        assert_eq!(kept[0].provider, "oa");
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(errors[0].contains("lacks capability chat_completions"));
+    }
+
+    #[test]
+    fn presence_check_keeps_targets_whose_used_protocol_is_declared() {
+        // No hard requirement → the presence check is the only gate, and a
+        // declared used protocol passes it (native and translated lanes).
+        let r = req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let mut providers = HashMap::new();
+        providers.insert("am".into(), provider(&[ApiKind::AnthropicMessages]));
+        providers.insert(
+            "both".into(),
+            provider(&[ApiKind::SystemOne, ApiKind::ChatCompletions]),
+        );
+
+        // Native anthropic lane: `anthropic_messages` is declared.
+        let (out, errors) = filter(
+            &r,
+            &providers,
+            target("am"),
+            IngressProtocol::AnthropicMessages,
+        );
+        assert_eq!(out.len(), 1, "declared node keeps the target: {errors:?}");
+        assert!(errors.is_empty());
+
+        // Translated chat lane on a mixed provider: SystemOne does not count
+        // as a chat-IR candidate, the chat node does — kept.
+        let (out2, errors2) = filter(
+            &r,
+            &providers,
+            target("both"),
+            IngressProtocol::ChatCompletions,
+        );
+        assert_eq!(out2.len(), 1, "mixed provider kept: {errors2:?}");
+        assert!(errors2.is_empty());
+    }
+
+    #[test]
+    fn presence_check_skips_unknown_providers() {
+        // An unregistered provider is reported later by `resolve_provider`
+        // (`"{provider}: not found"`) and must stay failover-able instead of
+        // being hard-dropped as incapable.
+        let r = req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let (out, errors) = filter(
+            &r,
+            &HashMap::new(),
+            target("ghost"),
+            IngressProtocol::ChatCompletions,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(errors.is_empty());
     }
 
     #[test]

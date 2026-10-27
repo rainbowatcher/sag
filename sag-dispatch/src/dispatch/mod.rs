@@ -4,8 +4,9 @@
 //!
 //! - [`resolve_route`] — model → ordered targets + `api_endpoint` resolution
 //!   with disabled-provider filtering and retry-count inheritance.
-//! - [`dispatch_chat`] / [`dispatch_image`] — multi-provider fallback loops
-//!   for chat and image generation respectively.
+//! - [`dispatch_chat`] / [`dispatch_image`] / [`dispatch_systemone`] —
+//!   multi-provider fallback loops for chat, image generation and the
+//!   SystemOne decision API respectively.
 //! - [`retry::run_with_retries`] — generic per-target retry loop shared by both
 //!   dispatch paths.
 //! - [`stream::build_streaming_response`] — SSE response builder that loops
@@ -45,10 +46,12 @@ pub mod image;
 pub mod resolve;
 pub mod retry;
 pub mod stream;
+pub mod systemone;
 
 pub use chat::dispatch_chat;
 pub use image::dispatch_image;
 pub use resolve::{resolve_route, resolve_route_with_ingress};
+pub use systemone::dispatch_systemone;
 
 /// A single resolved fallback target with effective values after
 /// three-tier fallback resolution.

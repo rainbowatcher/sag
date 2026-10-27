@@ -108,6 +108,18 @@ pub struct CascadeResult {
     pub removed_targets: usize,
 }
 
+/// 该 [`ApiKind`] 是否属于 chat-IR 三协议（`chat_completions` / `responses` /
+/// `anthropic_messages`）。
+///
+/// `systemone` 是决策协议：没有 chat IR 映射、也没有 Translated lane，
+/// 故不参与 `fallback`（chat 翻译 lane 的降级目标）语义；`image` 更不是协议。
+fn is_chat_ir_protocol(kind: ApiKind) -> bool {
+    matches!(
+        kind,
+        ApiKind::ChatCompletions | ApiKind::Responses | ApiKind::AnthropicMessages
+    )
+}
+
 impl GatewayConfig {
     /// Remove a provider from the configuration, cascading the deletion to all
     /// routes that reference it.
@@ -331,35 +343,56 @@ impl GatewayConfig {
                 .copied()
                 .filter(|k| k.is_protocol())
                 .collect();
+            // fallback 只服务 chat 翻译 lane，因此候选集仅限 chat-IR 三协议：
+            // SystemOne 是决策协议（无 chat IR、无 Translated lane），既不计数
+            // 也不允许作为降级目标。
+            let fallback_keys: Vec<ApiKind> = protocol_keys
+                .iter()
+                .copied()
+                .filter(|k| is_chat_ir_protocol(*k))
+                .collect();
             if provider.apis.is_empty() {
                 errors.push(format!(
                     "provider '{name}': apis must not be empty — declare at least one protocol API, e.g. [providers.{name}.apis.chat_completions]"
                 ));
             } else if protocol_keys.is_empty() {
                 errors.push(format!(
-                    "provider '{name}': apis must declare at least one protocol key (chat_completions, responses, or anthropic_messages); 'image' alone is not a protocol"
+                    "provider '{name}': apis must declare at least one protocol key (chat_completions, responses, anthropic_messages, or systemone); 'image' alone is not a protocol"
                 ));
             } else {
-                let key_list: Vec<&str> = protocol_keys.iter().map(|k| k.as_str()).collect();
+                let key_list: Vec<&str> = fallback_keys.iter().map(|k| k.as_str()).collect();
+                let key_list = if key_list.is_empty() {
+                    "none configured".to_string()
+                } else {
+                    key_list.join(", ")
+                };
                 match provider.fallback {
-                    Some(fb) if !protocol_keys.contains(&fb) => {
+                    // 类型化枚举值严格校验：SystemOne 没有 chat IR，
+                    // 采信为翻译协议语义非法，直接报错而非静默回退。
+                    Some(ApiKind::SystemOne) => {
+                        errors.push(format!(
+                            "provider '{name}': fallback='systemone' is not supported — SystemOne is a decision protocol with no chat IR and no translated lane; fallback must be one of the chat-IR protocol keys [{key_list}]"
+                        ));
+                    }
+                    Some(fb) if !fallback_keys.contains(&fb) => {
                         errors.push(format!(
                             "provider '{name}': fallback='{}' must be one of the configured apis protocol keys [{}]",
                             fb.as_str(),
-                            key_list.join(", ")
+                            key_list
                         ));
                     }
                     Some(_) => {}
-                    None if protocol_keys.len() > 1 => {
-                        // 多协议 key 未写 fallback → 报错并给出建议值
-                        // （apis 中第一个协议 key，IndexMap 表序）。
+                    None if fallback_keys.len() > 1 => {
+                        // 多 chat-IR 协议 key 未写 fallback → 报错并给出建议值
+                        // （apis 中第一个 chat-IR 协议 key，IndexMap 表序）。
+                        // 只有 systemone 额外出现时不触发（见 `fallback_keys`）。
                         errors.push(format!(
-                            "provider '{name}': fallback is required when apis declares multiple protocol keys [{}]; suggested value: fallback = \"{}\"",
-                            key_list.join(", "),
-                            protocol_keys[0].as_str()
+                            "provider '{name}': fallback is required when apis declares multiple chat-IR protocol keys [{}]; suggested value: fallback = \"{}\"",
+                            key_list,
+                            fallback_keys[0].as_str()
                         ));
                     }
-                    // 单协议 key：降级目标唯一，未写则自动取之 —— 校验通过。
+                    // 单 chat-IR 协议 key：降级目标唯一，未写则自动取之 —— 校验通过。
                     None => {}
                 }
             }
@@ -3308,6 +3341,90 @@ targets = [{ provider = "openai" }]
                 err.iter().any(|e| e.contains("fallback is required")
                     && e.contains("suggested value: fallback = \"responses\"")),
                 "expected multi-key-missing-fallback error with first-key suggestion, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn chat_completions_plus_systemone_needs_no_fallback() {
+            // systemone 不参与 fallback 语义：chat_completions + systemone 仍算
+            // “单 chat-IR 协议”，无需 fallback。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, systemone = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "chat_completions + systemone must not require fallback: {:?}",
+                config.validate().unwrap_err()
+            );
+            assert_eq!(config.providers["openai"].fallback, None);
+        }
+
+        #[test]
+        fn systemone_does_not_count_towards_fallback_requirement() {
+            // 多 chat-IR 协议 + systemone：仍要求 fallback，且建议值取第一个
+            // chat-IR 协议 key（systemone 排在最前也不选它）。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.openai.com/v1" }, responses = { base_url = "https://api.openai.com/v1" }, chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("fallback is required")
+                    && e.contains("suggested value: fallback = \"responses\"")),
+                "expected fallback required with first chat-IR key suggested, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_fallback_systemone() {
+            // systemone 没有 chat IR / 翻译 lane：作为 fallback 是非法枚举值语义。
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[providers.openai]
+api_keys = ["sk-test"]
+fallback = "systemone"
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" }, systemone = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "gpt-4o"
+targets = [{ provider = "openai" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("fallback='systemone'") && e.contains("not supported")),
+                "fallback='systemone' must be rejected, got {err:?}"
             );
         }
 

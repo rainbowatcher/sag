@@ -132,4 +132,24 @@ pub trait LlmProvider: Send + Sync {
             self.name()
         )))
     }
+
+    /// Native SystemOne call: send a SystemOne-shaped body
+    /// (`POST /v1/systemone`) and return the raw JSON response, verbatim.
+    ///
+    /// There is no streaming variant: the protocol defines no `stream`
+    /// field, so every call is a single non-streaming round-trip.
+    ///
+    /// Default: unsupported. Providers declaring `apis.systemone` override
+    /// this by delegating to [`crate::ProviderBase::systemone_inner`].
+    async fn systemone(
+        &self,
+        _body: serde_json::Value,
+        _target_extra: &HashMap<String, serde_json::Value>,
+        _timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        Err(AppError::BadRequest(format!(
+            "provider '{}' does not support native SystemOne",
+            self.name()
+        )))
+    }
 }

@@ -514,6 +514,56 @@ impl ProviderBase {
     pub fn role_mapping_for(&self, kind: ApiKind, role: &str) -> Option<&String> {
         self.effective_role_mappings(kind).get(role)
     }
+
+    // ── native SystemOne passthrough ───────────────────────────────
+
+    /// Native SystemOne call: `POST` the caller's SystemOne-shaped body to
+    /// `apis.systemone.base_url` + `/systemone` and return the raw JSON
+    /// response.
+    ///
+    /// The body is never translated: `state` / `questions` / `answers` /
+    /// `id` and the probability fields round-trip verbatim (same principle
+    /// as the native Responses lane). Body synthesis (overrides, strip
+    /// fields, target extras), auth headers and the request deadline are
+    /// all handled by [`ProviderBase::build_request`] +
+    /// [`ProviderBase::send_json`].
+    ///
+    /// A 200-delivered `error` object is promoted to
+    /// [`AppError::Upstream`] (429 when rate-limit-ish, else 502), matching
+    /// the chat / responses convention.
+    pub async fn systemone_inner(
+        &self,
+        body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        let url = self.protocol_url(ApiKind::SystemOne)?;
+        let timeout = self.effective_timeout(ApiKind::SystemOne, timeout_secs);
+        let body_text = self
+            .send_json(&url, ApiKind::SystemOne, body, target_extra, Some(timeout))
+            .await?;
+
+        let raw: serde_json::Value = serde_json::from_str(&body_text)
+            .map_err(|e| AppError::Internal(format!("failed to parse systemone response: {e}")))?;
+
+        if body_has_error_object(&raw) {
+            let err_obj = raw.get("error").expect("checked error object");
+            let msg = body_error_message(err_obj);
+            let status = if body_error_is_rate_limited(err_obj) {
+                429
+            } else {
+                502
+            };
+            warn!(status = 200, %body_text, "upstream returned error");
+            return Err(AppError::Upstream {
+                provider: self.name.clone(),
+                status,
+                body: msg,
+            });
+        }
+
+        Ok(raw)
+    }
 }
 
 // ── 200-delivered upstream error detection ───────────────────────
@@ -1445,6 +1495,254 @@ mod tests {
         assert_eq!(base.effective_timeout(ApiKind::ChatCompletions, 600), 7);
         // Undeclared kind keeps the caller-resolved value.
         assert_eq!(base.effective_timeout(ApiKind::Responses, 600), 600);
+    }
+
+    // ── native SystemOne passthrough ───────────────────────────────
+
+    /// Base with an `apis.systemone` node at `base_url`; the shared test
+    /// config deliberately omits that node (presence is the capability).
+    fn make_systemone_base(
+        base_url: &str,
+        timeout_secs: Option<u64>,
+        body_overrides: Option<HashMap<String, serde_json::Value>>,
+    ) -> ProviderBase {
+        let mut config = crate::test_support::test_config(base_url, 30, None, None);
+        config.apis.insert(
+            ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: base_url.into(),
+                timeout_secs,
+                body_overrides,
+                ..Default::default()
+            },
+        );
+        ProviderBase::new("test".into(), &config).unwrap()
+    }
+
+    #[test]
+    fn systemone_protocol_url_appends_fixed_path() {
+        let base = make_systemone_base("https://example.com/v1/", None, None);
+        assert_eq!(
+            base.protocol_url(ApiKind::SystemOne).unwrap(),
+            "https://example.com/v1/systemone"
+        );
+    }
+
+    #[tokio::test]
+    async fn systemone_inner_missing_api_node_is_bad_request() {
+        // `test_config` declares no `apis.systemone`: the capability is
+        // absent, so the call must fail before any network round-trip.
+        let base = make_base_with("https://example.com".into(), None);
+        let err = base
+            .systemone_inner(
+                serde_json::json!({ "model": "m", "state": "s", "questions": {} }),
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("apis.systemone")),
+            "expected missing-node BadRequest, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn systemone_effective_timeout_prefers_api_node() {
+        let base = make_systemone_base("https://example.com", Some(7), None);
+        assert_eq!(base.effective_timeout(ApiKind::SystemOne, 600), 7);
+        // No per-API declaration → the caller-resolved value wins.
+        let base = make_systemone_base("https://example.com", None, None);
+        assert_eq!(base.effective_timeout(ApiKind::SystemOne, 600), 600);
+    }
+
+    #[tokio::test]
+    async fn systemone_inner_returns_raw_upstream_json() {
+        let body = r#"{"id":"ans-1","model":"m","answers":{"q1":{"type":"choice","choice":"a","confidence":0.9,"probabilities":{"a":0.9,"b":0.1}}},"usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let base_url = spawn_server(move |mut stream| {
+            use tokio::io::AsyncWriteExt;
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let base = make_systemone_base(&base_url, None, None);
+        let value = base
+            .systemone_inner(
+                serde_json::json!({ "model": "m", "state": "s", "questions": {} }),
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .expect("200 body parses as JSON");
+
+        // Passthrough: id / answers / probability fields survive verbatim.
+        assert_eq!(value["id"], "ans-1");
+        assert_eq!(value["answers"]["q1"]["choice"], "a");
+        assert_eq!(
+            value["answers"]["q1"]["probabilities"]["b"].as_f64(),
+            Some(0.1)
+        );
+    }
+
+    #[tokio::test]
+    async fn systemone_inner_200_error_object_maps_to_502() {
+        let body = r#"{"error":{"message":"model overloaded","code":500}}"#;
+        let base_url = spawn_server(move |mut stream| {
+            use tokio::io::AsyncWriteExt;
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let base = make_systemone_base(&base_url, None, None);
+        let err = base
+            .systemone_inner(serde_json::json!({}), &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 502, "200-delivered error maps to 502");
+                assert_eq!(body, "model overloaded");
+            }
+            other => panic!("expected Upstream 502, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_inner_200_rate_limit_error_maps_to_429() {
+        let body = r#"{"error":{"message":"burst tokens limit","code":429}}"#;
+        let base_url = spawn_server(move |mut stream| {
+            use tokio::io::AsyncWriteExt;
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let base = make_systemone_base(&base_url, None, None);
+        let err = base
+            .systemone_inner(serde_json::json!({}), &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 429, "rate-limit-ish error maps to 429");
+                assert_eq!(body, "burst tokens limit");
+            }
+            other => panic!("expected Upstream 429, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_inner_applies_api_node_timeout_over_caller_value() {
+        use tokio::io::AsyncWriteExt;
+        // Headers arrive immediately, the body never does. The node declares
+        // timeout_secs = 1 while the caller passes 30, so the request must
+        // abort at ~1s — proving `apis.systemone.timeout_secs` wins.
+        let base_url = spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            drop(stream);
+        })
+        .await;
+
+        let base = make_systemone_base(&base_url, Some(1), None);
+        let start = std::time::Instant::now();
+        let err = base
+            .systemone_inner(serde_json::json!({}), &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        match err {
+            AppError::Network(e) => assert!(e.is_timeout(), "expected reqwest timeout, got: {e}"),
+            other => panic!("expected Network timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "api-node deadline should fire at ~1s, not the caller's 30s: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn systemone_body_composition_api_overrides_then_target_extra() {
+        // provider-level body_overrides { temperature: 0.5 }
+        // → apis.systemone.body_overrides { temperature: 0.4 } (wholesale replace)
+        // → target_extra { temperature: 0.7 } (wins)
+        let mut provider_overrides = HashMap::new();
+        provider_overrides.insert("temperature".into(), serde_json::json!(0.5));
+        let mut api_overrides = HashMap::new();
+        api_overrides.insert("temperature".into(), serde_json::json!(0.4));
+
+        let mut config = crate::test_support::test_config("https://example.com", 30, None, None);
+        config.body_overrides = provider_overrides;
+        config.apis.insert(
+            ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: "https://example.com".into(),
+                body_overrides: Some(api_overrides),
+                ..Default::default()
+            },
+        );
+        let base = ProviderBase::new("test".into(), &config).unwrap();
+
+        let mut target_extra = HashMap::new();
+        target_extra.insert("temperature".into(), serde_json::json!(0.7));
+        let req = base
+            .build_request(
+                "https://example.com/systemone",
+                ApiKind::SystemOne,
+                serde_json::json!({
+                    "model": "m",
+                    "state": { "turn": 2 },
+                    "questions": { "q1": { "type": "noul" } },
+                    "temperature": 1.0
+                }),
+                &target_extra,
+            )
+            .build()
+            .unwrap();
+
+        let body = extract_json_body(req);
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "target_extra must win the composition chain"
+        );
+        // Passthrough fields survive the override layers untouched.
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["state"]["turn"].as_i64(), Some(2));
+        assert_eq!(body["questions"]["q1"]["type"], "noul");
     }
 
     #[test]

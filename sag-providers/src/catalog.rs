@@ -25,7 +25,8 @@ use crate::{AnthropicProvider, LlmProvider, OpenAiProvider, ProviderBase};
 ///   `anthropic_messages` (translated OpenAI→Anthropic path);
 /// - `chat_image` → `image` (or `chat_completions`) node;
 /// - `anthropic_messages*` → `anthropic_messages` node;
-/// - `responses_native*` → `responses` node.
+/// - `responses_native*` → `responses` node;
+/// - `systemone` → `systemone` node.
 ///
 /// The dispatcher keys the call path on the **actually-used protocol**
 /// (`target.upstream_protocol`): `anthropic_messages*` / `responses_native*`
@@ -233,5 +234,70 @@ impl LlmProvider for CatalogProvider {
                 self.base.name
             )))
         }
+    }
+
+    async fn systemone(
+        &self,
+        body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: u64,
+    ) -> sag_core::Result<serde_json::Value> {
+        if self.base.supports(ApiKind::SystemOne) {
+            self.openai
+                .systemone(body, target_extra, timeout_secs)
+                .await
+        } else {
+            Err(self.unsupported("native SystemOne"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalog_with(base_url: &str, with_systemone: bool) -> CatalogProvider {
+        let mut config = crate::test_support::test_config(base_url, 30, None, None);
+        if with_systemone {
+            config.apis.insert(
+                ApiKind::SystemOne,
+                sag_config::ApiConfig {
+                    base_url: base_url.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        CatalogProvider::new("test".into(), &config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn systemone_without_api_node_is_bad_request() {
+        // No `apis.systemone` → the catalog declares no SystemOne capability,
+        // so the call is rejected before any network round-trip.
+        let provider = catalog_with("https://example.com", false);
+        let err = provider
+            .systemone(serde_json::json!({}), &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AppError::BadRequest(m) if m.contains("native SystemOne")),
+            "expected unsupported BadRequest, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn systemone_with_api_node_is_forwarded_to_the_shared_inner() {
+        // `apis.systemone` present → forwarded; the unreachable base URL makes
+        // the failure a network error, proving the dispatch reached the
+        // passthrough lane instead of the unsupported BadRequest.
+        let provider = catalog_with("http://127.0.0.1:1", true);
+        let err = provider
+            .systemone(serde_json::json!({}), &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(&err, AppError::BadRequest(_)),
+            "configured SystemOne must not be rejected as unsupported, got {err:?}"
+        );
     }
 }

@@ -169,6 +169,19 @@ models_endpoint = "/models"
 # [providers.my-image.apis.image]
 # base_url = "https://api.openai.com/v1"
 
+# SystemOne (`POST /v1/systemone`, TypeSafe decision API) is a protocol key
+# like the others — the upstream URL is this base_url + the fixed path
+# `/systemone`. It has no chat IR and no translated lane, so `apis.systemone`
+# presence *is* the capability: a target whose provider omits this section is
+# never used for that ingress. Because it is not a chat-IR protocol it never
+# counts towards the `fallback` requirement, and `fallback = "systemone"` is
+# rejected as a config error. Routing is a normal `[[routes]]` target.
+# [providers.my-systemone]
+# api_keys = ["sk-your-systemone-api-key"]
+# timeout_secs = 120
+# [providers.my-systemone.apis.systemone]
+# base_url = "https://api.systemone.example/v1"
+
 # Custom headers override or add to the default request headers.
 # [providers.my-custom.headers]
 # x-api-key = "override-key"

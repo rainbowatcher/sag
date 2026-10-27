@@ -11,6 +11,7 @@ use sag_core::{ChatCompletionRequest, ChatMessage};
 use serde_json::json;
 
 /// 一条最小探测请求。三协议显式，无 catch-all——新增 ApiKind 时必须在此显式处理。
+/// （`SystemOne` / `Image` 不走 chat IR 探测，故不在此枚举内。）
 pub(crate) enum MinimalRequest {
     /// chat_completions：IR 形态。raw 路径序列化为 JSON，adapter 路径直接喂 provider.chat()
     Chat(Box<ChatCompletionRequest>),
@@ -22,7 +23,8 @@ pub(crate) enum MinimalRequest {
 
 /// 构造某一协议的最小探测请求。
 ///
-/// image（非协议）→ None。调用方必须显式处理 None（返回 400）。
+/// image（非协议）与 systemone（决策协议，无 chat IR、无流式）→ None。
+/// 调用方必须显式处理 None（返回 400）。
 pub(crate) fn minimal_request(kind: ApiKind, model: &str) -> Option<MinimalRequest> {
     match kind {
         ApiKind::ChatCompletions => Some(MinimalRequest::Chat(Box::new(ChatCompletionRequest {
@@ -48,6 +50,9 @@ pub(crate) fn minimal_request(kind: ApiKind, model: &str) -> Option<MinimalReque
             // 部分厂商强制 16 为下限。
             "max_output_tokens": 16,
         }))),
+        // 探针暂不支持 SystemOne：决策协议的请求形状与 chat IR 无关，
+        // 最小探测请求无从构造（与 image 同形制：显式 None）。
+        ApiKind::SystemOne => None,
         ApiKind::Image => None,
     }
 }
@@ -120,6 +125,12 @@ mod tests {
     #[test]
     fn minimal_request_image_is_none() {
         assert!(minimal_request(ApiKind::Image, "dall-e-3").is_none());
+    }
+
+    #[test]
+    fn minimal_request_systemone_is_none() {
+        // 探针不支持 SystemOne：显式 None（调用方转 400），不得 panic。
+        assert!(minimal_request(ApiKind::SystemOne, "decision-model").is_none());
     }
 
     #[test]

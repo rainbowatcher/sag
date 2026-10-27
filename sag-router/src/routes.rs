@@ -33,7 +33,7 @@ use crate::middleware::trace::trace_middleware;
 use sag_admin::build_admin_routes;
 use sag_dispatch::{
     AppState, DispatchCtx, DispatchRuntime, ResolvedRoute, dispatch_chat, dispatch_image,
-    resolve_route, resolve_route_with_ingress,
+    dispatch_systemone, resolve_route, resolve_route_with_ingress,
 };
 
 /// Maximum request body size accepted by any route.
@@ -52,9 +52,9 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 /// don't. It is threaded into the orchestrator via a request extension so
 /// non-dispatch handlers never see it.
 pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
-    // The three auth-protected sub-routers are built first, then wrapped
+    // The auth-protected sub-routers are built first, then wrapped
     // in a single `route_layer` so `gateway_auth` is registered once
-    // (one `state.clone()`) instead of three times. The unprotected
+    // (one `state.clone()`) instead of once per ingress. The unprotected
     // `/health` and `/v1/analytics/*` routes (stats 诊断面 + v2) are added
     // to the outer router *after* the merge, so they stay public.
     let protected = Router::new()
@@ -74,6 +74,12 @@ pub fn build_router(state: AppState, runtime: DispatchRuntime) -> Router {
             "/v1/responses",
             Router::new()
                 .route("/", post(responses))
+                .layer(axum::Extension(runtime.clone())),
+        )
+        .nest(
+            "/v1/systemone",
+            Router::new()
+                .route("/", post(system_one))
                 .layer(axum::Extension(runtime)),
         )
         .nest("/v1", Router::new().route("/models", get(list_models)))
@@ -650,6 +656,176 @@ async fn responses(
         ingress_protocol: sag_core::IngressProtocol::Responses,
         ir: Some(&ir),
         entry_loss: encode_loss,
+        session_key,
+        session_writeback,
+    })
+    .await
+}
+
+/// POST `/v1/systemone` — TypeSafe System One decision ingress.
+///
+/// The body is never decoded into a gateway IR: `state` / `questions` /
+/// `assets` (and the response's `answers` / `id` / probability fields) are
+/// forwarded with **semantic zero-loss at the `Value` level** — see
+/// [`sag_dispatch::dispatch_systemone`], which rebuilds the wire body from the
+/// carrier request's `extra` and rewrites only `model` to the target's
+/// `real_model`. Fields keep their JSON values (including explicit `null`),
+/// but both directions go through `serde_json::Value`, so key order and
+/// number/escape formatting may be re-normalised.
+///
+/// The gateway validates exactly what routing needs (`model` is a string,
+/// `questions` is an object); question `type` / `criteria` shapes are left to
+/// the upstream (unknown values in a request body are tolerated, strictness is
+/// reserved for typed config enums).
+#[instrument(skip_all, fields(request_id, model))]
+async fn system_one(
+    State(state): State<AppState>,
+    Extension(trace_id): Extension<uuid::Uuid>,
+    Extension(runtime): Extension<DispatchRuntime>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response<Body> {
+    let start = Instant::now();
+    let started_at = chrono::Utc::now();
+
+    let Json(raw_body) = match body {
+        Ok(json) => json,
+        Err(rejection) => {
+            emit_client_error_event(&state, trace_id, started_at, &rejection).await;
+            // SystemOne uses the OpenAI error envelope (same `{error:{code,
+            // message}}` contract as the rest of the surface), so axum's
+            // plain-text rejection is re-rendered here — same shape as the
+            // `/v1/messages` rejection branch, which re-renders into the
+            // Anthropic envelope.
+            let status = rejection.status();
+            let code = match status {
+                StatusCode::PAYLOAD_TOO_LARGE => "PAYLOAD_TOO_LARGE",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE => "UNSUPPORTED_MEDIA_TYPE",
+                _ => "BAD_REQUEST",
+            };
+            return (
+                status,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": code,
+                        "message": rejection.body_text(),
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Shape pre-check on the raw value, before the carrier is built: only the
+    // two routing-relevant fields are validated. Everything else (including
+    // unknown fields) rides through untouched.
+    let serde_json::Value::Object(extra) = raw_body else {
+        return unprocessable("request body must be a JSON object");
+    };
+    let Some(model) = extra
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return unprocessable("`model` must be a string");
+    };
+    if !extra.get("questions").is_some_and(|v| v.is_object()) {
+        return unprocessable("`questions` must be an object");
+    }
+
+    // Carrier request: `model` is the routing key, the rest of the original
+    // body rides in `extra` (`build_systemone_body` puts it back on the wire).
+    let request = ChatCompletionRequest {
+        model,
+        extra,
+        ..Default::default()
+    };
+    // SystemOne defines no `stream` field: always non-streaming.
+    let is_stream = false;
+    let span = tracing::Span::current();
+    span.record("request_id", trace_id.to_string());
+    span.record("model", request.model.as_str());
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+
+    // Session identity for session-sticky routing (design §4.1 chain).
+    // SystemOne carries no IR, so the content-hash fallback stays disabled.
+    let session_key =
+        crate::session::extract_session_key(crate::session::BodyView::Chat(&request), None);
+
+    // SystemOne target filtering is `apis.systemone` presence (a protocol
+    // without a translated lane) — handled inside resolution.
+    let ResolvedRoute {
+        pipeline,
+        targets,
+        api_endpoint,
+        strategy,
+        sticky_token,
+        session_writeback,
+        route_name,
+        started_at,
+        precheck_errors,
+    } = match resolve_route_with_ingress(
+        &state,
+        &runtime,
+        &request,
+        trace_id,
+        start,
+        started_at,
+        is_stream,
+        user_agent.as_deref(),
+        client_ip.as_deref(),
+        session_key.as_ref(),
+        sag_core::IngressProtocol::SystemOne,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        // Resolution failures already use the OpenAI error envelope — pass through.
+        Err(response) => return response,
+    };
+
+    let mut errors = precheck_errors;
+
+    if pipeline == sag_config::Pipeline::Image {
+        // Image path is Chat-only (D8); reject with the OpenAI envelope.
+        return unprocessable("image generation is not supported on /v1/systemone");
+    }
+
+    dispatch_systemone(DispatchCtx {
+        state: &state,
+        runtime: &runtime,
+        request: &request,
+        targets: &targets,
+        api_endpoint: &api_endpoint,
+        is_stream,
+        trace_id,
+        start,
+        route_name: &route_name,
+        started_at,
+        errors: &mut errors,
+        strategy,
+        sticky_token,
+        user_agent,
+        client_ip,
+        ingress_protocol: sag_core::IngressProtocol::SystemOne,
+        // SystemOne stays out of IR: no chat mapping exists for it.
+        ir: None,
+        entry_loss: Default::default(),
         session_key,
         session_writeback,
     })

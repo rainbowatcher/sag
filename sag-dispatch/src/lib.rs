@@ -4,8 +4,8 @@
 //! `sag-router`:
 //!
 //! - [`order`] — target ordering strategies (FillFirst / RoundRobin).
-//! - [`dispatch`] — route resolution, per-target retry loop, chat & image
-//!   dispatch fallback, and SSE streaming response builder.
+//! - [`dispatch`] — route resolution, per-target retry loop, chat / image /
+//!   SystemOne dispatch fallback, and SSE streaming response builder.
 //! - [`state`] — [`DispatchRuntime`] (dispatch-only runtime state).
 //!   [`AppState`] has moved to `sag-state`; this module re-exports it
 //!   for backwards compatibility.
@@ -26,8 +26,8 @@ pub mod testing;
 // ── Re-exports ──────────────────────────────────────────────────────
 
 pub use dispatch::{
-    DispatchCtx, ResolvedRoute, ResolvedTarget, dispatch_chat, dispatch_image, resolve_route,
-    resolve_route_with_ingress,
+    DispatchCtx, ResolvedRoute, ResolvedTarget, dispatch_chat, dispatch_image, dispatch_systemone,
+    resolve_route, resolve_route_with_ingress,
 };
 pub use order::order_targets;
 pub use sag_state::CachedOrder;

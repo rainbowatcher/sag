@@ -126,6 +126,41 @@ pub async fn resolve_route_with_ingress(
         .await);
     }
 
+    // SystemOne ingress: presence is the capability. The protocol has no chat
+    // IR and no Translated lane, so a target can only serve it when its
+    // provider declares `apis.systemone`. Hard-drop the rest with the same
+    // `"{provider}/{model}: lacks capability …"` wording the chat pre-check
+    // uses, so an all-dropped route reports *why* instead of the generic
+    // disabled wording.
+    let mut cap_errors = Vec::new();
+    let targets = if ingress_protocol == sag_core::IngressProtocol::SystemOne {
+        filter_systemone_targets(
+            &config_guard.providers,
+            targets,
+            &request.model,
+            &mut cap_errors,
+        )
+    } else {
+        targets
+    };
+    if targets.is_empty() {
+        return Err(emit_all_disabled_failure(
+            state,
+            request,
+            &route.model_name,
+            trace_id,
+            is_stream,
+            start,
+            started_at,
+            user_agent,
+            client_ip,
+            &cap_errors,
+            session_key,
+            ingress_protocol,
+        )
+        .await);
+    }
+
     // Hard-requirement capability pre-check (after enabled filter, before
     // ordering). Per-drop `info!` happens inside `filter_capable_targets`.
     // Partial drops ride on `ResolvedRoute::precheck_errors` into the
@@ -134,9 +169,12 @@ pub async fn resolve_route_with_ingress(
     //
     // The image pipeline is a different species (no chat protocol
     // semantics, see D3/D8) — the chat hard-requirement table does not
-    // apply to it, so it is never pre-checked here.
-    let mut cap_errors = Vec::new();
-    let targets = if route.pipeline == sag_config::Pipeline::Image {
+    // apply to it, so it is never pre-checked here. Same for SystemOne:
+    // it is a non-chat decision protocol with no lane and no chat
+    // capabilities (its gate is the `apis.systemone` presence check above).
+    let targets = if route.pipeline == sag_config::Pipeline::Image
+        || ingress_protocol == sag_core::IngressProtocol::SystemOne
+    {
         targets
     } else {
         filter_capable_targets(
@@ -608,6 +646,47 @@ pub fn filter_enabled_targets(
         .collect()
 }
 
+/// Drop targets whose provider does not declare the `systemone` API node.
+///
+/// SystemOne is a non-chat decision protocol: it has no chat IR and no
+/// Translated lane, so `apis.systemone` presence *is* the capability (same
+/// `apis.keys()` matching style as the chat pre-check). Dropped targets push
+/// `"{provider}/{model}: lacks capability X"` into `errors` — the wording the
+/// all-dropped 502 surfaces verbatim.
+///
+/// The model named in the reason is the target's `real_model` when set, else
+/// the requested model (passthrough targets).
+pub fn filter_systemone_targets(
+    providers: &HashMap<String, ProviderConfig>,
+    targets: Vec<RouteTarget>,
+    requested_model: &str,
+    errors: &mut Vec<String>,
+) -> Vec<RouteTarget> {
+    targets
+        .into_iter()
+        .filter(|t| {
+            let has_node = providers
+                .get(&t.provider)
+                .map(|p| p.apis.contains_key(&sag_core::ApiKind::SystemOne))
+                .unwrap_or(false);
+            if has_node {
+                return true;
+            }
+            let model = t.real_model.as_deref().unwrap_or(requested_model);
+            info!(
+                provider = %t.provider,
+                model = %model,
+                "skipping target whose provider declares no apis.systemone"
+            );
+            errors.push(format!(
+                "{}/{model}: lacks capability systemone",
+                t.provider
+            ));
+            false
+        })
+        .collect()
+}
+
 /// Whether a provider is enabled in the current config. Used as a
 /// re-check between resolve and dispatch to avoid race conditions when
 /// an admin disables a provider mid-request.
@@ -748,6 +827,63 @@ mod tests {
         }];
         let filtered = filter_enabled_targets(&providers, &targets, "test-route");
         assert_eq!(filtered.len(), 1);
+    }
+
+    // ── systemone target filter tests ─────────────────────────────
+
+    fn systemone_route_target(provider: &str, real_model: Option<&str>) -> RouteTarget {
+        RouteTarget {
+            provider: provider.into(),
+            real_model: real_model.map(str::to_string),
+            priority: 1,
+            retries: None,
+            timeout_secs: None,
+            extra: HashMap::new(),
+            capabilities: None,
+        }
+    }
+
+    fn provider_with_systemone() -> ProviderConfig {
+        let mut pc = provider_config(true);
+        pc.apis.insert(
+            sag_core::ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: "https://example.com/v1".into(),
+                ..Default::default()
+            },
+        );
+        pc
+    }
+
+    #[test]
+    fn filter_systemone_targets_keeps_only_providers_with_the_api_node() {
+        let mut providers = HashMap::new();
+        providers.insert("with".into(), provider_with_systemone());
+        // `provider_config` declares only `chat_completions`.
+        providers.insert("without".into(), provider_config(true));
+
+        let targets = vec![
+            systemone_route_target("with", Some("so-1")),
+            systemone_route_target("without", Some("so-2")),
+            systemone_route_target("ghost", None),
+        ];
+        let mut errors = Vec::new();
+        let kept = filter_systemone_targets(&providers, targets, "so-route", &mut errors);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].provider, "with");
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors[0].contains("without/so-2: lacks capability systemone"),
+            "got: {}",
+            errors[0]
+        );
+        // Passthrough target (no real_model) reports the requested model.
+        assert!(
+            errors[1].contains("ghost/so-route: lacks capability systemone"),
+            "got: {}",
+            errors[1]
+        );
     }
 
     // ── resolve_route prune-stale-entries tests ───────────────────
@@ -1502,6 +1638,153 @@ mod tests {
         assert!(
             error.contains("lacks capability"),
             "CallLog error must expose the capability reason; got: {error}"
+        );
+    }
+
+    // ── presence check (chat path × systemone-only provider) ───────
+
+    /// State with one chat route whose only target points at a provider that
+    /// declares `apis.systemone` and **no** chat-IR node — the config shape
+    /// `apis = { systemone }` relaxed earlier. When `with_chat_target` is set a
+    /// second, chat-capable target is appended at a lower priority.
+    async fn build_state_systemone_only_target(
+        with_chat_target: bool,
+    ) -> (AppState, DispatchRuntime) {
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        let mut so_only = provider_config(true);
+        so_only.apis.clear();
+        so_only.apis.insert(
+            sag_core::ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: "https://api.example.com/v1".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert("so".into(), so_only);
+        if with_chat_target {
+            providers.insert("oa".into(), provider_config(true));
+        }
+
+        let mut targets = vec![sag_config::RouteTarget {
+            provider: "so".into(),
+            real_model: Some("so-1".into()),
+            priority: 10,
+            retries: None,
+            timeout_secs: None,
+            extra: HashMap::new(),
+            capabilities: None,
+        }];
+        if with_chat_target {
+            targets.push(sag_config::RouteTarget {
+                provider: "oa".into(),
+                real_model: Some("gpt-4o".into()),
+                priority: 5,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                capabilities: None,
+            });
+        }
+
+        let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
+            model_name: "gpt-4o".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::Chat,
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets,
+        }];
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        (state, DispatchRuntime::default())
+    }
+
+    #[tokio::test]
+    async fn resolve_route_systemone_only_chat_target_is_dropped_not_client_error() {
+        // Regression (Major): before the presence check, this request resolved
+        // the systemone-only target onto `ChatCompletions`, `provider.chat()`
+        // answered `BadRequest`, and dispatch turned that into a 400
+        // `client_error` terminal (no failover, no attempt row) — a config
+        // mistake blamed on the caller. Now it must pre-drop with
+        // `lacks capability chat_completions` and surface as 502.
+        let (state, runtime) = build_state_systemone_only_target(false).await;
+        let req = test_request("gpt-4o");
+        let response = resolve_route(
+            &state,
+            &runtime,
+            &req,
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("all targets lack the used protocol → resolve failure");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "must be provider-side exhaustion, never a 400 client error"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("lacks capability chat_completions"),
+            "must name the missing protocol; got: {body_str}"
+        );
+        assert!(
+            body_str.contains("so/so-1"),
+            "must identify the dropped target; got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_systemone_only_target_fails_over_to_chat_capable() {
+        let (state, runtime) = build_state_systemone_only_target(true).await;
+        let req = test_request("gpt-4o");
+        let resolved = resolve_route(
+            &state,
+            &runtime,
+            &req,
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a capable target remains");
+
+        assert_eq!(resolved.targets.len(), 1, "only the chat-capable target");
+        assert_eq!(resolved.targets[0].provider, "oa");
+        assert_eq!(
+            resolved.targets[0].upstream_protocol,
+            sag_core::ApiKind::ChatCompletions
+        );
+        assert!(
+            resolved
+                .precheck_errors
+                .iter()
+                .any(|e| e.contains("so/so-1: lacks capability chat_completions")),
+            "the drop must be reported: {:?}",
+            resolved.precheck_errors
         );
     }
 

@@ -413,6 +413,9 @@ fn classify_raw_frame(raw: &[u8], upstream: ApiKind, saw_input_tokens: &mut bool
         },
         // The image pipeline never reaches the chat empty-peek path.
         ApiKind::Image => RawVerdict::Content,
+        // SystemOne is non-streaming (the protocol defines no `stream` field),
+        // so its dispatch path never reaches the chat empty-peek either.
+        ApiKind::SystemOne => RawVerdict::Content,
     }
 }
 
