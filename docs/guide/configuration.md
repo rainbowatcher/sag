@@ -4,9 +4,9 @@ SAG 使用基于 TOML 的配置文件，查找顺序：
 
 1. `--config <path>` 或位置参数（显式指定）
 2. 项目根目录 `./gateway.toml`（存在时，向后兼容）
-3. `$XDG_CONFIG_HOME/sag/gateway.toml`（默认 `~/.config/sag/gateway.toml`，XDG Base Directory 标准）
+3. `$XDG_CONFIG_HOME/sag/gateway.toml`（默认 `~/.config/sag/gateway.toml`，XDG Base Directory 标准；开发轨的 `XDG_CONFIG_HOME` 被注入为 `.dev/xdg/config`，故为 `.dev/xdg/config/sag/gateway.toml`）
 
-analytics 数据库与滚动日志同样遵循 XDG 标准：相对 `sqlite://` DSN 锚定到 `$XDG_DATA_HOME/sag`（默认 `~/.local/share/sag`），日志写入 `$XDG_STATE_HOME/sag/logs`（默认 `~/.local/state/sag/logs`）。详见 [部署 → 日志轮转与清理](/guide/deployment)。
+analytics 数据库与滚动日志同样遵循 XDG 标准：相对 `sqlite://` DSN 锚定到 `$XDG_DATA_HOME/sag`（默认 `~/.local/share/sag`），日志写入 `$XDG_STATE_HOME/sag/logs`（默认 `~/.local/state/sag/logs`）。开发轨（`just dev` / `just run`）由 `scripts/dev_env.py` 注入项目内 `XDG_*` 覆盖，上述路径整体平移到 `.dev/xdg/`（分析库 `.dev/xdg/data/sag/analytics.db`、日志（仅非 TTY）`.dev/xdg/state/sag/logs/`、配置 fallback `.dev/xdg/config/sag/gateway.toml`），不碰生产数据。详见 [部署 → 日志轮转与清理](/guide/deployment)。
 
 ## 日志
 
@@ -25,7 +25,9 @@ format = "compact"
 
 ### 日志文件与轮转
 
-在非 TTY 环境（生产部署、test-env）下，SAG 自动将日志写入 `$XDG_STATE_HOME/sag/logs/` 目录下的**每日轮转文件**（默认 `~/.local/state/sag/logs/sag.2026-06-26.log`），不依赖启动器的 stdout 重定向。开发环境（TTY）下日志输出到终端，保持不变。
+在非 TTY 环境（生产部署、test-env）下，SAG 自动将日志写入 `$XDG_STATE_HOME/sag/logs/` 目录下的**每日轮转文件**（默认 `~/.local/state/sag/logs/sag.log.2026-06-26`），不依赖启动器的 stdout 重定向。开发环境（TTY）下日志输出到终端，保持不变。
+
+开发轨注入了 `XDG_STATE_HOME=.dev/xdg/state`，非 TTY（如 `just dev` 的管道、`just run` 的重定向）时轮转文件落在 `.dev/xdg/state/sag/logs/`（`just dev-clean` 可整体清除）；TTY 交互下（直接 `just run`）仍只输出终端、不产生文件（见上）。
 
 每次启动时，SAG 自动清理 **7 天前**的旧日志文件，保留最近一周的日志。
 
@@ -67,7 +69,9 @@ port = 37210
 [analytics]
 enabled = true
 # 相对 `sqlite://` 路径锚定到 $XDG_DATA_HOME/sag（默认 ~/.local/share/sag）。
-# 此处即解析为 ~/.local/share/sag/analytics.db；也可写绝对路径或 ":memory:"。
+# 此处即解析为 ~/.local/share/sag/analytics.db；开发轨（`just dev` / `just run`）
+# 注入了 XDG_DATA_HOME=.dev/xdg/data，故解析为 .dev/xdg/data/sag/analytics.db。
+# 也可写绝对路径或 ":memory:"。
 storage_dsn = "sqlite://analytics.db"
 # session_registry（日志页会话信息卡的数据源）的保留天数，默认 7。
 # 省略该键就等于启用 7 天清理：超期的会话记录会被直接删行（不归档）。

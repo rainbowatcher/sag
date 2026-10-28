@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-11
+updated: 2026-10-28
 ---
 
 # 配置
@@ -13,7 +13,7 @@ updated: 2026-10-11
 
 ### 加载
 
-1. 解析命令行参数，确定配置文件路径（`--config <path>` > 位置参数 > `./gateway.toml`（存在时，向后兼容）> `$XDG_CONFIG_HOME/sag/gateway.toml`）
+1. 解析命令行参数，确定配置文件路径（`--config <path>` > 位置参数 > `./gateway.toml`（存在时，向后兼容）> `$XDG_CONFIG_HOME/sag/gateway.toml`）。开发轨（`just dev` / `just run`）由 `scripts/dev_env.py` 注入 `XDG_*` 覆盖（`.dev/xdg/`），因此第三项为 `.dev/xdg/config/sag/gateway.toml`；前两项优先级不受注入影响
 2. Peek 配置文件中的 `[logging]` 段（在完整加载前初始化 tracing）
 3. 统一 typed 反序列化 TOML → `GatewayConfig` 结构体（`toml::Deserializer` + `serde_ignored`，与结构体 Schema 自动同步）
 4. 运行 `validate()` → 收集所有错误（不 fail-fast）
@@ -120,6 +120,7 @@ UI（Settings 页）：`Network` / `Authentication` 之外新增 Backoff、Break
 
 ## 变更记录
 
+- [0008 dev 轨 XDG 数据隔离（`.dev/xdg/`）](changes/0008-dev-track-xdg-isolation.md)
 - [0007 顶级配置 Admin API 与 Settings 页可视化](changes/0007-gateway-config-visualization.md)
 - [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)
 - [0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](changes/0005-outbound-proxy-configuration.md)

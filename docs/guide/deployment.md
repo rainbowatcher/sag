@@ -105,11 +105,11 @@ just test-env stop     # SIGTERM → 5s grace → SIGKILL
 
 > **默认行为提醒**：裸 `just test-env`（不带子命令）等价于 `just test-env status`，源自 `scripts/test-env.py` 中 argparse `args.cmd` 为 `None` 时 fallback 到 `cmd_status()` 的有意设计 —— status 是 read-only、作默认安全。想真正启动 gateway 必须**显式**写 `just test-env start`。无参调用看到 `[ERR] no test-env state` 不是错，是状态为空指针 —— 此时跑 `just test-env start` 即可拉起。
 
-State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`.test-env/xdg/data/sag/analytics-test.db`）均与开发环境互不干扰。
+State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`.test-env/xdg/data/sag/analytics-test.db`）均与开发环境互不干扰。开发轨（`just dev` / `just run`）同样注入了项目内 `XDG_*`（`.dev/xdg/`），其分析库在 `.dev/xdg/data/sag/analytics.db`、日志（仅非 TTY，见下节）在 `.dev/xdg/state/sag/logs/`，生产 XDG 路径（`~/.local/share/sag`、`~/.local/state/sag`、`~/.config/sag`）在两轨下都不会被写入 —— 逃生口是绕过 launcher 直接 `cargo run`（无注入，可再自行导出 `XDG_*` 指到任意位置）；`just dev` / `just run` / `just run-release` 会无条件覆盖这三个变量，预先导出无效。
 
 ### 日志轮转与清理
 
-SAG 遵循 XDG Base Directory 标准，在非 TTY 环境（生产部署、test-env）下自动将日志写入 `$XDG_STATE_HOME/sag/logs/` 目录的**每日轮转文件**（默认 `~/.local/state/sag/logs/sag.log.2026-06-26`）。test-env 启动器向子进程注入项目内的 `XDG_*` 覆盖（`.test-env/xdg/`），日志落在 `.test-env/xdg/state/sag/logs/`；test-env 不再重定向 stdout，但会**捕获 stderr 到 `.test-env/stderr.log`**（每次 start 覆盖），panics 与非 tracing 的 `Error:` 输出不会静默丢失。
+SAG 遵循 XDG Base Directory 标准，在非 TTY 环境（生产部署、test-env、`just dev` 的管道）下自动将日志写入 `$XDG_STATE_HOME/sag/logs/` 目录的**每日轮转文件**（默认 `~/.local/state/sag/logs/sag.log.2026-06-26`）。test-env 启动器向子进程注入项目内的 `XDG_*` 覆盖（`.test-env/xdg/`），日志落在 `.test-env/xdg/state/sag/logs/`；开发轨的 `scripts/dev_env.py` 同理注入 `.dev/xdg/`，非 TTY 时（`just dev` 的 stdout=PIPE、`just run 2>&1 | cat` 等重定向）落在 `.dev/xdg/state/sag/logs/`，TTY 交互下（直接 `just run`）仍只输出终端、不产生文件。test-env 不再重定向 stdout，但会**捕获 stderr 到 `.test-env/stderr.log`**（每次 start 覆盖），panics 与非 tracing 的 `Error:` 输出不会静默丢失。
 
 - **轮转**：每日自动切换新文件（`tracing-appender` `Rotation::DAILY`）
 - **清理**：每次启动时自动删除 **7 天前**的旧日志文件，保留最近一周

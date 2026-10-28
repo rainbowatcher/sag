@@ -65,13 +65,18 @@ test-crate crate:
 
 # ── 运行 ────────────────────────────────────────────────────────────
 
+# dev 轨 XDG 隔离：经 scripts/dev_env.py 注入 `.dev/xdg/`，analytics 库 / 滚动
+# 日志 / 配置 fallback 都落在项目内，不碰生产数据（滚动日志仅非 TTY 时落盘，TTY 下
+# 只输出终端、不写文件）。
+# 逃生口：绕过 launcher 直接 `cargo run`（无注入，可再自行导出 XDG_*）；本 recipe
+# 会无条件覆盖 XDG_*，预先导出无效。
 # 仅启动后端 (debug 模式)
 run config=config:
-    cargo run -- {{ config }}
+    python3 scripts/dev_env.py -- cargo run -- {{ config }}
 
-# 仅启动后端 (release 模式)
+# 仅启动后端 (release 模式)，XDG 隔离同 run
 run-release config=config:
-    cargo run --release -- {{ config }}
+    python3 scripts/dev_env.py -- cargo run --release -- {{ config }}
 
 # 启动前端开发服务器
 ui-dev:
@@ -87,6 +92,8 @@ ui-story:
 
 # ── 开发环境 ────────────────────────────────────────────────────────
 
+# 后端子进程同样注入 dev 轨 XDG_* 覆盖，数据落在 `.dev/xdg/`，与生产 XDG
+# 目录、`.test-env/` 均互不感知。
 # 一键启动前后端开发环境 (推荐)
 dev *args:
     python3 scripts/dev.py {{ args }}
@@ -149,10 +156,12 @@ verify-ui: ui-fmt-check ui-lint ui-typecheck ui-test ui-i18n-check
 
 # ── 清理 ────────────────────────────────────────────────────────────
 
-# 清理所有构建产物。analytics 数据库与滚动日志在用户级 XDG 目录
-# （$XDG_DATA_HOME/sag、$XDG_STATE_HOME/sag，默认 ~/.local/share/sag 与
-# ~/.local/state/sag），属用户数据，clean 不触碰；测试轨的全部产物在
-# .test-env/ 下，`just test-env stop` 后可整体删除。
+# dev 轨隔离数据在 `.dev/xdg/`，由 `just dev-clean` 显式删除（clean 不触碰）；
+# 生产 analytics 数据库与滚动日志在用户级 XDG 目录（$XDG_DATA_HOME/sag、
+# $XDG_STATE_HOME/sag，默认 ~/.local/share/sag 与 ~/.local/state/sag），属用户
+# 数据，clean 也不触碰；测试轨的全部产物在 .test-env/ 下，`just test-env stop`
+# 后可整体删除。
+# 清理所有构建产物
 clean:
     cargo clean
     rm -rf sag-ui/dist sag-ui/node_modules
@@ -160,6 +169,10 @@ clean:
 # 只清理 Rust 构建产物
 clean-rust:
     cargo clean
+
+# 删除 dev 轨隔离数据（.dev/，含 dev 用 analytics 库与日志）
+dev-clean:
+    rm -rf .dev
 
 # ── 文档 ────────────────────────────────────────────────────────────
 
@@ -179,8 +192,9 @@ audit:
 
 # ── 辅助 ────────────────────────────────────────────────────────────
 
-# 一键初始化开发环境（可重复运行）。配置写在项目根目录（CWD 回退命中）；
-# 也可改放 $XDG_CONFIG_HOME/sag/gateway.toml（删掉本文件即可）。
+# dev 轨注入了 XDG_*，配置也可改放 .dev/xdg/config/sag/gateway.toml（删掉项目根
+# 的 gateway.toml 即可）。
+# 一键初始化开发环境（可重复运行）；默认配置写在项目根目录（CWD 回退命中）
 setup:
     git config core.hooksPath scripts/hooks
     @echo "✓ Git hooks installed"

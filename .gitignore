@@ -46,6 +46,9 @@ node_modules
 .workbuddy/
 .codebuddy/
 
+# dev 轨隔离数据（XDG 注入根，见 scripts/dev_env.py）
+.dev/
+
 # test-env state (Phase 2 — see .plan/test-environment.md)
 .test-env/
 gateway.test.toml

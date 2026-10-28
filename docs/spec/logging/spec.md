@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-19
+updated: 2026-10-28
 ---
 
 # 日志 — 规格
@@ -142,7 +142,7 @@ body > 512 KiB 时不缓冲（否则 413 与流式请求会被破坏），但响
 ## 测试策略
 
 - 手动测试 `just test-env` 验证日志轮转和清理
-- 验证 TTY 环境行为不退化（`just dev` 日志仍输出到终端）
+- 验证 TTY 环境行为不退化（直接 `just run` 等 TTY 直跑日志仍输出到终端；`just dev` 的 stdout 走管道属非 TTY，日志落 `.dev/xdg/state/sag/logs/`）
 - 日志断言测试用 `tracing-subscriber` 的 `MakeWriter` 捕获到内存 buffer：
   - [sag-router/tests/http_log_large_body.rs](../../../sag-router/tests/http_log_large_body.rs) — 大 body 响应行（普通 + SSE）
   - `sag-providers/src/util.rs` 内联测试 — 后台任务 span 继承

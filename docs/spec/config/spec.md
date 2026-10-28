@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-09-30
+updated: 2026-10-28
 ---
 
 # 配置 — 规格
@@ -164,6 +164,10 @@ provider 级代理策略用三态枚举（`inherit` / `enabled` / `disabled`）�
 - `proxy_mode='enabled'` 且无可用顶层 `proxy_url` 是配置错误，validate / 保存 / 接口请求一致拒绝
 - 全局代理变化按 effective proxy 差异重建受影响 provider；`disabled` provider 不重建；在途请求不强行中断
 - `fallback` 必须 ∈ `apis` 的协议 key 集；`apis` 声明多个协议 key 时必填（缺省 = 校验错误），恰好一个协议 key 时省略即自动取之
+- **轨隔离靠 launcher 注入，不靠代码分支**：`scripts/dev_env.py`（开发轨 → `.dev/xdg/`）与 `scripts/test-env.py`（测试轨 → `.test-env/xdg/`）向子进程注入 `XDG_*` 覆盖，二进制无「开发/测试模式」判断；`sag-core/src/paths.rs` 的解析规则不变
+- 注入值必须是**绝对路径**：`XDG_*` 为空或相对路径时被 `paths.rs` 视为未设置并静默回退 `$HOME` 默认值（隔离无声失效），故 `dev_env.py` 用 `PROJECT_ROOT` 拼绝对路径并预建叶子目录
+- 注入只影响配置的 **fallback 级**：`--config` / 位置参数 > `./gateway.toml` > `$XDG_CONFIG_HOME/sag/gateway.toml` 的优先级任何轨都不变
+- `.dev/` 与 `.test-env/` 互不感知：两个隔离根并列且各自 gitignore，`clean` 只清构建产物，`dev-clean` 只删 `.dev/`
 
 ## 测试策略
 
@@ -175,8 +179,12 @@ provider 级代理策略用三态枚举（`inherit` / `enabled` / `disabled`）�
 - `sag-admin/src/admin_settings.rs` tests — GET/PUT `/api/settings` 行为（读取/设置/清空/400 映射）与 rebuild 验证
 - `sag-core/src/http_client.rs` tests — 显式 http/https 代理构建、直连构建、无效代理拒绝
 - `sag-config/src/config.rs` tests — `normalize_proxy_url` / `resolve_effective_proxy` 系列（scheme 限制、userinfo 拒绝、空白归一、三态解析）
+- `scripts/tests/test_dev_env.py` tests — dev 轨 `XDG_*` 注入（三变量均为绝对路径、只拷贝不修改 `os.environ` / 入参、`ensure_dev_dirs()` 幂等）；`just test-scripts` 执行
+- 端到端冒烟 — `just dev`（或 `just run 2>&1 | cat` 等非 TTY 方式）后 analytics 库 / 日志分别落在 `.dev/xdg/data/sag/` 与 `.dev/xdg/state/sag/logs/`；TTY 交互（直接 `just run`）下日志只输出终端、不产生文件；两种情况下生产 XDG 目录 mtime 不变
 
 ## 变更记录
+- [0008 dev 轨 XDG 数据隔离（`.dev/xdg/`）](changes/0008-dev-track-xdg-isolation.md)
+- [0007 顶级配置 Admin API 与 Settings 页可视化](changes/0007-gateway-config-visualization.md)
 - [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)
 - [0005 出站代理配置：顶层 proxy_url + provider proxy_mode 三态](changes/0005-outbound-proxy-configuration.md)
 - [0004 配置未知字段告警重构：serde_ignored 统一 typed 反序列化](changes/0004-warn-unknown-config-fields.md)

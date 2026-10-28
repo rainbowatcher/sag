@@ -5,10 +5,18 @@
     python3 scripts/dev.py                    # 走二进制默认查找顺序：
                                               #   ./gateway.toml（存在时）
                                               #   → $XDG_CONFIG_HOME/sag/gateway.toml
+                                              #     （后端注入了 dev 轨 XDG_*，
+                                              #      故实际为 .dev/xdg/config/sag/gateway.toml）
     python3 scripts/dev.py --config my.toml   # 显式指定配置文件
     python3 scripts/dev.py --skip-ui          # 只启动后端
     python3 scripts/dev.py --skip-backend     # 只启动前端
     python3 scripts/dev.py --release          # release 模式启动后端
+
+后端（watchexec → cargo run → sag）拿到的环境带 `XDG_CONFIG_HOME` /
+`XDG_DATA_HOME` / `XDG_STATE_HOME` 覆盖，全部指向项目内 `.dev/xdg/`，
+因此 dev 轨不会读写 `~/.config/sag`、`~/.local/share/sag/analytics.db`
+与 `~/.local/state/sag/logs/`（后者会被 dev 的 7 天清理误删生产日志）。
+详见 `scripts/dev_env.py`。
 """
 
 import argparse
@@ -18,6 +26,8 @@ import signal
 import subprocess
 import threading
 from pathlib import Path
+
+from dev_env import dev_env, ensure_dev_dirs
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -35,7 +45,10 @@ def start_backend(config: str | None, release: bool) -> subprocess.Popen:
 
     config 为 None 时不传位置参数，由二进制自己解析配置路径
     （./gateway.toml 存在则命中，否则回退 $XDG_CONFIG_HOME/sag/gateway.toml，
-    见 sag-gateway/src/main.rs 的 resolve_config_path）。
+    见 sag-gateway/src/main.rs 的 resolve_config_path）。这里注入的 env 把
+    XDG_* 钉在 `.dev/xdg/`，所以回退目标是 `.dev/xdg/config/sag/gateway.toml`。
+
+    watchexec 会把环境原样传给 `cargo run` 子进程，因此只需在此注入一次。
     """
     cmd = ["watchexec", "-r", "-e", "rs", "--", "cargo", "run"]
     if release:
@@ -47,6 +60,7 @@ def start_backend(config: str | None, release: bool) -> subprocess.Popen:
     return subprocess.Popen(
         cmd,
         cwd=PROJECT_ROOT,
+        env=dev_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -166,12 +180,19 @@ def main() -> None:
     parser.add_argument("--skip-ui", action="store_true")
     args = parser.parse_args()
 
+    ensure_dev_dirs()
+
     procs: list[subprocess.Popen] = []
 
     print()
     log("SYS", "╔══════════════════════════════════════╗")
     log("SYS", "║   SAG — Smart AI Gateway Dev Mode    ║")
     log("SYS", "╚══════════════════════════════════════╝")
+    log(
+        "SYS",
+        "Isolated data → .dev/xdg/ "
+        "(data: .dev/xdg/data/sag/, logs: .dev/xdg/state/sag/logs/)",
+    )
     print()
 
     # ── 后端 ──

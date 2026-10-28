@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-19
+updated: 2026-10-28
 ---
 
 # 日志
@@ -15,8 +15,9 @@ updated: 2026-10-19
 
 | 环境 | stdout | stderr | 日志文件 |
 |------|--------|--------|---------|
-| TTY（开发） | ✅ 输出 | ✅ 输出 | ❌ 不写文件 |
-| 非 TTY（生产/test-env） | ❌ DEVNULL | test-env 捕获到 `.test-env/stderr.log` | ✅ `logs/sag.log.YYYY-MM-DD` 每日轮转 |
+| TTY 直跑（如直接 `just run`） | ✅ 输出 | ✅ 输出 | ❌ 不写文件 |
+| 非 TTY dev 轨（`just dev` / 重定向） | ❌ 不写日志（管道由 `dev.py` 以 `[BE]` 回显） | 同左（stderr 合并进该管道） | ✅ `.dev/xdg/state/sag/logs/sag.log.YYYY-MM-DD` 每日轮转 |
+| 非 TTY 生产与 test-env | ❌ DEVNULL | test-env 捕获到 `.test-env/stderr.log` | ✅ 各自 XDG 路径下 `logs/sag.log.YYYY-MM-DD` 每日轮转 |
 
 ### 日志格式
 
@@ -39,7 +40,7 @@ TTY 环境启用 ANSI 颜色。
 
 非 TTY 环境使用 `tracing_appender::rolling::Rotation::DAILY`：
 - 每天自动切换到新文件
-- 文件名格式：`sag.2026-06-26.log`
+- 文件名格式：`sag.log.YYYY-MM-DD`
 - 目录自动创建（`$XDG_STATE_HOME/sag/logs`，XDG Base Directory 标准）
 
 ### 启动时清理

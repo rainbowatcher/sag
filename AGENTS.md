@@ -16,8 +16,9 @@
 - `just test-rust --doc` — 仅文档测试
 - `just test-crate sag-config` — 单个 crate 的测试
 - `just clippy` — 仅 clippy
-- `just run` — 以 debug 模式运行网关
-- `just dev` — 通过 `scripts/dev.py` 同时启动前后端
+- `just run` / `just run-release` — 以 debug / release 模式运行网关（经 `scripts/dev_env.py` 注入 `.dev/xdg/` 的 `XDG_*` 覆盖，不碰生产数据）
+- `just dev` — 通过 `scripts/dev.py` 同时启动前后端（后端同样注入 `.dev/xdg/`）
+- `just dev-clean` — 删除 dev 轨隔离数据（`.dev/`，含 dev 用 analytics 库与日志）；`just clean` 只清构建产物，不碰 `.dev/`
 
 ### 前端 (`sag-ui/`)
 - `pnpm dev` — 启动 Vite 开发服务器
@@ -96,15 +97,18 @@
 
 ### 两轨对比
 
-| 维度 | 开发轨 (`just dev`) | 测试轨 (`just test-env`) |
+两轨都通过向子进程注入 `XDG_*` 覆盖把数据关在项目内：开发轨 → `.dev/xdg/`（`scripts/dev_env.py`），测试轨 → `.test-env/xdg/`（`scripts/test-env.py`）。生产路径只在直接 `cargo run`（不经注入）时生效。
+
+| 维度 | 开发轨 (`just dev` / `just run`) | 测试轨 (`just test-env`) |
 |---|---|---|
 | Rust 二进制 | `cargo run` 的 debug 实例 | `./target/release/sag`（事先 `just build-test`） |
 | 前端 | Vite dev server 独立 HMR | emit 后的产物通过 `rust-embed` 嵌入二进制（`--features embed-ui`） |
 | 默认端口 | 37210（读 `gateway.toml`） | 37211（读 `gateway.test.toml`） |
-| 状态目录 | n/a | `.test-env/{pid,lock,build-info.json,stderr.log}` |
-| 日志 | `$XDG_STATE_HOME/sag/logs/sag.log.YYYY-MM-DD`（默认 `~/.local/state/sag/logs/`，每日滚动，tracing-appender 写入；dev.py 将子进程 stdout 以 `[BE]` 标签回显到终端） | `.test-env/xdg/state/sag/logs/sag.log.YYYY-MM-DD`（每日滚动，grep 友好；stdout 重定向到 DEVNULL，**stderr 捕获到 `.test-env/stderr.log`**） |
-| 配置 | `gateway.toml` | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
-| SQLite | `$XDG_DATA_HOME/sag/analytics.db`（默认 `~/.local/share/sag/`） | `.test-env/xdg/data/sag/analytics-test.db` |
+| 状态目录 | `.dev/xdg/{config,data,state}` | `.test-env/{pid,lock,build-info.json,stderr.log}` + `.test-env/xdg/` |
+| 日志（仅非 TTY） | `.dev/xdg/state/sag/logs/sag.log.YYYY-MM-DD`（`XDG_STATE_HOME` → `.dev/xdg/state`，每日滚动，tracing-appender 写入；`just dev` 的 stdout 走管道故为非 TTY，dev.py 捕获该管道并以 `[BE]` 标签回显；TTY 下直接 `just run` 只输出终端、不写文件） | `.test-env/xdg/state/sag/logs/sag.log.YYYY-MM-DD`（每日滚动，grep 友好；stdout 重定向到 DEVNULL，**stderr 捕获到 `.test-env/stderr.log`**） |
+| 配置 | `gateway.toml`；fallback 为 `.dev/xdg/config/sag/gateway.toml`（`XDG_CONFIG_HOME` → `.dev/xdg/config`） | `gateway.test.toml`（从 `gateway.test.example.toml` 复制） |
+| SQLite | `.dev/xdg/data/sag/analytics.db`（`XDG_DATA_HOME` → `.dev/xdg/data`） | `.test-env/xdg/data/sag/analytics-test.db` |
+| 清理 | `just dev-clean`（删 `.dev/`；`just clean` 不触碰） | `just test-env stop` 后可整体删 `.test-env/` |
 
 ### 启动顺序
 
@@ -128,11 +132,22 @@ just test-env start    # 真正启动 gateway；同上必须显式写
 
 误输 `just test-env` 看到 `[ERR] no test-env state (`.test-env/pid` missing)` 不是错，是状态为空 —— 跑 `just test-env start` 即可拉起。启动路径上的 4 类常见 bail 见下一小节。
 
-State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`.test-env/xdg/data/sag/analytics-test.db`）、日志（`.test-env/xdg/state/sag/sag.log.*`）均列入 `.gitignore`，不会污染版本控制。
+State（`.test-env/`）、配置（`gateway.test.toml`）、分析库（`.test-env/xdg/data/sag/analytics-test.db`）、日志（`.test-env/xdg/state/sag/logs/sag.log.*`）均列入 `.gitignore`，不会污染版本控制。
 
 ### XDG Base Directory
 
-SAG 遵循 XDG 标准（`sag-core/src/paths.rs` 是唯一解析点）：配置 → `$XDG_CONFIG_HOME/sag`，analytics 数据库 → `$XDG_DATA_HOME/sag`，滚动日志 → `$XDG_STATE_HOME/sag/logs`；三个变量未设置/为空/相对路径时回退 `$HOME` 下的规范默认值（`~/.config`、`~/.local/share`、`~/.local/state`）。配置查找顺序：`--config` / 位置参数 > 项目根 `gateway.toml`（存在时，向后兼容）> `$XDG_CONFIG_HOME/sag/gateway.toml`。配置里的相对 `sqlite://` DSN 锚定到 `$XDG_DATA_HOME/sag`，老配置无感迁移；test-env 通过向子进程注入项目内 `XDG_*` 覆盖实现两轨物理隔离。
+SAG 遵循 XDG 标准（`sag-core/src/paths.rs` 是唯一解析点）：配置 → `$XDG_CONFIG_HOME/sag`，analytics 数据库 → `$XDG_DATA_HOME/sag`，滚动日志 → `$XDG_STATE_HOME/sag/logs`；三个变量未设置/为空/相对路径时回退 `$HOME` 下的规范默认值（`~/.config`、`~/.local/share`、`~/.local/state`）。配置查找顺序：`--config` / 位置参数 > 项目根 `gateway.toml`（存在时，向后兼容）> `$XDG_CONFIG_HOME/sag/gateway.toml`。配置里的相对 `sqlite://` DSN 锚定到 `$XDG_DATA_HOME/sag`，老配置无感迁移。
+
+**双注入**：两轨都靠 launcher 向子进程注入项目内 `XDG_*` 覆盖实现物理隔离，Rust 侧无「测试/开发模式」分支：
+
+| 轨 | 注入者 | XDG 根 | 实际落点 |
+|---|---|---|---|
+| 开发轨（`just dev` / `just run` / `just run-release`） | `scripts/dev_env.py` 的 `dev_env()`（`dev.py` 在拉起 `watchexec → cargo run` 时复用同一函数） | `.dev/xdg/` | 库 `.dev/xdg/data/sag/analytics.db`、日志（仅非 TTY）`.dev/xdg/state/sag/logs/`、配置 fallback `.dev/xdg/config/sag/gateway.toml` |
+| 测试轨（`just test-env`） | `scripts/test-env.py` 的 `child_env()` | `.test-env/xdg/` | 库 `.test-env/xdg/data/sag/analytics-test.db`、日志 `.test-env/xdg/state/sag/logs/` |
+
+注入值必须是**绝对路径**：`paths.rs` 会把空的或相对的 `XDG_*` 视为未设置并静默回退到 `$HOME` 默认值，隔离会无声失效。
+
+**迁移提示（唯一有意 break）**：以前靠 `~/.config/sag/gateway.toml` fallback 的开发者，dev 轨现在读不到它了 —— 把该文件复制成项目根 `gateway.toml`，或放到 `.dev/xdg/config/sag/gateway.toml`。**逃生口**：绕过 launcher 直接 `cargo run`（不带注入，可再自行导出 `XDG_*` 指到任意位置）；`just dev` / `just run` / `just run-release` 会**无条件覆盖**这三个变量，预先导出无效。
 
 ### Agent 工具接入要点
 
@@ -145,4 +160,6 @@ SAG 遵循 XDG 标准（`sag-core/src/paths.rs` 是唯一解析点）：配置 �
 
 ## 开发环境与测试环境的边界
 
-`just dev` 与 `just test-env` 共用 `.gitignore` 的 categorical 排除（`*.db` / `target/` / `node_modules/`），但两者各自**不**感知对方的状态。开发轨禁用 test-env launcher，测试轨禁用 watchexec —— 否则 watch 触发 cargo 重建会让测试实例的 PID 失效，但 launcher 的状态目录不会自动清理，留下幽灵 pid 文件。
+`just dev` 与 `just test-env` 共用 `.gitignore` 的 categorical 排除（`*.db` / `target/` / `node_modules/` / `.dev/` / `.test-env/`），但两者各自**不**感知对方的状态：开发轨的可变状态全在 `.dev/xdg/`（`just dev-clean` 显式删除，`just clean` 只清构建产物、不碰它），测试轨的在 `.test-env/`。开发轨禁用 test-env launcher，测试轨禁用 watchexec —— 否则 watch 触发 cargo 重建会让测试实例的 PID 失效，但 launcher 的状态目录不会自动清理，留下幽灵 pid 文件。
+
+生产路径（`~/.local/share/sag`、`~/.local/state/sag`、`~/.config/sag`）在两轨下都不再被写入，只有绕过 launcher 直接 `cargo run` 才会命中。

@@ -262,7 +262,9 @@ SELECT 'call_logs_all' AS src, id, request_id, provider, model, status_code,
 
 ```bash
 # 1) 先停 gateway：VACUUM 需要独占访问，有并发读写会报 database is locked
-just test-env stop        # 测试轨；开发轨停掉 `just dev` 实例
+#    测试轨 `just test-env stop`；开发轨停掉 `just dev`（其库在
+#    .dev/xdg/data/sag/analytics.db，下面的路径换掉即可）
+just test-env stop
 
 # 2) 把 WAL 内容并回主库并截断 WAL 文件
 sqlite3 ~/.local/share/sag/analytics.db "PRAGMA wal_checkpoint(TRUNCATE);"
@@ -278,7 +280,7 @@ sqlite3 ~/.local/share/sag/analytics.db "PRAGMA integrity_check;"
 
 - `VACUUM` 会写出一份新库再替换原文件，**需要约 2 倍库文件大小的空闲磁盘余量**，库大时耗时可达分钟级。
 - `VACUUM` 不会删除任何数据，`call_logs` 与各冷表的行数都不变，只重整页。
-- 测试轨的库在 `.test-env/xdg/data/sag/analytics-test.db`，把路径换掉即可。
+- 测试轨的库在 `.test-env/xdg/data/sag/analytics-test.db`，开发轨的库在 `.dev/xdg/data/sag/analytics.db`（开发轨注入了 `XDG_DATA_HOME=.dev/xdg/data`），把路径换掉即可。
 
 ### 逃生舱：冷表派生名索引
 
