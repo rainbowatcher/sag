@@ -1403,19 +1403,9 @@ impl ResponsesCodec {
                 format!("data: {payload}\n\n").into_bytes()
             }
             IrStreamEvent::Finish { finish_reason, .. } => {
-                // Synthesize response.completed (translated path; native
+                // Synthesize the terminal event (translated path; native
                 // passes the upstream frame through as Raw).
-                let status = match finish_reason {
-                    Some(IrFinishReason::Length | IrFinishReason::ContentFilter) => "incomplete",
-                    Some(IrFinishReason::Cancelled) => "cancelled",
-                    Some(IrFinishReason::Other(s)) if s == "failed" => "failed",
-                    _ => "completed",
-                };
-                let payload = json!({
-                    "type": "response.completed",
-                    "response": {"object": "response", "status": status, "output": []},
-                });
-                format!("data: {payload}\n\n").into_bytes()
+                encode_terminal_event(finish_reason.as_ref())
             }
             // Usage / Error / End are handled inline by the dispatch loop.
             IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) | IrStreamEvent::End => Vec::new(),
@@ -1616,7 +1606,7 @@ impl StreamEncodeState {
             IrStreamEvent::Finish { finish_reason, .. } => {
                 let mut out = self.close_open_item();
                 if !self.completed {
-                    out.extend_from_slice(&encode_completed(finish_reason.as_ref()));
+                    out.extend_from_slice(&encode_terminal_event(finish_reason.as_ref()));
                     self.completed = true;
                 }
                 out
@@ -1678,17 +1668,39 @@ impl StreamEncodeState {
     }
 }
 
-fn encode_completed(finish: Option<&IrFinishReason>) -> Vec<u8> {
-    let status = match finish {
-        Some(IrFinishReason::Length | IrFinishReason::ContentFilter) => "incomplete",
-        Some(IrFinishReason::Cancelled) => "cancelled",
-        Some(IrFinishReason::Other(s)) if s == "failed" => "failed",
-        _ => "completed",
-    };
-    let payload = json!({
-        "type": "response.completed",
-        "response": {"object": "response", "status": status, "output": []},
-    });
+/// Map an IR finish reason to the Responses terminal event triple:
+/// `(event_type, status, incomplete_reason)`.
+///
+/// Only truncation / content filtering terminate as `response.incomplete` with
+/// an `incomplete_details.reason`; every other reason keeps the historical
+/// `response.completed` event with its derived status (native upstream already
+/// terminated via `Raw`, so `failed` / `cancelled` stay on `completed` here).
+fn terminal_event_fields(
+    finish: Option<&IrFinishReason>,
+) -> (&'static str, &'static str, Option<&'static str>) {
+    match finish {
+        Some(IrFinishReason::Length) => (
+            "response.incomplete",
+            "incomplete",
+            Some("max_output_tokens"),
+        ),
+        Some(IrFinishReason::ContentFilter) => {
+            ("response.incomplete", "incomplete", Some("content_filter"))
+        }
+        Some(IrFinishReason::Cancelled) => ("response.completed", "cancelled", None),
+        Some(IrFinishReason::Other(s)) if s == "failed" => ("response.completed", "failed", None),
+        _ => ("response.completed", "completed", None),
+    }
+}
+
+/// Encode the synthesized terminal SSE frame for a finish reason.
+fn encode_terminal_event(finish: Option<&IrFinishReason>) -> Vec<u8> {
+    let (event_type, status, incomplete_reason) = terminal_event_fields(finish);
+    let mut response = json!({"object": "response", "status": status, "output": []});
+    if let Some(reason) = incomplete_reason {
+        response["incomplete_details"] = json!({"reason": reason});
+    }
+    let payload = json!({"type": event_type, "response": response});
     format!("data: {payload}\n\n").into_bytes()
 }
 
@@ -2965,6 +2977,81 @@ mod tests {
             1,
             "exactly one response.completed: {s}"
         );
+    }
+
+    #[test]
+    fn stream_finish_length_emits_incomplete_with_max_output_tokens() {
+        let enc = ResponsesCodec::stream_encoder();
+        let s = String::from_utf8(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::Length),
+        }))
+        .unwrap();
+        assert!(s.contains("\"type\":\"response.incomplete\""), "{s}");
+        assert!(s.contains("\"status\":\"incomplete\""), "{s}");
+        assert!(
+            s.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"),
+            "{s}"
+        );
+        assert!(!s.contains("response.completed"), "{s}");
+    }
+
+    #[test]
+    fn stream_finish_content_filter_emits_incomplete_with_content_filter() {
+        let enc = ResponsesCodec::stream_encoder();
+        let s = String::from_utf8(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::ContentFilter),
+        }))
+        .unwrap();
+        assert!(s.contains("\"type\":\"response.incomplete\""), "{s}");
+        assert!(s.contains("\"status\":\"incomplete\""), "{s}");
+        assert!(
+            s.contains("\"incomplete_details\":{\"reason\":\"content_filter\"}"),
+            "{s}"
+        );
+        assert!(!s.contains("response.completed"), "{s}");
+    }
+
+    #[test]
+    fn stream_finish_stop_emits_completed_without_incomplete_details() {
+        let enc = ResponsesCodec::stream_encoder();
+        let s = String::from_utf8(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::Stop),
+        }))
+        .unwrap();
+        assert!(s.contains("\"type\":\"response.completed\""), "{s}");
+        assert!(s.contains("\"status\":\"completed\""), "{s}");
+        assert!(!s.contains("incomplete_details"), "{s}");
+    }
+
+    /// The stateless `encode_stream_event` view and the stateful
+    /// `stream_encoder` closure must emit byte-identical terminal frames.
+    #[test]
+    fn stream_finish_terminal_frame_is_shared_by_both_entry_points() {
+        let cases = [
+            Some(IrFinishReason::Length),
+            Some(IrFinishReason::ContentFilter),
+            Some(IrFinishReason::Stop),
+            Some(IrFinishReason::ToolCalls),
+            Some(IrFinishReason::Cancelled),
+            Some(IrFinishReason::Other("failed".into())),
+            Some(IrFinishReason::Other("weird".into())),
+            None,
+        ];
+        for finish_reason in cases {
+            let ev = IrStreamEvent::Finish {
+                index: 0,
+                finish_reason: finish_reason.clone(),
+            };
+            let stateless = ResponsesCodec::encode_stream_event(&ev);
+            let stateful = ResponsesCodec::stream_encoder()(&ev);
+            assert_eq!(
+                stateless, stateful,
+                "terminal frames diverged for {finish_reason:?}"
+            );
+        }
     }
 
     #[test]

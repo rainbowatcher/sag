@@ -73,9 +73,10 @@ enum EndSynthesis {
     /// client-cancelled (499).
     AnthropicMessageStop,
     /// Bridge #3 — Responses ingress + translated upstream: the ingress
-    /// encoder renders `response.completed` from a structured `Finish`, never
-    /// from `End`, so a non-compliant upstream (no `finish_reason`) would leave
-    /// the client without its terminal frame.
+    /// encoder renders the Responses terminal frame from a structured `Finish`
+    /// (`response.completed`, or `response.incomplete` for `length` /
+    /// `content_filter`), never from `End`, so a non-compliant upstream (no
+    /// `finish_reason`) would leave the client without its terminal frame.
     ResponsesCompleted,
 }
 
@@ -131,8 +132,10 @@ fn apply_end_synthesis_bridge(
                 EndSynthesis::AnthropicMessageStop => out.push(sag_core::IrStreamEvent::Raw(
                     b"data: {\"type\":\"message_stop\"}\n\n".to_vec(),
                 )),
-                // A compliant upstream already produced `response.completed`
-                // from its own `Finish`; the first End only terminates.
+                // A compliant upstream already produced its terminal frame
+                // (`response.completed`, or `response.incomplete` for
+                // `length` / `content_filter`) from its own `Finish`; the first
+                // End only terminates.
                 EndSynthesis::ResponsesCompleted if finish_seen => {
                     out.push(sag_core::IrStreamEvent::End)
                 }

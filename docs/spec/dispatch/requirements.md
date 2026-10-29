@@ -68,7 +68,7 @@ updated: 2026-10-27
 - **translated 桥接终点帧**：ingress 协议与 upstream 协议不一致时，网关在首个 `End` 合成 ingress 协议的终止帧，保证客户端总能收到协议终点：
   - Chat ingress + Anthropic / Responses upstream → `data: [DONE]`（响应帧仍为上游原样透传）
   - Anthropic ingress + 非 Anthropic upstream → `message_stop`；上游未发 `finish_reason` 时先闭合 content block 并补 `message_delta`（`stop_reason`），合规上游不重复
-  - Responses ingress + 非 Responses upstream → `response.completed`；上游未发 `finish_reason` 时合成，合规上游不重复
+  - Responses ingress + 非 Responses upstream → `response.completed`（`length` / `content_filter` 为 `response.incomplete` + `incomplete_details.reason`）；上游未发 `finish_reason` 时合成，合规上游不重复
   - native 透传路径字节不变，空响应重试（empty-peek）语义不变
 - **运营影响**：桥接只补协议缺失的终止帧（包括不合规上游的块闭合与 `stop_reason`），属协议合规修复，不改变分类与统计口径
 

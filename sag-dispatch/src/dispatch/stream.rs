@@ -3504,9 +3504,10 @@ mod tests {
 
     /// Wiring regression: the terminal-frame judgement runs on the bytes
     /// **after** `encode`. A structured `Finish` event encoded by the
-    /// Responses codec synthesizes `response.completed` (translated lane) and
-    /// must set the flag; a plain delta frame and Anthropic's
-    /// `message_delta` with `stop_reason: null` must not.
+    /// Responses codec synthesizes the Responses terminal frame (translated
+    /// lane) — `response.completed`, or `response.incomplete` for `length` /
+    /// `content_filter` — and must set the flag; a plain delta frame and
+    /// Anthropic's `message_delta` with `stop_reason: null` must not.
     #[tokio::test]
     async fn terminal_frame_flag_set_on_encoded_terminal() {
         // ── Positive: `Finish` → `response.completed` via the Responses

@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-26
+updated: 2026-10-29
 ---
 
 # 供应商 — 规格
@@ -263,11 +263,13 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - `sag-core/src/api/anthropic.rs` / `sag-core/src/api/responses.rs` — DTO 往返（`json!` ↔ typed）、未知字段经 `extra` 保留、未知联合 tag 落 `Unknown`、弃用字段仍可透传
 - `sag-providers/src/codec/{anthropic,responses}.rs` — typed 化后的 wire 形状断言；无 IR 归宿的 typed 字段经 `decode → ir.raw → encode` 存活（`request_typed_fields_without_ir_home_roundtrip` / `request_typed_echo_fields_roundtrip_through_raw` / `input_message_typed_extras_roundtrip` / `response_typed_fields_without_ir_home_roundtrip`）；`reject_unsupported_keeps_value_layer_messages` 钉住 422 消息与顺序；`tool_choice_allowed_tools_shape_preserved`、`message_item_without_role_defaults_to_user` / `message_item_with_non_string_role_defaults_to_user`、`malformed_values_are_parse_errors_but_unknown_fields_pass`；usage 降级（`usage_degrades_per_field_when_subobject_is_malformed` / `usage_degraded_path_keeps_old_defaults` / `usage_degrades_per_field_when_details_are_ill_typed` / `stream_completed_keeps_usage_when_details_are_ill_typed`）；`parse_faithful` 守护（`tool_use_block_without_input_keeps_wire_shape` / `response_raw_block_without_input_keeps_wire_shape` / `faithful_guard_keeps_well_formed_unions_typed`）
 - `sag-dispatch/src/dispatch/chat/tests.rs` — typed happy path、Anthropic / Responses 两处 schema mismatch 的 lenient 降级（含 `decode_anthropic_response_lenient_path_keeps_unmodelled_fields` 钉住降级不丢字段）、200 送达的上游错误体保留在 `raw`
-- `sag-router/tests/{anthropic_messages_ingress,responses_ingress}.rs` — typed 形状不匹配 422（各自信封）、stateful 预检查先于 typed 解析
+- `sag-providers/src/codec/responses.rs` — translated 合成终点帧按 finish reason 分档（`stream_finish_length_emits_incomplete_with_max_output_tokens` / `stream_finish_content_filter_emits_incomplete_with_content_filter` / `stream_finish_stop_emits_completed_without_incomplete_details`），`stream_finish_terminal_frame_is_shared_by_both_entry_points` 钉两入口（`encode_stream_event` / `stream_encoder`）终点帧字节一致
+- `sag-router/tests/{anthropic_messages_ingress,responses_ingress}.rs` — typed 形状不匹配 422（各自信封）、stateful 预检查先于 typed 解析；`responses_ingress_chat_upstream_stream_length_emits_response_incomplete` 钉 translated 整链终点帧（`length` → `response.incomplete` + `incomplete_details.reason = max_output_tokens`）
 - `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
 - `sag-core/src/http_client.rs` — `pool_connection_constants_match_plan`（钉住 pool 常量）、`pool_options_coexist_with_proxy_and_timeout`（pool 与 proxy/timeout 共存）
 
 ## 变更记录
+- [0009 Responses 流式终点帧按 finish reason 区分 `response.incomplete`](changes/0009-responses-incomplete-terminal-event.md)
 - [0008 Responses / Anthropic 请求响应体 typed 化（无损透传）](changes/0008-typed-wire-dtos-responses-anthropic.md)
 - [0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](changes/0007-tool-raw-cross-codec-fidelity.md)
 - [0005 共享 HTTP client 连接池 idle 调优（降低 stale 连接复用）](changes/0005-http-client-pool-idle-tuning.md)

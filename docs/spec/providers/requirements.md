@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-26
+updated: 2026-10-29
 ---
 
 # 供应商
@@ -152,6 +152,7 @@ Responses API 与 Anthropic Messages API 的请求体/响应体由 `sag_core::ap
 
 ## 变更记录
 
+- [0009 Responses 流式终点帧按 finish reason 区分 `response.incomplete`](changes/0009-responses-incomplete-terminal-event.md)
 - [0008 Responses / Anthropic 请求响应体 typed 化（无损透传）](changes/0008-typed-wire-dtos-responses-anthropic.md)
 - [0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](changes/0007-tool-raw-cross-codec-fidelity.md)
 - [0004 供应商 role_mappings 编辑入口](changes/0004-role-mappings-editor.md)

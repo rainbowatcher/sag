@@ -517,6 +517,76 @@ async fn responses_ingress_chat_upstream_stream() {
     );
 }
 
+#[tokio::test]
+async fn responses_ingress_chat_upstream_stream_length_emits_response_incomplete() {
+    let frames = concat!(
+        r#"data: {"id":"chatcmpl-s2","object":"chat.completion.chunk","created":1700000000,"model":"real-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"id":"chatcmpl-s2","object":"chat.completion.chunk","created":1700000000,"model":"real-model","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let expected = frames.to_string();
+    let base_url = spawn_server(move |mut stream| async move {
+        respond_sse(&mut stream, &expected).await;
+    })
+    .await;
+
+    let state = build_state(&base_url, "resp-key", Upstream::Chat).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{
+        "model": "route-model",
+        "stream": true,
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    }"#;
+    let resp = app
+        .oneshot(responses_request(body, "resp-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(ct.contains("text/event-stream"), "got {ct}");
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("response.created"), "missing created: {text}");
+    assert!(text.contains("Hello"), "missing delta: {text}");
+    assert!(
+        !text.contains("response.completed"),
+        "truncated stream must not terminate as response.completed: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "Responses stream must not emit [DONE]: {text}"
+    );
+
+    // Parse the terminal frame (the last `data:` payload) as JSON so the
+    // `incomplete_details` nesting is asserted structurally: a sibling of
+    // `response` would leave `response.incomplete_details` null and fail.
+    let terminal_payload = text
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .last()
+        .expect("no data frames in stream");
+    let terminal: serde_json::Value = serde_json::from_str(terminal_payload).unwrap();
+    assert_eq!(
+        terminal["type"], "response.incomplete",
+        "terminal frame: {terminal_payload}"
+    );
+    assert_eq!(terminal["response"]["status"], "incomplete");
+    assert_eq!(
+        terminal["response"]["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+}
+
 // ── Responses × Anthropic upstream (translated) ───────────────────
 
 #[tokio::test]

@@ -1,11 +1,13 @@
 ---
 created: 2026-06-03
-updated: 2026-10-28
+updated: 2026-10-29
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-10-29** · **供应商**：[0009 Responses 流式终点帧按 finish reason 区分 `response.incomplete`](providers/changes/0009-responses-incomplete-terminal-event.md) — Responses 入口 + Chat-Completions 上游（translated lane）的终点帧由 `sag-providers/src/codec/responses.rs` 的 `Finish` 分支合成，旧实现把 `length` / `content_filter` 渲染成 `status: "incomplete"` 但**事件类型恒为 `response.completed`**，且响应对象里没有 `incomplete_details` 键（`Response` 上该键 required-but-nullable）；真实受害者是 pi 的 Responses 客户端——`status === "incomplete"` 而拿不到 reason 时直接抛 `Response incomplete without a provider reason`，截断响应变成客户端异常而非可处理的 `max_output_tokens` 停止；新增 `terminal_event_fields` 作 finish reason →（事件类型, status, incomplete reason）的唯一映射，`encode_terminal_event` 渲染帧并在有 reason 时写 `response.incomplete_details: {"reason": …}`（无 reason 时该键完全缺省），`Length` → `response.incomplete` + `incomplete` + `max_output_tokens`、`ContentFilter` → 同上 + `content_filter`、`Stop` / `ToolCalls` / `FunctionCall` / `Other(..)`（除 `"failed"`）/ `None` → `response.completed` + `completed`，`ResponsesCodec::encode_stream_event` 与 `StreamEncodeState::encode` 两处 `Finish` 分支共用并删除重复的 `encode_completed`，信封其余部分不变（`{type, response: {object, status, output: []}}`，无 `sequence_number`）；有意留在范围外：`Cancelled` 仍 `response.completed` + `status: "cancelled"`、`Other("failed")` 仍 `response.completed` + `status: "failed"`（不涉及 reason 缺失，改 `response.failed` 会与 dispatch 终点帧 / 502 分类口径联动：`response.failed` 在 `is_client_terminal_frame` 中不算终点、其 Error 帧走 502）；native 路径上游帧原样 Raw 透传、非流式 `encode_response` 与反向 `status_to_finish` 均不动；测试 +4 codec 单测（含两入口终点帧字节一致）+1 `sag-router/tests/responses_ingress.rs` 入口集成
 
 - **2026-10-28** · **配置**：[0008 dev 轨 XDG 数据隔离（`.dev/xdg/`）](config/changes/0008-dev-track-xdg-isolation.md) — 开发轨（`just dev` / `just run` / `just run-release`）此前不注入 XDG，analytics 库、滚动日志、配置 fallback 全落在生产路径（`~/.local/share/sag`、`~/.local/state/sag`、`~/.config/sag`）；新增 `scripts/dev_env.py` 提供 `dev_env()`（纯函数覆盖三个 `XDG_*` 为项目内绝对路径 `.dev/xdg/`）与 `ensure_dev_dirs()`（预建 `config/sag`、`data/sag`、`state/sag/logs`，SQLite 不自建父目录）加 CLI `python3 scripts/dev_env.py -- <cmd...>`（建目录后 `execvpe`），`scripts/dev.py` 的后端（`watchexec → cargo run`）复用同一注入，`justfile` 的 `run` / `run-release` 改经 launcher 启动并新增 `dev-clean`（`rm -rf .dev`，`clean` 只清构建产物、不碰隔离数据）；dev 轨落点变为库 `.dev/xdg/data/sag/analytics.db` / 日志（仅非 TTY）`.dev/xdg/state/sag/logs/` / 配置 fallback `.dev/xdg/config/sag/gateway.toml`，配置优先级（显式参数 > `./gateway.toml` > XDG）不变，唯一有意 break 是此前依赖 `~/.config/sag/gateway.toml` fallback 者需复制到项目根或 `.dev/xdg/config/sag/`，逃生口为绕过 launcher 直接 `cargo run`（无注入，可再自行导出 `XDG_*` 指到任意位置；`just dev` / `just run` / `just run-release` 无条件覆盖这三个变量，预先导出无效）；零 Rust 改动（`paths.rs` 纯 XDG 逻辑不动，注入值必须绝对路径否则静默回退 `$HOME`），`.dev/` 与 `.test-env/` 互不感知；`AGENTS.md`（两轨表新增 dev 轨 SQLite / 日志 / 配置 / 清理行 + 双注入小节 + 边界小节，修正两处过时路径）与 `docs/guide/{configuration,deployment,analytics}.md` 同步
 
