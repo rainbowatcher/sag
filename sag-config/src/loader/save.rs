@@ -5,8 +5,8 @@ use std::path::Path;
 use tracing::info;
 
 use crate::config::{
-    ApiConfig, GatewayConfig, KeyStrategy, Pipeline, ProviderConfig, ProxyMode, RouteConfig,
-    RouteTarget, Strategy,
+    ApiConfig, GatewayConfig, KeyStrategy, Pipeline, PrivacyBuiltins, PrivacyConfig,
+    PrivacyCustomRegex, PrivacyMode, ProviderConfig, ProxyMode, RouteConfig, RouteTarget, Strategy,
 };
 use crate::loader::json_util::{check_json_map, json_to_toml_value};
 use crate::toml_edit_util::{
@@ -253,6 +253,18 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
         }
     }
 
+    // ── [privacy] — semantic diff, field-level write ──
+    // The on-disk section is compared against the in-memory value using a
+    // projection that reads *only* `privacy` (defaults when the section is
+    // absent). Equal sections — the common case for provider/auth/runtime
+    // saves — are left byte-for-byte untouched, so an unrelated save never
+    // materialises `[privacy]` from defaults nor rewrites user comments,
+    // unknown keys, or hand-authored table/inline forms.
+    let on_disk_privacy = privacy_on_disk(&existing)?;
+    if on_disk_privacy != config.privacy {
+        write_privacy_section(&mut doc, &on_disk_privacy, &config.privacy)?;
+    }
+
     // ── Write back (atomic: temp-file + rename) ──
     // Multi-line layout for inline-table-arrays (e.g. `targets`) is
     // handled natively by `toml_edit` 0.24.1 via per-item
@@ -265,6 +277,561 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
 
     info!("config persisted to {}", path.display());
     Ok(())
+}
+
+/// Minimal parse target for the change check above. Every root key except
+/// `privacy` is ignored, so this never reads credentials or any other
+/// section of the file. A missing `privacy` section yields the defaults.
+#[derive(serde::Deserialize)]
+struct PrivacyProjection {
+    #[serde(default)]
+    privacy: PrivacyConfig,
+}
+
+/// Read the on-disk `[privacy]` semantics (defaults when absent).
+fn privacy_on_disk(existing: &str) -> Result<PrivacyConfig, sag_core::AppError> {
+    let projection: PrivacyProjection = toml::from_str(existing).map_err(|e| {
+        sag_core::AppError::Internal(format!(
+            "failed to parse existing config privacy section: {e}"
+        ))
+    })?;
+    Ok(projection.privacy)
+}
+
+/// Persist `new` into `doc`, touching only the fields whose typed value
+/// differs from `old`.
+///
+/// - A missing section is created by serializing the whole in-memory value
+///   (the caller only reaches this when the candidate differs from the
+///   defaults, so the section is genuinely new).
+/// - An existing `[privacy]` table is updated in place: unchanged fields
+///   (including their comments and decor) are not rewritten, and unknown
+///   root keys, sub-tables, and per-rule fields are never pruned.
+/// - `privacy = { … }` / inline sub-tables and arrays of inline tables are
+///   supported alongside the standard table / array-of-tables forms.
+fn write_privacy_section(
+    doc: &mut toml_edit::DocumentMut,
+    old: &PrivacyConfig,
+    new: &PrivacyConfig,
+) -> Result<(), sag_core::AppError> {
+    if !doc.as_table().contains_key("privacy") {
+        let serialized = toml_edit::ser::to_document(new).map_err(|e| {
+            sag_core::AppError::Config(format!("failed to serialize privacy config: {e}"))
+        })?;
+        doc.as_table_mut()
+            .insert("privacy", toml_edit::Item::Table((*serialized).clone()));
+        return Ok(());
+    }
+
+    let item = doc
+        .as_table_mut()
+        .get_mut("privacy")
+        .expect("checked above");
+    let mut table = PrivacyTable::from_item(item).ok_or_else(|| {
+        // Existing on-disk shape, not the caller's request → `Internal`.
+        sag_core::AppError::Internal("privacy must be a table in the config file".into())
+    })?;
+
+    if old.enabled != new.enabled {
+        table.set("enabled", toml_edit::Value::from(new.enabled));
+    }
+    if old.mode != new.mode {
+        table.set("mode", toml_edit::Value::from(privacy_mode_str(new.mode)));
+    }
+    if old.restore != new.restore {
+        table.set("restore", toml_edit::Value::from(new.restore));
+    }
+    if old.salt != new.salt {
+        table.set("salt", toml_edit::Value::from(new.salt.as_str()));
+    }
+    if old.builtins != new.builtins {
+        let mut builtins = table.child_table("builtins");
+        for (key, old_value, new_value) in builtin_pairs(old.builtins, new.builtins) {
+            if old_value != new_value {
+                builtins.set(key, toml_edit::Value::from(new_value));
+            }
+        }
+    }
+    if old.custom_words != new.custom_words {
+        sync_privacy_word_list(&mut table, "custom_words", &new.custom_words.items);
+    }
+    if old.allowlist != new.allowlist {
+        sync_privacy_word_list(&mut table, "allowlist", &new.allowlist.items);
+    }
+    if old.custom_regexes != new.custom_regexes {
+        sync_privacy_regexes(&mut table, &new.custom_regexes);
+    }
+    Ok(())
+}
+
+fn privacy_mode_str(mode: PrivacyMode) -> &'static str {
+    match mode {
+        PrivacyMode::Mask => "mask",
+        PrivacyMode::Warn => "warn",
+        PrivacyMode::Block => "block",
+    }
+}
+
+/// The seven builtin toggles as `(key, old, new)` pairs, so the writer can
+/// skip keys whose value did not change.
+fn builtin_pairs(old: PrivacyBuiltins, new: PrivacyBuiltins) -> [(&'static str, bool, bool); 7] {
+    [
+        ("email", old.email, new.email),
+        ("phone", old.phone, new.phone),
+        ("id_card_cn", old.id_card_cn, new.id_card_cn),
+        ("bank_card", old.bank_card, new.bank_card),
+        ("iban", old.iban, new.iban),
+        ("api_key", old.api_key, new.api_key),
+        ("private_key", old.private_key, new.private_key),
+    ]
+}
+
+/// Mutable view over a `[privacy]` section or an inline `privacy = { … }`
+/// value. Both shapes are legal TOML, so the writer must not assume either.
+enum PrivacyTable<'a> {
+    Table(&'a mut toml_edit::Table),
+    Inline(&'a mut toml_edit::InlineTable),
+}
+
+impl<'a> PrivacyTable<'a> {
+    fn from_item(item: &'a mut toml_edit::Item) -> Option<Self> {
+        match item {
+            toml_edit::Item::Table(table) => Some(Self::Table(table)),
+            toml_edit::Item::Value(value) => value.as_inline_table_mut().map(Self::Inline),
+            toml_edit::Item::None | toml_edit::Item::ArrayOfTables(_) => None,
+        }
+    }
+
+    /// Replace (or insert) a scalar field. An existing key keeps its
+    /// position because `IndexMap::insert` does for present keys.
+    fn set(&mut self, key: &str, value: toml_edit::Value) {
+        match self {
+            Self::Table(table) => {
+                table.insert(key, toml_edit::Item::Value(value));
+            }
+            Self::Inline(table) => {
+                table.insert(key, value);
+            }
+        }
+    }
+
+    /// Return a nested table-like view, creating an inline table when the
+    /// key is missing or holds an unexpected shape. Existing standard
+    /// sub-tables (`[privacy.builtins]`) are reused as-is.
+    fn child_table(&mut self, key: &str) -> PrivacyTable<'_> {
+        match self {
+            Self::Table(table) => {
+                let table = &mut **table;
+                if !table.contains_key(key) {
+                    table.insert(
+                        key,
+                        toml_edit::Item::Value(toml_edit::Value::InlineTable(
+                            toml_edit::InlineTable::new(),
+                        )),
+                    );
+                }
+                let item = table.get_mut(key).expect("just inserted or existed");
+                let usable = item.is_table()
+                    || item
+                        .as_value()
+                        .map(toml_edit::Value::is_inline_table)
+                        .unwrap_or(false);
+                if !usable {
+                    *item = toml_edit::Item::Value(toml_edit::Value::InlineTable(
+                        toml_edit::InlineTable::new(),
+                    ));
+                }
+                match item {
+                    toml_edit::Item::Table(inner) => PrivacyTable::Table(inner),
+                    toml_edit::Item::Value(value) => PrivacyTable::Inline(
+                        value
+                            .as_inline_table_mut()
+                            .expect("ensured inline table above"),
+                    ),
+                    _ => unreachable!("ensured table-like above"),
+                }
+            }
+            Self::Inline(table) => {
+                let table = &mut **table;
+                let needs_init = table
+                    .get(key)
+                    .map(|value| !value.is_inline_table())
+                    .unwrap_or(true);
+                if needs_init {
+                    table.insert(
+                        key,
+                        toml_edit::Value::InlineTable(toml_edit::InlineTable::new()),
+                    );
+                }
+                PrivacyTable::Inline(
+                    table
+                        .get_mut(key)
+                        .and_then(toml_edit::Value::as_inline_table_mut)
+                        .expect("just ensured inline table"),
+                )
+            }
+        }
+    }
+
+    /// Return the array field at `key`, creating it when missing.
+    fn array(&mut self, key: &str) -> &mut toml_edit::Array {
+        match self {
+            Self::Table(table) => ensure_array_field(table, key),
+            Self::Inline(table) => {
+                let table = &mut **table;
+                let needs_init = table
+                    .get(key)
+                    .map(|value| !value.is_array())
+                    .unwrap_or(true);
+                if needs_init {
+                    table.insert(key, toml_edit::Value::Array(toml_edit::Array::new()));
+                }
+                table
+                    .get_mut(key)
+                    .and_then(toml_edit::Value::as_array_mut)
+                    .expect("just ensured array")
+            }
+        }
+    }
+}
+
+/// Sync one word list's `items` array. The array is rewritten positionally,
+/// so duplicate entries and the candidate's order round-trip exactly and an
+/// emptied list actually drops every old word (the generic string-array
+/// helper keeps old positions and de-duplicates, which would break both).
+fn sync_privacy_word_list(table: &mut PrivacyTable<'_>, key: &str, items: &[String]) {
+    let mut list = table.child_table(key);
+    sync_privacy_items(list.array("items"), items);
+}
+
+fn sync_privacy_items(array: &mut toml_edit::Array, items: &[String]) {
+    // Sniff a multi-line layout so appended entries keep the existing indent.
+    let multiline = array.to_string().contains('\n');
+    let indent: Option<String> = array.iter().find_map(|value| {
+        value
+            .decor()
+            .prefix()
+            .and_then(|prefix| prefix.as_str())
+            .and_then(|prefix| prefix.rfind('\n').map(|i| prefix[i..].to_string()))
+    });
+
+    let reused = array.len().min(items.len());
+    for (index, item) in items.iter().take(reused).enumerate() {
+        // `replace` keeps the existing item's decor, so a value that stays in
+        // the same slot keeps its leading comment.
+        array.replace(index, item.as_str());
+    }
+    for item in items.iter().skip(reused) {
+        let mut value = toml_edit::Value::from(item.as_str());
+        if multiline && let Some(indent) = indent.as_deref() {
+            value.decor_mut().set_prefix(indent);
+        }
+        array.push(value);
+    }
+    while array.len() > items.len() {
+        array.remove(array.len() - 1);
+    }
+}
+
+/// Sync `custom_regexes` against the candidate list, keeping the row order of
+/// the candidate and supporting both legal forms (`[[privacy.custom_regexes]]`
+/// and `custom_regexes = [{ … }]`).
+fn sync_privacy_regexes(table: &mut PrivacyTable<'_>, regexes: &[PrivacyCustomRegex]) {
+    match table {
+        PrivacyTable::Table(table) => {
+            let table = &mut **table;
+            match table.get_mut("custom_regexes") {
+                None => {
+                    if regexes.is_empty() {
+                        return;
+                    }
+                    let mut aot = toml_edit::ArrayOfTables::new();
+                    for regex in regexes {
+                        aot.push(new_regex_table(regex));
+                    }
+                    table.insert("custom_regexes", toml_edit::Item::ArrayOfTables(aot));
+                }
+                Some(item) if item.is_array_of_tables() => {
+                    let aot = item
+                        .as_array_of_tables_mut()
+                        .expect("checked array of tables");
+                    let rows = drain_regex_tables(aot);
+                    // An emptied array of tables renders nothing, so the key
+                    // disappears from the file exactly like a removed list.
+                    for row in plan_regex_rows(rows, regexes, |regex| {
+                        RegexRow::Table(new_regex_table(regex))
+                    }) {
+                        aot.push(row.into_table());
+                    }
+                }
+                Some(item)
+                    if item
+                        .as_value()
+                        .map(toml_edit::Value::is_array)
+                        .unwrap_or(false) =>
+                {
+                    let array = item
+                        .as_value_mut()
+                        .and_then(toml_edit::Value::as_array_mut)
+                        .expect("checked array");
+                    sync_regex_inline_array(array, regexes);
+                }
+                Some(_) => {
+                    // Unreachable for a config that loaded successfully (the
+                    // projection would have failed); replace defensively.
+                    table.remove("custom_regexes");
+                    if !regexes.is_empty() {
+                        let mut aot = toml_edit::ArrayOfTables::new();
+                        for regex in regexes {
+                            aot.push(new_regex_table(regex));
+                        }
+                        table.insert("custom_regexes", toml_edit::Item::ArrayOfTables(aot));
+                    }
+                }
+            }
+        }
+        PrivacyTable::Inline(table) => {
+            let table = &mut **table;
+            let needs_init = table
+                .get("custom_regexes")
+                .map(|value| !value.is_array())
+                .unwrap_or(true);
+            if needs_init {
+                table.insert(
+                    "custom_regexes",
+                    toml_edit::Value::Array(toml_edit::Array::new()),
+                );
+            }
+            let array = table
+                .get_mut("custom_regexes")
+                .and_then(toml_edit::Value::as_array_mut)
+                .expect("just ensured array");
+            sync_regex_inline_array(array, regexes);
+        }
+    }
+}
+
+fn drain_regex_tables(aot: &mut toml_edit::ArrayOfTables) -> Vec<RegexRow> {
+    let mut rows = Vec::with_capacity(aot.len());
+    while !aot.is_empty() {
+        rows.push(RegexRow::Table(aot.remove(0)));
+    }
+    rows
+}
+
+/// Rebuild an inline `custom_regexes` array in the candidate's order. The
+/// array itself is cleared in place, so its layout decor survives.
+fn sync_regex_inline_array(array: &mut toml_edit::Array, regexes: &[PrivacyCustomRegex]) {
+    let old: Vec<RegexRow> = array.iter().cloned().map(RegexRow::Inline).collect();
+    array.clear();
+    for row in plan_regex_rows(old, regexes, |regex| {
+        RegexRow::Inline(toml_edit::Value::InlineTable(new_regex_inline_table(regex)))
+    }) {
+        array.push(row.into_value());
+    }
+}
+
+/// Selecting the on-disk row to reuse for each candidate rule.
+///
+/// Rule rows carry no stable identifier, so exact reuse is decided by the
+/// full known triple in on-disk order (a rule that was not edited keeps its
+/// comments and unknown keys). Remaining candidates then take the remaining
+/// rows positionally, and any surplus rows are dropped. The final row order
+/// always follows the candidate list, so duplicate kinds are preserved
+/// instead of being merged by kind.
+fn plan_regex_rows<F>(
+    old: Vec<RegexRow>,
+    regexes: &[PrivacyCustomRegex],
+    mut create: F,
+) -> Vec<RegexRow>
+where
+    F: FnMut(&PrivacyCustomRegex) -> RegexRow,
+{
+    let mut used = vec![false; old.len()];
+    let mut chosen: Vec<Option<usize>> = vec![None; regexes.len()];
+
+    for (index, regex) in regexes.iter().enumerate() {
+        let want = (
+            regex.kind.as_str(),
+            regex.pattern.as_str(),
+            regex.case_insensitive,
+        );
+        let found = old.iter().enumerate().find_map(|(row_index, row)| {
+            (!used[row_index] && row.triple() == Some(want)).then_some(row_index)
+        });
+        if let Some(row_index) = found {
+            used[row_index] = true;
+            chosen[index] = Some(row_index);
+        }
+    }
+
+    let mut next = 0;
+    for slot in &mut chosen {
+        if slot.is_none() {
+            while next < old.len() && used[next] {
+                next += 1;
+            }
+            if next < old.len() {
+                used[next] = true;
+                *slot = Some(next);
+            }
+        }
+    }
+
+    let mut slots: Vec<Option<RegexRow>> = old.into_iter().map(Some).collect();
+    let mut rows = Vec::with_capacity(regexes.len());
+    for (index, regex) in regexes.iter().enumerate() {
+        let mut row = match chosen[index].and_then(|row_index| slots[row_index].take()) {
+            Some(row) => row,
+            None => create(regex),
+        };
+        row.update(regex);
+        rows.push(row);
+    }
+    rows
+}
+
+/// One regex rule row, abstracted over the two legal container forms.
+enum RegexRow {
+    Table(toml_edit::Table),
+    Inline(toml_edit::Value),
+}
+
+impl RegexRow {
+    /// The full known triple, or `None` for a malformed row (only reachable
+    /// from a file that would already fail projection/`validate`).
+    fn triple(&self) -> Option<(&str, &str, bool)> {
+        match self {
+            Self::Table(table) => Some((
+                table.get("kind")?.as_str()?,
+                table.get("pattern")?.as_str()?,
+                table
+                    .get("case_insensitive")
+                    .and_then(toml_edit::Item::as_bool)
+                    .unwrap_or(false),
+            )),
+            Self::Inline(value) => {
+                let table = value.as_inline_table()?;
+                Some((
+                    table.get("kind")?.as_str()?,
+                    table.get("pattern")?.as_str()?,
+                    table
+                        .get("case_insensitive")
+                        .and_then(toml_edit::Value::as_bool)
+                        .unwrap_or(false),
+                ))
+            }
+        }
+    }
+
+    /// Write only the known fields whose value differs, leaving unchanged
+    /// fields (and every unknown key) with their original decor.
+    fn update(&mut self, regex: &PrivacyCustomRegex) {
+        match self {
+            Self::Table(table) => {
+                if table.get("kind").and_then(toml_edit::Item::as_str) != Some(regex.kind.as_str())
+                {
+                    table.insert(
+                        "kind",
+                        toml_edit::Item::Value(toml_edit::Value::from(regex.kind.as_str())),
+                    );
+                }
+                if table.get("pattern").and_then(toml_edit::Item::as_str)
+                    != Some(regex.pattern.as_str())
+                {
+                    table.insert(
+                        "pattern",
+                        toml_edit::Item::Value(toml_edit::Value::from(regex.pattern.as_str())),
+                    );
+                }
+                match table
+                    .get("case_insensitive")
+                    .and_then(toml_edit::Item::as_bool)
+                {
+                    Some(value) if value == regex.case_insensitive => {}
+                    // Missing is the `false` default: leave the key absent
+                    // instead of materialising it.
+                    None if !regex.case_insensitive => {}
+                    _ => {
+                        table.insert(
+                            "case_insensitive",
+                            toml_edit::Item::Value(toml_edit::Value::from(regex.case_insensitive)),
+                        );
+                    }
+                }
+            }
+            Self::Inline(value) => {
+                let table = value
+                    .as_inline_table_mut()
+                    .expect("inline regex row is an inline table");
+                if table.get("kind").and_then(toml_edit::Value::as_str) != Some(regex.kind.as_str())
+                {
+                    table.insert("kind", toml_edit::Value::from(regex.kind.as_str()));
+                }
+                if table.get("pattern").and_then(toml_edit::Value::as_str)
+                    != Some(regex.pattern.as_str())
+                {
+                    table.insert("pattern", toml_edit::Value::from(regex.pattern.as_str()));
+                }
+                match table
+                    .get("case_insensitive")
+                    .and_then(toml_edit::Value::as_bool)
+                {
+                    Some(value) if value == regex.case_insensitive => {}
+                    None if !regex.case_insensitive => {}
+                    _ => {
+                        table.insert(
+                            "case_insensitive",
+                            toml_edit::Value::from(regex.case_insensitive),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn into_table(self) -> toml_edit::Table {
+        match self {
+            Self::Table(table) => table,
+            Self::Inline(toml_edit::Value::InlineTable(table)) => table.into_table(),
+            Self::Inline(_) => toml_edit::Table::new(),
+        }
+    }
+
+    fn into_value(self) -> toml_edit::Value {
+        match self {
+            Self::Inline(value) => value,
+            Self::Table(table) => toml_edit::Value::InlineTable(table.into_inline_table()),
+        }
+    }
+}
+
+fn new_regex_table(regex: &PrivacyCustomRegex) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table.insert(
+        "kind",
+        toml_edit::Item::Value(toml_edit::Value::from(regex.kind.as_str())),
+    );
+    table.insert(
+        "pattern",
+        toml_edit::Item::Value(toml_edit::Value::from(regex.pattern.as_str())),
+    );
+    table.insert(
+        "case_insensitive",
+        toml_edit::Item::Value(toml_edit::Value::from(regex.case_insensitive)),
+    );
+    table
+}
+
+fn new_regex_inline_table(regex: &PrivacyCustomRegex) -> toml_edit::InlineTable {
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("kind", toml_edit::Value::from(regex.kind.as_str()));
+    table.insert("pattern", toml_edit::Value::from(regex.pattern.as_str()));
+    table.insert(
+        "case_insensitive",
+        toml_edit::Value::from(regex.case_insensitive),
+    );
+    table
 }
 
 /// Atomically write `content` to `path` via a temp-file in the same

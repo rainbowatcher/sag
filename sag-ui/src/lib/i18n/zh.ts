@@ -433,6 +433,7 @@ export const zh: Record<keyof typeof en, string> = {
   "settings.toast.proxyCleared": "代理设置已清除",
   "settings.toast.apiKeysSaved": "API keys 已保存",
   "settings.toast.authDisabled": "认证已关闭",
+  "settings.toast.privacySaved": "隐私设置已保存",
 
   // ── Settings: proxy / API-key validation ─────────────────────
   "settings.proxy.invalidUrl": "URL 无效。请使用 http://host:port 或 https://host:port 格式。",
@@ -568,6 +569,7 @@ export const zh: Record<keyof typeof en, string> = {
   "settings.loadingConfig": "加载配置中...",
   "settings.tabs.network": "网络",
   "settings.tabs.authentication": "认证",
+  "settings.tabs.privacy": "隐私",
   "settings.tabs.backoff": "退避",
   "settings.tabs.breaker": "熔断",
   "settings.tabs.timers": "计时器",
@@ -633,6 +635,123 @@ export const zh: Record<keyof typeof en, string> = {
   "settings.strategyTimers.hintFillFirstTtlTail": " 表示永不过期。",
   "settings.strategyTimers.hintStickyReset":
     "sticky-failover pin 被记住、直到再次尝试路由主 target 的时长。",
+
+  // ── 设置 › 隐私过滤 ─────────────────────────────────────────────
+  "settings.privacy.title": "隐私过滤",
+  "settings.privacy.description":
+    "在请求发往上游前识别并处置聊天文本中的敏感信息。仅影响聊天接口的请求文本，其它接口与本地记录保持原样。",
+  "settings.privacy.loading": "正在加载隐私设置...",
+  "settings.privacy.loadError": "加载隐私设置失败。",
+  "settings.privacy.unavailable": "该网关未返回隐私设置。请刷新页面或升级网关。",
+  "settings.privacy.statusTitle": "配置状态",
+  "settings.privacy.statusDescription":
+    "已保存的配置是网关当前生效的内容；草稿是尚未保存的编辑，两者互相独立。",
+  "settings.privacy.savedTitle": "当前生效",
+  "settings.privacy.draftTitle": "草稿",
+  "settings.privacy.draftSynced": "已与已保存的配置同步。",
+  "settings.privacy.draftDirty": "有未保存的更改。",
+  "settings.privacy.summaryMode": "模式",
+  "settings.privacy.summaryBuiltins": "内置检测",
+  "settings.privacy.summaryRestore": "响应还原",
+  "settings.privacy.summarySalt": "盐值",
+  "settings.privacy.basicTitle": "基础设置",
+  "settings.privacy.basicDescription":
+    "总开关、处置模式与响应还原。以上各项都需要显式保存后才会生效。",
+  "settings.privacy.enabledLabel": "启用隐私过滤",
+  "settings.privacy.enabledHint": "关闭时不做任何检测与处置，但仍可预先配置下方的模式与规则。",
+  "settings.privacy.disabledNote":
+    "隐私过滤已关闭。你可以先预配置模式与规则；保存并开启后才会作用于请求。",
+  "settings.privacy.modeTitle": "命中后的处置方式",
+  "settings.privacy.modeDescription":
+    "网关检测到敏感信息后的处理方式。切换模式会保留响应还原设置。",
+  "settings.privacy.mode.mask": "脱敏后发送",
+  "settings.privacy.mode.maskRecommended": "推荐",
+  "settings.privacy.mode.maskDescription":
+    "命中项在发往上游前替换为占位符，例如 [[EMAIL_1a2b3c4d5e6f]]；上游收到的是这些命中项的占位符。",
+  "settings.privacy.mode.block": "阻止请求",
+  "settings.privacy.mode.blockDescription":
+    "任一命中即拒绝本次请求并返回网关错误；不会向上游发送任何内容。",
+  "settings.privacy.mode.blockWarning":
+    "被拒绝的请求不会到达上游；客户端会收到网关返回的错误响应。",
+  "settings.privacy.mode.warn": "仅告警",
+  "settings.privacy.mode.warnDescription": "请求原样转发，并记录命中的类别。",
+  "settings.privacy.mode.warnWarning": "原文仍会发送给上游。",
+  "settings.privacy.mode.warnLog":
+    "日志只记录命中类别与数量（例如 email=1），不记录命中原文，也不记录占位符。",
+  "settings.privacy.restoreLabel": "响应还原",
+  "settings.privacy.restoreHint":
+    "把响应中本次请求生成的占位符替换回原文；只还原本次请求的占位符，不检测模型新生成的敏感内容。",
+  "settings.privacy.restoreMaskOnly":
+    "响应还原仅在「脱敏后发送」模式下生效。当前设置：{state}；切回该模式后会继续保留。",
+  "settings.privacy.builtinsTitle": "内置检测规则",
+  "settings.privacy.builtinsDescription": "按类别识别敏感信息；由上方处置模式决定命中的结果。",
+  "settings.privacy.builtinsCount": "已选 {enabled} / {total}",
+  "settings.privacy.builtin.email": "邮箱",
+  "settings.privacy.builtin.email.hint": "常见格式的邮箱地址，例如 user@example.com。",
+  "settings.privacy.builtin.phone": "中国大陆手机号",
+  "settings.privacy.builtin.phone.hint": "以 13 至 19 开头的 11 位手机号。",
+  "settings.privacy.builtin.id_card_cn": "中国居民身份证",
+  "settings.privacy.builtin.id_card_cn.hint": "带有效校验位的 18 位号码，或 15 位旧版号码。",
+  "settings.privacy.builtin.bank_card": "银行卡号",
+  "settings.privacy.builtin.bank_card.hint": "13 至 19 位且通过 Luhn 校验的号码。",
+  "settings.privacy.builtin.iban": "IBAN",
+  "settings.privacy.builtin.iban.hint": "通过 mod-97 校验的账号。",
+  "settings.privacy.builtin.api_key": "常见 API 密钥",
+  "settings.privacy.builtin.api_key.hint": "sk-、ghp_、AKIA 等已知前缀后跟至少 16 个字符。",
+  "settings.privacy.builtin.private_key": "PEM 私钥",
+  "settings.privacy.builtin.private_key.hint": "PEM 私钥块，包含密钥正文。",
+  "settings.privacy.customSectionTitle": "自定义规则与例外",
+  "settings.privacy.customSectionDescription":
+    "在 7 项内置检测之外，追加敏感词、放行名单与自定义正则。",
+  "settings.privacy.customSectionBadge": "可选",
+  "settings.privacy.customWordsTitle": "自定义敏感词",
+  "settings.privacy.customWordsHint": "每行一项，空行会被忽略。命中后按当前处置模式处理。",
+  "settings.privacy.allowlistTitle": "放行名单",
+  "settings.privacy.allowlistHint":
+    "每行一项。每项必须与候选命中的完整值精确相等且区分大小写；不做子串、前缀或单词边界匹配。",
+  "settings.privacy.regexTitle": "自定义正则",
+  "settings.privacy.regexDescription": "每条规则包含类别标识、表达式与大小写选项。",
+  "settings.privacy.regexKindHint": "类别标识用于标记命中项并作为占位符名称。允许重复的类别标识。",
+  "settings.privacy.regexAdd": "添加规则",
+  "settings.privacy.regexRemove": "删除规则",
+  "settings.privacy.regexEmpty": "暂无自定义正则。",
+  "settings.privacy.regexKindLabel": "类别",
+  "settings.privacy.regexKindPlaceholder": "例如 employee_id",
+  "settings.privacy.regexPatternLabel": "表达式",
+  "settings.privacy.regexPatternPlaceholder": "要匹配的表达式，例如 EMP- 加六位数字",
+  "settings.privacy.regexCaseInsensitive": "忽略大小写",
+  "settings.privacy.regexKindRequired": "类别不能为空",
+  "settings.privacy.regexPatternRequired": "表达式不能为空",
+  "settings.privacy.regexDialectNote":
+    "保存时网关会用 Rust regex 方言编译每条表达式；不支持 (?=...) 等环视断言与 \\1 等反向引用。",
+  "settings.privacy.regexIndexError": "第 {index} 条规则被拒绝：{message}",
+  "settings.privacy.advancedTitle": "高级",
+  "settings.privacy.advancedDescription": "用于占位符哈希的盐值。网关不会回显盐值内容。",
+  "settings.privacy.saltTitle": "盐值",
+  "settings.privacy.saltHint":
+    "盐值参与占位符哈希计算，增加预计算反推的难度。相同的类别、原文与盐值始终生成相同的占位符。页面只显示配置状态，不回显内容。",
+  "settings.privacy.saltConfigured": "已配置",
+  "settings.privacy.saltNotConfigured": "未配置",
+  "settings.privacy.saltPendingReplace": "待替换盐值",
+  "settings.privacy.saltNewLabel": "新盐值",
+  "settings.privacy.saltNewPlaceholder": "例如 9f2c1a7b03de",
+  "settings.privacy.saltNewHint":
+    "留空则保持当前盐值。非空值会按输入内容原样替换（包含空格）。保存后清空此输入框，页面仅保留配置状态，不回显内容。",
+  "settings.privacy.scopeTitle": "保护范围",
+  "settings.privacy.scopeDescription": "当前实现的行为边界，避免高估覆盖范围。",
+  "settings.privacy.scopeChat":
+    "仅处理聊天接口的请求文本：/v1/chat/completions、/v1/messages、/v1/responses。",
+  "settings.privacy.scopeMedia":
+    "不扫描图片、附件与 URL：媒体块以及 data、file_data、url 字段会被跳过。",
+  "settings.privacy.scopeUpstream":
+    "不扫描上游新生成的内容：只会还原本次请求产生的占位符，不检测模型自己写出的敏感信息。",
+  "settings.privacy.scopePreview":
+    "本地会话预览仍可能包含原文。隐私检测日志只记录命中类别与数量，不记录命中内容。",
+  "settings.privacy.footerHint": "所有更改都需要显式保存；开关不会自动生效。",
+  "settings.privacy.undo": "撤销更改",
+  "settings.privacy.savingLocked": "保存期间无法编辑。",
+  "settings.privacy.saveFailed": "保存未确认：{message}",
+  "settings.privacy.saveUnconfirmedHint": "草稿已保留。请刷新以确认网关实际使用的内容。",
 
   "logs.filter.provider": "供应商",
   "logs.filter.searchProvider": "搜索供应商...",

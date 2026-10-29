@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sag_analytics::{IdentityRegistry, RouteIdentity, TargetIdentity};
 use sag_config::{
     BackoffConfig, CircuitBreakerConfig, ConfigHandle, GatewayAuthConfig, GatewayConfig,
-    ProviderConfig, RouteConfig,
+    PrivacyBuiltins, PrivacyCustomRegex, PrivacyMode, PrivacyWordList, ProviderConfig, RouteConfig,
 };
 use sag_core::AppError;
 use sag_providers::LlmProvider;
@@ -60,7 +60,41 @@ pub struct MutationReport {
     pub providers_rebuilt: Vec<String>,
     pub providers_removed: Vec<String>,
     pub routes_changed: usize,
+    /// `true` when the provider registry and the route list are unchanged.
+    /// A command surface that also writes fields outside those two views
+    /// (today only `[privacy]` via [`ConfigMutationCoordinator::update_runtime_config`])
+    /// clears it when its own section really changed.
     pub no_op: bool,
+}
+
+/// Domain command for a `[privacy]` update, applied by
+/// [`ConfigMutationCoordinator::update_runtime_config`].
+///
+/// Carries the seven plain `[privacy]` fields as a full-object replacement
+/// plus the optional `salt` write. Deliberately **not** `Debug` (the salt is
+/// a secret) and deliberately serde-free: HTTP DTOs live in `sag-admin` and
+/// map into this command.
+///
+/// `salt` semantics: `None` (or `Some("")`) keeps the stored value; a
+/// non-empty string replaces it byte for byte — no trimming, no
+/// normalization.
+pub struct PrivacyConfigUpdate {
+    /// Master switch.
+    pub enabled: bool,
+    /// Detection handling strategy (`mask` / `warn` / `block`).
+    pub mode: PrivacyMode,
+    /// Whether masked placeholders are restored in upstream responses.
+    pub restore: bool,
+    /// Built-in detector toggles (all seven).
+    pub builtins: PrivacyBuiltins,
+    /// User-supplied regex detectors, in order.
+    pub custom_regexes: Vec<PrivacyCustomRegex>,
+    /// Literal words to mask.
+    pub custom_words: PrivacyWordList,
+    /// Words that must never be masked.
+    pub allowlist: PrivacyWordList,
+    /// Replacement salt; `None` / empty keeps the current value.
+    pub salt: Option<String>,
 }
 
 /// Pre-built adapter diff produced before acquiring any RwLock write guard.
@@ -829,10 +863,15 @@ impl ConfigMutationCoordinator {
     /// Update the top-level runtime-tuning sections of the gateway config.
     ///
     /// Supports the global exponential-backoff settings, the circuit-breaker
-    /// settings, and the two routing-cache TTLs
-    /// (`shuffle_cache_ttl_secs` / `sticky_failover_reset_secs`). Each
-    /// argument is an optional full-object replacement: `None` leaves the
-    /// corresponding section untouched, `Some` overwrites it.
+    /// settings, the two routing-cache TTLs
+    /// (`shuffle_cache_ttl_secs` / `sticky_failover_reset_secs`), and the
+    /// `[privacy]` section. Each argument is an optional full-object
+    /// replacement: `None` leaves the corresponding section untouched, `Some`
+    /// overwrites it.
+    ///
+    /// A supplied [`PrivacyConfigUpdate`] replaces the seven plain privacy
+    /// fields; its `salt` is only written when non-`None` and non-empty, so a
+    /// caller that does not manage the salt cannot accidentally clear it.
     ///
     /// The circuit breaker is replaced as a full object: all four fields,
     /// including the half-open `probe_interval_secs` probe cadence, are taken
@@ -851,29 +890,60 @@ impl ConfigMutationCoordinator {
         circuit_breaker: Option<CircuitBreakerConfig>,
         shuffle_cache_ttl_secs: Option<u64>,
         sticky_failover_reset_secs: Option<u64>,
+        privacy: Option<PrivacyConfigUpdate>,
     ) -> Result<MutationReport, AppError> {
-        self.mutate(true, |candidate| {
-            if let Some(backoff) = backoff {
-                candidate.backoff = backoff;
-            }
-            if let Some(circuit_breaker) = circuit_breaker {
-                candidate.circuit_breaker = circuit_breaker;
-            }
-            if let Some(ttl) = shuffle_cache_ttl_secs {
-                candidate.shuffle_cache_ttl_secs = ttl;
-            }
-            if let Some(ttl) = sticky_failover_reset_secs {
-                candidate.sticky_failover_reset_secs = ttl;
-            }
-            // `mutate` also validates the post-mutation candidate; validating
-            // here keeps the rejection reason attached to the field-level
-            // change and keeps this method correct if that guard ever moves.
-            candidate
-                .validate()
-                .map_err(|errs| AppError::Config(errs.join("; ")))?;
-            Ok(())
-        })
-        .await
+        // `mutate` computes `no_op` from the provider/route diff only. A
+        // privacy/salt-only write still persists and bumps `routes_version`,
+        // so it would be reported as a no-op — a false negative for this
+        // command surface. Detect a real `[privacy]` change here (before/after
+        // inside the mutation, so no lock is acquired twice) and clear the
+        // flag afterwards; every non-privacy caller keeps the old semantics.
+        let mut privacy_changed = false;
+        let mut report = self
+            .mutate(true, |candidate| {
+                if let Some(backoff) = backoff {
+                    candidate.backoff = backoff;
+                }
+                if let Some(circuit_breaker) = circuit_breaker {
+                    candidate.circuit_breaker = circuit_breaker;
+                }
+                if let Some(ttl) = shuffle_cache_ttl_secs {
+                    candidate.shuffle_cache_ttl_secs = ttl;
+                }
+                if let Some(ttl) = sticky_failover_reset_secs {
+                    candidate.sticky_failover_reset_secs = ttl;
+                }
+                if let Some(privacy) = privacy {
+                    let privacy_before = candidate.privacy.clone();
+                    candidate.privacy.enabled = privacy.enabled;
+                    candidate.privacy.mode = privacy.mode;
+                    candidate.privacy.restore = privacy.restore;
+                    candidate.privacy.builtins = privacy.builtins;
+                    candidate.privacy.custom_regexes = privacy.custom_regexes;
+                    candidate.privacy.custom_words = privacy.custom_words;
+                    candidate.privacy.allowlist = privacy.allowlist;
+                    // `None` / empty keeps the stored salt: the management layer
+                    // never round-trips it, so "absent" must never mean "clear".
+                    if let Some(salt) = privacy.salt
+                        && !salt.is_empty()
+                    {
+                        candidate.privacy.salt = salt;
+                    }
+                    privacy_changed = candidate.privacy != privacy_before;
+                }
+                // `mutate` also validates the post-mutation candidate; validating
+                // here keeps the rejection reason attached to the field-level
+                // change and keeps this method correct if that guard ever moves.
+                candidate
+                    .validate()
+                    .map_err(|errs| AppError::Config(errs.join("; ")))?;
+                Ok(())
+            })
+            .await?;
+        if privacy_changed {
+            report.no_op = false;
+        }
+        Ok(report)
     }
 }
 
@@ -1763,7 +1833,13 @@ mod tests {
         };
 
         coord
-            .update_runtime_config(Some(backoff.clone()), Some(breaker), Some(1234), Some(4321))
+            .update_runtime_config(
+                Some(backoff.clone()),
+                Some(breaker),
+                Some(1234),
+                Some(4321),
+                None,
+            )
             .await
             .expect("valid runtime config update must commit");
 
@@ -1790,7 +1866,7 @@ mod tests {
             retry_on_empty_response: true,
         };
         let err = coord
-            .update_runtime_config(Some(invalid), None, Some(1), Some(1))
+            .update_runtime_config(Some(invalid), None, Some(1), Some(1), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Config(_)));
@@ -1802,5 +1878,197 @@ mod tests {
             after.sticky_failover_reset_secs,
             before.sticky_failover_reset_secs
         );
+    }
+
+    // ── privacy command tests ─────────────────────────────────────────
+
+    fn privacy_update(salt: Option<&str>) -> PrivacyConfigUpdate {
+        PrivacyConfigUpdate {
+            enabled: true,
+            mode: PrivacyMode::Block,
+            restore: false,
+            builtins: PrivacyBuiltins {
+                email: false,
+                phone: true,
+                id_card_cn: false,
+                bank_card: true,
+                iban: false,
+                api_key: true,
+                private_key: false,
+            },
+            custom_regexes: vec![PrivacyCustomRegex {
+                pattern: r"EMP-\d{4}".into(),
+                kind: "employee_id".into(),
+                case_insensitive: true,
+            }],
+            custom_words: PrivacyWordList {
+                items: vec!["project-bluebird".into()],
+            },
+            allowlist: PrivacyWordList {
+                items: vec!["public@example.com".into()],
+            },
+            salt: salt.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_applies_privacy_sections() {
+        let (coord, config) = make_runtime_coordinator();
+        let before = config.read().await.privacy.clone();
+        assert_eq!(before.salt, "");
+
+        coord
+            .update_runtime_config(None, None, None, None, Some(privacy_update(None)))
+            .await
+            .expect("valid privacy update must commit");
+
+        let cfg = config.read().await;
+        assert!(cfg.privacy.enabled);
+        assert_eq!(cfg.privacy.mode, PrivacyMode::Block);
+        assert!(!cfg.privacy.restore);
+        assert!(!cfg.privacy.builtins.email);
+        assert!(cfg.privacy.builtins.phone);
+        assert!(!cfg.privacy.builtins.id_card_cn);
+        assert!(!cfg.privacy.builtins.iban);
+        assert!(!cfg.privacy.builtins.private_key);
+        assert_eq!(cfg.privacy.custom_regexes.len(), 1);
+        assert_eq!(cfg.privacy.custom_regexes[0].kind, "employee_id");
+        assert!(cfg.privacy.custom_regexes[0].case_insensitive);
+        assert_eq!(cfg.privacy.custom_words.items, vec!["project-bluebird"]);
+        assert_eq!(cfg.privacy.allowlist.items, vec!["public@example.com"]);
+        // `salt: None` keeps the stored (empty) salt.
+        assert_eq!(cfg.privacy.salt, "");
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_privacy_salt_keeps_or_replaces_literally() {
+        let (coord, config) = make_runtime_coordinator();
+
+        coord
+            .update_runtime_config(
+                None,
+                None,
+                None,
+                None,
+                Some(privacy_update(Some(" s3cret "))),
+            )
+            .await
+            .expect("valid privacy update must commit");
+        // Non-empty salt replaces byte for byte: no trimming.
+        assert_eq!(config.read().await.privacy.salt, " s3cret ");
+
+        // Empty string and `None` both keep the current salt.
+        coord
+            .update_runtime_config(None, None, None, None, Some(privacy_update(Some(""))))
+            .await
+            .expect("empty salt must not fail");
+        assert_eq!(config.read().await.privacy.salt, " s3cret ");
+
+        coord
+            .update_runtime_config(None, None, None, None, Some(privacy_update(None)))
+            .await
+            .expect("omitted salt must not fail");
+        assert_eq!(config.read().await.privacy.salt, " s3cret ");
+    }
+
+    /// `no_op` is computed from the provider/route diff, but a privacy-only
+    /// (or salt-only) write still persists and bumps `routes_version`; the
+    /// report must not claim "nothing changed", while an idempotent re-apply
+    /// must keep the old provider/route no-op semantics.
+    #[tokio::test]
+    async fn update_runtime_config_privacy_only_change_is_not_a_no_op() {
+        let (coord, _config) = make_runtime_coordinator();
+
+        let report = coord
+            .update_runtime_config(None, None, None, None, Some(privacy_update(None)))
+            .await
+            .expect("valid privacy update must commit");
+        assert!(!report.no_op, "privacy-only change must not be a no-op");
+        assert_eq!(report.routes_changed, 0);
+        assert!(report.providers_added.is_empty());
+        assert!(report.providers_rebuilt.is_empty());
+        assert!(report.providers_removed.is_empty());
+
+        // Same seven fields, new salt: still a real change.
+        let report = coord
+            .update_runtime_config(
+                None,
+                None,
+                None,
+                None,
+                Some(privacy_update(Some("rotate-me"))),
+            )
+            .await
+            .expect("salt rotation must commit");
+        assert!(!report.no_op, "salt-only change must not be a no-op");
+
+        // Re-applying the exact same command leaves the config untouched.
+        let report = coord
+            .update_runtime_config(
+                None,
+                None,
+                None,
+                None,
+                Some(privacy_update(Some("rotate-me"))),
+            )
+            .await
+            .expect("idempotent privacy update must commit");
+        assert!(report.no_op, "unchanged privacy command stays a no-op");
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_without_privacy_leaves_section_untouched() {
+        let (coord, config) = make_runtime_coordinator();
+        coord
+            .update_runtime_config(
+                None,
+                None,
+                None,
+                None,
+                Some(privacy_update(Some("keep-me"))),
+            )
+            .await
+            .expect("valid privacy update must commit");
+        let before = config.read().await.privacy.clone();
+
+        coord
+            .update_runtime_config(None, None, Some(777), None, None)
+            .await
+            .expect("runtime-only update must commit");
+
+        let cfg = config.read().await;
+        assert_eq!(cfg.privacy, before);
+        assert_eq!(cfg.shuffle_cache_ttl_secs, 777);
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_invalid_privacy_regex_leaves_config_unchanged() {
+        let (coord, config) = make_runtime_coordinator();
+        let before = config.read().await.clone();
+
+        // Validation rejects an uncompilable pattern even though the master
+        // switch is on: the error names the offending rule index.
+        let mut privacy = privacy_update(Some("new-salt"));
+        privacy.custom_regexes = vec![PrivacyCustomRegex {
+            pattern: "(unclosed".into(),
+            kind: "broken".into(),
+            case_insensitive: false,
+        }];
+
+        let err = coord
+            .update_runtime_config(None, None, None, None, Some(privacy))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("privacy.custom_regexes[0]"),
+            "unexpected validation error: {message}"
+        );
+
+        let after = config.read().await;
+        assert_eq!(after.privacy, before.privacy);
+        assert_eq!(after.backoff, before.backoff);
+        assert_eq!(after.shuffle_cache_ttl_secs, before.shuffle_cache_ttl_secs);
     }
 }

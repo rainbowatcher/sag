@@ -28,6 +28,7 @@ import { toast } from "vue-sonner"
 import RefreshButton from "@/components/RefreshButton.vue"
 import BackoffForm from "@/components/settings/BackoffForm.vue"
 import CircuitBreakerForm from "@/components/settings/CircuitBreakerForm.vue"
+import PrivacyForm from "@/components/settings/PrivacyForm.vue"
 import StrategyTimersForm from "@/components/settings/StrategyTimersForm.vue"
 import SystemInfoCard, { type SystemInfoRow } from "@/components/settings/SystemInfoCard.vue"
 import { Badge } from "@/components/ui/badge"
@@ -343,6 +344,10 @@ function keyFingerprint(key: string): string {
             {{ store.apiKeys.length > 0 ? $t("common.on") : $t("common.off") }}
           </Badge>
         </TabsTrigger>
+        <TabsTrigger value="privacy" class="gap-1.5">
+          <ShieldCheck class="h-3.5 w-3.5" />
+          {{ $t("settings.tabs.privacy") }}
+        </TabsTrigger>
         <TabsTrigger value="backoff" class="gap-1.5">
           <Timer class="h-3.5 w-3.5" />
           {{ $t("settings.tabs.backoff") }}
@@ -585,6 +590,21 @@ function keyFingerprint(key: string): string {
               </div>
             </CardContent>
           </Card>
+        </TabsContent>
+
+        <!-- ── Privacy ──────────────────────────────────────────────── -->
+        <!-- PrivacyForm owns its own load/error/unavailable states from the
+             shared `gatewayConfig` store, so no page-level wrapper here.
+             `force-mount` keeps the mounted instance (draft, unsaved salt,
+             field errors) alive across tab switches: reka Tabs unmounts inactive
+             panels by default (`unmountOnHide`). reka-ui's docs are explicit that
+             a force-mounted panel no longer gets hidden for you (`TabsContent.js`
+             renders `hidden: !present` with `present = forceMount || isSelected`),
+             so hide the inactive state with the theme utility instead of adding a
+             second state owner here. It keeps the panel in the DOM (display:none)
+             and out of the layout while any other tab is active. -->
+        <TabsContent value="privacy" class="mt-0 data-[state=inactive]:hidden" force-mount>
+          <PrivacyForm />
         </TabsContent>
 
         <!-- ── Backoff ──────────────────────────────────────────────── -->

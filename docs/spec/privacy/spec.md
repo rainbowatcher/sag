@@ -1,6 +1,6 @@
 ---
 created: 2026-10-25
-updated: 2026-10-26
+updated: 2026-10-29
 ---
 
 # 隐私过滤 — 规格
@@ -21,8 +21,29 @@ updated: 2026-10-26
 
 ### 配置
 
-- `sag-config/src/config.rs` — `PrivacyConfig`（含 `Default`：`enabled=false` / `mode=Mask` / `restore=true` / 空 salt）、`PrivacyMode`（严格枚举）、`PrivacyBuiltins`（默认全 true）、`PrivacyCustomRegex`、`PrivacyWordList`、`GatewayConfig::validate_privacy`
+- `sag-config/src/config.rs` — `PrivacyConfig`（含 `Default`：`enabled=false` / `mode=Mask` / `restore=true` / 空 salt）、`PrivacyMode`（严格枚举）、`PrivacyBuiltins`（默认全 true）、`PrivacyCustomRegex`、`PrivacyWordList`、`GatewayConfig::validate_privacy`（自定义正则**无条件编译**，错误带 `privacy.custom_regexes[i]` 索引）
 - `gateway.example.toml` — `[privacy]` 示例段（默认全注释）
+
+### 管理面（`sag-admin` / `sag-state`）
+
+- `sag-admin/src/admin_config.rs` — `ConfigSnapshot.privacy`（必有）、`PrivacySnapshot`（七个非 salt 字段 + `salt_configured`，由 `From<&PrivacyConfig>` 逐字段映射）、`UpdatePrivacyRequest`（七个字段必填、`salt: Option<String>`）、`UpdateConfigRequest.privacy: Option<UpdatePrivacyRequest>`、`update_config`（映射成命令后只调一次 coordinator，`AppError::Config` → `400`）、`get_config`
+- `sag-state/src/config_mutation.rs` — `PrivacyConfigUpdate`（纯领域命令，无 serde、不 derive `Debug`）、`update_runtime_config` 的第五参数与 candidate 上的 salt 保持规则、`mutate` 的 apply → validate → 冲突检测 → 原子落盘 → commit 顺序（约 L292-390）；`sag-state/src/lib.rs` 重新导出该命令
+
+### 持久化写回（`sag-config`）
+
+- `sag-config/src/loader/save.rs` — `PrivacyProjection` / `privacy_on_disk`（L286-298，只解析 `[privacy]` 的投影，缺节取默认）、`write_privacy_section`（L312，差异写回入口）、`PrivacyTable`（L391，`Table` / `InlineTable` 两形态抽象）、`sync_privacy_word_list` / `sync_privacy_items`（L502-537，按位置重写数组）、`sync_privacy_regexes` / `sync_regex_inline_array` / `plan_regex_rows`（L539-700，行复用与顺序）、`new_regex_table`
+- `sag-config/tests/privacy_persistence.rs` — 落盘与重载的集成覆盖（`tests/` 目录，不仿照旧内联文件系统测试）
+
+### 设置页（`sag-ui`）
+
+- `sag-ui/src/types/api.ts` — `PrivacyMode` / `PrivacyBuiltins` / `PrivacyCustomRegex` / `PrivacyWordList` / `PrivacyConfigFields` / `PrivacyConfigSnapshot`（+`salt_configured`）/ `UpdatePrivacyConfigPayload`（+`salt?`）；`GatewayConfigSnapshot.privacy` 必有，`UpdateGatewayConfigPayload.privacy?` 可选
+- `sag-ui/src/lib/privacyConfig.ts` — 纯函数 `createPrivacyDraft` / `getPrivacyChanges` / `validatePrivacyDraft` / `buildPrivacyPayload` 与 `PrivacyDraft`（词表存 textarea 文本、正则行带页面内 `id`、`newSalt`）
+- `sag-ui/src/lib/privacyConfig.test.ts` — 草稿 / 脏标记 / 校验 / payload 的纯逻辑覆盖（Node 原生 runner，文件级断言）
+- `sag-ui/src/components/settings/PrivacyForm.vue` — 显式保存表单：初次读取、草稿、pending 锁定、错误与「保存未确认」提示
+- `sag-ui/src/pages/SettingsPage.vue` — privacy tab 的 trigger / content，挂载表单，复用既有 fetch / store 错误边界，不复制布局壳
+- `sag-ui/src/lib/settingsTabs.ts` + `settingsTabs.test.ts` — `privacy` 插在 `auth` 与 `backoff` 之间，默认 tab 仍为 `network`
+- `sag-ui/src/stores/gatewayConfig.ts` — `fetchConfig` / `saveRuntimeConfig` 已泛型透传完整快照，本次不新增 store
+- `sag-ui/src/lib/i18n/{en,zh}.ts` — `settings.tabs.privacy`、`settings.privacy.*`、`settings.toast.privacySaved` 成对新增
 
 ### 分发挂点（`sag-dispatch`）
 
@@ -113,6 +134,96 @@ flowchart TD
     D --> M[End / None: finish 冲尾<br/>剩余字节原样下发]
 ```
 
+### 管理面读写链路
+
+一次读取、一次保存都落在既有 `/api/config` 上：`privacy` 只是该快照 / 更新体的又一个 section，与 backoff、breaker、TTL 共用同一次 coordinator 事务（apply → validate → 冲突检测 → 原子落盘 → commit）。
+
+```mermaid
+sequenceDiagram
+    participant U as 设置页 privacy tab
+    participant S as gatewayConfig store
+    participant H as admin_config
+    participant K as config_mutation 协调器
+    participant F as save.rs
+
+    U->>S: fetchConfig()
+    S->>H: GET /api/config
+    H-->>S: ConfigSnapshot（privacy: PrivacySnapshot）
+    Note over H,S: 只有 salt_configured 布尔，无 salt 键、无掩码回显
+    S-->>U: 快照
+    U->>U: createPrivacyDraft(snapshot)，不 dirty
+    U->>U: 编辑 → getPrivacyChanges 判定 dirty
+    U->>U: 保存前 validatePrivacyDraft（kind / pattern 必填）
+    U->>S: saveRuntimeConfig(privacy: buildPrivacyPayload(...))
+    Note over U: pending 期间锁定全部编辑与撤销，重复提交被拒
+    S->>H: PUT /api/config（privacy 整对象 + 可选 salt）
+    H->>H: UpdatePrivacyRequest（七字段必填，未知 mode 在反序列化处 422）
+    H->>K: update_runtime_config(..., Some(PrivacyConfigUpdate))
+    K->>K: candidate 上逐字段 apply；salt 为 None 或空则保留原值
+    K->>K: candidate.validate()：Rust regex 编译、空 kind、枚举值
+    alt 校验失败
+        K-->>H: AppError::Config（privacy.custom_regexes[i] ...）
+        H-->>S: 400，内存与文件未变
+    else 校验通过
+        K->>K: 文件 revision 冲突检测
+        K->>F: save_config_to_file(candidate)
+        F->>F: privacy_on_disk != candidate.privacy 才写回（差异字段级）
+        K->>K: commit config + routes_version 自增（provider 重建列表为空）
+        K-->>H: MutationReport
+        H-->>S: 200 ConfigSnapshot
+    end
+    alt 200
+        S-->>U: 用返回快照重建草稿，清空 newSalt，解锁
+    else 4xx
+        S-->>U: 保留草稿 + 定位错误，解锁（确定未提交）
+    else 5xx / 响应丢失
+        S-->>U: 保留草稿，提示「保存未确认」，不自动重读
+    end
+```
+
+提交后仍可能失败：`mutate` 在 commit 之后才做 analytics 身份同步（`config_mutation.rs` 的 Step 6b），该步骤报错时新配置已经生效。因此保存失败只有「已知校验 / 冲突 / 写入前失败」能断言未提交；其余情况由 UI 表述为未确认。
+
+### privacy 差异写回
+
+落盘路径不为 privacy 建立旁路，仍复用 `save_config_to_file` 的 DocumentMut 与 `atomic_write`；只在写入前插入一步「仅在语义差异时逐字段同步」。
+
+```mermaid
+flowchart TD
+    A[save_config_to_file：读取 existing] --> B[PrivacyProjection：只解析 privacy，缺节取默认]
+    B --> C{on_disk == candidate.privacy?}
+    C -->|相等| D[跳过 privacy 写入<br/>普通保存不物化该节、不改注释]
+    C -->|不等| E{文件里有 privacy 键?}
+    E -->|否| F[toml_edit::ser::to_document 序列化新节]
+    E -->|是| G[PrivacyTable：Table 或 InlineTable]
+    G --> H[标量：仅 enabled/mode/restore/salt 中变化者 set]
+    H --> I[builtins：七个键逐个比较]
+    I --> J[词表 items：按位置 replace/push/remove<br/>保留重复与顺序，清空即删尽旧项]
+    J --> K[custom_regexes：先按完整三元组复用行<br/>剩余按位置回填，多余行删除]
+    K --> L[未知键/未知子表/注释与值装饰保持]
+    F --> M[atomic_write]
+    L --> M
+    D --> M
+```
+
+### 表单状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Loading
+    Loading --> LoadFailed: GET 失败或快照缺 privacy
+    Loading --> Clean: GET 成功，createPrivacyDraft
+    LoadFailed --> Loading: 显式重试
+    Clean --> Dirty: 编辑
+    Dirty --> Clean: 撤销回已确认快照
+    Dirty --> Saving: 保存且必填校验通过
+    Saving --> Clean: 200，用响应快照重建并清空 newSalt
+    Saving --> Dirty: 4xx / 5xx / 网络中断，保留草稿
+    Dirty --> Loading: 显式重新读取（丢弃草稿）
+    LoadFailed --> [*]
+    Clean --> [*]
+    Dirty --> [*]
+```
+
 ## 关键决策
 
 ### 正则 + 邻接 + 校验和，而非 NER
@@ -201,6 +312,66 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 
 **Trade-off**：现状是「被拒请求在统计里不可见」。好处是拒绝不会污染成功/失败率与供应商维度指标（没有 provider 被调用）；代价是运营方无法从 dashboard 看到「有多少请求被隐私策略挡掉」——已列入 v1.5 候选（补一条独立事件而非复用 `call_logs`）。
 
+### 管理面：复用 `/api/config` + 第五参数，不新增端点
+
+设置页读写的 `privacy` 只是既有运行时配置快照 / 更新体的一个新 section，写路径仍走 `update_runtime_config`，本次只给它追加一个 `Option<PrivacyConfigUpdate>` 参数。
+
+**Trade-off**：放弃独立的 `/api/privacy` 端点与通用 `RuntimeConfigUpdate` / 全配置 REST 重构。独立端点会多出一条写路径（校验、锁序、冲突检测各一份），且与 backoff 同一次 PUT 时无法原子；通用命令则为本次一个 section 的增量付整代接口迁移成本。代价是 handler 与 state 命令之间要写一层显式映射（七个字段逐项），且 `update_runtime_config` 参数增到五个（含 `self` 六个）。
+
+### 管理面：快照显式投影，不序列化 `PrivacyConfig`
+
+`PrivacySnapshot` 由 `From<&PrivacyConfig>` 逐字段构造，七个非 salt 字段加 `salt_configured: !privacy.salt.is_empty()`；`PrivacyConfig` 自身的 `Serialize` 仍只服务 TOML。
+
+**Trade-off**：放弃「直接序列化 `PrivacyConfig`、让 UI 自己不看 `salt`」。响应体里多一个 `salt` 键就是泄露事实，与 UI 是否渲染无关（`curl`、devtools、缓存都能看到）；也放弃「回显掩码后的 salt」，那仍能确认猜测。代价是每新增一个 privacy 字段要同步改两处（config 结构 + snapshot 映射），且有测试钉住两者一致。
+
+### 管理面：salt 只在非空时替换，没有清空指令
+
+`UpdatePrivacyRequest.salt: Option<String>` 里，未传 / `null` / `Some("")` 都保持原值；只有非空串按原始字节替换（不 trim、不规范化，纯空白也算非空）。UI 不在空输入时发 `salt` 键。
+
+**Trade-off**：放弃「`None` = 保持不变、`Some("")` = 清空」的三态，也放弃单独的 `clear_salt` 标志。管理面不回显 salt，用户无法知道当前值；把「留空」解读成清空会让最常见的表单行为默默抹掉盐值，而盐值变更会让占位符全体漂移。代价是清空只能手改配置文件——已写入需求边界，不是遗漏。
+
+### 管理面：显式保存 + pending 锁定，不做即时自动保存
+
+表单把改动存在页面内草稿，一次 `PUT` 提交；保存中锁定全部编辑与撤销，重复提交被拒；只有 200 才用响应快照重建。
+
+**Trade-off**：放弃逐项即时写与自动保存。词表 / 正则行在编辑中会短暂不合法（空 pattern），即时写会连续 400 或留下半生效配置；「撤销」与「保存未确认」也失去落点。代价是用户必须点保存，且未保存草稿没有离开拦截（需求已列为不包含）。
+
+### 管理面失败：区分「确定未提交」与「保存未确认」
+
+UI 对 4xx（`AppError::Config` / 冲突）提示具体错误并认为服务器仍为旧配置；对 5xx 与网络中断只说「保存未确认，草稿已保留」，不自动重读。
+
+**Trade-off**：放弃「任何报错都说未保存」。`mutate` 的 Step 6b（analytics 身份同步）在 commit 之后运行，可能返回错误但新配置已生效；响应也可能在提交后丢失。笼统承诺会误导用户重试时覆盖刚生效的配置；严格化该事务语义又超出本模块边界。
+
+### 持久化：差异字段级写回，不整节替换
+
+`save_config_to_file` 先用 `PrivacyProjection`（仅 `#[serde(default)] privacy`）读盘上语义，与 candidate 不等时进入 `write_privacy_section`：已有节只写变化字段，`Table` 与 `InlineTable` 两种合法形态都就地更新。
+
+**Trade-off**：放弃 `doc["privacy"] = to_document(&privacy)` 的整节覆盖。那会丢掉用户注释、未知键与手写排版，且每次保存都把默认值物化（`builtins` 七键、空 `items`）。代价是 writer 变长（`PrivacyTable` 双形态 + 逐字段比较），且必须自己处理数组清空与重复项。
+
+### 持久化：语义相等就完全不碰 `[privacy]`
+
+provider / auth / runtime 字段的保存若未改变 privacy，`write_privacy_section` 一次也不调用，文件里原本没有 `[privacy]` 的保持没有。
+
+**Trade-off**：放弃「每次保存都补齐默认键」这种看似自愈的行为。补齐会把每个用户的配置文件变成写操作的目标，制造与本模块无关的 diff、破坏注释，并让「只改 base_url」也可能改动隐私节。
+
+### 持久化：正则行按完整三元组复用 + 剩余按位置，不引入规则 ID
+
+`plan_regex_rows` 先用完整 `(kind, pattern, case_insensitive)` 按盘上顺序消费行，剩余候选按位置回填、多余行删除，输出顺序恒等于候选顺序；重复 `kind` 不合并。
+
+**Trade-off**：放弃给 `PrivacyCustomRegex` 加 `id` 字段，也放弃按 `kind` 作唯一键。前者要改配置 schema、校验与旧文件兼容；后者把「同名不同 pattern」的两条规则当一条，直接丢数据（配置层本就不限制 kind 唯一）。代价是编辑/删除/重排后行身份只能近似，被删行的注释随行消失——需求不承诺跨任意编辑保留行身份。
+
+### 校验：Rust `validate_privacy` 是唯一裁决者，前端只判必填
+
+前端 `validatePrivacyDraft` 只检查 `kind` / `pattern` 去空白后非空；正则是否可编译、`kind` 是否空白统一由 `GatewayConfig::validate_privacy` 在 coordinator 里判定（即使 `enabled=false`），错误带 `privacy.custom_regexes[i]`。
+
+**Trade-off**：放弃用 JS `RegExp` 做前端预校验。两套方言不同（lookaround、反向引用、`\d` 的 Unicode 语义等），前端判合法而后端拒绝（或反之）几乎必现，且会让「表单提示通过、保存 400」成为常态。代价是非法正则要等一次往返才能定位，且 `pattern` 永远不能被 trim（前后空白是 pattern 语义的一部分）。
+
+### 前端：草稿只在初次读取 / 撤销 / 保存成功时由快照重建
+
+`createPrivacyDraft` 是唯一入口，Form 不 watch store 自动覆盖草稿；每次重建都深拷贝，`newSalt` 总从空开始。
+
+**Trade-off**：放弃「store 一变就刷新表单」的省事写法。热重载、其它 tab 保存、后台轮询都会改 store，自动覆盖会在用户输入时静默丢掉草稿；放弃「草稿直接引用 store 对象」，因为那会把 `salt_configured` 与正则行 UI id 混进请求体。
+
 ### 掩码边界是上游出口，`session_registry` 是已批准的例外
 
 本模块只承诺「发往上游的内容」不含明文：掩码作用于 Chat 请求副本与 IR，还原作用于回客户端的响应；两者都是**请求链路**上的动作。网关本地管理面另有一张 `session_registry` 表（[analytics 0009](../analytics/changes/0009-session-registry-and-logs-session-envelope.md)），按用户裁定存**掩码前**的 `conversation_id`（≤128，仅 `meta` / `top` 来源）与首条用户消息预览（≤160，被截断时追加 `…`），供日志页会话信息卡经 `GET /api/logs?session=` 读取。
@@ -236,6 +407,18 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 - 流式终点（`End` / `None` / `Error` 后无显式 `End`）必须调用 `finish()` 并下发残余字节，否则尾部帧会被丢弃；若尾缓冲非空，必须先置 `terminal_pending` 并 yield 尾字节，`finish_stream_terminal` 只能在下一次 poll 执行
 - `block` 的 400 与 `503` 的 body 不得包含明文、正则 pattern 或引擎错误详情
 - 掩码边界恒为「上游出口」：`mask_request` / `mask_ir` 产出的占位符只能出现在上游请求里，回客户端的响应只做还原；本地持久化面（`session_registry`）取的是掩码**前**的请求与 IR，不得写入占位符
+- 管理面响应恒不含 salt：`PrivacySnapshot` 的字段集为 `{enabled, mode, restore, builtins, custom_regexes, custom_words, allowlist, salt_configured}`，序列化结果中 `salt` 只能以 `salt_configured` 出现（不得出现独立的 `salt` 键，也不得回显其值或掩码值）
+- 管理面 DTO 不得直接嵌套 `PrivacyConfig`：`PrivacySnapshot::from` 与 `UpdatePrivacyRequest::into_update` 逐字段赋值；`PrivacyConfigUpdate` 不 derive `Debug`，`UpdatePrivacyRequest` / `UpdateConfigRequest` 也不 derive `Debug`
+- `UpdatePrivacyRequest` 的七个非 salt 字段无 `#[serde(default)]`（缺失即 422），`salt` 恒为 `#[serde(default)] Option<String>`
+- `update_runtime_config` 只在 `privacy.salt` 为 `Some(s)` 且 `!s.is_empty()` 时替换 `candidate.privacy.salt`；`None` / `Some("")` 保持旧值（`salt` 永不被管理面清空）
+- 一次 `PUT /api/config` 只调用一次 `update_runtime_config`；`privacy` 链路提交成功后 `MutationReport.providers_rebuilt` 为空
+- 持久化写回只在 `privacy_on_disk(&existing)? != config.privacy` 时发生；privacy 无变化的保存不得创建 `[privacy]` 节、不得重写其注释或未知键
+- `write_privacy_section` 对已有节只 `set` 值发生变化的字段；未变化字段与未知兄弟键 / 未知子表 / 值装饰保持原样
+- `custom_regexes` 不以 `kind` 作唯一键：`plan_regex_rows` 输出顺序恒等于候选顺序，重复 `kind` 不被合并或去重
+- 词表 `items` 按位置重写（`sync_privacy_items`）：重复项与候选顺序精确 round-trip，候选清空时旧项全部移除而不是保留
+- 前端 `newSalt === ""` 时 `getPrivacyChanges` 不含 `"salt"`，`buildPrivacyPayload` 不带 `salt` 键；非空 `salt` 原样上送（不 trim）
+- 前端 `pattern` 的 trim 只用于 `validatePrivacyDraft` 的必填判断，`buildPrivacyPayload` 回写的 `kind` / `pattern` 与草稿逐字节一致
+- 前端行 id 与 `salt_configured` 只存在于草稿 / 快照，不得出现在 `UpdatePrivacyConfigPayload` 中；`buildPrivacyPayload` 不得修改入参
 
 ## 测试策略
 
@@ -262,6 +445,25 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 
 `cargo test -p sag-config privacy` — 8 个配置测试（`config::tests`）：`empty_privacy_table_yields_defaults`、`missing_privacy_section_yields_defaults`、`full_privacy_section_round_trips`、`unknown_privacy_mode_is_rejected`、`unknown_privacy_fields_are_tolerated`、`invalid_custom_regex_is_rejected`、`empty_custom_regex_kind_is_rejected`、`valid_custom_regex_passes_validation`。
 
+管理面（后端）：
+
+| 位置 | 覆盖 |
+|---|---|
+| `sag-admin/src/admin_config.rs`（`mod tests`） | `PrivacySnapshot` 全字段映射且无 `salt` 键（只 `salt_configured`）；`salt_configured` 仅对非空 salt 为 true（纯空白算非空）；七个字段缺失即反序列化失败；salt 未传 / `null` / `""` / `" new-salt "` 原样透传；未知字段容忍、未知 `mode` 拒绝；`privacy` 缺省 / `null` / 仅 runtime 字段时不改该节；DTO 逐字段映射到命令 |
+| `sag-admin/tests/privacy_config.rs`（HTTP 集成） | GET 默认与自定义取值、响应体无 salt 键与盐值；PUT 后 GET 不回显新旧盐；salt omit / null / empty 保持、非空精确替换；非法 regex 与空 `kind` → 400 且 message 含 `privacy.custom_regexes[i]`；未知 `mode`、partial privacy → 422；`backoff` + 非法 privacy 混合时整体不提交 |
+| `sag-state/tests/privacy_config_mutation.rs` | file-backed：合法更新后内存与文件一致；校验失败无改动；外部修改返回 `Conflict`；纯 privacy 更新不重建 provider |
+| `sag-config/tests/privacy_persistence.rs` | `full_privacy_config_round_trips_and_reloads` / `clearing_rules_and_word_lists_removes_old_entries` / `duplicate_kinds_and_item_order_round_trip` / `inline_privacy_form_is_updated_in_place` / `table_form_preserves_comments_and_unknown_fields` / `unrelated_save_does_not_materialise_privacy` / `unrelated_save_leaves_existing_privacy_untouched` |
+
+设置页（前端）：
+
+| 位置 | 覆盖 |
+|---|---|
+| `sag-ui/src/lib/privacyConfig.test.ts` | 首次读取 clean；草稿与快照双向深拷贝隔离；每字段独立 dirty 与撤销；未编辑词表原样保留（含重复与含换行项）；编辑后按行 trim / 去空、保留顺序与重复；`pattern` 前后空白不当成编辑也不被 trim；空 salt 不 dirty / 不发，非空原样上送；payload 不含行 id 与 `salt_configured`；helper 不改入参 |
+| `sag-ui/src/lib/settingsTabs.test.ts` | `privacy` 位于 `auth` 与 `backoff` 之间、`?tab=privacy` 可解析、默认 tab 仍为 `network` |
+| `PrivacyForm.vue` 浏览器验收（隔离 fixture） | GET 失败 / 快照缺 `privacy` 时显示错误与重试而非「已关闭」；保存中不能编辑、不能撤销、双击保存被拒；4xx 保留草稿并展示字段错误；5xx / 网络中断提示保存未确认且不自动重读；成功后用响应快照重建并清空 `newSalt`；页面与请求载荷中无 salt 回显 |
+
+本节列出的是验收目标；具体执行结果以门禁与浏览器验收记录为准。
+
 关键场景清单：
 
 - 规则正反例（校验和失败、邻接字符失败、前缀长度不足）
@@ -271,9 +473,14 @@ masked 请求需要同步到 IR（translated lane 的编码源），实现上是
 - 端到端五条路径（mask 非流式还原 / mask 流式还原 / mask 覆盖 messages 之外的字段 / **mask 还原 IR-only 字段** / block 早退不调 provider）
 - 流式终态顺序（尾帧先下发、`call_logs` 后写；`Error` 后无显式 `End` 同样）
 - 配置校验（未知 `mode` 拒绝、未知字段容忍、坏正则与空 `kind` 在 `enabled=false` 下仍被拒）
+- 管理面读写（GET 无 `salt` 键、只 `salt_configured`；PUT 的 salt omit / null / empty 均保持、非空按字节替换）
+- 管理面失败（非法 regex / 空 `kind` → 400 带 `privacy.custom_regexes[i]`；未知 `mode` / partial privacy → 422；`backoff` + 非法 privacy 混合时整体不提交）
+- 持久化差异（无关保存不物化 / 不改写已有 privacy；清空词表与规则后无旧项残留；重复 `kind` 与顺序 round-trip；table 与 inline 两形态都保留未知键与注释）
+- 前端草稿（首次读取 clean、未编辑词表原样、`pattern` 不被 trim、空 salt 不发、4xx / 5xx 均保留草稿与锁定释放）
 
 ## 变更记录
 
 - [0001 隐私过滤初始化](changes/0001-initial.md)
 - [0002 隐私过滤 Minor 项收敛](changes/0002-minor-fixes.md)
 - [0003 隐私边界与 `session_registry` PII 例外](changes/0003-pii-carve-out-boundary.md)
+- [0004 隐私设置管理面读写](changes/0004-admin-settings.md)

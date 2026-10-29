@@ -340,6 +340,136 @@ Content-Type: application/json
 }
 ```
 
+### 读取网关配置
+
+```
+GET /api/config
+```
+
+返回内存生效的顶级配置快照。`providers` / `routes` / `gateway_auth` 不在其中（各有专属端点）。`privacy` 段里的盐值只以布尔 `salt_configured` 出现：响应体**从不包含 `salt` 键**，也不回显其原值或掩码值。
+
+```json
+{
+  "server": { "host": "127.0.0.1", "port": 3000 },
+  "logging": { "level": "info", "format": "compact" },
+  "analytics": null,
+  "backoff": {
+    "retries": 2,
+    "base_ms": 100,
+    "max_ms": 5000,
+    "jitter": true,
+    "retry_on_empty_response": true
+  },
+  "circuit_breaker": {
+    "quota_exhausted_secs": 3600,
+    "rate_limited_secs": 10,
+    "generic_secs": 60,
+    "probe_interval_secs": 60
+  },
+  "shuffle_cache_ttl_secs": 7200,
+  "sticky_failover_reset_secs": 7200,
+  "proxy_url": null,
+  "privacy": {
+    "enabled": false,
+    "mode": "mask",
+    "restore": true,
+    "builtins": {
+      "email": true,
+      "phone": true,
+      "id_card_cn": true,
+      "bank_card": true,
+      "iban": true,
+      "api_key": true,
+      "private_key": true
+    },
+    "custom_regexes": [],
+    "custom_words": { "items": [] },
+    "allowlist": { "items": [] },
+    "salt_configured": false
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `server` | object | `host` / `port`；启动期生效，只读 |
+| `logging` | object | `level` / `format`（`compact` / `json`）；启动期生效，只读 |
+| `analytics` | object \| null | `enabled` / `storage_dsn` / `call_log_retention_days` / `session_retention_days`；`null` 表示缺 `[analytics]` 段 |
+| `backoff` | object | 全局重试与退避参数 |
+| `circuit_breaker` | object | 三个冷却时长 + `probe_interval_secs`（半开探测间隔） |
+| `shuffle_cache_ttl_secs` | integer | 路由 shuffle 缓存 TTL（秒） |
+| `sticky_failover_reset_secs` | integer | sticky 目标复位间隔（秒） |
+| `proxy_url` | string \| null | 全局出站代理；`null` 表示直连（由 `PUT /api/settings` 修改） |
+| `privacy` | object | 隐私过滤设置，见下表；**不含 `salt`** |
+
+**`privacy` 字段**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | boolean | 主开关，默认 `false`（完全不过滤） |
+| `mode` | string | 命中后的处理方式：`"mask"`（默认，替换为占位符）/ `"warn"`（原样放行，只记警告与类别计数）/ `"block"`（拒绝请求） |
+| `restore` | boolean | 是否在上游响应里把占位符还原为原文，默认 `true` |
+| `builtins` | object | 七个内置检测器开关：`email` / `phone` / `id_card_cn` / `bank_card` / `iban` / `api_key` / `private_key`；每个缺键即视为 `true` |
+| `custom_regexes` | array | 自定义正则规则，每条 `{ "kind": string, "pattern": string, "case_insensitive": boolean }`；`case_insensitive` 缺省 `false` |
+| `custom_words` | object | `{ "items": [string] }`，逐字面命中的词 |
+| `allowlist` | object | `{ "items": [string] }`，整段精确相等才算放行（大小写敏感，不是子串匹配），命中的词永不被掩码 |
+| `salt_configured` | boolean | 只读；是否已存非空盐值。盐值本身（含掩码形式）永不返回 |
+
+`mask` 的占位符形如 `[[EMAIL_9f2c4a1b7d30]]`（类别大写 + 12 位小写 hex），同一 `(kind, 原文, salt)` 恒得同一占位符。两个词表是 `{ "items": [...] }` 对象而非裸数组；`pattern` 是有语义的原始文本，前后空白同样属于模式的一部分。
+
+### 更新网关配置
+
+```
+PUT /api/config
+Content-Type: application/json
+
+{
+  "privacy": {
+    "enabled": true,
+    "mode": "mask",
+    "restore": true,
+    "builtins": {
+      "email": true,
+      "phone": true,
+      "id_card_cn": true,
+      "bank_card": true,
+      "iban": true,
+      "api_key": true,
+      "private_key": true
+    },
+    "custom_regexes": [
+      { "kind": "employee_id", "pattern": "EMP-\\d{4}", "case_insensitive": true }
+    ],
+    "custom_words": { "items": [] },
+    "allowlist": { "items": [] },
+    "salt": "example-only-salt"
+  }
+}
+```
+
+> 上例的 `example-only-salt` 是虚构占位值，只用于说明字段位置，不是凭据。请勿把真实盐值、密钥或生产配置粘进文档、日志与工单。
+
+只更新请求体中出现的字段，未出现的字段保持原值。`backoff` / `circuit_breaker` / `privacy` 都是**整对象替换**：对象一旦出现，其全部字段必填。`proxy_url` 由 `PUT /api/settings` 拥有，`server` / `logging` / `analytics` 不可经该端点修改（未声明的字段被 serde 静默忽略）。
+
+**`privacy` 的写入规则**：
+
+- 省略 `privacy` 或传 `null`：隐私段完全不变。只改 backoff / TTL 的 PUT 不会创建、补齐或重写已有 `[privacy]` 节。
+- `privacy` 出现即整对象替换七个非 salt 字段（`enabled` / `mode` / `restore` / `builtins` / `custom_regexes` / `custom_words` / `allowlist`），缺任何一个 → 422。
+- `salt` 是唯一可选字段，且**只写不回显**：
+  - 省略 / `null` / `""` → 保持已存盐值，`salt_configured` 维持原样。
+  - 非空字符串 → 按字面字节替换（不 trim、不规范化；前后空格是该盐值的一部分）。
+  - **没有清空盐值的请求形式**：清空只能手改配置文件。改盐会让所有占位符摘要漂移，`restore` 无法还原改盐前生成的占位符。
+- 未知字段被忽略（含 `privacy` 内以及 `builtins` / 词表内的未知键）；未知 `mode` 在反序列化阶段即被拒绝（422，不会走到校验与提交）。
+- `custom_regexes[i]` 的 `pattern` 无法编译或 `kind` 为空白 → 400，错误信息带 `privacy.custom_regexes[i]`；`enabled = false` 时同样拒绝。
+
+成功时返回与 `GET /api/config` 同形状的快照（**同样不含 `salt`**）。
+
+**失败与生效语义**：
+
+- 校验失败、外部编辑冲突、写入前的 IO 失败：整个请求不提交。`privacy` 与同一请求里的 `backoff` / `circuit_breaker` / TTL 一起保留旧值（一次 PUT 只走一次统一的 mutation 事务），内存与文件都不变。
+- 5xx、响应丢失、网络中断：**不能保证未生效**。提交之后仍可能有后续步骤报错（如 analytics 身份同步），也可能只是响应没送达；应重新 `GET /api/config` 确认，而不是假设旧值仍在。
+- 保存成功后对**后续新请求**生效（分发路径每次从内存配置读取），无需重启；进行中的请求不中断；privacy 变更不重建 provider。
+
 ### 读取网关设置
 
 ```

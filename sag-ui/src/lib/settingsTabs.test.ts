@@ -14,7 +14,17 @@ import {
 {
   assert.deepEqual(
     SETTINGS_TABS.map((tab) => tab.value),
-    ["network", "auth", "backoff", "breaker", "timers", "analytics", "system", "appearance"],
+    [
+      "network",
+      "auth",
+      "privacy",
+      "backoff",
+      "breaker",
+      "timers",
+      "analytics",
+      "system",
+      "appearance",
+    ],
     "settings tabs keep their declared order (sidebar sub-menu renders it verbatim)",
   )
   assert.equal(DEFAULT_SETTINGS_TAB, "network")
@@ -24,6 +34,7 @@ import {
 {
   assert.equal(isSettingsTab("appearance"), true)
   assert.equal(isSettingsTab("auth"), true)
+  assert.equal(isSettingsTab("privacy"), true)
   // The old standalone tab value was retired in favor of `appearance`.
   assert.equal(isSettingsTab("language"), false)
   assert.equal(isSettingsTab("bogus"), false)
@@ -35,6 +46,7 @@ import {
 // ── resolveSettingsTab ─────────────────────────────────────────────
 {
   assert.equal(resolveSettingsTab("breaker"), "breaker")
+  assert.equal(resolveSettingsTab("privacy"), "privacy")
   assert.equal(resolveSettingsTab(undefined), DEFAULT_SETTINGS_TAB, "bare /settings → default tab")
   assert.equal(resolveSettingsTab(""), DEFAULT_SETTINGS_TAB)
   assert.equal(resolveSettingsTab("bogus"), DEFAULT_SETTINGS_TAB)

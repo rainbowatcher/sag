@@ -7,6 +7,7 @@ import type { MessageKey } from "@/lib/i18n"
 export const SETTINGS_TABS = [
   { value: "network", key: "settings.tabs.network" },
   { value: "auth", key: "settings.tabs.authentication" },
+  { value: "privacy", key: "settings.tabs.privacy" },
   { value: "backoff", key: "settings.tabs.backoff" },
   { value: "breaker", key: "settings.tabs.breaker" },
   { value: "timers", key: "settings.tabs.timers" },

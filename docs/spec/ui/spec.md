@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-26
+updated: 2026-10-29
 ---
 
 # UI 管理面板 — 规格
@@ -23,6 +23,7 @@ updated: 2026-10-26
 
 - [sag-ui/src/stores/connection.ts](../../../sag-ui/src/stores/connection.ts) — 连接生命周期：localStorage 持久化、Bearer token 同步、健康检查验证、TTL 30 天过期、401 全局拦截
 - [sag-ui/src/stores/health.ts](../../../sag-ui/src/stores/health.ts) — 网关版本号和在线状态轮询
+- [sag-ui/src/stores/gatewayConfig.ts](../../../sag-ui/src/stores/gatewayConfig.ts) — `GET|PUT /api/config` 的快照 / 保存（401 → `handle401()`）；隐私设置沿用同一份 `config` / `saving` / `error` 与泛型透传，不另建 store
 - [sag-ui/src/stores/providers.ts](../../../sag-ui/src/stores/providers.ts) — Provider CRUD + 上游模型拉取 + 乐观删除+回滚
 - [sag-ui/src/stores/routes.ts](../../../sag-ui/src/stores/routes.ts) — Route CRUD + provider models 懒加载
 - [sag-ui/src/stores/analytics.ts](../../../sag-ui/src/stores/analytics.ts) — Stats、Logs、Cache、Trend、Distribution 查询 + 分页状态管理
@@ -37,6 +38,7 @@ updated: 2026-10-26
 - [sag-ui/src/pages/AnalyticsPage.vue](../../../sag-ui/src/pages/AnalyticsPage.vue) — 用量统计（Stats + Cache 双 Tab）
 - [sag-ui/src/pages/LogsPage.vue](../../../sag-ui/src/pages/LogsPage.vue) — 请求日志（表格 + 筛选 + 分页；Client 列之后为 Session 列，点击单元格即套用会话筛选；应用会话过滤时在筛选栏与表格之间渲染 `SessionInfoCard`）
 - [sag-ui/src/pages/ConnectPage.vue](../../../sag-ui/src/pages/ConnectPage.vue) — 连接配置页面
+- [sag-ui/src/pages/SettingsPage.vue](../../../sag-ui/src/pages/SettingsPage.vue) — 设置页外壳：按 `SETTINGS_TABS` 渲染 tab trigger / content，隐私 tab 位于「API 鉴权」之后、「重试退避」之前；挂载时并行取 `settings`（鉴权）与 `gatewayConfig`（运行时 / 隐私）快照，不复制布局壳
 
 ### 核心组件
 
@@ -55,6 +57,7 @@ updated: 2026-10-26
 - [sag-ui/src/lib/sse.ts](../../../sag-ui/src/lib/sse.ts) — 通用 SSE 客户端（`fetch` + `ReadableStream`）：`createSseParser`（跨 chunk 分帧、`: ping` 注释、多行 `data`、flush 尾帧）、`nextRetryDelay`（指数退避 + 封顶）、`headersFromDefaults`、`SseHttpError` / `isAuthFailure`（401/403）、`createSseClient`（单飞循环 + `stop()` abort + `running` 闸保证 stop 后零投递）
 - [sag-ui/src/lib/inflight.ts](../../../sag-ui/src/lib/inflight.ts) — 在途计数的纯函数：`emptyInflightState`、`parseInflightSnapshot`（容错解析 + 本地降序）、`applySnapshot`（整体替换 + 清 `stale`）、`markConnected` / `markDisconnected`（保留快照标 `stale`）、`activeRouteCounts`（仅 `count > 0`）、`resolveSseUrl`
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
+- [sag-ui/src/components/settings/PrivacyForm.vue](../../../sag-ui/src/components/settings/PrivacyForm.vue) — 隐私设置表单：已确认配置 / 草稿双摘要、三模式、7 个内置检测器、词表与正则行编辑、盐值替换、只读保护范围、底部显式保存与撤销；读取中 / 读取失败 / 快照缺 `privacy` 三态都不渲染可编辑表单
 
 ### 工具函数与类型
 
@@ -62,7 +65,9 @@ updated: 2026-10-26
 - [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
 - [sag-ui/src/lib/targetPicker.ts](../../../sag-ui/src/lib/targetPicker.ts) — Target 浮窗的纯选择逻辑：`provider+model` 集合键、分组构建（含禁用/orphan）、搜索过滤、勾选集合 ↔ target 行的 diff 与合并（type-only import，可被 node test runner 直接加载）
 - [sag-ui/src/lib/sessionAffinity.ts](../../../sag-ui/src/lib/sessionAffinity.ts) — 会话 pin 的纯函数：`shortSessionKey(key, length = 8)`（展示前缀，删除仍用全量 key）、`isPinActive(entry)`（`expires_in_secs === null || > 0` 为活跃）、`sortPins(entries)`（活跃组在前、组内 stable，返回新数组不改入参）、`mergeSessionEntries(prev, incoming, model?)`（共享 store 的换桶语义：`model` 未指定时整体替换、给定则只替换该 model 的桶并保留其他行数据，返回新数组不改入参）、`errorForModel(errors, model)`（按 fetch 作用域取值：`Object.hasOwn(errors, model)` 为真时返回 `errors[model]`、否则 `null`——`""` 是全量拉取的作用域键，只被全量视图读取；必须用 `Object.hasOwn` 而非裸取值，裸 `errors[model]` 会走原型链，模型名恰好是 `constructor` / `toString` 时会把 `Function` 当错误文案渲染）、`loadingForModel(loading, model)`（按 fetch 作用域取在途标志：`Object.hasOwn(loading, model)` 为真时返回 `loading[model]`、否则 `false`，与 `errorForModel` 对称；裸 `loading[model] ?? false` 同样会走原型链，`constructor` / `toString` 会拿到非 `nullish` 的 `Function`，`?? false` 不生效、该行 loading 恒真）；同 targetPicker 一样可被 node test runner 直接加载
-- [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）
+- [sag-ui/src/lib/settingsTabs.ts](../../../sag-ui/src/lib/settingsTabs.ts) — 设置 tab 的顺序单一来源（`value` 即 `?tab=`，`DEFAULT_SETTINGS_TAB = "network"`）；`SidebarNav` 复用同一 `SETTINGS_TABS`，隐私入口因此没有单独的导航代码
+- [sag-ui/src/lib/privacyConfig.ts](../../../sag-ui/src/lib/privacyConfig.ts) — 隐私表单纯逻辑：`createPrivacyDraft`（快照 → 草稿，深拷贝、`newSalt` 恒空）、`getPrivacyChanges`（逐字段 dirty）、`validatePrivacyDraft`（只判必填，按行 id）、`buildPrivacyPayload`（整节 payload，去 UI 行 id 与 `salt_configured`）
+- [sag-ui/src/types/api.ts](../../../sag-ui/src/types/api.ts) — 所有 API 类型定义（Provider、RouteConfig、CallLog、StatsRow 等）；隐私侧为 `PrivacyMode` / `PrivacyBuiltins` / `PrivacyCustomRegex` / `PrivacyWordList` / `PrivacyConfigFields` / `PrivacyConfigSnapshot` / `UpdatePrivacyConfigPayload`
 - [sag-ui/src/composables/useTheme.ts](../../../sag-ui/src/composables/useTheme.ts) — 亮/暗主题切换（基于 `@vueuse/core` 的 `useDark`）
 - [sag-ui/src/composables/useChartTheme.ts](../../../sag-ui/src/composables/useChartTheme.ts) — Chart.js 配色跟随主题（通过 DOM probe element 解析 CSS 变量）
 - [sag-ui/src/composables/useResponsiveModal.ts](../../../sag-ui/src/composables/useResponsiveModal.ts) — Dialog/Drawer 双轨弹框：`MODAL_DESKTOP_QUERY`（768px）+ `Modal` 八槽位组件映射（Root/Content/Header/Title/Description/Footer/Close/Trigger）
@@ -70,7 +75,7 @@ updated: 2026-10-26
 ### 多语言（i18n）
 
 - [sag-ui/src/lib/i18n/index.ts](../../../sag-ui/src/lib/i18n/index.ts) — DIY i18n 核心：`t()` / `setLocale()` / `useI18n()` / `installI18n()`、locale 持久化与白名单校验、`<html lang>` 同步
-- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，607 key），key 为稳定英文标识符
+- [sag-ui/src/lib/i18n/en.ts](../../../sag-ui/src/lib/i18n/en.ts) — canonical 英文字典（`as const`，704 key，含 `settings.privacy.*` 95 条），key 为稳定英文标识符
 - [sag-ui/src/lib/i18n/zh.ts](../../../sag-ui/src/lib/i18n/zh.ts) — 中文译文（`Record<keyof typeof en, string>`，编译期与 en 齐平）
 - [sag-ui/src/types/i18n.d.ts](../../../sag-ui/src/types/i18n.d.ts) — 声明 `ComponentCustomProperties.$t`，为模板中的 `$t()` 提供类型
 - [sag-ui/scripts/check-i18n.mjs](../../../sag-ui/scripts/check-i18n.mjs) — 防回潮门禁：键/占位符齐平、花括号合法性、CJK 字面量扫描、dead-key 报告
@@ -119,6 +124,22 @@ flowchart TD
 
     O --> AA[fetchLogs + 分页]
     AA --> AB[hasMoreLogs via sentinel row]
+```
+
+### 隐私设置的草稿与保存
+
+```mermaid
+flowchart TD
+    A[打开 privacy tab] --> B[gatewayConfig.fetchConfig → GET /api/config]
+    B -->|成功且含 privacy| C[createPrivacyDraft(snapshot) → 表单局部草稿]
+    B -->|失败 / 快照无 privacy| D[错误或不可用 + 重试，不渲染可编辑表单]
+    C --> E[编辑只改草稿，getPrivacyChanges 判定未保存]
+    E -->|撤销| C
+    E -->|保存| F[validatePrivacyDraft 只判必填]
+    F -->|有错| E
+    F -->|通过| G[buildPrivacyPayload → PUT /api/config]
+    G -->|成功| H[用响应快照替换已确认配置并重建草稿]
+    G -->|失败| I[保留草稿与 newSalt，提示保存未确认]
 ```
 
 ### 固定高度布局渲染数据流
@@ -257,6 +278,45 @@ flowchart TD
 - ❌ 两个表单的错误渲染风格不一致：新建表单用 `FieldError`（与其它字段一致），编辑表单的 pipeline 字段用内联 `<p class="text-destructive">`，也是已知 minor
 - ✅ 前端仍只拦「输入框里根本打不出合法值」的形态（非整数、负容量）与上述两条组合，其余不插手
 - ❌ 其余组合（容量为 `0` 等）仍然要提交后才知道非法，错误消息为后端原文（英文、带配置路径），比本两条的前端文案生硬；由 session-sticky 的说明行（hint）部分补偿上下文
+
+### 隐私设置：显式保存 + 已确认/草稿双份 vs 即时写
+
+`PrivacyForm` 把「最近一次服务器确认的配置」与「局部草稿」分开放：开关、模式、词表、正则、盐值输入都只改草稿，只有「保存更改」会 `PUT /api/config`。
+
+**Trade-off**:
+- ✅ 模式 × 检测器 × 还原是一组互相约束的语义，逐项即时写会让中间态（先关掉邮箱再切 `block`）瞬间作用于线上请求
+- ✅ 失败时保留刚敲的内容、展示最后一次确认的配置，与 Provider 启停这类单字段即时写语义区分开
+- ❌ 与 Provider 启停的即时生效相比多一步「保存」，也放弃了「单份状态直接绑定 store」的简化实现
+- ❌ 必须自行维护 dirty / 撤销 / 保存中锁定，表单状态明显比受控单字段复杂
+
+### 草稿只存在组件内 vs 全局 store / localStorage / URL
+
+草稿由 `privacyConfig.ts` 的纯函数生成，保存在 `PrivacyForm` 局部状态；`gatewayConfig` store 只存服务器快照。
+
+**Trade-off**:
+- ✅ 新盐值是明文敏感输入：不进 Pinia、不进 localStorage、不进 URL、不写日志，离开 `/settings` 路由（或刷新）即随组件销毁
+- ✅ settings 内 tab 间切换保留草稿、未保存盐值与字段错误；重进 `/settings`（或刷新）才以确认快照重建草稿，「无路由离开拦截」的行为可预测
+- ❌ 关闭 `/settings` 或刷新会丢掉未保存编辑，无恢复路径；多入口共享同一份未保存状态也不可能
+
+**force-mount 说明**：privacy 的 `TabsContent` 带 `force-mount` + `data-[state=inactive]:hidden`。reka Tabs 默认卸载非激活面板，`force-mount` 让组件实例（含 `draft` / `newSalt` / 字段错误）跨 tab 切换存活；其 `present = forceMount || isSelected`，非激活面板不再自动加 `hidden`，故用主题类补上（仍在 DOM 内 `display:none`、不占布局）。相邻 tab 无此设置，属 privacy 专属行为。
+
+### 客户端只判必填 vs 复刻 Rust regex 语法校验
+
+`validatePrivacyDraft` 只对 `kind` / `pattern` 做 `trim()` 判空并返回 `{rowId, field, code: "required"}`，不编译表达式。
+
+**Trade-off**:
+- ✅ 表达式终审在 `validate_privacy`（Rust regex 方言，无 lookaround / 反向引用）；JS `RegExp` 不是同一方言，前端预校验会同时造假阴性与假阳性
+- ✅ 错误按行 id 定位（`kind` 允许重复），不依赖 kind 唯一或数组下标文案
+- ❌ 非法表达式要等一次 400 才知道；由 `regexDialectNote` 与后端 `privacy.custom_regexes[i]` 原文错误部分补偿
+
+### 盐值只写不回显 vs 快照携带完整配置
+
+`PrivacyConfigSnapshot` 只有 `salt_configured: boolean`；`UpdatePrivacyConfigPayload.salt` 空字符串时整个字段不下发，非空按字面（含空格）替换。
+
+**Trade-off**:
+- ✅ 任何响应 / 表单 / 日志都不出现盐值内容，只写字段不会变成新的泄露面（同一口径见 privacy `0003`）
+- ✅ 「空串不发」与服务端「未传 / null / 空串都保持」的语义对齐，UI 不会误触清空
+- ❌ 用户无法核对当前盐值，也没有清空入口（只能改 TOML）；「留空保持不变」刻意不表达显式清空
 
 ### 会话 pin 浮层：共享 store + 客户端按 model 过滤 vs 每行独立 state
 
@@ -432,6 +492,13 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **`stop()` 之后零投递**：`consume()` 内每个 `onEvent` 调用前必须过 `running` 闸。一个在 `stop()` 之后才 settle 的 `read()` 不得把已卸载的面板重新点亮（会清掉 `stale`）
 - **SSE client 不得放进 reactive state**：`createSseClient` 的实例是资源而非数据，存在 store 闭包里；放进 `ref` 会被 Vue 深度 proxy 包一层
 - **Logs 会话筛选单一状态源**：Session 列点击必须走 `applySessionFilter()` → 写 `logsFilterSession` → `refreshLogs()`，与筛选栏内的会话过滤控件（空态内嵌输入框、有值内联显示 + 清空 X）、`clearSessionFilter()` 同源。不得为该列另建一套过滤状态（会出现控件与列不同步）
+- **隐私表单三态不得降级为默认值**：初次 `GET /api/config` 未成功、或快照缺 `privacy` 时，`PrivacyForm` 只能渲染 loading / error+retry / unavailable，不得用 `createPrivacyDraft` 伪造一份 `enabled=false` 的表单（否则把未知当关闭）。grep：错误分支里不得出现 `createPrivacyDraft`
+- **隐私草稿的纯函数不改入参**：`createPrivacyDraft` / `getPrivacyChanges` / `buildPrivacyPayload` 均不得写 `saved` / `draft`；payload 里的 `builtins`、`custom_regexes`、两个 `items` 数组必须是新对象。grep：`privacyConfig.ts` 除 `payload.salt = draft.newSalt` 外无对 `saved` / `draft` 成员的赋值，测试文件有 `pure helpers never mutate their inputs` 断言
+- **未编辑的词表保留原字节**：`resolveWordList` 必须先用 `text === itemsToText(saved)` 判定；相等时返回 `savedItems.slice()`，否则才 `split`/`trim`/过滤空行。不得无条件拆分（会抹掉含换行的条目与重复项）
+- **正则表达式不 trim**：`validatePrivacyDraft` 只用 `kind.trim()` / `pattern.trim()` 判空，`buildPrivacyPayload` 写 `row.kind` / `row.pattern` 原串；行身份只用 `id`（`saved-<i>` / `new-<n>`），不得用 `kind` 作 key
+- **空盐值不下发**：`buildPrivacyPayload` 只在 `draft.newSalt !== ""` 时写 `payload.salt`；响应侧只有 `salt_configured`，不得出现 `salt:` 字段或盐值明文
+- **保存中全局锁定**：`saving` 期间所有编辑控件与撤销 `disabled`，双击不得产生第二次 `PUT`；失败路径不得清空草稿或 `newSalt`
+- **隐私入口只经设置 tab 表**：`privacy` 在 `SETTINGS_TABS` 中紧跟 `auth`，`SettingsPage` 与 `SidebarNav` 均读同一常量；不得硬编码「隐私」导航项或新增顶级路由
 
 ## 测试策略
 
@@ -447,6 +514,15 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 | 全链门禁 | `just verify-ui` = `fmt-check` + `lint` + `typecheck` + `test` + `i18n-check` | just |
 | 视觉验证 | 浏览器手动检查：1920×1080、2560×1440、1024×768、1366×768；弹框形态另需 390px（手机竖屏）与 700px（640–768 区间）；i18n 另需 en/zh 各过一遍 | Chrome DevTools |
 | API 集成 | 通过 `scripts/test-env.py` 启动 gateway 测试实例，浏览器连接验证 | test-env |
+
+隐私表单纯逻辑（`sag-ui/src/lib/privacyConfig.test.ts`，`pnpm -C sag-ui test`）至少钉住：
+
+1. **首次加载为 clean**：`createPrivacyDraft` 后 `getPrivacyChanges` 返回空数组、`newSalt === ""`，draft 与 snapshot 双向深隔离（改 draft 不回写 snapshot）
+2. **未编辑词表保真**：saved items 含换行项 / 重复项时同步草稿再取 changes 仍为空；编辑后才按行 trim + 忽略空行，其余顺序与重复保留
+3. **regex 只判必填**：`kind` / `pattern` 全空白时返回 `{rowId, field, code: "required"}`（按行 id，重复 kind 不错位）；payload 中 `pattern` 与输入原串相等（首尾空格不丢）
+4. **dirty 逐字段**：enabled / mode / restore / builtins / custom_regexes / 两个词表各自独立计 dirty，顺序稳定且 `salt` 在最后
+5. **空盐值不发 / 非空原样发**：`newSalt === ""` 时 payload 无 `salt` 键；非空时 `payload.salt` 与输入（含空格）完全一致
+6. **payload 只含协议字段**：无 `id`、无 `salt_configured`；`settingsTabs.test.ts` 钉住 `privacy` 在 `auth` 之后、`backoff` 之前
 
 关键验证场景：
 
@@ -465,9 +541,11 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 13. **日志会话列**：存在 `session_key` 的行显示前 8 位、`title` 为全量；无会话的行显示 `—`；点击单元格 → 筛选栏内的会话过滤控件原地变成同一全量 key（截断显示、`title` 为全量）且表格立即重查 → 点控件内 X 后控件回到空态输入框（placeholder）且回到无会话筛选的行集
 14. **会话信息卡三态**：点一条有注册表记录的 Session 列 → 筛选栏与表格之间出现卡片，会话键前 8 位与全量 `title` 与所点行一致、来源徽标 hover 显示首次 / 最近出现、会话 ID 与首条消息为明文 → 点另一段对话的 Session 列 → 新响应返回前卡片已回到降级形态（不会把上一段对话的首条消息显示在新哈希下）→ 粘贴一个无记录的 key 回车 → 卡片仍显示该 key，但只剩会话键 + 降级文案 → 点 X 清除会话过滤 → 卡片整张消失（`v-if`）
 15. **实时在途徽章**：打开路由页 → 首帧到达前徽章行不渲染，到达后显示 `◉ 处理中 N`（无流量时为「空闲 — 无正在处理的请求」）；发一个流式请求 → 对应 route 徽章出现（绿点脉冲、`×1`），结束后徽章消失并回到空闲；断开 gateway（或断网）→ 徽章置灰 + 「连接断开，重连中…」且计数**不归零**，恢复后自动回实时态；把 API key 改错后重连 → 跳转 `/connect` 而不是无限「重连中」
+16. **隐私设置**：Settings → 隐私（`?tab=privacy`，侧边栏同步出现且无新增顶级导航）→ 初次加载后两张摘要卡一致、无未保存提示 → 关总开关、切 `warn`、关一个检测器 → 摘要卡即时变「有未保存的更改」但 Network 无请求 → 保存 → 仅一次 `PUT /api/config`，body 含完整 `privacy` 对象、不含 `salt` / `salt_configured` → 成功后表单以响应快照重建、草稿回到同步；改一项后撤销 → 回到确认配置；保存中按钮为「保存中…」且全部控件与撤销不可点 → 让保存返回 400 → toast 为「保存未确认：<后端原文>」，草稿与新盐值保留；让 `GET /api/config` 失败或返回无 `privacy` 的旧快照 → 只出错误 / 不可用提示与重试，**不**渲染一份关闭状态的表单
 
 ## 变更记录
 
+- [0014 设置页隐私过滤配置](changes/0014-privacy-settings.md)
 - [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)
 - [0012 会话 pin 图标 hover 预览与活跃 pin 置顶/置灰](changes/0012-session-pin-tooltip-and-active-pin-ordering.md)
 - [0011 日志页会话信息卡](changes/0011-logs-session-info-card.md)

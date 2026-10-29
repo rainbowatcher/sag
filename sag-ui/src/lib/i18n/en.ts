@@ -455,6 +455,7 @@ export const en = {
   "settings.toast.proxyCleared": "Proxy settings cleared",
   "settings.toast.apiKeysSaved": "API keys saved",
   "settings.toast.authDisabled": "Authentication disabled",
+  "settings.toast.privacySaved": "Privacy settings saved",
 
   // ── Settings: proxy / API-key validation ────────────────────────
   "settings.proxy.invalidUrl": "Invalid URL. Use the form http://host:port or https://host:port.",
@@ -598,6 +599,7 @@ export const en = {
   "settings.loadingConfig": "Loading config...",
   "settings.tabs.network": "Network",
   "settings.tabs.authentication": "Authentication",
+  "settings.tabs.privacy": "Privacy",
   "settings.tabs.backoff": "Backoff",
   "settings.tabs.breaker": "Breaker",
   "settings.tabs.timers": "Timers",
@@ -671,6 +673,136 @@ export const en = {
   "settings.strategyTimers.hintFillFirstTtlTail": " never expires it.",
   "settings.strategyTimers.hintStickyReset":
     "How long a sticky-failover pin is remembered before the route's primary target is tried again.",
+
+  // ── Settings › Privacy ──────────────────────────────────────────
+  "settings.privacy.title": "Privacy Filtering",
+  "settings.privacy.description":
+    "Detect and handle sensitive data in chat text before it goes upstream. Only request text on chat endpoints is affected; other endpoints and local records are left as they are.",
+  "settings.privacy.loading": "Loading privacy settings...",
+  "settings.privacy.loadError": "Failed to load privacy settings.",
+  "settings.privacy.unavailable":
+    "This gateway did not return privacy settings. Reload the page or update the gateway.",
+  "settings.privacy.statusTitle": "Configuration status",
+  "settings.privacy.statusDescription":
+    "The saved configuration is what the gateway is using now. The draft holds unsaved edits, and the two stay independent.",
+  "settings.privacy.savedTitle": "Currently in effect",
+  "settings.privacy.draftTitle": "Draft",
+  "settings.privacy.draftSynced": "Synced with the saved configuration.",
+  "settings.privacy.draftDirty": "Unsaved changes.",
+  "settings.privacy.summaryMode": "Mode",
+  "settings.privacy.summaryBuiltins": "Built-in detectors",
+  "settings.privacy.summaryRestore": "Restore responses",
+  "settings.privacy.summarySalt": "Salt",
+  "settings.privacy.basicTitle": "Basics",
+  "settings.privacy.basicDescription":
+    "Master switch, action mode, and response restore. None of these take effect until you save.",
+  "settings.privacy.enabledLabel": "Enable privacy filtering",
+  "settings.privacy.enabledHint":
+    "When off, nothing is detected or handled, but the mode and rules below can still be configured in advance.",
+  "settings.privacy.disabledNote":
+    "Privacy filtering is off. You can pre-configure the mode and rules; they apply to requests only after you save with filtering enabled.",
+  "settings.privacy.modeTitle": "Action on detection",
+  "settings.privacy.modeDescription":
+    "What the gateway does when sensitive data is detected. Switching modes keeps the response restore setting.",
+  "settings.privacy.mode.mask": "Mask and send",
+  "settings.privacy.mode.maskRecommended": "Recommended",
+  "settings.privacy.mode.maskDescription":
+    "Replace each detected value with a placeholder before sending upstream, for example [[EMAIL_1a2b3c4d5e6f]]; the upstream receives placeholders for those detected values.",
+  "settings.privacy.mode.block": "Block request",
+  "settings.privacy.mode.blockDescription":
+    "Reject the request on the first hit and return a gateway error; nothing is sent upstream.",
+  "settings.privacy.mode.blockWarning":
+    "Rejected requests never reach the upstream; the client receives an error response from the gateway.",
+  "settings.privacy.mode.warn": "Warn only",
+  "settings.privacy.mode.warnDescription":
+    "Forward the request as it is and log which categories were hit.",
+  "settings.privacy.mode.warnWarning": "The original text is still sent upstream.",
+  "settings.privacy.mode.warnLog":
+    "Logs record hit categories and counts only (for example email=1); they never record the matched text or placeholders.",
+  "settings.privacy.restoreLabel": "Restore responses",
+  "settings.privacy.restoreHint":
+    "Replace placeholders created by this request in the response with their originals; only this request's placeholders are restored, and newly generated sensitive content is not detected.",
+  "settings.privacy.restoreMaskOnly":
+    "Response restore only applies in mask mode. Current setting: {state}; it is kept if you switch back to mask mode.",
+  "settings.privacy.builtinsTitle": "Built-in detectors",
+  "settings.privacy.builtinsDescription":
+    "Recognize sensitive data by category; the action mode above decides what happens on a hit.",
+  "settings.privacy.builtinsCount": "{enabled} of {total} selected",
+  "settings.privacy.builtin.email": "Email",
+  "settings.privacy.builtin.email.hint": "Conventional email addresses such as user@example.com.",
+  "settings.privacy.builtin.phone": "Mainland China mobile number",
+  "settings.privacy.builtin.phone.hint": "11-digit mobile numbers starting with 13 through 19.",
+  "settings.privacy.builtin.id_card_cn": "Chinese resident ID",
+  "settings.privacy.builtin.id_card_cn.hint":
+    "18-character numbers with a valid check digit, or the 15-character legacy form.",
+  "settings.privacy.builtin.bank_card": "Bank card number",
+  "settings.privacy.builtin.bank_card.hint": "13 to 19 digit numbers that pass the Luhn check.",
+  "settings.privacy.builtin.iban": "IBAN",
+  "settings.privacy.builtin.iban.hint": "Account numbers that pass the mod-97 check.",
+  "settings.privacy.builtin.api_key": "Common API keys",
+  "settings.privacy.builtin.api_key.hint":
+    "Known key prefixes such as sk-, ghp_, or AKIA followed by at least 16 characters.",
+  "settings.privacy.builtin.private_key": "PEM private key",
+  "settings.privacy.builtin.private_key.hint": "PEM private-key blocks, including the key body.",
+  "settings.privacy.customSectionTitle": "Custom rules and exceptions",
+  "settings.privacy.customSectionDescription":
+    "Add sensitive words, an allowlist, and custom regular expressions on top of the seven built-in detectors.",
+  "settings.privacy.customSectionBadge": "Optional",
+  "settings.privacy.customWordsTitle": "Custom sensitive words",
+  "settings.privacy.customWordsHint":
+    "One entry per line; blank lines are ignored. A hit is handled by the current action mode.",
+  "settings.privacy.allowlistTitle": "Allowlist",
+  "settings.privacy.allowlistHint":
+    "One entry per line. Each entry must match the whole candidate value exactly and is case-sensitive; there is no substring, prefix, or word-boundary matching.",
+  "settings.privacy.regexTitle": "Custom regular expressions",
+  "settings.privacy.regexDescription":
+    "Each rule has a kind label, an expression, and a case-sensitivity option.",
+  "settings.privacy.regexKindHint":
+    "The kind labels the hit and names its placeholder. Duplicate kinds are allowed.",
+  "settings.privacy.regexAdd": "Add rule",
+  "settings.privacy.regexRemove": "Remove rule",
+  "settings.privacy.regexEmpty": "No custom regular expressions.",
+  "settings.privacy.regexKindLabel": "Kind",
+  "settings.privacy.regexKindPlaceholder": "e.g. employee_id",
+  "settings.privacy.regexPatternLabel": "Pattern",
+  "settings.privacy.regexPatternPlaceholder": "Expression to match, e.g. EMP- plus six digits",
+  "settings.privacy.regexCaseInsensitive": "Case-insensitive",
+  "settings.privacy.regexKindRequired": "Kind is required",
+  "settings.privacy.regexPatternRequired": "Pattern is required",
+  "settings.privacy.regexDialectNote":
+    "The gateway compiles each expression in the Rust regex dialect when you save; lookaround assertions such as (?=...) and backreferences such as \\1 are not supported.",
+  "settings.privacy.regexIndexError": "Rule {index} was rejected: {message}",
+  "settings.privacy.advancedTitle": "Advanced",
+  "settings.privacy.advancedDescription":
+    "Salt used when hashing placeholders. The gateway never echoes the salt value.",
+  "settings.privacy.saltTitle": "Salt",
+  "settings.privacy.saltHint":
+    "The salt feeds placeholder hashing to make precomputed reverse lookups harder. The same kind, original text, and salt always produce the same placeholder. Only the configuration state is shown; the value is never echoed.",
+  "settings.privacy.saltConfigured": "Configured",
+  "settings.privacy.saltNotConfigured": "Not configured",
+  "settings.privacy.saltPendingReplace": "New salt pending",
+  "settings.privacy.saltNewLabel": "New salt",
+  "settings.privacy.saltNewPlaceholder": "e.g. 9f2c1a7b03de",
+  "settings.privacy.saltNewHint":
+    "Leave blank to keep the current salt. A non-empty value replaces it exactly as typed, spaces included. After saving, this input is cleared and the page shows only the configured state, never the value.",
+  "settings.privacy.scopeTitle": "Coverage limits",
+  "settings.privacy.scopeDescription":
+    "Current behavior boundaries, so coverage is not overestimated.",
+  "settings.privacy.scopeChat":
+    "Chat request text only: /v1/chat/completions, /v1/messages, /v1/responses.",
+  "settings.privacy.scopeMedia":
+    "Images, attachments, and URLs are not scanned: media blocks and the data, file_data, and url fields are skipped.",
+  "settings.privacy.scopeUpstream":
+    "New upstream content is not scanned: only placeholders created by this request are restored, and sensitive content the model writes itself is not detected.",
+  "settings.privacy.scopePreview":
+    "Local session previews may still contain the original text. Privacy-detection logs record only hit categories and counts, never the matched content.",
+  "settings.privacy.footerHint":
+    "All changes require an explicit save; switches do not take effect on their own.",
+  "settings.privacy.undo": "Discard changes",
+  "settings.privacy.savingLocked": "Editing is locked while saving.",
+  "settings.privacy.saveFailed": "Save not confirmed: {message}",
+  "settings.privacy.saveUnconfirmedHint":
+    "Your draft has been kept. Reload to check what the gateway is actually using.",
 
   // ── P3b: logs page ──────────────────────────────────────────────
   "logs.filter.provider": "provider",

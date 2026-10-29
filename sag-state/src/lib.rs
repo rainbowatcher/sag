@@ -20,7 +20,9 @@ use sag_providers::LlmProvider;
 use tokio::sync::RwLock;
 
 pub mod config_mutation;
-pub use config_mutation::{ConfigMutationCoordinator, FileRevision, MutationReport};
+pub use config_mutation::{
+    ConfigMutationCoordinator, FileRevision, MutationReport, PrivacyConfigUpdate,
+};
 
 pub mod inflight;
 pub use inflight::{

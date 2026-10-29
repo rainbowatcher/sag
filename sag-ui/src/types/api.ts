@@ -170,9 +170,74 @@ export interface LoggingConfig {
 }
 
 /**
+ * Privacy filter action applied to a detected PII match.
+ * - `mask` — replace the matched text with a deterministic placeholder.
+ * - `warn` — forward the original text and only count the match category.
+ * - `block` — reject the request.
+ */
+export type PrivacyMode = "mask" | "warn" | "block"
+
+/** Per-category toggles of the built-in detectors (`[privacy.builtins]`). */
+export interface PrivacyBuiltins {
+  email: boolean
+  phone: boolean
+  id_card_cn: boolean
+  bank_card: boolean
+  iban: boolean
+  api_key: boolean
+  private_key: boolean
+}
+
+/** One user-defined regex rule (`[[privacy.custom_regexes]]`). */
+export interface PrivacyCustomRegex {
+  /** User-visible category label; duplicates are allowed. */
+  kind: string
+  /** Raw pattern text, sent back verbatim (never trimmed). */
+  pattern: string
+  case_insensitive: boolean
+}
+
+/** A word list section; the payload is wrapped, not a bare array. */
+export interface PrivacyWordList {
+  items: string[]
+}
+
+/**
+ * Writable `[privacy]` fields. Sent whole on `PUT /api/config`, which is a
+ * full-object replace of the section (omitted nested keys fall back to the
+ * config defaults, so the UI always sends the complete object).
+ */
+export interface PrivacyConfigFields {
+  enabled: boolean
+  mode: PrivacyMode
+  restore: boolean
+  builtins: PrivacyBuiltins
+  custom_regexes: PrivacyCustomRegex[]
+  custom_words: PrivacyWordList
+  allowlist: PrivacyWordList
+}
+
+/**
+ * `privacy` section of `GET /api/config`. The salt is never returned, not
+ * even masked; `salt_configured` only reports whether one is set.
+ */
+export interface PrivacyConfigSnapshot extends PrivacyConfigFields {
+  salt_configured: boolean
+}
+
+/**
+ * `privacy` section of `PUT /api/config`. Omit `salt` (or send an empty
+ * string) to keep the current value — there is no way to clear it.
+ */
+export interface UpdatePrivacyConfigPayload extends PrivacyConfigFields {
+  salt?: string
+}
+
+/**
  * Full gateway config snapshot returned by `GET /api/config`. Only the
- * runtime-tuning fields are writable via `PUT /api/config`; `server`,
- * `logging` and `analytics` are read-only and apply at process startup.
+ * runtime-tuning fields and `privacy` are writable via `PUT /api/config`;
+ * `server`, `logging` and `analytics` are read-only and apply at process
+ * startup.
  */
 export interface GatewayConfigSnapshot {
   server: ServerConfig
@@ -183,18 +248,21 @@ export interface GatewayConfigSnapshot {
   shuffle_cache_ttl_secs: number
   sticky_failover_reset_secs: number
   proxy_url: string | null
+  privacy: PrivacyConfigSnapshot
 }
 
 /**
  * Payload of `PUT /api/config`. Every field is optional; omitted fields
- * stay unchanged. `backoff` / `circuit_breaker` are full-object replaces.
- * `server` / `logging` / `analytics` are not accepted (restart-required).
+ * stay unchanged. `backoff` / `circuit_breaker` / `privacy` are full-object
+ * replaces. `server` / `logging` / `analytics` are not accepted
+ * (restart-required).
  */
 export interface UpdateGatewayConfigPayload {
   backoff?: BackoffConfig
   circuit_breaker?: CircuitBreakerConfigForm
   shuffle_cache_ttl_secs?: number
   sticky_failover_reset_secs?: number
+  privacy?: UpdatePrivacyConfigPayload
 }
 
 /** Gateway-level settings returned by `GET /api/settings`. */
