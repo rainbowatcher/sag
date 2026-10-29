@@ -32,8 +32,12 @@ impl FileRevision {
     /// Compute a revision from the file at `path` (synchronous read;
     /// config files are small).
     fn from_path(path: &Path) -> Result<Self, AppError> {
+        // A read failure is a server-side fault (missing/unreadable file,
+        // EISDIR, EIO), never caller-supplied validation: surface it as
+        // `AppError::Internal` (HTTP 500) so admin handlers cannot report it
+        // as a 400. The message text is unchanged so log greps keep working.
         let bytes = std::fs::read(path).map_err(|e| {
-            AppError::Config(format!("failed to read config file for revision: {e}"))
+            AppError::Internal(format!("failed to read config file for revision: {e}"))
         })?;
         Ok(Self::from_bytes(&bytes))
     }
@@ -904,6 +908,29 @@ mod tests {
     fn file_revision_empty_bytes() {
         let rev = FileRevision::from_bytes(b"");
         assert_eq!(rev.len, 0);
+    }
+
+    /// An unreadable config file is a server-side fault, not caller input:
+    /// `from_path` must surface `AppError::Internal` (HTTP 500), so a future
+    /// edit cannot silently regress admin mutations to a 400 on IO failure.
+    #[test]
+    fn file_revision_from_path_missing_file_is_internal() {
+        let path = std::env::temp_dir().join(format!(
+            "sag-file-revision-missing-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!path.exists(), "fixture path must not exist: {path:?}");
+
+        let err = FileRevision::from_path(&path).unwrap_err();
+        assert!(
+            matches!(err, AppError::Internal(_)),
+            "unreadable config file must map to Internal (500), got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to read config file for revision"),
+            "unexpected error message: {message}"
+        );
     }
 
     // ── adapter_config_changed tests ──────────────────────────────────

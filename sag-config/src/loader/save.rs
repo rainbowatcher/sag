@@ -49,11 +49,18 @@ use crate::toml_edit_util::{
 /// via a `tokio::sync::Mutex`. Concurrent mutations within the same
 /// process are serialized, so no lost-update occurs.
 ///
-/// **Error-path behaviour**: if `existing.parse()`, `config.validate()`,
-/// temp-file creation, or `sync_all` fails, the function returns `Err`
-/// without touching the destination file – the original config file is
-/// preserved untouched (all-or-nothing). The temp file is cleaned up on
-/// failure.
+/// **Error-path behaviour**: if reading the existing file, `existing.parse()`,
+/// `config.validate()`, temp-file creation, or `sync_all` fails, the function
+/// returns `Err` without touching the destination file – the original config
+/// file is preserved untouched (all-or-nothing). The temp file is cleaned up
+/// on failure, including a failed temp-file write.
+///
+/// **Error classes**: server-side persistence/IO failures — reading or
+/// parsing the existing on-disk file, `metadata`, the temp-file write,
+/// `set_permissions`, `sync_all`, and `rename` — surface as
+/// `AppError::Internal` (→ HTTP 500, code `INTERNAL_ERROR`). Problems with
+/// the caller-supplied candidate (validation, in-memory serialization) stay
+/// `AppError::Config` (→ HTTP 400).
 ///
 /// **Cross-process TOCTOU**: an external editor saving concurrently with
 /// an admin API mutation can still race the read and rename. The
@@ -93,12 +100,25 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
         }
     }
 
-    // Read the existing file (empty string if missing — toml_edit accepts
-    // that as a blank document).
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = existing
-        .parse()
-        .map_err(|e| sag_core::AppError::Config(format!("failed to parse existing config: {e}")))?;
+    // Read the existing file. A missing file is the only expected failure
+    // (a new config is being created) and is treated as a blank document
+    // (toml_edit accepts an empty string). Every other read failure —
+    // `EACCES`, `EIO`, `EISDIR`, … — aborts the save before anything is
+    // written, so an unreadable config is never silently replaced by a
+    // document rebuilt from scratch.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(sag_core::AppError::Internal(format!(
+                "failed to read existing config '{}': {e}",
+                path.display()
+            )));
+        }
+    };
+    let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| {
+        sag_core::AppError::Internal(format!("failed to parse existing config: {e}"))
+    })?;
 
     // ── [providers.*] — per-field update via upsert_table ──
     for (name, provider) in &config.providers {
@@ -174,7 +194,9 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
                 },
                 |item| {
                     let table = item.as_table_mut().ok_or_else(|| {
-                        sag_core::AppError::Config(
+                        // Existing on-disk shape, not the caller's request:
+                        // server-side state → `Internal`.
+                        sag_core::AppError::Internal(
                             "gateway_auth is not a table in the config file".into(),
                         )
                     })?;
@@ -261,35 +283,77 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
 /// 4. On any failure, clean up the temp file and return `Err` without
 ///    touching the destination.
 fn atomic_write(path: &Path, content: &str) -> Result<(), sag_core::AppError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| sag_core::AppError::Config("config path has no parent directory".into()))?;
+    let dir = path.parent().ok_or_else(|| {
+        sag_core::AppError::Internal("config path has no parent directory".into())
+    })?;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
     let temp_path = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
 
-    // 1. Write to temp file.
+    // Remember the destination's mode before writing the temp file:
+    // `rename(2)` replaces the inode, so without this the saved config
+    // would silently fall back to the temp file's default mode (0o644
+    // minus umask) instead of keeping e.g. a hand-tightened 0o600. Only
+    // `NotFound` is tolerated — a fresh file has no mode to preserve.
+    #[cfg(unix)]
+    let existing_mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        match std::fs::metadata(path) {
+            // `mode()` returns the full `st_mode`, file-type bits included
+            // (e.g. `S_IFREG`). `chmod` ignores those bits so behaviour is
+            // unchanged, but masking to the permission bits (`& 0o7777`,
+            // which keeps setuid/setgid/sticky) is exact and self-documenting.
+            Ok(meta) => Some(meta.permissions().mode() & 0o7777),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(sag_core::AppError::Internal(format!(
+                    "failed to stat existing config '{}': {e}",
+                    path.display()
+                )));
+            }
+        }
+    };
+
+    // 1. Write to temp file. A failure here (ENOSPC, read-only FS, …) must
+    //    still clean up: `write` may have created a partial temp file.
     std::fs::write(&temp_path, content).map_err(|e| {
-        sag_core::AppError::Config(format!("failed to write temp config file: {e}"))
+        let _ = std::fs::remove_file(&temp_path);
+        sag_core::AppError::Internal(format!("failed to write temp config file: {e}"))
     })?;
+
+    // 1b. Carry the destination's mode over to the temp file so the
+    //     rename below does not reset it. No-op when the file is new.
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(mode)).map_err(
+            |e| {
+                let _ = std::fs::remove_file(&temp_path);
+                sag_core::AppError::Internal(format!(
+                    "failed to preserve permissions of '{}': {e}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
 
     // 2. Sync the temp file.
     let file = std::fs::File::open(&temp_path).map_err(|e| {
         let _ = std::fs::remove_file(&temp_path);
-        sag_core::AppError::Config(format!("failed to open temp config for sync: {e}"))
+        sag_core::AppError::Internal(format!("failed to open temp config for sync: {e}"))
     })?;
     file.sync_all().map_err(|e| {
         let _ = std::fs::remove_file(&temp_path);
-        sag_core::AppError::Config(format!("failed to sync temp config file: {e}"))
+        sag_core::AppError::Internal(format!("failed to sync temp config file: {e}"))
     })?;
     drop(file);
 
     // 3. Atomic rename (overwrites destination on Unix).
     std::fs::rename(&temp_path, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp_path);
-        sag_core::AppError::Config(format!("failed to rename temp config file: {e}"))
+        sag_core::AppError::Internal(format!("failed to rename temp config file: {e}"))
     })?;
 
     Ok(())
@@ -987,6 +1051,132 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         assert!(
             saved.contains("[providers.openai]"),
             "sub-table format should be preserved, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── filesystem edge cases: missing / unreadable / mode ──
+
+    #[test]
+    fn save_creates_file_when_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "sag-save-missing-{}-{}.toml",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        assert!(!path.exists(), "test path must not exist yet");
+
+        save_config_to_file(&openai_only_config(), &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("[providers.openai]"),
+            "providers should be written to the new file, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_aborts_when_existing_file_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let content = r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers.openai]
+# keep me
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root bypasses permission bits, so the "read fails" precondition
+        // cannot be established then — skip rather than report a false
+        // failure.
+        if std::fs::read_to_string(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let err = save_config_to_file(&config, &path).expect_err(
+            "an unreadable existing config must abort the save instead of being replaced",
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, content,
+            "original file must stay byte-for-byte intact after a failed save"
+        );
+        assert!(
+            matches!(&err, sag_core::AppError::Internal(msg)
+                if msg.contains("failed to read existing config")),
+            "expected an internal read error from the existing config, got: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_toml("[server]\nhost = \"127.0.0.1\"\nport = 9090\n\n[providers]\n");
+
+        // Anti-vacuity: a hardcoded expectation such as `0o640` proves
+        // nothing, because the *unfixed* code leaves the temp file at
+        // `0o666 & !umask` — under the common `umask 027` that is already
+        // `0o640`, so the assertion would pass without any mode
+        // preservation. Measure the process's effective default instead,
+        // with a control file created the same way the temp file is (same
+        // directory, plain `fs::write`), then demand a mode that provably
+        // differs from it.
+        let control = std::env::temp_dir().join(format!(
+            "sag-save-mode-control-{}-{}.toml",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::write(&control, "").unwrap();
+        let default_mode = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&control);
+
+        // Flip group-write on, or other-execute when the default already
+        // has group-write: a single-bit change, so it differs from the
+        // default under every possible umask.
+        let target_mode = if default_mode & 0o020 == 0 {
+            default_mode | 0o020
+        } else {
+            default_mode ^ 0o001
+        };
+        assert_ne!(
+            target_mode, default_mode,
+            "the target mode must differ from the umask-derived default"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(target_mode)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            target_mode,
+            "chmod of the test fixture must be effective"
+        );
+
+        save_config_to_file(&openai_only_config(), &path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, target_mode,
+            "atomic_write must keep the destination's mode ({target_mode:o}) instead of \
+             falling back to the temp file's umask-derived default ({default_mode:o})"
         );
 
         let _ = std::fs::remove_file(&path);
