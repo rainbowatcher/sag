@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-28
+updated: 2026-10-30
 ---
 
 # 配置 — 规格
@@ -9,7 +9,7 @@ updated: 2026-10-28
 
 - [sag-config/src/config.rs](../../../sag-config/src/config.rs) — `GatewayConfig`、所有子结构体、`validate()`、序列化辅助函数
 - [sag-config/src/loader/load.rs](../../../sag-config/src/loader/load.rs) — `load_config()`、`peek_logging_config()`、统一 typed 反序列化（`deserialize_config` / `deserialize_config_collecting`，基于 `serde_ignored`）
-- [sag-config/src/loader/reload.rs](../../../sag-config/src/loader/reload.rs) — `spawn_hot_reload()` 热重载 watcher（尾部防抖、目录+文件双监听、有界重试）
+- [sag-config/src/loader/reload.rs](../../../sag-config/src/loader/reload.rs) — `spawn_hot_reload()` 热重载 watcher（尾部防抖、只监听父目录 + 收包后按文件名过滤、有界重试）
 - [sag-config/src/loader/save.rs](../../../sag-config/src/loader/save.rs) — `save_config_to_file()` 原子保存
 - [sag-config/src/toml_edit_util.rs](../../../sag-config/src/toml_edit_util.rs) — `toml_edit` 原地编辑工具函数
 - [sag-config/src/lib.rs](../../../sag-config/src/lib.rs) — `ConfigHandle` 类型别名
@@ -40,7 +40,7 @@ flowchart TD
     J --> K[write to file]
 ```
 
-热重载 watcher（`loader/reload.rs`）在 [0002](changes/0002-hot-reload-trailing-debounce.md) 起同时监听**父目录**与**配置文件本身**：目录监听保证原子 temp-file + rename 保存（inode 替换）后监听不失效，直接文件监听覆盖 macOS kqueue 目录监听不报告文件内就地编辑的情况。事件按配置路径/文件名过滤，`Access` 只读事件忽略。触发采用**尾部防抖**（`DEBOUNCE`=300ms，`DEBOUNCE_TICK`=100ms 轮询）+ settle 窗口（`SETTLE`=100ms）边界排空：突发写入期间不断重置窗口，保证读取的是最终版本；防抖窗口后若排空到新相关事件则重新武装。加载失败最多重试 `MAX_RELOAD_RETRIES`（2）次后等待下一个文件事件。
+热重载 watcher（`loader/reload.rs`）在 [0002](changes/0002-hot-reload-trailing-debounce.md) 起只监听**父目录**（非递归，`watch_dir_for()`），不再单独监听配置文件本身：目录监听保证原子 temp-file + rename 保存（inode 替换）后监听不失效，成本是目录内所有条目的事件都会到达，故过滤发生在收到事件之后——`event_targets_config()` 按配置路径或文件名匹配（`Access` 只读事件忽略），非本配置的事件被丢弃。触发采用**尾部防抖**（`DEBOUNCE`=300ms，`DEBOUNCE_TICK`=100ms 轮询）+ settle 窗口（`SETTLE`=100ms）边界排空：突发写入期间不断重置窗口，保证读取的是最终版本；防抖窗口后若排空到新相关事件则重新武装。加载失败最多重试 `MAX_RELOAD_RETRIES`（2）次后等待下一个文件事件。
 
 ### 出站代理解析链路
 
@@ -183,6 +183,8 @@ provider 级代理策略用三态枚举（`inherit` / `enabled` / `disabled`）�
 - 端到端冒烟 — `just dev`（或 `just run 2>&1 | cat` 等非 TTY 方式）后 analytics 库 / 日志分别落在 `.dev/xdg/data/sag/` 与 `.dev/xdg/state/sag/logs/`；TTY 交互（直接 `just run`）下日志只输出终端、不产生文件；两种情况下生产 XDG 目录 mtime 不变
 
 ## 变更记录
+- [0010 修复热重载 watcher 的通道背压死锁](changes/0010-hot-reload-watcher-channel-deadlock.md)
+- [0009 空 `api_keys` 归一化为关闭鉴权并告警](changes/0009-empty-api-keys-normalize-to-disabled-auth.md)
 - [0008 dev 轨 XDG 数据隔离（`.dev/xdg/`）](changes/0008-dev-track-xdg-isolation.md)
 - [0007 顶级配置 Admin API 与 Settings 页可视化](changes/0007-gateway-config-visualization.md)
 - [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)

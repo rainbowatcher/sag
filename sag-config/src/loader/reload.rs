@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::loader::handle::ConfigHandle;
 
@@ -261,11 +261,15 @@ pub fn spawn_hot_reload(
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<notify::Event, notify::Error>>();
 
+        // The callback does nothing but build the message and hand it over:
+        // it runs on notify's FSEvents run-loop thread, where *any* work
+        // (even logging) keeps the loop from being "waiting" and can make
+        // `Watcher::drop` spin in `stop()` — see the channel comment above.
+        // A failed `send` only means the receiver is already gone (shutdown),
+        // which needs no reporting.
         let mut watcher = match RecommendedWatcher::new(
             move |res| {
-                if tx.send(res).is_err() {
-                    debug!("config watcher event dropped (receiver gone)");
-                }
+                let _ = tx.send(res);
             },
             notify::Config::default(),
         ) {

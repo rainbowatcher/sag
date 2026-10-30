@@ -112,6 +112,27 @@ struct CoordHandler {
     coordinator: Arc<ConfigMutationCoordinator>,
 }
 
+/// A `ConfigReloadHandler` that reports when a reload has started, then stalls.
+///
+/// Used by [`watcher_drop_with_event_burst_does_not_hang`] to hold the
+/// watcher's consumer inside a reload (as a real disk read + validate +
+/// publish does) while a large burst of file events arrives, so the watcher's
+/// event channel has to buffer the whole burst instead of being drained
+/// eagerly.
+struct StallHandler {
+    entered: Arc<tokio::sync::Semaphore>,
+    stall: Duration,
+}
+
+#[async_trait::async_trait]
+impl sag_config::ConfigReloadHandler for StallHandler {
+    async fn reload_from_path(&self, _path: &Path) -> sag_core::Result<()> {
+        self.entered.add_permits(1);
+        tokio::time::sleep(self.stall).await;
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl sag_config::ConfigReloadHandler for CoordHandler {
     async fn reload_from_path(&self, path: &Path) -> sag_core::Result<()> {
@@ -161,6 +182,83 @@ where
     tokio::task::yield_now().await;
     emit();
     wait_until(Duration::from_secs(10), &mut pred).await
+}
+
+/// Regression guard for the watcher-shutdown deadlock.
+///
+/// notify's macOS FSEvents backend stops a stream by spinning
+/// `while !runloop.is_waiting() { thread::yield_now() }`, and the event
+/// callback runs on that very run loop thread. So the callback must never
+/// block: the old `mpsc::channel(16)` + `blocking_send` send site parked the
+/// run-loop thread as soon as 17 events queued up, which made `is_waiting()`
+/// false forever and turned `drop(watcher)` (and the gateway's `shutdown()`)
+/// into an unkillable spin. A single burst of >16 events is enough to fill the
+/// old 16-slot channel, so this test drives 40 distinct file events while the
+/// consumer is stalled inside a reload, then requires the shutdown path to
+/// finish.
+///
+/// Plain `#[test]`, not `#[tokio::test]`: the watcher runs on its own thread
+/// with its own runtime, so a hung shutdown is caught by `recv_timeout` and
+/// fails the test instead of hanging the whole suite.
+#[test]
+fn watcher_drop_with_event_burst_does_not_hang() {
+    // A dedicated directory: the burst writes 40 sibling files into the
+    // watched directory, which must not collide with other tests.
+    let dir = unique_temp_path("sag_hotreload_burst_drop").with_extension("dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("gateway.toml");
+    std::fs::write(&file_path, initial_toml()).unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    // Detached on purpose: on the failure path this thread is the one stuck in
+    // the spin, so it must never be joined.
+    let _driver = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let handle = sag_config::load_config(&file_path).unwrap();
+            let entered = Arc::new(tokio::sync::Semaphore::new(0));
+            let handler: Arc<dyn sag_config::ConfigReloadHandler> = Arc::new(StallHandler {
+                entered: entered.clone(),
+                stall: Duration::from_millis(800),
+            });
+            let watcher = sag_config::spawn_hot_reload(handle, handler);
+
+            // Let the spawned task register its directory watch, then trigger
+            // one reload and wait until the consumer is inside it (i.e. not
+            // draining the event channel).
+            tokio::task::yield_now().await;
+            std::fs::write(&file_path, toml_with_enabled_models(&["burst"])).unwrap();
+            let _entered = entered.acquire().await.unwrap();
+
+            // Burst: 40 writes to 40 DISTINCT paths in the watched directory.
+            // Distinct paths matter — FSEvents coalesces repeated changes to
+            // one path, but a batch of N paths yields N separate notify
+            // events, far more than the old 16-slot channel could hold.
+            for i in 0..40u32 {
+                let p = file_path.with_file_name(format!("burst_{i}.toml"));
+                std::fs::write(&p, format!("burst = {i}\n")).unwrap();
+                tokio::task::yield_now().await;
+            }
+
+            // Shutdown while the burst is (mostly) still queued: the watcher
+            // task drops the notify watcher, which on macOS spins until the
+            // callback thread is back in its run loop.
+            watcher.shutdown().await;
+        });
+        let _ = done_tx.send(());
+    });
+
+    let outcome = done_rx.recv_timeout(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        outcome.is_ok(),
+        "watcher shutdown did not finish within 10s after a >16-event burst: \
+         the notify callback must never block (a blocked callback makes \
+         FSEvents' stop() spin forever)"
+    );
 }
 
 #[tokio::test]
