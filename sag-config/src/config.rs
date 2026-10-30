@@ -186,6 +186,18 @@ impl GatewayConfig {
     /// 剥去每个 `apis.<key>.base_url` 的尾部 `/`，避免「base_url + 固定协议
     /// path」拼接出 `//path`（参照 [`normalize_models_endpoint`] 的裁剪语义）。
     pub fn normalize(&mut self) {
+        // The documented contract is "an empty `gateway_auth.api_keys` list
+        // means no authentication", and the canonical model form of that is
+        // `None`. Collapsing it here makes the documented behaviour work at
+        // load time while `validate_gateway_auth` keeps rejecting a directly
+        // constructed `Some(empty)` as a belt-and-braces guard.
+        if self
+            .gateway_auth
+            .as_ref()
+            .is_some_and(|auth| auth.api_keys.is_empty())
+        {
+            self.gateway_auth = None;
+        }
         for provider in self.providers.values_mut() {
             for api in provider.apis.values_mut() {
                 let trimmed = api.base_url.trim_end_matches('/');
@@ -204,7 +216,7 @@ impl GatewayConfig {
 
         self.validate_server(&mut errors);
         self.validate_analytics(&mut errors);
-        self.validate_gateway_auth(&mut errors);
+        self.validate_gateway_auth(&mut errors, &mut warnings);
         let normalized_global_proxy = self.validate_proxy(&mut errors);
         // The empty-map check is emitted here, before circuit-breaker and
         // backoff errors, to preserve the historical error-vector order;
@@ -259,13 +271,23 @@ impl GatewayConfig {
     }
 
     /// ── Gateway auth validation ──
-    fn validate_gateway_auth(&self, errors: &mut Vec<String>) {
-        if let Some(ref auth) = self.gateway_auth
-            && auth.api_keys.is_empty()
-        {
-            errors.push(
+    ///
+    /// `Some` with an empty `api_keys` list is a hard error: the canonical
+    /// "authentication disabled" form is `None`, which
+    /// [`GatewayConfig::normalize`] produces from an empty list at load time.
+    /// Keeping the rejection here guards callers that build `Some(empty)`
+    /// directly and bypass normalization. `None` is valid but disables
+    /// authentication, which is worth a warning.
+    fn validate_gateway_auth(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+        match self.gateway_auth.as_ref() {
+            Some(auth) if auth.api_keys.is_empty() => errors.push(
                 "gateway_auth.api_keys must not be empty when authentication is configured".into(),
-            );
+            ),
+            Some(_) => {}
+            None => warnings.push(
+                "gateway authentication is disabled: every request to protected routes is allowed"
+                    .into(),
+            ),
         }
     }
 
@@ -1872,6 +1894,44 @@ targets = [
     }
 
     #[test]
+    fn normalize_collapses_empty_gateway_auth_to_none() {
+        let mut config: GatewayConfig = toml::from_str(
+            r#"
+[server]
+[gateway_auth]
+api_keys = []
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+        )
+        .unwrap();
+        assert!(
+            config.gateway_auth.is_some(),
+            "parsing yields Some(empty); normalize is what collapses it"
+        );
+
+        config.normalize();
+
+        assert!(config.gateway_auth.is_none());
+        assert!(
+            config.validate().is_ok(),
+            "an empty key list means no authentication and must not be rejected"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_non_empty_gateway_auth_keys() {
+        let mut config: GatewayConfig = toml::from_str(minimal_toml()).unwrap();
+
+        config.normalize();
+
+        let auth = config.gateway_auth.expect("non-empty keys stay Some");
+        assert_eq!(auth.api_keys, vec!["key1", "key2"]);
+    }
+
+    #[test]
     fn parse_analytics_call_log_retention_defaults_to_90() {
         let toml_str = r#"
 [server]
@@ -3119,6 +3179,42 @@ targets = []"#,
             let mut config = valid_config();
             config.gateway_auth = None;
             assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn warns_when_gateway_auth_is_disabled() {
+            let mut config = valid_config();
+            config.gateway_auth = None;
+            let mut errors = Vec::new();
+            let mut warnings = Vec::new();
+
+            config.validate_gateway_auth(&mut errors, &mut warnings);
+
+            assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("gateway authentication is disabled")),
+                "expected auth-disabled warning, got {warnings:?}"
+            );
+        }
+
+        #[test]
+        fn does_not_warn_when_gateway_auth_keys_are_configured() {
+            let mut config = valid_config();
+            config.gateway_auth = Some(GatewayAuthConfig {
+                api_keys: vec!["key1".into()],
+            });
+            let mut errors = Vec::new();
+            let mut warnings = Vec::new();
+
+            config.validate_gateway_auth(&mut errors, &mut warnings);
+
+            assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+            assert!(
+                warnings.is_empty(),
+                "expected no warnings, got {warnings:?}"
+            );
         }
 
         #[test]

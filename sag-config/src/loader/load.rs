@@ -231,6 +231,34 @@ base_url = "https://api.openai.com/v1/"
         );
     }
 
+    /// 文档契约：`gateway_auth.api_keys = []` 表示关闭鉴权。加载时必须成功，
+    /// 且 `normalize()` 已把它折叠为 `gateway_auth = None`。
+    #[test]
+    fn load_config_treats_empty_gateway_auth_api_keys_as_disabled() {
+        let path = temp_toml(
+            r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+[gateway_auth]
+api_keys = []
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+        );
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap();
+        assert!(
+            config.gateway_auth.is_none(),
+            "empty api_keys must normalize to no authentication"
+        );
+        drop(config);
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn load_config_missing_file() {
         let result = load_config("/tmp/does-not-exist-sag-test.toml");

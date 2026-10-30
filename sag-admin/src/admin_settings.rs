@@ -23,8 +23,10 @@ use sag_state::AppState;
 ///   whitespace-only to clear the global proxy. The handler never stores
 ///   credentials: the config layer rejects userinfo-bearing URLs outright.
 /// - `api_keys`, when present, replaces the gateway client-auth key list.
-///   An empty array disables authentication (same as removing
-///   `[gateway_auth]`). When the field is omitted the current key list is
+///   An empty array means "no authentication": the coordinator normalizes
+///   it to an absent `gateway_auth`, so the saved file omits the
+///   `[gateway_auth]` section entirely (it is never persisted as
+///   `api_keys = []`). When the field is omitted the current key list is
 ///   left unchanged.
 #[derive(Debug, serde::Deserialize)]
 pub struct UpdateSettingsRequest {
