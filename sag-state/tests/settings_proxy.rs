@@ -512,6 +512,9 @@ async fn update_settings_rejects_blank_only_api_key_list() {
         .update_settings(None, Some(vec!["existing-key".into()]))
         .await
         .expect("seeding a usable key must succeed");
+    // The fixture is file-backed, so "unchanged" is checked against the
+    // persisted bytes: a rejected mutation must not rewrite the file either.
+    let persisted = std::fs::read(&path).expect("config file must exist");
 
     for blank in ["", "   "] {
         let err = coord
@@ -528,6 +531,11 @@ async fn update_settings_rejects_blank_only_api_key_list() {
             cfg.gateway_auth.as_ref().map(|a| a.api_keys.clone()),
             Some(vec!["existing-key".to_string()]),
             "rejected mutation must leave the config unchanged"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("config file must exist"),
+            persisted,
+            "a rejected mutation must leave the on-disk config byte-identical"
         );
     }
 

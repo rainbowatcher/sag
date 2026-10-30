@@ -55,7 +55,7 @@ updated: 2026-10-30
 - 至少一个 provider
 - `server.port > 0`
 - `server.host` 非空
-- `gateway_auth` 存在时 `api_keys` 非空——配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；仅程序化直接构造的空 key 列表被拒绝
+- `gateway_auth` 存在时 `api_keys` 必须含至少一个非空白 key（`has_usable_key()`）；加载归一化会先裁掉每个 key 的首尾空白（`[" sk "]` → `["sk"]`），配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；列表为空或全部为空白一律报错，与配置来源（文件 / 程序化构造）无关
 - `base_url` 包含 `://`
 - `timeout_secs > 0`（provider、route、target 三级）
 - `chunk_timeout_secs > 0`（如果设置）

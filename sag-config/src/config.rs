@@ -184,7 +184,8 @@ impl GatewayConfig {
 
     /// Load-time normalization（`load_config` / `reload_config` 在校验前调用）：
     /// 剥去每个 `apis.<key>.base_url` 的尾部 `/`，避免「base_url + 固定协议
-    /// path」拼接出 `//path`（参照 [`normalize_models_endpoint`] 的裁剪语义）。
+    /// path」拼接出 `//path`（参照 [`normalize_models_endpoint`] 的裁剪语义）；
+    /// 并裁掉每个 `gateway_auth.api_keys` 条目的首尾空白。
     pub fn normalize(&mut self) {
         // The documented contract is "an empty `gateway_auth.api_keys` list
         // means no authentication", and the canonical model form of that is
@@ -202,6 +203,22 @@ impl GatewayConfig {
             .is_some_and(|auth| auth.api_keys.is_empty())
         {
             self.gateway_auth = None;
+        }
+        // Keys are trimmed here rather than at the comparison site: the auth
+        // middleware compares a *trimmed* presented credential against the
+        // configured entries verbatim, so a space-padded key (`[" sk "]`)
+        // would boot yet never match `"sk"`. Trimming once at load time makes
+        // the stored form canonical for every reader (`has_usable_key`,
+        // `validate`, the middleware) and matches what the admin settings path
+        // already writes. Blank entries are **not** dropped: `["good", ""]`
+        // stays valid, and the blank entry simply never matches a credential.
+        // Trimming runs before `validate()`, so `["   "]` becomes `[""]` and
+        // still hits the "no usable key" error instead of passing silently.
+        if let Some(auth) = self.gateway_auth.as_mut() {
+            for key in &mut auth.api_keys {
+                let trimmed = key.trim().to_string();
+                *key = trimmed;
+            }
         }
         for provider in self.providers.values_mut() {
             for api in provider.apis.values_mut() {
@@ -3233,7 +3250,13 @@ targets = []"#,
                 "a blank entry next to a usable key must validate: {:?}",
                 config.validate()
             );
-            assert!(config.gateway_auth.unwrap().has_usable_key());
+            // `validate()` only inspects the list: the blank entry is neither
+            // dropped nor promoted to a credential, so both entries survive
+            // verbatim and only the usable one decides.
+            let auth = config
+                .gateway_auth
+                .expect("a usable key keeps gateway_auth configured");
+            assert_eq!(auth.api_keys, vec!["valid-key", ""]);
         }
 
         #[test]

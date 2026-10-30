@@ -171,6 +171,11 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
                     // it must never match, even if a blank key somehow reached
                     // the configured list (the invariant therefore does not
                     // depend on the `has_usable_key` arm alone).
+                    //
+                    // The comparison itself is verbatim: configured keys are
+                    // stored trimmed (`GatewayConfig::normalize` on load /
+                    // reload, the settings API on write), so `" sk "` in a
+                    // config file is already `"sk"` here.
                     let presented = provided_key.trim();
                     if !presented.is_empty() && auth_config.api_keys.iter().any(|k| k == presented)
                     {
@@ -229,6 +234,12 @@ mod tests {
             gateway_auth: auth_keys.map(|keys| sag_config::GatewayAuthConfig { api_keys: keys }),
             ..sag_config::gateway_config_base!()
         };
+        state_from_config(config).await
+    }
+
+    /// Helper: wrap a config in an [`AppState`] (the provider registry is
+    /// always empty here).
+    async fn state_from_config(config: sag_config::GatewayConfig) -> AppState {
         let handle = ConfigHandle::from_config(config);
         let registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
         sag_state::testing::test_app_state(handle, Arc::new(RwLock::new(registry))).await
@@ -429,6 +440,50 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn auth_authorizes_a_key_that_normalize_trimmed() {
+        // `normalize()` runs on every load/reload path and trims padded keys,
+        // so `api_keys = [" sk "]` is stored as `["sk"]` — without that, the
+        // gateway boots and then 401s every request, because the middleware
+        // compares the configured entry verbatim against a trimmed credential.
+        // (Both sides are trimmed, so the padded credential also normalizes to
+        // the same key; only a genuinely different credential is rejected.)
+        let mut config = sag_config::GatewayConfig {
+            gateway_auth: Some(sag_config::GatewayAuthConfig {
+                api_keys: vec![" sk ".into()],
+            }),
+            ..sag_config::gateway_config_base!()
+        };
+        config.normalize();
+        assert_eq!(
+            config
+                .gateway_auth
+                .as_ref()
+                .expect("a usable key keeps gateway_auth configured")
+                .api_keys,
+            vec!["sk"]
+        );
+        let app = test_app(state_from_config(config).await);
+
+        for (credential, expected) in [
+            ("sk", StatusCode::OK),
+            (" sk ", StatusCode::OK),
+            ("nope", StatusCode::UNAUTHORIZED),
+        ] {
+            let request = Request::builder()
+                .uri("/test")
+                .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "credential {credential:?} must be {expected:?}"
+            );
+        }
+    }
+
     // ── missing-Authorization warning carries client_ip / user_agent ──
 
     /// Minimal `MakeWriter` that appends every formatted event to a buffer.
@@ -533,6 +588,37 @@ mod tests {
         assert!(
             fields.contains(&"user_agent=-"),
             "missing User-Agent must log a placeholder: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_blank_only_key_list_warns_once_per_request() {
+        // A `gateway_auth` whose keys are all blank denies every request; the
+        // denial must log exactly one WARN (the denial arm), not a second copy
+        // from the shared denial log below it.
+        let state = test_state(Some(vec![String::new(), "   ".into()])).await;
+        let app = test_app(state);
+        let (capture, _guard) = capture_warnings();
+
+        let request = Request::builder()
+            .uri("/test")
+            .header(header::USER_AGENT, "probe-agent/1.0")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let text = capture.text();
+        let events: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one WARN event per denied request, captured:\n{text}"
+        );
+        assert!(
+            events[0].contains("has no non-empty key"),
+            "the single warning must be the blank-key denial, captured:\n{text}"
         );
     }
 

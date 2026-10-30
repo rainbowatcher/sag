@@ -55,10 +55,16 @@ use crate::toml_edit_util::{
 /// process are serialized, so no lost-update occurs.
 ///
 /// **Error-path behaviour**: if reading the existing file, `existing.parse()`,
-/// `config.validate()`, temp-file creation, or `sync_all` fails, the function
-/// returns `Err` without touching the destination file – the original config
-/// file is preserved untouched (all-or-nothing). The temp file is cleaned up
-/// on failure, including a failed temp-file write.
+/// temp-file creation, or `sync_all` fails, the function returns `Err` without
+/// touching the destination file – the original config file is preserved
+/// untouched (all-or-nothing). The temp file is cleaned up on failure,
+/// including a failed temp-file write.
+///
+/// This function does **not** validate: `GatewayConfig::validate()` is called
+/// by the caller — `ConfigMutationCoordinator::mutate` in `sag-state` checks
+/// the candidate before handing it here (and its settings path pre-checks
+/// `api_keys`), which is where a bad candidate becomes `AppError::Config`
+/// instead of reaching the write.
 ///
 /// **Error classes**: server-side persistence/IO failures — reading or
 /// parsing the existing on-disk file, `metadata`, the temp-file write,

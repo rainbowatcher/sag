@@ -26,10 +26,11 @@ review 又发现一处**空白 key 漏洞**：校验只看「列表是否为空�
 - **管理面写入拒绝空白条目**：`ConfigMutationCoordinator::update_settings` 在构造候选配置前就检查提交的 key 数组，含空白条目即 `AppError::Config`（admin API 报 400），所以空白 key 既进不了内存也落不了盘；空数组仍合法（关闭鉴权）。这条比 `has_usable_key()` 更严：`["sk-ok", ""]` 在管理面被拒，而在文件里混写是合法的（见下条）。
 - **单一事实来源**：`GatewayAuthConfig::has_usable_key()`（至少一个 key 含非空白字符）是「鉴权配置是否可用」的唯一判定入口，校验与中间件都经它判断，不再各自数 `api_keys.len()`。
 - **中间件的空白安全比较**：中间件把该分支的条件从 `is_empty()` 改为 `!has_usable_key()`，并让凭据先 `trim()`、trim 后为空一律不匹配；于是即使一个空白 key 绕过校验到达内存，也不可能被空 `Bearer` 凭据命中。
+- **加载时裁剪 key 首尾空白**（review 二轮补丁）：`normalize()` 在折叠空列表之后把每个 `gateway_auth.api_keys` 条目原地 trim。此前 `api_keys = [" sk "]` 能通过校验并启动，但中间件拿 trim 过的 `"sk"` 去比对未 trim 的配置值，永远不相等——网关能启动却 401 所有请求。trim 放在归一化而不是比对处，使 `has_usable_key()`、校验与中间件看到同一份规范形式，也与管理面写入侧（已 trim）对齐；空白条目不被丢弃，`["good", ""]` 仍合法，纯空白列表 trim 后变成 `[""]`，仍在随后的校验里报「no usable key」。
 
 ## 需求变更
 
-- `requirements.md`「验证规则」：原条目 `- api_keys 非空`（无条件硬性要求）改为——`gateway_auth` 存在时 `api_keys` 非空；配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；仅程序化直接构造的空 key 列表被拒绝。
+- `requirements.md`「验证规则」：原条目 `- api_keys 非空`（无条件硬性要求）改为——`gateway_auth` 存在时 `api_keys` 必须含至少一个非空白 key（`has_usable_key()`），加载归一化先裁掉每个 key 的首尾空白（`[" sk "]` → `["sk"]`）；配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；列表为空或全部为空白一律报错，与配置来源（文件 / 程序化构造）无关。
 - `requirements.md`「认证模式」：再收紧一格——`gateway_auth` 存在时要求至少一个**含非空白字符**的 key（`has_usable_key()`）；`api_keys = [""]` / `["   "]` 在校验时被拒绝，与 `api_keys = []` 不同：后者合法（归一化为段缺失），前者是配置错误。
 
 ## 代码变更
@@ -54,7 +55,7 @@ review 又发现一处**空白 key 漏洞**：校验只看「列表是否为空�
 - `sag-config/src/loader/load.rs` tests：`load_config_treats_empty_gateway_auth_api_keys_as_disabled` — 端到端覆盖「文件里写 `api_keys = []` 不再启动失败」。
 - `sag-router/src/middleware/auth.rs` tests：`auth_empty_key_list_denies_all` — 空 key 列表下请求被 401 拒绝、错误码 `UNAUTHORIZED`（原 `auth_empty_key_list_allows_all` 的错误方向已被钉死）。
 - review 补丁（空白 key 漏洞）新增的测试：
-  - `sag-config/src/config.rs` tests：`rejects_blank_only_gateway_auth_keys` — 全空白 key 列表被判为无效配置；`accepts_gateway_auth_with_blank_entry_alongside_usable_key` — 空白条目与可用 key 混写被接受；`has_usable_key_requires_non_whitespace_content` — 唯一判定入口本身的行为（空、`[""]`、`["", "   ", "\t"]` 为 false，`["key"]`、`["", " key "]` 为 true）；`validate_emits_no_auth_disabled_warning_with_usable_key` — 有可用 key 时不误报「鉴权已关闭」。
-  - `sag-config/src/loader/load.rs` tests：`load_config_rejects_blank_only_gateway_auth_api_keys` — 文件里写 `api_keys = [""]` 加载失败（与 `api_keys = []` 合法相反）；`load_config_keeps_auth_enabled_with_blank_entry_alongside_usable_key` — 混写时鉴权仍启用；`load_config_rejects_present_but_keyless_gateway_auth_section` — 写了 `[gateway_auth]` 段却没有可用 key 时拒绝。
-  - `sag-admin/src/admin_settings.rs` tests：`put_settings_blank_api_key_is_400` — `PUT /api/settings` 提交只含空白字符的 key 数组返回 400，配置不变。
-  - `sag-router/src/middleware/auth.rs` tests：`auth_empty_bearer_returns_401` — 空 `Bearer` 凭据返回 401（review 发现的漏洞本身）；`auth_blank_only_key_list_denies_all` — 内存里是 `Some(全空白)` 时一律 401；`auth_blank_configured_key_never_matches_blank_credential` — 混写列表里空白条目永远不会被空凭据命中；`auth_blank_only_key_list_warns_once_per_request` — fail-closed 分支每个请求恰好一条 warning。
+  - `sag-config/src/config.rs` tests：`rejects_blank_only_gateway_auth_keys` — 全空白 key 列表被判为无效配置；`accepts_gateway_auth_with_blank_entry_alongside_usable_key` — 空白条目与可用 key 混写被接受（且两个条目原样保留，校验既不丢弃也不把空白项当成凭据）；`has_usable_key_requires_non_whitespace_content` — 唯一判定入口本身的行为（空、`[""]`、`["", "   ", "\t"]` 为 false，`["key"]`、`["", " key "]` 为 true）；`validate_emits_auth_disabled_warning` — `validate()` 真的把收集到的「鉴权已关闭」warning 发到日志（收集 ≠ 输出）；`validate_emits_no_auth_disabled_warning_with_usable_key` — 有可用 key 时不误报「鉴权已关闭」。
+  - `sag-config/src/loader/load.rs` tests：`load_config_rejects_blank_only_gateway_auth_api_keys` — 文件里写 `api_keys = [""]` 加载失败（与 `api_keys = []` 合法相反）；`load_config_keeps_auth_enabled_with_blank_entry_alongside_usable_key` — 混写时鉴权仍启用；`load_config_rejects_present_but_keyless_gateway_auth_section` — 写了 `[gateway_auth]` 段却没有可用 key 时拒绝；`load_config_trims_gateway_auth_api_keys` — `api_keys = [" sk "]` 加载后内存里是 `["sk"]`（空白条目保留）。
+  - `sag-admin/src/admin_settings.rs` tests：`put_settings_blank_only_api_key_list_is_400` — `PUT /api/settings` 提交只含空白字符的 key 数组返回 400，配置不变（更早的 `put_settings_blank_api_key_is_400` 已覆盖「可用 key + 空白条目」混写被拒，不是本 commit 新增）。
+  - `sag-router/src/middleware/auth.rs` tests：`auth_empty_bearer_returns_401` — 空 `Bearer` 凭据返回 401（review 发现的漏洞本身）；`auth_blank_only_key_list_denies_all` — 内存里是 `Some(全空白)` 时一律 401；`auth_blank_configured_key_never_matches_blank_credential` — 混写列表里空白条目永远不会被空凭据命中；`auth_authorizes_a_key_that_normalize_trimmed` — 经 `normalize()` 的 `[" sk "]` 存为 `["sk"]`，中间件放行 `"sk"`（两侧都 trim，故 `" sk "` 同样归一为同一凭据）并拒绝无关凭据；`auth_blank_only_key_list_warns_once_per_request` — fail-closed 分支每个请求恰好一条 warning。

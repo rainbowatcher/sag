@@ -315,6 +315,40 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         let _ = std::fs::remove_file(&path);
     }
 
+    /// key 的首尾空白在校验前被裁掉：`[" sk "]` 归一化为 `["sk"]`。否则这条
+    /// key 永远不等于中间件拿到的已 trim 凭据（`"sk"`）——网关能启动，但每个
+    /// 请求都 401。空白条目不被丢弃，仍然只是「不可匹配」。
+    #[test]
+    fn load_config_trims_gateway_auth_api_keys() {
+        let path = temp_toml(
+            r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+[gateway_auth]
+api_keys = [" sk ", "  other  ", ""]
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+        );
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap();
+        let auth = config
+            .gateway_auth
+            .as_ref()
+            .expect("a usable key keeps gateway_auth configured");
+        assert_eq!(
+            auth.api_keys,
+            vec!["sk", "other", ""],
+            "load-time normalization must trim every key and keep blank entries"
+        );
+        drop(config);
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 现存的 `[gateway_auth]` 段但没有 `api_keys` 键：`api_keys` 没有 serde
     /// default，所以解析直接报 `missing field`，不会静默降级为「无鉴权」。
     /// 同理，写成 `api_key` 这类 typo 只是多一条 unknown-field 警告，仍然会因为
