@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-28
+updated: 2026-10-30
 ---
 
 # 配置
@@ -55,7 +55,7 @@ updated: 2026-10-28
 - 至少一个 provider
 - `server.port > 0`
 - `server.host` 非空
-- `api_keys` 非空
+- `gateway_auth` 存在时 `api_keys` 非空——配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；仅程序化直接构造的空 key 列表被拒绝
 - `base_url` 包含 `://`
 - `timeout_secs > 0`（provider、route、target 三级）
 - `chunk_timeout_secs > 0`（如果设置）
@@ -120,6 +120,7 @@ UI（Settings 页）：`Network` / `Authentication` 之外新增 Backoff、Break
 
 ## 变更记录
 
+- [0009 空 `api_keys` 归一化为关闭鉴权并告警](changes/0009-empty-api-keys-normalize-to-disabled-auth.md)
 - [0008 dev 轨 XDG 数据隔离（`.dev/xdg/`）](changes/0008-dev-track-xdg-isolation.md)
 - [0007 顶级配置 Admin API 与 Settings 页可视化](changes/0007-gateway-config-visualization.md)
 - [0006 XDG Base Directory 标准路径布局](changes/0006-xdg-base-directories.md)

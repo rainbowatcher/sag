@@ -1,11 +1,13 @@
 ---
 created: 2026-06-03
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-10-30** · **配置**：[0009 空 `api_keys` 归一化为关闭鉴权并告警](config/changes/0009-empty-api-keys-normalize-to-disabled-auth.md) — 文档一直承诺「`gateway_auth.api_keys` 为空列表 = 关闭鉴权」，但 `validate_gateway_auth` 对 `Some(empty)` 直接报错，照文档写 `api_keys = []` 的 `gateway.toml` 启动即 exit 1；新增的 `GatewayConfig::normalize()` 首步把 `Some(GatewayAuthConfig { api_keys: [] })` 折叠为 `gateway_auth = None`（`normalize()` 在 `load_config` 与 `reload_config` 上均先于 `validate()` 运行），于是空列表被接受且语义为「无鉴权」，关闭鉴权的 canonical 形式明确为「`[gateway_auth]` 段缺失」——`save.rs` / `admin_settings.rs` 两处与实现相反的注释同步修正（空 key 列表绝不持久化为 `api_keys = []`，而是整段不写）；`validate_gateway_auth` 保留对直接构造 `Some(empty)` 的硬拒作为兜底（归一化只覆盖加载路径），并改收 `warnings` 向量：`gateway_auth == None` 时 push `gateway authentication is disabled: every request to protected routes is allowed`，由 `validate()` 统一 `tracing::warn!` 输出，故启动 / 热重载 / 管理面 mutation 三条路径都能看到「鉴权已关闭」而非静默 fail-open；`sag-router/src/middleware/auth.rs` 的 `api_keys.is_empty()` 分支同步由放行改为 fail-closed（401 + `UNAUTHORIZED` + 一条指明修复方式的 `warn!`），理由是零 key 列表无法匹配任何凭据、方向只能读作「拒绝一切」，且规范化后正常配置不再产生 `Some(empty)`、该分支仅为最后防线；测试 +5（`normalize_collapses_empty_gateway_auth_to_none` / `normalize_keeps_non_empty_gateway_auth_keys` / `warns_when_gateway_auth_is_disabled` / `does_not_warn_when_gateway_auth_keys_are_configured` / `load_config_treats_empty_gateway_auth_api_keys_as_disabled`）且 `auth_empty_key_list_allows_all` 更名为 `auth_empty_key_list_denies_all`（断言 401 与 `UNAUTHORIZED`）
 
 - **2026-10-29** · **隐私过滤**：[0004 隐私设置管理面读写](privacy/changes/0004-admin-settings.md) — 隐私配置从「只能改 TOML + 热重载」扩展到管理面读写：`GET /api/config` 的 runtime-tuning 快照与 `PUT /api/config` 的请求体各新增一段 `privacy`（`enabled` / `mode` / `restore` / `salt` / `builtins` / `custom_regexes` / `custom_words` / `allowlist`），写入经既有的 `ConfigMutationCoordinator` 与 `update_runtime_config` 原子提交并即时热生效，保存前按配置校验口径编译自定义正则，校验失败按 400（配置错误）/ 422（请求体形状错）分轨返回，磁盘/序列化故障仍走 500；`salt` 只写不回显——快照仅给 `salt_configured` 布尔，PUT 省略 / `null` / 空串均保持原值，非空才替换字面字节，响应与错误信息里不含盐明文；落盘按类型化差异比对，只写变动字段并保留未知键、注释与表内联写法，失效的空数组项清理；脱敏边界不变，仍只作用于上游出口（沿用 0003 口径）
 - **2026-10-29** · **UI**：[0014 设置页隐私过滤配置](ui/changes/0014-privacy-settings.md) — 设置页新增 `privacy` tab（`SETTINGS_TABS` 与 `SettingsPage` 的 `TabsTrigger` / `TabsContent` 同步，`?tab=privacy` 可深链进侧边子菜单）：总开关 + `mask` / `warn` / `block` 三模式（含各模式语义说明）+ `restore` 开关、七个内置检测器勾选、自定义正则 / 自定义词 / allowlist 列表编辑、`salt` 只替换不回显（仅展示「已配置」状态，输入留空 = 不修改，不提供清除入口）；表单编辑只落本地草稿并维护脏标记，保存是唯一写服务端的显式动作（`PUT /api/config`），旁边配丢弃草稿的「撤销」，成功后草稿转为已同步、失败保留草稿并明确提示「保存未确认」而非断言服务端仍是旧配置
