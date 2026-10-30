@@ -126,9 +126,18 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
         match &config_guard.gateway_auth {
             Some(auth_config) => {
                 if auth_config.api_keys.is_empty() {
-                    // Empty api_keys list means "no auth" — same as removing
-                    // the [gateway_auth] section entirely.
-                    true
+                    // An empty api_keys list is invalid: any list of zero keys
+                    // can never match a credential, so the safe reading is
+                    // "deny everything" rather than "no auth". Config load
+                    // normalizes an empty list to a missing [gateway_auth]
+                    // section, so this arm is only a last-resort guard and
+                    // must never fail open.
+                    warn!(
+                        "gateway_auth is configured with an empty api_keys list; \
+                         all requests are being rejected (remove the \
+                         [gateway_auth] section to disable auth)"
+                    );
+                    false
                 } else {
                     let provided_key = match auth_header.or(x_api_key) {
                         Some(key) => key,
@@ -324,14 +333,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_empty_key_list_allows_all() {
+    async fn auth_empty_key_list_denies_all() {
+        // An empty list cannot authorize anything; the guard must fail closed.
         let state = test_state(Some(vec![])).await;
         let app = test_app(state);
 
         let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "UNAUTHORIZED");
     }
 
     #[tokio::test]
