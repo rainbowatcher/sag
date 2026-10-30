@@ -106,11 +106,11 @@ flowchart LR
 
 ### 热重载 vs 重启
 
-大部分配置支持热重载，但 `[server]` 和 `[gateway_auth]` 不支持。这是因为：
+大部分配置支持热重载，但 `[server]` 不支持；`[gateway_auth]` 则支持。这是因为：
 - `[server].host/port`：已绑定的 TCP socket 无法热迁移到新地址
-- `[gateway_auth]`：认证中间件在 Axum 路由构建时注入，热替换需要重建整个 router（等同于重启）
+- `[gateway_auth]`：支持热重载——认证中间件虽在 Axum 路由构建时注入，但每次请求都读取当前内存配置（`state.config.read().await`），热替换 `ConfigHandle` 即生效，无需重建整个 router
 
-**Trade-off**: 大部分运维场景中 server/auth 在部署时确定，不需要运行时修改。Provider 和 routes 是运维日
+**Trade-off**: 大部分运维场景中 `[server]` 在部署时确定，不需要运行时修改。Provider 和 routes 是运维日
 
 常调整的，热重载提供即时生效。
 

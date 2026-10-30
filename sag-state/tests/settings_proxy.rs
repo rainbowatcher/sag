@@ -497,3 +497,39 @@ async fn update_settings_trims_api_keys() {
     let auth = cfg.gateway_auth.as_ref().expect("gateway_auth must be set");
     assert_eq!(auth.api_keys, vec!["sk-padded"]);
 }
+
+/// A list with no usable key (`[""]` / `["   "]`) is rejected and leaves
+/// the committed config untouched — otherwise the persisted `gateway_auth`
+/// would authenticate a blank credential.
+#[tokio::test]
+async fn update_settings_rejects_blank_only_api_key_list() {
+    let path = unique_temp_path("sag_settings_auth_blank_only");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, initial_toml()).unwrap();
+
+    let (coord, handle) = make_coordinator(&path);
+    coord
+        .update_settings(None, Some(vec!["existing-key".into()]))
+        .await
+        .expect("seeding a usable key must succeed");
+
+    for blank in ["", "   "] {
+        let err = coord
+            .update_settings(None, Some(vec![blank.into()]))
+            .await
+            .expect_err("a list without a usable key must be rejected");
+        assert!(
+            err.to_string()
+                .contains("api_keys must contain at least one non-empty key"),
+            "the shared `has_usable_key` guard must reject a blank-only list, got: {err}"
+        );
+        let cfg = handle.read().await;
+        assert_eq!(
+            cfg.gateway_auth.as_ref().map(|a| a.api_keys.clone()),
+            Some(vec!["existing-key".to_string()]),
+            "rejected mutation must leave the config unchanged"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

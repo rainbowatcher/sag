@@ -16,8 +16,15 @@ updated: 2026-06-03
 | 配置 | 行为 |
 |------|------|
 | 无 `[gateway_auth]` 段 | 完全开放，无需认证 |
-| `api_keys = []` | 完全开放（同无配置） |
+| `api_keys = []` | 加载时归一化为「段缺失」，即完全开放（同无配置） |
 | `api_keys = ["key1", "key2"]` | 需要 `Authorization: Bearer <key>` |
+
+补充约束：
+
+- 空列表在加载（启动与热重载）时被归一化为「无 `[gateway_auth]` 段」，即关闭认证，并记录一条 `gateway authentication is disabled` warning。
+- 只含空白字符的 key 列表（`api_keys = [""]`、`["   "]`）被校验拒绝，进程不启动；`gateway_auth` 段必须至少含一个非空白 key。
+- 非空白 key 与空白条目混写可通过校验，但空白条目永远匹配不到任何凭据。
+- 内存中绕过加载归一化、直接构造出的空列表或全空白列表，由认证中间件一律拒绝（`401 UNAUTHORIZED`），包括 `Authorization: Bearer ` 携带空凭据的请求；该分支绝不 fail-open。
 
 ### 错误响应
 
@@ -58,3 +65,4 @@ updated: 2026-06-03
 ## 变更记录
 
 - [0001 初始化](changes/0001-initial.md)
+- [0009 空 `api_keys` 归一化为关闭鉴权并告警](../config/changes/0009-empty-api-keys-normalize-to-disabled-auth.md) — 空列表归一化为段缺失、空白 key 被拒、中间件 fail-closed

@@ -41,7 +41,7 @@ updated: 2026-10-30
 3. 替换 `AppState` 中的配置（通过 `Arc<RwLock<GatewayConfig>>`）
 4. 清除路由的 shuffle 缓存和 sticky active targets（因为 targets 可能变了）
 
-**热重载边界**：`[server].host` 和 `[server].port` 修改不触发 listen socket 重新 bind——需要重启生效。`[gateway_auth]` 同样需要重启。
+**热重载边界**：`[server].host` 和 `[server].port` 修改不触发 listen socket 重新 bind——需要重启生效。`[gateway_auth]` 则经热重载即时生效（认证中间件每次请求读取当前内存配置，无需重建 router）。
 
 **监听与防抖**（[0002](changes/0002-hot-reload-trailing-debounce.md) 起）：
 - 同时监听配置文件**父目录**与文件本身；原子 temp-file + rename 保存不会中断监听（目录监听不受 inode 替换影响），事件按配置路径/文件名过滤，`Access` 类只读事件忽略。

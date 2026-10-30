@@ -318,7 +318,7 @@ Dashboard 前端在登录页输入 URL 和 API Key 后，会将连接信息保�
 
 ## 热重载
 
-配置文件使用 `notify` 库监听变化。更新后，供应商和路由会在不重启服务器的情况下即时生效。服务器设置（`[server]`）不支持热更新，需重启服务。通过 Settings 页 / `PUT /api/settings` 修改的 `gateway_auth.api_keys` 会立即在内存生效并持久化；外部直接改配置文件中的 `[gateway_auth]` 则需重启（文件热重载路径不重建认证中间件依赖的 router）。
+配置文件使用 `notify` 库监听变化。更新后，供应商和路由会在不重启服务器的情况下即时生效。服务器设置（`[server]`）不支持热更新，需重启服务。通过 Settings 页 / `PUT /api/settings` 修改的 `gateway_auth.api_keys` 会立即在内存生效并持久化；外部直接改配置文件中的 `[gateway_auth]` 同样经热重载即时生效（认证中间件每次请求读取当前内存配置，无需重建 router）。
 
 ## 环境变量
 

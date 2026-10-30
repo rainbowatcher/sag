@@ -191,6 +191,11 @@ impl GatewayConfig {
         // `None`. Collapsing it here makes the documented behaviour work at
         // load time while `validate_gateway_auth` keeps rejecting a directly
         // constructed `Some(empty)` as a belt-and-braces guard.
+        //
+        // Only the zero-length list is collapsed. A list whose keys are all
+        // blank (`[""]`, `["   "]`) is deliberately **not** collapsed: blank
+        // keys are not credentials, so such a config must fail validation at
+        // startup instead of silently starting without authentication.
         if self
             .gateway_auth
             .as_ref()
@@ -272,16 +277,20 @@ impl GatewayConfig {
 
     /// ── Gateway auth validation ──
     ///
-    /// `Some` with an empty `api_keys` list is a hard error: the canonical
+    /// `Some` without a single usable key is a hard error: the canonical
     /// "authentication disabled" form is `None`, which
     /// [`GatewayConfig::normalize`] produces from an empty list at load time.
-    /// Keeping the rejection here guards callers that build `Some(empty)`
-    /// directly and bypass normalization. `None` is valid but disables
-    /// authentication, which is worth a warning.
+    /// Keeping the rejection here guards callers that build `Some(empty)` (or
+    /// `Some` with only blank keys) directly and bypass normalization —
+    /// [`GatewayAuthConfig::has_usable_key`] is the single definition of "a
+    /// blank key is not a credential". A list that also holds at least one
+    /// usable key is accepted. `None` is valid but disables authentication,
+    /// which is worth a warning.
     fn validate_gateway_auth(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
         match self.gateway_auth.as_ref() {
-            Some(auth) if auth.api_keys.is_empty() => errors.push(
-                "gateway_auth.api_keys must not be empty when authentication is configured".into(),
+            Some(auth) if !auth.has_usable_key() => errors.push(
+                "gateway_auth.api_keys must contain at least one non-empty key when authentication is configured"
+                    .into(),
             ),
             Some(_) => {}
             None => warnings.push(
@@ -849,6 +858,23 @@ fn default_session_retention_days() -> u32 {
 pub struct GatewayAuthConfig {
     /// List of valid API keys for clients calling this gateway.
     pub api_keys: Vec<String>,
+}
+
+impl GatewayAuthConfig {
+    /// Whether at least one configured key is a usable credential.
+    ///
+    /// Invariant: a key that is empty or whitespace-only is **not** a
+    /// credential. A `gateway_auth` whose keys are all blank therefore means
+    /// "no authentication is configured" — the same state as a missing
+    /// `[gateway_auth]` section — and must be treated as invalid (rejected by
+    /// [`GatewayConfig::validate`]) or disabled (denied by the router auth
+    /// middleware), never as "authorized by an empty string".
+    ///
+    /// This is the single source of truth for the rule; callers must not
+    /// re-implement the `trim().is_empty()` test.
+    pub fn has_usable_key(&self) -> bool {
+        self.api_keys.iter().any(|k| !k.trim().is_empty())
+    }
 }
 
 /// Fixed-key capability override for a route target (§7.1.3 / D3).
@@ -3169,9 +3195,57 @@ targets = []"#,
             let err = config.validate().unwrap_err();
             assert!(
                 err.iter()
-                    .any(|e| e.contains("gateway_auth.api_keys must not be empty")),
+                    .any(|e| e
+                        .contains("gateway_auth.api_keys must contain at least one non-empty key")),
                 "expected gateway_auth error, got {err:?}"
             );
+        }
+
+        #[test]
+        fn rejects_blank_only_gateway_auth_keys() {
+            // `[""]` used to pass validation and then authorize
+            // `Authorization: Bearer ` (empty credential) in the router.
+            for blank in ["", "   ", "\t\n"] {
+                let mut config = valid_config();
+                config.gateway_auth = Some(GatewayAuthConfig {
+                    api_keys: vec![blank.into()],
+                });
+                let err = config.validate().unwrap_err();
+                assert!(
+                    err.iter().any(|e| e
+                        .contains("gateway_auth.api_keys must contain at least one non-empty key")),
+                    "blank key {blank:?} must be rejected, got {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn accepts_gateway_auth_with_blank_entry_alongside_usable_key() {
+            // One usable key is enough: a stray blank entry must not reject
+            // an otherwise working config (the middleware never matches a
+            // blank credential, so the blank entry is inert).
+            let mut config = valid_config();
+            config.gateway_auth = Some(GatewayAuthConfig {
+                api_keys: vec!["valid-key".into(), String::new()],
+            });
+            assert!(
+                config.validate().is_ok(),
+                "a blank entry next to a usable key must validate: {:?}",
+                config.validate()
+            );
+            assert!(config.gateway_auth.unwrap().has_usable_key());
+        }
+
+        #[test]
+        fn has_usable_key_requires_non_whitespace_content() {
+            let named = |keys: Vec<&str>| GatewayAuthConfig {
+                api_keys: keys.into_iter().map(str::to_string).collect(),
+            };
+            assert!(!named(vec![]).has_usable_key());
+            assert!(!named(vec![""]).has_usable_key());
+            assert!(!named(vec!["", "   ", "\t"]).has_usable_key());
+            assert!(named(vec!["key"]).has_usable_key());
+            assert!(named(vec!["", " key "]).has_usable_key());
         }
 
         #[test]
@@ -3179,6 +3253,102 @@ targets = []"#,
             let mut config = valid_config();
             config.gateway_auth = None;
             assert!(config.validate().is_ok());
+        }
+
+        // ── `validate()` must actually emit the warnings it collects ──
+
+        /// Minimal [`tracing::Subscriber`] that records every event message.
+        ///
+        /// `sag-config` has no `tracing-subscriber` dependency, so a scoped
+        /// hand-rolled subscriber is the cheapest way to prove that the
+        /// warnings collected by `validate()` really reach the log (a
+        /// subsystem test on the private `validate_gateway_auth` cannot).
+        #[derive(Clone, Default)]
+        struct CapturedWarnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl CapturedWarnings {
+            fn text(&self) -> String {
+                self.0.lock().unwrap().join("\n")
+            }
+        }
+
+        struct MessageVisitor(Vec<String>);
+
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0.push(value.to_string());
+                }
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0.push(format!("{value:?}"));
+                }
+            }
+        }
+
+        impl tracing::Subscriber for CapturedWarnings {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = MessageVisitor(Vec::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().extend(visitor.0);
+            }
+        }
+
+        /// Run `validate()` with warnings captured, returning the result and
+        /// the captured text.
+        fn validate_capturing(
+            config: &GatewayConfig,
+        ) -> (std::result::Result<(), Vec<String>>, String) {
+            let capture = CapturedWarnings::default();
+            let result = tracing::subscriber::with_default(capture.clone(), || config.validate());
+            (result, capture.text())
+        }
+
+        #[test]
+        fn validate_emits_auth_disabled_warning() {
+            let mut config = valid_config();
+            config.gateway_auth = None;
+
+            let (result, logged) = validate_capturing(&config);
+            assert!(result.is_ok(), "auth off is valid, got {result:?}");
+            assert!(
+                logged.contains("authentication is disabled"),
+                "validate() must emit the auth-disabled warning, captured: {logged:?}"
+            );
+        }
+
+        #[test]
+        fn validate_emits_no_auth_disabled_warning_with_usable_key() {
+            let mut config = valid_config();
+            config.gateway_auth = Some(GatewayAuthConfig {
+                api_keys: vec!["key1".into()],
+            });
+
+            let (result, logged) = validate_capturing(&config);
+            assert!(result.is_ok(), "expected no errors, got {result:?}");
+            assert!(
+                !logged.contains("authentication is disabled"),
+                "no auth-disabled warning expected, captured: {logged:?}"
+            );
         }
 
         #[test]

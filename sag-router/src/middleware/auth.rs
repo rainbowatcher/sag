@@ -121,23 +121,27 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
     // then release it. Holding the lock across `next.run` would deadlock
     // any handler that needs to acquire a write lock (e.g. the admin
     // `POST/DELETE` endpoints that mutate `config.providers`).
-    let key_valid: bool = {
+    //
+    // `Some(reason)` means "deny this request"; `reason` is the single warning
+    // line emitted for it below. Keeping the decision separate from the log is
+    // what keeps a misconfigured `gateway_auth` at exactly one WARN per
+    // request instead of one from this arm plus the shared denial log.
+    let denial: Option<&'static str> = {
         let config_guard = state.config.read().await;
         match &config_guard.gateway_auth {
             Some(auth_config) => {
-                if auth_config.api_keys.is_empty() {
-                    // An empty api_keys list is invalid: any list of zero keys
-                    // can never match a credential, so the safe reading is
-                    // "deny everything" rather than "no auth". Config load
-                    // normalizes an empty list to a missing [gateway_auth]
-                    // section, so this arm is only a last-resort guard and
-                    // must never fail open.
-                    warn!(
-                        "gateway_auth is configured with an empty api_keys list; \
-                         all requests are being rejected (remove the \
-                         [gateway_auth] section to disable auth)"
-                    );
-                    false
+                if !auth_config.has_usable_key() {
+                    // No usable key (empty list, or every key blank) is
+                    // invalid: a blank key is not a credential, so the safe
+                    // reading is "deny everything" rather than "no auth".
+                    // Config load normalizes an empty list to a missing
+                    // [gateway_auth] section and rejects a blank-only list, so
+                    // this arm is only a last-resort guard and must never
+                    // fail open.
+                    Some(
+                        "gateway_auth.api_keys has no non-empty key: all requests are being \
+                         rejected (remove the [gateway_auth] section to disable auth)",
+                    )
                 } else {
                     let provided_key = match auth_header.or(x_api_key) {
                         Some(key) => key,
@@ -163,24 +167,34 @@ pub async fn gateway_auth(State(state): State<AppState>, request: Request, next:
                             };
                         }
                     };
-                    auth_config.api_keys.iter().any(|k| k == &provided_key)
+                    // A credential that trims to empty is not a credential:
+                    // it must never match, even if a blank key somehow reached
+                    // the configured list (the invariant therefore does not
+                    // depend on the `has_usable_key` arm alone).
+                    let presented = provided_key.trim();
+                    if !presented.is_empty() && auth_config.api_keys.iter().any(|k| k == presented)
+                    {
+                        None
+                    } else {
+                        Some("invalid gateway API key")
+                    }
                 }
             }
             None => {
                 // No gateway auth configured — allow all requests
-                true
+                None
             }
         }
     };
 
-    if !key_valid {
+    if let Some(reason) = denial {
         // Same attribution as the missing-header branch: invalid keys are the
         // brute-force signal, so the peer and client matter even more here.
         warn!(
             path = %path,
             client_ip = %client_ip_for_log(&request),
             user_agent = %user_agent_for_log(&request),
-            "invalid gateway API key"
+            "{reason}"
         );
         let err = AppError::Unauthorized("invalid API key".into());
         return if is_messages {
@@ -363,6 +377,56 @@ mod tests {
 
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_blank_only_key_list_denies_all() {
+        // `api_keys = [""]` must not mean "authenticated by the empty string":
+        // a blank key is not a credential, so the guard denies every request.
+        let state = test_state(Some(vec![String::new()])).await;
+        let app = test_app(state);
+
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "UNAUTHORIZED");
+
+        // And the empty credential itself is denied too.
+        let request = Request::builder()
+            .uri("/test")
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_blank_configured_key_never_matches_blank_credential() {
+        // One usable key is enough to keep auth enabled, but the blank entry
+        // next to it must stay inert: a blank credential never matches.
+        let state = test_state(Some(vec!["valid-key".into(), String::new()])).await;
+        let app = test_app(state);
+
+        let blank = Request::builder()
+            .uri("/test")
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(blank).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let valid = Request::builder()
+            .uri("/test")
+            .header(header::AUTHORIZATION, "Bearer valid-key")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(valid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     // ── missing-Authorization warning carries client_ip / user_agent ──

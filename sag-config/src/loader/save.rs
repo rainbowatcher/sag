@@ -27,8 +27,10 @@ use crate::toml_edit_util::{
 /// client API keys, so the admin save path owns `gateway_auth.api_keys`.
 /// An empty or absent key list means "no authentication", and the
 /// canonical on-disk form of that state is the section being absent: the
-/// `api_keys` array is written only when it is non-empty, and otherwise the
-/// `[gateway_auth]` section is removed from the file entirely (it is never
+/// `api_keys` array is written only when it is non-empty. Otherwise the
+/// `api_keys` key is dropped and the `[gateway_auth]` section is omitted
+/// **only when it would be empty afterwards** — sibling or unknown keys in
+/// that section keep it non-empty, so the section is preserved (it is never
 /// persisted as `api_keys = []`).
 ///
 /// All other sections — `[server]`, `[analytics]`, `[circuit_breaker]`,

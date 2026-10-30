@@ -830,21 +830,37 @@ impl ConfigMutationCoordinator {
         };
         sag_config::normalize_proxy_url(normalized.as_deref()).map_err(AppError::Config)?;
 
-        // Reject blank entries inside a supplied key list so a typo cannot
-        // silently create a key that can never authenticate. Empty list is
-        // allowed and means "disable authentication".
-        if let Some(ref keys) = api_keys
-            && keys.iter().any(|k| k.trim().is_empty())
-        {
-            return Err(AppError::Config(
-                "api_keys must not contain empty or whitespace-only values".into(),
-            ));
-        }
+        // Reject a supplied key list that has no usable key: a blank key is
+        // not a credential, so `[""]` must not persist a `gateway_auth` that
+        // would authenticate a blank credential. `has_usable_key` is the
+        // shared definition of "a usable key" (see
+        // `sag_config::GatewayAuthConfig::has_usable_key`), so the settings
+        // path and the file loader agree on what counts as a credential.
+        // The empty list stays allowed and means "disable authentication".
         let normalized_keys = api_keys.map(|keys| {
             keys.into_iter()
                 .map(|k| k.trim().to_string())
                 .collect::<Vec<String>>()
         });
+        if let Some(ref keys) = normalized_keys {
+            let configured = GatewayAuthConfig {
+                api_keys: keys.clone(),
+            };
+            if !keys.is_empty() && !configured.has_usable_key() {
+                return Err(AppError::Config(
+                    "api_keys must contain at least one non-empty key".into(),
+                ));
+            }
+            // Stricter than the file loader on purpose: a blank entry sitting
+            // next to a usable key is rejected too, so the settings API never
+            // persists a key that can never authenticate. The values are
+            // already trimmed here, so this is a plain emptiness test.
+            if keys.iter().any(String::is_empty) {
+                return Err(AppError::Config(
+                    "api_keys must not contain empty or whitespace-only values".into(),
+                ));
+            }
+        }
 
         self.mutate(true, |candidate| {
             candidate.proxy_url = normalized;

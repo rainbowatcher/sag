@@ -397,4 +397,43 @@ mod tests {
             "rejected mutation must not commit keys"
         );
     }
+
+    #[tokio::test]
+    async fn put_settings_blank_only_api_key_list_is_400() {
+        // `api_keys: [""]` must be rejected: persisting it would leave a
+        // gateway_auth that authenticates a blank credential.
+        for blank in ["", "   "] {
+            let (providers, routes) = one_provider_config("openai", vec![]);
+            let state = build_state_with_proxy(providers, routes, None).await;
+            // A pre-existing usable key proves the rejected mutation leaves
+            // the committed config untouched (it must not be cleared either).
+            {
+                let mut cfg = state.config.write().await;
+                cfg.gateway_auth = Some(sag_config::GatewayAuthConfig {
+                    api_keys: vec!["existing-key".into()],
+                });
+            }
+            let app = test_app(state.clone());
+
+            let response = put_settings(
+                &app,
+                &format!(r#"{{"proxy_url":null,"api_keys":["{blank}"]}}"#),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "api_keys [\"{blank}\"] must be rejected"
+            );
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["code"], "BAD_REQUEST");
+
+            let cfg = state.config.read().await;
+            assert_eq!(
+                cfg.gateway_auth.as_ref().map(|a| a.api_keys.clone()),
+                Some(vec!["existing-key".to_string()]),
+                "rejected mutation must leave the config unchanged"
+            );
+        }
+    }
 }

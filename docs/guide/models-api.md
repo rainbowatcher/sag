@@ -31,8 +31,10 @@ API Key 在 `gateway.toml` 的 `[gateway_auth]` 段定义：
 | 配置 | 行为 |
 |------|------|
 | 无 `[gateway_auth]` 段 | 完全开放，无需认证 |
-| `api_keys = []` | 完全开放（同上） |
+| `api_keys = []` | 加载时归一化为「段缺失」，即完全开放（同上） |
 | `api_keys = ["key1", "key2"]` | 只有提供有效 key 的请求可以通过 |
+
+空列表在加载（含热重载）时被归一化为「无 `[gateway_auth]` 段」并记录一条 warning，不会持久化成 `api_keys = []`；只含空白字符的 key（如 `api_keys = [""]`）被拒绝，配置无法加载。
 
 认证失败：`/v1/messages` 返回 Anthropic 错误 envelope；其余端点返回 OpenAI 错误 envelope。
 

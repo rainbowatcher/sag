@@ -259,6 +259,89 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 空白 key（`[""]` / `["   "]`）不是凭据：加载必须在 validate 阶段
+    /// 失败，而不是把它当成「鉴权关闭」或「空串即凭据」。
+    #[test]
+    fn load_config_rejects_blank_only_gateway_auth_api_keys() {
+        for blank in ["", "   "] {
+            let path = temp_toml(&format!(
+                r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+[gateway_auth]
+api_keys = ["{blank}"]
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = {{ chat_completions = {{ base_url = "https://api.openai.com/v1" }} }}
+"#
+            ));
+            let err = load_config(&path).unwrap_err().to_string();
+            assert!(
+                err.contains("gateway_auth.api_keys must contain at least one non-empty key"),
+                "blank key {blank:?} must fail validation, got: {err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 一个可用 key + 一个空白项是合法配置：鉴权保持开启。
+    #[test]
+    fn load_config_keeps_auth_enabled_with_blank_entry_alongside_usable_key() {
+        let path = temp_toml(
+            r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+[gateway_auth]
+api_keys = ["valid-key", ""]
+
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+"#,
+        );
+        let handle = load_config(&path).unwrap();
+        let config = handle.inner.try_read().unwrap();
+        let auth = config
+            .gateway_auth
+            .as_ref()
+            .expect("a usable key keeps gateway_auth configured");
+        assert!(auth.has_usable_key());
+        assert_eq!(auth.api_keys, vec!["valid-key", ""]);
+        drop(config);
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 现存的 `[gateway_auth]` 段但没有 `api_keys` 键：`api_keys` 没有 serde
+    /// default，所以解析直接报 `missing field`，不会静默降级为「无鉴权」。
+    /// 同理，写成 `api_key` 这类 typo 只是多一条 unknown-field 警告，仍然会因为
+    /// 缺少必填字段而失败。
+    #[test]
+    fn load_config_rejects_present_but_keyless_gateway_auth_section() {
+        for body in ["[gateway_auth]\n", "[gateway_auth]\napi_key = \"typo\"\n"] {
+            let path = temp_toml(&format!(
+                r#"[server]
+host = "127.0.0.1"
+port = 9090
+
+{body}
+[providers.openai]
+api_keys = ["sk-test"]
+apis = {{ chat_completions = {{ base_url = "https://api.openai.com/v1" }} }}
+"#
+            ));
+            let err = load_config(&path).unwrap_err().to_string();
+            assert!(
+                err.contains("failed to parse config") && err.contains("api_keys"),
+                "a keyless [gateway_auth] section must fail to parse, got: {err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     #[test]
     fn load_config_missing_file() {
         let result = load_config("/tmp/does-not-exist-sag-test.toml");
