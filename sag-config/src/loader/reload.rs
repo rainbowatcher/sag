@@ -168,7 +168,7 @@ fn classify_watcher_event(
 /// Returns early (no-op) while the debounce window is still open.
 async fn try_debounced_reload(
     last_event: &mut Option<tokio::time::Instant>,
-    rx: &mut tokio::sync::mpsc::Receiver<Result<Event, notify::Error>>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Result<Event, notify::Error>>,
     handler: &Arc<dyn ConfigReloadHandler>,
     path: &Path,
 ) {
@@ -250,12 +250,21 @@ pub fn spawn_hot_reload(
             return;
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<notify::Event, notify::Error>>(16);
+        // Deliberately UNBOUNDED and fed with a non-blocking `send`: a
+        // bounded channel would park this callback thread in `blocking_send`
+        // whenever the consumer is busy (e.g. mid-reload), and a callback
+        // parked outside its run loop makes notify's FSEvents `stop()`
+        // (`while CFRunLoopIsWaiting(runloop) == 0 { yield_now() }`) spin
+        // forever — deadlocking watcher shutdown, including the gateway's own
+        // `shutdown()`. The trailing debounce already coalesces bursts, so the
+        // queue does not grow in practice.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<notify::Event, notify::Error>>();
 
         let mut watcher = match RecommendedWatcher::new(
             move |res| {
-                if tx.blocking_send(res).is_err() {
-                    debug!("config watcher event dropped (receiver gone or channel full)");
+                if tx.send(res).is_err() {
+                    debug!("config watcher event dropped (receiver gone)");
                 }
             },
             notify::Config::default(),

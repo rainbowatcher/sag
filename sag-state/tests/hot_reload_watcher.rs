@@ -139,31 +139,28 @@ where
     }
 }
 
-/// Run `emit` (which performs a write to the config file) up to `attempts`
-/// times, polling `pred` after each emission. Writing repeatedly guards
-/// against two real-world races:
-/// - the watcher's directory watch may not be registered yet when the first
-///   write lands (the event would be missed), and
-/// - a transient failed read (mid-write) may need a re-trigger.
+/// Emit `emit` once (which performs a write to the config file), then poll
+/// `pred` until the expected FINAL state lands, with a generous deadline.
 ///
-/// Each attempt emits exactly once and then waits quietly, so the watcher's
-/// trailing debounce can fire.
-async fn emit_and_wait<F, Fut, E>(attempts: usize, mut emit: E, mut pred: F) -> Result<(), String>
+/// The assertion is on final state content, never on an event or reload count:
+/// how many watcher events a burst produces (and therefore how many
+/// intermediate reloads run) is an implementation detail of the debounce, not
+/// something a test should pin.
+///
+async fn emit_and_wait<F, Fut, E>(mut emit: E, mut pred: F) -> Result<(), String>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
     E: FnMut(),
 {
-    for _ in 0..attempts {
-        emit();
-        if wait_until(Duration::from_millis(1500), &mut pred)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err("condition not satisfied after repeated config writes".into())
+    // `spawn_hot_reload` registers the directory watch inside the spawned
+    // task, so a write issued before that task has been polled would be
+    // missed outright (no event, and nothing to re-trigger it). The task's
+    // body runs synchronously up to its first `await`, so handing the
+    // scheduler a turn is enough to have the watch registered.
+    tokio::task::yield_now().await;
+    emit();
+    wait_until(Duration::from_secs(10), &mut pred).await
 }
 
 #[tokio::test]
@@ -184,7 +181,6 @@ async fn external_edit_reloaded_then_ui_mutation_succeeds() {
     // provider `p1` in the file. SAG must detect and reload it.
     let edited = toml_with_enabled_models(&["gpt-4"]);
     emit_and_wait(
-        5,
         || std::fs::write(&file_path, &edited).unwrap(),
         || async { enabled_models(&handle, "p1").await == vec!["gpt-4".to_string()] },
     )
@@ -240,7 +236,6 @@ async fn atomic_replace_burst_reloads_final_version() {
 
     let expected = vec!["gpt-4".to_string(), "gpt-4o".to_string()];
     emit_and_wait(
-        8,
         || {
             // Write the intermediate and final versions back-to-back within a
             // single burst, as an editor's staged atomic save would. Both are
@@ -330,7 +325,6 @@ async fn sag_own_persist_reloaded_without_false_conflict() {
     // to the probe file.
     let probe = toml_with_enabled_models(&["probe"]);
     emit_and_wait(
-        5,
         || std::fs::write(&file_path, &probe).unwrap(),
         || async { enabled_models(&handle, "p1").await == vec!["probe".to_string()] },
     )
