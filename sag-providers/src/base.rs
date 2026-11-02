@@ -16,6 +16,150 @@ fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base, path)
 }
 
+/// Maximum number of characters of an upstream body kept in a JSON
+/// parse-failure diagnostic. Bounds how much upstream content can reach the
+/// logs and the admin UI.
+const BODY_PREVIEW_LIMIT: usize = 200;
+
+/// A non-streaming upstream response: body text plus the metadata needed to
+/// diagnose a JSON parse failure.
+///
+/// Returned by [`ProviderBase::send_json_response`]. The status is always 2xx
+/// (non-2xx bodies turn into [`AppError::Upstream`] earlier), and
+/// `content_type` is the raw `content-type` header when the upstream sent one.
+/// It is informational only — a `text/plain` body holding valid JSON must
+/// still parse.
+#[derive(Debug, Clone)]
+pub struct UpstreamResponse {
+    /// Body decoded as text.
+    pub text: String,
+    /// HTTP status code of the (successful) response.
+    pub status: u16,
+    /// Raw `content-type` header value, if any.
+    pub content_type: Option<String>,
+}
+
+/// Build a safe, single-line preview of an upstream body for an error message.
+///
+/// Whitespace runs collapse into one space and credential-looking tokens are
+/// masked, so an HTML fallback page (or an echoed API key) cannot flood the
+/// logs or the admin UI.
+fn body_preview(body: &str) -> String {
+    // Bound the scan: only text that can reach the preview matters, so a
+    // multi-megabyte page is never processed in full.
+    let bounded: String = body.chars().take(BODY_PREVIEW_LIMIT * 4).collect();
+    let collapsed = collapse_whitespace(&bounded);
+    // Mask before truncating: truncation must never leave a key fragment that
+    // no longer looks long enough to be recognized as a secret.
+    let redacted = redact_secrets(&collapsed);
+    let mut preview: String = redacted.chars().take(BODY_PREVIEW_LIMIT).collect();
+    if redacted.chars().count() > BODY_PREVIEW_LIMIT {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Collapse every whitespace run into a single space and trim the ends.
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Replace credential-looking tokens with `***`.
+///
+/// A token is a maximal run of `[A-Za-z0-9_-]`. It is masked when it is at
+/// least 32 characters long, or when it starts with `sk-` and carries at least
+/// 6 more characters — the shapes of an opaque API key.
+fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token_start: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        let in_token = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        match (in_token, token_start) {
+            (true, None) => token_start = Some(idx),
+            (false, Some(start)) => {
+                push_redacted(&mut out, &text[start..idx]);
+                token_start = None;
+                out.push(ch);
+            }
+            (false, None) => out.push(ch),
+            (true, Some(_)) => {}
+        }
+    }
+    if let Some(start) = token_start {
+        push_redacted(&mut out, &text[start..]);
+    }
+    out
+}
+
+/// Append `token` to `out`, masking it when it looks like a credential.
+fn push_redacted(out: &mut String, token: &str) {
+    let long = token.len() >= 32;
+    let bare_key = token
+        .strip_prefix("sk-")
+        .is_some_and(|rest| rest.len() >= 6);
+    if long || bare_key {
+        out.push_str("***");
+    } else {
+        out.push_str(token);
+    }
+}
+
+/// Hint appended when the body looks like an HTML page rather than JSON.
+const HTML_HINT: &str = "hint: upstream returned HTML, not JSON - the provider \
+base_url is probably missing a path segment (e.g. /v1)";
+
+/// True when the body (content-type or preview) looks like an HTML page.
+fn looks_like_html(response: &UpstreamResponse, preview: &str) -> bool {
+    let html_content_type = response
+        .content_type
+        .as_deref()
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("html"));
+    html_content_type || preview.trim_start().starts_with('<')
+}
+
+/// Render a JSON parse failure into a self-diagnosing message.
+///
+/// Carries the serde error (or `empty body`), the HTTP status, the upstream
+/// `content-type`, a masked body preview, and — for HTML bodies — a hint that
+/// the base URL may be missing a path segment.
+fn json_parse_diagnostic(
+    context: &str,
+    response: &UpstreamResponse,
+    err: &serde_json::Error,
+) -> String {
+    let status = response.status;
+    let content_type = response.content_type.as_deref().unwrap_or("<none>");
+    let preview = body_preview(&response.text);
+    let hint = if looks_like_html(response, &preview) {
+        format!("; {HTML_HINT}")
+    } else {
+        String::new()
+    };
+    if response.text.trim().is_empty() {
+        return format!(
+            "failed to parse {context}: empty body; status={status}; \
+content-type={content_type}{hint}"
+        );
+    }
+    format!(
+        "failed to parse {context}: {err}; status={status}; content-type={content_type}; \
+body preview: \"{preview}\"{hint}"
+    )
+}
+
 /// Shared state and helper methods for all provider adapters.
 ///
 /// Each provider struct (e.g. `OpenAiProvider`, `AnthropicProvider`,
@@ -339,13 +483,19 @@ impl ProviderBase {
 
     /// Check upstream response status for **non-streaming** requests.
     ///
-    /// On success returns the response body text for further parsing.
-    /// On error returns `AppError::Upstream`.
+    /// On success returns the body text plus the status / `content-type`
+    /// needed to diagnose a later parse failure. On error returns
+    /// `AppError::Upstream`.
     pub(crate) async fn check_upstream_error(
         &self,
         response: reqwest::Response,
-    ) -> sag_core::Result<String> {
+    ) -> sag_core::Result<UpstreamResponse> {
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body_text = response.text().await.map_err(AppError::from)?;
 
         if !(200..300).contains(&status) {
@@ -357,7 +507,11 @@ impl ProviderBase {
             });
         }
 
-        Ok(body_text)
+        Ok(UpstreamResponse {
+            text: body_text,
+            status,
+            content_type,
+        })
     }
 
     /// Send a JSON POST request for `kind` and return the response body
@@ -378,14 +532,61 @@ impl ProviderBase {
         target_extra: &HashMap<String, serde_json::Value>,
         timeout_secs: Option<u64>,
     ) -> sag_core::Result<String> {
+        Ok(self
+            .send_json_response(url, kind, body, target_extra, timeout_secs)
+            .await?
+            .text)
+    }
+
+    /// Send a JSON POST request for `kind` and return the body together with
+    /// the status / `content-type` of the response.
+    ///
+    /// Same as [`Self::send_json`], but keeps the metadata a caller needs to
+    /// build a self-diagnosing parse error via [`Self::parse_json_response`].
+    pub async fn send_json_response(
+        &self,
+        url: &str,
+        kind: ApiKind,
+        body: serde_json::Value,
+        target_extra: &HashMap<String, serde_json::Value>,
+        timeout_secs: Option<u64>,
+    ) -> sag_core::Result<UpstreamResponse> {
         let mut request = self.build_request(url, kind, body, target_extra);
         if let Some(secs) = timeout_secs {
             request = request.timeout(std::time::Duration::from_secs(secs));
         }
         let response = request.send().await.map_err(AppError::from)?;
-        let body_text = self.check_upstream_error(response).await?;
-        trace!(response_body = %body_text, "upstream response body");
-        Ok(body_text)
+        let response = self.check_upstream_error(response).await?;
+        trace!(response_body = %response.text, "upstream response body");
+        Ok(response)
+    }
+
+    /// Deserialize a non-streaming upstream body as JSON.
+    ///
+    /// `content-type` is never trusted up front: a `text/plain` body that is
+    /// valid JSON parses normally. Only an actual serde failure becomes a
+    /// self-diagnosing [`AppError::Upstream`] (status, content-type, serde
+    /// error, masked body preview, and a base_url hint for HTML pages), so an
+    /// HTML fallback page or an empty body is distinguishable from a genuine
+    /// parse bug. `context` names the lane in the message (e.g. `"anthropic
+    /// response"`).
+    pub(crate) fn parse_json_response<T: serde::de::DeserializeOwned>(
+        &self,
+        response: &UpstreamResponse,
+        context: &str,
+    ) -> sag_core::Result<T> {
+        match serde_json::from_str(&response.text) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let body = json_parse_diagnostic(context, response, &err);
+                warn!(provider = %self.name, %body, "upstream body is not valid JSON");
+                Err(AppError::Upstream {
+                    provider: self.name.clone(),
+                    status: response.status,
+                    body,
+                })
+            }
+        }
     }
 
     /// Send a JSON POST request for `kind` (streaming) and return the
@@ -2003,5 +2204,44 @@ mod tests {
             "code": 503,
             "message": "service unavailable"
         })));
+    }
+
+    // ── parse-failure diagnostics ────────────────────────────────
+
+    #[test]
+    fn body_preview_collapses_whitespace_and_truncates() {
+        let html = format!("<!DOCTYPE html>\n\n  <html> {}", "lorem ipsum ".repeat(40));
+        let preview = body_preview(&html);
+
+        assert!(
+            preview.starts_with("<!DOCTYPE html> <html> lorem"),
+            "whitespace runs collapse into one space: {preview}"
+        );
+        assert!(!preview.contains('\n'), "preview is single-line: {preview}");
+        assert_eq!(
+            preview.chars().count(),
+            BODY_PREVIEW_LIMIT + 1,
+            "truncated to the limit plus the ellipsis marker: {preview}"
+        );
+        assert!(preview.ends_with('…'), "{preview}");
+
+        // Short bodies are kept verbatim (after collapse).
+        assert_eq!(body_preview("a \n\tb"), "a b");
+    }
+
+    #[test]
+    fn body_preview_masks_credential_looking_tokens() {
+        // Tokens are built at runtime: a literal credential-shaped string
+        // would be scrubbed by secret scanners that read this file.
+        let sk_key = format!("sk-{}", "0123456789abcdef".repeat(2));
+        let opaque = "abcdef123456".repeat(3);
+        let body = format!("bad key {sk_key} and opaque {opaque} plus short sk-abc");
+        let preview = body_preview(&body);
+
+        assert!(!preview.contains(&sk_key), "sk- key leaked: {preview}");
+        assert!(!preview.contains(&opaque), "opaque key leaked: {preview}");
+        assert!(preview.contains("***"), "mask marker missing: {preview}");
+        // Short `sk-` runs are not credentials and stay readable.
+        assert!(preview.contains("sk-abc"), "{preview}");
     }
 }

@@ -419,7 +419,7 @@ base_url = "https://api.openai.com/v1"
 api_keys = ["${ANTHROPIC_API_KEY}"]
 
 [providers.anthropic.apis.anthropic_messages]
-base_url = "https://api.anthropic.com"
+base_url = "https://api.anthropic.com/v1"
 
 # 主模型 — OpenAI 优先，Anthropic 兜底
 [[routes]]

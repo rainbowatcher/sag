@@ -338,9 +338,9 @@ impl AnthropicProvider {
         let timeout = self
             .base
             .effective_timeout(ApiKind::AnthropicMessages, timeout_secs);
-        let body_text = self
+        let response = self
             .base
-            .send_json(
+            .send_json_response(
                 &url,
                 ApiKind::AnthropicMessages,
                 body,
@@ -348,9 +348,9 @@ impl AnthropicProvider {
                 Some(timeout),
             )
             .await?;
-        self.check_200_error(&body_text)?;
-        serde_json::from_str(&body_text)
-            .map_err(|e| AppError::Internal(format!("failed to parse anthropic response: {e}")))
+        self.check_200_error(&response.text)?;
+        self.base
+            .parse_json_response(&response, "anthropic response")
     }
 
     /// Apply role mappings and optional cache_control to a native
@@ -667,9 +667,9 @@ impl LlmProvider for AnthropicProvider {
         let timeout = self
             .base
             .effective_timeout(ApiKind::AnthropicMessages, timeout_secs);
-        let body_text = self
+        let response = self
             .base
-            .send_json(
+            .send_json_response(
                 &url,
                 ApiKind::AnthropicMessages,
                 body,
@@ -678,10 +678,11 @@ impl LlmProvider for AnthropicProvider {
             )
             .await?;
 
-        self.check_200_error(&body_text)?;
+        self.check_200_error(&response.text)?;
 
-        let raw: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| AppError::Internal(format!("failed to parse anthropic response: {e}")))?;
+        let raw: serde_json::Value = self
+            .base
+            .parse_json_response(&response, "anthropic response")?;
 
         Ok(Self::from_anthropic_response(&raw, real_model))
     }
@@ -1714,5 +1715,136 @@ mod tests {
         assert_eq!(resp["id"], "msg_n");
         assert_eq!(resp["content"][0]["text"], "native");
         assert_eq!(resp["usage"]["input_tokens"], 3);
+    }
+
+    // ── non-JSON 2xx bodies are self-diagnosing ──────────────────
+
+    #[tokio::test]
+    async fn messages_native_html_2xx_reports_diagnosable_upstream_error() {
+        use tokio::io::AsyncWriteExt;
+        // A base_url missing `/v1` hits the SPA fallback page instead of the
+        // API, so the upstream answers 200 + text/html. The key is built at
+        // runtime: a literal credential-shaped string would be scrubbed by
+        // secret scanners that read this file.
+        let key = format!("sk-{}", "0123456789abcdef".repeat(2));
+        let html = format!(
+            "<!DOCTYPE html><html><title>TokenFlux</title>\
+<script>var k = \"{key}\";</script>not found</html>"
+        );
+        let base_url = crate::test_support::spawn_server(move |mut stream| async move {
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, None);
+        let req_body = serde_json::json!({
+            "model": "claude-3",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let err = provider
+            .messages_native(req_body, &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+
+        match err {
+            AppError::Upstream {
+                provider,
+                status,
+                body,
+            } => {
+                assert_eq!(provider, "test");
+                assert_eq!(status, 200, "the upstream answered 200, not 5xx");
+                assert!(body.contains("text/html"), "content-type missing: {body}");
+                assert!(body.contains("base_url"), "base_url hint missing: {body}");
+                assert!(
+                    body.contains("<!DOCTYPE html>"),
+                    "body preview missing: {body}"
+                );
+                assert!(
+                    !body.contains(&key),
+                    "credential leaked into the message: {body}"
+                );
+                assert!(body.contains("***"), "mask marker missing: {body}");
+                assert!(
+                    !body.contains('\n'),
+                    "preview must stay single-line: {body}"
+                );
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_native_empty_2xx_body_reports_empty_body() {
+        use tokio::io::AsyncWriteExt;
+        let base_url = crate::test_support::spawn_server(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, None);
+        let req_body = serde_json::json!({
+            "model": "claude-3",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let err = provider
+            .messages_native(req_body, &HashMap::new(), 30)
+            .await
+            .unwrap_err();
+
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 200);
+                assert!(body.contains("empty body"), "{body}");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_native_text_plain_json_body_still_succeeds() {
+        use tokio::io::AsyncWriteExt;
+        // content-type is not trusted: a text/plain body holding valid JSON
+        // must parse normally.
+        let body = r#"{"id":"msg_p","type":"message","role":"assistant","model":"claude-3","content":[{"type":"text","text":"plain"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let base_url = crate::test_support::spawn_server(move |mut stream| {
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, None);
+        let req_body = serde_json::json!({
+            "model": "claude-3",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let resp = provider
+            .messages_native(req_body, &HashMap::new(), 30)
+            .await
+            .expect("valid JSON behind text/plain must not be rejected");
+        assert_eq!(resp["id"], "msg_p");
     }
 }

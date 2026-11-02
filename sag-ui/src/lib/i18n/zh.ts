@@ -187,7 +187,8 @@ export const zh: Record<keyof typeof en, string> = {
   "providers.probe.backfillOne": "回填 1 个协议",
   "providers.probe.backfillMany": "回填 {count} 个协议",
   "providers.probe.modelHintLead": "模型：建议使用非推理模型。使用 ",
-  "providers.probe.modelHintTail": " 在所有协议间共享同一个 base URL。",
+  "providers.probe.modelHintTail":
+    " 在所有协议间共享同一个 base URL。base URL 必须包含版本路径（如 /v1），网关会自行拼接 /messages、/chat/completions 等协议路径。",
   "providers.probe.addKeyFirst": "请先添加至少一个 API key。",
   "providers.probe.declareApiFirst": "请先声明一个 API section（APIs 标签页）",
   "providers.probe.resultsTitle": "探测结果",

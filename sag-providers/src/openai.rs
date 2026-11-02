@@ -87,9 +87,9 @@ impl LlmProvider for OpenAiProvider {
 
         let body = serde_json::to_value(&upstream_request)
             .map_err(|e| AppError::Internal(format!("failed to serialize request: {e}")))?;
-        let body_text = self
+        let response = self
             .base
-            .send_json(
+            .send_json_response(
                 &url,
                 ApiKind::ChatCompletions,
                 body,
@@ -97,6 +97,7 @@ impl LlmProvider for OpenAiProvider {
                 Some(timeout),
             )
             .await?;
+        let body_text = response.text.as_str();
 
         // Some upstreams deliver errors with HTTP 200 by embedding a
         // top-level `error` object in the JSON body (observed with Volcano
@@ -106,7 +107,7 @@ impl LlmProvider for OpenAiProvider {
         // over (or surfaces the all-exhausted envelope) instead of silently
         // reporting success. Rate-limit-ish errors map to 429 so the
         // analytics failure reason is `rate_limited`.
-        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(body_text)
             && crate::base::body_has_error_object(&raw)
         {
             let err_obj = raw.get("error").expect("checked error object");
@@ -125,8 +126,9 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        let mut completion: ChatCompletionResponse = serde_json::from_str(&body_text)
-            .map_err(|e| AppError::Internal(format!("failed to parse upstream response: {e}")))?;
+        let mut completion: ChatCompletionResponse = self
+            .base
+            .parse_json_response(&response, "upstream response")?;
 
         // Patch nested cache/reasoning token fields from the raw usage
         // object. The derived Deserialize for Usage sees a flat struct,
@@ -135,7 +137,7 @@ impl LlmProvider for OpenAiProvider {
         // This post-deserialization patch lifts them into the top-level
         // Usage fields without requiring a custom deserializer.
         if let Some(ref mut usage) = completion.usage
-            && let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+            && let Ok(raw) = serde_json::from_str::<serde_json::Value>(body_text)
             && let Some(raw_usage) = raw.get("usage")
         {
             let pt_details = raw_usage.get("prompt_tokens_details");
@@ -368,13 +370,14 @@ impl OpenAiProvider {
         let timeout = self
             .base
             .effective_timeout(ApiKind::Responses, timeout_secs);
-        let body_text = self
+        let response = self
             .base
-            .send_json(&url, ApiKind::Responses, body, target_extra, Some(timeout))
+            .send_json_response(&url, ApiKind::Responses, body, target_extra, Some(timeout))
             .await?;
+        let body_text = response.text.as_str();
 
         // 200-delivered error object (same convention as chat()).
-        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body_text)
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(body_text)
             && crate::base::body_has_error_object(&raw)
         {
             let err_obj = raw.get("error").expect("checked error object");
@@ -392,8 +395,7 @@ impl OpenAiProvider {
             });
         }
 
-        serde_json::from_str(&body_text)
-            .map_err(|e| AppError::Internal(format!("failed to parse responses body: {e}")))
+        self.base.parse_json_response(&response, "responses body")
     }
 
     /// Native Responses streaming: Responses body in, raw Responses SSE
@@ -1002,5 +1004,111 @@ mod tests {
         assert_eq!(errors.len(), 1, "exactly one in-stream error signal");
         assert_eq!(errors[0], "burst limit");
         assert!(!saw_done, "no Done after an in-stream upstream error");
+    }
+
+    // ── non-JSON 2xx bodies are self-diagnosing ──────────────────
+
+    #[tokio::test]
+    async fn chat_html_2xx_reports_diagnosable_upstream_error() {
+        let body = "<!DOCTYPE html><html><head><title>Gateway</title></head>\
+<body>page not found</body></html>";
+        let base_url = spawn_server(move |mut stream| {
+            let body = body.to_string();
+            async move {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        })
+        .await;
+
+        let err = openai_provider(&base_url, 30, None)
+            .chat(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 200, "the upstream answered 200, not 5xx");
+                assert!(body.contains("text/html"), "content-type missing: {body}");
+                assert!(body.contains("base_url"), "base_url hint missing: {body}");
+                assert!(
+                    body.contains("<!DOCTYPE html>"),
+                    "body preview missing: {body}"
+                );
+                assert!(
+                    body.contains("expected ident") || body.contains("expected value"),
+                    "serde error missing: {body}"
+                );
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    /// A 2xx `application/json` body that is syntactically valid JSON but
+    /// does not match the chat response schema must surface the serde error
+    /// alone: the upstream did answer JSON, so appending the HTML/base_url
+    /// hint would misdirect the user to a URL problem that does not exist.
+    #[tokio::test]
+    async fn chat_valid_json_type_mismatch_has_no_base_url_hint() {
+        let body = r#"{"invalid_response": true}"#;
+        let base_url = spawn_server(move |mut stream| async move {
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        })
+        .await;
+
+        let err = openai_provider(&base_url, 30, None)
+            .chat(
+                &chat_request(),
+                "test-model",
+                "/chat/completions",
+                &HashMap::new(),
+                30,
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            AppError::Upstream { status, body, .. } => {
+                assert_eq!(status, 200, "the upstream answered 200, not 5xx");
+                assert!(
+                    body.contains("application/json"),
+                    "content-type missing: {body}"
+                );
+                // serde names the first absent required field in declaration
+                // order; `id` precedes `choices` in `ChatCompletionResponse`.
+                // Either way only the serde error appears: the upstream did
+                // answer JSON, so no HTML/base_url hint may be appended.
+                assert!(
+                    body.contains("missing field `id`"),
+                    "serde missing-field error missing: {body}"
+                );
+                assert!(
+                    !body.contains("base_url"),
+                    "valid JSON must not get the HTML hint: {body}"
+                );
+                assert!(
+                    !body.contains("hint:"),
+                    "valid JSON must not get any hint: {body}"
+                );
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
     }
 }

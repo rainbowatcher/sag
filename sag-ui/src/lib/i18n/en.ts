@@ -200,7 +200,8 @@ export const en = {
   "providers.probe.backfillOne": "Backfill 1 protocol",
   "providers.probe.backfillMany": "Backfill {count} protocols",
   "providers.probe.modelHintLead": "Model: prefer a non-reasoning model. Use ",
-  "providers.probe.modelHintTail": " to share one base URL across protocols.",
+  "providers.probe.modelHintTail":
+    " to share one base URL across protocols. The base URL must include the version path (e.g. /v1); the gateway appends protocol paths such as /messages and /chat/completions itself.",
   "providers.probe.addKeyFirst": "Add at least one API key first.",
   "providers.probe.declareApiFirst": "Declare an API section first (APIs tab)",
   "providers.probe.resultsTitle": "Probe results",

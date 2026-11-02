@@ -131,6 +131,8 @@ targets = [
 ]
 ```
 
+`base_url` 是 API 根地址，**必须包含版本路径**（如 `https://api.anthropic.com/v1`、`https://api.openai.com/v1`）：网关会自行拼接协议路径（`/chat/completions`、`/responses`、`/messages`；`pipeline = "image"` 时为路由的 `api_endpoint`），省略 `/v1` 会让请求打到 `https://api.anthropic.com/messages` 这类不存在的地址。
+
 `models_endpoint` 是 per-API 配置（`[providers.<name>.apis.<key>]` 节），用于管理面板刷新上游模型列表。默认值为 `models`，相对本节的 `base_url` 拼接；支持 `models`、`/models`、`v1/models` 等写法，保存时会规范化为相对路径。
 
 ### Provider 完整字段
