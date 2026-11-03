@@ -1,11 +1,13 @@
 ---
 created: 2026-06-03
-updated: 2026-10-30
+updated: 2026-11-03
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-11-03** · **UI**：[0015 systemone API 类型的前端支持](ui/changes/0015-systemone-api-kind.md) — 后端 `/v1/systemone` 早已就绪，但架构编辑只认识 chat IR 三协议与 `image`，且 `ApisEditor.emitAll()` 只从 `API_KIND_ORDER` 派生的 sections 回写 `apis`，导致配置里已有的 `apis.systemone`（及任何未识别 key）在 UI 保存时被静默丢弃；本轮 `types/api.ts` 的 `ApiKind` 加 `"systemone"`、`ProtocolApiKind` 收窄为 chat IR 三协议（`Exclude<ApiKind, "image" | "systemone">`）并新增语义别名 `ChatIrApiKind = ProtocolApiKind`（`fallback` 字段改用后者），`ApisEditor.vue` 的 `API_KIND_ORDER` 在 `image` 之前插入 `systemone`、`emitAll()` 改走新抽的纯函数 `lib/apis-catalog.ts::draftsToCatalog(drafts, base, order)` 做保真回写（`order` 内 key 由草稿决定，基底中不在 order 里的 key 原样透传），Provider 列表 `apis` 过滤下拉、模型 tab 标签、路由 Target 短标签与 i18n（en/zh 同步，新增 `providers.apis.kindSystemOne` 与「不支持探针」提示）一并补齐；`systemone` 与 `image` 同为非 chat-IR 协议，故意不进 `PROBE_KIND_ORDER`（`defaultProbeKind` 兜底也排除二者）、不作 `fallback` 候选，systemone 行内给出「不支持协议探针 / 模型测试」灰提示；不新增 playground 页面 / 路由 / 侧边栏入口，后端 Rust 零改动
 
 - **2026-10-30** · **配置**：[0010 修复热重载 watcher 的通道背压死锁](config/changes/0010-hot-reload-watcher-channel-deadlock.md) — 热重载 watcher 的事件通道 `mpsc::channel(16)` + 回调内 `blocking_send` 会把 notify 的 FSEvents run loop 线程挂在投递上，而 notify 的 `FsEventWatcher::stop()` 用 `while !runloop.is_waiting() { yield_now() }` 等 run loop 回空闲，于是消费端一旦在忙（正在 reload）且突发事件跨过 16 条边界，`drop(watcher)` 就进入永不终止的自旋 —— `HotReloadHandle::shutdown()` 与 `sag-gateway` 的 `shutdown()` 一死卡住只能 SIGKILL（此前观察到的测试偶发超时只是症状，不是测试本身不稳定）；改为 `unbounded_channel()` + 非阻塞 `send`，回调只做「组装消息 + 投递」且不再打任何日志（回调与 run loop 同线程，日志等额外工作同样会推迟 run loop 回到等待态），`try_debounced_reload` 接收端随之改为 `UnboundedReceiver`；无界之所以安全：尾部防抖已把突发折成一次 reload，且 reload 语义是重读磁盘最终版本（重复读幂等、丢帧不失步），风险仅剩「消费端无限期停滞」（其上限由一次 reload 的耗时决定）——放弃「有界 + `try_send` 丢弃」是避免外部编辑事件被静默丢弃而破坏 `ConfigMutationCoordinator` 的一致性；测试 +1 `watcher_drop_with_event_burst_does_not_hang`（消费端停滞 800ms 时向被监听目录写 **40 个不同路径** 造 >16 条事件 —— FSEvents 会合并同一路径的重复变更，故必须用不同路径，随后走 `shutdown()` → `drop(watcher)` 并要求 10s 内完成；用 `#[test]` + 独立线程独立 runtime，死锁只卡该线程由 `recv_timeout` 判失败，不拖住整个套件；已验证临时恢复 `channel(16)` + `blocking_send` 后该测试在 10.00s 处干净失败而非挂起）；同步校正 `docs/spec/config/spec.md` 两处「目录 + 文件双监听」的过时描述为「只监听父目录（非递归）+ 收包后由 `event_targets_config()` 按配置路径/文件名过滤」
 

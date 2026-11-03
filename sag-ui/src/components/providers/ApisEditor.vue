@@ -17,30 +17,15 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import {
+  catalogToDrafts,
+  draftsToCatalog,
+  kvToObject,
+  type ApiDraft,
+  type ApiDraftKvPair as KvPair,
+} from "@/lib/apis-catalog"
 import { t } from "@/lib/i18n"
 import type { ApiConfig, ApiKind, ProtocolApiKind, ProxyMode } from "@/types/api"
-
-interface KvPair {
-  key: string
-  value: string
-}
-
-interface SectionDraft {
-  uid: number
-  kind: ApiKind
-  base_url: string
-  models_endpoint: string
-  headers: KvPair[]
-  body_overrides: KvPair[]
-  strip_fields: string[]
-  model_overrides: KvPair[]
-  role_mappings: KvPair[]
-  anthropic_cache_control: "inherit" | "enable" | "disable"
-  timeout_secs: string
-  chunk_timeout_secs: string
-  ttfb_timeout_secs: string
-  advancedOpen: boolean
-}
 
 const props = defineProps<{
   modelValue: Partial<Record<ApiKind, ApiConfig>>
@@ -55,8 +40,15 @@ const emit = defineEmits<{
   "update:fallback": [value: ApiKind | null]
 }>()
 
-const API_KIND_ORDER: ApiKind[] = ["chat_completions", "responses", "anthropic_messages", "image"]
+const API_KIND_ORDER: ApiKind[] = [
+  "chat_completions",
+  "responses",
+  "anthropic_messages",
+  "systemone",
+  "image",
+]
 
+// chat-IR 协议集合：systemone 与 image 不是 chat-IR provider，不能做 fallback、也不参与探针。
 const PROTOCOL_KINDS = new Set<ApiKind>(["chat_completions", "responses", "anthropic_messages"])
 
 /** Display labels for `ApiKind` sections, resolved through `t()` (locale-reactive). */
@@ -64,6 +56,7 @@ const apiKindLabels = computed<Record<ApiKind, string>>(() => ({
   chat_completions: t("providers.probe.protocolChat"),
   responses: t("providers.probe.protocolResponses"),
   anthropic_messages: t("providers.probe.protocolAnthropic"),
+  systemone: t("providers.apis.kindSystemOne"),
   image: t("providers.apis.kindImage"),
 }))
 
@@ -81,79 +74,25 @@ const DEFAULT_MODELS_ENDPOINT_HINTS: Record<ApiKind, string> = {
   chat_completions: "models",
   responses: "models",
   anthropic_messages: "v1/models",
+  systemone: "models",
   image: "models",
 }
 
 const BASE_URL_PLACEHOLDER = "https://api.example.com/v1"
 
-let uidCounter = 0
-
-function pairsFrom(obj: Record<string, string> | undefined): KvPair[] {
-  return Object.entries(obj ?? {}).map(([key, value]) => ({ key, value }))
+/**
+ * Fresh draft for a kind being added, or back-filled by a probe. Delegates to
+ * `catalogToDrafts` so blank and loaded drafts share one field mapping
+ * (including the editor-local `uid` / `advancedOpen`).
+ */
+function draftFrom(kind: ApiKind, cfg?: ApiConfig): ApiDraft {
+  const [draft] = catalogToDrafts({ [kind]: cfg ?? { base_url: "" } }, [kind])
+  return draft
 }
 
-function jsonPairsFrom(obj: Record<string, Record<string, any>> | undefined): KvPair[] {
-  return Object.entries(obj ?? {}).map(([key, value]) => ({
-    key,
-    value: JSON.stringify(value),
-  }))
-}
-
-function draftFrom(kind: ApiKind, cfg?: ApiConfig): SectionDraft {
-  return {
-    uid: ++uidCounter,
-    kind,
-    base_url: cfg?.base_url ?? "",
-    models_endpoint: cfg?.models_endpoint ?? "",
-    headers: pairsFrom(cfg?.headers),
-    body_overrides: Object.entries(cfg?.body_overrides ?? {}).map(([key, value]) => ({
-      key,
-      value: typeof value === "string" ? value : JSON.stringify(value),
-    })),
-    strip_fields: [...(cfg?.strip_fields ?? [])],
-    model_overrides: jsonPairsFrom(cfg?.model_overrides),
-    role_mappings: pairsFrom(cfg?.role_mappings),
-    anthropic_cache_control:
-      cfg?.anthropic_cache_control === undefined
-        ? "inherit"
-        : cfg.anthropic_cache_control
-          ? "enable"
-          : "disable",
-    timeout_secs: cfg?.timeout_secs !== undefined ? String(cfg.timeout_secs) : "",
-    chunk_timeout_secs: cfg?.chunk_timeout_secs !== undefined ? String(cfg.chunk_timeout_secs) : "",
-    ttfb_timeout_secs: cfg?.ttfb_timeout_secs !== undefined ? String(cfg.ttfb_timeout_secs) : "",
-    advancedOpen: false,
-  }
-}
-
-const sections = ref<SectionDraft[]>(
-  API_KIND_ORDER.filter((kind) => props.modelValue[kind]).map((kind) =>
-    draftFrom(kind, props.modelValue[kind]),
-  ),
-)
+const sections = ref<ApiDraft[]>(catalogToDrafts(props.modelValue, API_KIND_ORDER))
 const fallbackValue = ref<ApiKind | null>(props.fallback ?? null)
 const probeOpen = ref(false)
-
-function kvToObject(pairs: KvPair[]): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const { key, value } of pairs) {
-    if (key.trim() && value.trim()) out[key.trim()] = value.trim()
-  }
-  return out
-}
-
-function kvToJson(pairs: KvPair[]): Record<string, any> {
-  const out: Record<string, any> = {}
-  for (const { key, value } of pairs) {
-    if (!key.trim() || !value.trim()) continue
-    try {
-      out[key.trim()] = JSON.parse(value.trim())
-    } catch {
-      out[key.trim()] = value.trim()
-    }
-  }
-  return out
-}
 
 function parseOptionalNumber(raw: string): number | undefined {
   const trimmed = raw.trim()
@@ -162,7 +101,7 @@ function parseOptionalNumber(raw: string): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined
 }
 
-function sectionJsonError(d: SectionDraft): string | null {
+function sectionJsonError(d: ApiDraft): string | null {
   for (const { key, value } of d.model_overrides) {
     if (!key.trim() || !value.trim()) continue
     try {
@@ -177,50 +116,9 @@ function sectionJsonError(d: SectionDraft): string | null {
   return null
 }
 
-function sectionToConfig(d: SectionDraft): ApiConfig {
-  const cfg: ApiConfig = { base_url: d.base_url.trim() }
-  const modelsEndpoint = d.models_endpoint.trim()
-  if (modelsEndpoint) cfg.models_endpoint = modelsEndpoint
-  const headers = kvToObject(d.headers)
-  if (Object.keys(headers).length > 0) cfg.headers = headers
-  const bodyOverrides = kvToJson(d.body_overrides)
-  if (Object.keys(bodyOverrides).length > 0) cfg.body_overrides = bodyOverrides
-  const stripFields = d.strip_fields.filter((f) => f.trim()).map((f) => f.trim())
-  if (stripFields.length > 0) cfg.strip_fields = stripFields
-  const modelOverrides: Record<string, Record<string, any>> = {}
-  for (const { key, value } of d.model_overrides) {
-    if (!key.trim() || !value.trim()) continue
-    try {
-      const parsed = JSON.parse(value.trim())
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-        modelOverrides[key.trim()] = parsed
-      }
-    } catch {
-      // Surfaced by sectionJsonError / validate() before submit.
-    }
-  }
-  if (Object.keys(modelOverrides).length > 0) cfg.model_overrides = modelOverrides
-  const roleMappings = kvToObject(d.role_mappings)
-  if (Object.keys(roleMappings).length > 0) cfg.role_mappings = roleMappings
-  if (d.anthropic_cache_control !== "inherit")
-    cfg.anthropic_cache_control = d.anthropic_cache_control === "enable"
-  const timeout = parseOptionalNumber(d.timeout_secs)
-  if (timeout !== undefined) cfg.timeout_secs = timeout
-  const chunkTimeout = parseOptionalNumber(d.chunk_timeout_secs)
-  if (chunkTimeout !== undefined) cfg.chunk_timeout_secs = chunkTimeout
-  const ttfbTimeout = parseOptionalNumber(d.ttfb_timeout_secs)
-  if (ttfbTimeout !== undefined) cfg.ttfb_timeout_secs = ttfbTimeout
-  return cfg
-}
-
 function emitAll() {
-  const apis = {} as Record<ApiKind, ApiConfig>
-  for (const d of [...sections.value].sort(
-    (a, b) => API_KIND_ORDER.indexOf(a.kind) - API_KIND_ORDER.indexOf(b.kind),
-  )) {
-    apis[d.kind] = sectionToConfig(d)
-  }
-  emit("update:modelValue", apis)
+  // 整目录回写：受管 kind 完全由 `sections` 决定（删除即删除），`order` 之外的 key 原样透传。
+  emit("update:modelValue", draftsToCatalog(sections.value, props.modelValue, API_KIND_ORDER))
 
   const protocols = sections.value.map((d) => d.kind).filter((k) => PROTOCOL_KINDS.has(k))
   if (protocols.length <= 1) {
@@ -305,7 +203,7 @@ function onFallbackChange(v: unknown) {
   emit("update:fallback", kind)
 }
 
-function updateSection(uid: number, patch: Partial<SectionDraft>) {
+function updateSection(uid: number, patch: Partial<ApiDraft>) {
   const idx = sections.value.findIndex((d) => d.uid === uid)
   if (idx === -1) return
   sections.value[idx] = { ...sections.value[idx], ...patch }
@@ -318,11 +216,11 @@ function toggleAdvanced(uid: number) {
   sections.value[idx].advancedOpen = !sections.value[idx].advancedOpen
 }
 
-function stripFieldsText(d: SectionDraft): string {
+function stripFieldsText(d: ApiDraft): string {
   return d.strip_fields.join("\n")
 }
 
-function onStripFieldsChange(d: SectionDraft, raw: string) {
+function onStripFieldsChange(d: ApiDraft, raw: string) {
   updateSection(d.uid, { strip_fields: raw.split("\n") })
 }
 
@@ -426,6 +324,10 @@ defineExpose({ validate })
             <X class="h-3.5 w-3.5" />
           </Button>
         </div>
+
+        <p v-if="d.kind === 'systemone'" class="text-muted-foreground text-xs">
+          {{ $t("providers.apis.systemOneNoProbe") }}
+        </p>
 
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div class="flex items-center justify-between gap-4">

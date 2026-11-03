@@ -576,6 +576,8 @@ export const en = {
 
   // ── P3b: providers › API kind labels ────────────────────────────
   "providers.apis.kindImage": "Image",
+  "providers.apis.kindSystemOne": "System One",
+  "providers.apis.systemOneNoProbe": "System One does not support protocol probes or model tests",
 
   // ── P3b: routes page shell ──────────────────────────────────────
   "routes.addForm.title": "New Route",

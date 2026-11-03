@@ -466,6 +466,7 @@ const table = useVueTable({
               <SelectItem value="chat_completions">chat_completions</SelectItem>
               <SelectItem value="responses">responses</SelectItem>
               <SelectItem value="anthropic_messages">anthropic_messages</SelectItem>
+              <SelectItem value="systemone">{{ $t("providers.apis.kindSystemOne") }}</SelectItem>
               <SelectItem value="image">image</SelectItem>
             </SelectContent>
           </Select>

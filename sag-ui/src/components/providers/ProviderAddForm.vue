@@ -33,6 +33,7 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useProviderProbe } from "@/composables/useProviderProbe"
+import { toChatIrFallback } from "@/lib/apis-catalog"
 import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
@@ -171,6 +172,7 @@ const form = useForm({
     }
 
     const filteredStrip = stripFields.value.filter((f) => f.trim().length > 0)
+    const fallbackKind = toChatIrFallback(fallback.value)
 
     try {
       await store.addProvider({
@@ -178,7 +180,7 @@ const form = useForm({
         api_keys: validKeys,
         key_strategy: keyStrategy.value,
         apis: apis.value as Record<ApiKind, ApiConfig>,
-        ...(fallback.value ? { fallback: fallback.value } : {}),
+        ...(fallbackKind ? { fallback: fallbackKind } : {}),
         enabled_models: enabledModels.value,
         headers: Object.keys(parsedHeaders).length > 0 ? parsedHeaders : undefined,
         role_mappings: Object.keys(parsedRoleMappings).length > 0 ? parsedRoleMappings : undefined,

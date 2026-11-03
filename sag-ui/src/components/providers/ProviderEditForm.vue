@@ -13,6 +13,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useProviderProbe } from "@/composables/useProviderProbe"
 import { useResponsiveModal } from "@/composables/useResponsiveModal"
+import { toChatIrFallback } from "@/lib/apis-catalog"
 import { t } from "@/lib/i18n"
 import { getErrorMessage } from "@/lib/utils"
 import { useProviderStore } from "@/stores/providers"
@@ -126,7 +127,9 @@ async function handleSubmit() {
     payload.apis = apis.value
     // Triple-state fallback patch: a value sets, `null` clears (back to the
     // single-protocol auto default) — both states are always explicit here.
-    payload.fallback = fallback.value
+    // The value is narrowed to a chat-IR protocol: `image` / `systemone` are not
+    // valid fallbacks, so they are sent as `null` (cleared).
+    payload.fallback = toChatIrFallback(fallback.value)
 
     if (timeoutSecs.value !== props.provider.timeout_secs) {
       payload.timeout_secs = timeoutSecs.value

@@ -7,14 +7,26 @@
 export type ProxyMode = "inherit" | "enabled" | "disabled"
 
 /**
- * Key of a provider `apis` section: the three chat-family protocols plus
- * the non-protocol `image` entry (its path comes from route.`api_endpoint`).
+ * Key of a provider `apis` section: the chat-family protocols, the
+ * `systemone` decision protocol, plus the non-protocol `image` entry (its
+ * path comes from route.`api_endpoint`).
  * Unknown keys are rejected by the backend (strict enum).
  */
-export type ApiKind = "chat_completions" | "responses" | "anthropic_messages" | "image"
+export type ApiKind =
+  | "chat_completions"
+  | "responses"
+  | "anthropic_messages"
+  | "systemone"
+  | "image"
 
-/** The three protocol keys of `ApiKind` (excludes `image`). */
-export type ProtocolApiKind = Exclude<ApiKind, "image">
+/** The protocol keys of `ApiKind` (excludes `image`). */
+export type ProtocolApiKind = Exclude<ApiKind, "image" | "systemone">
+
+/**
+ * chat-IR 协议：可作 fallback、可探针。
+ * `systemone`（无 chat IR、无 Translated lane）与 `image` 都不在内。
+ */
+export type ChatIrApiKind = ProtocolApiKind
 
 /**
  * One `providers.<name>.apis.<key>` section. `base_url` is required (the
@@ -61,7 +73,7 @@ export interface Provider {
    * Downgrade protocol for translated-lane dispatch. Implicit (auto) when
    * exactly one protocol key is declared; required when several are.
    */
-  fallback?: ApiKind | null
+  fallback?: ChatIrApiKind | null
   timeout_secs: number
   chunk_timeout_secs?: number
   ttfb_timeout_secs?: number
@@ -87,7 +99,7 @@ export interface AddProviderPayload {
   key_strategy?: "fill_first" | "round_robin"
   apis: Record<ApiKind, ApiConfig>
   /** Required when `apis` declares more than one protocol key. */
-  fallback?: ApiKind
+  fallback?: ChatIrApiKind
   timeout_secs?: number
   headers?: Record<string, string>
   body_overrides?: Record<string, any>
@@ -107,7 +119,7 @@ export interface UpdateProviderPayload {
   /** Whole-directory replace: sections not repeated are dropped. */
   apis?: Record<ApiKind, ApiConfig>
   /** Triple-state: omit → keep, `null` → clear, value → set. */
-  fallback?: ApiKind | null
+  fallback?: ChatIrApiKind | null
   timeout_secs?: number
   headers?: Record<string, string>
   body_overrides?: Record<string, any>

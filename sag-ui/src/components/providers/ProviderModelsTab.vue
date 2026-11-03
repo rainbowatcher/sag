@@ -35,6 +35,7 @@ const apiKindLabels = computed<Record<ApiKind, string>>(() => ({
   responses: t("providers.probe.protocolResponses"),
   anthropic_messages: t("providers.probe.protocolAnthropic"),
   image: t("providers.apis.kindImage"),
+  systemone: t("providers.apis.kindSystemOne"),
 }))
 </script>
 

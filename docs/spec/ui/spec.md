@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-29
+updated: 2026-11-03
 ---
 
 # UI 管理面板 — 规格
@@ -46,6 +46,7 @@ updated: 2026-10-29
 - [sag-ui/src/components/providers/ProviderList.vue](../../../sag-ui/src/components/providers/ProviderList.vue) — Provider 列表（TanStack Table）
 - [sag-ui/src/components/providers/ProviderAddForm.vue](../../../sag-ui/src/components/providers/ProviderAddForm.vue) — Provider 添加表单
 - [sag-ui/src/components/providers/ProviderEditForm.vue](../../../sag-ui/src/components/providers/ProviderEditForm.vue) — Provider 编辑表单（Dialog/Drawer 双轨，由 useResponsiveModal 驱动）
+- [sag-ui/src/components/providers/ApisEditor.vue](../../../sag-ui/src/components/providers/ApisEditor.vue) — Provider 架构（`providers[].apis`）目录编辑器：渲染顺序由 `API_KIND_ORDER` 决定（chat IR 三协议在前，`systemone` 排在 `image` 之前），逐类 API 一行；回写经 `src/lib/apis-catalog.ts` 的 `draftsToCatalog(drafts, base, order)` 做保真合并——`order` 内的 key 由草稿决定（草稿没有则删除），基底只透传**不在** order 里的 key，因此配置里存在的未知 `apis` 节点不会被保存动作静默丢弃；fallback 校正在组件内联完成（守卫 `PROTOCOL_KINDS.has(kind)`，协议数 ≤1 时清空 fallback）；`systemone` 行内提示不支持协议探针 / 模型测试
 - [sag-ui/src/components/routes/RouteActivityBar.vue](../../../sag-ui/src/components/routes/RouteActivityBar.vue) — 表格上方的实时活动徽章行：`◉ 处理中 N` + 标题内联 Info Tooltip、逐 route 徽章（脉冲绿点 + 等宽 `model_name` 截断 + `×count`）、`stale` 置灰 + 「连接断开，重连中…」、全零时「空闲」占位、无快照时整行不渲染
 - [sag-ui/src/components/routes/RouteList.vue](../../../sag-ui/src/components/routes/RouteList.vue) — Route 列表（TanStack Table + 排序）；active target 单元格在 session_sticky 行无 active target 时不再渲染 `-` 占位，只返回该行的 pin 浮层（非 session_sticky 行无 active target 时仍渲染 `-`，其 pin 浮层为 `null`）
 - [sag-ui/src/components/routes/RouteEditForm.vue](../../../sag-ui/src/components/routes/RouteEditForm.vue) — Route 编辑表单
@@ -64,6 +65,7 @@ updated: 2026-10-29
 - [sag-ui/src/lib/client.ts](../../../sag-ui/src/lib/client.ts) — 共享 axios 实例（Authorization header 由 connection store 同步）
 - [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
 - [sag-ui/src/lib/targetPicker.ts](../../../sag-ui/src/lib/targetPicker.ts) — Target 浮窗的纯选择逻辑：`provider+model` 集合键、分组构建（含禁用/orphan）、搜索过滤、勾选集合 ↔ target 行的 diff 与合并（type-only import，可被 node test runner 直接加载）
+- [sag-ui/src/lib/apis-catalog.ts](../../../sag-ui/src/lib/apis-catalog.ts) — API 目录的纯函数：`catalogToDrafts(apis, order)`（基底 → 按 order 排布的有序草稿，只为 `apis` 中**已存在**的 kind 生成草稿，缺节点不补）、`draftsToCatalog(drafts, base, order)`（保真回写——`order` 内 key 由草稿决定（草稿没有则删除，`base` 无法复活），基底中不在 order 里的键原样透传，保真、不改入参）。保真是 **key 级**的：`apis` 目录中 UI 未管理的 key 原样透传；section **内部字段**以编辑器渲染的为准，`ApiConfig.model_strip_fields` 目前不在编辑器字段集中（既有行为，非本轮引入，后续单独修）
 - [sag-ui/src/lib/sessionAffinity.ts](../../../sag-ui/src/lib/sessionAffinity.ts) — 会话 pin 的纯函数：`shortSessionKey(key, length = 8)`（展示前缀，删除仍用全量 key）、`isPinActive(entry)`（`expires_in_secs === null || > 0` 为活跃）、`sortPins(entries)`（活跃组在前、组内 stable，返回新数组不改入参）、`mergeSessionEntries(prev, incoming, model?)`（共享 store 的换桶语义：`model` 未指定时整体替换、给定则只替换该 model 的桶并保留其他行数据，返回新数组不改入参）、`errorForModel(errors, model)`（按 fetch 作用域取值：`Object.hasOwn(errors, model)` 为真时返回 `errors[model]`、否则 `null`——`""` 是全量拉取的作用域键，只被全量视图读取；必须用 `Object.hasOwn` 而非裸取值，裸 `errors[model]` 会走原型链，模型名恰好是 `constructor` / `toString` 时会把 `Function` 当错误文案渲染）、`loadingForModel(loading, model)`（按 fetch 作用域取在途标志：`Object.hasOwn(loading, model)` 为真时返回 `loading[model]`、否则 `false`，与 `errorForModel` 对称；裸 `loading[model] ?? false` 同样会走原型链，`constructor` / `toString` 会拿到非 `nullish` 的 `Function`，`?? false` 不生效、该行 loading 恒真）；同 targetPicker 一样可被 node test runner 直接加载
 - [sag-ui/src/lib/settingsTabs.ts](../../../sag-ui/src/lib/settingsTabs.ts) — 设置 tab 的顺序单一来源（`value` 即 `?tab=`，`DEFAULT_SETTINGS_TAB = "network"`）；`SidebarNav` 复用同一 `SETTINGS_TABS`，隐私入口因此没有单独的导航代码
 - [sag-ui/src/lib/privacyConfig.ts](../../../sag-ui/src/lib/privacyConfig.ts) — 隐私表单纯逻辑：`createPrivacyDraft`（快照 → 草稿，深拷贝、`newSalt` 恒空）、`getPrivacyChanges`（逐字段 dirty）、`validatePrivacyDraft`（只判必填，按行 id）、`buildPrivacyPayload`（整节 payload，去 UI 行 id 与 `salt_configured`）
@@ -239,6 +241,19 @@ flowchart TD
 - ✅ 各 store 在 catch 路径显式调用 `handle401()`，调用点明确、可追踪
 - ✅ 避免了 axios interceptor 在 `connect()` 流程中误触发（连接阶段本身就是验证 API key）
 - ❌ 每个 store 的每个 catch 分支都需要写 `if (e.response?.status === 401) handle401()`，存在遗漏风险
+
+### API 类型三层：`ApiKind` / `ProtocolApiKind` / `ChatIrApiKind`
+
+`sag-ui/src/types/api.ts` 把「有哪些 API 类型」与「哪些类型能当 chat 翻译目标 / 探针目标」拆成三层：
+
+- `ApiKind` 是全集：`chat_completions` / `responses` / `anthropic_messages` / `image` / `systemone`。用于「目录」场景——架构编辑的 `API_KIND_ORDER`、Providers 列表的 `apis` 过滤下拉、模型 tab 的标签映射；任何 provider 都可以声明其中任意节点。
+- `ProtocolApiKind` 是 chat IR 子集：`Exclude<ApiKind, "image" | "systemone">`。用于「可探针 / 可作 chat 翻译目标」的场景——`PROBE_KIND_ORDER`（`ProtocolApiKind[]`）与 `defaultProbeKind` 的兜底取值域都在这个集合里；`defaultProbeKind` 的 `fallback` 参数类型仍是 `ApiKind | null`，对 `systemone` / `image` 的排除由运行时守卫（`!== "image" && !== "systemone"` + 末尾 `find` 兜底）完成，不依赖类型层。
+- `ChatIrApiKind = ProtocolApiKind` 是语义别名：用于路由的 `fallback` 字段。fallback 只在 chat IR 协议之间选择，`image` 与 `systemone` 都不是合法值（后端校验同口径硬拒 `fallback = "systemone"`）。
+
+**Trade-off**:
+- ✅ 「目录全集」与「能力子集」在类型上分开：新增一个非 chat-IR 协议时 `ApiKind` 扩展即可，探针 / fallback 的取值域由 `Exclude` 与别名自动收窄，漏改的消费点会在 `vue-tsc` 阶段暴露
+- ✅ `ChatIrApiKind` 保留别名而非直接复用 `ProtocolApiKind`：调用点能读出「这是 fallback 的取值域」这层语义，而不只是一个技术性的 chat 协议集合
+- ❌ 两个名字都以 `ApiKind` 结尾，容易混淆；改消费点前必须先确认它要的是「全集」还是「chat IR 子集」
 
 ### localStorage 连接 TTL 30 天 vs 永久/会话存储
 
@@ -545,6 +560,7 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 
 ## 变更记录
 
+- [0015 systemone API 类型的前端支持](changes/0015-systemone-api-kind.md)
 - [0014 设置页隐私过滤配置](changes/0014-privacy-settings.md)
 - [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)
 - [0012 会话 pin 图标 hover 预览与活跃 pin 置顶/置灰](changes/0012-session-pin-tooltip-and-active-pin-ordering.md)

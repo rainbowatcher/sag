@@ -550,6 +550,8 @@ export const zh: Record<keyof typeof en, string> = {
   "analytics.v2.othersSeries": "其他（{count} {population}）",
 
   "providers.apis.kindImage": "Image",
+  "providers.apis.kindSystemOne": "System One",
+  "providers.apis.systemOneNoProbe": "System One 不支持协议探针与模型测试",
 
   "routes.addForm.title": "新建路由",
   "routes.addForm.description": "配置新的路由规则及其 target 供应商",

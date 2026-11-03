@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-10-29
+updated: 2026-11-03
 ---
 
 # UI 管理面板
@@ -69,6 +69,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 筛选：按 model 名称（Combobox 模糊搜索）、provider type（OpenAI / Anthropic）、排序（Name A-Z / 默认）
 - 添加：`ProviderAddForm` 组件，根据 provider_type 动态展示不同表单字段
 - 编辑：`ProviderEditForm`，视口 ≥768px（`md`）为 Dialog、<768px 为底部抽屉（drawer），由 `useResponsiveModal` 统一提供
+- 架构编辑（`ApisEditor`）支持 `systemone` API 类型：`ApiKind` 在 chat IR 三协议与 `image` 之外新增 `systemone`，同一目录区域可声明该节点，Providers 列表的 `apis` 过滤下拉、模型 tab 与路由 Target 短标签同步识别；`systemone` 与 `image` 同为非 chat-IR 协议，不得作为路由 `fallback` 候选，也不可发起协议探针 / 模型测试（探针面板保持 chat IR 三协议）。架构编辑保存时按基底合并回写：配置中已存在、但当前 UI 未提供编辑入口的 `apis` key 必须原样透传，不得因保存而丢弃
 - 开关：Switch 组件直接切换 provider 启用/禁用，即时生效
 - 删除：二次确认对话框，底部固定栏显示确认信息
 
@@ -301,6 +302,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0015 systemone API 类型的前端支持](changes/0015-systemone-api-kind.md)
 - [0014 设置页隐私过滤配置](changes/0014-privacy-settings.md)
 - [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)
 - [0012 会话 pin 图标 hover 预览与活跃 pin 置顶/置灰](changes/0012-session-pin-tooltip-and-active-pin-ordering.md)

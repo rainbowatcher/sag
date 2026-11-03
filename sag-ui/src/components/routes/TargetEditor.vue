@@ -99,6 +99,7 @@ const API_KIND_SHORT: Record<string, string> = {
   chat_completions: "chat",
   responses: "responses",
   anthropic_messages: "anthropic",
+  systemone: "systemone",
   image: "image",
 }
 
