@@ -1,13 +1,14 @@
 ---
 created: 2026-06-03
-updated: 2026-10-27
+updated: 2026-11-03
 ---
 
 # 调度 — 规格
 
 ## 关键文件
 
-- [sag-dispatch/src/dispatch/chat/](../../../sag-dispatch/src/dispatch/chat/) — 聊天补全分发模块（主调度、尝试结果与事实构造、空响应校验、translated 终点帧桥接）
+- [sag-dispatch/src/dispatch/chat/](../../../sag-dispatch/src/dispatch/chat/) — 聊天补全分发模块（主调度、尝试结果与事实构造、空响应校验、translated 终点帧桥接、raw 帧工具参数窥探与 Responses 帧过滤）
+- [sag-core/src/ir/tool_args.rs](../../../sag-core/src/ir/tool_args.rs) — 工具调用参数质量谓词（`ToolArgsQuality` / `args_quality` / `args_value_quality` / `ToolArgWatch`），`sag-dispatch` 的唯一质量来源
 - [sag-dispatch/src/dispatch/image.rs](../../../sag-dispatch/src/dispatch/image.rs) — 图片生成分发
 - [sag-dispatch/src/dispatch/systemone.rs](../../../sag-dispatch/src/dispatch/systemone.rs) — SystemOne 决策分发（`dispatch_systemone` 镜像 `dispatch_image` 的尝试 / 降级骨架，`build_systemone_body` 从 carrier `extra` 重建 wire body）
 - [sag-dispatch/src/dispatch/stream.rs](../../../sag-dispatch/src/dispatch/stream.rs) — SSE 流式处理（`StreamAnalytics` 共享状态、`TerminalGuard` 三路终点分类、`StreamState._in_flight` 持 per-route 在途 guard）
@@ -134,9 +135,54 @@ translated 路径（ingress 协议 ≠ upstream 协议）下，upstream 不会�
 
 `#2` / `#3` 共用 `apply_end_synthesis_bridge`（`EndSynthesis` 枚举 + `flat_map`，状态为 `finish_seen` / `end_sent`）：首个 `End` 若此前未见 `Finish`（即上游未给 `finish_reason`，不合规），先合成 `Finish { finish_reason: None }` 再发终止帧。编码器据此渲染：Anthropic → `content_block_stop`（闭合悬挂的 content block）+ `message_delta`（协议要求的 `stop_reason`，`None` 映射 `end_turn`）+ `message_stop`；Responses → `response.completed`（`status: completed`）。合规上游（已有 `Finish`）不重复合成，故不会多出第二条 `message_delta` 或第二个 `response.completed`。native 路径（`use_anthropic` / `use_responses`）不启用任何桥接，字节恒等。
 
-桥接 #1 只补 Chat 协议的终止符：Chat ingress + Responses upstream 的响应帧仍为上游原样 Raw 透传（字节恒等），帧形态转换不在范围内。
+桥接 #1 只补 Chat 协议的终止符，不改变帧形态归属：Chat ingress + **Anthropic** upstream 的响应帧仍为上游原样 Raw 透传（字节恒等）；Chat ingress + **Responses** upstream 的帧则先解码为 IR、再重编码为 Chat chunk（`needs_ir_decode` 含该组合），`data: [DONE]` 只是加在重编码后的 Chat 帧之上。字节恒等因此**只对同构车道（chat→chat、native→native）成立**，跨协议车道不在此列。
 
 **次序不变式**：`#1` 必须在 empty-peek **之前**——`classify_raw_frame` 把 `data: [DONE]` 判为 `RawVerdict::Empty`，因此真空上游仍能报 `EmptyResponse` 并走 `retry_on_empty`；`#2` / `#3` 必须在 peek **之后**——它们合成的帧（`message_stop` / Responses 终点帧 `response.completed` 或 `response.incomplete`）没有 Empty 特判，前置于 peek 会被 `classify_raw_frame` 读作 `Content`，使真空上游不再重试。该次序写在 `chat/mod.rs` 的注释里，改动桥接位置时需同时复核。
+
+### 工具调用参数质量告警（warn-only）
+
+上游确实会发出 `arguments` 为空、纯空白、或根本不是 JSON 对象的工具调用（`""`、`null`、`[1]`、`{bad`）。这类响应在 chat IR 里与非空的**同形**——`tool_calls` 数组非空即算内容——因此既不重试也不降级，`call_logs` 是一行干净的 200，客户端拿到 `get_weather({})` 也无任何预警。本轮只补信号，不改判定。
+
+**谓词层**（`sag-core/src/ir/tool_args.rs`，纯逻辑、无 I/O 无日志）：`ToolArgsQuality` 三档 `Ok` < `Blank` < `NotJson`，`Ord` 即严重度序。`{}` 是合法参数；空串 / 纯空白是「缺失」；不可解析或非对象（含 `null` / 数组 / 数字 / JSON 字符串）一律不可用——工具参数在协议上恒为对象。`args_value_quality(&Value)` 是已解析值入口，其中 `Value::String` 会被**重新按文本分类**（chat codec 只在上游 `arguments` 解析失败或本就发了个字符串时才退化到 `Value::String`）。
+
+**累积层**：`ToolArgWatch` 按 tool-call `index` 累积证据，`quality()` 取所有调用的最差档（无调用时 `Ok`）。两个 API 是同一套累积逻辑的两个入口：`observe(&IrStreamEvent)`（已解码车道）与 `observe_tool_call_start` / `observe_arguments`（裸片段，字节透传车道的窥探结果）。**登记本身就是证据**——起了头却一个 delta 都没收到的调用判 `Blank`（正是要抓的缺陷），而非「不存在」；**空 delta 也要喂**，否则 `arguments: ""` 这个最典型的样本会被跳过。
+
+**发射层**（仅 `sag-dispatch`）：
+
+| 场景 | 位置 | 时机 |
+|---|---|---|
+| 流式 | `dispatch/stream.rs::finish_stream_terminal` | claim 终点之后、终止帧投递之前，每流最多一条 |
+| 非流式 | `dispatch/chat/mod.rs` 的 `ChatAttempt::NonStream` 成功出口 | egress 之前，每响应最多一条 |
+
+两处条件同为 `tool_calls > 0 && quality != ToolArgsQuality::Ok`。流的聚合值在 `StreamState.tool_args: ToolArgWatchHandle`（`Arc<Mutex<ToolArgWatch>>`）里跨整个生命周期累积，分发侧把每个交给客户端的 `IrStreamEvent` 在 fold 里喂进同一个 watch，终点只读一次。
+
+**`TerminalGuard::Drop` 有意不发**：drop 路径代表客户端提前断连；在那里报 `Blank` 会让「参数完整的流被客户端在第一个 delta 后关掉」也变成假阳性——假阳性比漏报更损害信号可信度。故被取消的流没有这条日志，是设计而非遗漏。
+
+**有意留盲**：两条同协议 native 透传车道（Anthropic→Anthropic、Responses→Responses）不观察。它们的帧是上游自己的事件形状，没有 `choices[].delta.tool_calls`，且契约是「客户端收到的就是上游的帧」，网关不仲裁其载荷质量。
+
+### 流式解码归属与 Responses 帧过滤
+
+帧的解码归属由 **upstream 协议**选定，不由 ingress 单独决定：
+
+```rust
+type StreamFrameDecoder = Box<dyn FnMut(&[u8]) -> Vec<IrStreamEvent> + Send>;
+```
+
+boxed `FnMut`（而非常规 `fn` 指针）是必需的：Responses 解码器已变为有状态（`output_item.done` 需对照同一 item 已投递的 delta 决定是否供载荷，见 [providers 0010](../providers/changes/0010-responses-stream-item-payload-fidelity.md)）。选择器三路：`use_anthropic` → Anthropic 解码器、`use_responses` → `ResponsesCodec::stream_decoder()`、其余 → Chat 解码器。
+
+修掉的是**归属**缺陷，不是某个分支的局部 bug：此前只判 `use_anthropic`、其余一律落 Chat 解码器，于是 Anthropic ingress × Responses upstream 的帧因无 `choices` 全数退化为 `Raw`，Anthropic 编码器再逐字转发——「解码」形同虚设，文本永远变不成 `text_delta`，`message_start` 也从未被合成。同一处 fallthrough 还让 Chat ingress × Responses upstream 保持原样透传，Chat 协议客户端（OpenAI SDK / Codex CLI）收到完全没有 `choices` 的帧。`needs_ir_decode` 因此纳入 `(is_chat_ingress && use_responses)`：该组合解码为 IR 后按 Chat 协议重编码，桥接 #1 再补恰好一个 `data: [DONE]`。
+
+**字节透传车道（`needs_ir_decode == false`）的盲区补洞**：字节恒等透传的每个事件都是 `IrStreamEvent::Raw(Vec<u8>)`（完整 SSE 帧，含 `data: ` 前缀与尾部 `\n\n`），IR 层的观察器在这里什么也看不到。`peek_chat_raw_frame` 复用 `sse_data_payload` 剥出 payload 后 `serde_json::from_slice`，读 `choices[].delta.tool_calls[].function.arguments` 并喂 `observe_tool_call_start` / `observe_arguments`。约束：
+
+- **observation-only**：原始帧原封不动地转发，客户端收到的字节一个也不变。
+- **门控在 `!needs_ir_decode`**：已解码车道上的 `Raw` 只是剩余副本，其载荷早已由 `ToolCallStart` / `ToolCallDelta` 计入；同时窥探会把同一段参数拼两次并产出假阳性 `NotJson`。
+- `delta.tool_calls` 优先、`message.tool_calls` 只作非流式形状的兜底，两者**互斥**（同时读两边会拼出 `{"a":1}{"a":1}`）；缺 `index` 时以数组下标兜底；`arguments` 缺失 / 非字符串按 `""` 计入并仍登记该调用。
+- 不可解析的帧（`data: [DONE]`、`: keep-alive`、截断数据）静默跳过——这是 warn-only 信号，绝不得把一帧透传数据变成错误。
+- 解析器只有一份，落点有两个：`ToolArgSink` 让单元测试喂裸 `ToolArgWatch`、让分发 fold 喂 `ToolArgWatchHandle`（内层 watch 对 `dispatch::stream` 私有），后者把窥探结果重放成事件再 `observe`。
+
+**`Raw` 帧过滤**：Responses 解码器把「无法表达为 IR」的帧作为 `Raw` 交出来是为保住同协议透传，但这些帧逐字转发到别的协议出口就是泄漏。`is_responses_event_frame(bytes)` 用同一个 `sse_data_payload` 剥出 payload，判定其 `type` 是否以 `response.` 开头；命中的 `Raw` 在到达编码器之前从流里滤除。
+
+**契约**：过滤只在 `needs_ir_decode == true` 时生效，且只针对 Responses 上游——凡是「Responses 上游 + 已解码」的组合（Chat ingress、Anthropic ingress 皆属此族），Responses 形状的 `Raw` 一律不得流向非 Responses 出口；`needs_ir_decode == false` 的同协议车道永不过滤、永不改写，那里的 `Raw` 就是上游原字节，是字节恒等不变式的一部分（该过滤落在解码分支内部，同协议车道根本进不到，因此不存在误过滤的可能）。只认 `response.` 前缀，故 `data: [DONE]`、`: keep-alive`、非 JSON 帧与 Chat 帧不受影响。
 
 ### 无 IR 物种：SystemOne 镜像图片生成的分发骨架
 
@@ -193,6 +239,10 @@ SystemOne 没有 chat IR（`state` / `questions` / `answers` 与逐题概率字�
 - SystemOne 目标必须声明 `apis.systemone`（presence 即能力）；chat 的硬需求能力表与 Translated lane 对它一律不参与
 - chat 路由的能力过滤先做 `apis` presence 检查：目标实际使用的协议必须是 provider 已声明的 `apis` 节点，缺则 pre-drop 并记 `lacks capability {used}`；未知 provider 名不在这一层丢弃（留给 `resolve_provider` 记 `not found`，保留 failover）
 - `fallback` 的需求判定与取值域只统计 chat IR 三协议；`fallback = "systemone"` 必须在配置校验期拒绝，不得运行期降级
+- 工具调用参数质量告警是**纯观测**：不得计入 `failure_reason`、不得触发重试 / fallback / 粘性变更、不得改写响应体字节；流式告警只在 `finish_stream_terminal` 发（`TerminalGuard::Drop` 不发，否则取消的流会假报 `Blank`）
+- 工具参数窥探只在 `needs_ir_decode == false` 的透传车道启用；已解码车道上的 `Raw` 不得再被窥探（同一段 `arguments` 会被拼两次）
+- 帧的解码器由 upstream 协议选（Anthropic / Responses / Chat 三路）且必须是有状态 `FnMut`；`needs_ir_decode` 必须包含 Chat ingress × Responses upstream
+- Responses 形状的 `Raw` 帧（`type` 以 `response.` 开头）不得到达非 Responses 出口；过滤只在 `needs_ir_decode == true` 时生效，`needs_ir_decode == false` 的同协议车道字节恒等
 - 每请求在途计数（`InFlightGuard`）在 `dispatch_chat` / `dispatch_image` / `dispatch_systemone` 入口 acquire，只由 `Drop` 释放；流式路径必须把 guard 移交 `StreamState._in_flight`（`build_streaming_response` 的 `in_flight` 参数），不得留在 dispatch 栈帧上——否则响应返回即释放，整条流的传输时间不被计入。计数器与 `AppState` 共享同一 `Arc`（见 [admin 0003](../admin/changes/0003-per-route-in-flight-counters-sse.md)）
 
 ## 测试策略
@@ -204,11 +254,15 @@ SystemOne 没有 chat IR（`state` / `questions` / `answers` 与逐题概率字�
 - `sag-dispatch/src/dispatch/image.rs` — 图片路径 `reasoning_effort=None` 断言
 - `sag-dispatch/src/dispatch/systemone.rs` — 透传与 usage 留 NULL、跨目标降级、全耗尽 502、熔断跳过、`build_systemone_body` 只改 `model`、provider 解析失败时半开探针槽同步释放
 - `sag-dispatch/src/dispatch/capability.rs` — chat 侧 presence 门：provider 缺 used protocol 的 `apis` 节点 → pre-drop `lacks capability`（未知 provider 不在此层丢弃）
+- `sag-core/src/ir/tool_args.rs` — 参数质量三档判定（`{}` 为 `Ok`、空白为 `Blank`、非对象为 `NotJson`）、`ToolArgWatch` 的累积 / 最差档 / 空 delta / 重复 start，以及裸片段 API 与 `IrStreamEvent` API 等价
+- `sag-dispatch/src/dispatch/chat/mod.rs` 的 `peek_tests` — raw 帧窥探：跨帧累积、空白参数、忽略 `[DONE]` / 非 JSON / keep-alive、缺 `index` 回退、IR 车道的门控（同一组事件 `peek=false` → `Ok`、`peek=true` → 假阳性 `NotJson`）
+- `sag-dispatch/src/dispatch/chat/tests.rs` — 告警计数（内联 `CapturedEvents` 订阅器，流式每流一条 / 非流式每响应一条）、透传车道字节恒等、Chat×Responses 重编码、Anthropic×Responses 解码归属
 - `sag-router/tests/systemone_ingress.rs` — 入口级集成：逐字透传、401 / 400 / 422 顺序、`lacks capability systemone` 过滤、image 路由 422、`/v1/models` 派生
 - 关键场景：熔断器交互、重试耗尽、流式超时、4xx 分类判定（non-retryable vs retryable）、时间穿越（UTC 时间戳）
 
 ## 变更记录
 
+- [0009 工具调用参数质量告警与 Chat×Responses 车道的解码归属修正](changes/0009-tool-arg-quality-and-responses-lane-decode.md) — 新增 `sag-core` 纯谓词层 `ToolArgsQuality` / `ToolArgWatch`，流式（`finish_stream_terminal`）与非流式各发一条 warn-only 告警（不动空响应判定）；字节透传车道补 `peek_chat_raw_frame` 窥探（observation-only、门控在 `!needs_ir_decode`）；`StreamFrameDecoder` 改 boxed `FnMut` 并补 `use_responses` 分支，修掉 Anthropic ingress × Responses upstream 用错 Chat 解码器；`needs_ir_decode` 纳入 Chat ingress × Responses upstream（解码重编码为 Chat chunk），`is_responses_event_frame` 拦下已解码车道的 Responses `Raw` 帧
 - [0008 SystemOne 决策接口接入（原样透传 + 深度 dispatch）](changes/0008-systemone-ingress.md) — 新增 `dispatch_systemone`（镜像 `dispatch_image` 骨架、无 IR、恒非流式）、`build_systemone_body` 的 carrier 契约（`extra` 逐字重建 + 仅改写 `model`）、`filter_systemone_targets` 的 presence 即能力闸门，并把 `fallback` 语义收窄为 chat IR 三协议
 - [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — `is_client_terminal_frame` 字节级三协议判定（含 `response.cancelled`）+ `TerminalGuard` 三路分类（error→502 / 标志→200 带完整 usage / 否则 499），并补三条 translated 终点帧桥接（`[DONE]` / `message_stop` / `response.completed`，含不合规上游的块闭合与 `stop_reason`）
 - [0006 流式请求超时边界修复](changes/0006-stream-request-timeout-boundary.md) — 成功流式响应不再受共享 client 总 timeout 限制，按 TTFB、chunk idle 和错误 body 阶段分别设定边界

@@ -203,6 +203,31 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - ❌ 多态联合的序列化（`untagged` 派生）与反序列化（宏按 tag 分派）不是同一套逻辑，读代码需对照变体列表
 - ❌ 上游响应多一条 lenient 降级分支，属「typed 化不损失健壮性」的额外成本
 
+### Responses 流式 item 生命周期与终止载荷
+
+`codec/responses.rs` 的流式两侧（入口 `stream_encoder` / 上游 `stream_decoder`）各自维护一份 item 生命周期状态，而不是把 item 当无状态帧处理：
+
+| 决策 | 内容 |
+|------|------|
+| 编码器累积在途 item 载荷 | `StreamEncodeState` 的 `open_call_id` / `open_name` / `open_args` / `open_text` 记住 `added` 帧发出的标识与已累积的正文 / 参数，`completed_items: BTreeMap<u32, Value>` 记录已关闭 item |
+| `added` 与 `done` 共用 index 派生 id | `function_call` / `message` / `reasoning` 分别为 `fc_{index}` / `msg_{index}` / `rs_{index}`，客户端据此把两帧对上 |
+| `done` 发完整 item，不是空壳 | 每个 `OpenItem` 变体都写全 `call_id` / `name` / `arguments` 或 `content` / `summary`；终止帧的 `response.output` 由 `completed_items` 按升序渲染，不再写死 `[]`。若只发 `{type, status}`，累积 delta 的客户端看起来正常，直接读 `done` / `output` 的 SDK 客户端则静默拿到空参数 |
+| `done` 是权威替换而非增量 | OpenAI 真实流既在 `output_item.done` 发完整 item，也在 `response.completed.output` 发完整数组，所以按 delta 累积的客户端必须把 `done` 视为替换 |
+| 解码器改为有状态 | `stream_decoder()` 返回 `FnMut`，内部 `StreamDecodeState { deltas_seen, open_items }`；`decode_stream_frame` 保留为逐帧无状态包装（每调用新建 state），供单帧场景与既有调用方 |
+| `done` 只在 delta 缺席时供载荷 | 不变式见下；`function_call` 在 `added` 缺席时兼发一次 `ToolCallStart`，`message` / `reasoning` 分别拼 `content` / `summary` 的 part 文本 |
+| 已知 bookkeeping 返回空 vec | `in_progress`、`content_part.*`、`output_text.done`、`function_call_arguments.done`、`reasoning_*` 终止帧、annotation、宿主工具项（`web_search_call`）与 `message` / `reasoning` 的 `output_item.added` 都解出空 vec。落 `Raw` 会被逐字转发到别的协议出口 |
+| 保留 `Raw` 的非 catch-all 边界 | 非 JSON 载荷、顶层 `error`、无 `type`、SSE 注释 / 无 `data:` 兜底、通用未知 `type` 仍发 `Raw`——同协议透传车道靠它转发上游新增事件，静默吞掉比外泄更危险 |
+| `End` 也要收尾 | 流在 item 仍打开时结束，`End` 先 `close_open_item` 再合成终止帧；`Finish` / `End` 仅在 `completed == false` 时合成，`Raw` 已带 `response.completed` 时不重复发 |
+| 无状态入口不带 item 历史 | `encode_stream_event` 的 `Finish` 分支传 `&[]`，仍是 `output: []`；与 0009 的 `terminal_event_fields` 映射共用同一终止帧形状 |
+
+**Trade-off**：
+
+- ✅ 工具调用的 `arguments` 在「有 delta / 无 delta」两种上游行为下都恰好到达 IR 一次
+- ✅ 终止帧的 `response.output` 与 OpenAI 真实流同形，SDK 客户端不再拿到空参数
+- ✅ 跨协议出口不再泄漏 Responses bookkeeping 帧，且未牺牲同协议透传能力
+- ❌ 两侧各多一份状态（编码器 5 个字段、解码器 2 个容器），`decode_stream_frame` 与 `stream_decoder` 并存需按场景选对入口
+- ❌ bookkeeping 白名单需随上游新增事件维护：漏登记的事件会以 `Raw` 外泄（这是有意选择的失败方向，便于发现）
+
 ### 共享 HTTP client 连接池 idle 调优
 
 `build_http_client`（`sag-core/src/http_client.rs`，provider + admin 共享）在模块级写死连接池常量，用于降低 stale 连接复用导致的流中途 `peer closed connection without sending TLS close_notify`：
@@ -251,6 +276,9 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - input message 的 `role` 缺失或非字符串一律按 `"user"` 兜底，不得丢弃消息内容
 - `reject_unsupported` / `reject_unsupported_mode` 保持 `&Value` 签名与 422 消息文本不变
 - SSE 流式路径不做 typed 化
+- 每个 item 的载荷恰好一次进入 IR：`response.output_item.done` 仅在无 delta 供过该 `output_index` 时作为唯一供给者，否则保持静默
+- 流式编码器关闭 item 时必须发完整载荷（`function_call` 带 `call_id` / `name` / `arguments`，`message` 带 `content`，`reasoning` 带 `summary`），终止帧的 `response.output` 不得写死 `[]`
+- 已知 Responses bookkeeping 事件解码为空事件而非 `Raw`；`Raw` 只留给无法归类的帧（非 JSON / 顶层 `error` / 无 `type` / 未知 `type`），不得加 catch-all 丢弃
 - provider 路径调用 `build_http_client` 时 `timeout: None`（无 client 级 total deadline）；**禁止**为 pool 调优回退 total `.timeout()`
 
 ## 测试策略
@@ -265,10 +293,12 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - `sag-dispatch/src/dispatch/chat/tests.rs` — typed happy path、Anthropic / Responses 两处 schema mismatch 的 lenient 降级（含 `decode_anthropic_response_lenient_path_keeps_unmodelled_fields` 钉住降级不丢字段）、200 送达的上游错误体保留在 `raw`
 - `sag-providers/src/codec/responses.rs` — translated 合成终点帧按 finish reason 分档（`stream_finish_length_emits_incomplete_with_max_output_tokens` / `stream_finish_content_filter_emits_incomplete_with_content_filter` / `stream_finish_stop_emits_completed_without_incomplete_details`），`stream_finish_terminal_frame_is_shared_by_both_entry_points` 钉两入口（`encode_stream_event` / `stream_encoder`）终点帧字节一致
 - `sag-router/tests/{anthropic_messages_ingress,responses_ingress}.rs` — typed 形状不匹配 422（各自信封）、stateful 预检查先于 typed 解析；`responses_ingress_chat_upstream_stream_length_emits_response_incomplete` 钉 translated 整链终点帧（`length` → `response.incomplete` + `incomplete_details.reason = max_output_tokens`）
+- `sag-providers/src/codec/responses.rs` — 流式 item 载荷保真与 bookkeeping 不外泄：`output_item_done_carries_function_call_payload`（`done` 带 `arguments` / `call_id` / `name` 且 id 与 `added` 一致）、`response_completed_output_lists_all_items_in_index_order`（终止帧 `output` 按 `output_index` 升序列全）、`output_item_done_supplies_arguments_when_no_deltas`（无 delta 时 `done` 为唯一供给者）、`output_item_done_does_not_duplicate_streamed_deltas`（有 delta 时 `done` 静默）、`stream_roundtrip_encode_then_decode_delivers_arguments_once`（编解码整链 `arguments` 恰好一次）、`known_bookkeeping_events_yield_no_raw`（同一顺序解码器喂全部已知 bookkeeping 帧均为空）、`unknown_event_type_still_surfaces_as_raw`（未知 `type` 仍发 `Raw`）
 - `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
 - `sag-core/src/http_client.rs` — `pool_connection_constants_match_plan`（钉住 pool 常量）、`pool_options_coexist_with_proxy_and_timeout`（pool 与 proxy/timeout 共存）
 
 ## 变更记录
+- [0010 Responses 流式 item 载荷保真与已知 bookkeeping 帧不外泄](changes/0010-responses-stream-item-payload-fidelity.md)
 - [0009 Responses 流式终点帧按 finish reason 区分 `response.incomplete`](changes/0009-responses-incomplete-terminal-event.md)
 - [0008 Responses / Anthropic 请求响应体 typed 化（无损透传）](changes/0008-typed-wire-dtos-responses-anthropic.md)
 - [0007 跨 codec 工具字段保真（统一 `IrTool.raw` 双层约定）](changes/0007-tool-raw-cross-codec-fidelity.md)

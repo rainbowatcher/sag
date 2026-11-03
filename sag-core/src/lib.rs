@@ -29,7 +29,8 @@ pub use http_client::build_http_client;
 pub use ir::{
     IrContentBlock, IrFinishReason, IrMessage, IrOutputItem, IrRequest, IrResponse, IrResponseMeta,
     IrRole, IrStreamEvent, IrTool, IrToolCall, LossEntry, LossInventory, LossReason, LossScope,
-    Reasoning, Sampling, summarize_losses,
+    Reasoning, Sampling, ToolArgWatch, ToolArgsQuality, args_quality, args_value_quality,
+    summarize_losses,
 };
 pub use paths::{
     CONFIG_FILE_NAME, anchor_sqlite_dsn, default_analytics_db_path, default_config_path,

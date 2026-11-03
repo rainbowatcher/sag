@@ -9,7 +9,7 @@ use futures_util::{Stream, StreamExt, stream::unfold};
 use sag_analytics::{CallLogCollector, EventCollector, EventQueueError};
 use sag_core::{
     CallLog, FailureReason, FinalStatus, IrStreamEvent, RequestResultFact, TargetAttemptFact,
-    TargetStatus, Usage,
+    TargetStatus, ToolArgWatch, ToolArgsQuality, Usage,
 };
 use sag_privacy::RestoreWriter;
 use sag_state::InFlightGuard;
@@ -471,6 +471,35 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Shared handle on the [`ToolArgWatch`] of one streamed attempt.
+///
+/// The dispatch body folds every event that reaches the client through
+/// [`Self::observe`]; the stream terminal reads the aggregate through
+/// [`Self::verdict`]. Cheap to clone, so the fold closure and the body state
+/// share one watch. Purely a warn-only signal: nothing here can change what
+/// the client receives or how the terminal is classified.
+#[derive(Clone, Default)]
+pub struct ToolArgWatchHandle(Arc<Mutex<ToolArgWatch>>);
+
+impl ToolArgWatchHandle {
+    /// Create an empty watch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one event into the watch (observe-by-reference: the event is not
+    /// cloned).
+    pub fn observe(&self, ev: &IrStreamEvent) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).observe(ev);
+    }
+
+    /// `(tool_call_count, worst quality)` across the events folded so far.
+    pub fn verdict(&self) -> (usize, ToolArgsQuality) {
+        let watch = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (watch.tool_call_count(), watch.quality())
+    }
+}
+
 /// Per-response mutable state carried through the `unfold` loop of
 /// [`build_streaming_response`].
 struct StreamState<S, E> {
@@ -500,6 +529,9 @@ struct StreamState<S, E> {
     /// (`unfold` yields one item per poll, so it cannot both yield the tail
     /// and finish the terminal in the same step).
     terminal_pending: bool,
+    /// Tool-argument quality evidence of this attempt, folded by the dispatch
+    /// body on the way in and reported once at the terminal (warn-only).
+    tool_args: ToolArgWatchHandle,
     // Declared before the guard so it drops first; the guard's own
     // `Arc` clone keeps the shared data alive regardless. The guard
     // field is never read — it exists solely for its `Drop` (client
@@ -585,6 +617,7 @@ fn make_stream_state<S, E>(
     session_key: Option<String>,
     privacy_restore: Option<RestoreWriter>,
     in_flight: InFlightGuard,
+    tool_args: ToolArgWatchHandle,
 ) -> StreamState<S, E> {
     StreamState {
         stream,
@@ -600,6 +633,7 @@ fn make_stream_state<S, E>(
         session_key,
         privacy_restore,
         terminal_pending: false,
+        tool_args,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
         _in_flight: in_flight,
@@ -762,6 +796,23 @@ async fn finish_stream_terminal<S, E>(state: &mut StreamState<S, E>) {
     // conflicting request result or a duplicate call_logs
     // row.
     state.analytics.done.store(true, Ordering::SeqCst);
+    // Tool-argument quality: a warn-only signal, emitted exactly once here —
+    // after the stream is claimed done and before the terminal event reaches
+    // the client. Blank / unparseable tool-call arguments arrive as ordinary
+    // data (no `Error` event), so the terminal classification below stays
+    // `Success`; this line is the only trace of the defect.
+    let (tool_calls, tool_args_quality) = state.tool_args.verdict();
+    if tool_calls > 0 && tool_args_quality != ToolArgsQuality::Ok {
+        warn!(
+            request_id = %state.analytics.request_id,
+            provider = %state.analytics.provider,
+            model = %state.analytics.requested_model,
+            real_model = %state.analytics.real_model,
+            tool_calls,
+            reason = ?tool_args_quality,
+            "upstream streamed tool calls with blank/invalid arguments"
+        );
+    }
     let error = state.error.take();
     let had_error = error.is_some();
     // `upstream_duration_ms` / `ttft_ms` mark *successful*
@@ -938,6 +989,10 @@ pub fn build_streaming_response<S, E>(
     // released exactly once by that state's `Drop` (client disconnect
     // included). Never released manually.
     in_flight: InFlightGuard,
+    // Tool-argument quality watch of this attempt: the caller folds every
+    // event into it on the way in; the terminal reads the aggregate once.
+    // Warn-only — it never affects encoding or the terminal classification.
+    tool_args: ToolArgWatchHandle,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -982,6 +1037,7 @@ where
         session_key,
         privacy_restore,
         in_flight,
+        tool_args,
     );
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -1196,6 +1252,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         )
     }
 
@@ -1525,6 +1582,7 @@ mod tests {
             None,
             Some(privacy_restore),
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         )
     }
 
@@ -1657,6 +1715,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1881,6 +1940,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2010,6 +2070,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2102,6 +2163,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         // The disconnect: drop the response without polling the body. The
@@ -2189,6 +2251,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2284,6 +2347,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         drop(resp);
@@ -2370,6 +2434,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2478,6 +2543,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2575,6 +2641,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -2656,6 +2723,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         // Drive the body exactly ONE frame with a noop waker: the first poll
@@ -2766,6 +2834,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2873,6 +2942,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -2961,6 +3031,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -3185,6 +3256,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -3307,6 +3379,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -3389,6 +3462,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -3466,6 +3540,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
 
         let mut body = resp.into_body();
@@ -3543,6 +3618,7 @@ mod tests {
             None,
             None,
             state.in_flight.acquire("test-route"),
+            ToolArgWatchHandle::default(),
         );
         let mut body = resp.into_body();
         assert_eq!(drain_until_pending(&mut body), 1);
@@ -3605,6 +3681,7 @@ mod tests {
                 None,
                 None,
                 state.in_flight.acquire("test-route"),
+                ToolArgWatchHandle::default(),
             );
             let mut body = resp.into_body();
             assert_eq!(drain_until_pending(&mut body), 1, "{encode_name}");

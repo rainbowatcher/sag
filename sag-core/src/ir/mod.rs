@@ -7,6 +7,7 @@ mod loss;
 mod request;
 mod response;
 mod stream;
+mod tool_args;
 
 pub use loss::{LossEntry, LossInventory, LossReason, LossScope, summarize_losses};
 pub use request::{
@@ -14,6 +15,7 @@ pub use request::{
 };
 pub use response::{IrFinishReason, IrOutputItem, IrResponse, IrResponseMeta};
 pub use stream::IrStreamEvent;
+pub use tool_args::{ToolArgWatch, ToolArgsQuality, args_quality, args_value_quality};
 
 #[cfg(test)]
 mod tests {

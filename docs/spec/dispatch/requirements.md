@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-10-27
+updated: 2026-11-03
 ---
 
 # 调度
@@ -66,11 +66,13 @@ updated: 2026-10-27
   - 终点帧判定基于**编码后字节**，三协议形态并集匹配且行锚定，内容 delta 中的伪造字样不误判
   - 终点帧判定基于**编码后字节**，三协议形态并集匹配且行锚定，内容 delta 中的伪造字样不误判；Responses 的三个流终点事件类型（completed / incomplete / cancelled）全部覆盖
 - **translated 桥接终点帧**：ingress 协议与 upstream 协议不一致时，网关在首个 `End` 合成 ingress 协议的终止帧，保证客户端总能收到协议终点：
-  - Chat ingress + Anthropic / Responses upstream → `data: [DONE]`（响应帧仍为上游原样透传）
+  - Chat ingress + Anthropic / Responses upstream → `data: [DONE]`。Anthropic 上游的响应帧仍为上游原样透传；Responses 上游的响应帧**解码为 IR 后重新编码为 Chat chunk**（Chat 协议客户端不得收到 `response.*` 事件名），字节恒等只对同构车道（chat→chat、native→native）成立
   - Anthropic ingress + 非 Anthropic upstream → `message_stop`；上游未发 `finish_reason` 时先闭合 content block 并补 `message_delta`（`stop_reason`），合规上游不重复
   - Responses ingress + 非 Responses upstream → `response.completed`（`length` / `content_filter` 为 `response.incomplete` + `incomplete_details.reason`）；上游未发 `finish_reason` 时合成，合规上游不重复
   - native 透传路径字节不变，空响应重试（empty-peek）语义不变
 - **运营影响**：桥接只补协议缺失的终止帧（包括不合规上游的块闭合与 `stop_reason`），属协议合规修复，不改变分类与统计口径
+- **工具调用参数质量告警（warn-only）**：上游发出的工具调用若 `arguments` 为空 / 纯空白 / 非 JSON 对象（`null`、数组、数字、JSON 字符串、语法坏掉），流式每流一次、非流式每响应一次记一条 `warn!`，携带工具调用数与最差质量档。该信号**只观测不干预**：不计失败、不触发重试或降级、不改写响应体字节、不参与 `call_logs` 分类——空白参数响应仍记 `Success` + `failure_reason: None`、仍不触发 fallback。未收到任何 `arguments` delta 的工具调用按「空白」计（起了头却无参数正是要抓的缺陷）；被取消的流不报（客户端提前断连会把完整参数误报成空白）。同构 native 透传车道（Anthropic→Anthropic、Responses→Responses）不观察：客户端收到的就是上游自己的帧，网关不仲裁其载荷质量
+- **帧的解码归属与 Responses 帧过滤**：解码器由 **upstream 协议**选定（Anthropic 帧走 Anthropic 解码器、Responses 帧走有状态的 Responses 解码器、其余走 Chat 解码器），不得只看 ingress 协议；`needs_ir_decode` 包含 Chat ingress × Responses upstream。已解码车道上，Responses 形状的 `Raw` 帧（`type` 以 `response.` 开头）不得流向非 Responses 出口；`needs_ir_decode == false` 的同协议车道永不过滤、永不改写
 
 ### 图片生成
 
@@ -147,6 +149,7 @@ updated: 2026-10-27
 
 ## 变更记录
 
+- [0009 工具调用参数质量告警与 Chat×Responses 车道的解码归属修正](changes/0009-tool-arg-quality-and-responses-lane-decode.md) — 空白 / 非法工具参数改为流式每流一次、非流式每响应一次的 `warn!`（warn-only，三处空响应谓词行为不变）；Chat ingress × Chat upstream 的透传车道补 raw 帧窥探；解码器按 upstream 协议选定（修掉 Anthropic ingress × Responses upstream 用错 Chat 解码器），Chat ingress × Responses upstream 改为解码重编码 + Responses `Raw` 帧过滤
 - [0008 SystemOne 决策接口接入（原样透传 + 深度 dispatch）](changes/0008-systemone-ingress.md) — 新增 `POST /v1/systemone` 无 IR 分发路径：只校验路由所需字段（400 / 422）、body 与响应逐字透传（仅改写 `model`）、`apis.systemone` presence 即能力、错误统一 OpenAI 信封、恒非流式，`fallback` 取值域收窄为 chat IR 三协议
 - [0003 per-route 在途计数与 `GET /api/inflight` SSE 端点](../admin/changes/0003-per-route-in-flight-counters-sse.md)（跨模块：入口 acquire + 流式 guard 移交 `StreamState`）
 - [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — 终点帧转发后的客户端断连改记成功（499 计数下降、成功计数上升），并补 drop-as-success 行的 usage / TTFT / upstream 时长，以及三条 translated 终点帧桥接（`[DONE]` / `message_stop` / `response.completed`）与不合规上游的块闭合 / `stop_reason`

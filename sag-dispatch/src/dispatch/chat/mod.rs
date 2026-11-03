@@ -16,6 +16,7 @@ use sag_core::{
     },
 };
 use sag_core::{AppError, FailureReason, FinalStatus, RequestResultFact, TargetAttemptFact};
+use sag_core::{IrOutputItem, ToolArgWatch, ToolArgsQuality, args_value_quality};
 use sag_privacy::{Outcome as PrivacyOutcome, PlaceholderMap, PrivacyEngine};
 use sag_providers::{AnthropicMessagesCodec, ChatCompletionsCodec, ResponsesCodec};
 use serde_json::json;
@@ -24,7 +25,7 @@ use crate::dispatch::resolve::resolve_provider;
 use crate::dispatch::retry::RetryOutcome;
 use crate::dispatch::retry::is_client_caused_4xx;
 use crate::dispatch::retry::run_with_retries_outcome;
-use crate::dispatch::stream::build_streaming_response;
+use crate::dispatch::stream::{ToolArgWatchHandle, build_streaming_response};
 use crate::dispatch::{
     CircuitPermit, DispatchCancelGuard, DispatchCtx, apply_circuit_outcome, circuit_allows_target,
     client_error_failure_reason, emit_analytics_event, fallback_exhausted_response,
@@ -40,12 +41,240 @@ mod tests;
 pub(crate) use attempt::{ChatAttempt, NonStreamAttempt, build_target_attempt_fact};
 pub(crate) use empty::{is_empty_ir_response, validate_stream_first_chunk};
 
+/// Fold every event of `stream` into a shared [`ToolArgWatchHandle`] on its way
+/// to the client, returning the wrapped stream plus the handle.
+///
+/// The fold observes by reference (`&ev`) *before* the event is moved on and
+/// never rewrites it: folding an IR event clones nothing and allocates nothing
+/// per event, and peeking a `Raw` frame only allocates the argument fragment it
+/// replays into the watch. Warn-only — the event sequence, the encoded bytes
+/// and the stream's terminal classification are untouched. The handle is handed
+/// to `build_streaming_response`, whose terminal reports the aggregate quality
+/// once per stream.
+///
+/// `peek_raw_chat_frames` must be `!(lane needs IR decode)`: on a decoded
+/// lane the same tool call already arrives as `ToolCallDelta`, and peeking the
+/// leftover `Raw` frame too would append its arguments a second time (a
+/// false-positive `NotJson`). The three byte-identical passthrough lanes are
+/// the only ones where `Raw` is the sole evidence; of those, only Chat→Chat
+/// carries chat-chunk frames, so the two native passthroughs
+/// (Anthropic→Anthropic, Responses→Responses) stay blind by decision — their
+/// frames have no `choices[].delta.tool_calls` and the peek simply finds
+/// nothing.
+fn watch_tool_args(
+    stream: futures_util::stream::BoxStream<'static, sag_core::IrStreamEvent>,
+    peek_raw_chat_frames: bool,
+) -> (
+    futures_util::stream::BoxStream<'static, sag_core::IrStreamEvent>,
+    ToolArgWatchHandle,
+) {
+    let watch = ToolArgWatchHandle::new();
+    let folded = {
+        // Own clone for the fold: `map` runs an `FnMut`, so the closure may
+        // borrow it mutably for the raw-frame peek without cloning per frame.
+        let mut watch = watch.clone();
+        stream
+            .map(move |ev| {
+                match &ev {
+                    sag_core::IrStreamEvent::Raw(bytes) if peek_raw_chat_frames => {
+                        peek_chat_raw_frame(bytes, &mut watch);
+                    }
+                    _ => watch.observe(&ev),
+                }
+                ev
+            })
+            .boxed()
+    };
+    (folded, watch)
+}
+
+/// Worst tool-argument quality across a decoded non-stream response, plus the
+/// number of tool calls it carries.
+///
+/// A `Value::String` is malformed by construction (the chat codec only falls
+/// back to a string when upstream `arguments` failed to parse), so it is
+/// re-classified as raw text by [`args_value_quality`].
+fn non_stream_tool_args_quality(ir: &sag_core::IrResponse) -> (usize, ToolArgsQuality) {
+    let mut calls = 0usize;
+    let mut worst = ToolArgsQuality::Ok;
+    for item in &ir.output {
+        if let IrOutputItem::ToolCall(call) = item {
+            calls += 1;
+            worst = worst.max(args_value_quality(&call.arguments));
+        }
+    }
+    (calls, worst)
+}
+
+/// Translated-lane stream frame decoder: one upstream SSE frame in, 0..n IR
+/// events out.
+///
+/// Boxed and `FnMut` (not a bare `fn` pointer) because the Responses decoder
+/// is stateful: `response.output_item.done` must be resolved against the
+/// deltas already delivered for the same item.
+type StreamFrameDecoder = Box<dyn FnMut(&[u8]) -> Vec<sag_core::IrStreamEvent> + Send>;
+
 /// Chat ingress stream encoder: Raw bytes pass through unchanged; structured
 /// events / control frames go through the Chat codec. (`End` / `Usage` /
 /// `Error` are handled inline by the unfold loop and never reach `encode`
 /// for client yield — this fn is only for client-visible events.)
 fn encode_chat_stream_event(ev: &sag_core::IrStreamEvent) -> Vec<u8> {
     ChatCompletionsCodec::encode_stream_event(ev)
+}
+
+/// The `data:` payload of one raw SSE frame, borrowed from `frame`.
+///
+/// Strips the field name — `data: {…}` and `data:{…}` both occur — plus the
+/// trailing line terminators (`\n`, `\r\n`, `\n\n`) and surrounding
+/// whitespace. On a multi-line frame the first `data:` line wins. `None` when
+/// the frame carries no `data:` field at all or its payload is empty
+/// (`: keep-alive` comments, blank frames).
+///
+/// Single source of the strip for every raw-frame peek in this module, so the
+/// frame-JSON readers cannot drift apart.
+fn sse_data_payload(frame: &str) -> Option<&str> {
+    let rest = frame
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("data:"))?;
+    let payload = rest.trim();
+    (!payload.is_empty()).then_some(payload)
+}
+
+/// Is this Raw SSE frame a **Responses**-protocol event frame (its `type`
+/// starts with `response.`)?
+///
+/// Used on IR-decoded egress lanes with Responses upstream: the Responses decoder
+/// forwards the frames it cannot express as IR verbatim (`response.completed`,
+/// unknown event types, unparseable data). Those frames have no non-Responses
+/// representation, and a client of another protocol must never see protocol A's
+/// event names — only the decoded IR events are kept on that lane.
+fn is_responses_event_frame(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(payload) = sse_data_payload(&text) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    val.get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|ty| ty.starts_with("response."))
+}
+
+/// Sink for raw-frame tool-call evidence.
+///
+/// The peek has one parser but two destinations: the inline unit tests feed a
+/// bare [`ToolArgWatch`], while the dispatch stream fold can only reach the
+/// shared watch through [`ToolArgWatchHandle`] (whose inner watch is private
+/// to `dispatch::stream`). Implementing both keeps the parser — and therefore
+/// the accumulation semantics — single-sourced on every lane.
+trait ToolArgSink {
+    /// Register a tool call at `index`.
+    fn tool_call_start(&mut self, index: u32);
+    /// Append one `arguments` fragment to the tool call at `index`.
+    fn arguments_delta(&mut self, index: u32, delta: &str);
+}
+
+impl ToolArgSink for ToolArgWatch {
+    fn tool_call_start(&mut self, index: u32) {
+        self.observe_tool_call_start(index);
+    }
+
+    fn arguments_delta(&mut self, index: u32, delta: &str) {
+        self.observe_arguments(index, delta);
+    }
+}
+
+impl ToolArgSink for ToolArgWatchHandle {
+    fn tool_call_start(&mut self, index: u32) {
+        // The handle exposes only the event-level API, so raw-frame evidence
+        // is replayed as the events a decoded lane would have produced. The
+        // replayed event is observed only — the client still receives the
+        // original `Raw` frame byte for byte.
+        self.observe(&sag_core::IrStreamEvent::ToolCallStart {
+            index,
+            id: None,
+            name: None,
+        });
+    }
+
+    fn arguments_delta(&mut self, index: u32, delta: &str) {
+        self.observe(&sag_core::IrStreamEvent::ToolCallDelta {
+            index,
+            arguments_delta: delta.to_string(),
+        });
+    }
+}
+
+/// Peek one raw SSE frame's JSON and feed any chat tool-call fragments into
+/// `watch`. Returns true when the frame contributed a tool call.
+///
+/// Only the byte-identical passthrough lanes need this: there the upstream
+/// frames reach the client verbatim, so the fold sees [`sag_core::IrStreamEvent::Raw`]
+/// and never a `ToolCallStart` / `ToolCallDelta`. The frame is already
+/// delineated by the SSE transport (a `Raw` carries its `data: ` prefix and
+/// its `\n\n` suffix), so this is a prefix strip plus one `serde_json` parse —
+/// not a second SSE parser, and the frame itself is never copied.
+///
+/// Unparseable frames (`data: [DONE]`, keep-alive comments, truncated data)
+/// are silently ignored: this is a warn-only signal and must never turn a
+/// passthrough frame into an error.
+fn peek_chat_raw_frame<S: ToolArgSink>(frame: &[u8], watch: &mut S) -> bool {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return false;
+    };
+    let Some(payload) = sse_data_payload(text) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(choices) = val.get("choices").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+
+    let mut fed = false;
+    for choice in choices {
+        // Streaming shape first; `message.tool_calls` is the non-streaming
+        // shape and only a fallback. A single frame carrying both would
+        // describe the same call twice, and feeding both would append the
+        // same arguments twice (spelling `{"a":1}{"a":1}`, a false-positive
+        // `NotJson`). A choice that has any `delta.tool_calls` array is
+        // therefore never also read through `message`.
+        let entries = choice
+            .get("delta")
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| {
+                choice
+                    .get("message")
+                    .and_then(|message| message.get("tool_calls"))
+                    .and_then(serde_json::Value::as_array)
+            });
+        let Some(entries) = entries else {
+            continue;
+        };
+        for (position, entry) in entries.iter().enumerate() {
+            // Chat tool-call deltas always carry `index`; the array position
+            // is the defensive fallback (the non-streaming shape omits it).
+            let index = entry
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(position as u32, |i| u32::try_from(i).unwrap_or(u32::MAX));
+            watch.tool_call_start(index);
+            // An empty / absent / non-string `arguments` must still register
+            // the call: "streamed a tool call with no arguments" is exactly
+            // the defect this watch exists to catch.
+            let arguments = entry
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            watch.arguments_delta(index, arguments);
+            fed = true;
+        }
+    }
+    fed
 }
 
 /// Build a per-response Anthropic stream encoder with content-block
@@ -448,6 +677,52 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
         // `upstream_start` `Instant` remains untouched.
         let mut target_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
+        // Branch on the actually-used upstream protocol, not just the
+        // native-lane flags: a Translated lane whose fallback is
+        // `anthropic_messages` must encode the IR down to an Anthropic body
+        // and hit `apis.anthropic_messages.base_url` — never the Chat node's
+        // address (CatalogProvider::chat used to blind-prefer
+        // chat_completions on multi-protocol providers).
+        let use_anthropic = target.upstream_protocol == ApiKind::AnthropicMessages;
+        let use_responses = target.upstream_protocol == ApiKind::Responses;
+        // Native flags only gate *raw upstream JSON* egress (structure
+        // fidelity on the ingress-native lane); they no longer select the
+        // call path.
+        let use_native_anthropic = is_anthropic_ingress && target.lane == Lane::Native;
+        let use_native_responses = is_responses_ingress && target.lane == Lane::Native;
+        let is_chat_ingress = matches!(ingress_protocol, IngressProtocol::ChatCompletions);
+        // Dispatch-boundary mapping depends on ingress vs the upstream frame
+        // protocol:
+        // - Anthropic frames (native or translated) on an Anthropic ingress:
+        //   Raw passthrough (native).
+        // - Anthropic frames on any other ingress: decode to IR so the
+        //   ingress encoder can re-render them.
+        // - Chat ingress + Chat bridge frames: Raw passthrough (M4
+        //   byte-fidelity invariant).
+        // - Chat ingress + Responses frames: decode to IR so the Chat ingress
+        //   encoder re-renders them as Chat chunks — protocol A's frames are
+        //   never handed to protocol B's client.
+        // - Anthropic/Responses ingress + Chat-shaped frames: decode to IR,
+        //   re-render per ingress.
+        // - Responses-ingress native: Raw passthrough.
+        // Usage/Error/End → IR 1:1 in all cases.
+        //
+        // Computed here (not inside the attempt future) because the tool-arg
+        // watch at the `ChatAttempt::Stream` boundary needs the same verdict:
+        // it may peek raw frames only where the stream is *not* decoded.
+        let needs_ir_decode = if use_anthropic {
+            !is_anthropic_ingress
+        } else {
+            // Chat ingress × Responses upstream is the one combination that
+            // used to fall through to a Raw passthrough: protocol A's frames
+            // must not reach protocol B's client. Every other arm keeps its
+            // previous verdict (chat→chat stays a Raw passthrough — the M4
+            // byte-fidelity invariant — and the native Responses lane stays
+            // untouched).
+            (is_chat_ingress && use_responses)
+                || ((is_anthropic_ingress || is_responses_ingress) && !use_native_responses)
+        };
+
         let outcome = run_with_retries_outcome::<ChatAttempt, _, _>(
             provider_name,
             retries,
@@ -487,15 +762,9 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     // node's address (CatalogProvider::chat used to
                     // blind-prefer chat_completions on multi-protocol
                     // providers).
-                    let use_anthropic = target.upstream_protocol == ApiKind::AnthropicMessages;
-                    let use_responses = target.upstream_protocol == ApiKind::Responses;
-                    // Native flags only gate *raw upstream JSON* egress
-                    // (structure fidelity on the ingress-native lane); they
-                    // no longer select the call path.
-                    let use_native_anthropic = is_anthropic_ingress && target.lane == Lane::Native;
-                    let use_native_responses = is_responses_ingress && target.lane == Lane::Native;
-                    let is_chat_ingress =
-                        matches!(ingress_protocol, IngressProtocol::ChatCompletions);
+                    // (`use_anthropic` / `use_responses` / `use_native_*` /
+                    // `is_chat_ingress` / `needs_ir_decode` are computed per
+                    // target before the retry loop — see above.)
                     let result = async {
                         // Capture the upstream start time immediately before the
                         // provider call so retry/circuit overhead is excluded.
@@ -561,45 +830,52 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     )
                                     .await?
                             };
-                            // Dispatch-boundary mapping depends on ingress vs
-                            // the upstream frame protocol:
-                            // - Anthropic frames (native or translated) on an
-                            //   Anthropic ingress: Raw passthrough (native).
-                            // - Anthropic frames on any other ingress:
-                            //   decode to IR so the ingress encoder can
-                            //   re-render them.
-                            // - Chat ingress + Chat bridge frames: Raw
-                            //   passthrough (M4 byte-fidelity invariant).
-                            // - Anthropic/Responses ingress + Chat-shaped
-                            //   frames: decode to IR, re-render per ingress.
-                            // - Responses-ingress native: Raw passthrough.
-                            // Usage/Error/End → IR 1:1 in all cases.
-                            let needs_ir_decode = if use_anthropic {
-                                !is_anthropic_ingress
-                            } else {
-                                (is_anthropic_ingress || is_responses_ingress)
-                                    && !use_native_responses
-                            };
+                            // Dispatch-boundary mapping: see `needs_ir_decode`
+                            // above for the per-lane verdict table.
                             let s = if needs_ir_decode {
                                 // Frame protocol for the decode: the anthropic
                                 // arm always emits Anthropic SSE (native and
-                                // translated alike); other arms bridge through
+                                // translated alike); the responses arm emits
+                                // Responses SSE (its decoder is stateful —
+                                // `output_item.done` is resolved against the
+                                // deltas already seen, so it cannot be a bare
+                                // `fn` pointer); other arms bridge through
                                 // OpenAI-shaped Data.
-                                let decode: fn(&[u8]) -> Vec<sag_core::IrStreamEvent> =
-                                    if use_anthropic {
-                                        AnthropicMessagesCodec::decode_stream_frame
-                                    } else {
-                                        ChatCompletionsCodec::decode_stream_frame
-                                    };
-                                s.flat_map(move |chunk| match chunk {
-                                    sag_core::StreamChunk::Data(bytes) => {
-                                        futures_util::stream::iter(decode(&bytes))
-                                    }
-                                    other => futures_util::stream::iter(vec![
-                                        sag_core::IrStreamEvent::from(other),
-                                    ]),
-                                })
-                                .boxed()
+                                let mut decode: StreamFrameDecoder = if use_anthropic {
+                                    Box::new(AnthropicMessagesCodec::decode_stream_frame)
+                                } else if use_responses {
+                                    Box::new(ResponsesCodec::stream_decoder())
+                                } else {
+                                    Box::new(ChatCompletionsCodec::decode_stream_frame)
+                                };
+                                let decoded = s
+                                    .flat_map(move |chunk| match chunk {
+                                        sag_core::StreamChunk::Data(bytes) => {
+                                            futures_util::stream::iter(decode(&bytes))
+                                        }
+                                        other => futures_util::stream::iter(vec![
+                                            sag_core::IrStreamEvent::from(other),
+                                        ]),
+                                    })
+                                    .boxed();
+                                if use_responses && needs_ir_decode {
+                                    // Keep the IR events, drop the Raw frames
+                                    // the Responses decoder forwarded verbatim:
+                                    // they carry Responses event names, which
+                                    // a non-Responses client must never receive.
+                                    decoded
+                                        .filter(|ev| {
+                                            futures_util::future::ready(match ev {
+                                                sag_core::IrStreamEvent::Raw(bytes) => {
+                                                    !is_responses_event_frame(bytes)
+                                                }
+                                                _ => true,
+                                            })
+                                        })
+                                        .boxed()
+                                } else {
+                                    decoded
+                                }
                             } else {
                                 s.map(sag_core::IrStreamEvent::from).boxed()
                             };
@@ -613,12 +889,14 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             // `RawVerdict::Empty`, so an empty upstream still
                             // surfaces `EmptyResponse` and retries.
                             //
-                            // On the Responses arm the response frames stay a
-                            // byte-identical Raw passthrough (the Chat-ingress
-                            // M4 byte-fidelity invariant): `[DONE]` only adds
-                            // the Chat protocol's terminator. Converting those
-                            // frames into Chat-shaped chunks is a separate
-                            // concern and out of scope here.
+                            // On the Responses arm the frames are already IR by
+                            // the time they reach this bridge (the decode above
+                            // re-encodes them as Chat chunks), so `[DONE]` only
+                            // adds the Chat protocol's terminator on top of
+                            // Chat-shaped frames. The M4 byte-fidelity invariant
+                            // covers homogeneous lanes (chat→chat, native→native),
+                            // not handing protocol A's frames to protocol B's
+                            // client.
                             //
                             // Bridges #2 / #3 (Anthropic ingress
                             // `message_stop` / Responses ingress
@@ -1038,6 +1316,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
 
         match attempt {
             ChatAttempt::Stream(stream, upstream_start) => {
+                // Tool-argument quality watch: every event this attempt emits
+                // is folded on the way to the client, and the aggregate is
+                // reported once at the stream terminal (warn-only).
+                let (stream, tool_args) = watch_tool_args(stream, !needs_ir_decode);
                 // The stream's single terminal analytics event (success /
                 // stream-error-after-commit / client-cancelled) is emitted
                 // from inside `build_streaming_response`, which receives the
@@ -1084,6 +1366,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         session_log_key.clone(),
                         privacy_restore.take(),
                         in_flight,
+                        tool_args.clone(),
                     );
                 }
                 if is_responses_ingress {
@@ -1111,6 +1394,7 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         session_log_key.clone(),
                         privacy_restore.take(),
                         in_flight,
+                        tool_args.clone(),
                     );
                 }
                 return build_streaming_response(
@@ -1137,9 +1421,27 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     session_log_key.clone(),
                     privacy_restore.take(),
                     in_flight,
+                    tool_args.clone(),
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {
+                // Tool-argument quality: a warn-only signal, emitted exactly
+                // once per successful non-stream response and *before* egress.
+                // A blank / unparseable `arguments` still records the attempt
+                // as `Success` and still egresses the original body; this line
+                // is the only trace of the defect.
+                let (tool_calls, tool_args_quality) = non_stream_tool_args_quality(&att.ir);
+                if tool_calls > 0 && tool_args_quality != ToolArgsQuality::Ok {
+                    tracing::warn!(
+                        request_id = %trace_id,
+                        provider = %provider_name,
+                        model = %request.model,
+                        real_model = %real_model,
+                        tool_calls,
+                        reason = ?tool_args_quality,
+                        "upstream returned tool calls with blank/invalid arguments"
+                    );
+                }
                 // Non-streaming responses are single-shot: TTFT equals the
                 // total upstream duration. Usage comes from the IR view
                 // (same `Usage` type / values as the original response).
@@ -1526,4 +1828,128 @@ fn privacy_restored_response<T: serde::Serialize>(
     };
     restore_value(map, &mut value);
     (StatusCode::OK, Json(value)).into_response()
+}
+
+/// Unit tests for the raw-frame tool-argument peek.
+///
+/// The module is named `peek_tests` (not `tests`) because `mod tests;` above
+/// already owns that name for the dispatch integration suite.
+#[cfg(test)]
+mod peek_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    /// One chat-chunk SSE frame carrying a single tool-call delta.
+    fn chunk(arguments: &str) -> Vec<u8> {
+        format!(
+            "data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"get_weather\",\"arguments\":{}}}}}]}},\"finish_reason\":null}}]}}\n\n",
+            serde_json::to_string(arguments).expect("serialize arguments")
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn peek_raw_frame_accumulates_tool_call_arguments() {
+        let mut watch = ToolArgWatch::new();
+        // `data: {…}` on the first frame, `data:{…}` (no space) on the second:
+        // both spellings must strip.
+        let first = chunk("{\"city\":");
+        let second = String::from_utf8(chunk("\"SF\"}"))
+            .expect("utf8")
+            .replacen("data: ", "data:", 1)
+            .into_bytes();
+
+        assert!(peek_chat_raw_frame(&first, &mut watch));
+        assert!(peek_chat_raw_frame(&second, &mut watch));
+
+        assert_eq!(watch.tool_call_count(), 1);
+        assert_eq!(watch.quality(), ToolArgsQuality::Ok);
+    }
+
+    #[test]
+    fn peek_raw_frame_blank_arguments_yield_blank() {
+        let mut watch = ToolArgWatch::new();
+
+        assert!(peek_chat_raw_frame(&chunk(""), &mut watch));
+
+        assert!(watch.saw_tool_call());
+        assert_eq!(watch.tool_call_count(), 1);
+        assert_eq!(watch.quality(), ToolArgsQuality::Blank);
+    }
+
+    #[test]
+    fn peek_raw_frame_ignores_done_and_non_json() {
+        let mut watch = ToolArgWatch::new();
+
+        for frame in [
+            &b"data: [DONE]\n\n"[..],
+            &b"data: not-json\n\n"[..],
+            &b": keep-alive\n\n"[..],
+            &b""[..],
+        ] {
+            assert!(
+                !peek_chat_raw_frame(frame, &mut watch),
+                "frame must not contribute a tool call: {:?}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+
+        assert!(!watch.saw_tool_call());
+        assert_eq!(watch.quality(), ToolArgsQuality::Ok);
+    }
+
+    #[test]
+    fn peek_raw_frame_handles_missing_index() {
+        // Two entries, neither carrying `index`: the array position is the
+        // fallback. If both fell back to a fixed 0 the watch would track one
+        // call instead of two.
+        let frame = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"a\",\"arguments\":\"\"}},{\"type\":\"function\",\"function\":{\"name\":\"b\"}}]}}]}\n\n";
+        let mut watch = ToolArgWatch::new();
+
+        assert!(peek_chat_raw_frame(frame, &mut watch));
+
+        assert!(watch.saw_tool_call());
+        assert_eq!(watch.tool_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn peek_raw_frame_is_gated_off_on_ir_lanes() {
+        // A decoded lane has already folded the call as IR; the same frame's
+        // leftover `Raw` copy must stay unread, otherwise the arguments are
+        // appended twice (`{"a":1}{"a":1}` → false-positive `NotJson`).
+        let events = || {
+            vec![
+                sag_core::IrStreamEvent::ToolCallStart {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("fn".into()),
+                },
+                sag_core::IrStreamEvent::ToolCallDelta {
+                    index: 0,
+                    arguments_delta: "{\"a\":1}".into(),
+                },
+                sag_core::IrStreamEvent::Raw(chunk("{\"a\":1}")),
+                sag_core::IrStreamEvent::End,
+            ]
+        };
+        let verdict = |peek_raw_chat_frames: bool| async move {
+            let stream = futures_util::stream::iter(events()).boxed();
+            let (folded, handle) = watch_tool_args(stream, peek_raw_chat_frames);
+            // The fold is cold: drain it so the watch sees every event.
+            let drained: Vec<_> = folded.collect().await;
+            assert_eq!(drained.len(), 4, "the fold must forward every event");
+            handle.verdict()
+        };
+
+        assert_eq!(
+            verdict(false).await,
+            (1, ToolArgsQuality::Ok),
+            "IR lane: no peek"
+        );
+        assert_eq!(
+            verdict(true).await,
+            (1, ToolArgsQuality::NotJson),
+            "passthrough lane: the peek is live (this is what the gate avoids on IR lanes)"
+        );
+    }
 }

@@ -25,6 +25,7 @@
 //! keep carrying them so encode can put them back (R1 / R5).
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1098,13 +1099,44 @@ impl ResponsesCodec {
     // stream decode (upstream): Responses SSE → IrStreamEvent(s)
     // ═══════════════════════════════════════════════════════════
 
-    /// Decode a single Responses SSE frame into 0..n IR stream events.
+    /// Decode a single Responses SSE frame into 0..n IR stream events,
+    /// statelessly: a fresh [`StreamDecodeState`] is used per call.
     ///
     /// State machine (plan §5.2):
     /// `response.created → response.in_progress → response.output_item.added
     ///  → response.content_part.added → delta → done → response.completed /
-    ///  response.failed`; unknown types → Raw.
+    ///  response.failed`. Known bookkeeping types (`response.in_progress`,
+    /// `response.content_part.*`, `response.output_text.done`,
+    /// `response.function_call_arguments.done`, `response.reasoning_*`
+    /// terminals, ...) decode to **no event at all**: they carry nothing the
+    /// IR needs, and passing them through as `Raw` would leak Responses
+    /// frames onto a different-protocol egress (e.g. an Anthropic client).
+    /// Only frames that cannot be classified (non-JSON payload, SSE
+    /// comments, unknown `type` strings) become `Raw`.
+    ///
+    /// Prefer [`Self::stream_decoder`] for a real stream: the per-call state
+    /// cannot tell whether an item's payload already arrived as deltas, so a
+    /// `response.output_item.done` seen in its own frame is treated as the
+    /// sole supplier (see [`StreamDecodeState`]).
     pub fn decode_stream_frame(frame: &[u8]) -> Vec<IrStreamEvent> {
+        StreamDecodeState::default().decode(frame)
+    }
+
+    /// Build a **stateful** upstream stream decoder that remembers which
+    /// `output_index` values already delivered their payload through deltas.
+    ///
+    /// Without it, `response.output_item.done` is either blindly dropped (a
+    /// `function_call` whose `arguments` never delta-streamed loses them) or
+    /// blindly re-emitted (a client accumulating deltas then double-applies
+    /// the payload). Returns a `FnMut` suitable for a stream combinator.
+    pub fn stream_decoder() -> impl FnMut(&[u8]) -> Vec<IrStreamEvent> + Send {
+        let mut state = StreamDecodeState::default();
+        move |frame| state.decode(frame)
+    }
+
+    /// Decode one frame against `state`; the shared body of the stateless
+    /// wrapper and the stateful [`Self::stream_decoder`].
+    fn decode_frame(state: &mut StreamDecodeState, frame: &[u8]) -> Vec<IrStreamEvent> {
         let text = String::from_utf8_lossy(frame);
         let mut events = Vec::new();
         let mut saw_data = false;
@@ -1163,40 +1195,111 @@ impl ResponsesCodec {
                         .get("output_index")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32;
-                    match item.get("type").and_then(|t| t.as_str()) {
-                        Some("function_call") => {
-                            events.push(IrStreamEvent::ToolCallStart {
+                    // Remember the payload so `output_item.done` can tell
+                    // whether the item was already started.
+                    state.open_items.insert(index, item.clone());
+                    // Only `function_call` carries IR content at item-open.
+                    // `message` / `reasoning` just announce the item (content
+                    // deltas follow) and any other item type (e.g. hosted tool
+                    // calls) is bookkeeping whose payload the IR never consumes
+                    // — emitting `Raw` for those would leak a Responses frame
+                    // onto a foreign-protocol egress.
+                    if let Some("function_call") = item.get("type").and_then(|t| t.as_str()) {
+                        events.push(IrStreamEvent::ToolCallStart {
+                            index,
+                            id: item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from),
+                            name: item.get("name").and_then(|v| v.as_str()).map(String::from),
+                        });
+                        // Initial arguments (often "") → ToolCallDelta.
+                        if let Some(args) = item.get("arguments").and_then(|v| v.as_str())
+                            && !args.is_empty()
+                        {
+                            events.push(IrStreamEvent::ToolCallDelta {
                                 index,
-                                id: item
-                                    .get("call_id")
-                                    .or_else(|| item.get("id"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                name: item.get("name").and_then(|v| v.as_str()).map(String::from),
+                                arguments_delta: args.to_string(),
                             });
-                            // Initial arguments (often "") → ToolCallDelta.
-                            if let Some(args) = item.get("arguments").and_then(|v| v.as_str())
-                                && !args.is_empty()
-                            {
-                                events.push(IrStreamEvent::ToolCallDelta {
-                                    index,
-                                    arguments_delta: args.to_string(),
-                                });
-                            }
-                        }
-                        Some("message") | Some("reasoning") => {
-                            // Item open — content deltas follow. Nothing to emit.
-                        }
-                        _ => {
-                            events.push(IrStreamEvent::Raw(frame.to_vec()));
+                            state.deltas_seen.insert(index);
                         }
                     }
                 }
-                "response.output_item.done"
-                | "response.content_part.added"
-                | "response.content_part.done" => {
-                    // Bookkeeping frames — no IR event (block re-opens on next delta).
+                "response.output_item.done" => {
+                    let index = val
+                        .get("output_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let item = val.get("item").cloned().unwrap_or(Value::Null);
+                    let added = state.open_items.remove(&index);
+                    // Round-trip invariant: every item's payload reaches IR
+                    // exactly once — `done` is the sole supplier only when
+                    // no delta was streamed for this index, and the deltas
+                    // are the sole supplier otherwise (`done` is an
+                    // authoritative replacement, not an addition, so it
+                    // must stay silent once deltas were delivered). A
+                    // replayed `done` (SSE reconnect / chunk replay) is the
+                    // same replacement, so it must stay silent too.
+                    let first_done = state.closed_items.insert(index);
+                    if !state.deltas_seen.contains(&index) && first_done {
+                        match item.get("type").and_then(|t| t.as_str()) {
+                            Some("function_call") => {
+                                // `added` is normally the start carrier; when
+                                // upstream skipped it, start here instead so
+                                // the IR shape is identical either way.
+                                let field = |key: &str| {
+                                    item.get(key)
+                                        .or_else(|| added.as_ref().and_then(|a| a.get(key)))
+                                        .and_then(|v| v.as_str())
+                                };
+                                if added.is_none() {
+                                    events.push(IrStreamEvent::ToolCallStart {
+                                        index,
+                                        id: field("call_id")
+                                            .or_else(|| field("id"))
+                                            .map(String::from),
+                                        name: field("name").map(String::from),
+                                    });
+                                }
+                                if let Some(args) = field("arguments")
+                                    && !args.is_empty()
+                                {
+                                    events.push(IrStreamEvent::ToolCallDelta {
+                                        index,
+                                        arguments_delta: args.to_string(),
+                                    });
+                                }
+                            }
+                            Some("message") => {
+                                let text = item_part_text(&item, "content");
+                                if !text.is_empty() {
+                                    events.push(IrStreamEvent::TextDelta { index, text });
+                                }
+                            }
+                            Some("reasoning") => {
+                                let mut text = item_part_text(&item, "summary");
+                                if text.is_empty() {
+                                    text = item_part_text(&item, "content");
+                                }
+                                if !text.is_empty() {
+                                    events.push(IrStreamEvent::ReasoningDelta { index, text });
+                                }
+                            }
+                            // Unknown / empty item: bookkeeping only.
+                            _ => {}
+                        }
+                    }
                 }
+                // Part / text terminals: no IR event. Part text is delivered
+                // by the delta frames and `output_item.done` carries the
+                // complete item, so reconstructing from a terminal frame here
+                // would emit the same text twice. Decoding them to nothing (not
+                // `Raw`) keeps them off a foreign-protocol egress.
+                "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.done"
+                | "response.function_call_arguments.done" => {}
                 "response.output_text.delta" | "response.content_part.delta" => {
                     let index = val
                         .get("output_index")
@@ -1236,6 +1339,7 @@ impl ResponsesCodec {
                         } else {
                             events.push(IrStreamEvent::TextDelta { index, text });
                         }
+                        state.deltas_seen.insert(index);
                     }
                 }
                 "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
@@ -1249,6 +1353,7 @@ impl ResponsesCodec {
                             index,
                             text: text.to_string(),
                         });
+                        state.deltas_seen.insert(index);
                     }
                 }
                 "response.function_call_arguments.delta" => {
@@ -1262,8 +1367,19 @@ impl ResponsesCodec {
                             index,
                             arguments_delta: delta.to_string(),
                         });
+                        state.deltas_seen.insert(index);
                     }
                 }
+                // Reasoning terminals (`response.reasoning_summary_text.done`,
+                // `response.reasoning_text.done`, part terminals) carry the
+                // already-streamed text — the deltas are the sole supplier, so
+                // these decode to nothing instead of `Raw`. Annotations likewise
+                // have no IR slot (citations stay upstream-only).
+                "response.reasoning_summary_text.done"
+                | "response.reasoning_text.done"
+                | "response.reasoning_summary_part.added"
+                | "response.reasoning_summary_part.done"
+                | "response.output_text.annotation.added" => {}
                 "response.completed" => {
                     // Forward the original frame (client-visible, carries
                     // usage) + extract Usage for analytics. Finish/End are
@@ -1376,9 +1492,11 @@ impl ResponsesCodec {
                 format!("data: {payload}\n\n").into_bytes()
             }
             IrStreamEvent::ToolCallStart { index, id, name } => {
+                // Same id scheme as the stateful encoder: the spec `id` is
+                // derived from the output index, the IR call id is `call_id`.
                 let item = json!({
                     "type": "function_call",
-                    "id": id.clone().unwrap_or_default(),
+                    "id": format!("fc_{index}"),
                     "call_id": id.clone().unwrap_or_default(),
                     "name": name.clone().unwrap_or_default(),
                     "arguments": "",
@@ -1404,8 +1522,9 @@ impl ResponsesCodec {
             }
             IrStreamEvent::Finish { finish_reason, .. } => {
                 // Synthesize the terminal event (translated path; native
-                // passes the upstream frame through as Raw).
-                encode_terminal_event(finish_reason.as_ref())
+                // passes the upstream frame through as Raw). The stateless
+                // view carries no item history.
+                encode_terminal_event(finish_reason.as_ref(), &[])
             }
             // Usage / Error / End are handled inline by the dispatch loop.
             IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) | IrStreamEvent::End => Vec::new(),
@@ -1427,25 +1546,97 @@ impl ResponsesCodec {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// stream decoder state
+// ═══════════════════════════════════════════════════════════════════
+
+/// Per-stream decode state: which item indices already delivered their
+/// payload through deltas, and the `output_item.added` payloads still open.
+///
+/// Invariant: **every item's payload reaches IR exactly once** — `done` is
+/// the sole supplier only when deltas were absent, and the deltas are the
+/// sole supplier otherwise.
+#[derive(Default)]
+struct StreamDecodeState {
+    /// `output_index` values whose content was already emitted as deltas.
+    deltas_seen: HashSet<u32>,
+    /// `response.output_item.added` payloads, keyed by `output_index`.
+    open_items: HashMap<u32, Value>,
+    /// `output_index` values whose `response.output_item.done` was already
+    /// processed, so a replayed `done` frame cannot re-deliver a payload.
+    closed_items: HashSet<u32>,
+}
+
+impl StreamDecodeState {
+    fn decode(&mut self, frame: &[u8]) -> Vec<IrStreamEvent> {
+        ResponsesCodec::decode_frame(self, frame)
+    }
+}
+
+/// Concatenate the `text` fields of an item's `content` / `summary` parts.
+fn item_part_text(item: &Value, field: &str) -> String {
+    item.get(field)
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // stream encoder state
 // ═══════════════════════════════════════════════════════════════════
 
+/// Per-stream encode state: the single open non-tool item plus the set of
+/// concurrently-open tool calls.
+///
+/// Invariant: **every item's payload reaches `output` exactly once** — each
+/// item is closed by exactly one `output_item.done` and inserted into
+/// `completed_items` exactly once.
 #[derive(Default)]
 struct StreamEncodeState {
     started: bool,
-    /// Kind of the currently open output item, if any.
+    /// Kind of the currently open non-tool output item, if any
+    /// (`message` / `reasoning` — they are never parallel, so they keep the
+    /// single-slot treatment).
     open_item: Option<OpenItem>,
-    /// Index of the currently open output item.
+    /// Index of the currently open non-tool output item.
     open_index: u32,
     next_index: u32,
     completed: bool,
+    /// Tool calls that were announced but never closed, keyed by the IR
+    /// tool-call index (chat upstreams stream parallel calls with distinct
+    /// indices in one `delta`). Each entry owns its own `output_index` and
+    /// argument buffer, so interleaved deltas cannot cross-contaminate.
+    open_tool_calls: HashMap<u32, OpenToolCall>,
+    /// Text accumulated from text / reasoning deltas for the open item.
+    open_text: String,
+    /// Items already closed, keyed by `output_index`; the terminal frame emits
+    /// them in ascending index order.
+    completed_items: BTreeMap<u32, Value>,
+    /// IR tool-call indices whose item was already committed by a terminal
+    /// close. A late `ToolCallDelta` for one of these is dropped instead of
+    /// resurrecting the call as a second `function_call` item.
+    closed_tool_calls: HashSet<u32>,
+}
+
+/// One concurrently-open `function_call` output item.
+struct OpenToolCall {
+    /// Responses `output_index` allocated when the item was opened.
+    output_index: u32,
+    /// IR call id, repeated as `call_id` by `added` / `done`.
+    call_id: String,
+    name: String,
+    /// Arguments accumulated from `ToolCallDelta` for this call only.
+    arguments: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum OpenItem {
     Message,
     Reasoning,
-    FunctionCall,
 }
 
 impl StreamEncodeState {
@@ -1480,11 +1671,17 @@ impl StreamEncodeState {
                 self.open_item = None;
                 self.next_index = 0;
                 self.completed = false;
+                self.open_tool_calls.clear();
+                self.closed_tool_calls.clear();
+                self.open_text.clear();
+                self.completed_items.clear();
                 let _ = meta;
                 ResponsesCodec::encode_stream_event(ev)
             }
             IrStreamEvent::TextDelta { text, .. } => {
                 let mut out = self.ensure_started();
+                // An open tool call stays open: it is committed once at the
+                // stream terminal, so a text delta cannot split it.
                 if self.open_item != Some(OpenItem::Message) {
                     out.extend_from_slice(&self.close_open_item());
                     let index = self.next_index;
@@ -1521,11 +1718,14 @@ impl StreamEncodeState {
                     "content_index": 0,
                     "delta": text,
                 });
+                self.open_text.push_str(text);
                 out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
                 out
             }
             IrStreamEvent::ReasoningDelta { text, .. } => {
                 let mut out = self.ensure_started();
+                // An open tool call stays open: it is committed once at the
+                // stream terminal, so a reasoning delta cannot split it.
                 if self.open_item != Some(OpenItem::Reasoning) {
                     out.extend_from_slice(&self.close_open_item());
                     let index = self.next_index;
@@ -1551,17 +1751,28 @@ impl StreamEncodeState {
                     "output_index": self.open_index,
                     "delta": text,
                 });
+                self.open_text.push_str(text);
                 out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
                 out
             }
-            IrStreamEvent::ToolCallStart { id, name, .. } => {
+            IrStreamEvent::ToolCallStart { index, id, name } => {
                 let mut out = self.ensure_started();
-                out.extend_from_slice(&self.close_open_item());
-                let index = self.next_index;
+                // Idempotent re-open: the item already announced itself, so it
+                // keeps its `output_index` and no second `added` is emitted.
+                if self.open_tool_calls.contains_key(index) {
+                    return out;
+                }
+                // An open message / reasoning item stays open: it is
+                // committed at the stream terminal (or when a text delta
+                // switches reasoning → message), never by a tool call.
+                // An explicit restart also clears the closed marker so the
+                // deltas that follow are not mistaken for a stale replay.
+                self.closed_tool_calls.remove(index);
+                let output_index = self.next_index;
                 let call_id = id.clone().unwrap_or_default();
                 let item = json!({
                     "type": "function_call",
-                    "id": format!("fc_{index}"),
+                    "id": format!("fc_{output_index}"),
                     "call_id": call_id,
                     "name": name.clone().unwrap_or_default(),
                     "arguments": "",
@@ -1569,50 +1780,91 @@ impl StreamEncodeState {
                 });
                 let payload = json!({
                     "type": "response.output_item.added",
-                    "output_index": index,
+                    "output_index": output_index,
                     "item": item,
                 });
                 out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
-                self.open_item = Some(OpenItem::FunctionCall);
-                self.open_index = index;
                 self.next_index += 1;
+                self.open_tool_calls.insert(
+                    *index,
+                    OpenToolCall {
+                        output_index,
+                        call_id,
+                        name: name.clone().unwrap_or_default(),
+                        arguments: String::new(),
+                    },
+                );
                 out
             }
             IrStreamEvent::ToolCallDelta {
-                arguments_delta, ..
+                index,
+                arguments_delta,
             } => {
-                // Defensive: open a function_call item if upstream skipped start.
-                if self.open_item != Some(OpenItem::FunctionCall) {
-                    let mut out = self.encode(&IrStreamEvent::ToolCallStart {
-                        index: 0,
-                        id: None,
-                        name: None,
-                    });
-                    let payload = json!({
-                        "type": "response.function_call_arguments.delta",
-                        "output_index": self.open_index,
-                        "delta": arguments_delta,
-                    });
-                    out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+                let mut out = self.ensure_started();
+                // A fragment for a call already committed by the terminal
+                // close is dropped: minting a fresh `output_index` here would
+                // resurrect the item as a duplicate `function_call` in
+                // `response.completed.output`.
+                if self.closed_tool_calls.contains(index) {
                     return out;
                 }
+                // Defensive: open a function_call item if upstream skipped the
+                // start frame for this index (never panic, never drop delta).
+                if !self.open_tool_calls.contains_key(index) {
+                    out.extend_from_slice(&self.encode(&IrStreamEvent::ToolCallStart {
+                        index: *index,
+                        id: None,
+                        name: None,
+                    }));
+                }
+                let Some(call) = self.open_tool_calls.get_mut(index) else {
+                    return out;
+                };
+                let output_index = call.output_index;
+                call.arguments.push_str(arguments_delta);
                 let payload = json!({
                     "type": "response.function_call_arguments.delta",
-                    "output_index": self.open_index,
+                    "output_index": output_index,
                     "delta": arguments_delta,
                 });
-                format!("data: {payload}\n\n").into_bytes()
-            }
-            IrStreamEvent::Finish { finish_reason, .. } => {
-                let mut out = self.close_open_item();
-                if !self.completed {
-                    out.extend_from_slice(&encode_terminal_event(finish_reason.as_ref()));
-                    self.completed = true;
-                }
+                out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
                 out
             }
-            IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) | IrStreamEvent::End => Vec::new(),
+            IrStreamEvent::Finish { finish_reason, .. } => {
+                let mut out = self.close_open_tool_calls();
+                out.extend_from_slice(&self.close_open_item());
+                if !self.completed {
+                    out.extend_from_slice(&encode_terminal_event(
+                        finish_reason.as_ref(),
+                        &self.completed_output(),
+                    ));
+                    self.completed = true;
+                }
+                self.completed_items.clear();
+                out
+            }
+            IrStreamEvent::End => {
+                // A stream closing with an item still open must flush it so
+                // the terminal payload is complete.
+                if self.open_item.is_none() && self.open_tool_calls.is_empty() {
+                    return Vec::new();
+                }
+                let mut out = self.close_open_tool_calls();
+                out.extend_from_slice(&self.close_open_item());
+                if !self.completed {
+                    out.extend_from_slice(&encode_terminal_event(None, &self.completed_output()));
+                    self.completed = true;
+                }
+                self.completed_items.clear();
+                out
+            }
+            IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) => Vec::new(),
         }
+    }
+
+    /// Closed items in ascending `output_index` order (BTreeMap iteration).
+    fn completed_output(&self) -> Vec<Value> {
+        self.completed_items.values().cloned().collect()
     }
 
     fn ensure_started(&mut self) -> Vec<u8> {
@@ -1623,48 +1875,102 @@ impl StreamEncodeState {
         ResponsesCodec::encode_stream_event(&IrStreamEvent::Start(IrResponseMeta::default()))
     }
 
+    /// Close the open non-tool item (`message` / `reasoning`), if any.
+    ///
+    /// Tool calls are not single-slot: they are flushed by
+    /// [`Self::close_open_tool_calls`].
     fn close_open_item(&mut self) -> Vec<u8> {
         let Some(kind) = self.open_item.take() else {
             return Vec::new();
         };
         let index = self.open_index;
         let mut out = Vec::new();
-        match kind {
+        // `done` repeats the full item the `added` frame announced — OpenAI's
+        // real stream does the same, so a client that accumulates deltas
+        // treats `done` as an authoritative replacement (never an addition).
+        let item = match kind {
             OpenItem::Message => {
+                let text = std::mem::take(&mut self.open_text);
                 let payload = json!({
                     "type": "response.content_part.done",
                     "output_index": index,
                     "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "part": {"type": "output_text", "text": text, "annotations": []},
                 });
                 out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
-                let payload = json!({
-                    "type": "response.output_item.done",
-                    "output_index": index,
-                    "item": {
-                        "type": "message",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [],
-                    },
-                });
-                out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+                json!({
+                    "type": "message",
+                    "id": format!("msg_{index}"),
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                })
             }
-            OpenItem::Reasoning | OpenItem::FunctionCall => {
-                let ty = if kind == OpenItem::Reasoning {
-                    "reasoning"
+            OpenItem::Reasoning => {
+                let text = std::mem::take(&mut self.open_text);
+                let summary = if text.is_empty() {
+                    json!([])
                 } else {
-                    "function_call"
+                    json!([{"type": "summary_text", "text": text}])
                 };
-                let payload = json!({
-                    "type": "response.output_item.done",
-                    "output_index": index,
-                    "item": {"type": ty, "status": "completed"},
-                });
-                out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+                json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{index}"),
+                    "summary": summary,
+                    "status": "completed",
+                })
             }
+        };
+        self.completed_items.insert(index, item.clone());
+        let payload = json!({
+            "type": "response.output_item.done",
+            "output_index": index,
+            "item": item,
+        });
+        out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
+        out
+    }
+
+    /// Close every open tool call, in ascending `output_index` order.
+    ///
+    /// The map is drained so a closed call can never leak into a later item,
+    /// each item reaches `completed_items` exactly once, and each IR index is
+    /// recorded in `closed_tool_calls` so later fragments cannot resurrect it.
+    fn close_open_tool_calls(&mut self) -> Vec<u8> {
+        if self.open_tool_calls.is_empty() {
+            return Vec::new();
+        }
+        let mut open: Vec<(u32, OpenToolCall)> = self.open_tool_calls.drain().collect();
+        open.sort_by_key(|(_, call)| call.output_index);
+        let mut out = Vec::new();
+        for (ir_index, call) in open {
+            self.closed_tool_calls.insert(ir_index);
+            out.extend_from_slice(&self.close_tool_call(call));
         }
         out
+    }
+
+    /// Commit one tool call as an `output_item.done` carrying its full item.
+    fn close_tool_call(&mut self, call: OpenToolCall) -> Vec<u8> {
+        let index = call.output_index;
+        // `done` repeats the full item the `added` frame announced — OpenAI's
+        // real stream does the same, so a client that accumulates deltas
+        // treats `done` as an authoritative replacement (never an addition).
+        let item = json!({
+            "type": "function_call",
+            "id": format!("fc_{index}"),
+            "call_id": call.call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "status": "completed",
+        });
+        self.completed_items.insert(index, item.clone());
+        let payload = json!({
+            "type": "response.output_item.done",
+            "output_index": index,
+            "item": item,
+        });
+        format!("data: {payload}\n\n").into_bytes()
     }
 }
 
@@ -1694,9 +2000,12 @@ fn terminal_event_fields(
 }
 
 /// Encode the synthesized terminal SSE frame for a finish reason.
-fn encode_terminal_event(finish: Option<&IrFinishReason>) -> Vec<u8> {
+///
+/// `completed` is the closed items in ascending `output_index` order, so the
+/// terminal payload mirrors OpenAI's real `response.completed.output`.
+fn encode_terminal_event(finish: Option<&IrFinishReason>, completed: &[Value]) -> Vec<u8> {
     let (event_type, status, incomplete_reason) = terminal_event_fields(finish);
-    let mut response = json!({"object": "response", "status": status, "output": []});
+    let mut response = json!({"object": "response", "status": status, "output": completed});
     if let Some(reason) = incomplete_reason {
         response["incomplete_details"] = json!({"reason": reason});
     }
@@ -3074,6 +3383,246 @@ mod tests {
         );
     }
 
+    // ── P0-2 encoder completeness / P0-3a stateful decoder ─────────
+
+    /// Split encoded SSE bytes into the decoded `data:` payloads.
+    fn sse_frames(bytes: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .split("\n\n")
+            .filter_map(|chunk| {
+                chunk
+                    .trim()
+                    .strip_prefix("data:")
+                    .and_then(|rest| serde_json::from_str::<Value>(rest.trim()).ok())
+            })
+            .collect()
+    }
+
+    fn find_frame<'a>(frames: &'a [Value], ty: &str) -> &'a Value {
+        frames
+            .iter()
+            .find(|f| f["type"] == json!(ty))
+            .unwrap_or_else(|| panic!("no {ty} frame in {frames:?}"))
+    }
+
+    /// `output_item.done` must repeat the full item — `arguments`, `call_id`
+    /// and `name` — not a hollow `{type, status}` stub.
+    #[test]
+    fn output_item_done_carries_function_call_payload() {
+        let enc = ResponsesCodec::stream_encoder();
+        let mut all = Vec::new();
+        all.extend(enc(&IrStreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("get_weather".into()),
+        }));
+        all.extend(enc(&IrStreamEvent::ToolCallDelta {
+            index: 0,
+            arguments_delta: "{\"city\":\"SF\"}".into(),
+        }));
+        all.extend(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::ToolCalls),
+        }));
+
+        let frames = sse_frames(&all);
+        let done = find_frame(&frames, "response.output_item.done");
+        let item = &done["item"];
+        assert_eq!(item["type"], json!("function_call"));
+        assert_eq!(item["arguments"], json!("{\"city\":\"SF\"}"));
+        assert!(
+            item["call_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "call_id missing: {item}"
+        );
+        assert!(
+            item["name"].as_str().is_some_and(|s| !s.is_empty()),
+            "name missing: {item}"
+        );
+        // The `added` frame announced the item with the same id.
+        let added = find_frame(&frames, "response.output_item.added");
+        assert_eq!(added["item"]["id"], item["id"]);
+    }
+
+    /// The terminal frame must carry every closed item, not `output: []`.
+    #[test]
+    fn response_completed_output_lists_all_items_in_index_order() {
+        let enc = ResponsesCodec::stream_encoder();
+        let mut all = Vec::new();
+        all.extend(enc(&IrStreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("fn".into()),
+        }));
+        all.extend(enc(&IrStreamEvent::ToolCallDelta {
+            index: 0,
+            arguments_delta: "{}".into(),
+        }));
+        all.extend(enc(&IrStreamEvent::TextDelta {
+            index: 1,
+            text: "hi".into(),
+        }));
+        all.extend(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::Stop),
+        }));
+
+        let frames = sse_frames(&all);
+        let completed = find_frame(&frames, "response.completed");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output array");
+        assert_eq!(output.len(), 2, "{completed}");
+        // Ascending `output_index`: item ids are minted from the index, and
+        // spec items carry no `output_index` field, so the suffixes pin the
+        // order (function_call is item 0, message is item 1).
+        assert_eq!(output[0]["id"], json!("fc_0"));
+        assert_eq!(output[1]["id"], json!("msg_1"));
+    }
+
+    /// Without deltas, `output_item.done` is the sole carrier of `arguments`.
+    #[test]
+    fn output_item_done_supplies_arguments_when_no_deltas() {
+        let mut dec = ResponsesCodec::stream_decoder();
+        let added = frame(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_0", "call_id": "call_1",
+                "name": "get_weather", "arguments": "", "status": "in_progress"
+            }
+        }));
+        let done = frame(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_0", "call_id": "call_1",
+                "name": "get_weather", "arguments": "{\"city\":\"SF\"}",
+                "status": "completed"
+            }
+        }));
+
+        let mut events = dec(&added);
+        events.extend(dec(&done));
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::ToolCallDelta {
+                    arguments_delta, ..
+                } => Some(arguments_delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["{\"city\":\"SF\"}"], "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, IrStreamEvent::ToolCallStart { .. }))
+                .count(),
+            1,
+            "start emitted once, at `added`: {events:?}"
+        );
+    }
+
+    /// Once the deltas delivered the payload, `done` must stay silent.
+    #[test]
+    fn output_item_done_does_not_duplicate_streamed_deltas() {
+        let mut dec = ResponsesCodec::stream_decoder();
+        let mut events = dec(&frame(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_0", "call_id": "call_1",
+                "name": "get_weather", "arguments": "", "status": "in_progress"
+            }
+        })));
+        for delta in ["{\"city\":", "\"SF\"}"] {
+            events.extend(dec(&frame(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": delta
+            }))));
+        }
+        events.extend(dec(&frame(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_0", "call_id": "call_1",
+                "name": "get_weather", "arguments": "{\"city\":\"SF\"}",
+                "status": "completed"
+            }
+        }))));
+
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::ToolCallDelta {
+                    arguments_delta, ..
+                } => Some(arguments_delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec!["{\"city\":", "\"SF\"}"],
+            "arguments must not be re-delivered by `done`: {events:?}"
+        );
+    }
+
+    /// P0-2/P0-3 pairing: encode a tool call, decode the bytes, and the
+    /// arguments arrive exactly once and intact.
+    #[test]
+    fn stream_roundtrip_encode_then_decode_delivers_arguments_once() {
+        let enc = ResponsesCodec::stream_encoder();
+        let mut bytes = Vec::new();
+        bytes.extend(enc(&IrStreamEvent::Start(IrResponseMeta {
+            id: Some("resp_1".into()),
+            created: Some(1),
+            model: Some("m".into()),
+        })));
+        bytes.extend(enc(&IrStreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("get_weather".into()),
+        }));
+        bytes.extend(enc(&IrStreamEvent::ToolCallDelta {
+            index: 0,
+            arguments_delta: "{\"city\":\"SF\"}".into(),
+        }));
+        bytes.extend(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::ToolCalls),
+        }));
+
+        let text = String::from_utf8(bytes).expect("utf-8 SSE");
+        let mut dec = ResponsesCodec::stream_decoder();
+        let mut events = Vec::new();
+        for chunk in text.split_inclusive("\n\n") {
+            events.extend(dec(chunk.as_bytes()));
+        }
+
+        let mut arguments = String::new();
+        let mut delta_count = 0;
+        let mut start_count = 0;
+        for ev in &events {
+            match ev {
+                IrStreamEvent::ToolCallStart { name, .. } => {
+                    start_count += 1;
+                    assert_eq!(name.as_deref(), Some("get_weather"));
+                }
+                IrStreamEvent::ToolCallDelta {
+                    arguments_delta, ..
+                } => {
+                    delta_count += 1;
+                    arguments.push_str(arguments_delta);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(start_count, 1, "{events:?}");
+        assert_eq!(delta_count, 1, "arguments delivered once: {events:?}");
+        assert_eq!(arguments, "{\"city\":\"SF\"}");
+    }
+
     // ── M8 stateful (native allow) ────────────────────────────────
 
     #[test]
@@ -3422,5 +3971,543 @@ mod tests {
         assert!(matches!(ir.output[0], IrOutputItem::Raw(_)));
         assert!(!ir.loss.is_empty());
         assert_eq!(encode_response(&ir)["output"][0]["content"], "t");
+    }
+
+    // ── P0-3b: bookkeeping frames must not leak as `Raw` ────────
+
+    /// Every known Responses bookkeeping event decodes to **no** IR event:
+    /// neither content nor `Raw`. One sequential decoder is used so that the
+    /// shared state cannot make a frame look bookkeeping by accident; each
+    /// frame is fed as its own upstream frame, in lifecycle order.
+    #[test]
+    fn known_bookkeeping_events_yield_no_raw() {
+        let mut dec = ResponsesCodec::stream_decoder();
+        for ty in [
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.done",
+            "response.function_call_arguments.done",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_text.done",
+            "response.output_text.annotation.added",
+        ] {
+            let events = dec(&frame(json!({
+                "type": ty,
+                "output_index": 0,
+                "content_index": 0,
+                "item": {"type": "message", "role": "assistant", "content": []},
+                "part": {"type": "output_text", "text": ""},
+                "text": "",
+                "arguments": "",
+                "delta": ""
+            })));
+            assert!(events.is_empty(), "{ty}: {events:?}");
+        }
+        // `response.created` is the one bookkeeping-adjacent frame that legitimately
+        // carries IR content (`Start`) — it must stay `Start`-only, never `Raw`.
+        let created = dec(&frame(json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "created_at": 5, "model": "gpt-4o"}
+        })));
+        assert!(
+            matches!(created.as_slice(), [IrStreamEvent::Start(_)]),
+            "{created:?}"
+        );
+        // No hosted-tool item is `Raw` either: its payload never reaches the IR.
+        let added = dec(&frame(json!({
+            "type": "response.output_item.added",
+            "output_index": 3,
+            "item": {"type": "web_search_call", "id": "ws_3", "status": "in_progress"}
+        })));
+        assert!(added.is_empty(), "{added:?}");
+    }
+
+    /// The deliberate non-catch-all: a genuinely unknown `type` stays visible
+    /// as `Raw` so a same-protocol passthrough lane still forwards it.
+    #[test]
+    fn unknown_event_type_still_surfaces_as_raw() {
+        let mut dec = ResponsesCodec::stream_decoder();
+        let events = dec(&frame(json!({
+            "type": "response.something_brand_new", "x": 1
+        })));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(events[0], IrStreamEvent::Raw(_)), "{events:?}");
+    }
+
+    // ── parallel tool calls (interleaved IR indices) ──────────────
+
+    /// Encode a whole IR event sequence through one stateful encoder and
+    /// return the decoded `data:` payloads.
+    fn encode_all(events: &[IrStreamEvent]) -> Vec<Value> {
+        let enc = ResponsesCodec::stream_encoder();
+        let mut bytes = Vec::new();
+        for ev in events {
+            bytes.extend(enc(ev));
+        }
+        sse_frames(&bytes)
+    }
+
+    /// Two tool calls opened back to back, then their deltas interleaved.
+    fn parallel_tool_call_events() -> Vec<IrStreamEvent> {
+        vec![
+            IrStreamEvent::ToolCallStart {
+                index: 0,
+                id: Some("c0".into()),
+                name: Some("f0".into()),
+            },
+            IrStreamEvent::ToolCallStart {
+                index: 1,
+                id: Some("c1".into()),
+                name: Some("f1".into()),
+            },
+            IrStreamEvent::ToolCallDelta {
+                index: 0,
+                arguments_delta: "{\"a\":1}".into(),
+            },
+            IrStreamEvent::ToolCallDelta {
+                index: 1,
+                arguments_delta: "{\"b\":2}".into(),
+            },
+            IrStreamEvent::Finish {
+                index: 0,
+                finish_reason: Some(IrFinishReason::ToolCalls),
+            },
+        ]
+    }
+
+    /// `output_index` → `call_id` for every `function_call` item announced.
+    fn function_call_owners(frames: &[Value]) -> HashMap<u32, String> {
+        frames
+            .iter()
+            .filter(|f| {
+                f["type"] == json!("response.output_item.added")
+                    && f["item"]["type"] == json!("function_call")
+            })
+            .map(|f| {
+                let index = f["output_index"].as_u64().expect("output_index") as u32;
+                let call_id = f["item"]["call_id"].as_str().expect("call_id").to_string();
+                (index, call_id)
+            })
+            .collect()
+    }
+
+    /// The production incident: two calls streamed concurrently must keep
+    /// their own arguments instead of one losing them and the other
+    /// concatenating both.
+    #[test]
+    fn parallel_tool_calls_preserve_independent_arguments() {
+        let frames = encode_all(&parallel_tool_call_events());
+        let completed = find_frame(&frames, "response.completed");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output array");
+        assert_eq!(output.len(), 2, "{completed}");
+
+        let arguments_for = |call_id: &str| {
+            output
+                .iter()
+                .find(|item| item["call_id"] == json!(call_id))
+                .unwrap_or_else(|| panic!("no item with call_id {call_id}: {completed}"))["arguments"]
+                .clone()
+        };
+        assert_eq!(arguments_for("c0"), json!("{\"a\":1}"), "{completed}");
+        assert_eq!(arguments_for("c1"), json!("{\"b\":2}"), "{completed}");
+    }
+
+    /// Every `function_call_arguments.delta` must name the `output_index` of
+    /// the call whose arguments it carries.
+    #[test]
+    fn parallel_tool_call_deltas_carry_correct_output_index() {
+        let frames = encode_all(&parallel_tool_call_events());
+        let owners = function_call_owners(&frames);
+        assert_eq!(owners.len(), 2, "{frames:?}");
+
+        let mut routed: Vec<(String, Value)> = Vec::new();
+        for frame in &frames {
+            if frame["type"] != json!("response.function_call_arguments.delta") {
+                continue;
+            }
+            let index = frame["output_index"].as_u64().expect("output_index") as u32;
+            let call_id = owners
+                .get(&index)
+                .unwrap_or_else(|| panic!("delta for unknown output_index {index}: {frames:?}"))
+                .clone();
+            routed.push((call_id, frame["delta"].clone()));
+        }
+        assert_eq!(
+            routed,
+            vec![
+                ("c0".to_string(), json!("{\"a\":1}")),
+                ("c1".to_string(), json!("{\"b\":2}")),
+            ],
+            "{frames:?}"
+        );
+    }
+
+    /// A second concurrently-open call must not commit the first one.
+    #[test]
+    fn parallel_tool_calls_in_one_chunk_do_not_close_each_other() {
+        let frames = encode_all(&[
+            IrStreamEvent::ToolCallStart {
+                index: 0,
+                id: Some("c0".into()),
+                name: Some("f0".into()),
+            },
+            IrStreamEvent::ToolCallStart {
+                index: 1,
+                id: Some("c1".into()),
+                name: Some("f1".into()),
+            },
+        ]);
+        let count = |ty: &str| frames.iter().filter(|f| f["type"] == json!(ty)).count();
+        assert_eq!(count("response.output_item.added"), 2, "{frames:?}");
+        assert_eq!(count("response.output_item.done"), 0, "{frames:?}");
+    }
+
+    /// A replayed `output_item.done` (SSE reconnect / chunk replay) must not
+    /// re-deliver the arguments the deltas already carried.
+    #[test]
+    fn duplicate_output_item_done_does_not_duplicate_arguments() {
+        let mut dec = ResponsesCodec::stream_decoder();
+        let mut events = dec(&frame(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_0", "call_id": "call_1",
+                "name": "get_weather", "arguments": "", "status": "in_progress"
+            }
+        })));
+        for delta in ["{\"city\":", "\"SF\"}"] {
+            events.extend(dec(&frame(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": delta
+            }))));
+        }
+        let done = frame(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_0", "call_id": "call_1",
+                "name": "get_weather", "arguments": "{\"city\":\"SF\"}",
+                "status": "completed"
+            }
+        }));
+        events.extend(dec(&done));
+        events.extend(dec(&done));
+
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                IrStreamEvent::ToolCallDelta {
+                    arguments_delta, ..
+                } => Some(arguments_delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec!["{\"city\":", "\"SF\"}"],
+            "arguments delivered once: {events:?}"
+        );
+    }
+
+    /// The stateless preview path must mint the same id shape as the stateful
+    /// encoder: `fc_{output_index}` for `id`, the IR call id for `call_id`.
+    #[test]
+    fn stateless_encode_stream_event_uses_index_derived_id() {
+        let out = ResponsesCodec::encode_stream_event(&IrStreamEvent::ToolCallStart {
+            index: 2,
+            id: Some("call_x".into()),
+            name: Some("fn".into()),
+        });
+        let frames = sse_frames(&out);
+        let added = find_frame(&frames, "response.output_item.added");
+        assert_eq!(added["output_index"], json!(2), "{added}");
+        assert_eq!(added["item"]["id"], json!("fc_2"), "{added}");
+        assert_eq!(added["item"]["call_id"], json!("call_x"), "{added}");
+    }
+
+    /// Interleaved calls survive an encode→decode round trip without mixing.
+    #[test]
+    fn parallel_tool_calls_roundtrip_through_decoder() {
+        let enc = ResponsesCodec::stream_encoder();
+        let mut bytes = enc(&IrStreamEvent::Start(IrResponseMeta {
+            id: Some("resp_1".into()),
+            created: Some(1),
+            model: Some("m".into()),
+        }));
+        for ev in parallel_tool_call_events() {
+            bytes.extend(enc(&ev));
+        }
+
+        let text = String::from_utf8(bytes).expect("utf-8 SSE");
+        let mut dec = ResponsesCodec::stream_decoder();
+        let mut events = Vec::new();
+        for chunk in text.split_inclusive("\n\n") {
+            events.extend(dec(chunk.as_bytes()));
+        }
+
+        // `output_index` → call id from the start frames, then route deltas.
+        let mut owners: HashMap<u32, String> = HashMap::new();
+        let mut arguments: HashMap<u32, String> = HashMap::new();
+        for ev in &events {
+            match ev {
+                IrStreamEvent::ToolCallStart {
+                    index,
+                    id: Some(id),
+                    ..
+                } => {
+                    owners.insert(*index, id.clone());
+                }
+                IrStreamEvent::ToolCallDelta {
+                    index,
+                    arguments_delta,
+                } => {
+                    arguments
+                        .entry(*index)
+                        .or_default()
+                        .push_str(arguments_delta);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(owners.len(), 2, "{events:?}");
+        let mut by_call_id: Vec<(String, String)> = arguments
+            .iter()
+            .map(|(index, args)| {
+                let call_id = owners
+                    .get(index)
+                    .unwrap_or_else(|| panic!("delta for unknown index {index}: {events:?}"));
+                (call_id.clone(), args.clone())
+            })
+            .collect();
+        by_call_id.sort();
+        assert_eq!(
+            by_call_id,
+            vec![
+                ("c0".to_string(), "{\"a\":1}".to_string()),
+                ("c1".to_string(), "{\"b\":2}".to_string()),
+            ],
+            "{events:?}"
+        );
+    }
+
+    // ── interleaving text / reasoning with tool calls ────────────
+
+    /// Count `response.output_item.added` frames whose `item.type` is `ty`.
+    fn count_added(frames: &[Value], ty: &str) -> usize {
+        frames
+            .iter()
+            .filter(|f| {
+                f["type"] == json!("response.output_item.added") && f["item"]["type"] == json!(ty)
+            })
+            .count()
+    }
+
+    /// Reviewer reproducer: a text delta in the middle of a tool call's
+    /// argument fragments must not split the tool call into two items, nor
+    /// leave a phantom `call_id: ""` item in the terminal output.
+    #[test]
+    fn interleaved_text_does_not_split_tool_call() {
+        let frames = encode_all(&[
+            IrStreamEvent::ToolCallStart {
+                index: 0,
+                id: Some("c0".into()),
+                name: Some("f0".into()),
+            },
+            IrStreamEvent::ToolCallDelta {
+                index: 0,
+                arguments_delta: "{\"a\":".into(),
+            },
+            IrStreamEvent::TextDelta {
+                index: 0,
+                text: "Wait".into(),
+            },
+            IrStreamEvent::ToolCallDelta {
+                index: 0,
+                arguments_delta: "1}".into(),
+            },
+            IrStreamEvent::Finish {
+                index: 0,
+                finish_reason: Some(IrFinishReason::Stop),
+            },
+        ]);
+
+        assert_eq!(count_added(&frames, "function_call"), 1, "{frames:?}");
+        assert_eq!(count_added(&frames, "message"), 1, "{frames:?}");
+
+        let completed = find_frame(&frames, "response.completed");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output array");
+        assert_eq!(output.len(), 2, "{completed}");
+
+        let calls: Vec<&Value> = output
+            .iter()
+            .filter(|item| item["type"] == json!("function_call"))
+            .collect();
+        assert_eq!(calls.len(), 1, "{completed}");
+        assert_eq!(calls[0]["call_id"], json!("c0"), "{completed}");
+        assert_eq!(calls[0]["arguments"], json!("{\"a\":1}"), "{completed}");
+
+        let messages: Vec<&Value> = output
+            .iter()
+            .filter(|item| item["type"] == json!("message"))
+            .collect();
+        assert_eq!(messages.len(), 1, "{completed}");
+        assert_eq!(
+            messages[0]["content"][0]["text"],
+            json!("Wait"),
+            "{completed}"
+        );
+    }
+
+    /// Mirror direction: a tool call opening in the middle of a message must
+    /// not split the message into two items.
+    #[test]
+    fn interleaved_tool_call_does_not_split_message() {
+        let frames = encode_all(&[
+            IrStreamEvent::TextDelta {
+                index: 0,
+                text: "Hello ".into(),
+            },
+            IrStreamEvent::ToolCallStart {
+                index: 1,
+                id: Some("c1".into()),
+                name: Some("f1".into()),
+            },
+            IrStreamEvent::TextDelta {
+                index: 0,
+                text: "world".into(),
+            },
+            IrStreamEvent::Finish {
+                index: 0,
+                finish_reason: Some(IrFinishReason::Stop),
+            },
+        ]);
+
+        assert_eq!(count_added(&frames, "message"), 1, "{frames:?}");
+        assert_eq!(count_added(&frames, "function_call"), 1, "{frames:?}");
+
+        let completed = find_frame(&frames, "response.completed");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output array");
+        assert_eq!(output.len(), 2, "{completed}");
+
+        let messages: Vec<&Value> = output
+            .iter()
+            .filter(|item| item["type"] == json!("message"))
+            .collect();
+        assert_eq!(messages.len(), 1, "{completed}");
+        assert_eq!(
+            messages[0]["content"][0]["text"],
+            json!("Hello world"),
+            "{completed}"
+        );
+        assert_eq!(
+            output
+                .iter()
+                .filter(|item| item["type"] == json!("function_call"))
+                .count(),
+            1,
+            "{completed}"
+        );
+    }
+
+    /// A fragment arriving after the item was committed must be dropped, not
+    /// resurrected as a fresh `function_call` with a new `output_index`.
+    #[test]
+    fn delta_after_close_does_not_resurrect_item() {
+        let enc = ResponsesCodec::stream_encoder();
+        let mut bytes = Vec::new();
+        bytes.extend(enc(&IrStreamEvent::ToolCallStart {
+            index: 0,
+            id: Some("c0".into()),
+            name: Some("f0".into()),
+        }));
+        bytes.extend(enc(&IrStreamEvent::ToolCallDelta {
+            index: 0,
+            arguments_delta: "{\"a\":1}".into(),
+        }));
+        bytes.extend(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::Stop),
+        }));
+        // Late replay of the same call's fragment.
+        bytes.extend(enc(&IrStreamEvent::ToolCallDelta {
+            index: 0,
+            arguments_delta: "}".into(),
+        }));
+
+        let frames = sse_frames(&bytes);
+        assert_eq!(count_added(&frames, "function_call"), 1, "{frames:?}");
+        let completed = find_frame(&frames, "response.completed");
+        assert_eq!(
+            completed["response"]["output"][0]["arguments"],
+            json!("{\"a\":1}"),
+            "{completed}"
+        );
+        assert!(
+            !frames.iter().any(|f| {
+                f["type"] == json!("response.output_item.added") && f["output_index"] == json!(1)
+            }),
+            "{frames:?}"
+        );
+    }
+
+    /// Reasoning → message keeps one item of each: the reasoning item is
+    /// committed when the message opens, and every text delta accumulates
+    /// into a single message item.
+    #[test]
+    fn reasoning_then_text_reuses_single_message_item() {
+        let frames = encode_all(&[
+            IrStreamEvent::ReasoningDelta {
+                index: 0,
+                text: "think ".into(),
+            },
+            IrStreamEvent::TextDelta {
+                index: 0,
+                text: "Hello ".into(),
+            },
+            IrStreamEvent::TextDelta {
+                index: 0,
+                text: "world".into(),
+            },
+            IrStreamEvent::Finish {
+                index: 0,
+                finish_reason: Some(IrFinishReason::Stop),
+            },
+        ]);
+
+        assert_eq!(count_added(&frames, "reasoning"), 1, "{frames:?}");
+        assert_eq!(count_added(&frames, "message"), 1, "{frames:?}");
+
+        let completed = find_frame(&frames, "response.completed");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output array");
+        assert_eq!(output.len(), 2, "{completed}");
+        assert_eq!(
+            output
+                .iter()
+                .filter(|item| item["type"] == json!("reasoning"))
+                .count(),
+            1,
+            "{completed}"
+        );
+        let messages: Vec<&Value> = output
+            .iter()
+            .filter(|item| item["type"] == json!("message"))
+            .collect();
+        assert_eq!(messages.len(), 1, "{completed}");
+        assert_eq!(
+            messages[0]["content"][0]["text"],
+            json!("Hello world"),
+            "{completed}"
+        );
     }
 }

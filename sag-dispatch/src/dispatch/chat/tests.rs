@@ -4723,22 +4723,23 @@ async fn anthropic_translated_message_stop_bridge_race_classifies_success() {
     assert!(log.error_category.is_none());
 }
 
-/// §6 case 5b: Chat ingress + **Responses** upstream. The `[DONE]` bridge
-/// (#1) covers both translated upstream protocols, so the Chat-protocol
-/// client gets its terminator even though the Responses upstream never emits
-/// `data: [DONE]`. The upstream frames themselves stay a byte-identical Raw
-/// passthrough.
+/// §6 case 5b: Chat ingress + **Responses** upstream. The upstream speaks the
+/// Responses protocol, so its frames must be decoded to IR and re-encoded as
+/// Chat chunks — a Chat-protocol client never sees `response.*` event names.
+/// The `[DONE]` bridge (#1) still supplies the Chat terminator exactly once.
 #[tokio::test]
-async fn chat_ingress_responses_upstream_gets_done_terminator() {
-    let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n".to_vec();
+async fn chat_ingress_responses_upstream_reencodes_as_chat_chunks() {
+    let created = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n".to_vec();
+    let delta = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n".to_vec();
     let completed =
         b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
             .to_vec();
     let upstream = Arc::new(ResponsesStreamProvider::new(
         "oai",
         vec![
-            StreamChunk::Data(delta.clone()),
-            StreamChunk::Data(completed.clone()),
+            StreamChunk::Data(created),
+            StreamChunk::Data(delta),
+            StreamChunk::Data(completed),
             StreamChunk::Done,
         ],
     ));
@@ -4757,6 +4758,28 @@ async fn chat_ingress_responses_upstream_gets_done_terminator() {
 
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8_lossy(&body);
+
+    // Chat-shaped frames: the decoded text delta is re-encoded as a
+    // `choices[0].delta.content` chunk.
+    assert!(
+        text.contains(r#""delta":{"content":"hi"}"#),
+        "the delta must be re-encoded as a Chat delta chunk, got: {text}"
+    );
+    assert!(
+        text.contains(r#""object":"chat.completion.chunk""#),
+        "the frames must be Chat completion chunks, got: {text}"
+    );
+    // No Responses event names may leak to the Chat client.
+    assert!(
+        !text.contains("\"type\":\"response."),
+        "a Responses event name must never reach the Chat egress, got: {text}"
+    );
+    assert!(
+        !text.contains("response.output_text.delta"),
+        "the Responses delta event name must never leak, got: {text}"
+    );
+
+    // Exactly one Chat terminator, and it is the last frame.
     assert_eq!(
         text.matches("data: [DONE]").count(),
         1,
@@ -4765,11 +4788,6 @@ async fn chat_ingress_responses_upstream_gets_done_terminator() {
     assert!(
         text.ends_with("data: [DONE]\n\n"),
         "the synthesized [DONE] must be the last frame, got: {text}"
-    );
-    assert_eq!(
-        body,
-        [delta, completed, b"data: [DONE]\n\n".to_vec()].concat(),
-        "the Responses frames must pass through byte-identically"
     );
 }
 
@@ -5215,4 +5233,414 @@ async fn in_flight_snapshot_reports_multiple_routes() {
 
     drop((a1, b1, b2));
     assert_eq!(rt.in_flight.snapshot().total, 0);
+}
+
+// ─── P0-1b: tool-argument quality watch (warn-only) ──────────────
+
+/// Minimal [`tracing::Subscriber`] that records the rendered field list of
+/// every event.
+///
+/// `sag-dispatch` has no `tracing-subscriber` / `tracing-test` dev-dependency,
+/// so a scoped hand-rolled subscriber (same shape as the one used by the
+/// `sag-config` `validate()` tests) is the cheapest way to count the warn!
+/// lines the tool-argument watch emits. `set_default` is thread-scoped and
+/// `#[tokio::test]` drives the whole dispatch on one thread, so the body (and
+/// the events it logs) run under it.
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<Mutex<Vec<String>>>);
+
+impl CapturedEvents {
+    /// Rendered field lists of every captured event whose text contains
+    /// `needle`.
+    fn matching(&self, needle: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.contains(needle))
+            .cloned()
+            .collect()
+    }
+}
+
+struct FieldVisitor(Vec<String>);
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push(format!("{}={value}", field.name()));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push(format!("{}={value:?}", field.name()));
+    }
+}
+
+impl tracing::Subscriber for CapturedEvents {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = FieldVisitor(Vec::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0.join(" "));
+    }
+}
+
+/// A streamed tool call whose `arguments` is `""` must (a) still terminate as
+/// `Success` with no `failure_reason` — the watch is warn-only — and (b) be
+/// reported as one blank-argument tool call in exactly one warn line.
+///
+/// Anthropic ingress + Chat upstream is used because that lane decodes the
+/// upstream frames to IR, which is where the watch can see `ToolCallStart` /
+/// `ToolCallDelta` (the Chat-ingress byte-fidelity lane keeps them as `Raw`).
+#[tokio::test]
+async fn stream_with_blank_tool_arguments_still_succeeds_but_flags_quality() {
+    let data = |payload: &str| StreamChunk::Data(format!("data: {payload}\n\n").into_bytes());
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        data(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        ),
+        // The blank-argument tool call: the codec emits `ToolCallStart` and
+        // drops the empty `arguments` delta, so the watch records one call
+        // with no arguments at all.
+        data(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+        ),
+        data(
+            r#"{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}"#,
+        ),
+        data("[DONE]"),
+    ]));
+    let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let trace_id = ctx.trace_id;
+
+    let capture = CapturedEvents::default();
+    let capture_guard = tracing::subscriber::set_default(capture.clone());
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(!body.is_empty(), "the upstream frames must still egress");
+    drop(capture_guard);
+
+    // Warn-only contract: exactly one warn for the whole stream (not one per
+    // delta), and it carries the aggregate watch verdict.
+    let warns = capture.matching("blank/invalid arguments");
+    assert_eq!(
+        warns.len(),
+        1,
+        "exactly one warn per stream, got: {warns:?}"
+    );
+    assert!(
+        warns[0].contains("tool_calls=1"),
+        "one blank-argument tool call: {}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("reason=Blank"),
+        "blank arguments are reported as Blank: {}",
+        warns[0]
+    );
+
+    state.event_collector.shutdown().await;
+
+    // No behaviour change: the attempt is still a success, the blank tool
+    // call is not reclassified as an empty response.
+    let (final_status, failure_reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT final_status, failure_reason FROM request_results WHERE request_id = ?",
+    )
+    .bind(trace_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("success fact must be persisted");
+    assert_eq!(final_status, "success");
+    assert!(failure_reason.is_none());
+
+    let (status, target_reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, failure_reason FROM target_attempts WHERE request_id = ?")
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "success");
+    assert!(target_reason.is_none());
+    assert_eq!(mock.stream_calls(), 1, "no retry on blank tool arguments");
+}
+
+/// A non-stream response whose tool call carries `"arguments": ""` is flagged
+/// by `args_value_quality` (the codec falls back to `Value::String`), still
+/// records the attempt as `Success`, and still egresses the original body
+/// byte-identically.
+#[tokio::test]
+async fn non_stream_string_tool_arguments_are_flagged() {
+    let original = ChatCompletionResponse {
+        id: "chatcmpl-blank-args".into(),
+        object: "chat.completion".into(),
+        created: 1_700_000_000,
+        model: "gpt-4o".into(),
+        choices: vec![sag_core::types::ChatChoice {
+            index: 0,
+            message: sag_core::types::ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::Null,
+                name: None,
+                extra: serde_json::Map::from_iter([(
+                    "tool_calls".into(),
+                    json!([{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": ""}
+                    }]),
+                )]),
+            },
+            finish_reason: Some("tool_calls".into()),
+        }],
+        usage: Some(Usage {
+            prompt_tokens: 9,
+            completion_tokens: 3,
+            total_tokens: 12,
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+        }),
+    };
+
+    // Free invariant: a `Value::String` arguments value means malformed.
+    let ir = ChatCompletionsCodec::decode_response(&original);
+    let call = ir
+        .output
+        .iter()
+        .find_map(|item| match item {
+            sag_core::IrOutputItem::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("the decoded response carries one tool call");
+    assert!(
+        matches!(call.arguments, serde_json::Value::String(_)),
+        "an unparseable `arguments` must fall back to Value::String"
+    );
+    assert_eq!(
+        sag_core::args_value_quality(&call.arguments),
+        sag_core::ToolArgsQuality::Blank
+    );
+
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_chat(ChatBehavior::Ok(original.clone()));
+    let (state, pool) = build_state_with_event_pool(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", false);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, false, &mut errors);
+    let trace_id = ctx.trace_id;
+
+    let capture = CapturedEvents::default();
+    let capture_guard = tracing::subscriber::set_default(capture.clone());
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    drop(capture_guard);
+    assert_eq!(
+        &body[..],
+        &serde_json::to_vec(&original).unwrap()[..],
+        "HTTP egress must stay byte-identical (warn-only change)"
+    );
+
+    let warns = capture.matching("blank/invalid arguments");
+    assert_eq!(
+        warns.len(),
+        1,
+        "exactly one warn per non-stream response, got: {warns:?}"
+    );
+    assert!(
+        warns[0].contains("tool_calls=1"),
+        "one blank-argument tool call: {}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("reason=Blank"),
+        "blank arguments are reported as Blank: {}",
+        warns[0]
+    );
+
+    state.event_collector.shutdown().await;
+
+    let (status, target_reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, failure_reason FROM target_attempts WHERE request_id = ?")
+            .bind(trace_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "success", "blank tool arguments must stay Success");
+    assert!(target_reason.is_none());
+    assert_eq!(mock.chat_calls(), 1, "no retry on blank tool arguments");
+}
+
+/// P0-3b: Anthropic ingress + **Responses** upstream must decode the upstream
+/// SSE with the (stateful) Responses decoder, not the Chat one.
+///
+/// The chooser used to test only `use_anthropic`, so this combination fell
+/// through to `ChatCompletionsCodec::decode_stream_frame`: Responses frames
+/// have no `choices`, so each one degraded to `IrStreamEvent::Raw` and the
+/// Anthropic egress encoder forwarded the bytes verbatim — the Responses event
+/// name leaked to the client and the text never became a `text_delta`.
+#[tokio::test]
+async fn anthropic_ingress_responses_upstream_decodes_as_responses() {
+    let upstream = Arc::new(ResponsesStreamProvider::new(
+        "oai",
+        vec![
+            StreamChunk::Data(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Done,
+        ],
+    ));
+    let state = build_state(vec![upstream.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-5", true);
+    let targets = vec![ResolvedTarget {
+        upstream_protocol: sag_core::ApiKind::Responses,
+        ..target("oai", "gpt-5", 0)
+    }];
+    let mut errors = Vec::new();
+    let mut ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    ctx.ingress_protocol = sag_core::IngressProtocol::AnthropicMessages;
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream.stream_calls(), 1);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("response.output_text.delta"),
+        "a Responses event name must never leak onto the Anthropic egress, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""text":"hi""#).count(),
+        1,
+        "the decoded delta must reach the client exactly once as a text_delta, got: {text}"
+    );
+    assert!(
+        text.contains(r#""type":"content_block_delta""#),
+        "the Anthropic egress must render the delta as a content_block_delta, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""type":"message_stop""#).count(),
+        1,
+        "the Anthropic terminator bridge must still fire, got: {text}"
+    );
+}
+
+// ─── P0-1: raw-frame tool-argument peek on the chat→chat lane ─────
+
+/// Chat ingress × Chat upstream is a byte-identical passthrough, so the
+/// tool-argument watch sees only `IrStreamEvent::Raw` frames; the peek that
+/// closes that blind spot must never rewrite a byte — including for the exact
+/// defect the watch exists for (a streamed tool call with `"arguments": ""`).
+///
+/// The same inline `CapturedEvents` subscriber used by
+/// `stream_with_blank_tool_arguments_still_succeeds_but_flags_quality` also
+/// pins the observation side: this lane must emit exactly one terminal warn
+/// reporting the single blank-argument tool call of this request.
+#[tokio::test]
+async fn chat_ingress_chat_upstream_blank_tool_arguments_keep_byte_fidelity() {
+    let f1 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n".to_vec();
+    let f2 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]\n\n".to_vec();
+    let f_done = b"data: [DONE]\n\n".to_vec();
+    let golden: Vec<u8> = [f1.clone(), f2.clone(), f_done.clone()].concat();
+
+    let mock = Arc::new(MockProvider::new("openai"));
+    mock.push_stream(StreamBehavior::Ok(vec![
+        StreamChunk::Data(f1),
+        StreamChunk::Data(f2),
+        StreamChunk::Data(f_done),
+        StreamChunk::Done,
+    ]));
+    let state = build_state(vec![mock.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("gpt-4o", true);
+    let targets = vec![target("openai", "gpt-4o", 0)];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    let trace_id = ctx.trace_id;
+
+    // The warn fires at the stream terminal, which is reached while the body is
+    // drained — so the guard spans both the dispatch and the body read.
+    let capture = CapturedEvents::default();
+    let capture_guard = tracing::subscriber::set_default(capture.clone());
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        &golden[..],
+        "the raw-frame peek must not rewrite any byte on the chat→chat passthrough lane"
+    );
+    drop(capture_guard);
+
+    // `set_default` is thread-scoped and this `#[tokio::test]` drives dispatch
+    // and the body drain on that one thread, so the count is already isolated;
+    // filtering on this request's id keeps it isolated even if that changes.
+    let warns: Vec<String> = capture
+        .matching("blank/invalid arguments")
+        .into_iter()
+        .filter(|event| event.contains(&format!("request_id={trace_id}")))
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "the previously blind chat→chat lane warns exactly once per stream, got: {warns:?}"
+    );
+    assert!(
+        warns[0].contains("reason=Blank"),
+        "the empty `arguments` delta is reported as Blank: {}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("tool_calls=1"),
+        "the warn counts the single tool call the mock streamed: {}",
+        warns[0]
+    );
+
+    assert_eq!(
+        mock.stream_calls(),
+        1,
+        "a blank-argument tool call is content — no empty-response retry"
+    );
 }

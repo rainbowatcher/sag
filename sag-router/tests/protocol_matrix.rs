@@ -384,12 +384,13 @@ async fn chat_x_responses_native_nonstream() {
 
 #[tokio::test]
 async fn chat_x_responses_native_stream() {
-    // Stream with a Responses-shaped SSE mock: frames pass through the Chat
-    // bridge's `process_sse_frame` (unknown JSON → Data) and Chat ingress
-    // Raw-passthroughs them **byte-identically** — so egress carries the
-    // Responses event types unchanged, with the Chat terminal frame
-    // `data: [DONE]` synthesized after `response.completed` (Responses never
-    // emits it; the Chat bridge supplies the ingress protocol's terminator).
+    // Stream with a Responses-shaped SSE mock on the Chat-ingress ×
+    // Responses-upstream lane. That lane is **decoded to IR and re-encoded**
+    // as Chat chunks: the upstream's Responses frames have no Chat
+    // representation, so handing them to a Chat-protocol client would be a
+    // protocol leak (`response.output_text.delta` instead of
+    // `choices[].delta`). Only the byte-identical homogeneous lanes (chat→chat,
+    // native→native) keep the Raw passthrough invariant.
     let sse = concat!(
         r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#,
         "\n\n",
@@ -398,8 +399,7 @@ async fn chat_x_responses_native_stream() {
         r#"data: {"type":"response.completed","response":{"id":"r1","object":"response","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
         "\n\n",
     );
-    let expected = sse.to_string();
-    let served = expected.clone();
+    let served = sse.to_string();
     let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
         let expected = served.clone();
         async move {
@@ -425,19 +425,54 @@ async fn chat_x_responses_native_stream() {
 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("response.created"), "missing created: {text}");
-    assert!(text.contains("Native"), "missing delta: {text}");
+
+    // The client is a Chat-protocol client: every visible frame must be a
+    // Chat chunk, never a Responses event.
     assert!(
-        text.contains("response.completed"),
-        "missing completed: {text}"
+        text.contains(r#""object":"chat.completion.chunk""#),
+        "Chat ingress must receive Chat-shaped chunks: {text}"
     );
     assert!(
-        text.starts_with(&expected),
-        "Responses frames must stay byte-identical: {text}"
+        text.contains(r#""choices""#),
+        "Chat chunks must carry a choices array: {text}"
+    );
+    assert!(
+        !text.contains("\"type\":\"response."),
+        "a Responses event name must never reach a Chat client: {text}"
+    );
+    assert!(
+        !text.contains("response.created") && !text.contains("response.completed"),
+        "no Responses frame (not even as a raw passthrough) may leak: {text}"
+    );
+
+    // The upstream text still arrives, inside `choices[0].delta.content` —
+    // exactly once (the delta is the sole supplier; `response.completed`
+    // carries no text).
+    let content_chunks = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .filter(|val| {
+            val.pointer("/choices/0/delta/content")
+                .and_then(|c| c.as_str())
+                == Some("Native")
+        })
+        .count();
+    assert_eq!(
+        content_chunks, 1,
+        "the upstream text must reach the client exactly once inside choices[0].delta.content: {text}"
+    );
+
+    // Exactly one Chat terminator, and it is the last frame.
+    assert_eq!(
+        text.matches("data: [DONE]").count(),
+        1,
+        "the Chat bridge must terminate the stream with exactly one [DONE]: {text}"
     );
     assert!(
         text.ends_with("data: [DONE]\n\n"),
-        "Chat bridge must terminate the stream with [DONE]: {text}"
+        "[DONE] must be the final frame: {text}"
     );
 
     // Upstream path is /responses.
@@ -517,18 +552,28 @@ async fn anthropic_x_responses_native_nonstream() {
 
 #[tokio::test]
 async fn anthropic_x_responses_native_stream() {
-    // Chat SSE from the bridge is decoded to IR and re-rendered as
-    // Anthropic SSE on the client (no [DONE], message lifecycle present).
-    let chat_sse = concat!(
-        r#"data: {"id":"chatcmpl-axs","object":"chat.completion.chunk","created":1700000000,"model":"real-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}"#,
+    // Anthropic ingress × explicit Responses upstream: the lane is Translated,
+    // so the upstream's Responses SSE is decoded to IR and re-encoded as
+    // Anthropic Messages SSE on the client (no [DONE], full message lifecycle).
+    //
+    // The mock must therefore emit **genuinely Responses-shaped** frames.
+    // This fixture used to serve Chat chunks (`object: "chat.completion.chunk"`)
+    // and passed only because the decoder chooser tested `use_anthropic` alone
+    // and fell through to `ChatCompletionsCodec::decode_stream_frame` for this
+    // combination (P0-3b). A Responses decoder sees no `type: "response.*"` in a
+    // Chat chunk and forwards it as `IrStreamEvent::Raw`, so no `Start` is
+    // produced and `message_start` is never synthesized.
+    let sse = concat!(
+        r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#,
         "\n\n",
-        r#"data: {"id":"chatcmpl-axs","object":"chat.completion.chunk","created":170000000,"model":"real-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        r#"data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"Hello"}"#,
         "\n\n",
-        "data: [DONE]\n\n",
+        r#"data: {"type":"response.completed","response":{"id":"r1","object":"response","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
+        "\n\n",
     );
-    let expected = chat_sse.to_string();
+    let served = sse.to_string();
     let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
-        let expected = expected.clone();
+        let expected = served.clone();
         async move {
             respond_sse(&mut stream, &expected).await;
         }
@@ -551,17 +596,102 @@ async fn anthropic_x_responses_native_stream() {
 
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("message_start"), "missing start: {text}");
-    assert!(text.contains("Hello"), "missing delta: {text}");
-    // Translated Anthropic egress: End is a protocol-control event that is
-    // never re-encoded into the body (stream.rs), so `message_stop` is not
-    // synthesized — the terminal `message_delta` (from finish_reason) is the
-    // last client-visible frame. `[DONE]` must not leak through.
+
+    // Full Anthropic Messages lifecycle, synthesized from the Responses
+    // decoder's `Start` and the deltas.
     assert!(
-        text.contains("message_delta"),
+        text.contains(r#""type":"message_start""#),
+        "missing message_start: {text}"
+    );
+    assert!(
+        text.contains(r#""type":"content_block_delta""#),
+        "missing content_block_delta: {text}"
+    );
+    // The upstream text must arrive exactly once, as a `text_delta`.
+    let hello = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .filter(|val| {
+            val.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
+                && val.pointer("/delta/type").and_then(|t| t.as_str()) == Some("text_delta")
+                && val.pointer("/delta/text").and_then(|t| t.as_str()) == Some("Hello")
+        })
+        .count();
+    assert_eq!(
+        hello, 1,
+        "the decoded delta must reach the client exactly once as a text_delta: {text}"
+    );
+
+    // Terminal Anthropic frames: `message_delta` (stop_reason from the
+    // synthesized `Finish`) followed by exactly one `message_stop`.
+    assert!(
+        text.contains(r#""type":"message_delta""#),
         "missing terminal message_delta: {text}"
     );
     assert!(text.contains("end_turn"), "missing stop_reason: {text}");
+    assert_eq!(
+        text.matches(r#""type":"message_stop""#).count(),
+        1,
+        "exactly one message_stop terminates the Anthropic stream: {text}"
+    );
+
+    // No Chat frames, no Chat terminator.
+    assert!(
+        !text.contains("[DONE]"),
+        "Anthropic stream must not emit [DONE]: {text}"
+    );
+    assert!(
+        !text.contains("chat.completion.chunk"),
+        "Chat frames must be re-rendered as Anthropic: {text}"
+    );
+
+    // P0-3b: the Responses *content* events must not leak onto the Anthropic
+    // egress — they are decoded into IR and re-rendered, never forwarded raw.
+    for leaked in [
+        "response.created",
+        "response.output_text.delta",
+        "response.output_item.added",
+        "response.content_part.added",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "a Responses content event must never leak onto the Anthropic egress ({leaked}): {text}"
+        );
+    }
+    // Cross-protocol leak closed: Responses frames (including the terminal
+    // `response.completed` emitted as `Raw` by the Responses decoder) are
+    // filtered on every IR-decoded egress lane.
+    assert!(
+        !text.contains(r#""type":"response."#),
+        "zero leaked Responses frames on the Anthropic egress: {text}"
+    );
+
+    // Upstream `Usage` is not stream-encoded on translated lanes: the dispatch
+    // loop merges it into `analytics.usage` and never hands it to the egress
+    // encoder (`IrStreamEvent::Usage(_) => Vec::new()`). What the client sees
+    // in `message_start.message.usage` is the Anthropic streaming shape's
+    // placeholder zero written by `encode_stream_event`'s `Start` arm — so this
+    // pins zeros, not the upstream's 4/2. Losing the leaked
+    // `response.completed` `Raw` frame therefore cannot lose *stream* usage;
+    // if real usage ever starts flowing here, or the placeholder disappears,
+    // this assertion is what notices.
+    let message_start = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .find(|val| val.get("type").and_then(|t| t.as_str()) == Some("message_start"))
+        .expect("must contain message_start");
+    assert_eq!(
+        message_start.pointer("/message/usage/input_tokens"),
+        Some(&serde_json::json!(0)),
+        "message_start usage is a placeholder zero, not the upstream's usage: {message_start}"
+    );
+    assert_eq!(
+        message_start.pointer("/message/usage/output_tokens"),
+        Some(&serde_json::json!(0)),
+        "message_start usage is a placeholder zero, not the upstream's usage: {message_start}"
+    );
     assert!(
         !text.contains("[DONE]"),
         "Anthropic stream must not emit [DONE]: {text}"

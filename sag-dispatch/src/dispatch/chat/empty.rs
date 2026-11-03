@@ -23,6 +23,11 @@ pub(crate) fn raw_contains_usage(raw: &[u8]) -> bool {
 /// an empty response. This intentionally differs from
 /// `process_sse_frame`'s `has_meaningful_choice`, which counts `finish_reason`
 /// to preserve the stream-termination signal.
+///
+/// Scope note: the streaming first-chunk peek
+/// ([`validate_stream_first_chunk`]) is a separate, narrower guard — it only
+/// inspects frames up to the first content verdict, so it cannot see a stream
+/// that starts with content and later emits blank tool calls.
 pub(crate) fn is_empty_response_data(raw: &[u8]) -> bool {
     if !raw_contains_usage(raw) {
         return false;
@@ -56,6 +61,15 @@ pub(crate) fn is_empty_response_data(raw: &[u8]) -> bool {
 
     // Check if any choice carries real content. finish_reason alone does
     // NOT count -- a "stop" with an empty delta is still an empty response.
+    //
+    // `arguments` quality is deliberately NOT inspected here: a tool call with
+    // blank/invalid arguments still counts as content, so this predicate's
+    // verdict (and therefore provider fallback) does not change. Blank
+    // arguments are surfaced separately as a warning — streaming at
+    // `dispatch::stream::finish_stream_terminal`, non-streaming at
+    // `dispatch::chat::attempt` — see `sag_core::ir::tool_args::args_quality`.
+    // Falling back on blank-argument responses is a deliberate behaviour change
+    // and must be gated behind `backoff.retry_on_empty_response`.
     let has_content = val
         .get("choices")
         .and_then(|c| c.as_array())
@@ -92,7 +106,9 @@ pub(crate) fn choice_has_message_content(msg: &sag_core::types::ChatMessage) -> 
         serde_json::Value::Array(arr) if !arr.is_empty() => return true,
         _ => {}
     }
-    // Check for tool_calls in the extra map
+    // Check for tool_calls in the extra map. `arguments` quality is
+    // deliberately NOT inspected here (same rationale as
+    // `is_empty_response_data`): a blank-argument call still counts as content.
     if let Some(tc) = msg.extra.get("tool_calls")
         && tc.as_array().is_some_and(|a| !a.is_empty())
     {
@@ -136,6 +152,8 @@ pub(crate) fn ir_item_has_content(item: &IrOutputItem) -> bool {
     match item {
         IrOutputItem::Text { text } => !text.is_empty(),
         IrOutputItem::Reasoning { text } => !text.is_empty(),
+        // Blank / invalid `arguments` still count as content — intentionally
+        // no quality check here; see the comment in `is_empty_response_data`.
         IrOutputItem::ToolCall(_) => true,
         IrOutputItem::Raw(v) => match v {
             serde_json::Value::Null => false,
@@ -1417,5 +1435,78 @@ mod tests {
         };
         assert!(is_empty_non_stream_response(&chat));
         assert!(is_empty_ir_response(&ir_with(vec![], usage(100, 0))));
+    }
+
+    /// Pin: a tool call whose `arguments` are blank still counts as content at
+    /// the `delta.tool_calls` site, so no provider fallback is triggered.
+    #[test]
+    fn blank_arguments_tool_call_still_counts_as_content() {
+        let raw = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"fn\",\"arguments\":\"\"}}]}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":0,\"total_tokens\":100}}\n\n";
+        assert!(
+            !is_empty_response_data(raw),
+            "blank-argument tool call is still content (no fallback on this frame)"
+        );
+    }
+
+    /// Pin: same for the non-streaming `ChatMessage` site.
+    #[test]
+    fn blank_arguments_tool_call_counts_as_content_in_message() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: serde_json::Value::Null,
+            name: None,
+            extra: serde_json::Map::from_iter([(
+                "tool_calls".to_string(),
+                serde_json::json!([{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "fn", "arguments": ""}
+                }]),
+            )]),
+        };
+        assert!(
+            choice_has_message_content(&msg),
+            "blank-argument tool call is still content"
+        );
+    }
+
+    /// Pin: an IR tool-call item is content regardless of `arguments`; the
+    /// aggressive (fallback-triggering) behaviour is NOT in effect.
+    #[test]
+    fn ir_tool_call_item_always_counts_as_content() {
+        let item = IrOutputItem::ToolCall(sag_core::IrToolCall {
+            id: "c1".into(),
+            name: "fn".into(),
+            arguments: serde_json::json!(""),
+            index: Some(0),
+        });
+        assert!(
+            ir_item_has_content(&item),
+            "ToolCall item is always content"
+        );
+        assert!(
+            !is_empty_ir_response(&ir_with(vec![item], usage(100, 0))),
+            "a response whose only item is a blank-argument tool call is NOT empty"
+        );
+    }
+
+    /// The executable statement of the documented gap: the quality helper
+    /// classifies blank arguments as `Blank`, yet emptiness still ignores it.
+    #[test]
+    fn args_quality_is_the_documented_quality_source() {
+        assert_eq!(
+            sag_core::args_value_quality(&serde_json::json!("")),
+            sag_core::ToolArgsQuality::Blank
+        );
+        let item = IrOutputItem::ToolCall(sag_core::IrToolCall {
+            id: "c1".into(),
+            name: "fn".into(),
+            arguments: serde_json::json!(""),
+            index: Some(0),
+        });
+        assert!(
+            ir_item_has_content(&item),
+            "quality is observed elsewhere; emptiness deliberately ignores it"
+        );
     }
 }
