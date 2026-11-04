@@ -1279,17 +1279,21 @@ mod tests {
         while let Ok(chunk) = rx.try_recv() {
             chunks.push(chunk);
         }
-        // Error + forwarded Data (Raw after Error).
-        assert!(chunks.len() >= 2, "expected Error + Data, got {chunks:?}");
+        // `Error` only. The raw Anthropic frame is NOT re-emitted as a Data
+        // chunk: this adapter feeds translated lanes, where the dispatch layer
+        // renders the single protocol-correct error frame from `Error`; a
+        // forwarded raw copy would duplicate it (in the wrong protocol). The
+        // native passthrough lane does not use this path at all — it forwards
+        // upstream frames directly (`messages_stream_native`).
+        assert_eq!(
+            chunks.len(),
+            1,
+            "expected only the Error chunk, got {chunks:?}"
+        );
         match &chunks[0] {
             StreamChunk::Error(msg) => assert_eq!(msg, "upstream overloaded"),
-            other => panic!("expected an Error chunk first, got {other:?}"),
+            other => panic!("expected an Error chunk, got {other:?}"),
         }
-        assert!(
-            matches!(&chunks[1], StreamChunk::Data(d) if String::from_utf8_lossy(d).contains("upstream overloaded")),
-            "the error frame must still be forwarded: {:?}",
-            chunks[1]
-        );
     }
 
     #[test]
@@ -1612,14 +1616,14 @@ mod tests {
 
         let mut saw_error = false;
         let mut saw_done = false;
-        let mut saw_forwarded_error_frame = false;
+        let mut saw_raw_error_frame = false;
         let mut saw_partial = false;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 StreamChunk::Data(d) => {
                     let text = String::from_utf8_lossy(&d).to_string();
                     if text.contains("upstream overloaded") {
-                        saw_forwarded_error_frame = true;
+                        saw_raw_error_frame = true;
                     } else if text.contains("partial") {
                         saw_partial = true;
                     }
@@ -1636,10 +1640,76 @@ mod tests {
         assert!(saw_partial, "the delta before the error must be forwarded");
         assert!(saw_error, "the in-stream error must emit an Error chunk");
         assert!(
-            saw_forwarded_error_frame,
-            "the error frame must still be forwarded"
+            !saw_raw_error_frame,
+            "the raw error frame must not be forwarded as Data on this lane"
         );
         assert!(!saw_done, "an errored stream must never emit Done");
+    }
+
+    /// Native lane (Anthropic ingress × Anthropic upstream): the reader
+    /// forwards the upstream frames itself, byte-for-byte — error frame
+    /// included — and only adds a side-channel `Error` chunk for the
+    /// analytics / failure classification. It never goes through the codec's
+    /// IR, so removing the codec's `Error`+`Raw` pairing cannot cost this lane
+    /// any byte fidelity.
+    #[tokio::test]
+    async fn messages_stream_native_forwards_error_frame_verbatim() {
+        use tokio::io::AsyncWriteExt;
+        let partial = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n".to_vec();
+        let error_frame = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n".to_vec();
+        let served = [partial.clone(), error_frame.clone()].concat();
+        let base_url = crate::test_support::spawn_server(move |mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream.write_all(&served).await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = stream.shutdown().await;
+        })
+        .await;
+
+        let provider = anthropic_provider(&base_url, 30, None);
+        let mut stream = provider
+            .messages_stream_native(
+                serde_json::json!({
+                    "model": "claude-3",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                &HashMap::new(),
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut data = Vec::new();
+        let mut saw_error = false;
+        let mut saw_done = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(d) => data.extend_from_slice(&d),
+                StreamChunk::Error(msg) => {
+                    saw_error = true;
+                    assert_eq!(msg, "upstream overloaded");
+                }
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+
+        assert_eq!(
+            data,
+            [partial, error_frame].concat(),
+            "the native lane must forward the upstream frames verbatim"
+        );
+        assert!(
+            saw_error,
+            "the error must still surface as an Error chunk (analytics)"
+        );
+        assert!(!saw_done, "an errored native stream must not emit Done");
     }
 
     // ── 200-delivered upstream error detection (non-streaming) ──

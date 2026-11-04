@@ -7,6 +7,8 @@
 //! - Chat × Responses (explicit declaration) non-stream + stream
 //! - Anthropic × Responses (explicit declaration) non-stream + stream
 //! - Anthropic × Chat stream (non-stream already covered upstream)
+//! - Mid-stream upstream error forwarding: verbatim on a homogeneous
+//!   (passthrough) lane, exactly one synthesized frame on a translated lane
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -464,6 +466,15 @@ async fn chat_x_responses_native_stream() {
         "the upstream text must reach the client exactly once inside choices[0].delta.content: {text}"
     );
 
+    // Terminal contract: `response.completed` is the upstream terminal, so the
+    // decoder emits a `finish_reason` chunk. Without it a Chat client reads a
+    // stream that delivered content and then just stopped as truncated.
+    assert_eq!(
+        text.matches(r#""finish_reason":"stop""#).count(),
+        1,
+        "exactly one finish_reason chunk must terminate the Chat stream: {text}"
+    );
+
     // Exactly one Chat terminator, and it is the last frame.
     assert_eq!(
         text.matches("data: [DONE]").count(),
@@ -486,6 +497,408 @@ async fn chat_x_responses_native_stream() {
 }
 
 // ── Anthropic × Responses (explicit) ──────────────────────────────
+
+/// Mid-stream upstream failure must be visible to the client.
+///
+/// The upstream commits HTTP 200 and streams content, then reports
+/// `response.failed`. Before this fix the `Error` IR event was consumed by the
+/// dispatch loop (analytics only), so the encoded body simply stopped: a Chat
+/// client read a truncated stream as a successful short response. The error
+/// event now reaches the Chat encoder, which renders the official OpenAI
+/// in-stream error frame, and the bridges suppress both the `[DONE]`
+/// terminator and the synthesized `finish_reason: stop` for that stream.
+#[tokio::test]
+async fn chat_ingress_responses_failed_emits_error_frame() {
+    let sse = concat!(
+        r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"partial"}"#,
+        "\n\n",
+        r#"data: {"type":"response.failed","response":{"id":"r1","object":"response","status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}"#,
+        "\n\n",
+    );
+    let served = sse.to_string();
+    let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
+        let expected = served.clone();
+        async move {
+            respond_sse(&mut stream, &expected).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body =
+        r#"{"model":"route-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let resp = app.oneshot(chat_request(body, "mx-key")).await.unwrap();
+    // The 200 was committed before the upstream failed: only the body changes.
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    // The error must be visible: an `error` object carrying the message.
+    let error_frames: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .filter(|val| val.get("error").is_some())
+        .collect();
+    assert_eq!(
+        error_frames.len(),
+        1,
+        "exactly one error frame must reach the client: {text}"
+    );
+    let err = &error_frames[0]["error"];
+    assert_eq!(err["message"], "upstream exploded");
+    assert_eq!(err["type"], "server_error");
+    assert!(err.get("code").is_some(), "error.code key required: {err}");
+    assert!(
+        err.get("param").is_some(),
+        "error.param key required: {err}"
+    );
+
+    // An errored stream is not a normal completion: no finish_reason chunk
+    // (the synthesized `finish_reason: stop` is suppressed) and no `[DONE]`.
+    assert!(
+        !text.contains(r#""finish_reason":"stop""#),
+        "an errored stream must not report finish_reason stop: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "OpenAI sends no [DONE] after an in-stream error: {text}"
+    );
+
+    let req = req_rx.await.expect("request bytes");
+    let (request_line, upstream) = parse_upstream_request(&req);
+    assert!(
+        request_line.starts_with("POST /responses "),
+        "got {request_line}"
+    );
+    assert_eq!(upstream["stream"], true);
+}
+
+/// Anthropic ingress × Responses upstream, same mid-stream failure: the error
+/// event must render the official Anthropic form (`event: error` + a
+/// `type: "error"` body), and the stream must terminate there — no
+/// `message_stop` and no `stop_reason`.
+#[tokio::test]
+async fn anthropic_ingress_responses_failed_emits_error_event() {
+    let sse = concat!(
+        r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"partial"}"#,
+        "\n\n",
+        r#"data: {"type":"response.failed","response":{"id":"r1","object":"response","status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}"#,
+        "\n\n",
+    );
+    let served = sse.to_string();
+    let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
+        let expected = served.clone();
+        async move {
+            respond_sse(&mut stream, &expected).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{"model":"route-model","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app.oneshot(messages_request(body, "mx-key")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        text.contains("event: error"),
+        "the error frame needs its event: line: {text}"
+    );
+    let error_body = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .find(|val| val.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .unwrap_or_else(|| panic!("missing {{\"type\":\"error\"}} body: {text}"));
+    assert_eq!(error_body["error"]["message"], "upstream exploded");
+    assert!(
+        error_body["error"]["type"].is_string(),
+        "the error object must carry a type: {error_body}"
+    );
+
+    // The stream terminates at the error frame.
+    assert!(
+        !text.contains("message_stop"),
+        "no message_stop after an error frame: {text}"
+    );
+    assert!(
+        !text.contains("stop_reason"),
+        "no stop_reason after an error frame: {text}"
+    );
+
+    let req = req_rx.await.expect("request bytes");
+    let (request_line, _) = parse_upstream_request(&req);
+    assert!(
+        request_line.starts_with("POST /responses "),
+        "got {request_line}"
+    );
+}
+
+// ── mid-stream upstream error forwarding contract ─────────────────────
+
+/// Chat ingress × Chat upstream (homogeneous lane): a 200-delivered upstream
+/// error frame is forwarded **byte-identically**, and nothing is synthesized
+/// on top of it.
+///
+/// The client would see exactly these bytes from the upstream directly, so
+/// rewriting them — a second frame, or a re-rendered one — would be a
+/// regression. The adapter's side-channel `Error` chunk is analytics-only on
+/// this lane.
+#[tokio::test]
+async fn chat_ingress_chat_upstream_error_is_forwarded_verbatim() {
+    let delta = r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#;
+    let error_frame =
+        r#"data: {"error":{"message":"upstream exploded","code":"rate_limit_exceeded"}}"#;
+    let sse = format!("{delta}\n\n{error_frame}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Chat).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body =
+        r#"{"model":"route-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let resp = app.oneshot(chat_request(body, "mx-key")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    // The upstream's error frame, byte-for-byte — the adapter re-emits
+    // `data: <json>\n\n`, which is exactly what the mock sent.
+    assert!(
+        text.contains(&format!("{error_frame}\n\n")),
+        "the upstream error frame must be forwarded verbatim: {text}"
+    );
+    // Exactly one error frame: a synthesized one would be a duplicate.
+    assert_eq!(
+        text.matches(r#"data: {"error""#).count(),
+        1,
+        "exactly one error frame may reach a Chat passthrough client: {text}"
+    );
+    // The gateway's synthesized marker never appears on this lane.
+    assert!(
+        !text.contains("STREAM_ERROR") && !text.contains("server_error"),
+        "no synthesized error frame may be added on a passthrough lane: {text}"
+    );
+    // The frame before the error is still byte-identical.
+    assert!(
+        text.contains(delta),
+        "frames before the error must stay verbatim: {text}"
+    );
+}
+
+/// Chat ingress × Anthropic upstream (translated lane): the upstream's
+/// Anthropic error frame must not reach the Chat client — exactly one
+/// **Chat-shaped** error frame does, and nothing follows it.
+#[tokio::test]
+async fn chat_ingress_anthropic_upstream_error_yields_single_chat_frame() {
+    let sse = concat!(
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream exploded\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let served = sse.to_string();
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = served.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Anthropic).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body =
+        r#"{"model":"route-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let resp = app.oneshot(chat_request(body, "mx-key")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    // Exactly one error frame, and it is Chat-shaped.
+    let error_frames: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .filter(|val| val.get("error").is_some())
+        .collect();
+    assert_eq!(
+        error_frames.len(),
+        1,
+        "a translated lane must emit exactly one error frame: {text}"
+    );
+    let err = &error_frames[0]["error"];
+    assert_eq!(err["message"], "upstream exploded");
+    assert_eq!(err["type"], "server_error", "must be the Chat shape: {err}");
+    assert_eq!(err["code"], "STREAM_ERROR");
+
+    // Nothing else after it: no Anthropic error envelope (wrong protocol for
+    // this client), no terminator of any kind.
+    assert!(
+        !text.contains("event: error"),
+        "raw Anthropic error bytes must not reach a Chat client: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "no [DONE] may follow an in-stream error: {text}"
+    );
+    assert!(
+        !text.contains("message_stop") && !text.contains("finish_reason\":\"stop"),
+        "no terminator may follow the error frame: {text}"
+    );
+    // The partial content before the failure still arrived.
+    assert!(text.contains("partial"), "missing partial delta: {text}");
+}
+
+/// Anthropic ingress × Chat upstream (translated lane): the upstream's OpenAI
+/// error frame must not leak; exactly one `event: error` frame does, and no
+/// `message_stop` / `stop_reason` follows it.
+#[tokio::test]
+async fn anthropic_ingress_chat_upstream_error_yields_single_anthropic_frame() {
+    let sse = concat!(
+        r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#,
+        "\n\n",
+        r#"data: {"error":{"message":"upstream exploded","code":"rate_limit_exceeded"}}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let served = sse.to_string();
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = served.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Chat).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{"model":"route-model","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app.oneshot(messages_request(body, "mx-key")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert_eq!(
+        text.matches("event: error").count(),
+        1,
+        "a translated lane must emit exactly one error event: {text}"
+    );
+    let error_body = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .find(|val| val.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .unwrap_or_else(|| panic!("missing {{\"type\":\"error\"}} body: {text}"));
+    assert_eq!(error_body["error"]["message"], "upstream exploded");
+
+    // No raw OpenAI error envelope (wrong protocol for this client) …
+    assert!(
+        !text.contains(r#"{"error":{"message":"upstream exploded","code":"rate_limit_exceeded"}}"#),
+        "raw OpenAI error bytes must not reach an Anthropic client: {text}"
+    );
+    assert!(
+        text.contains("api_error"),
+        "the error frame must be Anthropic-shaped: {text}"
+    );
+    // … and the stream terminates at the error frame.
+    assert!(
+        !text.contains("message_stop"),
+        "no message_stop after an error frame: {text}"
+    );
+    assert!(
+        !text.contains("stop_reason"),
+        "no stop_reason after an error frame: {text}"
+    );
+    // The partial content before the failure still arrived.
+    assert!(text.contains("partial"), "missing partial delta: {text}");
+}
+
+/// Anthropic ingress × Anthropic upstream (native **passthrough** lane): the
+/// client receives the upstream's own bytes — the `event: error` frame
+/// verbatim — and no synthesized/translated duplicate is added.
+///
+/// Byte fidelity outranks error-frame de-duplication on a homogeneous lane:
+/// the client would see exactly these bytes were it talking to the upstream
+/// directly. The adapter's side-channel `Error` chunk is analytics-only here.
+#[tokio::test]
+async fn anthropic_ingress_anthropic_upstream_error_is_forwarded_verbatim() {
+    let delta = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+    let error_frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n";
+    let sse = format!("{delta}{error_frame}data: {{\"type\":\"message_stop\"}}\n\n");
+    let served = sse.clone();
+    let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = served.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Anthropic).await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let body = r#"{"model":"route-model","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app.oneshot(messages_request(body, "mx-key")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    // The upstream's frames, byte-for-byte — error frame included.
+    assert!(
+        text.contains(&format!("{delta}{error_frame}")),
+        "the native lane must forward the upstream frames verbatim: {text}"
+    );
+    // Exactly one error frame, and it is the upstream's own…
+    assert_eq!(
+        text.matches("event: error").count(),
+        1,
+        "exactly one error frame may reach the client: {text}"
+    );
+    // …not a synthesized one (the gateway's shape uses `api_error`).
+    assert!(
+        !text.contains("api_error"),
+        "no synthesized Anthropic error frame may be added on a passthrough lane: {text}"
+    );
+    // The adapter stops reading at the error frame, so nothing follows it.
+    assert!(
+        text.ends_with(error_frame),
+        "the error frame must be the last byte on this path: {text}"
+    );
+
+    let req = req_rx.await.expect("request bytes");
+    let (request_line, upstream) = parse_upstream_request(&req);
+    assert!(
+        request_line.starts_with("POST /messages "),
+        "Anthropic×Anthropic must hit /messages: {request_line}"
+    );
+    assert_eq!(upstream["stream"], true);
+}
 
 #[tokio::test]
 async fn anthropic_x_responses_native_nonstream() {

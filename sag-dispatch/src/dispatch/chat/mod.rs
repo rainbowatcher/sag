@@ -307,6 +307,14 @@ enum EndSynthesis {
     /// `content_filter`), never from `End`, so a non-compliant upstream (no
     /// `finish_reason`) would leave the client without its terminal frame.
     ResponsesCompleted,
+    /// Bridge #4 — **Chat** ingress + IR-decoded upstream (Chat × Anthropic
+    /// and Chat × Responses): the Chat client's terminal signal is the
+    /// `finish_reason` chunk, which only a structured `Finish` produces. A
+    /// non-compliant upstream that ends without one would leave the client
+    /// with deltas and a bare `[DONE]` (a truncated-looking stream). Unlike
+    /// bridges #2 / #3 this one synthesizes **only** the `Finish`; the `End`
+    /// still passes through so bridge #1 can turn it into `data: [DONE]`.
+    ChatFinishReason,
 }
 
 /// Synthesize the ingress protocol's terminal frame on the first `End` of a
@@ -343,18 +351,39 @@ fn apply_end_synthesis_bridge(
     };
     let mut finish_seen = false;
     let mut end_sent = false;
+    // Per-stream: an upstream `Error` event terminates the response, so no
+    // synthetic terminal frame (`finish_reason` / `message_stop` /
+    // `response.completed`) may follow it. Scoped to this stream's closure, so
+    // healthy streams on the same route are unaffected.
+    let mut errored = false;
     s.flat_map(move |ev| match ev {
+        sag_core::IrStreamEvent::Error(_) => {
+            errored = true;
+            futures_util::stream::iter(vec![ev])
+        }
         sag_core::IrStreamEvent::Finish { .. } => {
             finish_seen = true;
             futures_util::stream::iter(vec![ev])
         }
         sag_core::IrStreamEvent::End if !end_sent => {
             end_sent = true;
+            if errored {
+                // The error frame already terminated the stream; only the
+                // `End` flows through so the dispatch loop finishes the
+                // terminal without emitting another client-visible frame.
+                return futures_util::stream::iter(vec![ev]);
+            }
             let mut out = Vec::with_capacity(2);
             if !finish_seen {
                 out.push(sag_core::IrStreamEvent::Finish {
                     index: 0,
-                    finish_reason: None,
+                    // Chat ingress has no protocol-mandated placeholder: a
+                    // stream that delivered content and then ended without an
+                    // upstream `finish_reason` is a normal completion.
+                    finish_reason: match kind {
+                        EndSynthesis::ChatFinishReason => Some(sag_core::IrFinishReason::Stop),
+                        _ => None,
+                    },
                 });
             }
             match kind {
@@ -369,7 +398,35 @@ fn apply_end_synthesis_bridge(
                     out.push(sag_core::IrStreamEvent::End)
                 }
                 EndSynthesis::ResponsesCompleted => {}
+                // Chat ingress: the synthesized `Finish` above is the whole
+                // bridge; the `End` must still flow so bridge #1 can render
+                // the Chat terminator.
+                EndSynthesis::ChatFinishReason => out.push(sag_core::IrStreamEvent::End),
             }
+            futures_util::stream::iter(out)
+        }
+        // Chat ingress reaches this bridge **after** bridge #1, which already
+        // rewrote the first `End` into the `data: [DONE]` frame. That frame is
+        // therefore the terminal carrier here: the missing `Finish` must
+        // precede it, or the client sees content and a bare terminator with no
+        // `finish_reason` (a truncated-looking stream). The `[DONE]` frame stays
+        // a `RawVerdict::Empty` for the earlier empty-response peek, so this
+        // placement cannot mask an empty upstream.
+        sag_core::IrStreamEvent::Raw(ref bytes)
+            if matches!(kind, EndSynthesis::ChatFinishReason)
+                && !end_sent
+                && !errored
+                && bytes.starts_with(b"data: [DONE]") =>
+        {
+            end_sent = true;
+            let mut out = Vec::with_capacity(2);
+            if !finish_seen {
+                out.push(sag_core::IrStreamEvent::Finish {
+                    index: 0,
+                    finish_reason: Some(sag_core::IrFinishReason::Stop),
+                });
+            }
+            out.push(ev);
             futures_util::stream::iter(out)
         }
         other => futures_util::stream::iter(vec![other]),
@@ -904,12 +961,35 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                             // peek — see `apply_end_synthesis_bridge`.
                             let s = if is_chat_ingress && (use_anthropic || use_responses) {
                                 let mut done_sent = false;
-                                s.map(move |ev| match ev {
-                                    sag_core::IrStreamEvent::End if !done_sent => {
-                                        done_sent = true;
-                                        sag_core::IrStreamEvent::Raw(b"data: [DONE]\n\n".to_vec())
+                                // An in-stream upstream error terminates the
+                                // response: OpenAI sends no `[DONE]` after an
+                                // error frame, and a Chat client reads the
+                                // terminator as a normal end. The flag is
+                                // per-stream (captured by this closure), so a
+                                // healthy stream on the same route keeps its
+                                // `[DONE]`.
+                                let mut errored = false;
+                                s.map(move |ev| {
+                                    if matches!(&ev, sag_core::IrStreamEvent::Error(_)) {
+                                        errored = true;
+                                        return ev;
                                     }
-                                    other => other,
+                                    match ev {
+                                        sag_core::IrStreamEvent::End if !done_sent => {
+                                            done_sent = true;
+                                            if errored {
+                                                // Pass the `End` through: the
+                                                // loop terminates without
+                                                // encoding a terminator.
+                                                sag_core::IrStreamEvent::End
+                                            } else {
+                                                sag_core::IrStreamEvent::Raw(
+                                                    b"data: [DONE]\n\n".to_vec(),
+                                                )
+                                            }
+                                        }
+                                        other => other,
+                                    }
                                 })
                                 .boxed()
                             } else {
@@ -945,6 +1025,12 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                 Some(EndSynthesis::AnthropicMessageStop)
                             } else if is_responses_ingress && !use_responses {
                                 Some(EndSynthesis::ResponsesCompleted)
+                            } else if is_chat_ingress && needs_ir_decode {
+                                // Chat ingress on an IR-decoded lane only: the
+                                // Chat→Chat byte-identical passthrough keeps
+                                // the upstream's own `finish_reason` and is
+                                // never decoded, so no synthesis there.
+                                Some(EndSynthesis::ChatFinishReason)
                             } else {
                                 None
                             };
@@ -1367,6 +1453,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         privacy_restore.take(),
                         in_flight,
                         tool_args.clone(),
+                        // Lane kind: translated lanes get one synthesized
+                        // error frame, passthrough lanes forward the
+                        // upstream's own bytes verbatim.
+                        needs_ir_decode,
                     );
                 }
                 if is_responses_ingress {
@@ -1395,6 +1485,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                         privacy_restore.take(),
                         in_flight,
                         tool_args.clone(),
+                        // Lane kind: translated lanes get one synthesized
+                        // error frame, passthrough lanes forward the
+                        // upstream's own bytes verbatim.
+                        needs_ir_decode,
                     );
                 }
                 return build_streaming_response(
@@ -1422,6 +1516,10 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                     privacy_restore.take(),
                     in_flight,
                     tool_args.clone(),
+                    // Lane kind: translated lanes get one synthesized error
+                    // frame, passthrough lanes forward the upstream's own
+                    // bytes verbatim.
+                    needs_ir_decode,
                 );
             }
             ChatAttempt::NonStream(att, upstream_start) => {

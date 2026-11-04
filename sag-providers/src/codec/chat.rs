@@ -388,8 +388,12 @@ impl ChatCompletionsCodec {
                 continue;
             };
 
-            // Top-level error object. Emit Error + Raw (client-visible frame),
-            // aligned with the Anthropic codec (B4).
+            // Top-level error object. Emit only `Error`: this decoder runs on
+            // a *translated* lane, where the raw upstream frame is the wrong
+            // protocol for the client and the dispatch layer synthesizes one
+            // protocol-correct frame from `Error` instead. Pairing it with
+            // `Raw` would hand the client a second, foreign-protocol error
+            // frame.
             if let Some(err) = val.get("error").filter(|e| !e.is_null()) {
                 let msg = err
                     .get("message")
@@ -397,7 +401,6 @@ impl ChatCompletionsCodec {
                     .unwrap_or_else(|| err.as_str().unwrap_or("upstream error"))
                     .to_string();
                 events.push(IrStreamEvent::Error(msg));
-                events.push(IrStreamEvent::Raw(frame.to_vec()));
                 continue;
             }
 
@@ -609,9 +612,18 @@ impl ChatCompletionsCodec {
             }
             // Align with StreamChunk::to_sse_bytes usage shape.
             IrStreamEvent::Usage(u) => json!({ "usage": u }),
-            // Align with StreamChunk::to_sse_bytes error shape.
+            // Official OpenAI in-stream error shape: a bare `data:` frame
+            // (no `event:` line) whose body is an `error` object. The IR event
+            // carries only the message, so the type is the generic
+            // `server_error` and `param` is null; `code` keeps the gateway's
+            // `STREAM_ERROR` marker. No `[DONE]` may follow this frame.
             IrStreamEvent::Error(e) => json!({
-                "error": { "code": "STREAM_ERROR", "message": e },
+                "error": {
+                    "message": e,
+                    "type": "server_error",
+                    "code": "STREAM_ERROR",
+                    "param": Value::Null,
+                },
             }),
             IrStreamEvent::End => return b"data: [DONE]\n\n".to_vec(),
             IrStreamEvent::Raw(bytes) => return bytes.clone(),
@@ -2422,14 +2434,11 @@ mod tests {
 
         let err = br#"data: {"error":{"message":"burst limit","code":429}}"#;
         let evs = ChatCompletionsCodec::decode_stream_frame(err);
-        // B4: error frames surface Error + Raw so clients see the envelope.
-        assert_eq!(
-            evs,
-            vec![
-                IrStreamEvent::Error("burst limit".into()),
-                IrStreamEvent::Raw(err.to_vec()),
-            ]
-        );
+        // B4: the decoder surfaces `Error` only. The raw frame is *not*
+        // re-emitted as `Raw`: this decoder only runs on translated lanes,
+        // where the dispatch layer renders the one protocol-correct error
+        // frame from `Error` and the upstream bytes must not leak.
+        assert_eq!(evs, vec![IrStreamEvent::Error("burst limit".into())]);
         rt_event(IrStreamEvent::Error("burst limit".into()));
 
         // StreamChunk-shaped error also round-trips.

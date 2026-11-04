@@ -532,6 +532,22 @@ struct StreamState<S, E> {
     /// Tool-argument quality evidence of this attempt, folded by the dispatch
     /// body on the way in and reported once at the terminal (warn-only).
     tool_args: ToolArgWatchHandle,
+    /// Lane kind, mirrored from the dispatch boundary's `needs_ir_decode`.
+    ///
+    /// `true` = translated lane: the upstream frames are re-rendered for
+    /// another protocol, so a mid-stream `Error` becomes **one**
+    /// protocol-correct frame synthesized by the ingress encoder, and every
+    /// event after it is dropped (no `[DONE]`, no `finish_reason`, no
+    /// `message_stop`, no further upstream frame).
+    ///
+    /// `false` = passthrough lane (Chat→Chat, Anthropic→Anthropic native,
+    /// Responses→Responses native): the client would see exactly the
+    /// upstream's bytes were it talking to the upstream directly, so `Error`
+    /// is recorded for analytics only and the upstream's own error frame is
+    /// forwarded verbatim as `Raw` — synthesizing one here would duplicate
+    /// it, and suppressing the upstream's own `[DONE]` would rewrite a
+    /// byte stream that is already correct.
+    emit_synthesized_error: bool,
     // Declared before the guard so it drops first; the guard's own
     // `Arc` clone keeps the shared data alive regardless. The guard
     // field is never read — it exists solely for its `Drop` (client
@@ -618,6 +634,7 @@ fn make_stream_state<S, E>(
     privacy_restore: Option<RestoreWriter>,
     in_flight: InFlightGuard,
     tool_args: ToolArgWatchHandle,
+    emit_synthesized_error: bool,
 ) -> StreamState<S, E> {
     StreamState {
         stream,
@@ -634,6 +651,7 @@ fn make_stream_state<S, E>(
         privacy_restore,
         terminal_pending: false,
         tool_args,
+        emit_synthesized_error,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
         _in_flight: in_flight,
@@ -906,10 +924,17 @@ async fn finish_stream_terminal<S, E>(state: &mut StreamState<S, E>) {
 /// `encode` maps one event to client-facing bytes. For the Chat ingress it
 /// must forward [`IrStreamEvent::Raw`] **byte-identically** (the original
 /// upstream SSE frame) and render structured events via the ingress codec.
-/// `Usage` / `Error` / `End` are handled inline by the loop (merge /
-/// record / finish) and are never re-encoded into the body — matching the
-/// legacy `StreamChunk` contract (only Data bytes reach the client;
-/// `[DONE]` itself arrives as a Raw Data frame).
+/// `Usage` / `End` are handled inline by the loop (merge / finish) and are
+/// never re-encoded into the body — matching the legacy `StreamChunk`
+/// contract (only Data bytes reach the client; `[DONE]` itself arrives as a
+/// Raw Data frame).
+///
+/// A mid-stream [`IrStreamEvent::Error`] is recorded for analytics in both
+/// cases, but only a **translated** lane (`emit_synthesized_error`) encodes
+/// it: there the ingress encoder renders one protocol-correct error frame and
+/// the stream goes silent afterwards. On a passthrough lane the upstream's
+/// own error bytes are already in the client's protocol and arrive as `Raw`,
+/// so nothing is synthesized and nothing is suppressed.
 ///
 /// `upstream_start` is captured immediately before the provider call. It
 /// drives two timing fields on the final `CallLog`:
@@ -993,6 +1018,11 @@ pub fn build_streaming_response<S, E>(
     // event into it on the way in; the terminal reads the aggregate once.
     // Warn-only — it never affects encoding or the terminal classification.
     tool_args: ToolArgWatchHandle,
+    // Lane kind, from the dispatch boundary's `needs_ir_decode`: `true` on a
+    // translated lane (synthesize exactly one protocol-correct error frame,
+    // then emit nothing), `false` on a same-protocol passthrough lane
+    // (forward the upstream's own error bytes verbatim, synthesize none).
+    emit_synthesized_error: bool,
 ) -> Response<Body>
 where
     // `+ Unpin` is required by `StreamExt::next().await` inside the
@@ -1038,6 +1068,7 @@ where
         privacy_restore,
         in_flight,
         tool_args,
+        emit_synthesized_error,
     );
 
     let body = Body::from_stream(unfold(state, |mut state| async move {
@@ -1052,10 +1083,10 @@ where
         }
         loop {
             match state.stream.next().await {
-                // Usage / Error / End are protocol-control events: merge /
-                // record / finish inline — never encoded into the client body
-                // (legacy StreamChunk contract: only Data bytes reach the
-                // client; [DONE] itself arrives as a Raw Data frame).
+                // Usage / End are protocol-control events: merge / finish
+                // inline — never encoded into the client body (legacy
+                // StreamChunk contract: only Data bytes reach the client;
+                // [DONE] itself arrives as a Raw Data frame).
                 Some(IrStreamEvent::Usage(u)) => {
                     let mut acc = state
                         .analytics
@@ -1063,9 +1094,6 @@ where
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     merge_stream_usage(&mut acc, &u);
-                }
-                Some(IrStreamEvent::Error(msg)) => {
-                    record_stream_error(&mut state, msg);
                 }
                 Some(IrStreamEvent::End) | None => {
                     // Every terminating path of this loop (explicit `End`, an
@@ -1095,6 +1123,36 @@ where
                     return None;
                 }
                 Some(ev) => {
+                    // A mid-stream upstream `Error` is always recorded for
+                    // analytics first (the response is already committed at
+                    // 200, and the attempt status / failure_reason semantics
+                    // must not change) — what reaches the client next depends
+                    // on the lane:
+                    //
+                    // - translated lane: encode the *synthesized*
+                    //   protocol-correct frame (the ingress encoder renders
+                    //   it), then drop every later event so nothing
+                    //   (`[DONE]` / `finish_reason` / `message_stop`) follows
+                    //   the terminal error; a duplicate `Error` stays
+                    //   analytics-only;
+                    // - passthrough lane: emit nothing — the upstream's own
+                    //   error bytes arrive as a separate `Raw` event and are
+                    //   forwarded verbatim. Behaving like the client talking
+                    //   to the upstream directly is the contract there, so a
+                    //   synthesized frame must never be added.
+                    if let IrStreamEvent::Error(msg) = &ev {
+                        let duplicate = state.error.is_some();
+                        record_stream_error(&mut state, msg.clone());
+                        if duplicate || !state.emit_synthesized_error {
+                            continue;
+                        }
+                    } else if state.emit_synthesized_error && state.error.is_some() {
+                        // The synthesized error frame already terminated a
+                        // translated stream: no later upstream frame may leak
+                        // through (cross-protocol bytes must not reach this
+                        // client, and no terminator may follow an error).
+                        continue;
+                    }
                     // Client-visible event (Raw / structured): encode and
                     // stamp TTFT on the first non-empty yielded byte —
                     // a 0-byte encode is not a first byte.
@@ -1253,6 +1311,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         )
     }
 
@@ -1583,6 +1642,7 @@ mod tests {
             Some(privacy_restore),
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         )
     }
 
@@ -1662,6 +1722,8 @@ mod tests {
             privacy_stream_response(&state, stream, RestoreWriter::new(email_placeholder_map()));
 
         let tail = resp.body_mut().frame().await.unwrap().unwrap();
+        // Passthrough lane here: the `Error` carries no bytes of its own, so
+        // the only visible frame is the flushed tail, byte-for-byte.
         assert_eq!(
             tail.into_data().unwrap().as_ref(),
             b"data: {\"content\":\"tail"
@@ -1716,6 +1778,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -1941,6 +2004,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2071,6 +2135,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2164,6 +2229,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         // The disconnect: drop the response without polling the body. The
@@ -2252,26 +2318,41 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            true,
         );
 
         // Drive the body one frame at a time with a noop waker: the first
-        // poll forwards the committed `Data` byte, the second consumes the
-        // `Error` chunk and suspends on `pending` — the client disconnects
-        // in that suspended state, so the drop guard must classify by the
-        // error flag it saw, not as a plain cancel.
+        // poll forwards the committed `Data` byte, the second delivers the
+        // forwarded error frame, the third suspends on `pending` — the client
+        // disconnects in that suspended state, so the drop guard must classify
+        // by the error flag it saw, not as a plain cancel.
         let mut body = resp.into_body();
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let frame = body.frame();
-        futures_util::pin_mut!(frame);
-        assert!(
-            frame.as_mut().poll(&mut cx).is_ready(),
-            "first body frame (the committed Data byte) must be ready"
-        );
-        assert!(
-            frame.poll(&mut cx).is_pending(),
-            "Error chunk consumed; the stream must be suspended on pending"
-        );
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_ready(),
+                "first body frame (the committed Data byte) must be ready"
+            );
+        }
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_ready(),
+                "the mid-stream error frame must reach the client"
+            );
+        }
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_pending(),
+                "after the error frame the stream must be suspended on pending"
+            );
+        }
         drop(body);
         tokio::task::yield_now().await;
         state.event_collector.shutdown().await;
@@ -2348,6 +2429,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         drop(resp);
@@ -2435,25 +2517,40 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            true,
         );
 
         // Drive the body one frame at a time with a noop waker: the first
-        // poll forwards the committed Data byte, the second consumes the
-        // Error chunk and suspends on `pending` — the client disconnects in
-        // that suspended state.
+        // poll forwards the committed Data byte, the second delivers the
+        // forwarded error frame, the third suspends on `pending` — the client
+        // disconnects in that suspended state.
         let mut body = resp.into_body();
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let frame = body.frame();
-        futures_util::pin_mut!(frame);
-        assert!(
-            frame.as_mut().poll(&mut cx).is_ready(),
-            "first body frame (the committed Data byte) must be ready"
-        );
-        assert!(
-            frame.poll(&mut cx).is_pending(),
-            "Error chunk consumed; the stream must be suspended on pending"
-        );
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_ready(),
+                "first body frame (the committed Data byte) must be ready"
+            );
+        }
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_ready(),
+                "the mid-stream error frame must reach the client"
+            );
+        }
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_pending(),
+                "after the error frame the stream must be suspended on pending"
+            );
+        }
         drop(body);
         tokio::task::yield_now().await;
         state.event_collector.shutdown().await;
@@ -2544,6 +2641,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -2642,6 +2740,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         let mut body = resp.into_body();
@@ -2724,6 +2823,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         // Drive the body exactly ONE frame with a noop waker: the first poll
@@ -2835,6 +2935,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         // Drive the body one frame at a time with a noop waker: the first
@@ -2943,21 +3044,36 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            true,
         );
 
         let mut body = resp.into_body();
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let frame = body.frame();
-        futures_util::pin_mut!(frame);
-        assert!(
-            frame.as_mut().poll(&mut cx).is_ready(),
-            "first body frame (the committed Data byte) must be ready"
-        );
-        assert!(
-            frame.poll(&mut cx).is_pending(),
-            "Error consumed; the terminal delivery must pend on the full queue"
-        );
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_ready(),
+                "first body frame (the committed Data byte) must be ready"
+            );
+        }
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_ready(),
+                "the mid-stream error frame must reach the client"
+            );
+        }
+        {
+            let frame = body.frame();
+            futures_util::pin_mut!(frame);
+            assert!(
+                frame.as_mut().poll(&mut cx).is_pending(),
+                "Error forwarded; the terminal delivery must pend on the full queue"
+            );
+        }
 
         drop(body);
         tokio::task::yield_now().await;
@@ -3032,6 +3148,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         let mut body = resp.into_body();
@@ -3257,6 +3374,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         let mut body = resp.into_body();
@@ -3380,6 +3498,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         let mut body = resp.into_body();
@@ -3463,6 +3582,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
 
         let mut body = resp.into_body();
@@ -3541,10 +3661,13 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            true,
         );
 
         let mut body = resp.into_body();
-        assert_eq!(drain_until_pending(&mut body), 1);
+        // Two client-visible frames: the committed Data byte and the forwarded
+        // error frame; then the stream suspends on `pending`.
+        assert_eq!(drain_until_pending(&mut body), 2);
         drop(body);
         tokio::task::yield_now().await;
         state.event_collector.shutdown().await;
@@ -3619,6 +3742,7 @@ mod tests {
             None,
             state.in_flight.acquire("test-route"),
             ToolArgWatchHandle::default(),
+            false,
         );
         let mut body = resp.into_body();
         assert_eq!(drain_until_pending(&mut body), 1);
@@ -3682,6 +3806,7 @@ mod tests {
                 None,
                 state.in_flight.acquire("test-route"),
                 ToolArgWatchHandle::default(),
+                false,
             );
             let mut body = resp.into_body();
             assert_eq!(drain_until_pending(&mut body), 1, "{encode_name}");

@@ -1381,16 +1381,62 @@ impl ResponsesCodec {
                 | "response.reasoning_summary_part.done"
                 | "response.output_text.annotation.added" => {}
                 "response.completed" => {
-                    // Forward the original frame (client-visible, carries
-                    // usage) + extract Usage for analytics. Finish/End are
-                    // NOT emitted here — native Data→Raw path never decodes,
-                    // and the translated path relies on the upstream
-                    // finish_reason / Done. Raw first so the client always
-                    // receives the authoritative completed frame.
-                    events.push(IrStreamEvent::Raw(frame.to_vec()));
+                    // Terminal of a compliant turn: derive the IR `Finish`
+                    // from `status` (+ `incomplete_details`) with the same
+                    // mapping the non-streaming decode uses. Without it a
+                    // translated egress (Chat client) never sees
+                    // `finish_reason` and the stream looks truncated — the
+                    // `Raw` frame below cannot rescue it, because the
+                    // dispatch filter drops `response.*` frames on an
+                    // IR-decoded lane. `has_function_call` matters: a turn
+                    // that ends on tool calls must report `tool_calls`, not
+                    // `stop`, so scan `output[]` for a `function_call` item.
+                    let has_function_call = val
+                        .pointer("/response/output")
+                        .and_then(|o| o.as_array())
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                            })
+                        });
+                    let incomplete_reason = val
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(|r| r.as_str());
+                    // `completed` is the status implied by the event name, so
+                    // a payload that omits `/response/status` still yields a
+                    // reason: `tool_calls` when the output carries a call,
+                    // `stop` otherwise.
+                    let finish_reason =
+                        match val.pointer("/response/status").and_then(|s| s.as_str()) {
+                            Some(status) => {
+                                status_to_finish(status, incomplete_reason, has_function_call)
+                            }
+                            None => Some(if has_function_call {
+                                IrFinishReason::FunctionCall
+                            } else {
+                                IrFinishReason::Stop
+                            }),
+                        };
+                    // `status_to_finish` keeps the Responses-native token
+                    // `function_call`; the IR stream terminal for a tool-call
+                    // turn is `tool_calls` (what the Chat and Anthropic
+                    // encoders render), so fold it here instead of adding a
+                    // second status→reason table.
+                    let finish_reason = finish_reason.map(|reason| match reason {
+                        IrFinishReason::FunctionCall => IrFinishReason::ToolCalls,
+                        other => other,
+                    });
+                    events.push(IrStreamEvent::Finish {
+                        index: 0,
+                        finish_reason,
+                    });
                     if let Some(u) = val.pointer("/response/usage").filter(|u| !u.is_null()) {
                         events.push(IrStreamEvent::Usage(responses_usage(u)));
                     }
+                    // Keep forwarding the original frame: on the same-protocol
+                    // lane it is the authoritative terminal, and the
+                    // IR-decoded lanes drop it in `is_responses_event_frame`.
+                    events.push(IrStreamEvent::Raw(frame.to_vec()));
                 }
                 "response.failed" => {
                     let msg = val
@@ -3096,10 +3142,12 @@ mod tests {
                 "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
             }
         })));
-        assert!(matches!(events[0], IrStreamEvent::Raw(_)));
+        // `Finish` now precedes `Usage` / `Raw` (the translated lanes need
+        // the terminal reason; see the `response.completed` arm).
+        assert!(matches!(events[0], IrStreamEvent::Finish { .. }));
         assert!(matches!(events[1], IrStreamEvent::Usage(ref u)
             if u.prompt_tokens == 7 && u.completion_tokens == 3));
-        let raw = match &events[0] {
+        let raw = match &events[2] {
             IrStreamEvent::Raw(b) => String::from_utf8_lossy(b).to_string(),
             _ => unreachable!(),
         };
@@ -4508,6 +4556,101 @@ mod tests {
             messages[0]["content"][0]["text"],
             json!("Hello world"),
             "{completed}"
+        );
+    }
+
+    // ── stream terminal: `response.completed` emits `Finish` ─────────
+
+    /// A Chat-ingress client on a Responses-upstream lane must receive a
+    /// `finish_reason`: `response.completed` is the upstream's terminal, so
+    /// the decoder emits the structured `Finish` (before `Usage`/`Raw`).
+    #[test]
+    fn response_completed_emits_stop_finish_reason() {
+        let events = ResponsesCodec::decode_stream_frame(&frame(json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+            }
+        })));
+        assert!(
+            matches!(
+                events[0],
+                IrStreamEvent::Finish {
+                    index: 0,
+                    finish_reason: Some(IrFinishReason::Stop),
+                }
+            ),
+            "a text-only completed turn must decode to Finish(Stop): {events:?}"
+        );
+        assert!(
+            matches!(events[1], IrStreamEvent::Usage(ref u) if u.completion_tokens == 3),
+            "Usage must still follow the Finish: {events:?}"
+        );
+    }
+
+    /// A turn that ends on tool calls must report `tool_calls`, not `stop` —
+    /// the `output[]` scan is the only evidence the payload carries.
+    #[test]
+    fn response_completed_with_function_call_emits_tool_calls() {
+        let events = ResponsesCodec::decode_stream_frame(&frame(json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{}",
+                    "status": "completed"
+                }]
+            }
+        })));
+        assert!(
+            matches!(
+                events[0],
+                IrStreamEvent::Finish {
+                    index: 0,
+                    finish_reason: Some(IrFinishReason::ToolCalls),
+                }
+            ),
+            "a function_call turn must decode to Finish(ToolCalls): {events:?}"
+        );
+    }
+
+    /// No `/response/status`: the event name implies `completed`, so fall back
+    /// to the tool-call scan and otherwise `stop` — never panic, never omit.
+    #[test]
+    fn response_completed_without_status_falls_back_to_stop() {
+        let events = ResponsesCodec::decode_stream_frame(&frame(json!({
+            "type": "response.completed",
+            "response": {
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+                }]
+            }
+        })));
+        assert!(
+            matches!(
+                events[0],
+                IrStreamEvent::Finish {
+                    index: 0,
+                    finish_reason: Some(IrFinishReason::Stop),
+                }
+            ),
+            "a payload without `status` falls back to Finish(Stop): {events:?}"
         );
     }
 }

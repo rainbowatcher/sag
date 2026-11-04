@@ -904,6 +904,11 @@ impl AnthropicMessagesCodec {
             };
 
             // Error event: `{"type":"error","error":{...}}` or top-level error.
+            // Only `Error` is emitted — this decoder runs on a translated lane,
+            // where the raw upstream frame is the wrong protocol for the
+            // client (the dispatch layer renders one protocol-correct frame
+            // from `Error`); re-emitting it as `Raw` would leak a second,
+            // foreign-protocol error frame.
             if val.get("type").and_then(|t| t.as_str()) == Some("error")
                 || crate::base::body_has_error_object(&val)
             {
@@ -912,9 +917,6 @@ impl AnthropicMessagesCodec {
                     .map(crate::base::body_error_message)
                     .unwrap_or_else(|| crate::base::body_error_message(&val));
                 events.push(IrStreamEvent::Error(msg));
-                // Forward the raw frame too so the client sees the
-                // Anthropic error envelope (behavior-compatible).
-                events.push(IrStreamEvent::Raw(frame.to_vec()));
                 continue;
             }
 
@@ -1141,11 +1143,21 @@ impl AnthropicMessagesCodec {
                 });
                 format!("data: {payload}\n\n").into_bytes()
             }
-            // Usage / Error / End are handled by the dispatch loop — never
-            // client-encoded here (Usage) … End is message_stop below only
-            // when it reaches encode (it normally finishes the terminal).
+            // Usage is handled by the dispatch loop — never client-encoded.
             IrStreamEvent::Usage(_) => Vec::new(),
-            IrStreamEvent::Error(_) => Vec::new(),
+            // Mid-stream upstream error: the official Anthropic wire form is
+            // an `event: error` line plus a `type: "error"` body, after which
+            // the stream terminates (no `message_stop`). The IR event carries
+            // only the message (no error kind), so the kind is the generic
+            // `api_error`.
+            IrStreamEvent::Error(msg) => format!(
+                "event: error\ndata: {}\n\n",
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg},
+                })
+            )
+            .into_bytes(),
             IrStreamEvent::End => b"data: {\"type\":\"message_stop\"}\n\n".to_vec(),
         }
     }
@@ -1173,6 +1185,9 @@ struct StreamEncodeState {
     /// Kind of the currently open content block, if any.
     open_block: Option<OpenBlock>,
     next_index: u32,
+    /// Set once an `Error` frame was rendered: the stream terminated at it, so
+    /// no later `message_delta` / `message_stop` may be emitted.
+    errored: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1186,6 +1201,14 @@ impl StreamEncodeState {
     fn encode(&mut self, ev: &IrStreamEvent) -> Vec<u8> {
         match ev {
             IrStreamEvent::Raw(bytes) => {
+                // Defense in depth: a translated stream terminated at its
+                // synthesized error frame, so no later raw frame may reach an
+                // Anthropic egress — in particular not an OpenAI-shaped one.
+                // The dispatch layer already drops them; this guard keeps the
+                // encoder from leaking them if it is ever fed directly.
+                if self.errored {
+                    return Vec::new();
+                }
                 let text = String::from_utf8_lossy(bytes);
                 if text.contains("[DONE]") {
                     return Vec::new();
@@ -1306,6 +1329,11 @@ impl StreamEncodeState {
                 format!("data: {payload}\n\n").into_bytes()
             }
             IrStreamEvent::Finish { finish_reason, .. } => {
+                // An errored stream terminated at its error frame: no
+                // `message_delta` (and therefore no `stop_reason`) follows.
+                if self.errored {
+                    return Vec::new();
+                }
                 let mut out = self.close_open_block();
                 let stop = finish_to_stop(finish_reason.as_ref());
                 let payload = json!({
@@ -1316,11 +1344,31 @@ impl StreamEncodeState {
                 out
             }
             IrStreamEvent::End => {
+                // The error frame already terminated the stream: no
+                // `message_stop` may follow it (official Anthropic wire
+                // form).
+                if self.errored {
+                    return Vec::new();
+                }
                 let mut out = self.close_open_block();
                 out.extend_from_slice(b"data: {\"type\":\"message_stop\"}\n\n");
                 out
             }
-            IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) => Vec::new(),
+            IrStreamEvent::Usage(_) => Vec::new(),
+            // A mid-stream upstream error: official shape (an `event: error`
+            // line plus a `type: "error"` body), after which the stream
+            // terminates. The IR event carries only the message (no error
+            // kind), so the kind is the generic `api_error`. The open content
+            // block is deliberately left unclosed — the error frame is the
+            // last frame, exactly like a native Anthropic error stream.
+            IrStreamEvent::Error(msg) => {
+                self.errored = true;
+                let payload = json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": msg},
+                });
+                format!("event: error\ndata: {payload}\n\n").into_bytes()
+            }
         }
     }
 
@@ -2957,12 +3005,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_yields_error_and_raw() {
+    fn stream_error_yields_error_only() {
         let frame =
             br#"data: {"type":"error","error":{"type":"overloaded_error","message":"boom"}}"#;
+        // Only `Error`: the Anthropic decoder runs on translated lanes, where
+        // the dispatch layer synthesizes the one protocol-correct frame; a
+        // paired `Raw` would duplicate it (in the wrong protocol).
         let events = AnthropicMessagesCodec::decode_stream_frame(frame);
-        assert!(matches!(events[0], IrStreamEvent::Error(ref m) if m == "boom"));
-        assert!(matches!(events[1], IrStreamEvent::Raw(_)));
+        assert_eq!(events, vec![IrStreamEvent::Error("boom".into())]);
     }
 
     #[test]
@@ -2987,6 +3037,22 @@ mod tests {
         let raw = b"data: {\"type\":\"custom\"}\n\n".to_vec();
         let out = AnthropicMessagesCodec::encode_stream_event(&IrStreamEvent::Raw(raw.clone()));
         assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn stream_encoder_drops_raw_after_error() {
+        let enc = AnthropicMessagesCodec::stream_encoder();
+        let error = enc(&IrStreamEvent::Error("boom".into()));
+        assert!(
+            String::from_utf8_lossy(&error).starts_with("event: error"),
+            "the error frame must be the official Anthropic shape"
+        );
+        // Defense in depth: a raw (possibly OpenAI-shaped) frame arriving
+        // after the error would leak the wrong protocol onto this egress.
+        let raw = enc(&IrStreamEvent::Raw(
+            b"data: {\"error\":{\"message\":\"boom\"}}\n\n".to_vec(),
+        ));
+        assert!(raw.is_empty(), "raw bytes after an error must be dropped");
     }
 
     #[test]

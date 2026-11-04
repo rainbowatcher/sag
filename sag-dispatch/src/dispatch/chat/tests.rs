@@ -138,6 +138,13 @@ struct AnthropicStreamProvider {
     name: String,
     stream: Mutex<Option<Vec<StreamChunk>>>,
     stream_calls: AtomicU32,
+    /// `true` keeps the upstream stream open after the last frame so a test
+    /// can drop the body inside the race window before the terminating `End`
+    /// is enqueued. `false` ends the stream after the last frame — the real
+    /// adapter's behavior (`anthropic_messages_stream` closes its channel
+    /// after `Done`) — so a full `to_bytes(.., usize::MAX)` drain terminates
+    /// instead of suspending forever.
+    keep_open: bool,
 }
 
 impl AnthropicStreamProvider {
@@ -146,6 +153,17 @@ impl AnthropicStreamProvider {
             name: name.to_string(),
             stream: Mutex::new(Some(chunks)),
             stream_calls: AtomicU32::new(0),
+            keep_open: true,
+        }
+    }
+
+    /// Variant whose upstream stream ends after the last frame, so the body
+    /// terminates on `None` instead of suspending. Use it when the test drains
+    /// the whole body; the synthesized terminal frames must still be present.
+    fn new_closed(name: &str, chunks: Vec<StreamChunk>) -> Self {
+        Self {
+            keep_open: false,
+            ..Self::new(name, chunks)
         }
     }
 
@@ -189,12 +207,18 @@ impl LlmProvider for AnthropicStreamProvider {
     ) -> sag_core::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         let chunks = self.stream.lock().unwrap().take().unwrap_or_default();
-        // `chain(pending)` keeps the stream open after the last frame so the
-        // test can drop the body inside the race window (the upstream `End`
-        // has not been enqueued yet).
-        Ok(Box::pin(
-            futures_util::stream::iter(chunks).chain(futures_util::stream::pending()),
-        ))
+        if self.keep_open {
+            // `chain(pending)` keeps the stream open after the last frame so
+            // the test can drop the body inside the race window (the upstream
+            // `End` has not been enqueued yet).
+            Ok(Box::pin(
+                futures_util::stream::iter(chunks).chain(futures_util::stream::pending()),
+            ))
+        } else {
+            // Real adapter behavior: the stream ends once the last frame has
+            // been delivered, so the consumer terminates on `None`.
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
     }
 }
 
@@ -3817,14 +3841,23 @@ async fn m4_non_stream_body_bytes_match_original_response() {
 
 /// Golden: streaming gateway body is byte-identical to the concatenation
 /// of the provider's `StreamChunk::Data` frames (Raw passthrough; Usage /
-/// Error / End never rewrite client bytes; `[DONE]` arrives as Data).
+/// End never rewrite client bytes; `[DONE]` arrives as Data).
+///
+/// Mid-stream error on the **passthrough** lane (Chat→Chat): the side-channel
+/// `Error` chunk is analytics-only, the upstream's own error bytes go out
+/// verbatim, and the upstream's own `[DONE]` is *not* suppressed — the client
+/// sees exactly the bytes it would have seen from the upstream directly. No
+/// synthesized frame is added (that would duplicate the error).
 #[tokio::test]
 async fn m4_stream_body_bytes_match_upstream_data_frames() {
     let f1 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n".to_vec();
     let f2 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n".to_vec();
     let f3 = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n".to_vec();
     let f_done = b"data: [DONE]\n\n".to_vec();
-    let golden: Vec<u8> = [f1.clone(), f2.clone(), f3.clone(), f_done.clone()].concat();
+    // The upstream's own Chat-shaped error envelope, in bytes the gateway
+    // must not rewrite.
+    let upstream_error = b"data: {\"error\":{\"message\":\"upstream died\",\"type\":\"insufficient_quota\",\"code\":\"rate_limit_exceeded\"}}\n\n".to_vec();
+    let golden_prefix: Vec<u8> = [f1.clone(), f2.clone(), f3.clone()].concat();
 
     let mock = Arc::new(MockProvider::new("openai"));
     mock.push_stream(StreamBehavior::Ok(vec![
@@ -3841,10 +3874,13 @@ async fn m4_stream_body_bytes_match_upstream_data_frames() {
             reasoning_tokens: None,
         }),
         StreamChunk::Data(f3),
-        // Mid-stream Error records analytics but emits no client bytes of
-        // its own (the error Data frame is separate when present).
-        StreamChunk::Error("ignored-for-body".into()),
-        StreamChunk::Data(f_done),
+        // Same order the real Chat passthrough produces
+        // (`forward_error_frame`): the `Error` chunk (analytics only) first,
+        // then the upstream's error bytes as a Data frame.
+        StreamChunk::Error("upstream died".into()),
+        StreamChunk::Data(upstream_error.clone()),
+        // The upstream's own terminator, forwarded verbatim.
+        StreamChunk::Data(f_done.clone()),
         StreamChunk::Done,
     ]));
     let state = build_state(vec![mock.clone()]).await;
@@ -3856,10 +3892,25 @@ async fn m4_stream_body_bytes_match_upstream_data_frames() {
     let resp = dispatch_chat(ctx).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    // Data frames byte-identical, including the upstream's error frame and
+    // its `[DONE]`; nothing synthesized in between.
+    let expected: Vec<u8> = [golden_prefix, upstream_error, f_done].concat();
     assert_eq!(
         &body[..],
-        &golden[..],
-        "M4 stream egress must be byte-identical to upstream Data frames (Raw passthrough)"
+        &expected[..],
+        "M4 stream egress must stay byte-identical to the upstream frames"
+    );
+    // Exactly one error frame, and it is the upstream's: a synthesized frame
+    // would carry the gateway's `STREAM_ERROR` marker.
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        text.matches("\"error\":").count(),
+        1,
+        "exactly one error frame may reach the client: {text}"
+    );
+    assert!(
+        !text.contains("STREAM_ERROR"),
+        "no synthesized error frame may be added on a passthrough lane: {text}"
     );
 }
 
@@ -3907,8 +3958,23 @@ fn m4_chat_stream_encoder_raw_passthrough_and_structured() {
     let chunk_u = StreamChunk::Usage(usage).to_sse_bytes();
     assert_eq!(ir_u, chunk_u, "usage frame must match to_sse_bytes");
     let ir_e = ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::Error("x".into()));
-    let chunk_e = StreamChunk::Error("x".into()).to_sse_bytes();
-    assert_eq!(ir_e, chunk_e, "error frame must match to_sse_bytes");
+    // Codec-level: dispatch only feeds `Error` to this encoder on a
+    // translated lane (passthrough lanes record analytics and forward the
+    // upstream's own bytes), so this is exactly the one synthesized frame the
+    // lane contract allows.
+    // The official OpenAI in-stream error shape (`message` / `type` / `code` /
+    // `param`), which deliberately diverges from the legacy
+    // `StreamChunk::to_sse_bytes` envelope (`{code, message}` only).
+    let ir_e_val: serde_json::Value =
+        serde_json::from_slice(ir_e.strip_prefix(b"data: ").unwrap().trim_ascii()).unwrap();
+    assert_eq!(ir_e_val["error"]["message"], "x");
+    assert_eq!(ir_e_val["error"]["type"], "server_error");
+    assert_eq!(ir_e_val["error"]["code"], "STREAM_ERROR");
+    assert!(ir_e_val["error"].get("param").is_some());
+    assert!(
+        ir_e.starts_with(b"data: ") && !ir_e.starts_with(b"event: "),
+        "OpenAI error frames are a bare data: frame"
+    );
     assert_eq!(
         ChatCompletionsCodec::encode_stream_event(&IrStreamEvent::End),
         b"data: [DONE]\n\n"
@@ -4789,6 +4855,14 @@ async fn chat_ingress_responses_upstream_reencodes_as_chat_chunks() {
         text.ends_with("data: [DONE]\n\n"),
         "the synthesized [DONE] must be the last frame, got: {text}"
     );
+    // Terminal contract: `response.completed` is the upstream terminal, so the
+    // decoder must surface a `finish_reason` chunk — without it a Chat client
+    // reads the stream as truncated.
+    assert_eq!(
+        text.matches(r#""finish_reason":"stop""#).count(),
+        1,
+        "exactly one finish_reason chunk, got: {text}"
+    );
 }
 
 /// §6 case 6 (non-compliant upstream): Anthropic ingress + Chat upstream that
@@ -5564,6 +5638,79 @@ async fn anthropic_ingress_responses_upstream_decodes_as_responses() {
         text.matches(r#""type":"message_stop""#).count(),
         1,
         "the Anthropic terminator bridge must still fire, got: {text}"
+    );
+}
+
+/// Bridge #4 (Chat ingress terminal safety net): an IR-decoded Chat-ingress
+/// lane whose upstream delivers content and then ends with **no** terminal
+/// event must still emit exactly one `finish_reason` chunk, followed by
+/// `[DONE]`. Without the safety net the Chat client sees deltas and a bare
+/// terminator — indistinguishable from a truncated stream. This pins the
+/// `EndSynthesis::ChatFinishReason` addition independently of the decoder fix
+/// (the Anthropic upstream here never sends `message_delta` / `message_stop`).
+#[tokio::test]
+async fn chat_ingress_without_upstream_finish_still_emits_finish_reason() {
+    let upstream = Arc::new(AnthropicStreamProvider::new_closed(
+        "anth",
+        vec![
+            StreamChunk::Data(
+                b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-3\"}}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+                    .to_vec(),
+            ),
+            StreamChunk::Data(
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+                    .to_vec(),
+            ),
+            // No `message_delta` (no `stop_reason`) and no `message_stop`:
+            // the upstream just terminates.
+            StreamChunk::Done,
+        ],
+    ));
+    let state = build_state(vec![upstream.clone()]).await;
+    let rt = crate::testing::test_dispatch_runtime();
+    let req = build_request("claude-3", true);
+    let targets = vec![ResolvedTarget {
+        upstream_protocol: sag_core::ApiKind::AnthropicMessages,
+        ..target("anth", "claude-3", 0)
+    }];
+    let mut errors = Vec::new();
+    let ctx = make_ctx(&state, &rt, &req, &targets, true, &mut errors);
+    let resp = dispatch_chat(ctx).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(upstream.stream_calls(), 1);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(r#""delta":{"content":"hi"}"#),
+        "the decoded delta must reach the Chat client, got: {text}"
+    );
+    assert_eq!(
+        text.matches(r#""finish_reason":"stop""#).count(),
+        1,
+        "the safety net must synthesize exactly one finish_reason chunk, got: {text}"
+    );
+    assert_eq!(
+        text.matches("data: [DONE]").count(),
+        1,
+        "exactly one Chat terminator, got: {text}"
+    );
+    assert!(
+        text.ends_with("data: [DONE]\n\n"),
+        "the terminator must be the last frame, got: {text}"
+    );
+    // The synthesized `Finish` must precede the terminator, never follow it.
+    let finish_at = text
+        .find(r#""finish_reason":"stop""#)
+        .expect("finish_reason chunk");
+    let done_at = text.find("data: [DONE]").expect("[DONE]");
+    assert!(
+        finish_at < done_at,
+        "finish_reason must precede the terminator, got: {text}"
     );
 }
 
