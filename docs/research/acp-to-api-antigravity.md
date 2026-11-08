@@ -662,7 +662,7 @@ SAG 现有架构事实（来自本仓库代码核对）：
 | `apis` 协议 catalog 工厂（`create_provider` → 按 catalog 创建单实例并委派适配器） | `sag-providers/src/catalog.rs:14-34`、`sag-providers/src/lib.rs:19-55` | **没有 `provider_type` 分派**，因此新增一个「转换服务上游」不需要新类型 |
 | 任意 OpenAI 兼容端点：`apis.*.base_url` + headers/body overrides | `sag-config/src/config.rs:1297` 起 `ApiConfig`；`sag-config/src/loader/load.rs:195` 示例 | 只要转换服务给标准 `/v1/chat/completions`，加一个 provider 节点即可 |
 | `provider_type` 已移除，迁移清理逻辑在 loader | `sag-config/src/loader/save.rs:1078-1088` | 不要再引入「按来源分派」的类型枚举 |
-| Admin API 增删改查 provider + 模型列表 / fetch-models / probe | `sag-admin/src/admin_providers.rs:257,277,345,451`；`sag-admin/src/admin.rs:40-48` | 凭证生命周期、探活可复用现有通道 |
+| Admin API 增删改查 provider + 模型列表 / fetch-models / probe | `sag-admin/src/admin_providers.rs:258,279,347,435,465`；`sag-admin/src/admin.rs:40-48` | 凭证生命周期、探活可复用现有通道 |
 | 重试语义：TTFB 超时可重试；4xx 不重试 | `sag-config/src/config.rs` ProviderConfig TTFB 注释；`docs/spec/dispatch/changes/0004-upstream-4xx-non-retryable.md` | **`429` / `403` 的分类必须在这里做对**，否则「假 429」会被当成真限速冷却，`TOS_VIOLATION` 403 会被当成不可重试的客户端错误直接回给用户 |
 | 目标池 / 会话粘性 / 断路器 | `sag-router/src/session.rs`、`docs/spec/circuit-breaker/spec.md` | 会话粘性已有落点；但 SAG 默认假设「上游稳定」，Anitgravity 通道需要更激进的断路器 |
 | 文档结构：`docs/` 顶层只有 `guide/` 与 `spec/`，无 research 目录 | `docs/index.md:4-6`；`docs/spec/index.md` | 本文新建 `docs/research/`，是该目录的第一个文件 |
@@ -853,7 +853,7 @@ SAG 现有架构事实（来自本仓库代码核对）：
 
 ### 9.5 SAG 本仓库代码位置（本轮核对，非外部来源）
 
-`docs/index.md:4-6`、`docs/spec/index.md`、`docs/spec/dispatch/spec.md:178`、`docs/spec/dispatch/changes/0004-upstream-4xx-non-retryable.md`、`docs/spec/circuit-breaker/spec.md`、`sag-providers/src/traits.rs:14-43`、`sag-providers/src/catalog.rs:14-34`、`sag-providers/src/lib.rs:19-55`、`sag-config/src/config.rs:1297` 起 `ApiConfig`、`sag-config/src/config.rs:982-1025`（`KeyStrategy` / `ProxyMode`）、`sag-config/src/config.rs:1351` 起 `ProviderConfig`、`sag-config/src/loader/load.rs:195`、`sag-config/src/loader/save.rs:1078-1088`、`sag-admin/src/admin_providers.rs:257,277,345,451`、`sag-admin/src/admin.rs:40-48`、`sag-router/src/routes.rs:205` 起、`sag-router/src/session.rs:11`。
+`docs/index.md:4-6`、`docs/spec/index.md`、`docs/spec/dispatch/spec.md:178`、`docs/spec/dispatch/changes/0004-upstream-4xx-non-retryable.md`、`docs/spec/circuit-breaker/spec.md`、`sag-providers/src/traits.rs:14-43`、`sag-providers/src/catalog.rs:14-34`、`sag-providers/src/lib.rs:19-55`、`sag-config/src/config.rs:1297` 起 `ApiConfig`、`sag-config/src/config.rs:982-1025`（`KeyStrategy` / `ProxyMode`）、`sag-config/src/config.rs:1351` 起 `ProviderConfig`、`sag-config/src/loader/load.rs:195`、`sag-config/src/loader/save.rs:1078-1088`、`sag-admin/src/admin_providers.rs:258,279,347,435,465`、`sag-admin/src/admin.rs:40-48`、`sag-router/src/routes.rs:205` 起、`sag-router/src/session.rs:11`。
 
 ---
 
