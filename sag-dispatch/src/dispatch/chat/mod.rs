@@ -140,27 +140,6 @@ fn sse_data_payload(frame: &str) -> Option<&str> {
     (!payload.is_empty()).then_some(payload)
 }
 
-/// Is this Raw SSE frame a **Responses**-protocol event frame (its `type`
-/// starts with `response.`)?
-///
-/// Used on IR-decoded egress lanes with Responses upstream: the Responses decoder
-/// forwards the frames it cannot express as IR verbatim (`response.completed`,
-/// unknown event types, unparseable data). Those frames have no non-Responses
-/// representation, and a client of another protocol must never see protocol A's
-/// event names — only the decoded IR events are kept on that lane.
-fn is_responses_event_frame(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes);
-    let Some(payload) = sse_data_payload(&text) else {
-        return false;
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return false;
-    };
-    val.get("type")
-        .and_then(|t| t.as_str())
-        .is_some_and(|ty| ty.starts_with("response."))
-}
-
 /// Sink for raw-frame tool-call evidence.
 ///
 /// The peek has one parser but two destinations: the inline unit tests feed a
@@ -916,18 +895,22 @@ pub async fn dispatch_chat(ctx: DispatchCtx<'_>) -> Response<Body> {
                                     })
                                     .boxed();
                                 if use_responses && needs_ir_decode {
-                                    // Keep the IR events, drop the Raw frames
-                                    // the Responses decoder forwarded verbatim:
-                                    // they carry Responses event names, which
-                                    // a non-Responses client must never receive.
+                                    // Keep the IR events, drop **every** `Raw`
+                                    // frame the Responses decoder forwarded
+                                    // verbatim. Any such frame is
+                                    // Responses-protocol bytes — an event this
+                                    // lane cannot express, an unknown type, a
+                                    // type-less payload, or unparseable data —
+                                    // and a Chat / Anthropic client must never
+                                    // receive protocol A's bytes. Content
+                                    // sniffing is not enough: a malformed
+                                    // payload has no `type` to inspect.
                                     decoded
                                         .filter(|ev| {
-                                            futures_util::future::ready(match ev {
-                                                sag_core::IrStreamEvent::Raw(bytes) => {
-                                                    !is_responses_event_frame(bytes)
-                                                }
-                                                _ => true,
-                                            })
+                                            futures_util::future::ready(!matches!(
+                                                ev,
+                                                sag_core::IrStreamEvent::Raw(_)
+                                            ))
                                         })
                                         .boxed()
                                 } else {

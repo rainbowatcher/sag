@@ -1140,6 +1140,12 @@ impl ResponsesCodec {
         let text = String::from_utf8_lossy(frame);
         let mut events = Vec::new();
         let mut saw_data = false;
+        // A multi-line `data:` event is one SSE frame, so it may contribute
+        // **at most one** verbatim `Raw` copy of those bytes. Without the flag
+        // each unparseable payload line pushed the whole frame again, and two
+        // malformed lines produced two identical `Raw` events (duplicated
+        // foreign bytes on the egress).
+        let mut raw_emitted = false;
 
         for line in text.lines() {
             let line = line.trim();
@@ -1156,7 +1162,7 @@ impl ResponsesCodec {
             }
 
             let Ok(val) = serde_json::from_str::<Value>(json_str) else {
-                events.push(IrStreamEvent::Raw(frame.to_vec()));
+                push_frame_raw(&mut events, &mut raw_emitted, frame);
                 continue;
             };
 
@@ -1168,12 +1174,12 @@ impl ResponsesCodec {
                     .unwrap_or_else(|| err.as_str().unwrap_or("upstream error"))
                     .to_string();
                 events.push(IrStreamEvent::Error(msg));
-                events.push(IrStreamEvent::Raw(frame.to_vec()));
+                push_frame_raw(&mut events, &mut raw_emitted, frame);
                 continue;
             }
 
             let Some(event_type) = val.get("type").and_then(|t| t.as_str()) else {
-                events.push(IrStreamEvent::Raw(frame.to_vec()));
+                push_frame_raw(&mut events, &mut raw_emitted, frame);
                 continue;
             };
 
@@ -1435,8 +1441,9 @@ impl ResponsesCodec {
                     }
                     // Keep forwarding the original frame: on the same-protocol
                     // lane it is the authoritative terminal, and the
-                    // IR-decoded lanes drop it in `is_responses_event_frame`.
-                    events.push(IrStreamEvent::Raw(frame.to_vec()));
+                    // IR-decoded lanes drop every Responses-decoder `Raw`
+                    // (they carry Responses event names).
+                    push_frame_raw(&mut events, &mut raw_emitted, frame);
                 }
                 "response.failed" => {
                     let msg = val
@@ -1450,7 +1457,7 @@ impl ResponsesCodec {
                         .unwrap_or("upstream response failed")
                         .to_string();
                     events.push(IrStreamEvent::Error(msg));
-                    events.push(IrStreamEvent::Raw(frame.to_vec()));
+                    push_frame_raw(&mut events, &mut raw_emitted, frame);
                 }
                 "response.incomplete" => {
                     // Incomplete is a normal terminal (token limit / filter),
@@ -1472,16 +1479,16 @@ impl ResponsesCodec {
                     if let Some(u) = val.pointer("/response/usage").filter(|u| !u.is_null()) {
                         events.push(IrStreamEvent::Usage(responses_usage(u)));
                     }
-                    events.push(IrStreamEvent::Raw(frame.to_vec()));
+                    push_frame_raw(&mut events, &mut raw_emitted, frame);
                 }
                 _ => {
-                    events.push(IrStreamEvent::Raw(frame.to_vec()));
+                    push_frame_raw(&mut events, &mut raw_emitted, frame);
                 }
             }
         }
 
         if !saw_data && events.is_empty() && !text.trim().is_empty() {
-            events.push(IrStreamEvent::Raw(frame.to_vec()));
+            push_frame_raw(&mut events, &mut raw_emitted, frame);
         }
 
         events
@@ -1572,8 +1579,13 @@ impl ResponsesCodec {
                 // view carries no item history.
                 encode_terminal_event(finish_reason.as_ref(), &[])
             }
-            // Usage / Error / End are handled inline by the dispatch loop.
-            IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) | IrStreamEvent::End => Vec::new(),
+            // Usage / End are handled inline by the dispatch loop.
+            IrStreamEvent::Usage(_) | IrStreamEvent::End => Vec::new(),
+            // Mid-stream upstream error (translated lane) or a gateway-local
+            // interruption (passthrough lane): the Responses wire form is the
+            // `{"type":"error"}` event, after which the stream terminates —
+            // no `response.completed` may follow.
+            IrStreamEvent::Error(msg) => encode_error_event(msg),
         }
     }
 
@@ -1594,6 +1606,19 @@ impl ResponsesCodec {
 // ═══════════════════════════════════════════════════════════════════
 // stream decoder state
 // ═══════════════════════════════════════════════════════════════════
+
+/// Push the verbatim copy of `frame` at most once per decoded frame.
+///
+/// A single SSE event may span several `data:` lines; the decoder parses them
+/// one by one, so without this guard every unclassifiable line pushed the whole
+/// frame again and the client received the same foreign bytes twice.
+fn push_frame_raw(events: &mut Vec<IrStreamEvent>, raw_emitted: &mut bool, frame: &[u8]) {
+    if *raw_emitted {
+        return;
+    }
+    *raw_emitted = true;
+    events.push(IrStreamEvent::Raw(frame.to_vec()));
+}
 
 /// Per-stream decode state: which item indices already delivered their
 /// payload through deltas, and the `output_item.added` payloads still open.
@@ -1666,6 +1691,10 @@ struct StreamEncodeState {
     /// close. A late `ToolCallDelta` for one of these is dropped instead of
     /// resurrecting the call as a second `function_call` item.
     closed_tool_calls: HashSet<u32>,
+    /// Set once an `Error` frame was rendered: the stream terminated at it, so
+    /// no later `output_item.done` / `response.completed` / upstream `Raw` may
+    /// be emitted.
+    errored: bool,
 }
 
 /// One concurrently-open `function_call` output item.
@@ -1689,6 +1718,11 @@ impl StreamEncodeState {
     fn encode(&mut self, ev: &IrStreamEvent) -> Vec<u8> {
         match ev {
             IrStreamEvent::Raw(bytes) => {
+                // Defense in depth: a translated stream terminated at its
+                // error frame, so no later raw frame may reach this egress.
+                if self.errored {
+                    return Vec::new();
+                }
                 let text = String::from_utf8_lossy(bytes);
                 if text.contains("[DONE]") {
                     return Vec::new();
@@ -1717,6 +1751,7 @@ impl StreamEncodeState {
                 self.open_item = None;
                 self.next_index = 0;
                 self.completed = false;
+                self.errored = false;
                 self.open_tool_calls.clear();
                 self.closed_tool_calls.clear();
                 self.open_text.clear();
@@ -1877,6 +1912,11 @@ impl StreamEncodeState {
                 out
             }
             IrStreamEvent::Finish { finish_reason, .. } => {
+                // The error frame already terminated the stream: no
+                // `output_item.done` and no `response.completed` may follow it.
+                if self.errored {
+                    return Vec::new();
+                }
                 let mut out = self.close_open_tool_calls();
                 out.extend_from_slice(&self.close_open_item());
                 if !self.completed {
@@ -1890,6 +1930,12 @@ impl StreamEncodeState {
                 out
             }
             IrStreamEvent::End => {
+                // The error frame already terminated the stream: the open item
+                // is deliberately left unclosed (exactly like a native
+                // Responses error stream, whose last frame is the error).
+                if self.errored {
+                    return Vec::new();
+                }
                 // A stream closing with an item still open must flush it so
                 // the terminal payload is complete.
                 if self.open_item.is_none() && self.open_tool_calls.is_empty() {
@@ -1904,7 +1950,15 @@ impl StreamEncodeState {
                 self.completed_items.clear();
                 out
             }
-            IrStreamEvent::Usage(_) | IrStreamEvent::Error(_) => Vec::new(),
+            IrStreamEvent::Usage(_) => Vec::new(),
+            // A mid-stream upstream error (translated lane) or a
+            // gateway-local interruption (passthrough lane): one
+            // `{"type":"error"}` event, after which nothing else may be
+            // emitted. The open item is deliberately left unclosed.
+            IrStreamEvent::Error(msg) => {
+                self.errored = true;
+                encode_error_event(msg)
+            }
         }
     }
 
@@ -2043,6 +2097,27 @@ fn terminal_event_fields(
         Some(IrFinishReason::Other(s)) if s == "failed" => ("response.completed", "failed", None),
         _ => ("response.completed", "completed", None),
     }
+}
+
+/// Encode a mid-stream error as the Responses SSE error event.
+///
+/// This is the **only** client-visible frame an errored Responses egress
+/// produces: the dispatch loop drops every later event and the encoder
+/// suppresses its own terminal, so no `response.completed` follows it.
+///
+/// Shape: the protocol event (`type` / `code` / `message` / `param`) plus the
+/// gateway's generic `{"error":{"code","message"}}` envelope inside the same
+/// payload, so a client reading either convention finds the upstream message
+/// and the stable `STREAM_ERROR` marker.
+fn encode_error_event(message: &str) -> Vec<u8> {
+    let payload = json!({
+        "type": "error",
+        "code": "STREAM_ERROR",
+        "message": message,
+        "param": Value::Null,
+        "error": {"code": "STREAM_ERROR", "message": message},
+    });
+    format!("data: {payload}\n\n").into_bytes()
 }
 
 /// Encode the synthesized terminal SSE frame for a finish reason.
@@ -3431,8 +3506,82 @@ mod tests {
         );
     }
 
-    // ── P0-2 encoder completeness / P0-3a stateful decoder ─────────
+    // ── error frame (Responses egress) ───────────────────────────
 
+    /// Every `data:` payload of an encoded SSE buffer, parsed as JSON.
+    fn data_payloads(bytes: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .collect()
+    }
+
+    /// A mid-stream `Error` must render exactly one Responses error event: the
+    /// stateless view and the stateful encoder agree, the payload carries the
+    /// upstream message plus a stable `code`, and nothing — no
+    /// `response.completed`, no open item's `output_item.done` — may follow it.
+    #[test]
+    fn stream_encoder_error_renders_one_error_event_and_suppresses_terminal() {
+        let ev = IrStreamEvent::Error("upstream exploded".into());
+        let stateless = ResponsesCodec::encode_stream_event(&ev);
+        let enc = ResponsesCodec::stream_encoder();
+        // An open item must not be closed by the error frame.
+        let mut out = enc(&IrStreamEvent::Start(IrResponseMeta::default()));
+        out.extend(enc(&IrStreamEvent::TextDelta {
+            index: 0,
+            text: "partial".into(),
+        }));
+        let error = enc(&ev);
+        assert_eq!(
+            error, stateless,
+            "both entry points must render the same error frame"
+        );
+        out.extend(error);
+        // Everything after the error frame must be suppressed.
+        out.extend(enc(&IrStreamEvent::Finish {
+            index: 0,
+            finish_reason: Some(IrFinishReason::Stop),
+        }));
+        out.extend(enc(&IrStreamEvent::Raw(
+            b"data: {\"type\":\"response.completed\"}\n\n".to_vec(),
+        )));
+        out.extend(enc(&IrStreamEvent::End));
+
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.matches("\"type\":\"error\"").count(),
+            1,
+            "exactly one error frame: {text}"
+        );
+        assert!(
+            !text.contains("response.completed") && !text.contains("response.output_item.done"),
+            "nothing may follow the error frame: {text}"
+        );
+        let payload = data_payloads(text.as_bytes())
+            .into_iter()
+            .find(|v| v.get("type").and_then(Value::as_str) == Some("error"))
+            .expect("an error payload");
+        assert_eq!(payload["message"], "upstream exploded");
+        assert_eq!(payload["code"], "STREAM_ERROR");
+        assert_eq!(payload["error"]["code"], "STREAM_ERROR");
+        assert_eq!(payload["error"]["message"], "upstream exploded");
+    }
+
+    /// A multi-line malformed SSE event is **one** frame: the verbatim copy may
+    /// not be duplicated per unparseable `data:` line.
+    #[test]
+    fn stream_multi_line_malformed_frame_yields_single_raw() {
+        let frame = b"data: not-json\ndata: also-not-json\n\n".to_vec();
+        let events = ResponsesCodec::decode_stream_frame(&frame);
+        assert_eq!(
+            events,
+            vec![IrStreamEvent::Raw(frame.clone())],
+            "one verbatim copy per frame"
+        );
+    }
+
+    // ── P0-2 encoder completeness / P0-3a stateful decoder ─────────
     /// Split encoded SSE bytes into the decoded `data:` payloads.
     fn sse_frames(bytes: &[u8]) -> Vec<Value> {
         String::from_utf8_lossy(bytes)

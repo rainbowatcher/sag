@@ -542,12 +542,23 @@ struct StreamState<S, E> {
     ///
     /// `false` = passthrough lane (Chat→Chat, Anthropic→Anthropic native,
     /// Responses→Responses native): the client would see exactly the
-    /// upstream's bytes were it talking to the upstream directly, so `Error`
-    /// is recorded for analytics only and the upstream's own error frame is
-    /// forwarded verbatim as `Raw` — synthesizing one here would duplicate
-    /// it, and suppressing the upstream's own `[DONE]` would rewrite a
-    /// byte stream that is already correct.
+    /// upstream's bytes were it talking to the upstream directly, so an
+    /// inbound upstream error frame is forwarded verbatim as `Raw` and nothing
+    /// is synthesized on top of it. An `Error` with **no** paired `Raw` is a
+    /// gateway-local interruption (upstream read failure / chunk idle
+    /// timeout), which has no upstream bytes at all: exactly one
+    /// ingress-protocol error frame is synthesized for it at the terminal, and
+    /// no success terminator follows.
     emit_synthesized_error: bool,
+    /// A passthrough-lane `Error` whose upstream error frame has not been seen
+    /// yet (see [`StreamState::emit_synthesized_error`]).
+    ///
+    /// The provider adapters enqueue the side-channel `Error` chunk *before*
+    /// the frame bytes it describes, so the next client-visible `Raw` on this
+    /// lane is that frame: it clears this slot (the client already receives
+    /// the upstream's own error bytes). Still set when the stream terminates ⇒
+    /// the error was gateway-local and the terminal synthesizes one frame.
+    pending_local_error: Option<String>,
     // Declared before the guard so it drops first; the guard's own
     // `Arc` clone keeps the shared data alive regardless. The guard
     // field is never read — it exists solely for its `Drop` (client
@@ -652,6 +663,7 @@ fn make_stream_state<S, E>(
         terminal_pending: false,
         tool_args,
         emit_synthesized_error,
+        pending_local_error: None,
         analytics: analytics.clone(),
         _guard: TerminalGuard { analytics },
         _in_flight: in_flight,
@@ -930,11 +942,17 @@ async fn finish_stream_terminal<S, E>(state: &mut StreamState<S, E>) {
 /// Raw Data frame).
 ///
 /// A mid-stream [`IrStreamEvent::Error`] is recorded for analytics in both
-/// cases, but only a **translated** lane (`emit_synthesized_error`) encodes
-/// it: there the ingress encoder renders one protocol-correct error frame and
-/// the stream goes silent afterwards. On a passthrough lane the upstream's
-/// own error bytes are already in the client's protocol and arrive as `Raw`,
-/// so nothing is synthesized and nothing is suppressed.
+/// cases, and both lanes end up emitting **exactly one** protocol-correct error
+/// frame as the client's last visible bytes:
+///
+/// - translated lane (`emit_synthesized_error`): the ingress encoder renders it
+///   immediately and the stream goes silent afterwards (nothing follows it);
+/// - passthrough lane: an *upstream* error is the side-channel `Error` plus the
+///   upstream's own error frame as `Raw`, which is forwarded verbatim and
+///   suppresses the synthesis; an `Error` **without** that paired `Raw` is a
+///   gateway-local interruption (upstream read failure / chunk idle timeout),
+///   which has no upstream bytes at all — the terminal synthesizes one frame
+///   and closes the body without a success terminator.
 ///
 /// `upstream_start` is captured immediately before the provider call. It
 /// drives two timing fields on the final `CallLog`:
@@ -1102,6 +1120,22 @@ where
                     // short-circuit) funnels through here, so the privacy
                     // tail is always flushed before the terminal.
                     //
+                    // A passthrough-lane error whose upstream frame never
+                    // arrived is a gateway-local interruption (upstream read
+                    // failure / chunk idle timeout): the client would
+                    // otherwise get a silent, unterminated 200 body. Render
+                    // exactly one ingress-protocol error frame here, ahead of
+                    // the privacy tail, and close the body right after it — no
+                    // success terminator may follow.
+                    let mut out = match state.pending_local_error.take() {
+                        Some(msg) => (state.encode)(&IrStreamEvent::Error(msg)),
+                        None => Vec::new(),
+                    };
+                    if !out.is_empty()
+                        && let Some(writer) = state.privacy_restore.as_mut()
+                    {
+                        out = writer.push(&out);
+                    }
                     // Flush the privacy restorer: bytes still buffered never
                     // formed a complete frame, so they are forwarded as-is
                     // (a placeholder split across frames is not restored —
@@ -1110,14 +1144,14 @@ where
                     // client's last visible byte, so `finish_stream_terminal`
                     // is deferred to the next poll via `terminal_pending`.
                     if let Some(writer) = state.privacy_restore.as_mut() {
-                        let tail = writer.finish();
-                        if !tail.is_empty() {
-                            state.terminal_pending = true;
-                            return Some((
-                                Ok::<_, std::io::Error>(axum::body::Bytes::from(tail)),
-                                state,
-                            ));
-                        }
+                        out.extend_from_slice(&writer.finish());
+                    }
+                    if !out.is_empty() {
+                        state.terminal_pending = true;
+                        return Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(out)),
+                            state,
+                        ));
                     }
                     finish_stream_terminal(&mut state).await;
                     return None;
@@ -1135,15 +1169,24 @@ where
                     //   (`[DONE]` / `finish_reason` / `message_stop`) follows
                     //   the terminal error; a duplicate `Error` stays
                     //   analytics-only;
-                    // - passthrough lane: emit nothing — the upstream's own
-                    //   error bytes arrive as a separate `Raw` event and are
-                    //   forwarded verbatim. Behaving like the client talking
-                    //   to the upstream directly is the contract there, so a
-                    //   synthesized frame must never be added.
+                    // - passthrough lane: hold the error instead of emitting
+                    //   anything now. An upstream error arrives as this
+                    //   side-channel `Error` *followed by* the upstream's own
+                    //   error frame (`Raw`), which is forwarded verbatim and
+                    //   clears the hold — synthesizing on top of it would
+                    //   duplicate it. A `Raw` that never comes means the
+                    //   failure was gateway-local (read failure / idle
+                    //   timeout): the terminal synthesizes exactly one frame.
                     if let IrStreamEvent::Error(msg) = &ev {
                         let duplicate = state.error.is_some();
                         record_stream_error(&mut state, msg.clone());
-                        if duplicate || !state.emit_synthesized_error {
+                        if !state.emit_synthesized_error {
+                            if !duplicate {
+                                state.pending_local_error = Some(msg.clone());
+                            }
+                            continue;
+                        }
+                        if duplicate {
                             continue;
                         }
                     } else if state.emit_synthesized_error && state.error.is_some() {
@@ -1160,6 +1203,10 @@ where
                     if bytes.is_empty() {
                         continue;
                     }
+                    // The upstream's own error frame just went out on a
+                    // passthrough lane: the held error needs no synthesized
+                    // frame (see the `Error` arm above).
+                    state.pending_local_error = None;
                     // Privacy: rewrite placeholders back to plaintext before
                     // the client sees the frame. The writer returns only
                     // complete frames, so an empty result means "nothing to
@@ -1709,7 +1756,9 @@ mod tests {
     }
 
     /// An upstream stream that ends right after an `Error` (no explicit
-    /// `End`) still flushes the privacy tail before the terminal.
+    /// `End`) still flushes the privacy tail before the terminal, and — the
+    /// `Error` having no paired upstream frame — synthesizes exactly one
+    /// error frame after it.
     #[tokio::test]
     async fn privacy_tail_flushes_when_upstream_errors_out() {
         let state = build_state().await;
@@ -1722,11 +1771,27 @@ mod tests {
             privacy_stream_response(&state, stream, RestoreWriter::new(email_placeholder_map()));
 
         let tail = resp.body_mut().frame().await.unwrap().unwrap();
-        // Passthrough lane here: the `Error` carries no bytes of its own, so
-        // the only visible frame is the flushed tail, byte-for-byte.
+        // The buffered partial frame goes out byte-for-byte (it never formed a
+        // complete frame, so nothing in it is restored), immediately followed
+        // by the one synthesized error frame of this gateway-local failure.
+        let bytes = tail.into_data().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.starts_with("data: {\"content\":\"tail"),
+            "the flushed tail must come first, got: {text}"
+        );
         assert_eq!(
-            tail.into_data().unwrap().as_ref(),
-            b"data: {\"content\":\"tail"
+            text.matches("\"error\":").count(),
+            1,
+            "exactly one error frame for a gateway-local interruption: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with('}'),
+            "the error frame must be the last visible bytes: {text}"
+        );
+        assert!(
+            !text.contains("[DONE]"),
+            "no success terminator may follow the error frame: {text}"
         );
         assert_eq!(
             call_log_count(&state).await,

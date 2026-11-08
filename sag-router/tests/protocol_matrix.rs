@@ -99,6 +99,17 @@ enum Upstream {
 }
 
 async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState {
+    build_state_with_chunk_timeout(base_url, key, upstream, None).await
+}
+
+/// Same as [`build_state`], with an explicit inter-chunk idle timeout
+/// (`provider.chunk_timeout_secs`).
+async fn build_state_with_chunk_timeout(
+    base_url: &str,
+    key: &str,
+    upstream: Upstream,
+    chunk_timeout_secs: Option<u64>,
+) -> AppState {
     // One declared `apis` key per upstream shape: it decides both the lane
     // (set membership) and the upstream path (fixed derivation).
     let (name, api_key) = match upstream {
@@ -113,6 +124,7 @@ async fn build_state(base_url: &str, key: &str, upstream: Upstream) -> AppState 
         key_strategy: KeyStrategy::FillFirst,
         proxy_mode: ProxyMode::default(),
         timeout_secs: 10,
+        chunk_timeout_secs,
         anthropic_cache_control: false,
         ..ProviderConfig::default()
     };
@@ -1333,4 +1345,583 @@ async fn cross_lane_fallback_native_responses_fail_then_chat_translated_ok() {
     let json = body_json(resp).await;
     assert_eq!(json["object"], "response");
     assert_eq!(json["output"][0]["content"][0]["text"], "fallback ok");
+}
+
+// ── gateway-local stream interruptions (no upstream bytes at all) ─────
+//
+// A passthrough lane (Chat→Chat, Anthropic→Anthropic native,
+// Responses→Responses native) has no upstream error frame to forward when the
+// failure is *local*: an upstream read error or a chunk idle timeout emits only
+// the side-channel `StreamChunk::Error`. The client must still get exactly one
+// protocol-correct error frame and an explicit body close — never a silent,
+// unterminated 200 body, and never a success terminator.
+
+/// All `data:` payloads of a client-visible SSE body, parsed as JSON.
+fn sse_payloads(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .collect()
+}
+
+/// Serve one complete SSE frame, then abort the body: the response is chunked
+/// without its terminating `0\r\n\r\n` chunk, which the provider's byte reader
+/// surfaces as a read error mid-stream.
+async fn respond_sse_then_truncate(stream: &mut tokio::net::TcpStream, body: &str) {
+    let header =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+    stream.write_all(header.as_bytes()).await.unwrap();
+    let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+    stream.write_all(chunk.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let _ = stream.shutdown().await;
+}
+
+/// Serve one complete SSE frame and then hold the connection open without
+/// sending anything else, so the provider's inter-chunk idle timeout fires.
+async fn respond_sse_then_hold(stream: &mut tokio::net::TcpStream, body: &str) {
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    stream.write_all(header.as_bytes()).await.unwrap();
+    stream.write_all(body.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+}
+
+const CHAT_PARTIAL: &str = r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#;
+const ANTHROPIC_PARTIAL: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}";
+const RESPONSES_PARTIAL: &str = r#"data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"partial"}"#;
+
+fn chat_stream_body() -> &'static str {
+    r#"{"model":"route-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+}
+
+fn messages_stream_body() -> &'static str {
+    r#"{"model":"route-model","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#
+}
+
+fn responses_stream_body() -> &'static str {
+    r#"{"model":"route-model","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#
+}
+
+fn responses_request(body: &str, key: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Chat ingress × Chat upstream (passthrough): a read error mid-stream yields
+/// exactly one Chat error frame, as the last frame, and no `[DONE]`.
+#[tokio::test]
+async fn chat_passthrough_read_error_synthesizes_one_error_frame() {
+    let sse = format!("{CHAT_PARTIAL}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse_then_truncate(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Chat).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(chat_request(chat_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        text.contains("partial"),
+        "the frames before the interruption still arrive: {text}"
+    );
+    let errors: Vec<_> = sse_payloads(&text)
+        .into_iter()
+        .filter(|v| v.get("error").is_some())
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one error frame for a gateway-local interruption: {text}"
+    );
+    assert_eq!(errors[0]["error"]["code"], "STREAM_ERROR");
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "the error frame carries the failure message: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "no success terminator may follow the error frame: {text}"
+    );
+    assert!(
+        text.trim_end().ends_with('}'),
+        "the error frame must be the last visible bytes: {text}"
+    );
+}
+
+/// Chat ingress × Chat upstream (passthrough): a chunk idle timeout is the same
+/// gateway-local interruption and must render the same single error frame.
+#[tokio::test]
+async fn chat_passthrough_idle_timeout_synthesizes_one_error_frame() {
+    let sse = format!("{CHAT_PARTIAL}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse_then_hold(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state_with_chunk_timeout(&base_url, "mx-key", Upstream::Chat, Some(1)).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(chat_request(chat_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let errors: Vec<_> = sse_payloads(&text)
+        .into_iter()
+        .filter(|v| v.get("error").is_some())
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one error frame for an idle timeout: {text}"
+    );
+    assert_eq!(errors[0]["error"]["code"], "STREAM_ERROR");
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("idle timeout")),
+        "the idle-timeout message reaches the client: {text}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "no success terminator may follow the error frame: {text}"
+    );
+}
+
+/// Anthropic ingress × Anthropic upstream (native passthrough): a read error
+/// yields exactly one official Anthropic error event and no `message_stop`.
+#[tokio::test]
+async fn anthropic_passthrough_read_error_synthesizes_one_error_event() {
+    let sse = format!("{ANTHROPIC_PARTIAL}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse_then_truncate(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Anthropic).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(messages_request(messages_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        text.contains("partial"),
+        "the frames before the interruption still arrive: {text}"
+    );
+    assert!(
+        text.contains("event: error"),
+        "the error frame needs its event: line: {text}"
+    );
+    let errors: Vec<_> = sse_payloads(&text)
+        .into_iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .collect();
+    assert_eq!(errors.len(), 1, "exactly one Anthropic error event: {text}");
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "the error event carries the failure message: {text}"
+    );
+    assert!(
+        !text.contains("message_stop") && !text.contains("stop_reason"),
+        "no success terminator may follow the error event: {text}"
+    );
+}
+
+/// Anthropic ingress × Anthropic upstream (native passthrough): an idle
+/// timeout renders the same single error event.
+#[tokio::test]
+async fn anthropic_passthrough_idle_timeout_synthesizes_one_error_event() {
+    let sse = format!("{ANTHROPIC_PARTIAL}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse_then_hold(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state =
+        build_state_with_chunk_timeout(&base_url, "mx-key", Upstream::Anthropic, Some(1)).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(messages_request(messages_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let errors: Vec<_> = sse_payloads(&text)
+        .into_iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one Anthropic error event for an idle timeout: {text}"
+    );
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("idle timeout")),
+        "the idle-timeout message reaches the client: {text}"
+    );
+    assert!(
+        !text.contains("message_stop") && !text.contains("stop_reason"),
+        "no success terminator may follow the error event: {text}"
+    );
+}
+
+/// Responses ingress × Responses upstream (native passthrough): a read error
+/// yields exactly one Responses error event and no `response.completed`.
+#[tokio::test]
+async fn responses_passthrough_read_error_synthesizes_one_error_event() {
+    let sse = format!("{RESPONSES_PARTIAL}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse_then_truncate(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(responses_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        text.contains("partial"),
+        "the frames before the interruption still arrive: {text}"
+    );
+    let errors: Vec<_> = sse_payloads(&text)
+        .into_iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .collect();
+    assert_eq!(errors.len(), 1, "exactly one Responses error event: {text}");
+    assert_eq!(errors[0]["code"], "STREAM_ERROR");
+    assert_eq!(errors[0]["error"]["code"], "STREAM_ERROR");
+    assert!(
+        errors[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "the error event carries the failure message: {text}"
+    );
+    assert!(
+        !text.contains("response.completed"),
+        "no success terminator may follow the error event: {text}"
+    );
+}
+
+/// Responses ingress × Responses upstream (native passthrough): an idle
+/// timeout renders the same single error event.
+#[tokio::test]
+async fn responses_passthrough_idle_timeout_synthesizes_one_error_event() {
+    let sse = format!("{RESPONSES_PARTIAL}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse_then_hold(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state =
+        build_state_with_chunk_timeout(&base_url, "mx-key", Upstream::ResponsesExplicit, Some(1))
+            .await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(responses_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let errors: Vec<_> = sse_payloads(&text)
+        .into_iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one Responses error event for an idle timeout: {text}"
+    );
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("idle timeout")),
+        "the idle-timeout message reaches the client: {text}"
+    );
+    assert!(
+        !text.contains("response.completed"),
+        "no success terminator may follow the error event: {text}"
+    );
+}
+
+// ── Responses egress error frame (translated lane) ────────────────────
+
+/// Responses ingress × Chat upstream (translated): the upstream's OpenAI error
+/// frame must not leak. Exactly one **Responses-shaped** error event reaches
+/// the client, carrying the upstream message plus the stable `STREAM_ERROR`
+/// code, and nothing (`response.completed` in particular) follows it.
+#[tokio::test]
+async fn responses_ingress_chat_upstream_error_yields_single_responses_error_event() {
+    let delta = r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#;
+    let error_frame =
+        r#"data: {"error":{"message":"upstream exploded","code":"rate_limit_exceeded"}}"#;
+    let sse = format!("{delta}\n\n{error_frame}\n\ndata: [DONE]\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Chat).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(responses_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    let payloads = sse_payloads(&text);
+    let error_at = payloads
+        .iter()
+        .position(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+        .unwrap_or_else(|| panic!("missing a Responses error event: {text}"));
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
+            .count(),
+        1,
+        "exactly one error event: {text}"
+    );
+    let error = &payloads[error_at];
+    assert_eq!(error["message"], "upstream exploded");
+    assert_eq!(error["code"], "STREAM_ERROR");
+    assert_eq!(error["error"]["code"], "STREAM_ERROR");
+    assert_eq!(error["error"]["message"], "upstream exploded");
+
+    // The error event terminates the stream: nothing follows it.
+    assert_eq!(
+        error_at,
+        payloads.len() - 1,
+        "the error event must be the last frame: {text}"
+    );
+    assert!(
+        !text.contains("response.completed"),
+        "no response.completed may follow the error event: {text}"
+    );
+    // The upstream's own OpenAI envelope never reaches a Responses client.
+    assert!(
+        !text.contains("rate_limit_exceeded"),
+        "raw upstream error bytes must not leak: {text}"
+    );
+    assert!(
+        text.contains("partial"),
+        "the partial content before the failure still arrived: {text}"
+    );
+}
+
+/// Responses ingress × Responses upstream (native passthrough): an in-band
+/// `response.failed` is the upstream's own terminal and is forwarded verbatim —
+/// no synthesized error event is added on top of it.
+#[tokio::test]
+async fn responses_ingress_responses_upstream_failed_is_forwarded_verbatim() {
+    let created = r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#;
+    let delta = r#"data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"partial"}"#;
+    let failed = r#"data: {"type":"response.failed","response":{"id":"r1","object":"response","status":"failed","error":{"code":"server_error","message":"upstream exploded"}}}"#;
+    // Content first: a failure *before* any content is promoted to a pre-commit
+    // 502 by the empty-response peek (`empty.rs`), not a committed 200 SSE
+    // stream. This test is about the mid-stream case.
+    let sse = format!("{created}\n\n{delta}\n\n{failed}\n\n");
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(responses_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        text.contains("partial"),
+        "the frames before the failure still arrive: {text}"
+    );
+
+    assert!(
+        text.contains(&format!("{failed}\n\n")),
+        "the upstream terminal frame must be forwarded verbatim: {text}"
+    );
+    assert_eq!(
+        text.matches("response.failed").count(),
+        1,
+        "exactly one upstream failure frame: {text}"
+    );
+    // No synthesized error event on this lane: the gateway marker would be a
+    // duplicate of the upstream's own error bytes.
+    assert!(
+        !text.contains("\"type\":\"error\"") && !text.contains("STREAM_ERROR"),
+        "no synthesized error event may be added on a passthrough lane: {text}"
+    );
+    assert!(
+        !text.contains("response.completed"),
+        "no terminal may follow the upstream failure frame: {text}"
+    );
+}
+
+// ── malformed / non-Responses frames must not leak on translated lanes ──
+
+/// A Responses upstream frame the decoder cannot classify (`data: not-json`,
+/// a type-less payload, an unknown `type`) becomes a verbatim `Raw`. On a
+/// translated lane those bytes are Responses-protocol input, so they must be
+/// dropped — a content sniff on `type` cannot see any of them.
+fn malformed_responses_upstream_fixture() -> String {
+    concat!(
+        r#"data: {"type":"response.created","response":{"id":"r1","object":"response","status":"in_progress","output":[]}}"#,
+        "\n\n",
+        "data: not-json\n\n",
+        r#"data: {"unmodelled_key":1}"#,
+        "\n\n",
+        r#"data: {"type":"totally_unknown_event","payload":"x"}"#,
+        "\n\n",
+        r#"data: {"type":"response.output_text.delta","item_id":"m1","output_index":0,"content_index":0,"delta":"hi"}"#,
+        "\n\n",
+        r#"data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}"#,
+        "\n\n",
+    )
+    .to_string()
+}
+
+fn assert_no_malformed_leak(text: &str) {
+    for leak in ["not-json", "unmodelled_key", "totally_unknown_event"] {
+        assert!(
+            !text.contains(leak),
+            "a Responses-decoder Raw frame leaked onto a translated egress ({leak}): {text}"
+        );
+    }
+}
+
+/// Chat ingress × Responses upstream: malformed / unknown Responses frames must
+/// not reach the Chat client; the decoded IR still produces Chat chunks and one
+/// `data: [DONE]`.
+#[tokio::test]
+async fn chat_ingress_responses_upstream_malformed_frames_do_not_leak() {
+    let sse = malformed_responses_upstream_fixture();
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(chat_request(chat_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert_no_malformed_leak(&text);
+    assert!(
+        text.contains(r#""delta":{"content":"hi"}"#),
+        "the decoded delta must still be re-encoded as a Chat chunk: {text}"
+    );
+    assert_eq!(
+        text.matches("data: [DONE]").count(),
+        1,
+        "exactly one Chat terminator: {text}"
+    );
+}
+
+/// Anthropic ingress × Responses upstream: same fixture, Anthropic egress. No
+/// raw Responses bytes may appear and the block lifecycle still terminates with
+/// one `message_stop`.
+#[tokio::test]
+async fn anthropic_ingress_responses_upstream_malformed_frames_do_not_leak() {
+    let sse = malformed_responses_upstream_fixture();
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = sse.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(messages_request(messages_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert_no_malformed_leak(&text);
+    assert!(
+        text.contains(r#""type":"content_block_delta""#),
+        "the decoded delta must still be re-encoded as an Anthropic block delta: {text}"
+    );
+    assert_eq!(
+        text.matches("message_stop").count(),
+        1,
+        "exactly one message_stop: {text}"
+    );
 }

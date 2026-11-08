@@ -88,7 +88,7 @@ let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 tokio::time::timeout(Duration::from_secs(n), stream.next()).await
 ```
 
-每次等待下一个 chunk 时加上 timeout。超时后 provider 发出 `StreamChunk::Error`（不会被转成 `Done`）并停止读取；分发侧把它映射为 `IrStreamEvent::Error`，**先**记 analytics（CallLog 记 `502` / `error_category = stream_error`），**再**按车道决定外发：翻译车道交给出口编码器合成一帧协议正确的错误帧——Chat 出口是裸 `data: {"error":{…}}`，Anthropic 出口是 `event: error` + `{"type":"error",…}`，两者后面都不再跟终止符；直通车道（如 Chat→Chat）不合成任何帧（详见「上游流内错误的客户端可见错误帧」一节）。旧路径的 `StreamChunk::to_sse_bytes` 固定信封（`{"error":{"code":"STREAM_ERROR","message":…}}`，见 `sag-core/src/types.rs`）不再用于流式出口；专用 `STREAM_CHUNK_TIMEOUT` 错误码 / 504 状态尚未实现，属后续独立任务。
+每次等待下一个 chunk 时加上 timeout。超时后 provider 发出 `StreamChunk::Error`（不会被转成 `Done`）并停止读取；分发侧把它映射为 `IrStreamEvent::Error`，**先**记 analytics（CallLog 记 `502` / `error_category = stream_error`），**再**按车道决定外发：翻译车道交给出口编码器合成一帧协议正确的错误帧——Chat 出口是裸 `data: {"error":{…}}`，Anthropic 出口是 `event: error` + `{"type":"error",…}`，Responses 出口是 `data: {"type":"error",…}`，三者后面都不再跟终止符；直通车道（如 Chat→Chat）的**入站上游错误帧**不合成任何帧（上游自己的字节原样转发），但**网关本地产生**的中断（chunk 空闲超时、读错误）没有上游字节可转发，同样在终点合成恰好一帧 ingress 协议错误帧后关闭 body（详见「上游流内错误的客户端可见错误帧」一节）。旧路径的 `StreamChunk::to_sse_bytes` 固定信封（`{"error":{"code":"STREAM_ERROR","message":…}}`，见 `sag-core/src/types.rs`）不再用于流式出口；专用 `STREAM_CHUNK_TIMEOUT` 错误码 / 504 状态尚未实现，属后续独立任务。
 
 **Trade-off**: timeout 作用于单个 chunk 的等待，不是整个请求的总时长。这意味着即使单个 chunk 都很快，长时间的静默期（silence）也会触发。这正是想要的行为——LLM 推理中长时间无输出通常意味着卡住了。
 
@@ -185,33 +185,33 @@ boxed `FnMut`（而非常规 `fn` 指针）是必需的：Responses 解码器已
 - 不可解析的帧（`data: [DONE]`、`: keep-alive`、截断数据）静默跳过——这是 warn-only 信号，绝不得把一帧透传数据变成错误。
 - 解析器只有一份，落点有两个：`ToolArgSink` 让单元测试喂裸 `ToolArgWatch`、让分发 fold 喂 `ToolArgWatchHandle`（内层 watch 对 `dispatch::stream` 私有），后者把窥探结果重放成事件再 `observe`。
 
-**`Raw` 帧过滤**：Responses 解码器把「无法表达为 IR」的帧作为 `Raw` 交出来是为保住同协议透传，但这些帧逐字转发到别的协议出口就是泄漏。`is_responses_event_frame(bytes)` 用同一个 `sse_data_payload` 剥出 payload，判定其 `type` 是否以 `response.` 开头；命中的 `Raw` 在到达编码器之前从流里滤除。
+**`Raw` 帧过滤**：Responses 解码器把「无法表达为 IR」的帧作为 `Raw` 交出来是为保住同协议透传，但这些帧逐字转发到别的协议出口就是泄漏。解码分支直接滤除**每一个** `Raw`（`matches!(ev, IrStreamEvent::Raw(_))` 取反），不看载荷内容。
 
-**契约**：过滤只在 `needs_ir_decode == true` 时生效，且只针对 Responses 上游——凡是「Responses 上游 + 已解码」的组合（Chat ingress、Anthropic ingress 皆属此族），Responses 形状的 `Raw` 一律不得流向非 Responses 出口；`needs_ir_decode == false` 的同协议车道永不过滤、永不改写，那里的 `Raw` 就是上游原字节，是字节恒等不变式的一部分（该过滤落在解码分支内部，同协议车道根本进不到，因此不存在误过滤的可能）。只认 `response.` 前缀，故 `data: [DONE]`、`: keep-alive`、非 JSON 帧与 Chat 帧不受影响。
+**契约**：过滤只在 `needs_ir_decode == true` 时生效，且只针对 Responses 上游——凡是「Responses 上游 + 已解码」的组合（Chat ingress、Anthropic ingress 皆属此族），**Responses 解码器产出的每一个 `Raw`** 一律不得流向非 Responses 出口。不看载荷内容：畸形 JSON、缺 `type`、未知 `type` 的帧同样带 Responses 上游的字节，内容嗅探（旧实现的 `type` 以 `response.` 前缀判定）对它们全部失效，正是原样泄漏的通道。`needs_ir_decode == false` 的同协议车道永不过滤、永不改写，那里的 `Raw` 就是上游原字节，是字节恒等不变式的一部分（该过滤落在解码分支内部，同协议车道根本进不到，因此不存在误过滤的可能）。
 
 ### 上游流内错误的客户端可见错误帧
 
 HTTP 200 一旦提交，后续任何失败都改不了状态码。旧实现在 `dispatch/stream.rs` 的流循环里把 `IrStreamEvent::Error` 单独分支走掉：只 `record_stream_error` 记 analytics，**不进编码器**。于是“上游发了内容又失败”与“上游正常地短”在客户端侧完全同形——客户端看到一段内容后流就停了，照正常完成处理。
 
-现在 `Error` **记录之后按车道分叉**：翻译车道（`needs_ir_decode == true`）**继续向下走同一条编码路径**（与 `Raw` / 结构化事件相同），由出口编码器按 ingress 协议合成一帧协议正确的错误帧；直通车道（`needs_ir_decode == false`）只记 analytics 就丢掉这个事件，一个合成帧也不发。顺序是硬约束：`record_stream_error` 在编码与 yield 之前调用，所以 attempt 状态与 `failure_reason` 口径不变，且字节外发前错误状态已就位（与 `TerminalGuard` 的分类依赖同一标志）。
+现在 `Error` **记录之后按车道分叉**：翻译车道（`needs_ir_decode == true`）**继续向下走同一条编码路径**（与 `Raw` / 结构化事件相同），由出口编码器按 ingress 协议合成一帧协议正确的错误帧；直通车道（`needs_ir_decode == false`）先**扣住**这个事件——provider 的 side-channel `Error` chunk 总是排在它所描述的上游错误帧**之前**，紧随其后的那个 `Raw` 就是上游自己的错误字节，原样转发并清掉扣留；若流结束时扣留仍在，说明这是**网关本地**产生的中断（读错误 / chunk 空闲超时，没有上游字节），终点合成恰好一帧 ingress 协议错误帧后关闭 body。顺序是硬约束：`record_stream_error` 在编码与 yield 之前调用，所以 attempt 状态与 `failure_reason` 口径不变，且字节外发前错误状态已就位（与 `TerminalGuard` 的分类依赖同一标志）。
 
-下表是**翻译车道**的契约；直通车道不查这张表（见表后的直通车道一节）：
+下表是**翻译车道**的契约；直通车道的入站错误帧不查这张表（见表后的直通车道一节），但网关本地中断的合成帧与表内同形（出口编码器相同）：
 
-| ingress（翻译车道） | 帧形态 | 之后的终止符 | 实现 |
+| ingress | 帧形态 | 之后的终止符 | 实现 |
 |---|---|---|---|
 | Chat | 裸 `data: {"error":{"message":…,"type":"server_error","code":"STREAM_ERROR","param":null}}` | 不发 `data: [DONE]` | `sag-providers/src/codec/chat.rs` 的 `Error` 分支 |
 | Anthropic | `event: error` + `data: {"type":"error","error":{"type":"api_error","message":…}}` | 不发 `message_delta` / `message_stop`（无 `stop_reason`） | `sag-providers/src/codec/anthropic.rs`；`StreamEncodeState.errored` 让 `Finish` / `End` 返回空 vec |
-| Responses | 仍不产生帧（本轮未改） | — | `responses.rs` 的 `Error` 分支仍返回 `Vec::new()` |
+| Responses | `data: {"type":"error","code":"STREAM_ERROR","message":…,"param":null,"error":{"code":"STREAM_ERROR","message":…}}` | 不发 `response.completed` / `response.incomplete` | `responses.rs` 的 `encode_error_event`；`StreamEncodeState.errored` 让 `Raw` / `Finish` / `End` 返回空 vec |
 
-两个形状都是上游自己定下的契约，不是网关自创：Chat Completions 的流内错误就是 `data: {"error":…}`，并不在错误帧后再发 `[DONE]`；Anthropic Messages 的错误流是 `event: error` + `type: "error"` 体，其后不再有 `message_stop`。IR 的 `Error` 事件只携带 message（不带错误类别），故 Anthropic 的 `error.type` 固定为通用的 `api_error`，Chat 的 `type` 为 `server_error` 而 `code` 保留网关的 `STREAM_ERROR` 标记（`param` 显式为 `null`，与 OpenAI 信封键集对齐）。
+三个形状都是上游自己定下的契约，不是网关自创：Chat Completions 的流内错误就是 `data: {"error":…}`，并不在错误帧后再发 `[DONE]`；Anthropic Messages 的错误流是 `event: error` + `type: "error"` 体，其后不再有 `message_stop`；Responses 的流内错误事件是 `type: "error"`，其后不再有 `response.completed`。IR 的 `Error` 事件只携带 message（不带错误类别），故 Anthropic 的 `error.type` 固定为通用的 `api_error`，Chat 的 `type` 为 `server_error`，Responses 的 `code` 与 Chat 的 `error.code` 同为网关的 `STREAM_ERROR` 标记（`param` 显式为 `null`，与 OpenAI 信封键集对齐）；Responses 帧额外带一份嵌套的 `error: {code, message}`，让只认网关通用信封（`{"error":{"code","message"}}`）的客户端也能读到上游消息。
 
-**直通车道相反**：`needs_ir_decode == false` 的 Chat→Chat / Anthropic→Anthropic native / Responses→Responses native 上**零合成帧**。上游自己的错误字节本来就以 `Raw` 在流里，逐字转发就是客户端与上游直连时看到的东西；上游在其错误帧之后发的一切（**包括它自己的 `data: [DONE]`**，以及 native 车道的 `message_stop` / `response.completed`）也照样逐字转发，不因「前面出过错」而抑制——字节保真优先。
+**直通车道的入站错误帧相反**：`needs_ir_decode == false` 的 Chat→Chat / Anthropic→Anthropic native / Responses→Responses native 上，上游自己的错误帧**零合成**。上游自己的错误字节本来就以 `Raw` 在流里，逐字转发就是客户端与上游直连时看到的东西；上游在其错误帧之后发的一切（**包括它自己的 `data: [DONE]`**，以及 native 车道的 `message_stop` / `response.completed`）也照样逐字转发，不因「前面出过错」而抑制——字节保真优先。
 
-**去重**：同一个失败可能被 provider 发两次（side-channel 的 `Error` chunk 加上解码出来的错误帧，两者在 `stream.rs` 里是两个 `Error` 事件），因此以 `StreamState.error` 是否已置位判定重复——第二次只进 analytics，不再产出帧。
+**去重**：同一个失败可能被 provider 发两次（side-channel 的 `Error` chunk 加上解码出来的错误帧，两者在 `stream.rs` 里是两个 `Error` 事件），因此以 `StreamState.error` 是否已置位判定重复——第二次只进 analytics，不再产出帧（直通车道也只扣留第一个，终点最多合成一帧）。
 
-**终端抑制的归处（只作用于翻译车道）**：Chat 车道（即 Chat ingress 的 IR 解码车道）的两个 `errored` 标志都在 `dispatch/chat/mod.rs` 的每流闭包里（桥接 `#1` 抑制 `data: [DONE]`、桥接 `#4` 抑制合成的 `finish_reason`），Anthropic 车道（即 Anthropic ingress 的翻译车道）的 `errored` 在 `StreamEncodeState` 里——错误帧本身就是该流最后一个客户端可见帧，`End` 仍会流到分发循环完成终点记账，只是编码为空。直通车道两者都碰不到：闭包块与 `StreamEncodeState.errored` 的置位都只在流循环把 `Error` 交给编码器时发生，而直通车道在 `stream.rs` 就把该事件丢掉了。
+**终端抑制的归处**：Chat 车道（即 Chat ingress 的 IR 解码车道）的两个 `errored` 标志都在 `dispatch/chat/mod.rs` 的每流闭包里（桥接 `#1` 抑制 `data: [DONE]`、桥接 `#4` 抑制合成的 `finish_reason`），Anthropic / Responses 车道的 `errored` 在各自 `StreamEncodeState` 里（Anthropic 让 `Finish` / `End` 返回空 vec，Responses 还额外让 `Raw` 返回空 vec）；错误帧本身就是该流最后一个客户端可见帧，`End` 仍会流到分发循环完成终点记账，只是编码为空。直通车道不走这条路：入站错误帧的清形下 `stream.rs` 根本不会把 `Error` 交给编码器，而网关本地中断的合成帧是**终点前最后一帧**，其后再无任何字节（body 立即关闭）。
 
-**有意不变**：HTTP 状态恒为 200；attempt 的 `TargetStatus` / `failure_reason`、`call_logs` 的 `stream_error` 口径、`Usage` 合并都不变；Chat→Chat 透传车道完全不变（零合成帧，上游自己的错误帧与其后的 `data: [DONE]` 都作为 `Raw` 原样转发，既有帧一个字节也不重写）；翻译车道的合成帧只出现在 provider 层失败（chunk 空闲超时、读错误）——那种场合旧实现什么都不会发；响应体已提交后不可能再退到 502，错误帧只是让客户端能分辨「失败」而不是「提前结束」。
+**有意不变**：HTTP 状态恒为 200；attempt 的 `TargetStatus` / `failure_reason`、`call_logs` 的 `stream_error` 口径、`Usage` 合并都不变；Chat→Chat 透传车道的**上游帧**完全不变（上游自己的错误帧与其后的 `data: [DONE]` 都作为 `Raw` 原样转发，既有帧一个字节也不重写）；合成帧只出现在“客户端必须知道它失败了”且上游没给任何字节的场合（翻译车道的上游错误、两种车道的网关本地中断）；响应体已提交后不可能再退到 502，错误帧只是让客户端能分辨「失败」而不是「提前结束」。
 
 ### 无 IR 物种：SystemOne 镜像图片生成的分发骨架
 
@@ -274,7 +274,8 @@ SystemOne 没有 chat IR（`state` / `questions` / `answers` 与逐题概率字�
 - 工具调用参数质量告警是**纯观测**：不得计入 `failure_reason`、不得触发重试 / fallback / 粘性变更、不得改写响应体字节；流式告警只在 `finish_stream_terminal` 发（`TerminalGuard::Drop` 不发，否则取消的流会假报 `Blank`）
 - 工具参数窥探只在 `needs_ir_decode == false` 的透传车道启用；已解码车道上的 `Raw` 不得再被窥探（同一段 `arguments` 会被拼两次）
 - 帧的解码器由 upstream 协议选（Anthropic / Responses / Chat 三路）且必须是有状态 `FnMut`；`needs_ir_decode` 必须包含 Chat ingress × Responses upstream
-- Responses 形状的 `Raw` 帧（`type` 以 `response.` 开头）不得到达非 Responses 出口；过滤只在 `needs_ir_decode == true` 时生效，`needs_ir_decode == false` 的同协议车道字节恒等
+- Responses 解码器产出的**所有** `Raw`（不看 `type`）不得到达非 Responses 出口；过滤只在 `needs_ir_decode == true` 时生效，`needs_ir_decode == false` 的同协议车道字节恒等
+- 一条流最多一个客户端可见错误帧，且它是最后可见字节：翻译车道由出口编码器即时渲染并抑制后续事件；直通车道的入站错误帧零合成（上游字节原样转发），网关本地中断（无配对 `Raw` 的 `Error`）由终点合成恰好一帧后关闭 body；两种情形都不得在错误帧后再发 `[DONE]` / `message_stop` / `response.completed`
 - 每请求在途计数（`InFlightGuard`）在 `dispatch_chat` / `dispatch_image` / `dispatch_systemone` 入口 acquire，只由 `Drop` 释放；流式路径必须把 guard 移交 `StreamState._in_flight`（`build_streaming_response` 的 `in_flight` 参数），不得留在 dispatch 栈帧上——否则响应返回即释放，整条流的传输时间不被计入。计数器与 `AppState` 共享同一 `Arc`（见 [admin 0003](../admin/changes/0003-per-route-in-flight-counters-sse.md)）
 
 ## 测试策略
@@ -294,6 +295,7 @@ SystemOne 没有 chat IR（`state` / `questions` / `answers` 与逐题概率字�
 
 ## 变更记录
 
+- [0010 流内错误帧在两种车道上的完整性](changes/0010-stream-error-frame-completeness.md) — `ResponsesCodec::encode_error_event` + `StreamEncodeState.errored`（错误帧后 `Raw` / `Finish` / `End` 返回空 vec）；`StreamState.pending_local_error` 让直通车道先扣住 `Error`、由紧随的 `Raw` 清除，流结束时仍扣留即为网关本地中断并在终点合成一帧；`use_responses && needs_ir_decode` 分支丢弃所有 Responses 解码器 `Raw`（删除 `is_responses_event_frame`）；解码器 `push_frame_raw` per-frame 去重
 - [0009 工具调用参数质量告警与 Chat×Responses 车道的解码归属修正](changes/0009-tool-arg-quality-and-responses-lane-decode.md) — 新增 `sag-core` 纯谓词层 `ToolArgsQuality` / `ToolArgWatch`，流式（`finish_stream_terminal`）与非流式各发一条 warn-only 告警（不动空响应判定）；字节透传车道补 `peek_chat_raw_frame` 窥探（observation-only、门控在 `!needs_ir_decode`）；`StreamFrameDecoder` 改 boxed `FnMut` 并补 `use_responses` 分支，修掉 Anthropic ingress × Responses upstream 用错 Chat 解码器；`needs_ir_decode` 纳入 Chat ingress × Responses upstream（解码重编码为 Chat chunk），`is_responses_event_frame` 拦下已解码车道的 Responses `Raw` 帧；`response.completed` 解码出 `Finish`（`function_call` → `tool_calls`），补 Chat ingress 的 `finish_reason` 兜底与翻译车道协议正确的流内错误帧（Chat `data: {"error":…}` / Anthropic `event: error`，错误后不再发终止符；直通车道零合成帧）
 - [0008 SystemOne 决策接口接入（原样透传 + 深度 dispatch）](changes/0008-systemone-ingress.md) — 新增 `dispatch_systemone`（镜像 `dispatch_image` 骨架、无 IR、恒非流式）、`build_systemone_body` 的 carrier 契约（`extra` 逐字重建 + 仅改写 `model`）、`filter_systemone_targets` 的 presence 即能力闸门，并把 `fallback` 语义收窄为 chat IR 三协议
 - [0007 流式终点帧竞态误分类修复](changes/0007-stream-terminal-frame-race.md) — `is_client_terminal_frame` 字节级三协议判定（含 `response.cancelled`）+ `TerminalGuard` 三路分类（error→502 / 标志→200 带完整 usage / 否则 499），并补三条 translated 终点帧桥接（`[DONE]` / `message_stop` / `response.completed`，含不合规上游的块闭合与 `stop_reason`）
