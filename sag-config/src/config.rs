@@ -881,11 +881,13 @@ impl GatewayAuthConfig {
     /// Whether at least one configured key is a usable credential.
     ///
     /// Invariant: a key that is empty or whitespace-only is **not** a
-    /// credential. A `gateway_auth` whose keys are all blank therefore means
-    /// "no authentication is configured" — the same state as a missing
-    /// `[gateway_auth]` section — and must be treated as invalid (rejected by
-    /// [`GatewayConfig::validate`]) or disabled (denied by the router auth
-    /// middleware), never as "authorized by an empty string".
+    /// credential, so a `gateway_auth` whose keys are all blank is not an
+    /// "authentication disabled" state at all: there is no such state to fall
+    /// back to, because it cannot match any credential. Such a list is rejected
+    /// by [`GatewayConfig::validate`], and if it bypasses validation the router
+    /// auth middleware fails closed (401) instead of authorizing an empty
+    /// string. Only `None` — a missing `[gateway_auth]` section — means "no
+    /// authentication is configured".
     ///
     /// This is the single source of truth for the rule; callers must not
     /// re-implement the `trim().is_empty()` test.
@@ -1161,7 +1163,7 @@ pub enum PrivacyMode {
 /// Every field has a default, so an empty `[privacy]` table is valid and
 /// leaves filtering **disabled**. Unknown fields are tolerated like
 /// everywhere else in the config; unknown [`PrivacyMode`] values are not.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivacyConfig {
     /// Master switch. Default: `false` (no filtering at all).
@@ -1198,6 +1200,29 @@ impl Default for PrivacyConfig {
             custom_words: PrivacyWordList::default(),
             allowlist: PrivacyWordList::default(),
         }
+    }
+}
+
+/// Placeholder printed in place of the secret salt in `Debug` output.
+const REDACTED_SECRET: &str = "[REDACTED]";
+
+/// Hand-written `Debug` instead of a derive: [`PrivacyConfig::salt`] is a
+/// secret that is mixed into the masking hash, so it must never reach a log
+/// line (or a panic message). `load_config` logs the whole config with
+/// `debug!(?config, "configuration loaded")`, which is exactly such a line.
+/// Everything else is printed normally; diagnostics keep working.
+impl std::fmt::Debug for PrivacyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivacyConfig")
+            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
+            .field("restore", &self.restore)
+            .field("salt", &REDACTED_SECRET)
+            .field("builtins", &self.builtins)
+            .field("custom_regexes", &self.custom_regexes)
+            .field("custom_words", &self.custom_words)
+            .field("allowlist", &self.allowlist)
+            .finish()
     }
 }
 
@@ -4585,6 +4610,36 @@ items = ["public@example.com"]
                 msg.contains("strict") && msg.contains("mode"),
                 "unknown privacy mode must fail to parse, got: {msg}"
             );
+        }
+
+        #[test]
+        fn debug_output_redacts_the_privacy_salt() {
+            // `load_config` logs the whole config with `debug!(?config, ...)`,
+            // so the salt is one `Debug` call away from a log line.
+            let salt = "super-secret-salt-value";
+            let privacy = PrivacyConfig {
+                enabled: true,
+                salt: salt.into(),
+                ..Default::default()
+            };
+
+            let rendered = format!("{privacy:?}");
+            assert!(
+                !rendered.contains(salt),
+                "the privacy salt must never reach a debug line, got: {rendered}"
+            );
+            assert!(
+                rendered.contains(REDACTED_SECRET),
+                "the redaction placeholder must be visible, got: {rendered}"
+            );
+            // Non-secret fields stay inspectable.
+            assert!(rendered.contains("enabled: true"), "got: {rendered}");
+            assert!(rendered.contains("mode: Mask"), "got: {rendered}");
+
+            // The redaction must not depend on the salt's content.
+            let privacy = PrivacyConfig::default();
+            let rendered = format!("{privacy:?}");
+            assert!(rendered.contains("salt: \"[REDACTED]\""), "got: {rendered}");
         }
 
         #[test]
