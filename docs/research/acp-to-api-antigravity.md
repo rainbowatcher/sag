@@ -31,13 +31,13 @@
 
 | # | 「ACP」实际所指 | 是什么 | 协议/传输 | 在 Antigravity 生态里的位置 |
 |---|---|---|---|---|
-| ① | **Agent Client Protocol**（Zed 发起，现 Zed + JetBrains 共同开发，Apache-2.0） | 编辑器/IDE ↔ coding agent 之间的通信标准，**公开规范**，v1 共 18 个方法/通知 | JSON-RPC 2.0，本地 stdio，远程 HTTP/WebSocket（远程仍标 work in progress） | Google **官方**提供 `antigravity-acp` 服务器（`agy acp`），在 ACP Registry 里是 v1.3.0，作者标 "Google LLC" |
+| ① | **Agent Client Protocol**（Zed 发起，现 Zed + JetBrains 共同开发，Apache-2.0） | 编辑器/IDE ↔ coding agent 之间的通信标准，**公开规范**，v1 共 18 个方法/通知 | JSON-RPC 2.0，本地 stdio，远程 HTTP/WebSocket（远程仍标 work in progress） | Google **官方**提供 `antigravity-acp` 服务器（`agy acp`），在 ACP Registry 里是 v1.4.5（2026-11-08 实测 `agent.json`），作者标 "Google LLC" |
 | ② | **Cloud Code `v1internal`** | Google 私有上游 HTTP 接口，Gemini 形状 JSON/SSE | HTTPS + JSON + SSE（**不是** protobuf gRPC，见 §4.2 争议项） | 这是**所有** `antigravity2api` 类项目实际打的靶子 |
 | ③ | **本地 language server Connect-RPC** | Antigravity 桌面/IDE 与 Codeium 血统的 Go `language_server` 之间的私有 RPC | Connect RPC v1（JSON over HTTP），自签 TLS，`127.0.0.1:随机端口`，需 `x-codeium-csrf-token` | 第一代架构的桥接层；①出现之前「驱动本机 LS」类项目的入口 |
 
 **为什么必须区分**：
 
-- **① 是公开标准，Google 自己支持它，但它被阉割了。** 官方 ACP 服务器在 `oauth-personal` 认证下**只暴露 Gemini 模型**，Claude / GPT-OSS 被本地过滤器丢弃。证据是 [agentclientprotocol/registry issue #554](https://github.com/agentclientprotocol/registry/issues/554)（2026-08-28）：作者读了分发包里的 Python 源码 `acp_server/model_selection.py`，其中 `if not ccpa_id.startswith("gemini"): continue`，随后 `server.py::_apply_session_model` 对非 Gemini ID 抛 `-32602`，但错误信息伪装成 "not available for the current authentication method"。Google 工作人员在论坛确认了同一约束："outside of first-party IDE integrations, **model selection in ACP clients is limited to the Gemini models included in your plan**" —— [discuss.ai.google.dev #192027 第 2 帖](https://discuss.ai.google.dev/t/tos-clarification-is-t3-code-official-antigravity-acp-agent-permitted-under-the-antigravity-terms-of-service/192027/2)（2026-10-26）。
+- **① 是公开标准，Google 自己支持它，但它被阉割了。** 官方 ACP 服务器在 `oauth-personal` 认证下**只暴露 Gemini 模型**，Claude / GPT-OSS 被本地过滤器丢弃。证据是 [agentclientprotocol/registry issue #554](https://github.com/agentclientprotocol/registry/issues/554)（2026-08-28）：作者读了分发包里的 Python 源码 `acp_server/model_selection.py`，其中 `if not ccpa_id.startswith("gemini"): continue`，随后 `server.py::_apply_session_model` 对非 Gemini ID 抛 `-32602`，但错误信息伪装成 "not available for the current authentication method"。**修正（2026-11-08 深挖更新）**：上述 `ccpa_id` 过滤是 RC01/1.0.0 时代的行为，且并非现行根因——1.3.0/1.4.1+ 的实际根因是 `supports_third_party_models()` 的 `clientInfo.name` 白名单（仅 JetBrains / Android Studio / Zed / Xcode 可见第三方模型），CLI issue #1168 / #1318 有源码级确诊与对照实验。详见 [antigravity-acp-vs-bare-api.md](./antigravity-acp-vs-bare-api.md) §3.1。Google 工作人员在论坛确认了同一约束："outside of first-party IDE integrations, **model selection in ACP clients is limited to the Gemini models included in your plan**" —— [discuss.ai.google.dev #192027 第 2 帖](https://discuss.ai.google.dev/t/tos-clarification-is-t3-code-official-antigravity-acp-agent-permitted-under-the-antigravity-terms-of-service/192027/2)（2026-10-26）。
 - **②③ 是私有的、逆向得来的，且属于 ToS 禁止范围。** 它们形态与 ① 相似（都是「事件流 + 工具 + 会话」），但稳定性差一个量级：公开协议不会因为「你没跟上客户端版本」而失效，私有协议会（见 §5.4）。
 - **① 的语义是 agent，不是 chat completions。** ACP 是 `session/prompt` + 工具授权 + 文件读写，agent 自己执行工具（"Agents run tool calls themselves"，[ACP v1 Tool Calls](https://agentclientprotocol.com/protocol/v1/tool-calls)）。把它「降维」成 `/v1/chat/completions` 必须丢掉工具执行权，或自己实现客户端侧的 `fs/*`、`terminal/*`、`session/request_permission`。
 
@@ -725,7 +725,7 @@ SAG 现有架构事实（来自本仓库代码核对）：
 | 4 | 「Antigravity ACP 二进制在 39-bit 寻址 ARM（多数 Pixel/Android）上不可用」 | 影响移动端可用性判断 | 论坛单一用户报告（2026-11-01），需复现 |
 | 5 | 「zero-gravity 的 Pro 账号 3 小时被封 vs Ultra 3 天无问题」 | 常被引作「Ultra 更安全」的证据 | 作者自述 n=1，需对照实验 |
 | 6 | 各项目 README 声称的 `/v1/audio`、`/v1/files` 等端点是否真有上游支撑 | 影响「能力矩阵」的乐观程度 | 读实现或实测 |
-| 7 | `agy_acp_server` 1.3.0（当前 registry 版本）是否已修掉 #554 的 Gemini-only 过滤 | 决定「官方 ACP 路线」能否拿到 Claude/GPT | registry #554 只覆盖 1.0.0/RC01，需实跑二进制 |
+| 7 | `agy_acp_server` 1.4.5（2026-11-08 实测的 registry 版本）是否仍按 `clientInfo.name` 白名单裁剪第三方模型 | 决定「官方 ACP 路线」能否拿到 Claude/GPT | registry #554 只覆盖 1.0.0/RC01，CLI #1168 覆盖到 1.4.1，1.4.5 无公开实测，需实跑二进制 |
 | 8 | Antigravity 是否就 Blyck（#196885）给出书面答复 | 决定 2026-10-26「开口」的稳定性 | 截至 2026-11-08 该帖无 Google 回复 |
 | 9 | 2026-11-06 `TOS_VIOLATION` 浪潮在 11-08 之后的扩散面 | 决定封禁是「抽样」还是「全量」 | 需要新 issue 报告第三、第四个凭证被打 |
 | 10 | 16384 输出上限在 2026-11 版本是否仍成立 | 与 64000 冲突，影响 `max_tokens` clamp 值 | 单方测量，需复测 |
@@ -782,7 +782,7 @@ SAG 现有架构事实（来自本仓库代码核对）：
 - [discuss #190310 — Google AI Pro (Jio/Partner plan) losing all Pro & Third-Party models](https://discuss.ai.google.dev/t/google-ai-pro-jio-partner-plan-losing-all-pro-third-party-models-on-nov-2-leaving-only-flash-3-8/190310)
 - [gemini-cli Discussion #20632 — Addressing Antigravity Bans & Reinstating Access](https://github.com/google-gemini/gemini-cli/discussions/20632)（2026-02-27）
 - [agentclientprotocol/registry issue #554](https://github.com/agentclientprotocol/registry/issues/554)（2026-08-28，Gemini-only 过滤器源码证据）
-- [registry/antigravity-acp/agent.json](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)（读取 2026-11-08，v1.3.0）
+- [registry/antigravity-acp/agent.json](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)（读取 2026-11-08，`"version": "1.4.5"`）
 - [Ground Truth — Google's Antigravity terms ban third-party clients outright](https://groundtruth.day/news/googles-antigravity-terms-ban-third-party-clients-outright.html)（2026-09-03）
 - [Zentor — Antigravity account suspended](https://zentor.ai/blog/antigravity-account-suspended-third-party)（2026-09-04，更新至 2026-10-27）
 - [VentureBeat — Google clamps down on Antigravity malicious usage](https://venturebeat.com/orchestration/google-clamps-down-on-antigravity-malicious-usage-cutting-off-openclaw-users)（2026-02-23）
