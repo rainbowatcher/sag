@@ -18,12 +18,50 @@ const MAX_BODY_READ: usize = crate::routes::DEFAULT_MAX_REQUEST_BODY_BYTES;
 const REQUEST_PREVIEW_MAX: usize = 512 * 1024;
 const BODY_PREVIEW_MAX: usize = 512;
 
+/// Admin endpoints whose request **and** response bodies must never reach a
+/// log line.
+///
+/// For these paths the middleware logs metadata only (`method`, `uri`,
+/// `body_size`, `status`, `elapsed_ms`) and never buffers either body, so no
+/// secret can land in `debug!` (preview) or `trace!` (full body) — even with
+/// `[logging].level = "debug"` / `RUST_LOG=trace` enabled.
+///
+/// - `/api/config` — `PUT` carries the write-only privacy salt
+///   (`UpdatePrivacyRequest.salt`). The admin API contract pins it as
+///   "must never reach a log line" (see `sag-admin/src/admin_config.rs` and
+///   `sag-ui/src/components/settings/PrivacyForm.vue`).
+/// - `/api/settings` — `PUT` replaces the gateway client-auth `api_keys`, and
+///   `GET` echoes them back.
+/// - `/api/providers*` — the writes carry provider `api_keys`; `GET
+///   /api/providers` echoes them back; the two temporary-probe endpoints take
+///   a short-lived key.
+/// - `/api/model/test` — same short-lived-key probe contract.
+///
+/// Matching is exact on the (trailing-slash-normalized) path so a sub-path
+/// such as `/api/providers/{name}/models` — which only returns a model name
+/// list — keeps its regular body preview.
+const BODY_LOG_EXCLUDED_PATHS: &[&str] = &[
+    "/api/config",
+    "/api/settings",
+    "/api/providers",
+    "/api/providers/fetch-models",
+    "/api/providers/probe-protocols",
+    "/api/model/test",
+];
+
+/// Whether the body of a request to `path` must be kept out of the logs.
+fn body_logging_excluded(path: &str) -> bool {
+    BODY_LOG_EXCLUDED_PATHS.contains(&path.trim_end_matches('/'))
+}
+
 /// Axum middleware that logs HTTP request/response bodies.
 ///
 /// - `debug!` level: `method`, `uri`, `auth` (masked), body preview (first 512 bytes + total size)
 /// - `trace_id` is provided by the root span from `trace_middleware`, not duplicated here
 /// - `trace!` (target: "sag_router::http_log::full"): full body
 /// - SSE streaming responses are logged without body consumption
+/// - credential-bearing admin endpoints (see [`BODY_LOG_EXCLUDED_PATHS`]) are
+///   logged as metadata only — neither body is ever buffered
 pub async fn log_http(request: Request, next: Next) -> Response {
     // ── Request ──────────────────────────────────────────────────────
     let (parts, body) = request.into_parts();
@@ -51,6 +89,22 @@ pub async fn log_http(request: Request, next: Next) -> Response {
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
+
+    // Credential-bearing admin endpoint: metadata only, no body buffering on
+    // either side. `body_skipped` tells the preview-less line apart from the
+    // large-body path below.
+    if body_logging_excluded(uri.path()) {
+        if let Some(ref auth) = auth {
+            debug!(%method, %uri, auth, body_size = content_length, body_skipped = true, "request");
+        } else {
+            debug!(%method, %uri, body_size = content_length, body_skipped = true, "request");
+        }
+        let request = Request::from_parts(parts, body);
+        let started = Instant::now();
+        let response = next.run(request).await;
+        log_response_meta(&response, started.elapsed());
+        return response;
+    }
 
     // Only buffer when we know the body is small enough for a preview.
     // Large / chunked (no content-length) bodies must stream through so
@@ -468,6 +522,40 @@ mod tests {
         let (data, _, errored) = read_all(body).await;
         assert_eq!(data, payload, "already-read data is still forwarded");
         assert!(errored, "the client must observe the stream error");
+    }
+
+    /// ⑤ Credential-bearing admin paths are excluded, everything else keeps
+    /// its body preview.
+    #[test]
+    fn credential_admin_paths_never_log_a_body() {
+        for path in [
+            "/api/config",
+            "/api/config/",
+            "/api/settings",
+            "/api/providers",
+            "/api/providers/fetch-models",
+            "/api/providers/probe-protocols",
+            "/api/model/test",
+        ] {
+            assert!(
+                body_logging_excluded(path),
+                "{path} carries a credential and must not log its body"
+            );
+        }
+
+        for path in [
+            "/health",
+            "/v1/chat/completions/",
+            "/api/routes",
+            "/api/logs",
+            "/api/providers/openai/models",
+            "/",
+        ] {
+            assert!(
+                !body_logging_excluded(path),
+                "{path} carries no credential and keeps its body preview"
+            );
+        }
     }
 
     /// ④ Trailers survive the truncated path.
