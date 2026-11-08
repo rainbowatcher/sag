@@ -984,8 +984,23 @@ fn create_temp_file(
     file_name: &str,
     existing_mode: Option<u32>,
 ) -> Result<(std::path::PathBuf, std::fs::File), sag_core::AppError> {
-    for _ in 0..TEMP_NAME_ATTEMPTS {
-        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Claim this call's block of sequence numbers up front, so the retry
+    // loop below depends only on `first_seq`. Tests exercise the exhaustion
+    // path through [`create_temp_file_from_seq`] with a fixed start instead
+    // of racing the shared counter against sibling tests.
+    let first_seq = TEMP_SEQ.fetch_add(TEMP_NAME_ATTEMPTS, Ordering::Relaxed);
+    create_temp_file_from_seq(dir, file_name, existing_mode, first_seq)
+}
+
+/// Retry loop of [`create_temp_file`], trying `TEMP_NAME_ATTEMPTS` consecutive
+/// names starting at `first_seq`.
+fn create_temp_file_from_seq(
+    dir: &Path,
+    file_name: &str,
+    existing_mode: Option<u32>,
+    first_seq: u64,
+) -> Result<(std::path::PathBuf, std::fs::File), sag_core::AppError> {
+    for seq in first_seq..first_seq + TEMP_NAME_ATTEMPTS {
         let candidate = dir.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
         match open_exclusive(&candidate, existing_mode) {
             Ok(file) => return Ok((candidate, file)),
@@ -1866,6 +1881,43 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_temp_file_reports_exhaustion_when_all_names_are_taken() {
+        let dir = std::env::temp_dir().join(format!(
+            "sag-save-temp-exhaust-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A recycled PID plus stale temp files is exactly how the retry
+        // budget gets exhausted. `create_temp_file_from_seq` takes the start
+        // of the block, so the eight occupied names below are precisely the
+        // candidates it will try — no dependency on what sibling tests do to
+        // the global counter.
+        let first_seq = 0;
+        let occupied: Vec<_> = (first_seq..first_seq + TEMP_NAME_ATTEMPTS)
+            .map(|seq| dir.join(format!(".gateway.toml.tmp.{}.{seq}", std::process::id())))
+            .collect();
+        for path in &occupied {
+            std::fs::write(path, "stale").unwrap();
+        }
+
+        let err = create_temp_file_from_seq(&dir, "gateway.toml", None, first_seq)
+            .expect_err("every candidate name is taken, so creation must give up");
+        assert!(
+            err.to_string().contains("no free temp name in 8 attempts"),
+            "the error must report the exhausted retry budget, got: {err}"
+        );
+
+        // Exhaustion must never truncate a file another writer may own.
+        for path in &occupied {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "stale");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

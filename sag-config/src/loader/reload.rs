@@ -434,12 +434,12 @@ mod tests {
 
     #[test]
     fn event_targets_config_ignores_temp_file_of_other_process() {
-        // SAG's own atomic save writes a `.gateway.toml.tmp.<pid>` sibling
-        // first; those events must not be mistaken for a change to the
-        // config file itself.
+        // SAG's own atomic save writes a `.gateway.toml.tmp.<pid>.<seq>`
+        // sibling first; those events must not be mistaken for a change to
+        // the config file itself.
         let e = event(
             EventKind::Create(notify::event::CreateKind::File),
-            "/etc/sag/.gateway.toml.tmp.1234",
+            "/etc/sag/.gateway.toml.tmp.1234.1",
         );
         assert!(!event_targets_config(
             &e,
