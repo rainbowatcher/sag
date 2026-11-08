@@ -115,7 +115,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 - **模型目录与二进制版本硬绑定**：`[项目]` t3code [#19150](https://github.com/pingdotgg/t3code/issues/19150)（2026-10-13 → 11-01 closed）标题即结论——"Antigravity provider never lists Gemini 4 Argon (bundled ACP runtime 1.3.0 predates it)"。**registry 落后 = 新模型看不见**，而 registry 的更新节奏是周级。
 - **1.0.0 即使解开滤镜也跑不了 Claude**：`[项目]` registry [#554](https://github.com/agentclientprotocol/registry/issues/554)（2026-08-28，**仍 open，Google 零回应**）作者读分发包内 Python 源，证明去过滤后还需 **5 处 provider 兼容改造**（`maxOutputTokens` 按 CCPA 广告上限裁剪；`parametersJsonSchema` → `parameters` 并递归删 `$schema`；给 Gemini `functionCall`/`functionResponse` 补配对 ID 以便 Anthropic 侧生成 `tool_use`/`tool_result`；GPT-OSS 去掉不支持的 generation 字段；保留 32768 输出上限）。结论句："RC01 is missing both catalog exposure and provider-specific request compatibility."
 
-> **对首份报告的修正点**：首份报告把「仅 Gemini」归因于 RC01 时代的 `if not ccpa_id.startswith("gemini"): continue` 过滤器；**现行（1.3.0 / 1.4.1+）根因是 `supports_third_party_models()` 的 `clientInfo.name` 白名单**。见 §7 第 1 条的未验证边界。
+> **对首份报告的修正点**：首份报告把「仅 Gemini」归因于 RC01 时代的 `if not ccpa_id.startswith("gemini"): continue` 过滤器；**现行（已验证上限 1.3.0 / 1.4.1，1.4.5 未验证）根因是 `supports_third_party_models()` 的 `clientInfo.name` 白名单**。见 §7 第 1 条的未验证边界。
 
 ### 3.2 协议语义硬约束（对「转 OpenAI」而言）
 
@@ -302,7 +302,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 | 项 | A 官方 ACP | B 裸 API |
 |---|---|---|
 | 政策文本 | Gemini-only（11-02 答复 + 官方文档） | 全部模型在技术上可取；政策上整条路都不许 |
-| 技术现状 | 1.5.1 起 `agy acp` 全模型；registry 1.4.5 仍按 `clientInfo.name` 白名单 | 账号 entitlement 全量，但受 UA 版本 gate 与档位裁剪 |
+| 技术现状 | 1.5.1 起 `agy acp` 全模型；registry 1.4.5（二进制）是否仍有 `clientInfo.name` 白名单：**未验证**（已验证上限为 1.4.1，#1168/#1318） | 账号 entitlement 全量，但受 UA 版本 gate 与档位裁剪 |
 | 拿到 Claude 的代价 | 伪装 `clientInfo.name: "zed"`（政策高危）或 `customModels` 旁路（1.4.5 未验证） | 无需伪装（本来就在伪装整条链） |
 | 新模型滞后 | **二进制版本绑定**（#19150：1.3.0 看不到 Gemini 4 Argon） | UA 版本 gate（#5175：3.7 需 ≥2.9.0） |
 
