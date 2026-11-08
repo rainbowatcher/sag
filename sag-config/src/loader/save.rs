@@ -1,6 +1,8 @@
 #[cfg(test)]
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::info;
 
@@ -52,7 +54,11 @@ use crate::toml_edit_util::{
 /// **Process-level serialization**: the `ConfigMutationCoordinator` in
 /// `sag-state` serializes all production writers (admin API + hot-reload)
 /// via a `tokio::sync::Mutex`. Concurrent mutations within the same
-/// process are serialized, so no lost-update occurs.
+/// process are serialized, so no lost-update occurs. `atomic_write` does
+/// not depend on that lock for temp-file safety: each call picks a temp
+/// name unique to the call (PID + in-process counter) and creates it with
+/// `create_new`, so an unlocked caller cannot truncate another writer's
+/// temp file.
 ///
 /// **Error-path behaviour**: if reading the existing file, `existing.parse()`,
 /// temp-file creation, or `sync_all` fails, the function returns `Err` without
@@ -69,9 +75,12 @@ use crate::toml_edit_util::{
 /// **Error classes**: server-side persistence/IO failures — reading or
 /// parsing the existing on-disk file, `metadata`, the temp-file write,
 /// `set_permissions`, `sync_all`, and `rename` — surface as
-/// `AppError::Internal` (→ HTTP 500, code `INTERNAL_ERROR`). Problems with
-/// the caller-supplied candidate (validation, in-memory serialization) stay
-/// `AppError::Config` (→ HTTP 400).
+/// `AppError::Internal`. Problems with the caller-supplied candidate
+/// (validation, in-memory serialization) stay `AppError::Config`. The
+/// generic `IntoResponse` maps both variants to HTTP 500 (`INTERNAL_ERROR`
+/// and `CONFIG_ERROR` respectively); the admin handlers in `sag-admin`
+/// explicitly re-map `Config` to HTTP 400, so "bad request" is an
+/// admin-path contract, not a property of `AppError::Config` itself.
 ///
 /// **Cross-process TOCTOU**: an external editor saving concurrently with
 /// an admin API mutation can still race the read and rename. The
@@ -188,9 +197,11 @@ pub fn save_config_to_file(config: &GatewayConfig, path: &Path) -> Result<(), sa
     // ── [gateway_auth] — write or leave absent ──
     // The Settings page owns client API keys, so this section is written
     // back. Field-level update via upsert_table preserves comments and
-    // any future sibling fields. Empty/`None` removes the section so a
-    // cleared auth config leaves no stale `api_keys` behind (empty list
-    // and missing section are equivalent: auth disabled).
+    // any future sibling fields. A cleared auth config is canonicalized to
+    // **section absent**, so no stale `api_keys` is left behind: `None` is
+    // written as no section at all. `Some(empty)` is not an equivalent,
+    // savable state — `validate()` rejects it and the router middleware
+    // fails closed, so it is never produced by a valid candidate.
     match &config.gateway_auth {
         Some(auth) if !auth.api_keys.is_empty() => {
             let keys = auth.api_keys.clone();
@@ -855,7 +866,8 @@ fn new_regex_inline_table(regex: &PrivacyCustomRegex) -> toml_edit::InlineTable 
 /// `rename-with-replace` implementation.
 ///
 /// Steps:
-/// 1. Write `content` to a unique temp file in the same directory.
+/// 1. Create a unique temp file in the same directory **with its final
+///    permissions already applied**, then write `content` to it.
 /// 2. `sync_all` the temp file so data reaches disk before the rename.
 /// 3. `rename(temp, path)` – atomic on Unix.
 /// 4. On any failure, clean up the temp file and return `Err` without
@@ -868,13 +880,13 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), sag_core::AppError> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
-    let temp_path = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
 
     // Remember the destination's mode before writing the temp file:
     // `rename(2)` replaces the inode, so without this the saved config
     // would silently fall back to the temp file's default mode (0o644
     // minus umask) instead of keeping e.g. a hand-tightened 0o600. Only
-    // `NotFound` is tolerated — a fresh file has no mode to preserve.
+    // `NotFound` is tolerated — a fresh file has no mode to inherit, and
+    // then the temp file is created as private (0o600) instead.
     #[cfg(unix)]
     let existing_mode = {
         use std::os::unix::fs::PermissionsExt as _;
@@ -893,40 +905,55 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), sag_core::AppError> {
             }
         }
     };
+    #[cfg(not(unix))]
+    let existing_mode: Option<u32> = None;
 
-    // 1. Write to temp file. A failure here (ENOSPC, read-only FS, …) must
-    //    still clean up: `write` may have created a partial temp file.
-    std::fs::write(&temp_path, content).map_err(|e| {
+    // 1. Create the temp file with its final mode *before* any content
+    //    exists on disk. `OpenOptions::mode` only applies at creation, so
+    //    the file never sits at the umask default (`0o666 & !umask`) while
+    //    it already holds secret material (`gateway_auth.api_keys`,
+    //    provider keys). `create_new(true)` plus a per-call name makes the
+    //    write self-contained: no external lock is needed to keep two
+    //    writers from sharing (and truncating) one temp path.
+    let (temp_path, mut temp) = create_temp_file(dir, file_name, existing_mode)?;
+
+    // 1a. Write the content. A failure here (ENOSPC, read-only FS, …) must
+    //     clean up: the file was created above but may be partially written.
+    if let Err(e) = temp.write_all(content.as_bytes()) {
+        drop(temp);
         let _ = std::fs::remove_file(&temp_path);
-        sag_core::AppError::Internal(format!("failed to write temp config file: {e}"))
-    })?;
+        return Err(sag_core::AppError::Internal(format!(
+            "failed to write temp config file: {e}"
+        )));
+    }
 
     // 1b. Carry the destination's mode over to the temp file so the
-    //     rename below does not reset it. No-op when the file is new.
+    //     rename below does not reset it. The mode was already applied at
+    //     creation; this is a redundant second check (and a no-op when the
+    //     file is new).
     #[cfg(unix)]
     if let Some(mode) = existing_mode {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(mode)).map_err(
-            |e| {
-                let _ = std::fs::remove_file(&temp_path);
-                sag_core::AppError::Internal(format!(
-                    "failed to preserve permissions of '{}': {e}",
-                    path.display()
-                ))
-            },
-        )?;
+        let permissions = std::fs::Permissions::from_mode(mode);
+        if let Err(e) = std::fs::set_permissions(&temp_path, permissions) {
+            drop(temp);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(sag_core::AppError::Internal(format!(
+                "failed to preserve permissions of '{}': {e}",
+                path.display()
+            )));
+        }
     }
 
     // 2. Sync the temp file.
-    let file = std::fs::File::open(&temp_path).map_err(|e| {
+    if let Err(e) = temp.sync_all() {
+        drop(temp);
         let _ = std::fs::remove_file(&temp_path);
-        sag_core::AppError::Internal(format!("failed to open temp config for sync: {e}"))
-    })?;
-    file.sync_all().map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        sag_core::AppError::Internal(format!("failed to sync temp config file: {e}"))
-    })?;
-    drop(file);
+        return Err(sag_core::AppError::Internal(format!(
+            "failed to sync temp config file: {e}"
+        )));
+    }
+    drop(temp);
 
     // 3. Atomic rename (overwrites destination on Unix).
     std::fs::rename(&temp_path, path).map_err(|e| {
@@ -935,6 +962,61 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), sag_core::AppError> {
     })?;
 
     Ok(())
+}
+
+/// Per-process counter appended to every temp file name.
+///
+/// Unique per call, not merely per process: [`atomic_write`] must stay safe
+/// when two callers in one process write concurrently without holding
+/// `ConfigMutationCoordinator`'s lock (`ConfigHandle::try_persist` calls
+/// `save_config_to_file` directly).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How many distinct temp names to try before giving up. A collision needs a
+/// stale temp file left behind by a crashed process whose PID was recycled;
+/// retrying beats truncating a file another writer may own.
+const TEMP_NAME_ATTEMPTS: u64 = 8;
+
+/// Create a temp file in `dir` with a per-call unique name, returning its
+/// path and the open handle.
+fn create_temp_file(
+    dir: &Path,
+    file_name: &str,
+    existing_mode: Option<u32>,
+) -> Result<(std::path::PathBuf, std::fs::File), sag_core::AppError> {
+    for _ in 0..TEMP_NAME_ATTEMPTS {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+        match open_exclusive(&candidate, existing_mode) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(sag_core::AppError::Internal(format!(
+                    "failed to create temp config file: {e}"
+                )));
+            }
+        }
+    }
+    Err(sag_core::AppError::Internal(format!(
+        "failed to create temp config file: no free temp name in {TEMP_NAME_ATTEMPTS} attempts"
+    )))
+}
+
+/// Open `path` exclusively (`create_new`, never truncating an existing file)
+/// with `mode` applied at creation time.
+fn open_exclusive(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Inherit the destination's mode; a brand-new file has no mode to
+        // inherit, so it starts out private instead of umask-default.
+        options.mode(mode.unwrap_or(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path)
 }
 
 /// Update fields of an existing provider's TOML sub-table
@@ -1651,6 +1733,32 @@ apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
         assert!(
             saved.contains("[providers.openai]"),
             "providers should be written to the new file, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_new_file_with_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "sag-save-new-mode-{}-{}.toml",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        assert!(!path.exists(), "test path must not exist yet");
+
+        // A freshly created config file carries secrets (`gateway_auth.api_keys`,
+        // provider keys), so it must not inherit the umask default (commonly
+        // 0o644) — there is no destination mode to preserve.
+        save_config_to_file(&openai_only_config(), &path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a newly created config file must be private (0o600), got {mode:o}"
         );
 
         let _ = std::fs::remove_file(&path);

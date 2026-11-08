@@ -30,7 +30,7 @@ review 又发现一处**空白 key 漏洞**：校验只看「列表是否为空�
 
 ## 需求变更
 
-- `requirements.md`「验证规则」：原条目 `- api_keys 非空`（无条件硬性要求）改为——`gateway_auth` 存在时 `api_keys` 必须含至少一个非空白 key（`has_usable_key()`），加载归一化先裁掉每个 key 的首尾空白（`[" sk "]` → `["sk"]`）；配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；列表为空或全部为空白一律报错，与配置来源（文件 / 程序化构造）无关。
+- `requirements.md`「验证规则」：原条目 `- api_keys 非空`（无条件硬性要求）改为——`gateway_auth` 存在时 `api_keys` 必须含至少一个非空白 key（`has_usable_key()`），加载归一化先裁掉每个 key 的首尾空白（`[" sk "]` → `["sk"]`）。**按来源区分**：配置文件里写零长度的 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；程序化构造的 `Some(empty)` / `Some(全空白)` 不是「关闭鉴权」的等价物，`validate()` 直接报错，绕过校验时中间件 fail-closed（401）。
 - `requirements.md`「认证模式」：再收紧一格——`gateway_auth` 存在时要求至少一个**含非空白字符**的 key（`has_usable_key()`）；`api_keys = [""]` / `["   "]` 在校验时被拒绝，与 `api_keys = []` 不同：后者合法（归一化为段缺失），前者是配置错误。
 
 ## 代码变更

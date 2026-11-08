@@ -44,9 +44,9 @@ updated: 2026-10-30
 **热重载边界**：`[server].host` 和 `[server].port` 修改不触发 listen socket 重新 bind——需要重启生效。`[gateway_auth]` 则经热重载即时生效（认证中间件每次请求读取当前内存配置，无需重建 router）。
 
 **监听与防抖**（[0002](changes/0002-hot-reload-trailing-debounce.md) 起）：
-- 同时监听配置文件**父目录**与文件本身；原子 temp-file + rename 保存不会中断监听（目录监听不受 inode 替换影响），事件按配置路径/文件名过滤，`Access` 类只读事件忽略。
+- 只监听配置文件**父目录**（`watcher.watch(watch_dir, NonRecursive)`），收到事件后按文件名过滤出目标配置；原子 temp-file + rename 保存不会中断监听（目录监听不受 inode 替换影响），`Access` 类只读事件忽略。
 - 使用**尾部防抖**（trailing debounce）：仅当文件静默超过 300ms 后才加载，突发写入期间不断重置窗口，保证读取的是**最终版本**而非中间态。
-- 防抖窗口后增加 100ms settle 窗口并排空边界事件，若有新相关事件则重新武装防抖；排空时同步重建直接文件监听。
+- 防抖窗口后增加 100ms settle 窗口并排空边界事件，若有新相关事件则重新武装防抖；排空仅消费队列（`try_recv()`），**不**重建任何监听。
 - 加载失败（读到截断/无效中间态、文件短暂缺失）最多重试 2 次，之后等待下一个文件事件。
 
 ### 验证规则
@@ -55,7 +55,7 @@ updated: 2026-10-30
 - 至少一个 provider
 - `server.port > 0`
 - `server.host` 非空
-- `gateway_auth` 存在时 `api_keys` 必须含至少一个非空白 key（`has_usable_key()`）；加载归一化会先裁掉每个 key 的首尾空白（`[" sk "]` → `["sk"]`），配置文件里写 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；列表为空或全部为空白一律报错，与配置来源（文件 / 程序化构造）无关
+- `gateway_auth` 存在时 `api_keys` 必须含至少一个非空白 key（`has_usable_key()`）；加载归一化会先裁掉每个 key 的首尾空白（`[" sk "]` → `["sk"]`）。**按来源区分**：配置文件里写零长度的 `api_keys = []` 在校验前被归一化为「`[gateway_auth]` 段缺失」（即关闭鉴权）并只给一条 warning，不报错；程序化构造的 `Some(empty)` / `Some(全空白)` 不是「关闭鉴权」的等价物，`validate()` 直接报错，绕过校验时中间件 fail-closed（401）
 - `base_url` 包含 `://`
 - `timeout_secs > 0`（provider、route、target 三级）
 - `chunk_timeout_secs > 0`（如果设置）
@@ -77,6 +77,8 @@ updated: 2026-10-30
 - 默认值跳过序列化（`skip_serializing_if`）
 - `extra` / `body_overrides` / `headers` 使用原地编辑，保留 key 顺序
 - 顶层 `proxy_url` 与 provider `proxy_mode` 同样原地编辑：清除全局代理时移除 key（不残留空值），`proxy_mode` 为默认 `inherit` 时跳过
+- 落盘是**同目录临时文件 + `rename(2)`** 的原子替换：临时文件在**创建时**就带上目标文件权限（目标不存在时新文件为 `0o600`），写完 `sync_all` 后才 rename；渲染或写入失败时目标文件逐字节不变，临时文件被清理
+- **错误分类**：服务端持久化 / IO 失败（读现有文件、`metadata`、写临时文件、`set_permissions`、`sync_all`、`rename`）→ `AppError::Internal`（通用响应 500 / `INTERNAL_ERROR`）；候选配置自身的问题（校验、内存序列化）→ `AppError::Config`（通用响应 500 / `CONFIG_ERROR`，管理面 handler 显式重映射为 HTTP 400）
 
 ### 出站代理
 
