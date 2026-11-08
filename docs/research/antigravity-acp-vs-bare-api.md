@@ -2,7 +2,7 @@
 
 > **调研日期**：2026-11-08（北京时间 / UTC 同日）
 > **面向**：SAG（Smart AI Gateway）接入决策
-> **续篇**：承接 [把 agent 客户端协议转成 OpenAI 兼容 API：限制全景与 Antigravity 深挖](./acp-to-api-antigravity.md)（下称「首份报告」）。本文只做**两条具体路线**的对比，不重复首份报告已展开的通用限制；凡标「详见首份报告 §x」者不再复述。
+> **续篇**：承接 [Antigravity 的合规边界与合规路径限制：官方 ACP 路线与官方 API key 替代](./acp-to-api-antigravity.md)（下称「首份报告」，v2 合规重构版）。本文只做**两条具体路线**的对比，不重复首份报告已展开的通用限制；凡标「见首份报告 ……」者不再复述。
 > **时效性说明**：本文涉及的对象处于**日更级**变动状态。`agy` CLI 在 2026-11-04 ~ 11-07 三天内发了 1.5.0 / 1.5.1 / 1.5.3 三个版本；政策文本与 release note 之间已出现**互相矛盾**（见 §3.1、§7 第 1 条）。**本文结论的有效期不超过 30 天**，任何「模型范围」「政策口径」判断在使用前必须重读一手页面。
 > **标注约定**：`[官方]` = Google 一手文档 / release note / 论坛官方回复；`[协议]` = agentclientprotocol.com 规范原文；`[项目]` = 转换层或客户端项目自述 / issue / PR；`[社区]` = 用户帖（附可信度）；`未验证` = 无法交叉核实，不得当作确定事实使用。
 
@@ -28,14 +28,14 @@
 | 5 | **工具语义** | **方向相反**：agent 自己执行工具，客户端只收到 `tool_call_update` 展示流；唯一注入通道是 MCP（实测有坑） | 原生 `functionDeclarations`，语义与 OpenAI `tools` 一致（但有 schema 子集 + 签名链约束） |
 | 6 | **多模态** | 图片上下文可用；媒体类工具结果在 1.4.5 上退化成文本（registry #741） | base64 inline 可用；长会话中会被压缩逻辑直接丢弃 |
 | 7 | **usage / 计量** | **硬缺失**（#1045 open，三种独立实测一致）→ 只能估算或填 0 | 部分有（`usageMetadata` + `cachedContentTokenCount`），但 `thoughtsTokenCount` 与 `reasoning_tokens` 不等价 |
-| 8 | **流式语义** | 逐 chunk 的 `session/update` 通知，**无 `finish_reason` 中间态**，只有终局 `stopReason` | Gemini 风格 SSE，可映射（已知 6 类转换缺陷，详见首份报告 §5.3.7） |
+| 8 | **流式语义** | 逐 chunk 的 `session/update` 通知，**无 `finish_reason` 中间态**，只有终局 `stopReason` | Gemini 风格 SSE，可映射（裸 API 侧 6 类转换缺陷明细已移出首份报告，见其「边界外的路线」） |
 | 9 | **会话所有权** | **服务端持有** `sessionId` + 历史（`session/load` 重放、`session/resume` 不重放）；与客户端 `messages[]` **双写** | 协议层无状态（每请求全量 `contents[]`），但需伪造「身份连续性」与签名链 |
 | 10 | **取消 / 中断** | RC01 上 `session/cancel` 返回 `-32601`，只能 teardown + `session/load`；1.5.1 才修 `cancelled` 语义 | 断连接即可 |
 | 11 | **审批语义** | `session/request_permission` 是**反向请求**，需人回答；Antigravity 还有 `interaction_` 提问滥用 → 无头网关**不可解** | 协议里**没有**这个位置（无审批概念） |
 | 12 | **运行成本** | ~1.5 GB 首次下载 + 冷启 5–6 s（Windows ~16 s）+ 常驻 ~327 MB RSS/进程 + stdio 单管道 | 一次 HTTPS 往返（网关自身开销仅数十 MB） |
 | 13 | **并发** | `session/prompt` 是长事务，业界实现普遍串行化（`one prompt per provider at a time`）；并发 = 多进程 = 内存线性增长 | 每请求独立，可水平扩展（受配额与账号粘性限制） |
 | 14 | **失效形态** | 二进制缺陷（SIGILL / 分块截断卡死 / stdin EOF 不退）+ 策略收紧 | 协议漂移（每月至少一次破坏性变更）+ 封号（凭证级 403） |
-| 15 | **对 SAG 的接入形态** | 子进程生命周期管理 + ACP 客户端实现 + MCP 桥 + 会话映射表 → **新增一类 provider 运行时** | 一个 OpenAI 兼容 `base_url` + headers/body overrides → **零新类型**（详见首份报告 §7.1） |
+| 15 | **对 SAG 的接入形态** | 子进程生命周期管理 + ACP 客户端实现 + MCP 桥 + 会话映射表 → **新增一类 provider 运行时** | 一个 OpenAI 兼容 `base_url` + headers/body overrides → **零新类型**（见首份报告「架构契合度」） |
 
 > 第 15 行本身就是结论的一半：**低成本接入的是不能接的那条，能接的那条要新造一整套运行时。**
 
@@ -66,9 +66,9 @@
 - **方法**：`POST /v1internal:loadCodeAssist`、`:fetchAvailableModels`、`:onboardUser`、`:generateContent`、`:streamGenerateContent?alt=sse`、`:countTokens`、`:retrieveUserQuotaSummary`。
 - **信封**：`{project, model, request:{contents, systemInstruction, generationConfig, tools}, userAgent, requestId}`，响应把 `GenerateContentResponse` 包在 `response` 字段下 —— `[项目]` [cortexkit/antigravity-auth `ANTIGRAVITY_API_SPEC.md`](https://github.com/cortexkit/antigravity-auth/blob/main/packages/opencode/docs/ANTIGRAVITY_API_SPEC.md)（v1.0，2025-12-13，Verified by Direct API Testing）。
 - **认证**：client_id `1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com`，scopes `cloud-platform`/`userinfo.email`/`userinfo.profile`/`cclog`/`experimentsandconfigs`，`POST https://oauth2.googleapis.com/token` 刷新（`expires_in≈3599`）—— `[项目]` [aphrody `auth.rs`](https://docs.rs/aphrody-antigravity/latest/src/aphrody_antigravity/auth.rs.html)。
-- **UA 是准入门槛不是装饰**：必须带 `{"metadata":{"ideType":"ANTIGRAVITY"}}` 才路由到 Antigravity tier，且上游按 UA **版本号** gate 模型可用性（同一 token 同一 payload，`2.2.1` → 404，`2.9.1` → 200）—— 详见首份报告 §4.3、§5.4.1。
+- **UA 是准入门槛不是装饰**：必须带 `{"metadata":{"ideType":"ANTIGRAVITY"}}` 才路由到 Antigravity tier，且上游按 UA **版本号** gate 模型可用性（同一 token 同一 payload，`2.2.1` → 404，`2.9.1` → 200）—— 见首份报告「边界外的路线」（该路线已按合规范围移出）。
 
-**生态事实**：首份报告 §4.5 盘点的 16 个项目里，**8 个**是这条路线（其余为 4 个本地 LS 桥接、2 个 CLI 包装、2 个凭证工厂）；`[项目]` [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（57,916★）与 [su-kaka/agy2api](https://github.com/su-kaka/agy2api)（5,318★）是其中的工程标杆。它们全部把这层翻译做完了——**这正是 B 路线「功能全」的来源：它是在逆向一个完整的 Gemini 协议面。**
+**生态事实**：同类项目的公开盘点里，**16 个项目中的 8 个**是这条路线（其余为 4 个本地 LS 桥接、2 个 CLI 包装、2 个凭证工厂）——该盘点已按合规范围移出首份报告（见其「边界外的路线」）；`[项目]` [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（57,916★）与 [su-kaka/agy2api](https://github.com/su-kaka/agy2api)（5,318★）是其中的工程标杆。它们全部把这层翻译做完了——**这正是 B 路线「功能全」的来源：它是在逆向一个完整的 Gemini 协议面。**
 
 ---
 
@@ -269,15 +269,15 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 
 ## 4. 裸 API 路线的限制（精炼复用）
 
-本节只列「与 A 路线形成对照」的骨架，**细节一律交叉引用首份报告，不再复述**。
+本节只列「与 A 路线形成对照」的骨架；**裸 API 侧的技术细节已按合规范围移出首份报告（其只保留「边界外的路线」范围声明），本节不再复述**。
 
-1. **ToS 明文禁止 + 点名工具**：§6 "Using third party software, tools, or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement."；FAQ 点名 Claude Code / OpenClaw / OpenCode，并建议改用 Vertex 或 AI Studio API key —— `[官方]` [Terms](https://antigravity.google/terms/)、[FAQ](https://www.antigravity.google/docs/faq/)。**详见首份报告 §5.1.1。**
-2. **封禁已到凭证级 + 服务级**：2026-11-06 `403 PERMISSION_DENIED / reason: TOS_VIOLATION`（带 `appeal_url`），**只封 Cloud Code 一个服务**，账号登录/token 刷新/模型目录/订阅全部正常；3 个凭证 2 个中招 —— `[项目]` [CLIProxyAPI #7296](https://github.com/router-for-me/CLIProxyAPI/issues/7296)。**详见首份报告 §5.1.2。**
-3. **多层检测**：TLS / JA3-JA4、会话头（`x-machine-id`、`x-vscode-sessionid`）、`requestId` 格式、`enabledCreditTypes`、`thought_signature`、设备指纹、**bootstrap 一致性**（OAuth 与 `loadCodeAssist` 的枚举/字符串不一致即可标记账号）—— `[项目]` [9router #1138](https://github.com/decolua/9router/issues/1138)（功能请求，清单**未验证**）。**详见首份报告 §5.1.3。**
-4. **假 429（内容级 WAF）**：`systemInstruction` 里含特定字面文本（`<system-conventions>` + RFC 2119 列表、`You are Codex, an agent based on GPT-5.`）→ 返回**假的** `429 RESOURCE_EXHAUSTED`，而配额完好、官方 App 同账号正常；插零宽字符即恢复 200 → 字面/词法级匹配 —— `[项目]` [CLIProxyAPI #5751](https://github.com/router-for-me/CLIProxyAPI/issues/5751)。**详见首份报告 §5.2.2。**
-5. **`thoughtSignature` 签名链**：多轮工具调用必须原样回传，任何改写即 400；只有「网关内维护签名存储」或「哨兵绕过」两条路 —— `[项目]` [Antigravity-Manager #3529](https://github.com/lbjlaq/Antigravity-Manager/issues/3529)、[CLIProxyAPI PR #3470](https://github.com/router-for-me/CLIProxyAPI/pull/3470)。**详见首份报告 §5.3.5。**
-6. **参数失真与静默降级**：Gemini 3.6 Flash 及之后 `temperature`/`topP`/`topK` **静默失效**、penalty 系列报错；`max_tokens` 硬顶 64000；模型被静默替换只给一行 warning —— `[官方]` [Content generation parameters](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/content-generation-parameters)（2026-11-07）。**详见首份报告 §5.2.3、§5.3.2。**
-7. **每月破坏性漂移**：UA 版本 gate（#5175）、字段白名单（#118）、端点身份绑定（#4749：consumer 只能打 `daily`）、模型下线日程（2026-11-18）—— 四类在 2026 年 2–11 月各至少发生一次。**详见首份报告 §5.4.1、§5.4.4。**
+1. **ToS 明文禁止 + 点名工具**：§6 "Using third party software, tools, or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement."；FAQ 点名 Claude Code / OpenClaw / OpenCode，并建议改用 Vertex 或 AI Studio API key —— `[官方]` [Terms](https://antigravity.google/terms/)、[FAQ](https://www.antigravity.google/docs/faq/)。**见首份报告「合规边界地图」§3.1 明文禁止区。**
+2. **封禁已到凭证级 + 服务级**：2026-11-06 `403 PERMISSION_DENIED / reason: TOS_VIOLATION`（带 `appeal_url`），**只封 Cloud Code 一个服务**，账号登录/token 刷新/模型目录/订阅全部正常；3 个凭证 2 个中招 —— `[项目]` [CLIProxyAPI #7296](https://github.com/router-for-me/CLIProxyAPI/issues/7296)。**见首份报告「合规边界地图」§3.1 明文禁止区（执法记录）。**
+3. **多层检测**：TLS / JA3-JA4、会话头（`x-machine-id`、`x-vscode-sessionid`）、`requestId` 格式、`enabledCreditTypes`、`thought_signature`、设备指纹、**bootstrap 一致性**（OAuth 与 `loadCodeAssist` 的枚举/字符串不一致即可标记账号）—— `[项目]` [9router #1138](https://github.com/decolua/9router/issues/1138)（功能请求，清单**未验证**）。**见首份报告「边界外的路线」（检测层明细已移出合规范围）。**
+4. **假 429（内容级 WAF）**：`systemInstruction` 里含特定字面文本（`<system-conventions>` + RFC 2119 列表、`You are Codex, an agent based on GPT-5.`）→ 返回**假的** `429 RESOURCE_EXHAUSTED`，而配额完好、官方 App 同账号正常；插零宽字符即恢复 200 → 字面/词法级匹配 —— `[项目]` [CLIProxyAPI #5751](https://github.com/router-for-me/CLIProxyAPI/issues/5751)。**见首份报告「边界外的路线」（该类指纹明细已移出合规范围）。**
+5. **`thoughtSignature` 签名链**：多轮工具调用必须原样回传，任何改写即 400；只有「网关内维护签名存储」或「哨兵绕过」两条路 —— `[项目]` [Antigravity-Manager #3529](https://github.com/lbjlaq/Antigravity-Manager/issues/3529)、[CLIProxyAPI PR #3470](https://github.com/router-for-me/CLIProxyAPI/pull/3470)。**见首份报告「边界外的路线」（签名链明细已移出合规范围）。**
+6. **参数失真与静默降级**：Gemini 3.6 Flash 及之后 `temperature`/`topP`/`topK` **静默失效**、penalty 系列报错；`max_tokens` 硬顶 64000；模型被静默替换只给一行 warning —— `[官方]` [Content generation parameters](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/capabilities/content-generation-parameters)（2026-11-07）。**见首份报告「边界外的路线」（参数失真明细已移出合规范围）。**
+7. **每月破坏性漂移**：UA 版本 gate（#5175）、字段白名单（#118）、端点身份绑定（#4749：consumer 只能打 `daily`）、模型下线日程（2026-11-18）—— 四类在 2026 年 2–11 月各至少发生一次。**见首份报告「边界外的路线」（漂移明细已移出合规范围）。**
 
 **一句话**：B 路线的每一条限制**都能在代码里绕过去**（代价是持续工程投入），但**没有一条能在政策上被容忍**。
 
@@ -331,7 +331,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 |---|---|---|
 | 历史权威方 | **服务端**（`sessionId` + SQLite `conversations/<id>.db`）；`session/load` 重放全文 | **协议无状态**：每次全量 `contents[]` |
 | 双写问题 | **有**：客户端 `messages[]` 与 ACP 历史并存，不一致即二选一 | **无协议级双写**，但有「身份连续性伪造」问题（session key + 粘性账号） |
-| 上下文丢失来源 | 客户端侧 compaction / pre-flight truncation（首份报告 §5.3.4）；ACP 侧 compaction 事件 OpenAI 无对应位 | 网关侧压缩逻辑 + 签名链断裂 + 上游 1,048,576 硬上限 |
+| 上下文丢失来源 | 客户端侧 compaction / pre-flight truncation（见首份报告「边界外的路线」）；ACP 侧 compaction 事件 OpenAI 无对应位 | 网关侧压缩逻辑 + 签名链断裂 + 上游 1,048,576 硬上限 |
 | 恢复能力 | `session/resume` 不重放历史（1.5.0+），比 `load` 更适合无头 | 完全靠客户端全量重传 |
 | 会话堆积 | server 侧 SQLite 会话文件持续增长（"Never poll these DBs"） | 上游 trajectory 堆积（**未验证**是否有配额成本） |
 
@@ -348,7 +348,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 | 失效可观测性 | 进程退出码 / 挂住（需要 watchdog） | HTTP 403 / 假 429（需要分类器） |
 | 修复方式 | 等 Google 发版（5–6 天一发，但缺陷修复慢：SIGILL 与 #1045 都跨版本存在） | 自己打补丁（每月至少一次） |
 
-论述：**A 的成本是「每会话固定成本」，B 的成本是「持续军备投入」**。前者可预算但不可压缩，后者不可预算且随时可能整体归零。首份报告 §5.4.3 的量化信号（CLIProxyAPI 824 open issues / Antigravity-Manager 1,713 open issues）说明 B 的军备成本是结构性的、不收敛的；A 的成本则是**一台机器能跑几个会话**这种朴素算术。
+论述：**A 的成本是「每会话固定成本」，B 的成本是「持续军备投入」**。前者可预算但不可压缩，后者不可预算且随时可能整体归零。同类项目维护负担的量化信号（CLIProxyAPI 824 open issues / Antigravity-Manager 1,713 open issues；见首份报告「边界外的路线」）说明 B 的军备成本是结构性的、不收敛的；A 的成本则是**一台机器能跑几个会话**这种朴素算术。
 
 ### 5.6 可观测性
 
@@ -359,7 +359,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 | 请求可审计 | 只能看自己发的 JSON-RPC + server 日志（`--log-file`） | 自己的 HTTP 请求完全可见，但上游可能重写 |
 | 健康检查 | 需 watchdog 探进程 + `initialize` 往返 | 可探配额端点 / 模型目录端点 |
 
-论述：**这是 A 路线最被低估的短板**。SAG 的核心能力之一是「按 token 记账 / 按配额路由」（首份报告 §7.3 第 11、15 条），而 A 路线在这个能力上是**结构性缺失**：没有 usage 就没有账本，没有账本就没有配额路由。**这不是加个字段能补的，是上游没发。**
+论述：**这是 A 路线最被低估的短板**。SAG 的核心能力之一是「按 token 记账 / 按配额路由」（首份报告「SAG 合规接入评估」的适配假设），而 A 路线在这个能力上是**结构性缺失**：没有 usage 就没有账本，没有账本就没有配额路由。**这不是加个字段能补的，是上游没发。**
 
 ### 5.7 对 SAG 的接入形态差异
 
@@ -369,9 +369,9 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 | 与现有 `LlmProvider` trait 的契合 | **不契合**：ACP 是「一轮长事务 + 通知流」，不是「请求 → chunk 流」 | 契合：本质就是 SSE chunk 流 |
 | 4xx 语义映射 | JSON-RPC error → HTTP 需自定映射（`-32602` / `-32000` / `-32601`） | 上游 429/403 直接可得（但需五类分拣） |
 | 状态引入 | 会话（会话 ID 映射 + 历史双写）、进程（生命周期） | 会话粘性（账号绑定）+ 签名存储 |
-| 与首份报告 Tier 分层的对应 | 首份报告把 `agy acp`（仅 Gemini）放在 **Tier B**，对应本次的 A 路线 | 首份报告把 `v1internal` 直连放在 **Tier C**，对应本次的 B 路线 |
+| 与首份报告 Tier 分层的对应 | 首份报告把 `agy acp`（仅 Gemini）放在 **Tier B**，对应本次的 A 路线 | 首份报告把 `v1internal` 直连放在 **Tier C**（v2 已从合规评估中剔除），对应本次的 B 路线 |
 
-论述：**接入成本的差异与风险方向相反**——B 路线「零成本接入」恰恰是危险（它让一个随时 403 的上游看起来像正常上游，见首份报告 §7.1）；A 路线「高成本接入」反而构成一道天然门槛，但门槛后面是一个**功能不够用**的东西。
+论述：**接入成本的差异与风险方向相反**——B 路线「零成本接入」恰恰是危险（它让一个随时 403 的上游看起来像正常上游，见首份报告「架构契合度」）；A 路线「高成本接入」反而构成一道天然门槛，但门槛后面是一个**功能不够用**的东西。
 
 ---
 
@@ -380,7 +380,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 ### 6.1 两条路线都不是「正经 provider」
 
 - **A 官方 ACP 路线**：合规，但**功能阉割 + 成本高 + 语义翻译伤筋动骨**。要接它，等于在 SAG 里内嵌「一个 ACP 客户端 + 一个 MCP 桥 + 一套会话状态机 + 一个进程看护器」，而换来的能力是「Gemini 文本 + agent 自执行工具（SAG 看不见）+ 无 usage」。**它更像「把 Antigravity 这个 agent 产品代理出来」，而不是「接一个模型 provider」。**
-- **B 裸 API 路线**：功能全、成本低、语义最近，但**政策上是死路**（§6 + FAQ + 凭证级封禁 + 每月漂移）。技术可行性从来不缺——首份报告 §4.5 的 16 个项目已证明这一点——缺的是「可以承诺」。
+- **B 裸 API 路线**：功能全、成本低、语义最近，但**政策上是死路**（§6 + FAQ + 凭证级封禁 + 每月漂移）。技术可行性从来不缺——同类项目的公开盘点早已证明这一点（明细见首份报告「边界外的路线」）——缺的是「可以承诺」。
 
 ### 6.2 若必须选：场景化建议
 
@@ -390,7 +390,7 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 | **个人自用 + 想要 Claude/GPT** | **不建议走任何一条** | A 需伪装 client 名（政策高危且 1.4.5 未验证）；B 是明文 breach 且已有凭证级封禁案例。**此时正确做法是买 Claude / OpenAI 官方 key** |
 | **团队内部工具 / 多人共享一个额度** | **不建议 A**：单用户交互式开发是许可前提，多人共享直接越界；**B 明确违规** | 11-02 答复的条件是 "single-user interactive development" |
 | **任何对外服务 / 需要 SLA / 需要计费** | **两条都别接**，走 **Vertex AI / AI Studio API key**（`gemini-api-key` auth method 也存在于 A 路线的合法选项里） | 只有 key 路线能承诺 SLA、能给准确 usage、不怕封号。这也是 Google 自己在 FAQ 里给的唯一建议 |
-| **研究/实验通道（自建、不对外）** | B 路线可作 **Tier C 可弃实验通道**，与合规通道硬隔离 | 首份报告 §7.2 的分层建议仍成立 |
+| **研究/实验通道（自建、不对外）** | B 路线可作 **Tier C 可弃实验通道**，与合规通道硬隔离 | 首份报告「合规分层」的分层框架仍可参照（其中 Tier C 已按合规范围移出） |
 
 ### 6.3 与首份报告 Tier 分层的衔接
 
@@ -398,13 +398,13 @@ def supports_third_party_models(client: client_info_lib.ClientInfo) -> bool:
 |---|---|---|
 | **Tier A**（可承诺 SLA） | 不涉及 | 唯一出口：Vertex / AI Studio key；或用 A 路线的 `gemini-api-key` / `agent-platform` auth method（此时不再是「订阅额度转换」，而是正当的 key 通道） |
 | **Tier B**（可提供但不承诺） | **A 官方 ACP** | 新增判据：①usage 全缺 → 无法计费；②工具语义反 → 无法承诺 `tools`；③进程级失败模式 → 需 watchdog；④模型范围政策限 Gemini。**结论：只适合「单用户 + Gemini 文本 + 不需计费」这一极窄场景。** |
-| **Tier C**（仅自用/研究） | **B 裸 API** | 判据不变（首份报告 §7.2）。新增证据：2026-11-06 凭证级 `TOS_VIOLATION` 已把「账号还在」这个健康信号打掉。 |
+| **Tier C**（仅自用/研究） | **B 裸 API** | 判据不变（首份报告「合规分层」）。新增证据：2026-11-06 凭证级 `TOS_VIOLATION` 已把「账号还在」这个健康信号打掉。 |
 
 ### 6.4 三条不可妥协的判断
 
 1. **不要在 A 路线上冒充 `clientInfo.name`。** 技术上可行（#1318 已验），但那是把「官方明文 permitted」换成「官方明文限 Gemini 之外的越界」，把唯一一条合规路线的合规性自己拆掉。
 2. **不要在 B 路线上承诺任何 SLA 或计费。** 凭证级封禁 + 假 429 + 静默降级三者叠加，使得「失败」与「成功但降级」都不可观测。
-3. **不要把两条路线混在同一个 `/v1/models` 列表里。** 它们的 SLA、ToS、可撤销性、能力面完全不同（首份报告 §7.3 第 16 条）。若要同池，必须按「通道来源」打标并暴露在响应头。
+3. **不要把两条路线混在同一个 `/v1/models` 列表里。** 它们的 SLA、ToS、可撤销性、能力面完全不同（首份报告「SAG 合规接入评估」的适配假设第 10 条）。若要同池，必须按「通道来源」打标并暴露在响应头。
 
 ---
 
@@ -487,7 +487,7 @@ R4 的 7 条 + 本轮新增 5 条。**特别地，第 1 条是本报告最重要
 - `[社区]` [discuss #189880](https://discuss.ai.google.dev/t/windows-acp-server-1-4-0-remains-running-after-stdin-eof/189880)（stdin EOF 不退出）
 - `[社区]` [discuss #196254](https://discuss.ai.google.dev/t/acp-sessions-become-permanently-wedged-with-502-the-model-is-currently-unreachable-while-fresh-sessions-succeed/196254)（502 后会话永久卡死）
 
-### 8.6 B 路线（细节见首份报告 §9）
+### 8.6 B 路线（细节见首份报告 §10 来源清单与「边界外的路线」）
 
 - `[项目]` [cortexkit/antigravity-auth — ANTIGRAVITY_API_SPEC.md](https://github.com/cortexkit/antigravity-auth/blob/main/packages/opencode/docs/ANTIGRAVITY_API_SPEC.md)（v1.0，2025-12-13）
 - `[项目]` [aphrody-antigravity — endpoints.rs](https://docs.rs/aphrody-antigravity/latest/src/aphrody_antigravity/endpoints.rs.html) / [auth.rs](https://docs.rs/aphrody-antigravity/latest/src/aphrody_antigravity/auth.rs.html)
@@ -499,7 +499,7 @@ R4 的 7 条 + 本轮新增 5 条。**特别地，第 1 条是本报告最重要
 
 ### 8.7 SAG 本仓库（前序报告，非外部来源）
 
-- [docs/research/acp-to-api-antigravity.md](./acp-to-api-antigravity.md) —— 首份报告，§2 术语澄清、§5 限制全景、§7 SAG 评估框架与 Tier 分层
+- [docs/research/acp-to-api-antigravity.md](./acp-to-api-antigravity.md) —— 首份报告（v2 合规重构），§2 术语澄清、§3 合规边界地图、§4 合规路径 A、§8 SAG 合规接入评估
 
 ---
 
@@ -507,8 +507,8 @@ R4 的 7 条 + 本轮新增 5 条。**特别地，第 1 条是本报告最重要
 
 | 主题 | 首份报告 | 本报告 |
 |---|---|---|
-| 「ACP」三重撞名 | §2 详解 | 引用（§2.1 / §2.2） |
-| 通用限制（ToS、429、签名、参数、漂移） | §5 详解 | §4 精炼 + 交叉引用 |
-| 官方 ACP 路线的内部构造 | 只到「仅 Gemini + 交互式权限」 | **§3 深挖主体**（模型白名单、14 种 update、工具执行方向、usage、认证运行、成本、二进制缺陷、合规现状） |
+| 「ACP」三重撞名 | §2 术语澄清 | 引用（§2.1 / §2.2） |
+| 通用限制（ToS、429、签名、参数、漂移） | §3 合规边界地图 + 裸 API 侧明细已移出（见「边界外的路线」） | §4 精炼 + 交叉引用 |
+| 官方 ACP 路线的内部构造 | §4 合规路径 A（模型范围、协议语义、认证运行、成本、二进制缺陷） | **§3 深挖主体**（模型白名单、14 种 update、工具执行方向、usage、认证运行、成本、二进制缺陷、合规现状） |
 | 双路线逐维度对比 | 无 | **§5** |
-| Tier 分层 | §7.2 提出 | §6.3 衔接并补充判据 |
+| Tier 分层 | §8.2「合规分层」提出 | §6.3 衔接并补充判据 |
