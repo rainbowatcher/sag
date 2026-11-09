@@ -114,6 +114,17 @@ Responses API 与 Anthropic Messages API 的请求体/响应体由 `sag_core::ap
 - `Some(n)`：超过 `n` 秒无数据 → 断开连接，返回超时错误
 - 仅对流式请求生效；非流式请求使用 `timeout_secs`
 
+### 原生流式透传（SSE 帧边界）
+
+原生透传车道（Anthropic → Anthropic、Responses → Responses）由 provider 自行转发上游帧，不经 codec / IR。切帧之后如何包装帧，按以下判据：
+
+- **仅适用于按分隔符切出的完整帧**：以 `data:` / `event:`（字段行）或 `:`（注释行）开头的帧按 SSE 原样转发，只补齐缺失的 `\n\n` 帧尾，不添加任何前缀
+- 其余完整帧视为裸数据（既有兼容语义），补 `data: ` 前缀与 `\n\n` 帧尾
+- SSE 注释（上游 keepalive / heartbeat，如 `: ping`）必须保持注释形态，禁止改写为 `data: : ping` —— 那会让客户端把它当成 payload 非 JSON 的 data 事件
+- 帧边界 `\n\n` 与 `\r\n\r\n` 都识别；转发的帧统一以 `\n\n` 收尾
+- **EOF 尾包是例外**：连接关闭时 buffer 里不足一个完整帧的残留（含无分隔符的裸 JSON 尾包与 `: tail` 注释尾包）原样发出，只补 `\n\n`，一律不加 `data: ` 前缀
+- `id:` / `retry:` 字段行暂无专门的透传约定（不属本判据范围）
+
 ### Provider 禁用
 
 `enabled = false` 时：
@@ -152,6 +163,7 @@ Responses API 与 Anthropic Messages API 的请求体/响应体由 `sag_core::ap
 
 ## 变更记录
 
+- [0011 原生流式车道保留 SSE 注释帧](changes/0011-sse-comment-passthrough.md)
 - [0010 Responses 流式 item 载荷保真与已知 bookkeeping 帧不外泄](changes/0010-responses-stream-item-payload-fidelity.md)
 - [0009 Responses 流式终点帧按 finish reason 区分 `response.incomplete`](changes/0009-responses-incomplete-terminal-event.md)
 - [0008 Responses / Anthropic 请求响应体 typed 化（无损透传）](changes/0008-typed-wire-dtos-responses-anthropic.md)

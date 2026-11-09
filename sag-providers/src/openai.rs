@@ -423,13 +423,12 @@ impl OpenAiProvider {
         // The reader outlives this call: attach the provider/model span so
         // its chunk-read errors stay correlatable with the request.
         spawn_in_current_span(async move {
-            use crate::util::find_sse_boundary;
             let mut byte_stream = response.bytes_stream();
             let mut buffer: Vec<u8> = Vec::new();
             let mut had_error = false;
 
             // Returns true when the frame carried an in-stream error.
-            let extract_side_channel = |frame: &[u8]| -> bool {
+            let mut extract_side_channel = |frame: &[u8]| -> bool {
                 let mut saw = false;
                 let text = String::from_utf8_lossy(frame);
                 for line in text.lines() {
@@ -486,40 +485,12 @@ impl OpenAiProvider {
                     Ok(Some(Ok(chunk))) => {
                         trace!(received_bytes = chunk.len(), "received responses SSE chunk");
                         buffer.extend_from_slice(&chunk);
-                        while let Some(end) = find_sse_boundary(&buffer) {
-                            let frame: Vec<u8> = buffer.drain(..end).collect();
-                            let delim_len = if buffer.starts_with(b"\r\n\r\n") {
-                                4
-                            } else {
-                                2
-                            };
-                            buffer.drain(..delim_len);
-                            if extract_side_channel(&frame) {
-                                had_error = true;
-                            }
-                            // Forward the raw Responses frame (native lane).
-                            let data =
-                                if frame.starts_with(b"data:") || frame.starts_with(b"event:") {
-                                    let mut data = frame;
-                                    if !data.ends_with(b"\n\n") {
-                                        data.extend_from_slice(b"\n\n");
-                                    }
-                                    data
-                                } else {
-                                    let mut data = b"data: ".to_vec();
-                                    data.extend_from_slice(&frame);
-                                    data.extend_from_slice(b"\n\n");
-                                    data
-                                };
-                            if !tx.is_closed() {
-                                let _ = tx.send(StreamChunk::Data(data));
-                            }
-                            if had_error {
-                                buffer.clear();
-                                break;
-                            }
-                        }
-                        if had_error {
+                        if drain_responses_native_frames(
+                            &mut buffer,
+                            &tx,
+                            &mut extract_side_channel,
+                        ) {
+                            had_error = true;
                             break;
                         }
                     }
@@ -562,6 +533,68 @@ impl OpenAiProvider {
             rx.recv().await.map(|chunk| (chunk, rx))
         });
         Ok(Box::pin(stream))
+    }
+}
+
+/// Emit every complete SSE frame buffered for the native Responses lane,
+/// leaving a trailing partial frame in `buffer`.
+///
+/// This is the frame-drain seam of the read loop: the loop only appends
+/// upstream bytes to `buffer` before draining, so feeding one piece at a time
+/// reproduces any upstream chunk segmentation exactly (deterministic unit
+/// coverage — a TCP mock cannot pin where hyper splits the body).
+///
+/// Returns true when a frame carried an in-stream error; the caller then aborts
+/// the stream.
+fn drain_responses_native_frames(
+    buffer: &mut Vec<u8>,
+    tx: &mpsc::UnboundedSender<StreamChunk>,
+    extract_side_channel: &mut impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let mut had_error = false;
+    while let Some(end) = crate::util::find_sse_boundary(buffer) {
+        let frame: Vec<u8> = buffer.drain(..end).collect();
+        let delim_len = if buffer.starts_with(b"\r\n\r\n") {
+            4
+        } else {
+            2
+        };
+        buffer.drain(..delim_len);
+        if extract_side_channel(&frame) {
+            had_error = true;
+        }
+        let data = wrap_responses_native_frame(frame);
+        if !tx.is_closed() {
+            let _ = tx.send(StreamChunk::Data(data));
+        }
+        if had_error {
+            buffer.clear();
+            break;
+        }
+    }
+    had_error
+}
+
+/// Wrap one complete SSE frame for the native Responses passthrough lane.
+///
+/// A frame is already SSE when it starts with a field line (`data:` /
+/// `event:`) or is an SSE comment (`:<text>` — upstream keepalive /
+/// heartbeat): forward it as-is, adding only a missing `\n\n` frame
+/// terminator. Anything else is bare data (legacy compatibility) and gets the
+/// `data: ` prefix. Wrapping a comment would turn `: ping` into a data event
+/// whose payload is not JSON, destroying the comment.
+fn wrap_responses_native_frame(frame: Vec<u8>) -> Vec<u8> {
+    if frame.starts_with(b"data:") || frame.starts_with(b"event:") || frame.starts_with(b":") {
+        let mut data = frame;
+        if !data.ends_with(b"\n\n") {
+            data.extend_from_slice(b"\n\n");
+        }
+        data
+    } else {
+        let mut data = b"data: ".to_vec();
+        data.extend_from_slice(&frame);
+        data.extend_from_slice(b"\n\n");
+        data
     }
 }
 
@@ -772,6 +805,144 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "idle timeout should fire at ~1s, not wait for the connection close: {elapsed:?}"
+        );
+    }
+
+    /// Upstream SSE comments (`:<text>` — keepalives / heartbeats) are frames
+    /// of their own but carry no `data:` field. The native lane used to wrap
+    /// every frame that did not start with `data:` / `event:` in `data: `,
+    /// which turns `: keepalive` into `data: : keepalive` — a data event whose
+    /// payload is not JSON, so the comment is destroyed. Comments must be
+    /// forwarded as-is, and the neighbouring real events must stay untouched.
+    ///
+    /// The whole fixture is served in one write: the client-visible bytes must
+    /// not depend on where the socket/hyper splits the body. Chunk-boundary
+    /// behaviour is pinned deterministically by
+    /// [`responses_native_frame_drain_ignores_chunk_boundaries`].
+    #[tokio::test]
+    async fn responses_stream_native_preserves_sse_comment_frames() {
+        let created = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}";
+        let delta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}";
+        // CRLF-framed comment and event each have their terminator rewritten
+        // to `\n\n`; the trailing comment has no blank line before EOF and
+        // rides the tail-flush path.
+        let served = format!(": keepalive\n\n{created}\n\n: ping\r\n\r\n{delta}\r\n\r\n: tail");
+        let expected = format!(": keepalive\n\n{created}\n\n: ping\n\n{delta}\n\n: tail\n\n");
+        let served = served.into_bytes();
+
+        let base_url = spawn_server(move |mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.write_all(&served).await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = stream.shutdown().await;
+        })
+        .await;
+
+        let provider = openai_provider(&base_url, 30, None);
+        let mut stream = provider
+            .responses_stream_native(
+                serde_json::json!({"model": "gpt-4.1", "input": "hi"}),
+                &HashMap::new(),
+                "/responses",
+            )
+            .await
+            .expect("stream should be established");
+
+        let mut data = Vec::new();
+        let mut saw_done = false;
+        let mut saw_error: Option<String> = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Data(d) => data.extend_from_slice(&d),
+                StreamChunk::Error(msg) => saw_error = Some(msg),
+                StreamChunk::Done => saw_done = true,
+                StreamChunk::Usage(_) => {}
+            }
+        }
+
+        let forwarded = String::from_utf8(data).expect("forwarded frames are UTF-8");
+        assert!(
+            !forwarded.contains("data: :"),
+            "a comment frame must never be wrapped in `data: `, got: {forwarded:?}"
+        );
+        assert_eq!(
+            forwarded, expected,
+            "comments must stay comments and neighbouring events must stay events"
+        );
+        assert!(
+            saw_error.is_none(),
+            "no in-stream error expected: {saw_error:?}"
+        );
+        assert!(saw_done, "the stream must terminate with Done at EOF");
+    }
+
+    /// Deterministic chunk-boundary coverage for the native Responses lane.
+    ///
+    /// The read loop appends whatever the socket reader produced and then
+    /// calls [`drain_responses_native_frames`], so feeding pieces one at a time
+    /// pins the behaviour a TCP mock cannot guarantee (hyper may coalesce
+    /// writes). A frame must only be emitted once its delimiter arrived, a
+    /// comment split mid-text must never gain a `data: ` prefix, and bare data
+    /// keeps its legacy prefix.
+    #[test]
+    fn responses_native_frame_drain_ignores_chunk_boundaries() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut extract_side_channel = |_: &[u8]| false;
+
+        let pieces: Vec<&[u8]> = vec![
+            b": keep",
+            b"alive\n",
+            b"\n",
+            b"data: {\"type\":\"response.created\"",
+            b"}\n",
+            b"\n",
+            b": pi",
+            b"ng\r\n\r\n",
+            b"data: {\"type\":\"response.output_text.delta\"}\r\n\r\n",
+            b"{\"bare\":true}\n\n",
+        ];
+
+        // Frames emitted after each piece, in order. A frame spans no piece
+        // boundary here without its delimiter arriving first.
+        let expected_steps: Vec<&str> = vec![
+            "",
+            "",
+            ": keepalive\n\n",
+            "",
+            "",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "",
+            ": ping\n\n",
+            "data: {\"type\":\"response.output_text.delta\"}\n\n",
+            "data: {\"bare\":true}\n\n",
+        ];
+
+        for (piece, expected) in pieces.into_iter().zip(expected_steps) {
+            buffer.extend_from_slice(piece);
+            assert!(
+                !drain_responses_native_frames(&mut buffer, &tx, &mut extract_side_channel),
+                "this fixture carries no in-stream error"
+            );
+            let mut emitted = String::new();
+            while let Ok(chunk) = rx.try_recv() {
+                match chunk {
+                    StreamChunk::Data(d) => {
+                        emitted.push_str(std::str::from_utf8(&d).expect("data frames are UTF-8"))
+                    }
+                    other => panic!("unexpected chunk: {other:?}"),
+                }
+            }
+            assert_eq!(emitted, expected, "after piece {piece:?}");
+        }
+        assert!(
+            buffer.is_empty(),
+            "every complete frame must be drained, left: {buffer:?}"
         );
     }
 

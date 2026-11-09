@@ -228,6 +228,29 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - ❌ 两侧各多一份状态（编码器 5 个字段、解码器 2 个容器），`decode_stream_frame` 与 `stream_decoder` 并存需按场景选对入口
 - ❌ bookkeeping 白名单需随上游新增事件维护：漏登记的事件会以 `Raw` 外泄（这是有意选择的失败方向，便于发现）
 
+### 原生流式车道的帧包装判据
+
+两条原生透传流的读循环（`OpenAiProvider::responses_stream_native_inner` / `AnthropicProvider::messages_stream_native`）不再用「非 `data:` / `event:` 就包 `data: `」的二值判据，而是区分 SSE 帧与裸数据：
+
+| 决策 | 内容 |
+|------|------|
+| 三种「已是 SSE」形态 | `data:`（字段行）、`event:`（字段行）、`:`（注释行）全部原样转发；注释帧与字段行同等对待。判据只对**按分隔符切出的完整帧**生效 |
+| 裸数据兼容分支不变 | 仅当完整帧既非字段行也非注释时才补 `data: ` 前缀与 `\n\n` 帧尾 |
+| EOF 尾包例外 | 连接关闭时 buffer 里不足一个完整帧的残留（含裸 JSON 尾包与 `: tail` 注释尾包）原样发出、只补 `\n\n`，一律不加 `data: ` 前缀（既有行为，本次未改） |
+| 为什么注释不能包 | `data: : keepalive` 是一个 payload 非 JSON 的 data 事件，客户端的注释语义（keepalive / heartbeat）彻底丢失；上游的 `: OPENAI_PROCESSING` 一类心跳会被读成错误事件 |
+| 切帧不受影响 | `util.rs::find_sse_boundary` 同时识别 `\n\n` 与 `\r\n\r\n`，注释帧本就被正确切出；缺陷只在切帧后的包装步骤 |
+| 抽出 drain seam（每文件一份） | 读循环只把字节 append 进 `buffer`，切帧 + 包装移入同文件的 `drain_{responses,anthropic}_native_frames` / `wrap_{responses,anthropic}_native_frame`：测试可以逐片喂入字节，确定性地钉住跨 chunk 行为（TCP flush + sleep 无法保证 hyper 不合并分片）。两条车道各一份而不共享，避免把两种协议的旁路提取闭包也抽象进来 |
+| 帧尾统一 `\n\n` | CRLF 帧转发时保留帧内 `\r\n`、末尾改写为 `\n\n`（既有行为，本次未改） |
+| 不新增字段行透传 | `id:` / `retry:` 仍落在裸数据分支；未在缺陷范围内，不顺手扩展 |
+
+**Trade-off**：
+
+- ✅ 上游心跳 / keepalive 注释不再被改写为畸形的 data 事件，客户端可以继续用注释判断连接存活
+- ✅ 裸数据兼容语义（非 SSE 帧补 `data: `）逐字不变，旧上游无需改动
+- ✅ 判据只多一个前缀条件，两条车道对称，无需引入共享抽象
+- ❌ 判据仍是前缀匹配而不是完整的 SSE 解析：以 `:` 开头的裸数据（非 JSON，本就不可能）会被当注释转发；代价可接受
+- ❌ `id:` / `retry:` 仍无约定，如上游开始使用需另立变更
+
 ### 共享 HTTP client 连接池 idle 调优
 
 `build_http_client`（`sag-core/src/http_client.rs`，provider + admin 共享）在模块级写死连接池常量，用于降低 stale 连接复用导致的流中途 `peer closed connection without sending TLS close_notify`：
@@ -279,6 +302,7 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - 每个 item 的载荷恰好一次进入 IR：`response.output_item.done` 仅在无 delta 供过该 `output_index` 时作为唯一供给者，否则保持静默
 - 流式编码器关闭 item 时必须发完整载荷（`function_call` 带 `call_id` / `name` / `arguments`，`message` 带 `content`，`reasoning` 带 `summary`），终止帧的 `response.output` 不得写死 `[]`
 - 已知 Responses bookkeeping 事件解码为空事件而非 `Raw`；`Raw` 只留给无法归类的帧（非 JSON / 顶层 `error` / 无 `type` / 未知 `type`），不得加 catch-all 丢弃
+- 原生透传车道对**分隔符切出的完整帧**以 `data:` / `event:` / `:` 开头的必须原样转发（只补 `\n\n` 帧尾），SSE 注释不得被改写为 `data: : …`；其余完整帧仍按裸数据补 `data: ` 前缀；EOF 尾包是例外（原样发出、只补 `\n\n`）
 - provider 路径调用 `build_http_client` 时 `timeout: None`（无 client 级 total deadline）；**禁止**为 pool 调优回退 total `.timeout()`
 
 ## 测试策略
@@ -295,9 +319,12 @@ Provider 新增/编辑表单（`ProviderAddForm.vue` / `ProviderEditForm.vue`）
 - `sag-router/tests/{anthropic_messages_ingress,responses_ingress}.rs` — typed 形状不匹配 422（各自信封）、stateful 预检查先于 typed 解析；`responses_ingress_chat_upstream_stream_length_emits_response_incomplete` 钉 translated 整链终点帧（`length` → `response.incomplete` + `incomplete_details.reason = max_output_tokens`）
 - `sag-providers/src/codec/responses.rs` — 流式 item 载荷保真与 bookkeeping 不外泄：`output_item_done_carries_function_call_payload`（`done` 带 `arguments` / `call_id` / `name` 且 id 与 `added` 一致）、`response_completed_output_lists_all_items_in_index_order`（终止帧 `output` 按 `output_index` 升序列全）、`output_item_done_supplies_arguments_when_no_deltas`（无 delta 时 `done` 为唯一供给者）、`output_item_done_does_not_duplicate_streamed_deltas`（有 delta 时 `done` 静默）、`stream_roundtrip_encode_then_decode_delivers_arguments_once`（编解码整链 `arguments` 恰好一次）、`known_bookkeeping_events_yield_no_raw`（同一顺序解码器喂全部已知 bookkeeping 帧均为空）、`unknown_event_type_still_surfaces_as_raw`（未知 `type` 仍发 `Raw`）
 - `sag-core/src/types.rs` — `normalize_reasoning_effort` 单元测试
+- `sag-providers/src/openai.rs` / `sag-providers/src/anthropic.rs` — 原生车道帧包装：`responses_stream_native_preserves_sse_comment_frames` / `messages_stream_native_preserves_sse_comment_frames` 走完整 provider 路径（一次写入的 TCP mock），钉注释独立帧 + CRLF 帧边界 + EOF 尾包原样转发、相邻正常事件不被破坏、EOF 仍发 `Done`，并断言输出不含 `data: :`；`responses_native_frame_drain_ignores_chunk_boundaries` / `messages_native_frame_drain_ignores_chunk_boundaries` 直接喂 `drain_*_native_frames` 逐片字节，确定性地钉跨 chunk 行为（分隔符到达前不发帧、注释跨片不得加 `data: `、裸数据仍补前缀）
+- `sag-router/tests/protocol_matrix.rs` — 客户端可见响应体：`anthropic_native_passthrough_preserves_sse_comments` / `responses_native_passthrough_preserves_sse_comments` 断言整条客户端 body 与上游 fixture 逐字节相等，且 ``: keepalive`` / ``: ping`` / ``: OPENAI_PROCESSING`` 各出现一次、不含 `data: :`（下游任一层重包装即红）
 - `sag-core/src/http_client.rs` — `pool_connection_constants_match_plan`（钉住 pool 常量）、`pool_options_coexist_with_proxy_and_timeout`（pool 与 proxy/timeout 共存）
 
 ## 变更记录
+- [0011 原生流式车道保留 SSE 注释帧](changes/0011-sse-comment-passthrough.md)
 - [0010 Responses 流式 item 载荷保真与已知 bookkeeping 帧不外泄](changes/0010-responses-stream-item-payload-fidelity.md)
 - [0009 Responses 流式终点帧按 finish reason 区分 `response.incomplete`](changes/0009-responses-incomplete-terminal-event.md)
 - [0008 Responses / Anthropic 请求响应体 typed 化（无损透传）](changes/0008-typed-wire-dtos-responses-anthropic.md)

@@ -1925,3 +1925,127 @@ async fn anthropic_ingress_responses_upstream_malformed_frames_do_not_leak() {
         "exactly one message_stop: {text}"
     );
 }
+
+// ── native passthrough: SSE comment frames (keepalive / heartbeat) ──
+//
+// The provider unit tests pin the frame wrapper (`: ping` must never become
+// `data: : ping`) at the provider layer — they only observe `StreamChunk::Data`,
+// never a client body. These two pin the *client-visible body* on the
+// homogeneous lanes, so a re-wrap reintroduced downstream — by the IR bridge
+// or by the response body writer — fails here too.
+//
+// Not covered here: the privacy restore path. This file's gateway state uses
+// `sag_config::gateway_config_base!()`, whose `privacy` is
+// `PrivacyConfig::default()` (`enabled = false`), so dispatch builds no
+// `privacy_map` / `RestoreWriter` and the stream is written verbatim.
+
+/// Anthropic ingress × Anthropic upstream (native passthrough): the upstream
+/// keepalive comment reaches the client as a comment, with the client body
+/// byte-identical to the upstream fixture.
+///
+/// The fixture's `message_start` reports `output_tokens: 1` so the stream
+/// passes the pre-existing empty-response peek: `validate_stream_first_chunk`
+/// treats a `Usage` event with `completion_tokens == 0 && prompt_tokens > 0`
+/// as empty (502 before the response is committed), and the provider's usage
+/// side channel turns `message_start` into such a `Usage` event. An upstream
+/// start frame reporting `output_tokens: 0` therefore hits that guard; that
+/// pre-existing behaviour is out of scope for the SSE-comment fix and is NOT
+/// fixed here — this test only pins comment fidelity past that guard.
+#[tokio::test]
+async fn anthropic_native_passthrough_preserves_sse_comments() {
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        ": keepalive\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        ": ping\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let served = sse.to_string();
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = served.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::Anthropic).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(messages_request(messages_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, StatusCode::OK, "body: {text}");
+
+    assert!(
+        !text.contains("data: :"),
+        "a comment must never reach the client wrapped in `data: `: {text}"
+    );
+    assert_eq!(
+        text.matches(": keepalive").count(),
+        1,
+        "the keepalive comment must reach the client exactly once: {text}"
+    );
+    assert_eq!(
+        text.matches(": ping").count(),
+        1,
+        "the heartbeat comment must reach the client exactly once: {text}"
+    );
+    assert_eq!(
+        text, sse,
+        "the native lane must forward the upstream frames verbatim: {text}"
+    );
+}
+
+/// Responses ingress × Responses upstream (native passthrough): same contract
+/// for the Responses lane.
+#[tokio::test]
+async fn responses_native_passthrough_preserves_sse_comments() {
+    let sse = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        ": keepalive\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n",
+        ": OPENAI_PROCESSING\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n",
+    );
+    let served = sse.to_string();
+    let (base_url, _req_rx) = spawn_server_capturing(move |mut stream| {
+        let served = served.clone();
+        async move {
+            respond_sse(&mut stream, &served).await;
+        }
+    })
+    .await;
+
+    let state = build_state(&base_url, "mx-key", Upstream::ResponsesExplicit).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(responses_request(responses_stream_body(), "mx-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        !text.contains("data: :"),
+        "a comment must never reach the client wrapped in `data: `: {text}"
+    );
+    assert_eq!(
+        text.matches(": keepalive").count(),
+        1,
+        "the keepalive comment must reach the client exactly once: {text}"
+    );
+    assert_eq!(
+        text.matches(": OPENAI_PROCESSING").count(),
+        1,
+        "the upstream heartbeat comment must reach the client exactly once: {text}"
+    );
+    assert_eq!(
+        text, sse,
+        "the native lane must forward the upstream frames verbatim: {text}"
+    );
+}
