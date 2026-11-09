@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-11-03
+updated: 2026-11-09
 ---
 
 # UI 管理面板 — 规格
@@ -66,6 +66,7 @@ updated: 2026-11-03
 - [sag-ui/src/lib/utils.ts](../../../sag-ui/src/lib/utils.ts) — `cn()`、`getErrorMessage()`、`formatDuration()`、`successRateColor()`
 - [sag-ui/src/lib/targetPicker.ts](../../../sag-ui/src/lib/targetPicker.ts) — Target 浮窗的纯选择逻辑：`provider+model` 集合键、分组构建（含禁用/orphan）、搜索过滤、勾选集合 ↔ target 行的 diff 与合并（type-only import，可被 node test runner 直接加载）
 - [sag-ui/src/lib/apis-catalog.ts](../../../sag-ui/src/lib/apis-catalog.ts) — API 目录的纯函数：`catalogToDrafts(apis, order)`（基底 → 按 order 排布的有序草稿，只为 `apis` 中**已存在**的 kind 生成草稿，缺节点不补）、`draftsToCatalog(drafts, base, order)`（保真回写——`order` 内 key 由草稿决定（草稿没有则删除，`base` 无法复活），基底中不在 order 里的键原样透传，保真、不改入参）。保真是 **key 级**的：`apis` 目录中 UI 未管理的 key 原样透传；section **内部字段**以编辑器渲染的为准，`ApiConfig.model_strip_fields` 目前不在编辑器字段集中（既有行为，非本轮引入，后续单独修）
+- [sag-ui/src/lib/routePipeline.ts](../../../sag-ui/src/lib/routePipeline.ts) — route `pipeline` 相关的纯判定 / 载荷构造层，`RouteAddForm` 与 `RouteEditForm` 共用：`PIPELINES`（`as const satisfies readonly Pipeline[]`，三值单一来源）、`isPipeline`（DOM / API 值收窄）、`showsApiEndpoint`（仅 `image` 为真）、`supportsSessionSticky`（仅 `systemone` 为假）、`pipelineSwitchReset(to, strategy)`（切换 pipeline 时需改写的字段：非 image 清 endpoint，非 session-sticky 支持者清两个会话字段且 `session_sticky` 回退 `sticky_failover`；**缺键 = 不动**）、`createEndpointField`（非 image 返回 `{}`，即省略 key）、`updateEndpointField`（非 image 返回 `null`，triple-state patch 的「清除」形态）
 - [sag-ui/src/lib/sessionAffinity.ts](../../../sag-ui/src/lib/sessionAffinity.ts) — 会话 pin 的纯函数：`shortSessionKey(key, length = 8)`（展示前缀，删除仍用全量 key）、`isPinActive(entry)`（`expires_in_secs === null || > 0` 为活跃）、`sortPins(entries)`（活跃组在前、组内 stable，返回新数组不改入参）、`mergeSessionEntries(prev, incoming, model?)`（共享 store 的换桶语义：`model` 未指定时整体替换、给定则只替换该 model 的桶并保留其他行数据，返回新数组不改入参）、`errorForModel(errors, model)`（按 fetch 作用域取值：`Object.hasOwn(errors, model)` 为真时返回 `errors[model]`、否则 `null`——`""` 是全量拉取的作用域键，只被全量视图读取；必须用 `Object.hasOwn` 而非裸取值，裸 `errors[model]` 会走原型链，模型名恰好是 `constructor` / `toString` 时会把 `Function` 当错误文案渲染）、`loadingForModel(loading, model)`（按 fetch 作用域取在途标志：`Object.hasOwn(loading, model)` 为真时返回 `loading[model]`、否则 `false`，与 `errorForModel` 对称；裸 `loading[model] ?? false` 同样会走原型链，`constructor` / `toString` 会拿到非 `nullish` 的 `Function`，`?? false` 不生效、该行 loading 恒真）；同 targetPicker 一样可被 node test runner 直接加载
 - [sag-ui/src/lib/settingsTabs.ts](../../../sag-ui/src/lib/settingsTabs.ts) — 设置 tab 的顺序单一来源（`value` 即 `?tab=`，`DEFAULT_SETTINGS_TAB = "network"`）；`SidebarNav` 复用同一 `SETTINGS_TABS`，隐私入口因此没有单独的导航代码
 - [sag-ui/src/lib/privacyConfig.ts](../../../sag-ui/src/lib/privacyConfig.ts) — 隐私表单纯逻辑：`createPrivacyDraft`（快照 → 草稿，深拷贝、`newSalt` 恒空）、`getPrivacyChanges`（逐字段 dirty）、`validatePrivacyDraft`（只判必填，按行 id）、`buildPrivacyPayload`（整节 payload，去 UI 行 id 与 `salt_configured`）
@@ -271,28 +272,41 @@ flowchart TD
 - ✅ 失败时回滚到旧列表，用户无感
 - ❌ 删除期间如果 API 成功但列表未刷新（其他数据变更），回滚逻辑只会恢复本地快照（实际上 `fetchRoutes()` 在成功后触发刷新，副作用可控）
 
-### 路由策略字段：只有格式校验 + 两条组合规则，其余留给后端
+### 路由策略字段：只有格式校验 + 三条组合规则，其余留给后端
 
 （本节为 0009 修订后的实态；原口径「组合规则完全留给后端」见 [0009 changefile](changes/0009-session-affinity-pins-and-log-session-column.md) 与 requirements.md 里保留的旧条目。）
 
-`RouteAddForm` / `RouteEditForm` 校验两个会话参数的**格式**（TTL `^\d+$`、容量 `^[1-9]\d*$`），且仅当 `strategy === "session_sticky"` 时生效；另加两条对象级 `.refine`，与后端 `sag-config/src/config.rs` 的 `validate_routes` 等价：
+`RouteAddForm` / `RouteEditForm` 校验两个会话参数的**格式**（TTL `^\d+$`、容量 `^[1-9]\d*$`），且仅当 `strategy === "session_sticky"` 时生效；另加三条对象级 `.refine`，与后端 `sag-config/src/config.rs` 的 `validate_routes` 等价：
 
 | 组合 | 错误挂载字段 | i18n key | 通配判定来源 |
 |------|-------------|----------|-------------|
 | `model_name = "*"` × `session_sticky` | `strategy` | `routes.form.wildcardSessionStickyUnsupported` | 新建：`model_name`，空时回退到首个 target 的 `real_model`；编辑：`props.route.model_name` |
 | `session_sticky` × `pipeline = "image"` | `pipeline` | `routes.form.imageSessionStickyUnsupported` | — |
+| `session_sticky` × `pipeline = "systemone"`（0016） | `pipeline` | `routes.form.systemoneSessionStickyUnsupported` | — |
 
 其余组合规则（容量为 `0` 等）仍不在前端复现，提交后由 `GatewayConfig::validate` → `validate_routes` 拒绝，400 消息经表单顶部错误条原文展示。
 
+### pipeline 三值与互斥字段（0016）
+
+`Pipeline` 为 `"chat" | "image" | "systemone"`（与后端 serde 名逐字对齐），两个表单的 schema 都写 `z.enum(PIPELINES)`，不再手写字面量数组。`pipeline` 决定三个字段的显示 / 清空 / 载荷，规则一律从 `lib/routePipeline.ts` 取，组件只做绑定：
+
+| 字段 | 显示 / 可编辑 | 切到其它 pipeline 时 | 提交形态 |
+|------|--------------|---------------------|----------|
+| `api_endpoint` | 仅 `image` 显示输入框（`showsApiEndpoint`） | 离开 image：输入框清空（`pipelineSwitchReset` → `api_endpoint: ""`） | 创建：非 image **省略 key**（`createEndpointField` → `{}`）；编辑：非 image 发**显式 `null`**（`updateEndpointField`，triple-state 的「清除」） |
+| `strategy` | 总是显示；`session_sticky` 选项在 `systemone` 下 `disabled` | 切到 `systemone` 时若当前为 `session_sticky` 则强制回退 `sticky_failover` | 正常提交；由第三条 `.refine` 兜底 |
+| `session_ttl_secs` / `session_max_entries` | 仅 `session_sticky` 显示 | 切到 `systemone` 时两个输入一并清空 | 仅当 `strategy === "session_sticky" && supportsSessionSticky(pipeline)` 时并入 payload，否则**永不下发** |
+
+`.refine` 是兜底而非主路径：`pipelineSwitchReset` 覆盖正常交互（切换时改字段），`.refine` 覆盖绕过 `onPipelineChange` 的程序化设值。两处都不得退化为「只靠后端 400」。
+
 **Trade-off**:
-- ✅ 两条最容易踩、且**无法从配置上修复**的组合（通配路由的 space 键域无界、image 管线不做会话写回）在表单里就地拦住，不再多一次 400 往返
+- ✅ 三条最容易踩、且**无法从配置上修复**的组合（通配路由的 space 键域无界、image 与 systemone 管线不做会话写回）在表单里就地拦住，不再多一次 400 往返
 - ✅ 前端文案能说清「该换成什么」：通配提示改为「为每个模型单独配置路由，或改用其他策略」，image 提示列出可用策略（后端 400 只报违规事实）
-- ✅ 仍只镜像两条规则：其余约束仍单源于后端，不会因前端漏同步而产生「前端放过/后端拒绝」以外的两套真相
-- ❌ 规则有了两个实现（Rust + Zod refine）：后端放宽或收紧时前端必须同步修改，否则会出现「前端拒绝、后端已放宽」——缓解手段是两句 `.refine` 旁写死对应的后端出处注释
+- ✅ 仍只镜像三条规则：其余约束仍单源于后端，不会因前端漏同步而产生「前端放过/后端拒绝」以外的两套真相
+- ❌ 规则有了两个实现（Rust + Zod refine）：后端放宽或收紧时前端必须同步修改，否则会出现「前端拒绝、后端已放宽」——缓解手段是三条 `.refine` 旁写死对应的后端出处注释
 - ❌ 通配判定未做 `trim()`：`model_name = " * "` 这类首尾空白的值前端会放过（后端仍会拒），已作为已知 minor 记在 0009 的评审结论里
 - ❌ 两个表单的错误渲染风格不一致：新建表单用 `FieldError`（与其它字段一致），编辑表单的 pipeline 字段用内联 `<p class="text-destructive">`，也是已知 minor
-- ✅ 前端仍只拦「输入框里根本打不出合法值」的形态（非整数、负容量）与上述两条组合，其余不插手
-- ❌ 其余组合（容量为 `0` 等）仍然要提交后才知道非法，错误消息为后端原文（英文、带配置路径），比本两条的前端文案生硬；由 session-sticky 的说明行（hint）部分补偿上下文
+- ✅ 前端仍只拦「输入框里根本打不出合法值」的形态（非整数、负容量）与上述三条组合，其余不插手
+- ❌ 其余组合（容量为 `0` 等）仍然要提交后才知道非法，错误消息为后端原文（英文、带配置路径），比这几条的前端文案生硬；由 session-sticky 的说明行（hint）部分补偿上下文
 
 ### 隐私设置：显式保存 + 已确认/草稿双份 vs 即时写
 
@@ -498,6 +512,8 @@ shadcn-vue 的 `<Table>` 组件渲染结构为 `<div class="overflow-auto">` 包
 - **只读预览不得出现清除入口**：`SessionAffinityPopover` 的 `TooltipContent` 只读（标题 + 条数 + 三态 + pin 列表），清除按钮只存在于 `PopoverContent`。不得把逐条清除 / 按模型清空搬进 hover 预览——指针扫过时误点就会丢掉活跃会话
 - **pin 活跃判定固定为 `expires_in_secs === null || > 0`**：由 `lib/sessionAffinity.ts` 的 `isPinActive()` 单点定义，Tooltip 与浮层的排序（`sortPins`）和置灰共用它。不得写成 `>= 0`：倒计时为 0 的 pin 已经过期，显示为活跃会让运维误判会话仍粘在该目标上。置灰强度固定为 Tooltip 行 `opacity-70`、浮层行 `text-muted-foreground opacity-60`（Tooltip 是反色底，`text-muted-foreground` 在上面对比度不足，只能调透明度）
 - **hover 拉取必须节流 + 本行在途去重，浮层打开必须重拉**：`ensureFresh()` 的取数条件是「距上次拉取完成满 `HOVER_REFRESH_MS`（3000ms）」**且**「本行 scope 无在途请求」（`loadingForModel(store.loading, props.model)` 为假），任一不满足即直接返回；`watch(open)` 走的 `refresh()` 不受这两道闸限制。在途判定只能用**本行 scope 的键**：`loading` 是按 scope 的映射，拿整个映射当布尔恒为真（旧代码的 `if (store.loading) return` 会变成永不刷新），但也不得因此彻底去掉在途判定——慢请求未结算时连续 hover / focus 会并发排入重复请求。取数触发点固定为 `pointerenter`（过滤 `pointerType === "touch"`，否则触屏点按会弹预览）与 `@focus`（仅 `:focus-visible`，否则鼠标点击带来的焦点也会弹预览）——去掉节流会让指针扫过一列路由按行发请求；把浮层打开也纳入节流则可能展示 ≤3 秒前的陈旧 pin；漏掉键盘聚焦会让键盘用户永远停在占位态
+- **pipeline 决定 `api_endpoint` 的载荷形态，创建与编辑不同**：创建（`CreateRoutePayload`）在非 image 时必须**省略** `api_endpoint` 键（该类型没有 `null` 形态），编辑（`UpdateRoutePayload`）在非 image 时必须发**显式 `null`**（triple-state：省略 = 保留，`null` = 清除）。两条路径由 `lib/routePipeline.ts` 的 `createEndpointField` / `updateEndpointField` 单点产出，组件不得手写 `pipeline === "image" ? … : …`——写成同一形态会在编辑时把旧的 image endpoint 留在配置里，或在创建时发出后端不接受的 `null`
+- **`session_sticky` 与 systemone 互斥，三条防线同源**：`supportsSessionSticky(pipeline)` 为假时下拉项 `disabled`、切过来的当前值由 `pipelineSwitchReset` 回退 `sticky_failover`、对象级 `.refine` 拦提交。两条会话字段（`session_ttl_secs` / `session_max_entries`）在该 pipeline 下必须清空且不进 payload——后端 `dispatch_systemone` 丢弃 session write-back，发下去等于配置一个永远不生效的策略
 - **实时在途计数只展示 `count > 0` 的 route**：`activeRouteCounts()` 过滤是单点定义，徽章行不得渲染零计数项；后端已删零计数键，前端过滤是纵深防御
 - **首帧到达前不渲染徽章行**：`snapshot === null` 时整行 `v-if` 不成立。不得在没有快照时渲染「处理中 0」或「空闲」——那是把「未知」谎报成「没有流量」
 - **断线保留快照并标 `stale`，不清零**：`markDisconnected()` 保留 `snapshot` 且 `stale = snapshot !== null`；`stale` 只能在收到新快照（`applySnapshot`）时清除。流断开时徽章置灰 + 「连接断开，重连中…」，不得归零
@@ -560,6 +576,7 @@ SAG UI 的自动化测试只有单元层（node test runner，`pnpm -C sag-ui te
 
 ## 变更记录
 
+- [0016 Route 表单支持 `systemone` pipeline](changes/0016-route-systemone-pipeline.md)
 - [0015 systemone API 类型的前端支持](changes/0015-systemone-api-kind.md)
 - [0014 设置页隐私过滤配置](changes/0014-privacy-settings.md)
 - [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)

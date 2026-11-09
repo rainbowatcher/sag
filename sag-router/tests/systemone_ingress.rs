@@ -644,3 +644,167 @@ async fn models_list_advertises_systemone_ingress() {
         "the apis.systemone node must surface in ingress_protocols"
     );
 }
+
+// ── explicit `pipeline = "systemone"` routes ──────────────────────
+
+/// Chat-family requests for a model that only exists as an explicit
+/// `pipeline = "systemone"` route must fail **without touching upstream**.
+#[tokio::test]
+async fn explicit_systemone_route_rejects_chat_family_ingress_without_upstream_call() {
+    for (uri, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"so-model","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"so-model","input":"hi"}"#),
+        (
+            "/v1/messages",
+            r#"{"model":"so-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        // The mock upstream records whether it was ever contacted; the
+        // listener below is never accepted from in the passing case, so a
+        // connection would show up as a oneshot that resolves.
+        let (base_url, req_rx) = spawn_server_capturing(|mut stream| async move {
+            respond_json(&mut stream, "{}").await;
+        })
+        .await;
+
+        let state = build_state_with_pipeline(
+            &base_url,
+            "so-key",
+            Upstream::SystemOne,
+            Pipeline::SystemOne,
+        )
+        .await;
+        let app = build_router(state, DispatchRuntime::default());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Bearer so-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            resp.status().is_client_error(),
+            "{uri}: a systemone-only model must not be served, got {}",
+            resp.status()
+        );
+        let json = body_json(resp).await;
+        // Chat / Responses use the OpenAI envelope (`MODEL_NOT_FOUND`); the
+        // Anthropic ingress re-renders the same 404 as `{"type":"error"}`.
+        let code = json["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let anthropic_type = json["error"]["type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            code == "MODEL_NOT_FOUND" || anthropic_type == "not_found_error",
+            "{uri}: unexpected error envelope {json}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), req_rx)
+                .await
+                .is_err(),
+            "{uri}: upstream must never be contacted for a systemone-only route"
+        );
+    }
+}
+
+/// A real request on `/v1/systemone` against an explicit
+/// `pipeline = "systemone"` route reaches the upstream with the target's
+/// `real_model` and the protocol path.
+#[tokio::test]
+async fn explicit_systemone_route_serves_systemone_ingress() {
+    let expected = UPSTREAM_BODY.to_string();
+    let (base_url, req_rx) = spawn_server_capturing(move |mut stream| {
+        let expected = expected.clone();
+        async move {
+            respond_json(&mut stream, &expected).await;
+        }
+    })
+    .await;
+
+    let state = build_state_with_pipeline(
+        &base_url,
+        "so-key",
+        Upstream::SystemOne,
+        Pipeline::SystemOne,
+    )
+    .await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let resp = app
+        .oneshot(systemone_request(REQUEST_BODY, "so-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = req_rx.await.expect("upstream must be contacted");
+    let (request_line, req_body) = split_request(&req);
+    assert!(
+        request_line.starts_with("POST /systemone "),
+        "upstream path must be the SystemOne protocol path: {request_line}"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&req_body).unwrap();
+    assert_eq!(
+        sent["model"], "so-real",
+        "the target's real_model must reach the upstream"
+    );
+
+    let json = body_json(resp).await;
+    let upstream: serde_json::Value = serde_json::from_str(UPSTREAM_BODY).unwrap();
+    assert_eq!(json, upstream);
+}
+
+/// `/v1/models` advertisement: an explicit systemone route advertises only
+/// `systemone`, while the legacy chat route keeps the provider union.
+#[tokio::test]
+async fn explicit_systemone_route_advertises_only_systemone() {
+    let state = build_state_with_pipeline(
+        "http://127.0.0.1:1",
+        "so-key",
+        Upstream::SystemOne,
+        Pipeline::SystemOne,
+    )
+    .await;
+    let app = build_router(state, DispatchRuntime::default());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("Authorization", "Bearer so-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let model = json["data"]
+        .as_array()
+        .and_then(|d| d.iter().find(|m| m["id"] == "so-model"))
+        .expect("route must be listed");
+    let protocols: Vec<&str> = model["ingress_protocols"]
+        .as_array()
+        .expect("ingress_protocols array")
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect();
+    assert_eq!(
+        protocols,
+        vec!["systemone"],
+        "an explicit systemone route must not advertise chat protocols"
+    );
+}

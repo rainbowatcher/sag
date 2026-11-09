@@ -105,6 +105,32 @@ pub async fn resolve_route_with_ingress(
         .await);
     };
 
+    // Pipeline × ingress guard (D2). A route that explicitly declares
+    // `pipeline = "systemone"` serves **only** `POST /v1/systemone`: it is a
+    // decision protocol with no chat IR, so a chat-family ingress must not
+    // fall through to chat/image dispatch. Report it as the existing
+    // "no such model" failure instead of inventing a new error type — the
+    // route is not a chat route at all, so the model is unknown on this
+    // endpoint. Route identity is `model_name` alone (exact match, then the
+    // `"*"` wildcard), so there is no same-name chat route to fall back to.
+    if route.pipeline == sag_config::Pipeline::SystemOne
+        && ingress_protocol != sag_core::IngressProtocol::SystemOne
+    {
+        return Err(emit_no_route_failure(
+            state,
+            request,
+            trace_id,
+            is_stream,
+            start,
+            started_at,
+            user_agent,
+            client_ip,
+            session_key,
+            ingress_protocol,
+        )
+        .await);
+    }
+
     // Drop targets pointing at disabled providers or models not in enabled_models.
     let targets = filter_enabled_targets(&config_guard.providers, &route.targets, &request.model);
 
@@ -215,7 +241,10 @@ pub async fn resolve_route_with_ingress(
             .api_endpoint
             .clone()
             .unwrap_or_else(|| "/images/generations".to_string()),
-        sag_config::Pipeline::Chat => String::new(),
+        // Chat and SystemOne derive their upstream path from the protocol
+        // (`sag_core::protocol_path`); validation rejects a declared
+        // `api_endpoint` on a systemone route.
+        sag_config::Pipeline::Chat | sag_config::Pipeline::SystemOne => String::new(),
     };
     let route_retries = route.retries;
     let route_timeout = route.timeout_secs;
@@ -1785,6 +1814,250 @@ mod tests {
                 .any(|e| e.contains("so/so-1: lacks capability chat_completions")),
             "the drop must be reported: {:?}",
             resolved.precheck_errors
+        );
+    }
+
+    // ── pipeline = "systemone" × ingress (D2 rule table) ─────────
+
+    /// State with a single route whose pipeline is `pipeline`, targeting a
+    /// provider that declares **both** `apis.chat_completions` and
+    /// `apis.systemone`. Both protocol nodes are present so an ingress
+    /// mismatch can never be blamed on a missing capability: the only
+    /// thing that can reject the request is the pipeline × ingress guard.
+    async fn build_state_with_pipeline(
+        pipeline: sag_config::Pipeline,
+    ) -> (AppState, DispatchRuntime) {
+        use std::collections::HashMap;
+
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        let mut pc = provider_config(true);
+        pc.apis.insert(
+            sag_core::ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: "https://api.systemone.example/v1".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert("dual".into(), pc);
+
+        let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
+            model_name: "sys-one-model".into(),
+            api_endpoint: None,
+            pipeline,
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![sag_config::RouteTarget {
+                provider: "dual".into(),
+                real_model: Some("sys-one-v1".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                capabilities: None,
+            }],
+        }];
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        (state, DispatchRuntime::default())
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn resolve_with_ingress(
+        state: &AppState,
+        runtime: &DispatchRuntime,
+        ingress: sag_core::IngressProtocol,
+    ) -> Result<ResolvedRoute, Response<Body>> {
+        let req = test_request("sys-one-model");
+        resolve_route_with_ingress(
+            state,
+            runtime,
+            &req,
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+            None,
+            ingress,
+        )
+        .await
+    }
+
+    /// Chat-family ingresses must resolve a `pipeline = "systemone"` route to
+    /// the **existing no-route failure** — never fall through to chat/image
+    /// dispatch, and never reach a provider.
+    #[tokio::test]
+    async fn systemone_pipeline_route_is_no_route_for_chat_family_ingress() {
+        for ingress in [
+            sag_core::IngressProtocol::ChatCompletions,
+            sag_core::IngressProtocol::Responses,
+            sag_core::IngressProtocol::AnthropicMessages,
+        ] {
+            let (state, runtime) = build_state_with_pipeline(sag_config::Pipeline::SystemOne).await;
+            let response = resolve_with_ingress(&state, &runtime, ingress)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{ingress:?}: systemone route must not resolve"));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{ingress:?}: must be the no-route failure"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["error"]["code"], "MODEL_NOT_FOUND",
+                "{ingress:?}: no-route envelope expected, got {json}"
+            );
+
+            // No target may have been touched: the sentinel call log proves
+            // resolve stopped before any provider call, and the runtime's
+            // routing memories stay empty.
+            state.collector.flush().await;
+            let logs = state
+                .collector
+                .store()
+                .query_logs(sag_analytics::LogFilter {
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(logs.len(), 1, "{ingress:?}: exactly one call log");
+            assert_eq!(logs[0].provider, "__no_route__", "{ingress:?}");
+            assert_eq!(logs[0].status_code, 404, "{ingress:?}");
+            assert!(
+                runtime.fill_first_orders.read().await.is_empty()
+                    && runtime.route_counters.read().await.is_empty(),
+                "{ingress:?}: the guard runs before ordering/caching"
+            );
+        }
+    }
+
+    /// `/v1/systemone` + an explicit systemone route resolves and dispatches
+    /// through the SystemOne lane (`upstream_protocol = systemone`).
+    #[tokio::test]
+    async fn systemone_pipeline_route_resolves_on_systemone_ingress() {
+        let (state, runtime) = build_state_with_pipeline(sag_config::Pipeline::SystemOne).await;
+        let resolved = resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::SystemOne)
+            .await
+            .expect("an explicit systemone route must resolve on /v1/systemone");
+
+        assert_eq!(resolved.pipeline, sag_config::Pipeline::SystemOne);
+        assert_eq!(resolved.route_name, "sys-one-model");
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].provider, "dual");
+        assert_eq!(resolved.targets[0].real_model, "sys-one-v1");
+        assert_eq!(
+            resolved.targets[0].upstream_protocol,
+            sag_core::ApiKind::SystemOne,
+            "the SystemOne protocol path is used upstream"
+        );
+        assert_eq!(resolved.targets[0].lane, sag_core::Lane::Native);
+        assert!(
+            resolved.api_endpoint.is_empty(),
+            "SystemOne derives its path from the protocol, not api_endpoint"
+        );
+    }
+
+    /// Regression: `/v1/systemone` + a **chat** route keeps today's behaviour
+    /// (presence filter → SystemOne dispatch); the new guard must not touch it.
+    #[tokio::test]
+    async fn systemone_ingress_on_chat_route_is_unchanged() {
+        let (state, runtime) = build_state_with_pipeline(sag_config::Pipeline::Chat).await;
+        let resolved = resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::SystemOne)
+            .await
+            .expect("a chat route stays servable on /v1/systemone (compat path)");
+
+        assert_eq!(resolved.pipeline, sag_config::Pipeline::Chat);
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(
+            resolved.targets[0].upstream_protocol,
+            sag_core::ApiKind::SystemOne
+        );
+    }
+
+    /// Regression: `/v1/systemone` + an **image** route keeps today's
+    /// behaviour — resolve succeeds and the handler rejects the Image
+    /// pipeline with 422 (`sag-router/src/routes.rs`).
+    #[tokio::test]
+    async fn systemone_ingress_on_image_route_still_resolves() {
+        let (state, runtime) = build_state_with_pipeline(sag_config::Pipeline::Image).await;
+        let resolved = resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::SystemOne)
+            .await
+            .expect("an image route still resolves; the handler renders the 422");
+
+        assert_eq!(resolved.pipeline, sag_config::Pipeline::Image);
+        assert_eq!(
+            resolved.api_endpoint, "/images/generations",
+            "image keeps its default endpoint"
+        );
+    }
+
+    /// A systemone route whose target provider declares no `apis.systemone`
+    /// is dropped with the existing diagnostic (502, not a client error) —
+    /// and never falls back to a same-named chat route.
+    #[tokio::test]
+    async fn systemone_pipeline_route_skips_targets_without_the_api_node() {
+        let mut providers: HashMap<String, sag_config::ProviderConfig> = HashMap::new();
+        // `provider_config` declares only `apis.chat_completions`.
+        providers.insert("chat-only".into(), provider_config(true));
+        let routes = vec![sag_config::RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
+            model_name: "sys-one-model".into(),
+            api_endpoint: None,
+            pipeline: sag_config::Pipeline::SystemOne,
+            retries: None,
+            timeout_secs: None,
+            strategy: sag_config::Strategy::FillFirst,
+            targets: vec![sag_config::RouteTarget {
+                provider: "chat-only".into(),
+                real_model: Some("sys-one-v1".into()),
+                priority: 10,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                capabilities: None,
+            }],
+        }];
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let runtime = DispatchRuntime::default();
+
+        let response = resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::SystemOne)
+            .await
+            .err()
+            .expect("the only target lacks apis.systemone → resolve failure");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("lacks capability systemone")
+                && body_str.contains("chat-only/sys-one-v1"),
+            "the existing presence diagnostic must be preserved; got: {body_str}"
         );
     }
 

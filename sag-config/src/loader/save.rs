@@ -3804,6 +3804,93 @@ targets = [
     }
 
     #[test]
+    fn save_round_trips_systemone_pipeline() {
+        // `pipeline = "systemone"` is non-default, so it must be persisted
+        // verbatim (the save path uses `Pipeline::as_str`, not serde) and
+        // survive a reload unchanged.
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.so]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.systemone.example/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+targets = [
+    { provider = "so" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].pipeline = Pipeline::SystemOne;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("pipeline = \"systemone\""),
+            "systemone pipeline must be written verbatim, got:\n{saved}"
+        );
+        assert!(
+            !saved.contains("system_one"),
+            "the save path must not emit the snake_case spelling, got:\n{saved}"
+        );
+
+        let reloaded_handle = load_config(&path).unwrap();
+        let reloaded = reloaded_handle.inner.try_read().unwrap();
+        assert_eq!(reloaded.routes[0].pipeline, Pipeline::SystemOne);
+        assert_eq!(reloaded.routes[0].api_endpoint, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_removes_systemone_pipeline_when_back_to_chat() {
+        let content = r#"
+[server]
+host = "127.0.0.1"
+port = 9090
+
+[providers]
+
+[providers.so]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.systemone.example/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+targets = [
+    { provider = "so" },
+]
+"#;
+        let path = temp_toml(content);
+        let handle = load_config(&path).unwrap();
+        let mut config = handle.inner.try_read().unwrap().clone();
+        drop(handle);
+
+        config.routes[0].pipeline = Pipeline::Chat;
+
+        save_config_to_file(&config, &path).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("pipeline"),
+            "the default pipeline must be removed from disk, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn save_round_trips_target_timeout_secs() {
         let content = r#"
 [server]

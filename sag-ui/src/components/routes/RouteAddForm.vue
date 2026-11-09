@@ -18,6 +18,14 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { t } from "@/lib/i18n"
+import {
+  PIPELINES,
+  createEndpointField,
+  isPipeline,
+  pipelineSwitchReset,
+  showsApiEndpoint,
+  supportsSessionSticky,
+} from "@/lib/routePipeline"
 import { getErrorMessage, validateExtraJson } from "@/lib/utils"
 import { useRouteStore } from "@/stores/routes"
 import type { Provider, Strategy, Pipeline, CreateRoutePayload, TargetItem } from "@/types/api"
@@ -75,7 +83,7 @@ const form = useForm({
       onSubmit: z
         .object({
           model_name: z.string(),
-          pipeline: z.enum(["chat", "image"]),
+          pipeline: z.enum(PIPELINES),
           api_endpoint: z.string(),
           strategy: z.enum(["sticky_failover", "fill_first", "round_robin", "session_sticky"]),
           session_ttl_secs: z.string(),
@@ -115,6 +123,13 @@ const form = useForm({
         .refine((v) => !(v.strategy === "session_sticky" && v.pipeline === "image"), {
           message: t("routes.form.imageSessionStickyUnsupported"),
           path: ["pipeline"],
+        })
+        // Same for systemone: `dispatch_systemone` drops the write-back too.
+        // Switching the pipeline already forces the strategy away, so this only
+        // guards a state the form could not normally reach.
+        .refine((v) => !(v.strategy === "session_sticky" && v.pipeline === "systemone"), {
+          message: t("routes.form.systemoneSessionStickyUnsupported"),
+          path: ["strategy"],
         }),
     }
   },
@@ -140,9 +155,10 @@ const form = useForm({
       const payload: CreateRoutePayload = {
         model_name: routeName,
         pipeline: value.pipeline,
-        ...(value.pipeline === "image" ? { api_endpoint: value.api_endpoint.trim() } : {}),
+        // image sends the endpoint; chat and systemone omit the key entirely.
+        ...createEndpointField(value.pipeline, value.api_endpoint),
         strategy: value.strategy,
-        ...(value.strategy === "session_sticky"
+        ...(value.strategy === "session_sticky" && supportsSessionSticky(value.pipeline)
           ? {
               session_ttl_secs: parseOptionalInt(value.session_ttl_secs),
               session_max_entries: parseOptionalInt(value.session_max_entries),
@@ -177,6 +193,24 @@ const form = useForm({
     }
   },
 })
+
+/**
+ * Pipeline is mutually exclusive with the fields the other pipelines own, so a
+ * switch rewrites them in one go (rules live in `routePipeline.ts`).
+ * A deselect (`ToggleGroup` single) emits an empty value: ignore it and keep
+ * the current pipeline rather than storing an empty string.
+ */
+function onPipelineChange(value: unknown) {
+  if (!isPipeline(value)) return
+  form.setFieldValue("pipeline", value)
+  const reset = pipelineSwitchReset(value, form.state.values.strategy)
+  if (reset.api_endpoint !== undefined) form.setFieldValue("api_endpoint", reset.api_endpoint)
+  if (reset.strategy !== undefined) form.setFieldValue("strategy", reset.strategy)
+  if (reset.session_ttl_secs !== undefined)
+    form.setFieldValue("session_ttl_secs", reset.session_ttl_secs)
+  if (reset.session_max_entries !== undefined)
+    form.setFieldValue("session_max_entries", reset.session_max_entries)
+}
 
 async function handleSubmit(event: Event) {
   event.preventDefault()
@@ -261,9 +295,12 @@ async function handleSubmit(event: Event) {
                       <SelectItem value="round_robin">{{
                         $t("routes.form.strategyRoundRobin")
                       }}</SelectItem>
-                      <SelectItem value="session_sticky">{{
-                        $t("routes.form.strategySessionSticky")
-                      }}</SelectItem>
+                      <SelectItem
+                        value="session_sticky"
+                        :disabled="!supportsSessionSticky(form.state.values.pipeline)"
+                      >
+                        {{ $t("routes.form.strategySessionSticky") }}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -287,7 +324,7 @@ async function handleSubmit(event: Event) {
               </FieldLabel>
               <ToggleGroup
                 :model-value="field.state.value ?? 'chat'"
-                @update:model-value="(v) => field.handleChange(v as Pipeline)"
+                @update:model-value="onPipelineChange"
                 type="single"
                 variant="outline"
                 size="sm"
@@ -297,13 +334,22 @@ async function handleSubmit(event: Event) {
                 <ToggleGroupItem value="image">{{
                   $t("routes.form.pipelineImage")
                 }}</ToggleGroupItem>
+                <ToggleGroupItem value="systemone">{{
+                  $t("routes.form.pipelineSystemone")
+                }}</ToggleGroupItem>
               </ToggleGroup>
+              <p
+                v-if="form.state.values.pipeline === 'systemone'"
+                class="text-muted-foreground text-xs"
+              >
+                {{ $t("routes.form.systemonePipelineHint") }}
+              </p>
               <FieldError v-if="field.state.meta.errors.length" :errors="field.state.meta.errors" />
             </Field>
           </form.Field>
 
           <form.Field name="api_endpoint" #default="{ field }">
-            <Field v-if="form.state.values.pipeline === 'image'">
+            <Field v-if="showsApiEndpoint(form.state.values.pipeline)">
               <div class="flex items-center justify-between gap-4">
                 <FieldLabel :for="field.name" class="flex shrink-0 items-center gap-1.5">
                   {{ $t("routes.form.apiEndpointLabel") }}

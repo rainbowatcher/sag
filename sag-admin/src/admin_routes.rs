@@ -1393,4 +1393,301 @@ mod tests {
             "route with unknown capability key must not commit"
         );
     }
+
+    // ── `pipeline = "systemone"` CRUD ──────────────────────────
+
+    /// Provider declaring `apis.systemone` (plus the chat node from
+    /// `test_provider`, so both pipelines are servable in one fixture).
+    fn systemone_providers() -> HashMap<String, sag_config::ProviderConfig> {
+        let mut providers = HashMap::new();
+        let mut pc = test_provider(
+            ApiKind::SystemOne,
+            "https://api.systemone.example/v1",
+            vec!["sk-test".into()],
+            vec![],
+        );
+        pc.apis.insert(
+            ApiKind::ChatCompletions,
+            sag_config::ApiConfig {
+                base_url: "https://api.openai.com/v1".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert("so".to_string(), pc);
+        providers
+    }
+
+    #[tokio::test]
+    async fn create_systemone_route_round_trips_pipeline() {
+        let state = build_state(systemone_providers(), vec![]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"systemone","targets":[{"provider":"so","real_model":"sys-one-v1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        {
+            let cfg = state.config.read().await;
+            let r = cfg
+                .routes
+                .iter()
+                .find(|r| r.model_name == "sys-one-model")
+                .expect("systemone route must commit");
+            assert_eq!(r.pipeline, Pipeline::SystemOne);
+            assert_eq!(r.api_endpoint, None);
+        }
+
+        // GET /api/routes must report the pipeline verbatim.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let route = body["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model_name"] == "sys-one-model")
+            .expect("systemone route present");
+        assert_eq!(route["pipeline"], serde_json::json!("systemone"));
+        assert_eq!(route["api_endpoint"], serde_json::json!(null));
+    }
+
+    /// `pipeline = "systemone"` + `api_endpoint` is rejected by the
+    /// coordinator's full validation → HTTP 400 (not 500).
+    #[tokio::test]
+    async fn create_systemone_route_with_api_endpoint_is_400() {
+        let state = build_state(systemone_providers(), vec![]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"systemone","api_endpoint":"/systemone","targets":[{"provider":"so","real_model":"sys-one-v1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "BAD_REQUEST");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("only valid when pipeline = \"image\""),
+            "{body}"
+        );
+
+        let cfg = state.config.read().await;
+        assert!(cfg.routes.is_empty(), "must not commit");
+    }
+
+    /// `pipeline = "systemone"` + `strategy = "session_sticky"` → 400.
+    #[tokio::test]
+    async fn create_systemone_route_with_session_sticky_is_400() {
+        let state = build_state(systemone_providers(), vec![]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"systemone","strategy":"session_sticky","targets":[{"provider":"so","real_model":"sys-one-v1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session_sticky"),
+            "{body}"
+        );
+    }
+
+    /// Image → SystemOne: the `api_endpoint` must be cleared. The triple-state
+    /// patch requires an explicit `null` (an absent field means "keep").
+    #[tokio::test]
+    async fn update_route_image_to_systemone_clears_endpoint_with_null() {
+        let state = build_state(systemone_providers(), vec![]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"image","api_endpoint":"/images/generations","targets":[{"provider":"so","real_model":"sys-one-v1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"systemone","api_endpoint":null}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.config.read().await;
+        let r = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "sys-one-model")
+            .unwrap();
+        assert_eq!(r.pipeline, Pipeline::SystemOne);
+        assert_eq!(
+            r.api_endpoint, None,
+            "the null patch must clear the endpoint, not leave it set"
+        );
+    }
+
+    /// Switching to systemone without clearing the endpoint is a 400 (the
+    /// leftover `api_endpoint` is illegal outside the image pipeline) —
+    /// proving the field is not silently dropped.
+    #[tokio::test]
+    async fn update_route_image_to_systemone_without_null_is_400() {
+        let state = build_state(systemone_providers(), vec![]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"image","api_endpoint":"/images/generations","targets":[{"provider":"so","real_model":"sys-one-v1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"systemone"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let cfg = state.config.read().await;
+        let r = cfg
+            .routes
+            .iter()
+            .find(|r| r.model_name == "sys-one-model")
+            .unwrap();
+        assert_eq!(
+            r.pipeline,
+            Pipeline::Image,
+            "rejected update must not commit"
+        );
+    }
+
+    /// Full chain on a **file-backed** state: create → save → reload keeps
+    /// `pipeline = "systemone"` on disk and in memory.
+    #[tokio::test]
+    async fn create_systemone_route_persists_and_reloads() {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let path = dir.join(format!("sag-admin-systemone-{id}.toml"));
+        let state =
+            crate::test_utils::build_file_backed_state(&path, systemone_providers(), vec![]).await;
+        let app = test_app(state.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model_name":"sys-one-model","pipeline":"systemone","targets":[{"provider":"so","real_model":"sys-one-v1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("pipeline = \"systemone\""),
+            "the pipeline must be persisted verbatim, got:\n{saved}"
+        );
+
+        let reloaded = sag_config::load_config(&path).unwrap();
+        let cfg = reloaded.read().await;
+        assert_eq!(cfg.routes[0].pipeline, Pipeline::SystemOne);
+        drop(cfg);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

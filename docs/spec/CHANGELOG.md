@@ -1,11 +1,15 @@
 ---
 created: 2026-06-03
-updated: 2026-11-08
+updated: 2026-11-09
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-11-09** · **调度**：[0011 route 级 `pipeline = "systemone"`](dispatch/changes/0011-route-pipeline-systemone.md) — `[[routes]]` 新增可选的 `pipeline = "systemone"`：显式声明它的 route 只在 `/v1/systemone` 上存在，`/v1/chat/completions` / `/v1/messages` / `/v1/responses` 一律走既有 no-route 信封、不回退到 chat / image 分发；守卫放在 route 选中后、目标过滤前（不消耗目标、不触达上游、不产生 attempt）。route 身份仍只有 `model_name`（落盘 key、admin 拒重名、解析精确 + `"*"` 通配），所以同一名字不能并存 chat 与 systemone 两条 route。校验上 systemone 拒绝 `api_endpoint`（上游路径由协议派生）与 `session_sticky`（`dispatch_systemone` 丢弃 session write-back），target 缺 `apis.systemone` 只记 warning、运行时跳过（与 unhealthy target 同一条诊断）；`strategy` 其余三值全适用，`fallback` 语义不变（仍只统计 chat IR 三协议，systemone 不可作 fallback）。`GET /v1/models` 对显式 systemone route 走独立分支：只在「有 eligible 且声明 `apis.systemone` 的目标」时通告 `systemone`，且永不通告 chat 协议；旧 pipeline 的并集聚合逐字不变。纯增量：不存在 `pipeline = "systemone"` 的旧配置行为完全不变（`pipeline = "chat"` 接住 `/v1/systemone` 仍是 0008 的 presence 过滤 + SystemOne dispatch）
+
+- **2026-11-09** · **UI**：[0016 Route 表单支持 `systemone` pipeline](ui/changes/0016-route-systemone-pipeline.md) — `Pipeline` 从两值扩为 `"chat" | "image" | "systemone"`，两个路由表单的 ToggleGroup 与 zod schema（`z.enum(PIPELINES)`）随之支持第三值，列表页 pipeline 列改用 `pipelineLabels` i18n 标签（image 行仍拼 `· {api_endpoint}`）。三个互斥字段收敛进新的纯逻辑层 `sag-ui/src/lib/routePipeline.ts`（`PIPELINES` / `isPipeline` / `showsApiEndpoint` / `supportsSessionSticky` / `pipelineSwitchReset` / `createEndpointField` / `updateEndpointField`）：`api_endpoint` 仅 image 显示，创建 payload 在非 image 时**省略键**、编辑 payload 发**显式 `null`**（triple-state 的清除）；`session_sticky` 在 systemone 下置 `disabled`，切换时若当前为此值则回退 `sticky_failover`，两个会话参数一并清空且永不下发，另有对象级 `.refine` 兜底拦提交（与后端 `validate_routes` 等价）。i18n 新增 `routes.form.pipelineSystemone` / `routes.form.systemonePipelineHint` / `routes.form.systemoneSessionStickyUnsupported` 三个 key（en / zh 齐平）
 
 - **2026-11-08** · **调度**：[0010 流内错误帧在两种车道上的完整性](dispatch/changes/0010-stream-error-frame-completeness.md) — 0009 之后仍有三处「静默未终止的 200 SSE」：`ResponsesCodec::encode_stream_event` 与 `StreamEncodeState::encode` 的 `Error` 分支返回 `Vec::new()`（Responses ingress × 翻译上游的客户端只收到内容 delta，随后 body 结束，既无错误帧也无 `response.completed`）；`dispatch/stream.rs` 对直通车道（`needs_ir_decode == false`）的 `Error` 无条件丢弃，而网络读错误与 chunk 空闲超时只发 `StreamChunk::Error`、adapter 又抑制 `Done`，客户端既无错误帧也无 `[DONE]` / `message_stop` / `response.completed`；转译车道只按「可解析 JSON 且 `type` 以 `response.` 开头」嗅探丢弃 Responses `Raw`，畸形 JSON / 缺 `type` / 未知 `type` 的帧原样泄漏给 Chat / Anthropic 客户端。修法：Responses 编码器新增 `encode_error_event`（`{"type":"error","code":"STREAM_ERROR","message","param":null}` 加一份嵌套 `error:{code,message}` 以兼容网关通用信封），`StreamEncodeState` 加 `errored` 让 `Raw` / `Finish` / `End` 在错误帧之后返回空 vec；`stream.rs` 的 `StreamState` 加 `pending_local_error` —— 直通车道先扣住 `Error`，紧随其后的 `Raw`（provider 的 side-channel `Error` 总是排在它所描述的上游错误帧之前）原样转发并清掉扣留，流结束时扣留仍在则判定为网关本地中断，终点合成恰好一帧 ingress 协议错误帧并立即关闭 body；`chat/mod.rs` 的 `use_responses && needs_ir_decode` 分支改为丢弃**所有** Responses 解码器 `Raw` 并删除 `is_responses_event_frame`；解码器加 per-frame `raw_emitted`，多行畸形事件不再重复整帧。测试：2 个 codec 单测 + `privacy_tail_flushes_when_upstream_errors_out` 改写 + `protocol_matrix.rs` 9 例（三条直通车道 × 读错误/空闲超时、Responses ingress 转译错误帧、native `response.failed` 原样转发）
 

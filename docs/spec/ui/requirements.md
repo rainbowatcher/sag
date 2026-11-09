@@ -1,6 +1,6 @@
 ---
 created: 2026-06-26
-updated: 2026-11-03
+updated: 2026-11-09
 ---
 
 # UI 管理面板
@@ -99,6 +99,7 @@ SAG UI（`sag-ui/`）是一个单页应用，通过 HTTP 调用 SAG 管理 API�
 - 会话 pin 预览的拉取节流与在途去重（0012）：hover / 键盘聚焦触发的拉取需**同时**满足两个条件——距上次拉取完成满 `HOVER_REFRESH_MS`（3000ms）**且**本行（该 `model` 作用域）没有在途请求；任一不满足即跳过，因此指针扫过一整列路由不会一行发一个请求，慢请求未结算时反复 hover / 聚焦也不会排入重复请求。判定按作用域：他行的在途请求不影响本行（不得拿整份 loading 映射当全局闸）。点击打开浮层时**总是重新拉取**（不走这两道闸），保证看到的是当下状态
 - 表单前置校验（0008 的「组合规则全留给后端」就此两类反案）：通配路由（`model_name = "*"`）× session-sticky、session-sticky × `pipeline = "image"` 由表单对象级 refine 直接拒绝，规则与后端 `sag-config` 的 `validate_routes` 等价；错误分别挂在 `strategy` 与 `pipeline` 字段上就地展示（新建表单的通配判定取 `model_name` 或首个 target 的 `real_model`，编辑表单取路由自身的 `model_name`），不再等提交后看顶部错误条。其余组合规则（容量为 `0` 等）仍只由后端拒绝
 - Models 列表中的「Create route」快捷建单：确认弹框，也使用同一双轨形态（移动端会出现抽屉套抽屉）
+- 路由编辑支持 `systemone` pipeline（0016）：pipeline 选择器为 `chat` / `image` / `systemone` 三值，值集与后端 serde 名逐字对齐；`systemone` 路由只服务 `POST /v1/systemone`（表单内提示目标 provider 需声明 `apis.systemone`）。该 pipeline 下 `api_endpoint` 与 `session_sticky` **被禁用 / 清空**：endpoint 输入框不显示且切换时清空（创建 payload 在非 image 时省略该键，编辑 payload 在非 image 时发显式 `null` 以清除旧值）、`session_sticky` 选项置灰且当前若为它则回退 `sticky_failover`、两个会话参数（TTL / 容量）一并清空且永不下发；另有对象级 refine 拦截 `session_sticky` × `systemone`（与后端 `validate_routes` 等价）。路由列表的 pipeline 列按 i18n 标签展示三值，image 行仍拼 `· {api_endpoint}`
 
 ### Analytics
 
@@ -302,6 +303,7 @@ UI 本身无独立配置文件。构建时通过 Vite 环境变量注入 API bas
 
 ## 变更记录
 
+- [0016 Route 表单支持 `systemone` pipeline](changes/0016-route-systemone-pipeline.md)
 - [0015 systemone API 类型的前端支持](changes/0015-systemone-api-kind.md)
 - [0014 设置页隐私过滤配置](changes/0014-privacy-settings.md)
 - [0013 路由页实时在途请求徽章行（SSE）](changes/0013-routes-live-inflight-badges.md)

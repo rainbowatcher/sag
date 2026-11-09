@@ -370,13 +370,21 @@ export interface TargetItem {
   extra: string
 }
 
-/** Dispatch pipeline of a route (default `chat`). */
-export type Pipeline = "chat" | "image"
+/**
+ * Dispatch pipeline of a route (default `chat`).
+ * `systemone` routes only serve `POST /v1/systemone`; the chat/messages/responses
+ * endpoints resolve no route for them. Route identity is `model_name` alone, so
+ * one model name cannot carry both a chat and a systemone route.
+ */
+export type Pipeline = "chat" | "image" | "systemone"
 
 export interface RouteConfig {
   model_name: string
   pipeline: Pipeline
-  /** Real upstream path — only legal when `pipeline = "image"`; `null` otherwise. */
+  /**
+   * Real upstream path — only meaningful for `pipeline = "image"`; `null` for
+   * chat and systemone routes (the backend rejects a systemone endpoint).
+   */
   api_endpoint: string | null
   strategy: Strategy
   retries?: number
@@ -392,7 +400,7 @@ export type Strategy = "sticky_failover" | "fill_first" | "round_robin" | "sessi
 export interface CreateRoutePayload {
   model_name: string
   pipeline?: Pipeline
-  /** Required when `pipeline = "image"`; must be omitted for chat routes. */
+  /** Required for `pipeline = "image"`; must be omitted for chat and systemone routes. */
   api_endpoint?: string
   strategy?: Strategy
   retries?: number
@@ -413,7 +421,10 @@ export interface CreateRoutePayload {
 export interface UpdateRoutePayload {
   model_name: string
   pipeline?: Pipeline
-  /** Triple-state: omit → keep, `null` → clear, value → set. */
+  /**
+   * Triple-state: omit → keep, `null` → clear, value → set. Non-image routes
+   * (chat and systemone) always send `null`.
+   */
   api_endpoint?: string | null
   strategy?: Strategy
   retries?: number

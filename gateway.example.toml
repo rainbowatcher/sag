@@ -231,6 +231,21 @@ targets = [
 # api_endpoint = "/images/generations"
 # targets = [{ provider = "my-image" }]
 #
+# SystemOne routes are the same kind of opt-in: `pipeline = "systemone"`
+# restricts the route to `POST /v1/systemone` only — a chat-family request
+# (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) for that model is
+# answered with the usual "no such model" error and never reaches upstream.
+# `api_endpoint` is rejected here (the path is derived from the protocol), and
+# so is `strategy = "session_sticky"` (the SystemOne dispatch performs no
+# session write-back). A target whose provider omits `apis.systemone` is
+# skipped at request time, not a config error. Omitting `pipeline` keeps the
+# old behaviour: a plain chat route that also serves `/v1/systemone` when its
+# provider declares `apis.systemone`.
+# [[routes]]
+# model_name = "sys-one-model"
+# pipeline = "systemone"
+# targets = [{ provider = "my-systemone", real_model = "sys-one-v1" }]
+#
 # Session-sticky routing (`strategy = "session_sticky"`): a request carrying a
 # session identity (conversation_id / prompt_cache_key / first-user-message
 # hash) sticks to the target that last served the session successfully.

@@ -33,6 +33,33 @@ pub async fn show_health() -> Json<serde_json::Value> {
     }))
 }
 
+/// Whether a route target can serve traffic under the current provider
+/// config: the provider exists, is enabled, and (when `enabled_models` is
+/// non-empty) admits the target's model. A target pointing at a provider
+/// that is **absent** from the config counts as eligible — a preserved
+/// legacy quirk of the `/v1/models` aggregation, kept byte-for-byte.
+fn target_is_eligible(
+    providers: &std::collections::HashMap<String, sag_config::ProviderConfig>,
+    route: &sag_config::RouteConfig,
+    target: &sag_config::RouteTarget,
+) -> bool {
+    providers
+        .get(&target.provider)
+        .map(|pc| {
+            if !pc.enabled {
+                return false;
+            }
+            if !pc.enabled_models.is_empty() {
+                let model_to_check = target.real_model.as_deref().unwrap_or(&route.model_name);
+                if model_to_check != "*" && !pc.enabled_models.iter().any(|m| m == model_to_check) {
+                    return false;
+                }
+            }
+            true
+        })
+        .unwrap_or(true)
+}
+
 /// GET `/v1/models`
 ///
 /// Returns the list of available models in OpenAI-compatible format.
@@ -47,27 +74,10 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
         .routes
         .iter()
         .filter(|route| {
-            route.targets.iter().any(|t| {
-                config
-                    .providers
-                    .get(&t.provider)
-                    .map(|pc| {
-                        if !pc.enabled {
-                            return false;
-                        }
-                        if !pc.enabled_models.is_empty() {
-                            let model_to_check =
-                                t.real_model.as_deref().unwrap_or(&route.model_name);
-                            if model_to_check != "*"
-                                && !pc.enabled_models.iter().any(|m| m == model_to_check)
-                            {
-                                return false;
-                            }
-                        }
-                        true
-                    })
-                    .unwrap_or(true)
-            })
+            route
+                .targets
+                .iter()
+                .any(|t| target_is_eligible(&config.providers, route, t))
         })
         .map(|route| {
             let owned_by = route
@@ -86,16 +96,37 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
             // `ingress_protocols` is the union of the `apis` protocol keys
             // of every target's provider, in canonical protocol order so
             // the payload is stable regardless of target ordering.
+            //
+            // An **explicit** `pipeline = "systemone"` route is the one
+            // exception: it serves `/v1/systemone` only, so it advertises
+            // `systemone` (and nothing else) when an eligible target's
+            // provider declares `apis.systemone`. Chat-family protocols are
+            // never advertised for it — a chat request would resolve to
+            // "no such model". Legacy routes keep the union aggregation
+            // unchanged, including its quirks.
             let mut ingress_protocols: Vec<&'static str> = Vec::new();
-            for kind in sag_core::ApiKind::protocols() {
-                let declared = route.targets.iter().any(|t| {
-                    config
-                        .providers
-                        .get(&t.provider)
-                        .is_some_and(|pc| pc.apis.contains_key(&kind))
+            if route.pipeline == sag_config::Pipeline::SystemOne {
+                let serves_systemone = route.targets.iter().any(|t| {
+                    target_is_eligible(&config.providers, route, t)
+                        && config
+                            .providers
+                            .get(&t.provider)
+                            .is_some_and(|pc| pc.apis.contains_key(&sag_core::ApiKind::SystemOne))
                 });
-                if declared {
-                    ingress_protocols.push(kind.as_str());
+                if serves_systemone {
+                    ingress_protocols.push(sag_core::ApiKind::SystemOne.as_str());
+                }
+            } else {
+                for kind in sag_core::ApiKind::protocols() {
+                    let declared = route.targets.iter().any(|t| {
+                        config
+                            .providers
+                            .get(&t.provider)
+                            .is_some_and(|pc| pc.apis.contains_key(&kind))
+                    });
+                    if declared {
+                        ingress_protocols.push(kind.as_str());
+                    }
                 }
             }
             model["ingress_protocols"] = json!(ingress_protocols);
@@ -305,5 +336,157 @@ mod tests {
 
         assert!(model_ids.contains(&"gpt-4o"));
         assert!(!model_ids.contains(&"deleted-model"));
+    }
+
+    // ── `pipeline = "systemone"` advertisement ───────────
+
+    fn route(
+        model_name: &str,
+        pipeline: sag_config::Pipeline,
+        provider: &str,
+        real_model: Option<&str>,
+    ) -> RouteConfig {
+        RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
+            model_name: model_name.into(),
+            api_endpoint: None,
+            pipeline,
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::FillFirst,
+            targets: vec![RouteTarget {
+                provider: provider.into(),
+                real_model: real_model.map(str::to_string),
+                priority: 1,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                capabilities: None,
+            }],
+        }
+    }
+
+    async fn models_for(config: GatewayConfig) -> serde_json::Value {
+        let handle = ConfigHandle::from_config(config);
+        let provider_registry = build_provider_registry(&handle, true).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        let Json(response) = list_models(State(state)).await;
+        response
+    }
+
+    fn protocols_of<'a>(body: &'a serde_json::Value, model: &str) -> Vec<&'a str> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == model)
+            .unwrap_or_else(|| panic!("{model} must be listed"))["ingress_protocols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect()
+    }
+
+    fn systemone_provider(enabled: bool) -> sag_config::ProviderConfig {
+        let mut pc = provider_config(enabled);
+        pc.apis.insert(
+            sag_core::ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: "https://api.systemone.example/v1".into(),
+                ..Default::default()
+            },
+        );
+        pc
+    }
+
+    #[tokio::test]
+    async fn list_models_advertises_only_systemone_for_an_explicit_systemone_route() {
+        // The provider declares BOTH chat and systemone; the legacy route must
+        // keep the union (chat + systemone), while the explicit systemone
+        // route must advertise `systemone` only.
+        let mut providers = HashMap::new();
+        providers.insert("dual".into(), systemone_provider(true));
+        let config = GatewayConfig {
+            providers,
+            routes: vec![
+                route(
+                    "legacy-chat",
+                    sag_config::Pipeline::Chat,
+                    "dual",
+                    Some("gpt-4o"),
+                ),
+                route(
+                    "sys-one-model",
+                    sag_config::Pipeline::SystemOne,
+                    "dual",
+                    Some("sys-one-v1"),
+                ),
+            ],
+            ..sag_config::gateway_config_base!()
+        };
+
+        let body = models_for(config).await;
+        assert_eq!(
+            protocols_of(&body, "legacy-chat"),
+            vec!["chat_completions", "systemone"],
+            "legacy aggregation is unchanged (including its quirks)"
+        );
+        assert_eq!(
+            protocols_of(&body, "sys-one-model"),
+            vec!["systemone"],
+            "an explicit systemone route must not advertise chat protocols"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_hides_systemone_for_an_explicit_route_without_eligible_provider() {
+        // Provider declares only `apis.chat_completions`: the systemone route
+        // has no eligible target, so it advertises nothing (not even chat).
+        let mut providers = HashMap::new();
+        providers.insert("chat-only".into(), provider_config(true));
+        let config = GatewayConfig {
+            providers,
+            routes: vec![route(
+                "sys-one-model",
+                sag_config::Pipeline::SystemOne,
+                "chat-only",
+                Some("sys-one-v1"),
+            )],
+            ..sag_config::gateway_config_base!()
+        };
+
+        let body = models_for(config).await;
+        assert_eq!(protocols_of(&body, "sys-one-model"), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn list_models_hides_systemone_for_a_disabled_provider() {
+        let mut providers = HashMap::new();
+        providers.insert("dual".into(), systemone_provider(false));
+        let config = GatewayConfig {
+            providers,
+            routes: vec![route(
+                "sys-one-model",
+                sag_config::Pipeline::SystemOne,
+                "dual",
+                Some("sys-one-v1"),
+            )],
+            ..sag_config::gateway_config_base!()
+        };
+
+        let body = models_for(config).await;
+        // Every target is ineligible → the route is not listed at all.
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !ids.contains(&"sys-one-model"),
+            "all-disabled routes stay excluded, got {ids:?}"
+        );
     }
 }

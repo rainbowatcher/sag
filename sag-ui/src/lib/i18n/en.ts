@@ -378,9 +378,14 @@ export const en = {
     "Session-sticky is not supported on a wildcard (*) route: add an explicit route per model, or use another strategy",
   "routes.form.imageSessionStickyUnsupported":
     "Session-sticky is not supported with the image pipeline: use sticky_failover, fill_first, or round_robin",
+  "routes.form.systemoneSessionStickyUnsupported":
+    "Session-sticky is not supported for SystemOne routes",
   "routes.form.pipeline": "Pipeline",
   "routes.form.pipelineChat": "Chat",
   "routes.form.pipelineImage": "Image",
+  "routes.form.pipelineSystemone": "SystemOne",
+  "routes.form.systemonePipelineHint":
+    "Only /v1/systemone can use this route; targets need apis.systemone",
   "routes.form.pipelineHint":
     "Image routes send to the provider's image section with a per-route path.",
   "routes.form.apiEndpointLabel": "API Endpoint *",

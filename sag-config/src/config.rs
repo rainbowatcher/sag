@@ -597,6 +597,17 @@ impl GatewayConfig {
                         route.model_name
                     ));
                 }
+                // SystemOne has a fixed upstream path derived from the
+                // protocol (`sag_core::protocol_path`), so a declared
+                // `api_endpoint` is dead config. Reject it explicitly
+                // (including the empty string) instead of silently
+                // ignoring it — the previous `_` arm let it through.
+                (Pipeline::SystemOne, Some(endpoint)) => {
+                    errors.push(format!(
+                        "routes[{i}] (model='{}'): api_endpoint='{endpoint}' is only valid when pipeline = \"image\"; remove api_endpoint from a systemone-pipeline route (the SystemOne upstream path is derived from the protocol)",
+                        route.model_name
+                    ));
+                }
                 (Pipeline::Image, None) => {
                     errors.push(format!(
                         "routes[{i}] (model='{}'): pipeline = \"image\" requires api_endpoint (the real upstream path appended to apis.image.base_url)",
@@ -618,9 +629,21 @@ impl GatewayConfig {
             // `session_writeback`, so an image route with `session_sticky`
             // would never record a pin and silently degrade to a pure
             // weighted-random order. Fail fast instead of degrading silently.
-            if route.pipeline == Pipeline::Image && route.strategy == Strategy::SessionSticky {
+            // `dispatch_systemone` discards the write-back for the same
+            // reason, so `pipeline = "systemone"` is rejected identically.
+            // A **chat** route hit by a SystemOne ingress is untouched here:
+            // that is the compatibility path (no explicit systemone route),
+            // and it keeps working exactly as before.
+            let no_writeback_pipeline = match route.pipeline {
+                Pipeline::Image => Some("image"),
+                Pipeline::SystemOne => Some("systemone"),
+                Pipeline::Chat => None,
+            };
+            if let Some(pipeline_name) = no_writeback_pipeline
+                && route.strategy == Strategy::SessionSticky
+            {
                 errors.push(format!(
-                    "routes[{i}] (model='{}'): strategy = \"session_sticky\" is not supported when pipeline = \"image\" — image dispatch performs no session write-back, so the route would silently fall back to weighted-random target selection; use \"sticky_failover\", \"fill_first\", or \"round_robin\"",
+                    "routes[{i}] (model='{}'): strategy = \"session_sticky\" is not supported when pipeline = \"{pipeline_name}\" — {pipeline_name} dispatch performs no session write-back, so the route would silently fall back to weighted-random target selection; use \"sticky_failover\", \"fill_first\", or \"round_robin\"",
                     route.model_name
                 ));
             }
@@ -727,6 +750,32 @@ impl GatewayConfig {
                     "routes[{i}] (model='{}'): no enabled targets — all referenced providers are disabled",
                     route.model_name
                 ));
+            }
+
+            // ── systemone pipeline × target capability ──
+            // SystemOne has no translated lane: presence of `apis.systemone`
+            // on the target's provider is the whole capability. A target
+            // without it is skipped at resolve time (same diagnostic as an
+            // unhealthy target) — a **warning**, not an error, so a route
+            // can list a not-yet-configured provider as a lower-priority
+            // fallback without blocking startup.
+            if route.pipeline == Pipeline::SystemOne {
+                let missing: Vec<&str> = route
+                    .targets
+                    .iter()
+                    .filter(|t| {
+                        self.providers
+                            .get(&t.provider)
+                            .is_some_and(|p| !p.apis.contains_key(&ApiKind::SystemOne))
+                    })
+                    .map(|t| t.provider.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    warnings.push(format!(
+                        "routes[{i}] (model='{}'): pipeline = \"systemone\" targets provider(s) {missing:?} which declare no apis.systemone — those targets are skipped at request time",
+                        route.model_name
+                    ));
+                }
             }
 
             // ── Composite (provider, real_model) uniqueness per route ──
@@ -1738,12 +1787,13 @@ pub struct RouteConfig {
     /// The model name as requested by the client.
     /// Use `"*"` as a wildcard to match any model not matched by an exact route.
     pub model_name: String,
-    /// 请求分派管线（`chat`（缺省）/ `image`）。image 是不同物种：无协议
-    /// 匹配语义、路径随模型变，须显式声明 `pipeline = "image"`。
+    /// 请求分派管线（`chat`（缺省）/ `image` / `systemone`）。image 是不同物种：无协议
+    /// 匹配语义、路径随模型变，须显式声明 `pipeline = "image"`。`systemone` 同理是
+    /// 独立物种：该 route 只接受 `POST /v1/systemone`，chat 族 ingress 按无此模型拒绝。
     #[serde(default, skip_serializing_if = "is_default_pipeline")]
     pub pipeline: Pipeline,
     /// Real upstream path appended to `apis.image.base_url` —
-    /// **only legal when `pipeline = "image"`**（chat 族 route 出现即 error）。
+    /// **only legal when `pipeline = "image"`**（chat / systemone 族 route 出现即 error）。
     /// Examples: `/v1beta/models/gemini:generateContent`, `/images/generations`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_endpoint: Option<String>,
@@ -1789,6 +1839,12 @@ pub enum Pipeline {
     Chat,
     /// 图像生成管线：上游 URL = `apis.image.base_url` + route.`api_endpoint`。
     Image,
+    /// SystemOne 决策管线：该 route **只**接受 `POST /v1/systemone`，
+    /// 其它 chat 族 ingress 一律按「无此模型」拒绝（不回退到 chat dispatch）。
+    /// 协议 key 是不带连字符的单词 `systemone`，故显式 rename 覆盖
+    /// `rename_all` 的产物（否则会得到 `system_one`）。
+    #[serde(rename = "systemone")]
+    SystemOne,
 }
 
 impl Pipeline {
@@ -1798,6 +1854,7 @@ impl Pipeline {
         match self {
             Pipeline::Chat => "chat",
             Pipeline::Image => "image",
+            Pipeline::SystemOne => "systemone",
         }
     }
 }
@@ -3934,6 +3991,235 @@ targets = [{ provider = "openai" }]
                         && e.contains("pipeline = \"image\"")
                 ),
                 "image route with session_sticky must error, got {err:?}"
+            );
+        }
+
+        // ── pipeline = "systemone" (route-level SystemOne opt-in) ──
+
+        #[test]
+        fn systemone_pipeline_serde_is_exactly_the_protocol_key() {
+            // The serde name must be the bare word `systemone` (matching
+            // `ApiKind::SystemOne` / `IngressProtocol::SystemOne`), not the
+            // `system_one` that `rename_all = "snake_case"` would produce.
+            let route: RouteConfig = toml::from_str(
+                r#"model_name = "sys-one-model"
+pipeline = "systemone"
+targets = []"#,
+            )
+            .unwrap();
+            assert_eq!(route.pipeline, Pipeline::SystemOne);
+            assert_eq!(route.pipeline.as_str(), "systemone");
+            assert!(!is_default_pipeline(&route.pipeline));
+            assert_eq!(
+                toml::to_string(&route).unwrap(),
+                "model_name = \"sys-one-model\"\npipeline = \"systemone\"\ntargets = []\n",
+                "save path must write the same key serde accepts"
+            );
+
+            // The snake_case spelling and any unknown value stay rejected
+            // (typed config enums are strict).
+            for bad in ["system_one", "systemone2", "SystemOne"] {
+                let parsed: Result<RouteConfig, _> = toml::from_str(&format!(
+                    "model_name = \"x\"\npipeline = \"{bad}\"\ntargets = []"
+                ));
+                assert!(parsed.is_err(), "pipeline = {bad:?} must fail parse");
+            }
+        }
+
+        #[test]
+        fn systemone_pipeline_default_is_still_chat() {
+            let config = valid_config();
+            assert_eq!(config.routes[0].pipeline, Pipeline::Chat);
+            assert_eq!(Pipeline::default(), Pipeline::Chat);
+        }
+
+        #[test]
+        fn rejects_api_endpoint_on_systemone_pipeline() {
+            // SystemOne's upstream path is derived from the protocol, so a
+            // declared `api_endpoint` (including the empty string) is dead
+            // config — the old `_` arm silently accepted it.
+            for endpoint in ["/systemone", ""] {
+                let config: GatewayConfig = toml::from_str(&format!(
+                    r#"
+[server]
+[providers.so]
+api_keys = ["sk-test"]
+apis = {{ systemone = {{ base_url = "https://api.systemone.example/v1" }} }}
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+api_endpoint = "{endpoint}"
+targets = [{{ provider = "so" }}]
+"#
+                ))
+                .unwrap();
+                let err = config.validate().unwrap_err();
+                assert!(
+                    err.iter()
+                        .any(|e| e.contains("only valid when pipeline = \"image\"")
+                            && e.contains("systemone-pipeline")),
+                    "api_endpoint={endpoint:?} on a systemone route must error, got {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_session_sticky_on_systemone_pipeline() {
+            // `dispatch_systemone` discards the session write-back, exactly
+            // like `dispatch_image`.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.so]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.systemone.example/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+strategy = "session_sticky"
+targets = [{ provider = "so" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(
+                    |e| e.contains("strategy = \"session_sticky\" is not supported")
+                        && e.contains("pipeline = \"systemone\"")
+                ),
+                "systemone route with session_sticky must error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_systemone_pipeline_with_any_non_sticky_strategy() {
+            for strategy in ["fill_first", "round_robin", "sticky_failover"] {
+                let config: GatewayConfig = toml::from_str(&format!(
+                    r#"
+[server]
+[providers.so]
+api_keys = ["sk-test"]
+apis = {{ systemone = {{ base_url = "https://api.systemone.example/v1" }} }}
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+strategy = "{strategy}"
+targets = [{{ provider = "so" }}]
+"#
+                ))
+                .unwrap();
+                assert!(
+                    config.validate().is_ok(),
+                    "systemone route with strategy = {strategy} must validate: {:?}",
+                    config.validate()
+                );
+            }
+        }
+
+        #[test]
+        fn tolerates_systemone_target_without_the_api_node() {
+            // A target whose provider declares no `apis.systemone` is skipped
+            // at request time (runtime diagnostic), never a config error.
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.openai]
+api_keys = ["sk-test"]
+apis = { chat_completions = { base_url = "https://api.openai.com/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+targets = [{ provider = "openai", real_model = "sys-one-v1" }]
+"#,
+            )
+            .unwrap();
+            assert!(
+                config.validate().is_ok(),
+                "a systemone target without apis.systemone must be tolerated: {:?}",
+                config.validate()
+            );
+            // …and it is surfaced as a warning, so the operator can see why
+            // the target is skipped at request time.
+            let (result, logged) = validate_capturing(&config);
+            assert!(result.is_ok());
+            assert!(
+                logged.contains("declare no apis.systemone"),
+                "the skipped-target warning must be logged, captured: {logged:?}"
+            );
+        }
+
+        #[test]
+        fn systemone_route_without_skipped_targets_emits_no_warning() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.so]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.systemone.example/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+targets = [{ provider = "so" }]
+"#,
+            )
+            .unwrap();
+            let (result, logged) = validate_capturing(&config);
+            assert!(result.is_ok(), "{result:?}");
+            assert!(
+                !logged.contains("declare no apis.systemone"),
+                "no warning when every target declares the node, captured: {logged:?}"
+            );
+        }
+
+        #[test]
+        fn systemone_route_still_rejects_unknown_provider() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.so]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.systemone.example/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+targets = [{ provider = "ghost" }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter()
+                    .any(|e| e.contains("references unknown provider 'ghost'")),
+                "unknown target provider stays a hard error, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn systemone_route_keeps_capability_unknown_key_validation() {
+            let config: GatewayConfig = toml::from_str(
+                r#"
+[server]
+[providers.so]
+api_keys = ["sk-test"]
+apis = { systemone = { base_url = "https://api.systemone.example/v1" } }
+
+[[routes]]
+model_name = "sys-one-model"
+pipeline = "systemone"
+targets = [{ provider = "so", capabilities = { teleport = true } }]
+"#,
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.iter().any(|e| e.contains("capabilities:")),
+                "unknown capability keys stay rejected, got {err:?}"
             );
         }
 

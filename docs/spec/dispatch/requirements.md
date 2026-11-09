@@ -1,6 +1,6 @@
 ---
 created: 2026-06-03
-updated: 2026-11-04
+updated: 2026-11-09
 ---
 
 # 调度
@@ -102,7 +102,8 @@ updated: 2026-11-04
 - **无流式**：协议没有 `stream` 字段，恒为一次性 JSON 响应；取消检测只走非流式 `DispatchCancelGuard` 路径
 - **analytics 口径**：`usage.input_tokens/output_tokens` → `prompt_tokens/completion_tokens`，缺失或形状不合法一律留 NULL（**不编造 0**）；每次请求照常计入 `in_flight`、写一次会话注册表 fact、按目标产生 `TargetAttemptFact` 并落 `call_logs` 终态（成功 / 客户端 4xx / 全耗尽 `502` 模型失败三路）
 - **`fallback` 只覆盖 chat IR 三协议**：`fallback` 的取值域与「是否需要 fallback」的判定只统计 `chat_completions` / `responses` / `anthropic_messages`。仅有 `apis.systemone` + 单个 chat 协议时仍不需要 `fallback`；显式 `fallback = "systemone"` 在配置校验阶段报错（`fallback='systemone' is not supported`）——静默回退会把决策协议当成 chat 翻译目标
-- **派生视图**：`GET /v1/models` 的 `ingress_protocols` 由 `ApiKind::protocols()` 派生，自动包含 `systemone`；`POST /api/providers/probe-protocols` 明确不支持该协议（`minimal_request` 返回 `None` → 调用方转 `400`），因为决策协议的请求形状与 chat 无关，无法用 chat 探针探测
+- **`pipeline = "systemone"` 的 route 只服务 `/v1/systemone`**：显式声明该 pipeline 的路由在 `/v1/chat/completions`、`/v1/messages`、`/v1/responses` 上按「无此模型」拒绝（沿用既有 no-route 信封，不新增错误类型），不回退到 chat / image 分发；`/v1/systemone` 命中它时照旧做 enabled 过滤 + `apis.systemone` presence 过滤后走 `dispatch_systemone`。**route 身份只有 `model_name`**（落盘按它合并 `[[routes]]`、admin 创建拒重名、解析先精确后通配），因此同一 `model_name` 不能并存 chat 与 systemone 两条 route。**纯增量**：配置里没有任何 `pipeline = "systemone"` 时行为完全不变（`pipeline = "chat"` 的 route 被 `/v1/systemone` 命中仍是 presence 过滤 + SystemOne dispatch）。校验上 systemone 拒绝 `api_endpoint`（仅 image 有效）与 `session_sticky`（无 session write-back），target 缺 `apis.systemone` 只记警告、运行时跳过。
+- **派生视图**：`GET /v1/models` 的 `ingress_protocols` 由 `ApiKind::protocols()` 派生，自动包含 `systemone`；`POST /api/providers/probe-protocols` 明确不支持该协议（`minimal_request` 返回 `None` → 调用方转 `400`），因为决策协议的请求形状与 chat 无关，无法用 chat 探针探测。显式的 `pipeline = "systemone"` route 例外：只在「有 eligible target 的 provider 声明了 `apis.systemone`」时通告 `systemone`，且不通告 chat 协议（chat 请求对它只会 no-route）
 
 ### 超时错误区分
 
@@ -161,6 +162,7 @@ updated: 2026-11-04
 
 ## 变更记录
 
+- [0011 route 级 `pipeline = "systemone"`](changes/0011-route-pipeline-systemone.md) — `[[routes]]` 可声明 `pipeline = "systemone"`，这样的 route 只在 `/v1/systemone` 上存在（其它 chat 族 ingress 走既有 no-route 信封、不回退）；守卫放在 route 选中后、目标过滤前；systemone 拒绝 `api_endpoint` 与 `session_sticky`，target 缺 `apis.systemone` 只警告；`/v1/models` 只为它通告 `systemone`；旧配置零影响
 - [0010 流内错误帧在两种车道上的完整性](changes/0010-stream-error-frame-completeness.md) — Responses 出口补 `{"type":"error"}` 错误帧（`StreamEncodeState.errored` 抑制其后的 `Raw` / `Finish` / `End`）；直通车道区分「入站上游错误帧（`Raw` 原样转发）」与「网关本地中断（读错误 / chunk 空闲超时，终点合成恰好一帧 ingress 协议错误帧后关闭 body）」；转译车道丢弃 Responses 解码器的**所有** `Raw`（畸形 JSON / 缺 `type` / 未知 `type` 不再泄漏）；多行畸形事件不再重复整帧
 - [0009 工具调用参数质量告警与 Chat×Responses 车道的解码归属修正](changes/0009-tool-arg-quality-and-responses-lane-decode.md) — 空白 / 非法工具参数改为流式每流一次、非流式每响应一次的 `warn!`（warn-only，三处空响应谓词行为不变）；Chat ingress × Chat upstream 的透传车道补 raw 帧窥探；解码器按 upstream 协议选定（修掉 Anthropic ingress × Responses upstream 用错 Chat 解码器），Chat ingress × Responses upstream 改为解码重编码 + Responses `Raw` 帧过滤；上游流内错误在翻译车道改为客户端可见的协议错误帧（Chat `data: {"error":…}` / Anthropic `event: error`，其后不再发终止符；直通车道零合成帧、原样转发上游字节），`response.completed` 解码为 `Finish`（`function_call` → `tool_calls`）并补 Chat ingress 的 `finish_reason` 兜底
 - [0008 SystemOne 决策接口接入（原样透传 + 深度 dispatch）](changes/0008-systemone-ingress.md) — 新增 `POST /v1/systemone` 无 IR 分发路径：只校验路由所需字段（400 / 422）、body 与响应逐字透传（仅改写 `model`）、`apis.systemone` presence 即能力、错误统一 OpenAI 信封、恒非流式，`fallback` 取值域收窄为 chat IR 三协议

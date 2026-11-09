@@ -270,6 +270,14 @@ const strategyLabels = computed<Record<string, string>>(() => ({
   session_sticky: t("routeList.strategy.sessionSticky"),
 }))
 
+// Same reason as the strategy labels: the pipeline column shows localized names,
+// and the image row keeps its per-route endpoint (`image · /images/...`).
+const pipelineLabels = computed<Record<string, string>>(() => ({
+  chat: t("routes.form.pipelineChat"),
+  image: t("routes.form.pipelineImage"),
+  systemone: t("routes.form.pipelineSystemone"),
+}))
+
 // headers must stay functions: () => t(...) — string headers freeze on locale switch (see review-p1-p2 Minor-2)
 const columns = [
   columnHelper.accessor("model_name", {
@@ -285,8 +293,9 @@ const columns = [
     header: () => t("routeList.columns.pipeline"),
     cell: (info) => {
       const r = info.row.original
-      const isImage = (r.pipeline ?? "chat") === "image"
-      const label = isImage && r.api_endpoint ? `image · ${r.api_endpoint}` : (r.pipeline ?? "chat")
+      const pipeline = r.pipeline ?? "chat"
+      const label = pipelineLabels.value[pipeline] ?? pipeline
+      const text = pipeline === "image" && r.api_endpoint ? `${label} · ${r.api_endpoint}` : label
       return h(
         Badge,
         {
@@ -294,7 +303,7 @@ const columns = [
           class: "text-xs font-normal",
           title: r.api_endpoint ?? undefined,
         },
-        () => label,
+        () => text,
       )
     },
   }),

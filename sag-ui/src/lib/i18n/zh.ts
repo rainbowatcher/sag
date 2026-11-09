@@ -358,9 +358,13 @@ export const zh: Record<keyof typeof en, string> = {
     "通配路由(*)不支持会话粘性策略：请为每个模型单独配置路由，或改用其他策略",
   "routes.form.imageSessionStickyUnsupported":
     "会话粘性策略不支持图像管道：请改用 sticky_failover / fill_first / round_robin",
+  "routes.form.systemoneSessionStickyUnsupported": "SystemOne 路由不支持会话粘性",
   "routes.form.pipeline": "流水线",
   "routes.form.pipelineChat": "Chat",
   "routes.form.pipelineImage": "Image",
+  "routes.form.pipelineSystemone": "SystemOne",
+  "routes.form.systemonePipelineHint":
+    "此路由仅供 /v1/systemone 使用；目标供应商需配置 apis.systemone",
   "routes.form.pipelineHint": "Image 路由会带每条路由的路径发送到供应商的 image section。",
   "routes.form.apiEndpointLabel": "API Endpoint *",
   "routes.form.apiEndpointHintLead": "追加到目标供应商的 ",
