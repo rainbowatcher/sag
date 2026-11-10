@@ -1,10 +1,12 @@
 ---
 created: 2026-11-09
-updated: 2026-11-09
+updated: 2026-11-10
 type: 新增
 ---
 
 # 0011 — route 级 `pipeline = "systemone"`
+
+> **后续修正（2026-11-10）**：本文「守卫命中即返回 404、不回退」的隐含契约漏掉了 `"*"` 通配 route —— 它本来就能服务任何 model 名。混合配置（先有 `*` chat 兜底、再补一条显式 systemone route）会让被占用的名字在 chat 族入口恒 404，并持续写 `__no_route__` call log。现已改为按 ingress 跳过不可服务的候选后继续尝试通配；只有连可服务通配都没有时才 404，且文案改为「该模型在此端点不可用」；`/v1/models` 与 `/v1/responses` stateful 预检同步修正。以 [dispatch/spec.md](../spec.md) 的「route 级 `pipeline = "systemone"`」节及其 0011 后续修正条目为准；下文保留为 0011 当时的设计记录。
 
 ## 动机
 

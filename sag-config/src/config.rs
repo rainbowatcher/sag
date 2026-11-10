@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 pub use sag_core::ApiKind;
+use sag_core::IngressProtocol;
 use serde::{Deserialize, Serialize};
 
 /// Macro: produce a minimal `GatewayConfig` with sensible defaults for
@@ -163,10 +164,21 @@ impl GatewayConfig {
         })
     }
 
-    /// Resolve a request `model` to its route: an exact `model_name` match
-    /// first, falling back to the `"*"` wildcard route.
+    /// Resolve a request `model` to its **identity** route: an exact
+    /// `model_name` match first, falling back to the `"*"` wildcard route.
+    /// Request dispatch uses [`resolve_model_route_for_ingress`] instead.
     pub fn resolve_route<'a>(&'a self, model: &str) -> Option<&'a RouteConfig> {
         resolve_model_route(&self.routes, model)
+    }
+
+    /// Resolve a request `model` to the route that can serve `ingress`.
+    /// See [`resolve_model_route_for_ingress`].
+    pub fn resolve_route_for_ingress<'a>(
+        &'a self,
+        model: &str,
+        ingress: IngressProtocol,
+    ) -> Result<&'a RouteConfig, NoRouteReason> {
+        resolve_model_route_for_ingress(&self.routes, model, ingress)
     }
 
     /// Normalize the gateway-level `proxy_url` into a [`ProxyConfig`].
@@ -1789,7 +1801,8 @@ pub struct RouteConfig {
     pub model_name: String,
     /// 请求分派管线（`chat`（缺省）/ `image` / `systemone`）。image 是不同物种：无协议
     /// 匹配语义、路径随模型变，须显式声明 `pipeline = "image"`。`systemone` 同理是
-    /// 独立物种：该 route 只接受 `POST /v1/systemone`，chat 族 ingress 按无此模型拒绝。
+    /// 独立物种：该 route 只接受 `POST /v1/systemone`；chat 族 ingress 会跳过它、继续
+    /// 尝试 `"*"` 通配（有可服务的通配才不会按「此端点不可用」拒绝）。
     #[serde(default, skip_serializing_if = "is_default_pipeline")]
     pub pipeline: Pipeline,
     /// Real upstream path appended to `apis.image.base_url` —
@@ -1839,8 +1852,9 @@ pub enum Pipeline {
     Chat,
     /// 图像生成管线：上游 URL = `apis.image.base_url` + route.`api_endpoint`。
     Image,
-    /// SystemOne 决策管线：该 route **只**接受 `POST /v1/systemone`，
-    /// 其它 chat 族 ingress 一律按「无此模型」拒绝（不回退到 chat dispatch）。
+    /// SystemOne 决策管线：该 route **只**接受 `POST /v1/systemone`。
+    /// 其它 chat 族 ingress 跳过它、继续找 `"*"` 通配；只有连可服务的
+    /// 通配都没有时才按「此端点不可用」拒绝（沿用 no-route 信封）。
     /// 协议 key 是不带连字符的单词 `systemone`，故显式 rename 覆盖
     /// `rename_all` 的产物（否则会得到 `system_one`）。
     #[serde(rename = "systemone")]
@@ -1867,14 +1881,74 @@ fn is_default_pipeline(v: &Pipeline) -> bool {
 /// match first, falling back to the `"*"` wildcard route. Returns the
 /// matching route, or `None` when the model does not belong to any route.
 ///
-/// Shared by the dispatch resolver, the stale-entry prune, and the admin
-/// sticky-target snapshot so all three agree on which route a request model
-/// belongs to.
+/// This is the **identity** lookup: which route *owns* a model name. Shared
+/// by the stale-entry prune and the admin sticky-target snapshot. The
+/// request path uses [`resolve_model_route_for_ingress`] instead (which also
+/// checks whether the route can serve the ingress).
 pub fn resolve_model_route<'a>(routes: &'a [RouteConfig], model: &str) -> Option<&'a RouteConfig> {
     routes
         .iter()
         .find(|r| r.model_name == model)
         .or_else(|| routes.iter().find(|r| r.model_name == "*"))
+}
+
+/// Why an ingress-aware route lookup found no usable route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRouteReason {
+    /// Neither an exact nor a `"*"` route exists for the model.
+    UnknownModel,
+    /// The model is claimed by a `pipeline = "systemone"` route, which this
+    /// chat-family ingress cannot serve, and no servable wildcard fallback
+    /// exists.
+    SystemOneOnly,
+}
+
+/// Whether `route` can serve `ingress` at all.
+///
+/// `pipeline = "systemone"` routes are bound to `/v1/systemone`; chat-family
+/// ingresses must skip them so a `"*"` wildcard route can still service the
+/// model name. Every other pipeline keeps its 0011 behaviour on every
+/// ingress (chat ingress × image route → `dispatch_image`; the other
+/// ingresses reject the image pipeline in their handler).
+pub fn route_serves_ingress(route: &RouteConfig, ingress: IngressProtocol) -> bool {
+    ingress == IngressProtocol::SystemOne || route.pipeline != Pipeline::SystemOne
+}
+
+/// Resolve a request `model` to the route that can actually serve `ingress`:
+/// exact `model_name` first, then the `"*"` wildcard, skipping candidates
+/// that [`route_serves_ingress`] rejects at **both** levels.
+///
+/// A model name claimed by an explicit `pipeline = "systemone"` route is not
+/// exclusively owned by it on chat-family ingresses: the wildcard branch is
+/// still evaluated. This keeps the common upgrade path working — start with a
+/// `"*"` chat fallback, then add one systemone route — while `/v1/systemone`
+/// still wins the exact route.
+///
+/// `Err(SystemOneOnly)` means a systemone route exists but no servable route
+/// does; it is deliberately distinct from a genuinely unknown model so the
+/// caller can say "not available on this endpoint" rather than "no such
+/// model".
+pub fn resolve_model_route_for_ingress<'a>(
+    routes: &'a [RouteConfig],
+    model: &str,
+    ingress: IngressProtocol,
+) -> Result<&'a RouteConfig, NoRouteReason> {
+    let exact = routes.iter().find(|r| r.model_name == model);
+    let wildcard = routes.iter().find(|r| r.model_name == "*");
+
+    for candidate in [exact, wildcard].into_iter().flatten() {
+        if route_serves_ingress(candidate, ingress) {
+            return Ok(candidate);
+        }
+    }
+
+    let blocked_by_systemone = exact.is_some_and(|r| r.pipeline == Pipeline::SystemOne)
+        || wildcard.is_some_and(|r| r.pipeline == Pipeline::SystemOne);
+    Err(if blocked_by_systemone {
+        NoRouteReason::SystemOneOnly
+    } else {
+        NoRouteReason::UnknownModel
+    })
 }
 
 /// A routing target: maps a logical model to a specific provider + real model name.
@@ -4995,5 +5069,162 @@ kind = "employee_id"
             .unwrap();
             assert!(config.validate().is_ok());
         }
+    }
+}
+
+/// Ingress-aware resolution (§0012): an explicit `pipeline = "systemone"`
+/// exact route must not monopolise a model name on chat-family ingresses
+/// when a `"*"` chat fallback exists.
+#[cfg(test)]
+mod ingress_resolution_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn route(model: &str, pipeline: Pipeline) -> RouteConfig {
+        RouteConfig {
+            session_ttl_secs: None,
+            session_max_entries: None,
+            model_name: model.into(),
+            api_endpoint: None,
+            pipeline,
+            retries: None,
+            timeout_secs: None,
+            strategy: Strategy::FillFirst,
+            targets: vec![RouteTarget {
+                provider: "p".into(),
+                real_model: None,
+                priority: 1,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                capabilities: None,
+            }],
+        }
+    }
+
+    const CHAT_INGRESSES: [IngressProtocol; 3] = [
+        IngressProtocol::ChatCompletions,
+        IngressProtocol::Responses,
+        IngressProtocol::AnthropicMessages,
+    ];
+
+    fn mixed_routes() -> Vec<RouteConfig> {
+        vec![
+            route("so-model", Pipeline::SystemOne),
+            route("*", Pipeline::Chat),
+        ]
+    }
+
+    #[test]
+    fn chat_ingress_falls_back_to_the_wildcard_when_exact_is_systemone() {
+        let routes = mixed_routes();
+        for ingress in CHAT_INGRESSES {
+            let resolved = resolve_model_route_for_ingress(&routes, "so-model", ingress).unwrap();
+            assert_eq!(resolved.model_name, "*", "{ingress:?}");
+            assert_eq!(resolved.pipeline, Pipeline::Chat, "{ingress:?}");
+        }
+        // The identity lookup still reports the exact owner — admin CRUD and
+        // cache pruning are deliberately ingress-agnostic.
+        assert_eq!(
+            resolve_model_route(&routes, "so-model").unwrap().model_name,
+            "so-model"
+        );
+    }
+
+    #[test]
+    fn systemone_ingress_keeps_the_exact_systemone_route() {
+        let routes = mixed_routes();
+        let resolved =
+            resolve_model_route_for_ingress(&routes, "so-model", IngressProtocol::SystemOne)
+                .unwrap();
+        assert_eq!(resolved.model_name, "so-model");
+        assert_eq!(resolved.pipeline, Pipeline::SystemOne);
+    }
+
+    #[test]
+    fn chat_ingress_without_a_wildcard_reports_systemone_only() {
+        let routes = vec![route("so-model", Pipeline::SystemOne)];
+        for ingress in CHAT_INGRESSES {
+            assert_eq!(
+                resolve_model_route_for_ingress(&routes, "so-model", ingress),
+                Err(NoRouteReason::SystemOneOnly),
+                "{ingress:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemone_wildcard_cannot_serve_chat_ingress() {
+        let routes = vec![route("*", Pipeline::SystemOne)];
+        for ingress in CHAT_INGRESSES {
+            assert_eq!(
+                resolve_model_route_for_ingress(&routes, "anything", ingress),
+                Err(NoRouteReason::SystemOneOnly),
+                "{ingress:?}"
+            );
+            assert_eq!(
+                resolve_model_route_for_ingress(&routes, "anything", IngressProtocol::SystemOne,)
+                    .unwrap()
+                    .model_name,
+                "*"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_model_is_distinct_from_ingress_mismatch() {
+        let routes = mixed_routes();
+        assert_eq!(
+            resolve_model_route_for_ingress(&routes, "missing", IngressProtocol::Responses),
+            // The wildcard is a chat route, so "missing" *is* servable.
+            Ok(routes.last().unwrap())
+        );
+        let empty: Vec<RouteConfig> = Vec::new();
+        assert_eq!(
+            resolve_model_route_for_ingress(&empty, "missing", IngressProtocol::Responses),
+            Err(NoRouteReason::UnknownModel)
+        );
+    }
+
+    #[test]
+    fn chat_exact_route_still_wins_over_the_wildcard() {
+        let routes = vec![route("gpt-4o", Pipeline::Chat), route("*", Pipeline::Chat)];
+        for ingress in CHAT_INGRESSES {
+            assert_eq!(
+                resolve_model_route_for_ingress(&routes, "gpt-4o", ingress)
+                    .unwrap()
+                    .model_name,
+                "gpt-4o"
+            );
+        }
+    }
+
+    #[test]
+    fn image_route_stays_servable_on_chat_ingress() {
+        let routes = vec![route("img", Pipeline::Image)];
+        for ingress in CHAT_INGRESSES {
+            assert_eq!(
+                resolve_model_route_for_ingress(&routes, "img", ingress)
+                    .unwrap()
+                    .pipeline,
+                Pipeline::Image,
+                "{ingress:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_config_wrapper_resolves_for_ingress() {
+        let config = GatewayConfig {
+            routes: mixed_routes(),
+            ..gateway_config_base!()
+        };
+        assert_eq!(
+            config
+                .resolve_route_for_ingress("so-model", IngressProtocol::ChatCompletions)
+                .unwrap()
+                .model_name,
+            "*"
+        );
     }
 }

@@ -243,17 +243,20 @@ SystemOne 没有 chat IR（`state` / `questions` / `answers` 与逐题概率字�
 |---|---|---|
 | `chat`（默认） | chat 族三协议；**0008 起的兼容路径**：`/v1/systemone` 也接受 | 由协议 / provider `apis` 节点派生 |
 | `image` | `/v1/chat/completions`（命中后分流到 `dispatch_image`）；`/v1/messages` / `/v1/responses` / `/v1/systemone` 显式拒绝 Image | `apis.image.base_url` + route.`api_endpoint` |
-| `systemone` | **仅** `/v1/systemone` | `protocol_path(SystemOne)` 派生（`api_endpoint` 非法） |
+| `systemone` | **仅** `/v1/systemone`；chat 族 ingress 跳过它、继续尝试 `"*"` 通配，连可服务的通配都没有才 no-route | `protocol_path(SystemOne)` 派生（`api_endpoint` 非法） |
 
-**守卫位置与语义**：在 `resolve_route_with_ingress` 内，route 已按 `model_name`（精确 → `"*"` 通配）选中之后、`filter_enabled_targets` 之前：
+**解析位置与语义**（0011 的守卫经 0012 修正）：`resolve_route_with_ingress` 不再「先精确 → 通配选中，再单独守卫」，而是直接调用 `sag_config::resolve_model_route_for_ingress(&cfg.routes, model, ingress)`：精确 `model_name` 与 `"*"` 两级候选依次过 `route_serves_ingress`（`pipeline = "systemone"` 且 ingress ≠ SystemOne ⇒ 跳过），第一个可服务的候选即被选中。守卫仍位于 `filter_enabled_targets` 之前，因此无路由时不消耗目标、不产生 attempt 行、不触达上游。
 
-```rust
-if route.pipeline == Pipeline::SystemOne && ingress_protocol != IngressProtocol::SystemOne {
-    return Err(emit_no_route_failure(/* 既有 no-route 路径 */).await);
-}
-```
+| ingress | 配置形状 | 结果 |
+|---|---|---|
+| chat 族 | 精确 systemone route + `"*"` chat 通配 | **命中通配 route**，正常 chat 分发（`route_name = "*"`） |
+| chat 族 | 精确 systemone route，无通配 / 通配也是 systemone | no-route 404（新文案，见下） |
+| `/v1/systemone` | 精确 systemone route + `"*"` chat 通配 | 仍命中精确 systemone route |
+| 任意 | 配置里没有 `pipeline = "systemone"` | 与 0011 之前完全一致 |
 
-语义是「该模型在这个 ingress 上不存在」：复用既有的 no-route 失败路径与错误信封（`/v1/messages` / `/v1/responses` 各自保留自己的信封），**不**新增错误类型、不产生 attempt 行、不触达上游、不 fall through 到 chat / image dispatch。守位选在 target 过滤之前，是因为它不依赖于目标——这是「路由身份」层面的判定。
+0011 的隐含契约「route 身份只有 `model_name`，所以没有同名的 chat route 可回退」漏掉了通配本身：`"*"` 是能服务任何 model 名的 chat route。先有 `*` 兜底、再补一条 systemone route 是升级路径上最常见的混合配置，旧守卫会让被占用的名字在三条 chat 入口上恒 404，且每次写一行 `provider = "__no_route__"` 的 call log，长期污染 no_route 指标。
+
+`sag_config::NoRouteReason` 把「真的没有任何 route」（`UnknownModel`）与「只有 systemone route、此 ingress 无可服务候选」（`SystemOneOnly`）分开。两者都沿用既有 no-route 路径与错误信封（`MODEL_NOT_FOUND`、`/v1/messages` 的 Anthropic 信封、`__no_route__` sentinel、`NoRoute` fact），**不新增错误类型、不改 analytics 口径**；只有后者把客户端 message 从裸 model 名改成 `model '<x>' is not available on this endpoint (...)`——模型确实存在，只是不能从这个端点访问。通配存在时请求被正常服务，也就不再产生 `__no_route__` 行。
 
 `/v1/systemone` 自己的三种 pipeline 组合与改动前完全一致：`systemone` / `chat` 都接受（都走 `filter_systemone_targets` 的 presence 过滤 + `dispatch_systemone`），`image` 先过 presence 过滤、存活则由 handler 拒 Image（`422`）。
 
@@ -266,9 +269,13 @@ if route.pipeline == Pipeline::SystemOne && ingress_protocol != IngressProtocol:
 - 四条 strategy 中除 `session_sticky` 外全部适用；`fallback` 语义不变——仍只统计 chat IR 三协议，`systemone` 不可作 fallback。
 - `capabilities` 字段保留既有形状校验，但 chat 能力预检对它不生效。
 
-**`/v1/models`**：`list_models` 对显式 systemone route 走独立分支——`ingress_protocols` 只在「存在 eligible 且 provider 声明了 `apis.systemone` 的 target」时包含 `systemone`，且**永不含 chat 族协议**（chat 请求对该 route 只会 no-route）。旧 pipeline 的「provider `apis` 并集」聚合逐字不变，包括其既有怪癖。
+**`/v1/models`**：`list_models` 对显式 systemone route 走独立分支——`ingress_protocols` 只在「存在 eligible 且 provider 声明了 `apis.systemone` 的 target」时包含 `systemone`；chat 族协议只从**可服务的 `"*"` 通配 route** 派生（存在、`pipeline != "systemone"`、至少一个 eligible target），按 `ApiKind::protocols()` 固定顺序输出。没有这样的通配时仍只通告 `systemone`。旧 pipeline 的「provider `apis` 并集」聚合逐字不变，包括其既有怪癖。这条修正让派生视图与实际可达性一致：OpenAI / Anthropic 客户端并不读 `ingress_protocols` 这个自定义字段，模型出现在列表里就该能按 chat 协议调用。
 
-**route 身份只有 `model_name`**：落盘 `sync_array_of_tables` 的 key、admin 创建 / 更新 / 删除的定位、解析的精确 + 通配两级匹配都只看它。因此同一名字不能并存 chat 与 systemone 两条 route；`"*"` 也只有一条，声明成 systemone 就会一并接管所有未命中模型的 chat 兜底。
+**route 身份只有 `model_name`（管理面）**：落盘 `sync_array_of_tables` 的 key、admin 创建 / 更新 / 删除的定位、`sag_config::resolve_model_route` 的精确 → 通配两级匹配都只看它，因此同一名字不能并存 chat 与 systemone 两条 route。但 **identity ≠ service**：请求路径用 `resolve_model_route_for_ingress`，一个 model 名可以同时被一条 systemone 精确 route（`/v1/systemone`）与一条 `"*"` chat route（chat 族）服务。`"*"` 只有一条，声明成 systemone 就等于放弃 chat 兜底——此时 chat 族仍 no-route。
+
+**`/v1/responses` stateful 预检**：M8 的 `all_native` 判定改用 `resolve_model_route_for_ingress(..., Responses)`，即真正会服务该请求的 route；解析无果时回退到 identity 查找以保留旧行为（随后 resolve 会返回 404）。否则精确 systemone route 的 provider 若声明 `apis.responses`、而 `"*"` chat 兜底走 Translated lane，`previous_response_id` 会被静默塞进 Chat `extra`。
+
+**有意不改的边界**：`sag-state` 的 `retain_sticky_routes` / `clear_wildcard_route` 与 `sag-admin` 的快照仍用 identity 解析（管理面没有 ingress 概念，缓存键按请求 model 记账）。混合配置下，一个由 `"*"` sticky route 服务、但名字被 systemone 精确 route 占用的 pin，可能在下一次 route CRUD / 热重载触发 prune 时被丢弃——pin 只是路由偏好缓存，不影响正确性，也不改变本修复的客户端可见行为。
 
 ### chat 路由的 `apis` presence 预检（SystemOne 放开后的连带修正）
 
@@ -304,11 +311,13 @@ if route.pipeline == Pipeline::SystemOne && ingress_protocol != IngressProtocol:
 - SystemOne 恒非流式：`is_stream` 固定 `false`，不得伪造 `stream` 字段，也不得把 `InFlightGuard` 移交给 `StreamState`
 - 形状预检（非对象 body / `model` 非字符串 / `questions` 非对象 → 422）必须在 carrier 构造与 `resolve_route_with_ingress` **之前**完成，不消耗路由上下文；`pipeline == Image` 的 422 靠路由解析出 `pipeline`，位于解析成功之后、`dispatch_systemone` 之前
 - SystemOne 目标必须声明 `apis.systemone`（presence 即能力）；chat 的硬需求能力表与 Translated lane 对它一律不参与
-- `pipeline = "systemone"` 的 route 只接受 `IngressProtocol::SystemOne`；其它 ingress 必须在 target 过滤**之前**走 no-route，不得 fall through 到 chat / image dispatch，也不得新增错误类型
+- `pipeline = "systemone"` 的精确 route 只服务 `IngressProtocol::SystemOne`；chat 族 ingress 必须跳过它并继续尝试 `"*"` 通配，只有连可服务的通配都没有时，才在 target 过滤**之前**走 no-route（且不新增错误类型）
 - `pipeline = "systemone"` 拒绝 `api_endpoint`（上游路径由协议派生）与 `session_sticky`（无 session write-back），两者都在配置校验期报错；target 缺 `apis.systemone` 只记 warning，不得升格为启动失败
 - target 的 provider 名字不存在是配置校验期**硬错误**（`references unknown provider`），不得因 systemone pipeline 放宽；它与「provider 存在但缺 `apis.systemone` 只记 warning、运行时被 pre-drop」分层：前者发生在 `validate_routes`（拒绝启动 / `400`），后者发生在 `resolve_route_with_ingress` 的 target 过滤（跳过 + `lacks capability` 诊断）
 - route 身份只有 `model_name`：解析、落盘、admin 定位三处必须一致（精确 → `"*"` 通配）；同一 `model_name` 不得同时存在 chat 与 systemone 两条 route
-- `/v1/models` 的显式 systemone route 只通告 `systemone`，不得因 provider 同时声明 chat 节点而通告 chat 协议；旧 pipeline 的聚合行为不得改变
+- `/v1/models` 的显式 systemone route 的 chat 族 `ingress_protocols` 只能来自可服务的 `"*"` 通配 route，不得因自身 provider 同时声明 chat 节点而通告；没有该通配时只通告 `systemone`，旧 pipeline 的聚合行为不得改变
+- `/v1/responses` 的 stateful 预检必须按 `resolve_model_route_for_ingress(..., Responses)` 取实际服务的 route，不得用 identity 解析出的 systemone route 授权 stateful 字段
+- `sag_config::resolve_model_route` 是管理面 / 缓存剪枝的 identity 查找，语义保持不变；请求路径一律用 `resolve_model_route_for_ingress`
 - chat 路由的能力过滤先做 `apis` presence 检查：目标实际使用的协议必须是 provider 已声明的 `apis` 节点，缺则 pre-drop 并记 `lacks capability {used}`；未知 provider 名不在这一层丢弃（留给 `resolve_provider` 记 `not found`，保留 failover）
 - `fallback` 的需求判定与取值域只统计 chat IR 三协议；`fallback = "systemone"` 必须在配置校验期拒绝，不得运行期降级
 - 工具调用参数质量告警是**纯观测**：不得计入 `failure_reason`、不得触发重试 / fallback / 粘性变更、不得改写响应体字节；流式告警只在 `finish_stream_terminal` 发（`TerminalGuard::Drop` 不发，否则取消的流会假报 `Blank`）
@@ -335,7 +344,8 @@ if route.pipeline == Pipeline::SystemOne && ingress_protocol != IngressProtocol:
 
 ## 变更记录
 
-- [0011 route 级 `pipeline = "systemone"`](changes/0011-route-pipeline-systemone.md) — `Pipeline` 三值（`systemone` 显式 serde rename）；`resolve_route_with_ingress` 的 pipeline × ingress 守卫（route 选中后、目标过滤前，不匹配走既有 no-route）；systemone 拒绝 `api_endpoint` / `session_sticky`、`apis.systemone` presence 缺失只记录 warning；`/v1/models` 对它只通告 `systemone`；route 身份只有 `model_name`
+- **0011 后续修正（2026-11-10，见上文「route 级 `pipeline = "systemone"`」节）** — 原先「守卫命中即返回 404」的隐含契约漏掉了 `"*"` 通配：新增 `sag_config::{NoRouteReason, route_serves_ingress, resolve_model_route_for_ingress}`（identity 与 service 两级解析分离），chat 族 ingress 跳过不可服务的 systemone 候选后继续尝试通配；无通配才 404 且文案改为「此端点不可用」；`/v1/models` 按可服务通配派生 chat 协议；`/v1/responses` stateful 预检改用实际服务的 route。测试：`sag-config` 8 例、`sag-dispatch` 5 例、`sag-router` 单元 3 例 + `systemone_ingress.rs` 入口集成 5 例
+- [0011 route 级 `pipeline = "systemone"`](changes/0011-route-pipeline-systemone.md) — `Pipeline` 三值（`systemone` 显式 serde rename）；`resolve_route_with_ingress` 的 pipeline × ingress 守卫（route 选中后、目标过滤前，不匹配走既有 no-route）；systemone 拒绝 `api_endpoint` / `session_sticky`、`apis.systemone` presence 缺失只记录 warning；`/v1/models` 对它只通告 `systemone`；route 身份只有 `model_name`（**守卫语义已由上条修正取代**）
 - [0010 流内错误帧在两种车道上的完整性](changes/0010-stream-error-frame-completeness.md) — `ResponsesCodec::encode_error_event` + `StreamEncodeState.errored`（错误帧后 `Raw` / `Finish` / `End` 返回空 vec）；`StreamState.pending_local_error` 让直通车道先扣住 `Error`、由紧随的 `Raw` 清除，流结束时仍扣留即为网关本地中断并在终点合成一帧；`use_responses && needs_ir_decode` 分支丢弃所有 Responses 解码器 `Raw`（删除 `is_responses_event_frame`）；解码器 `push_frame_raw` per-frame 去重
 - [0009 工具调用参数质量告警与 Chat×Responses 车道的解码归属修正](changes/0009-tool-arg-quality-and-responses-lane-decode.md) — 新增 `sag-core` 纯谓词层 `ToolArgsQuality` / `ToolArgWatch`，流式（`finish_stream_terminal`）与非流式各发一条 warn-only 告警（不动空响应判定）；字节透传车道补 `peek_chat_raw_frame` 窥探（observation-only、门控在 `!needs_ir_decode`）；`StreamFrameDecoder` 改 boxed `FnMut` 并补 `use_responses` 分支，修掉 Anthropic ingress × Responses upstream 用错 Chat 解码器；`needs_ir_decode` 纳入 Chat ingress × Responses upstream（解码重编码为 Chat chunk），`is_responses_event_frame` 拦下已解码车道的 Responses `Raw` 帧；`response.completed` 解码出 `Finish`（`function_call` → `tool_calls`），补 Chat ingress 的 `finish_reason` 兜底与翻译车道协议正确的流内错误帧（Chat `data: {"error":…}` / Anthropic `event: error`，错误后不再发终止符；直通车道零合成帧）
 - [0008 SystemOne 决策接口接入（原样透传 + 深度 dispatch）](changes/0008-systemone-ingress.md) — 新增 `dispatch_systemone`（镜像 `dispatch_image` 骨架、无 IR、恒非流式）、`build_systemone_body` 的 carrier 契约（`extra` 逐字重建 + 仅改写 `model`）、`filter_systemone_targets` 的 presence 即能力闸门，并把 `fallback` 语义收窄为 chat IR 三协议

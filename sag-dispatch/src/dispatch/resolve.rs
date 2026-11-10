@@ -88,48 +88,37 @@ pub async fn resolve_route_with_ingress(
     let config_guard = state.config.read().await;
     let current_version = prune_stale_if_needed(state, runtime, &config_guard.routes).await;
 
-    let route = sag_config::resolve_model_route(&config_guard.routes, &request.model);
-    let Some(route) = route else {
-        return Err(emit_no_route_failure(
-            state,
-            request,
-            trace_id,
-            is_stream,
-            start,
-            started_at,
-            user_agent,
-            client_ip,
-            session_key,
-            ingress_protocol,
-        )
-        .await);
+    // Pipeline × ingress (D2, amended by 0012). `pipeline = "systemone"`
+    // routes are invisible to chat-family ingresses: resolution tries the
+    // exact `model_name` first, then the `"*"` wildcard, skipping candidates
+    // that cannot serve this ingress. A model name claimed by an explicit
+    // systemone route therefore still falls through to a chat wildcard — the
+    // common upgrade path (a `*` chat fallback first, then one systemone
+    // route) no longer turns into a permanent 404. `/v1/systemone` keeps the
+    // exact route.
+    let route = match sag_config::resolve_model_route_for_ingress(
+        &config_guard.routes,
+        &request.model,
+        ingress_protocol,
+    ) {
+        Ok(route) => route,
+        Err(reason) => {
+            return Err(emit_no_route_failure(
+                state,
+                request,
+                trace_id,
+                is_stream,
+                start,
+                started_at,
+                user_agent,
+                client_ip,
+                session_key,
+                ingress_protocol,
+                reason,
+            )
+            .await);
+        }
     };
-
-    // Pipeline × ingress guard (D2). A route that explicitly declares
-    // `pipeline = "systemone"` serves **only** `POST /v1/systemone`: it is a
-    // decision protocol with no chat IR, so a chat-family ingress must not
-    // fall through to chat/image dispatch. Report it as the existing
-    // "no such model" failure instead of inventing a new error type — the
-    // route is not a chat route at all, so the model is unknown on this
-    // endpoint. Route identity is `model_name` alone (exact match, then the
-    // `"*"` wildcard), so there is no same-name chat route to fall back to.
-    if route.pipeline == sag_config::Pipeline::SystemOne
-        && ingress_protocol != sag_core::IngressProtocol::SystemOne
-    {
-        return Err(emit_no_route_failure(
-            state,
-            request,
-            trace_id,
-            is_stream,
-            start,
-            started_at,
-            user_agent,
-            client_ip,
-            session_key,
-            ingress_protocol,
-        )
-        .await);
-    }
 
     // Drop targets pointing at disabled providers or models not in enabled_models.
     let targets = filter_enabled_targets(&config_guard.providers, &route.targets, &request.model);
@@ -354,6 +343,12 @@ async fn prune_stale_if_needed(
 
 /// No-route terminal: fully-built 404 response (legacy CallLog row with the
 /// `__no_route__` sentinel) plus the formal analytics fact.
+///
+/// `reason` only changes the client-facing message. A model owned solely by
+/// a `pipeline = "systemone"` route is reported as unavailable on **this
+/// endpoint** instead of as an unknown model; the `MODEL_NOT_FOUND` code,
+/// the `__no_route__` sentinel and the `NoRoute` analytics fact stay shared
+/// with the genuinely-unknown-model case (no new error type).
 #[allow(clippy::too_many_arguments)]
 async fn emit_no_route_failure(
     state: &AppState,
@@ -366,7 +361,15 @@ async fn emit_no_route_failure(
     client_ip: Option<&str>,
     session_key: Option<&sag_core::SessionKey>,
     ingress_protocol: sag_core::IngressProtocol,
+    reason: sag_config::NoRouteReason,
 ) -> Response<Body> {
+    let err = match reason {
+        sag_config::NoRouteReason::UnknownModel => AppError::ModelNotFound(request.model.clone()),
+        sag_config::NoRouteReason::SystemOneOnly => AppError::ModelNotFound(format!(
+            "model '{}' is not available on this endpoint (pipeline = \"systemone\" routes only serve /v1/systemone; no chat wildcard fallback is configured)",
+            request.model
+        )),
+    };
     let response = failure_response(
         state,
         trace_id,
@@ -376,7 +379,7 @@ async fn emit_no_route_failure(
         is_stream,
         start,
         StatusCode::NOT_FOUND,
-        AppError::ModelNotFound(request.model.clone()),
+        err,
         request.reasoning_effort.as_deref(),
         user_agent,
         client_ip,
@@ -1893,9 +1896,212 @@ mod tests {
         .await
     }
 
+    /// Mixed config from the 0012 upgrade path: an exact
+    /// `pipeline = "systemone"` route on a dual-protocol provider, plus an
+    /// optional `"*"` route with the given pipeline on a chat-only provider.
+    async fn build_state_with_optional_wildcard(
+        wildcard_pipeline: Option<sag_config::Pipeline>,
+    ) -> (AppState, DispatchRuntime) {
+        fn target(provider: &str, real_model: &str) -> RouteTarget {
+            RouteTarget {
+                provider: provider.into(),
+                real_model: Some(real_model.into()),
+                priority: 1,
+                retries: None,
+                timeout_secs: None,
+                extra: HashMap::new(),
+                capabilities: None,
+            }
+        }
+
+        fn route(model_name: &str, pipeline: sag_config::Pipeline, t: RouteTarget) -> RouteConfig {
+            RouteConfig {
+                session_ttl_secs: None,
+                session_max_entries: None,
+                model_name: model_name.into(),
+                api_endpoint: None,
+                pipeline,
+                retries: None,
+                timeout_secs: None,
+                strategy: sag_config::Strategy::FillFirst,
+                targets: vec![t],
+            }
+        }
+
+        let mut providers: HashMap<String, ProviderConfig> = HashMap::new();
+        let mut dual = provider_config(true);
+        dual.apis.insert(
+            sag_core::ApiKind::SystemOne,
+            sag_config::ApiConfig {
+                base_url: "https://api.systemone.example/v1".into(),
+                ..Default::default()
+            },
+        );
+        providers.insert("dual".into(), dual);
+        providers.insert("chat".into(), provider_config(true));
+
+        let mut routes = vec![route(
+            "sys-one-model",
+            sag_config::Pipeline::SystemOne,
+            target("dual", "sys-one-v1"),
+        )];
+        if let Some(pipeline) = wildcard_pipeline {
+            routes.push(route("*", pipeline, target("chat", "chat-real")));
+        }
+
+        let config = sag_config::GatewayConfig {
+            providers,
+            routes,
+            ..sag_config::gateway_config_base!()
+        };
+        let handle = sag_config::ConfigHandle::from_config(config);
+        let provider_registry = sag_state::testing::build_provider_registry(&handle, false).await;
+        let state = sag_state::testing::test_app_state(handle, provider_registry).await;
+        (state, DispatchRuntime::default())
+    }
+
+    /// Regression (0012): the exact systemone route no longer monopolises the
+    /// model name. All three chat-family ingresses must resolve to the `"*"`
+    /// chat route and must NOT write the `__no_route__` sentinel that used to
+    /// pollute the no_route metric for a model that actually exists.
+    #[tokio::test]
+    async fn systemone_exact_route_falls_back_to_chat_wildcard_on_chat_ingress() {
+        for ingress in [
+            sag_core::IngressProtocol::ChatCompletions,
+            sag_core::IngressProtocol::Responses,
+            sag_core::IngressProtocol::AnthropicMessages,
+        ] {
+            let (state, runtime) =
+                build_state_with_optional_wildcard(Some(sag_config::Pipeline::Chat)).await;
+            let resolved = resolve_with_ingress(&state, &runtime, ingress)
+                .await
+                .unwrap_or_else(|_| panic!("{ingress:?}: the chat wildcard must serve the model"));
+
+            assert_eq!(resolved.route_name, "*", "{ingress:?}");
+            assert_eq!(resolved.pipeline, sag_config::Pipeline::Chat, "{ingress:?}");
+            assert_eq!(resolved.targets.len(), 1, "{ingress:?}");
+            assert_eq!(resolved.targets[0].provider, "chat", "{ingress:?}");
+            assert_eq!(resolved.targets[0].real_model, "chat-real", "{ingress:?}");
+
+            state.collector.flush().await;
+            let logs = state
+                .collector
+                .store()
+                .query_logs(sag_analytics::LogFilter {
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                logs.is_empty(),
+                "{ingress:?}: a wildcard-served request must not write a __no_route__ call log, got {logs:?}"
+            );
+        }
+    }
+
+    /// `/v1/systemone` still wins the exact route even when a chat wildcard
+    /// exists — the fallback is one-way (chat ingresses only).
+    #[tokio::test]
+    async fn systemone_ingress_keeps_the_exact_route_with_a_wildcard_present() {
+        let (state, runtime) =
+            build_state_with_optional_wildcard(Some(sag_config::Pipeline::Chat)).await;
+        let resolved = resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::SystemOne)
+            .await
+            .expect("exact systemone route must still win on /v1/systemone");
+
+        assert_eq!(resolved.route_name, "sys-one-model");
+        assert_eq!(resolved.pipeline, sag_config::Pipeline::SystemOne);
+        assert_eq!(
+            resolved.targets[0].upstream_protocol,
+            sag_core::ApiKind::SystemOne
+        );
+    }
+
+    /// With no wildcard, the 404 envelope stays (`MODEL_NOT_FOUND`) but says
+    /// the model is unavailable on this endpoint instead of implying the
+    /// model name is unknown.
+    #[tokio::test]
+    async fn systemone_route_without_wildcard_explains_endpoint_unavailability() {
+        let (state, runtime) = build_state_with_optional_wildcard(None).await;
+        let response =
+            resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::ChatCompletions)
+                .await
+                .err()
+                .expect("no servable route → 404");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "MODEL_NOT_FOUND");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available on this endpoint") && message.contains("sys-one-model"),
+            "the message must name the endpoint restriction, got {message}"
+        );
+    }
+
+    /// A `"*"` route declared as `pipeline = "systemone"` cannot serve chat
+    /// ingresses either — no infinite fallback, still a 404.
+    #[tokio::test]
+    async fn systemone_wildcard_does_not_rescue_chat_ingress() {
+        let (state, runtime) =
+            build_state_with_optional_wildcard(Some(sag_config::Pipeline::SystemOne)).await;
+        let response =
+            resolve_with_ingress(&state, &runtime, sag_core::IngressProtocol::ChatCompletions)
+                .await
+                .err()
+                .expect("a systemone wildcard is not a chat fallback");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "MODEL_NOT_FOUND");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not available on this endpoint"),
+            "got {json}"
+        );
+    }
+
+    /// Genuinely unknown models keep the legacy no-route message verbatim —
+    /// only the ingress-mismatch case gets the new wording.
+    #[tokio::test]
+    async fn unknown_model_keeps_the_legacy_no_route_message() {
+        let (state, runtime) = build_state_no_routes().await;
+        let response = resolve_route(
+            &state,
+            &runtime,
+            &test_request("gpt-4o"),
+            uuid::Uuid::new_v4(),
+            std::time::Instant::now(),
+            chrono::Utc::now(),
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("no routes → 404");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "MODEL_NOT_FOUND");
+        assert_eq!(json["error"]["message"], "gpt-4o");
+    }
+
     /// Chat-family ingresses must resolve a `pipeline = "systemone"` route to
-    /// the **existing no-route failure** — never fall through to chat/image
-    /// dispatch, and never reach a provider.
+    /// the **existing no-route failure** when no servable wildcard exists —
+    /// no target is consumed and no provider is reached.
     #[tokio::test]
     async fn systemone_pipeline_route_is_no_route_for_chat_family_ingress() {
         for ingress in [

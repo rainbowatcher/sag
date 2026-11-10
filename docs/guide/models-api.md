@@ -191,6 +191,8 @@ OpenAI envelope（`/v1/chat/completions`、`/v1/responses`、`/v1/models`）：
 
 两键**恒输出**（不再依赖显式协议声明）。
 
+> **`pipeline = "systemone"` 的 route 例外**：`systemone` 只在「自身存在 eligible 且 provider 声明了 `apis.systemone` 的目标」时通告；chat 族协议改从**可服务的 `"*"` 通配 route** 派生（该通配存在、非 systemone pipeline、至少一个 eligible target），没有这样的通配时只含 `systemone`。原因是 chat 族 ingress 会跳过这条精确 route、回落到通配 —— 混合配置（`*` chat 兜底 + 一条 systemone route）下，列表里的模型确实能按 chat 协议调用，通告必须与实际可达性一致。
+
 ---
 
 ## GET /health

@@ -532,7 +532,20 @@ async fn responses(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let cfg = state.config.read().await;
-        let all_native = sag_config::resolve_model_route(&cfg.routes, model).is_some_and(|route| {
+        // Decide statefulness on the route that will **actually** serve this
+        // ingress: an exact `pipeline = "systemone"` route is skipped on
+        // chat-family ingresses, so its targets must not authorise stateful
+        // fields for a request handled by the `"*"` chat fallback (0012).
+        // With no servable route keep the legacy identity lookup — resolve
+        // reports the 404 afterwards anyway.
+        let route = sag_config::resolve_model_route_for_ingress(
+            &cfg.routes,
+            model,
+            sag_core::IngressProtocol::Responses,
+        )
+        .ok()
+        .or_else(|| sag_config::resolve_model_route(&cfg.routes, model));
+        let all_native = route.is_some_and(|route| {
             !route.targets.is_empty()
                 && route.targets.iter().all(|t| {
                     cfg.providers

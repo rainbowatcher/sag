@@ -97,13 +97,15 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
             // of every target's provider, in canonical protocol order so
             // the payload is stable regardless of target ordering.
             //
-            // An **explicit** `pipeline = "systemone"` route is the one
-            // exception: it serves `/v1/systemone` only, so it advertises
-            // `systemone` (and nothing else) when an eligible target's
-            // provider declares `apis.systemone`. Chat-family protocols are
-            // never advertised for it — a chat request would resolve to
-            // "no such model". Legacy routes keep the union aggregation
-            // unchanged, including its quirks.
+            // An **explicit** `pipeline = "systemone"` route serves
+            // `/v1/systemone` by itself: it advertises `systemone` only when
+            // an eligible target's provider declares `apis.systemone`.
+            // Chat-family ingresses skip it and fall through to a servable
+            // `"*"` route (0012), so when such a fallback exists the model
+            // really is reachable on the chat protocols that fallback
+            // declares — advertise those too, in canonical protocol order.
+            // Legacy routes keep the union aggregation unchanged, including
+            // its quirks.
             let mut ingress_protocols: Vec<&'static str> = Vec::new();
             if route.pipeline == sag_config::Pipeline::SystemOne {
                 let serves_systemone = route.targets.iter().any(|t| {
@@ -113,8 +115,32 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
                             .get(&t.provider)
                             .is_some_and(|pc| pc.apis.contains_key(&sag_core::ApiKind::SystemOne))
                 });
-                if serves_systemone {
-                    ingress_protocols.push(sag_core::ApiKind::SystemOne.as_str());
+                let chat_fallback = config.routes.iter().find(|r| {
+                    r.model_name == "*"
+                        && sag_config::route_serves_ingress(
+                            r,
+                            sag_core::IngressProtocol::ChatCompletions,
+                        )
+                        && r.targets
+                            .iter()
+                            .any(|t| target_is_eligible(&config.providers, r, t))
+                });
+                for kind in sag_core::ApiKind::protocols() {
+                    let declared = if kind == sag_core::ApiKind::SystemOne {
+                        serves_systemone
+                    } else {
+                        chat_fallback.is_some_and(|fallback| {
+                            fallback.targets.iter().any(|t| {
+                                config
+                                    .providers
+                                    .get(&t.provider)
+                                    .is_some_and(|pc| pc.apis.contains_key(&kind))
+                            })
+                        })
+                    };
+                    if declared {
+                        ingress_protocols.push(kind.as_str());
+                    }
                 }
             } else {
                 for kind in sag_core::ApiKind::protocols() {
@@ -487,6 +513,103 @@ mod tests {
         assert!(
             !ids.contains(&"sys-one-model"),
             "all-disabled routes stay excluded, got {ids:?}"
+        );
+    }
+
+    // ── 0012: systemone route × chat wildcard advertisement ───────
+
+    #[tokio::test]
+    async fn list_models_advertises_chat_protocols_from_a_servable_wildcard() {
+        let mut providers = HashMap::new();
+        providers.insert("dual".into(), systemone_provider(true));
+        providers.insert("chat-only".into(), provider_config(true));
+        let config = GatewayConfig {
+            providers,
+            routes: vec![
+                route(
+                    "sys-one-model",
+                    sag_config::Pipeline::SystemOne,
+                    "dual",
+                    Some("sys-one-v1"),
+                ),
+                route("*", sag_config::Pipeline::Chat, "chat-only", Some("gpt-4o")),
+            ],
+            ..sag_config::gateway_config_base!()
+        };
+
+        let body = models_for(config).await;
+        assert_eq!(
+            protocols_of(&body, "sys-one-model"),
+            vec!["chat_completions", "systemone"],
+            "a chat wildcard really serves this model on chat ingresses"
+        );
+        assert_eq!(
+            protocols_of(&body, "*"),
+            vec!["chat_completions"],
+            "the wildcard keeps its ordinary aggregation"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_ignores_a_systemone_wildcard_for_chat_protocols() {
+        let mut providers = HashMap::new();
+        providers.insert("dual".into(), systemone_provider(true));
+        let config = GatewayConfig {
+            providers,
+            routes: vec![
+                route(
+                    "sys-one-model",
+                    sag_config::Pipeline::SystemOne,
+                    "dual",
+                    Some("sys-one-v1"),
+                ),
+                route(
+                    "*",
+                    sag_config::Pipeline::SystemOne,
+                    "dual",
+                    Some("sys-one-v2"),
+                ),
+            ],
+            ..sag_config::gateway_config_base!()
+        };
+
+        let body = models_for(config).await;
+        assert_eq!(
+            protocols_of(&body, "sys-one-model"),
+            vec!["systemone"],
+            "a systemone wildcard is no chat fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_ignores_an_ineligible_wildcard_for_chat_protocols() {
+        let mut providers = HashMap::new();
+        providers.insert("dual".into(), systemone_provider(true));
+        providers.insert("chat-disabled".into(), provider_config(false));
+        let config = GatewayConfig {
+            providers,
+            routes: vec![
+                route(
+                    "sys-one-model",
+                    sag_config::Pipeline::SystemOne,
+                    "dual",
+                    Some("sys-one-v1"),
+                ),
+                route(
+                    "*",
+                    sag_config::Pipeline::Chat,
+                    "chat-disabled",
+                    Some("gpt-4o"),
+                ),
+            ],
+            ..sag_config::gateway_config_base!()
+        };
+
+        let body = models_for(config).await;
+        assert_eq!(
+            protocols_of(&body, "sys-one-model"),
+            vec!["systemone"],
+            "a wildcard with no eligible target cannot serve chat ingresses"
         );
     }
 }

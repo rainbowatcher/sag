@@ -808,3 +808,337 @@ async fn explicit_systemone_route_advertises_only_systemone() {
         "an explicit systemone route must not advertise chat protocols"
     );
 }
+
+// ── 0012: explicit systemone route + `*` chat fallback ───────────
+
+fn provider_with_apis(base_url: &str, kinds: &[sag_core::ApiKind]) -> ProviderConfig {
+    let mut pc = ProviderConfig {
+        api_keys: vec!["sk-test".into()],
+        key_strategy: KeyStrategy::FillFirst,
+        proxy_mode: ProxyMode::default(),
+        timeout_secs: 10,
+        anthropic_cache_control: false,
+        ..ProviderConfig::default()
+    };
+    for kind in kinds {
+        pc.apis.insert(
+            *kind,
+            ApiConfig {
+                base_url: base_url.to_string(),
+                ..ApiConfig::default()
+            },
+        );
+    }
+    pc
+}
+
+/// Mixed config — the upgrade path that used to 404 forever: one exact
+/// `pipeline = "systemone"` route plus a `"*"` chat fallback, each on its
+/// own (one-shot) upstream. `so_extra_kinds` adds protocol nodes to the
+/// systemone provider without changing the routes.
+async fn build_state_mixed(
+    systemone_base_url: &str,
+    chat_base_url: &str,
+    key: &str,
+    so_extra_kinds: &[sag_core::ApiKind],
+) -> AppState {
+    let mut so_kinds = vec![sag_core::ApiKind::SystemOne];
+    so_kinds.extend_from_slice(so_extra_kinds);
+    let mut providers = HashMap::new();
+    providers.insert(
+        "so-up".to_string(),
+        provider_with_apis(systemone_base_url, &so_kinds),
+    );
+    providers.insert(
+        "chat-up".to_string(),
+        provider_with_apis(chat_base_url, &[sag_core::ApiKind::ChatCompletions]),
+    );
+
+    let target = |provider: &str, real_model: &str| RouteTarget {
+        extra: HashMap::new(),
+        retries: Some(0),
+        timeout_secs: None,
+        provider: provider.into(),
+        real_model: Some(real_model.into()),
+        priority: 1,
+        capabilities: None,
+    };
+    let route = |model_name: &str, pipeline: Pipeline, t: RouteTarget| RouteConfig {
+        session_ttl_secs: None,
+        session_max_entries: None,
+        model_name: model_name.into(),
+        api_endpoint: None,
+        pipeline,
+        retries: Some(0),
+        timeout_secs: None,
+        strategy: Strategy::FillFirst,
+        targets: vec![t],
+    };
+
+    let config = GatewayConfig {
+        gateway_auth: Some(GatewayAuthConfig {
+            api_keys: vec![key.to_string()],
+        }),
+        providers,
+        routes: vec![
+            route("so-model", Pipeline::SystemOne, target("so-up", "so-real")),
+            route("*", Pipeline::Chat, target("chat-up", "chat-real")),
+        ],
+        ..sag_config::gateway_config_base!()
+    };
+    let handle = ConfigHandle::from_config(config);
+    let mut registry: HashMap<String, Arc<dyn sag_providers::LlmProvider>> = HashMap::new();
+    let cfg_read = handle.read().await;
+    for (pname, pc) in cfg_read.providers.iter() {
+        let provider = sag_providers::create_provider(pname.clone(), pc).unwrap();
+        registry.insert(pname.clone(), provider);
+    }
+    drop(cfg_read);
+    test_app_state(handle, Arc::new(tokio::sync::RwLock::new(registry))).await
+}
+
+const CHAT_UPSTREAM_BODY: &str = r#"{
+    "id": "chatcmpl-wildcard",
+    "object": "chat.completion",
+    "created": 1700000000,
+    "model": "chat-real",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "from wildcard"}, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+}"#;
+
+fn chat_request_for(model: &str, key: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#
+        )))
+        .unwrap()
+}
+
+/// A chat-family request for the systemone-owned model name must be served
+/// by the `"*"` chat route — 200, real upstream call, no 404 / no-route log.
+#[tokio::test]
+async fn chat_ingress_uses_the_wildcard_when_the_exact_route_is_systemone() {
+    let chat_body = CHAT_UPSTREAM_BODY.to_string();
+    let (chat_url, chat_rx) = spawn_server_capturing(move |mut stream| {
+        let chat_body = chat_body.clone();
+        async move {
+            respond_json(&mut stream, &chat_body).await;
+        }
+    })
+    .await;
+    let (so_url, so_rx) = spawn_server_capturing(|mut stream| async move {
+        respond_json(&mut stream, "{}").await;
+    })
+    .await;
+
+    let state = build_state_mixed(&so_url, &chat_url, "so-key", &[]).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(chat_request_for("so-model", "so-key"))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "chat fallback must serve the model: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["choices"][0]["message"]["content"], "from wildcard");
+
+    let (request_line, req_body) = split_request(&chat_rx.await.expect("chat upstream contacted"));
+    assert!(
+        request_line.starts_with("POST /chat/completions "),
+        "chat upstream path: {request_line}"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&req_body).unwrap();
+    assert_eq!(
+        sent["model"], "chat-real",
+        "the wildcard target's real_model must be used"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), so_rx)
+            .await
+            .is_err(),
+        "the systemone upstream must not be contacted for a chat request"
+    );
+}
+
+/// `/v1/systemone` still wins the exact systemone route even when the chat
+/// wildcard is present — the fallback is one-way.
+#[tokio::test]
+async fn systemone_ingress_wins_the_exact_route_with_a_wildcard_present() {
+    let expected = UPSTREAM_BODY.to_string();
+    let (so_url, so_rx) = spawn_server_capturing(move |mut stream| {
+        let expected = expected.clone();
+        async move {
+            respond_json(&mut stream, &expected).await;
+        }
+    })
+    .await;
+    let (chat_url, chat_rx) = spawn_server_capturing(|mut stream| async move {
+        respond_json(&mut stream, "{}").await;
+    })
+    .await;
+
+    let state = build_state_mixed(&so_url, &chat_url, "so-key", &[]).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(systemone_request(REQUEST_BODY, "so-key"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (request_line, req_body) =
+        split_request(&so_rx.await.expect("systemone upstream contacted"));
+    assert!(
+        request_line.starts_with("POST /systemone "),
+        "systemone upstream path: {request_line}"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&req_body).unwrap();
+    assert_eq!(sent["model"], "so-real");
+    let json = body_json(resp).await;
+    assert_eq!(
+        json,
+        serde_json::from_str::<serde_json::Value>(UPSTREAM_BODY).unwrap()
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), chat_rx)
+            .await
+            .is_err(),
+        "the chat upstream must not be contacted for /v1/systemone"
+    );
+}
+
+/// `/v1/models` must not claim the model is systemone-only when a chat
+/// wildcard genuinely serves it on chat-family ingresses.
+#[tokio::test]
+async fn models_list_advertises_chat_and_systemone_for_the_mixed_config() {
+    let state = build_state_mixed("http://127.0.0.1:1", "http://127.0.0.1:1", "so-key", &[]).await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("Authorization", "Bearer so-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let data = json["data"].as_array().expect("data array");
+    let protocols_of = |id: &str| -> Vec<&str> {
+        data.iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must be listed"))["ingress_protocols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect()
+    };
+    assert_eq!(
+        protocols_of("so-model"),
+        vec!["chat_completions", "systemone"]
+    );
+    assert_eq!(protocols_of("*"), vec!["chat_completions"]);
+}
+
+/// With no wildcard at all the 404 stays, but all three chat-family
+/// ingresses now say the model is unavailable on this endpoint instead of
+/// implying the name is unknown.
+#[tokio::test]
+async fn systemone_only_model_reports_endpoint_unavailability_to_chat_ingresses() {
+    for (uri, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"so-model","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"so-model","input":"hi"}"#),
+        (
+            "/v1/messages",
+            r#"{"model":"so-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ] {
+        let state = build_state_with_pipeline(
+            "http://127.0.0.1:1",
+            "so-key",
+            Upstream::SystemOne,
+            Pipeline::SystemOne,
+        )
+        .await;
+        let app = build_router(state, DispatchRuntime::default());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Bearer so-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        let json = body_json(resp).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("not available on this endpoint") && message.contains("so-model"),
+            "{uri}: unhelpful no-route message: {json}"
+        );
+        let code = json["error"]["code"].as_str().unwrap_or_default();
+        let anthropic_type = json["error"]["type"].as_str().unwrap_or_default();
+        assert!(
+            code == "MODEL_NOT_FOUND" || anthropic_type == "not_found_error",
+            "{uri}: unexpected error envelope {json}"
+        );
+    }
+}
+
+/// The `/v1/responses` stateful pre-check must judge the route that will
+/// actually serve the request. The exact systemone route's provider declares
+/// `apis.responses` (old identity lookup ⇒ Allow), but the `"*"` chat
+/// fallback is translated — stateful fields must still be rejected with 422
+/// instead of being silently dropped into a Chat `extra` field.
+#[tokio::test]
+async fn responses_stateful_precheck_uses_the_wildcard_route() {
+    let state = build_state_mixed(
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        "so-key",
+        &[sag_core::ApiKind::Responses],
+    )
+    .await;
+    let app = build_router(state, DispatchRuntime::default());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("Authorization", "Bearer so-key")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"so-model","input":"hi","previous_response_id":"resp_abc"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "UNPROCESSABLE_ENTITY");
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("previous_response_id") && message.contains("not supported"),
+        "stateful fields must be rejected for the translated wildcard: {message}"
+    );
+}
