@@ -1309,6 +1309,8 @@ pub struct PrivacyBuiltins {
     pub api_key: bool,
     /// PEM private key blocks.
     pub private_key: bool,
+    /// IPv4 addresses (`10.0.0.1`).
+    pub ipv4: bool,
 }
 
 impl Default for PrivacyBuiltins {
@@ -1321,6 +1323,7 @@ impl Default for PrivacyBuiltins {
             iban: true,
             api_key: true,
             private_key: true,
+            ipv4: true,
         }
     }
 }
@@ -4886,6 +4889,7 @@ targets = [{{ provider = "openai" }}]
                     iban: true,
                     api_key: true,
                     private_key: true,
+                    ipv4: true,
                 }
             );
             assert!(privacy.custom_regexes.is_empty());
@@ -4917,6 +4921,7 @@ bank_card = true
 iban = false
 api_key = true
 private_key = false
+ipv4 = true
 
 [[privacy.custom_regexes]]
 pattern = 'EMP-\d{6}'
@@ -4943,6 +4948,7 @@ items = ["public@example.com"]
             assert!(!privacy.builtins.email);
             assert!(privacy.builtins.phone);
             assert!(!privacy.builtins.private_key);
+            assert!(privacy.builtins.ipv4);
             assert_eq!(privacy.custom_regexes.len(), 2);
             assert_eq!(privacy.custom_regexes[0].pattern, "EMP-\\d{6}");
             assert_eq!(privacy.custom_regexes[0].kind, "employee_id");

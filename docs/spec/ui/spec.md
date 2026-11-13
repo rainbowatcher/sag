@@ -58,7 +58,7 @@ updated: 2026-11-09
 - [sag-ui/src/lib/sse.ts](../../../sag-ui/src/lib/sse.ts) — 通用 SSE 客户端（`fetch` + `ReadableStream`）：`createSseParser`（跨 chunk 分帧、`: ping` 注释、多行 `data`、flush 尾帧）、`nextRetryDelay`（指数退避 + 封顶）、`headersFromDefaults`、`SseHttpError` / `isAuthFailure`（401/403）、`createSseClient`（单飞循环 + `stop()` abort + `running` 闸保证 stop 后零投递）
 - [sag-ui/src/lib/inflight.ts](../../../sag-ui/src/lib/inflight.ts) — 在途计数的纯函数：`emptyInflightState`、`parseInflightSnapshot`（容错解析 + 本地降序）、`applySnapshot`（整体替换 + 清 `stale`）、`markConnected` / `markDisconnected`（保留快照标 `stale`）、`activeRouteCounts`（仅 `count > 0`）、`resolveSseUrl`
 - [sag-ui/src/components/Combobox.vue](../../../sag-ui/src/components/Combobox.vue) — 通用模糊搜索下拉框
-- [sag-ui/src/components/settings/PrivacyForm.vue](../../../sag-ui/src/components/settings/PrivacyForm.vue) — 隐私设置表单：已确认配置 / 草稿双摘要、三模式、7 个内置检测器、词表与正则行编辑、盐值替换、只读保护范围、底部显式保存与撤销；读取中 / 读取失败 / 快照缺 `privacy` 三态都不渲染可编辑表单
+- [sag-ui/src/components/settings/PrivacyForm.vue](../../../sag-ui/src/components/settings/PrivacyForm.vue) — 隐私设置表单：已确认配置 / 草稿双摘要、三模式、8 个内置检测器、词表与正则行编辑、盐值替换、只读保护范围、底部显式保存与撤销；读取中 / 读取失败 / 快照缺 `privacy` 三态都不渲染可编辑表单
 
 ### 工具函数与类型
 

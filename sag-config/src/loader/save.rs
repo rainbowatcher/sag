@@ -394,9 +394,9 @@ fn privacy_mode_str(mode: PrivacyMode) -> &'static str {
     }
 }
 
-/// The seven builtin toggles as `(key, old, new)` pairs, so the writer can
+/// The eight builtin toggles as `(key, old, new)` pairs, so the writer can
 /// skip keys whose value did not change.
-fn builtin_pairs(old: PrivacyBuiltins, new: PrivacyBuiltins) -> [(&'static str, bool, bool); 7] {
+fn builtin_pairs(old: PrivacyBuiltins, new: PrivacyBuiltins) -> [(&'static str, bool, bool); 8] {
     [
         ("email", old.email, new.email),
         ("phone", old.phone, new.phone),
@@ -405,6 +405,7 @@ fn builtin_pairs(old: PrivacyBuiltins, new: PrivacyBuiltins) -> [(&'static str, 
         ("iban", old.iban, new.iban),
         ("api_key", old.api_key, new.api_key),
         ("private_key", old.private_key, new.private_key),
+        ("ipv4", old.ipv4, new.ipv4),
     ]
 }
 

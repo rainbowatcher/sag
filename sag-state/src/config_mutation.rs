@@ -1911,6 +1911,7 @@ mod tests {
                 iban: false,
                 api_key: true,
                 private_key: false,
+                ipv4: true,
             },
             custom_regexes: vec![PrivacyCustomRegex {
                 pattern: r"EMP-\d{4}".into(),
@@ -1947,6 +1948,7 @@ mod tests {
         assert!(!cfg.privacy.builtins.id_card_cn);
         assert!(!cfg.privacy.builtins.iban);
         assert!(!cfg.privacy.builtins.private_key);
+        assert!(cfg.privacy.builtins.ipv4);
         assert_eq!(cfg.privacy.custom_regexes.len(), 1);
         assert_eq!(cfg.privacy.custom_regexes[0].kind, "employee_id");
         assert!(cfg.privacy.custom_regexes[0].case_insensitive);

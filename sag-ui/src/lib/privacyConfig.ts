@@ -48,6 +48,7 @@ const BUILTIN_KEYS: readonly (keyof PrivacyBuiltins)[] = [
   "iban",
   "api_key",
   "private_key",
+  "ipv4",
 ]
 
 function cloneBuiltins(source: PrivacyBuiltins): PrivacyBuiltins {
@@ -59,6 +60,7 @@ function cloneBuiltins(source: PrivacyBuiltins): PrivacyBuiltins {
     iban: source.iban,
     api_key: source.api_key,
     private_key: source.private_key,
+    ipv4: source.ipv4,
   }
 }
 

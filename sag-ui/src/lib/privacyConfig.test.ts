@@ -28,6 +28,7 @@ function snapshot(partial: Partial<PrivacyConfigSnapshot> = {}): PrivacyConfigSn
       iban: true,
       api_key: true,
       private_key: true,
+      ipv4: true,
     },
     custom_regexes: [],
     custom_words: { items: [] },

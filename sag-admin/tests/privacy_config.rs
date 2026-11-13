@@ -314,6 +314,7 @@ async fn get_default_privacy_never_auto_enables() {
     assert_eq!(body["privacy"]["mode"], json!("mask"));
     assert_eq!(body["privacy"]["restore"], json!(true));
     assert_eq!(body["privacy"]["builtins"]["private_key"], json!(true));
+    assert_eq!(body["privacy"]["builtins"]["ipv4"], json!(true));
     assert_eq!(body["privacy"]["custom_regexes"], json!([]));
 
     // A read must never materialize filtering: the committed config stays off.

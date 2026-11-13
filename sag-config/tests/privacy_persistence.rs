@@ -127,6 +127,7 @@ fn full_privacy() -> PrivacyConfig {
             iban: false,
             api_key: true,
             private_key: false,
+            ipv4: false,
         },
         custom_regexes: vec![
             regex("employee_id", r"EMP-\d{6}", false),

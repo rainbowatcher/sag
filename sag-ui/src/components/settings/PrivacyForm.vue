@@ -95,6 +95,11 @@ const BUILTINS: readonly BuiltinRow[] = [
     label: () => t("settings.privacy.builtin.private_key"),
     hint: () => t("settings.privacy.builtin.private_key.hint"),
   },
+  {
+    key: "ipv4",
+    label: () => t("settings.privacy.builtin.ipv4"),
+    hint: () => t("settings.privacy.builtin.ipv4.hint"),
+  },
 ]
 
 interface ModeRow {

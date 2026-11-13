@@ -49,7 +49,7 @@ use serde_json::{Map, Value};
 use crate::placeholder::{self, PlaceholderMap};
 use crate::rules::{
     API_KEY_PATTERN, Adjacency, BANK_CARD_PATTERN, Checksum, CompiledRule, EMAIL_PATTERN,
-    IBAN_PATTERN, ID_CARD_CN_PATTERN, PHONE_PATTERN, PRIVATE_KEY_PATTERN,
+    IBAN_PATTERN, ID_CARD_CN_PATTERN, IPV4_PATTERN, PHONE_PATTERN, PRIVATE_KEY_PATTERN,
 };
 
 /// Kind reported for a match of the `custom_words` list.
@@ -201,6 +201,14 @@ impl PrivacyEngine {
                 "private_key",
                 PRIVATE_KEY_PATTERN,
                 Adjacency::None,
+                None,
+            )?);
+        }
+        if builtins.ipv4 {
+            rules.push(CompiledRule::new(
+                "ipv4",
+                IPV4_PATTERN,
+                Adjacency::Dotted,
                 None,
             )?);
         }
@@ -648,6 +656,7 @@ mod tests {
                 iban: false,
                 api_key: false,
                 private_key: false,
+                ipv4: false,
             },
             ..PrivacyConfig::default()
         }
@@ -673,6 +682,7 @@ mod tests {
             "iban" => cfg.builtins.iban = true,
             "api_key" => cfg.builtins.api_key = true,
             "private_key" => cfg.builtins.private_key = true,
+            "ipv4" => cfg.builtins.ipv4 = true,
             other => panic!("unknown builtin {other}"),
         }
         PrivacyEngine::compile(&cfg).expect("engine compiles")
@@ -811,6 +821,32 @@ mod tests {
         let spans = engine.scan(&format!("key: {pem} done"));
         assert_eq!(kinds(&spans), vec!["private_key"]);
         assert_eq!(spans[0].3, pem);
+    }
+
+    #[test]
+    fn ipv4_masks_addresses_but_not_version_runs() {
+        let engine = only("ipv4");
+        let spans = engine.scan("connect to 193.168.20.15 now");
+        assert_eq!(kinds(&spans), vec!["ipv4"]);
+        assert_eq!(spans[0].3, "193.168.20.15");
+        // Same address twice, and a second one in a range: all masked.
+        assert_eq!(
+            engine
+                .scan("10.0.0.1 then 10.0.0.1-10.0.0.5")
+                .iter()
+                .map(|span| span.3.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10.0.0.1", "10.0.0.1", "10.0.0.5"]
+        );
+        // A sentence period does not hide the address.
+        assert_eq!(kinds(&engine.scan("the host is 10.0.0.1.")), vec!["ipv4"]);
+        // Out-of-range octets, leading zeros and longer dotted runs are not
+        // addresses.
+        assert!(engine.scan("version 1.2.3.4.5").is_empty());
+        assert!(engine.scan("host 256.1.1.1").is_empty());
+        assert!(engine.scan("host 010.0.0.1").is_empty());
+        // Glued to a longer token.
+        assert!(engine.scan("ip10.0.0.1").is_empty());
     }
 
     #[test]

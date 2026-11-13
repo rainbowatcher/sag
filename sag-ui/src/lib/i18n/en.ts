@@ -752,9 +752,12 @@ export const en = {
     "Known key prefixes such as sk-, ghp_, or AKIA followed by at least 16 characters.",
   "settings.privacy.builtin.private_key": "PEM private key",
   "settings.privacy.builtin.private_key.hint": "PEM private-key blocks, including the key body.",
+  "settings.privacy.builtin.ipv4": "IPv4 address",
+  "settings.privacy.builtin.ipv4.hint":
+    "Dotted-quad addresses such as 10.0.0.1; version strings like 1.2.3.4.5 are left alone.",
   "settings.privacy.customSectionTitle": "Custom rules and exceptions",
   "settings.privacy.customSectionDescription":
-    "Add sensitive words, an allowlist, and custom regular expressions on top of the seven built-in detectors.",
+    "Add sensitive words, an allowlist, and custom regular expressions on top of the eight built-in detectors.",
   "settings.privacy.customSectionBadge": "Optional",
   "settings.privacy.customWordsTitle": "Custom sensitive words",
   "settings.privacy.customWordsHint":

@@ -22,6 +22,15 @@ pub enum Adjacency {
     Digits,
     /// No word-ish character may be adjacent: `[A-Za-z0-9_.+-]`.
     Wordish,
+    /// Word-ish neighbours are forbidden except `+` / `-`, and a `.` only
+    /// invalidates the match when the dotted run continues into another
+    /// digit. Used by dotted-quad detectors (IPv4): `1.2.3.4.5` is a version
+    /// string or a DNS path, while `10.0.0.1.` ends a sentence and
+    /// `10.0.0.1-10.0.0.5` is a range of two addresses.
+    ///
+    /// `.` is not part of [`Self::forbids`]: the decision needs the character
+    /// *after* the dot, so [`boundary_ok`] applies it separately.
+    Dotted,
     /// No adjacency requirement (multi-line blocks, user regexes).
     None,
 }
@@ -32,6 +41,7 @@ impl Adjacency {
         match self {
             Adjacency::Digits => c.is_ascii_digit(),
             Adjacency::Wordish => c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'),
+            Adjacency::Dotted => c.is_ascii_alphanumeric() || c == '_',
             Adjacency::None => false,
         }
     }
@@ -126,13 +136,34 @@ impl CompiledRule {
 /// `start` and `end` must be char boundaries (they come from regex matches).
 /// A match at the very beginning/end of `text` has no neighbour on that side
 /// and therefore passes.
+///
+/// [`Adjacency::Dotted`] adds one run-aware rule on top of the character set:
+/// a `.` before the match always rejects it, and a `.` after the match rejects
+/// it only when another digit follows (so a sentence period does not hide an
+/// address, while one segment of `1.2.3.4.5` is not an address).
 pub fn boundary_ok(text: &str, start: usize, end: usize, adj: Adjacency) -> bool {
     if adj == Adjacency::None {
         return true;
     }
     let before = text[..start].chars().next_back();
     let after = text[end..].chars().next();
-    !before.is_some_and(|c| adj.forbids(c)) && !after.is_some_and(|c| adj.forbids(c))
+    if before.is_some_and(|c| adj.forbids(c)) || after.is_some_and(|c| adj.forbids(c)) {
+        return false;
+    }
+    if adj == Adjacency::Dotted {
+        if before == Some('.') {
+            return false;
+        }
+        if after == Some('.')
+            && text[end + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Email addresses (conventional, not RFC-complete).
@@ -145,6 +176,13 @@ pub const ID_CARD_CN_PATTERN: &str = r"(?:[0-9]{17}[0-9Xx]|[0-9]{15})";
 pub const BANK_CARD_PATTERN: &str = r"[0-9]{13,19}";
 /// IBAN: 2 letters, 2 check digits, 10–30 alphanumerics.
 pub const IBAN_PATTERN: &str = r"[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}";
+/// Dotted-quad IPv4 address: four octets, each 0–255 with no leading zeros.
+/// The octet ranges live in the pattern, so `999.1.1.1` and `010.0.0.1` never
+/// produce a candidate that a later guard would have to reject.
+pub const IPV4_PATTERN: &str = concat!(
+    r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])",
+    r"(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}",
+);
 /// Known API-key prefixes followed by at least 16 key characters.
 pub const API_KEY_PATTERN: &str =
     r"(?:sk-ant-|sk-proj-|sk-|ghp_|gho_|gsk_|xox[baprs]-|AKIA|AIza)[A-Za-z0-9_\-]{16,}";
@@ -343,13 +381,61 @@ mod tests {
     }
 
     #[test]
+    fn dotted_adjacency_rejects_a_continuing_run_but_not_a_sentence_period() {
+        let dotted = Adjacency::Dotted;
+        // A standalone address, however it is delimited by prose.
+        assert!(boundary_ok("at 10.0.0.1 now", 3, 11, dotted));
+        assert!(boundary_ok("10.0.0.1.", 0, 8, dotted));
+        assert!(boundary_ok("10.0.0.1:8080", 0, 8, dotted));
+        assert!(boundary_ok("10.0.0.0/8", 0, 8, dotted));
+        // Ranges keep both addresses: `+` / `-` are not word-ish here.
+        assert!(boundary_ok("10.0.0.1-10.0.0.5", 0, 8, dotted));
+        assert!(boundary_ok("10.0.0.1-10.0.0.5", 9, 17, dotted));
+        // One segment of a longer dotted run is not an address.
+        assert!(!boundary_ok("1.2.3.4.5", 0, 7, dotted));
+        assert!(!boundary_ok("1.2.3.4.5", 2, 9, dotted));
+        // Glued to a longer token.
+        assert!(!boundary_ok("ip10.0.0.1", 2, 10, dotted));
+        assert!(!boundary_ok("10.0.0.1x", 0, 8, dotted));
+        assert!(!boundary_ok("10.0.0.1_2", 0, 8, dotted));
+    }
+
+    #[test]
+    fn ipv4_accepts_valid_quads_only() {
+        fn accepted<'a>(rule: &CompiledRule, text: &'a str) -> Vec<&'a str> {
+            rule.re
+                .find_iter(text)
+                .filter(|m| rule.accepts(text, m.start(), m.end()))
+                .map(|m| m.as_str())
+                .collect()
+        }
+
+        let rule = CompiledRule::new("ipv4", IPV4_PATTERN, Adjacency::Dotted, None).unwrap();
+        assert_eq!(accepted(&rule, "host 192.168.0.1 up"), vec!["192.168.0.1"]);
+        assert_eq!(
+            accepted(&rule, "0.0.0.0 to 255.255.255.255"),
+            vec!["0.0.0.0", "255.255.255.255"]
+        );
+        // Out-of-range octets and leading zeros.
+        assert!(accepted(&rule, "256.1.1.1").is_empty());
+        assert!(accepted(&rule, "1.2.3.256").is_empty());
+        assert!(accepted(&rule, "010.0.0.1").is_empty());
+        // Too few octets.
+        assert!(accepted(&rule, "1.2.3").is_empty());
+        // A longer dotted run is one token, not an address.
+        assert!(accepted(&rule, "v1.2.3.4.5").is_empty());
+        assert!(accepted(&rule, "1.2.3.4.5").is_empty());
+    }
+
+    #[test]
     fn builtin_patterns_match_expected_shapes() {
-        let cases: [(&str, &str, &str); 5] = [
+        let cases: [(&str, &str, &str); 6] = [
             ("email", EMAIL_PATTERN, "write to alice@example.com"),
             ("phone", PHONE_PATTERN, "call 13812345678"),
             ("id_card_cn", ID_CARD_CN_PATTERN, "id 110101199003074135"),
             ("bank_card", BANK_CARD_PATTERN, "card 4111111111111111"),
             ("iban", IBAN_PATTERN, "iban GB82WEST12345698765432"),
+            ("ipv4", IPV4_PATTERN, "ping 192.168.1.10 first"),
         ];
         for (kind, pattern, text) in cases {
             let rule = CompiledRule::new(kind, pattern, Adjacency::None, None).unwrap();

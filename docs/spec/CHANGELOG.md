@@ -1,11 +1,13 @@
 ---
 created: 2026-06-03
-updated: 2026-11-10
+updated: 2026-11-11
 ---
 
 # 变更时间线
 
 按时间倒序列出所有模块的变更记录。
+
+- **2026-11-11** · **隐私过滤**：[0005 IPv4 内置检测器](privacy/changes/0005-ipv4-detector.md) — `[privacy.builtins]` 新增 `ipv4`（默认 `true`），`IPV4_PATTERN` 把「四段 0–255、无前导零」写进 pattern 本身，不新增 `Checksum` 变体；难点在误报，因此新增 `Adjacency::Dotted` 专管点分串：两侧禁字母 / 数字 / `_`、左侧 `.` 恒拒、右侧 `.` 只在后随数字时作废 —— `1.2.3.4.5`（版本号、`in-addr.arpa`）整段不动，`host 10.0.0.1.`（句末）、`10.0.0.0/8`、`10.0.0.1:8080` 与 `10.0.0.1-10.0.0.5`（区间两端）照常脱敏；规则注册在 `private_key` 之后，`sag-config` 的 `builtin_pairs` 扩为 8 项差异写回，设置页开关 / `BUILTIN_KEYS` / i18n 同步（`已选 n / 8` 由 `BUILTINS.length` 自动跟随）。边界：IPv6 / MAC / 非点分形式不在范围，`1.2.3.4.5` 这类被更长点分串包住的地址整段不脱敏，`url` / `data` / `file_data` 字段按既有例外不扫描。测试：`sag-privacy` 60（原 57），新增 `dotted_adjacency_*` / `ipv4_accepts_valid_quads_only` / `ipv4_masks_addresses_but_not_version_runs`
 
 - **2026-11-10** · **调度**：[0011 后续修正 — systemone route 不再独占 model 名](dispatch/spec.md) — `pipeline = "systemone"` 精确 route 曾让 `resolve_route_with_ingress` 的守卫在 chat 族 ingress 上直接返回 404，而 `"*"` chat 兜底（升级路径上最常见的混合配置：先有 `*`、再加一条 systemone route）根本没被尝试；每次请求还写一行 `provider = "__no_route__"` 的 call log 长期污染 no_route 指标，`/v1/models` 却仍把该模型列成 `ingress_protocols: ["systemone"]`（OpenAI / Anthropic 客户端不读这个自定义字段，继续按「模型存在」调用）。修法：`sag-config` 新增 `NoRouteReason` / `route_serves_ingress` / `resolve_model_route_for_ingress`，把「identity 解析」（管理面 / 缓存剪枝继续用 `resolve_model_route`）与「service 解析」（请求路径）分开，精确与 `"*"` 两级候选依次按 ingress 过滤，systemone 精确 route 在 chat 族被跳过后继续尝试通配；`/v1/systemone` 仍命中精确 route。连可服务通配都没有时才走既有 no-route 路径，只把客户端 message 从裸 model 名改为 `model '<x>' is not available on this endpoint (...)`，`MODEL_NOT_FOUND` 信封、`__no_route__` sentinel、`NoRoute` fact、零 attempt 与不触达上游全部不变；通配存在时请求被正常服务，`__no_route__` 行随之消失。`list_models` 对显式 systemone route 的 chat 协议改为只从「可服务的 `"*"` 通配」（存在、非 systemone pipeline、至少一个 eligible target）派生，无该通配仍只通告 `systemone`；`/v1/responses` 的 M8 stateful 预检改用 `resolve_model_route_for_ingress(..., Responses)` 取实际服务的 route，避免精确 systemone route 的 `apis.responses` 为 Translated 通配错误授权 `previous_response_id`。admin / prune 侧 identity 解析有意不改（混合配置下 `"*"` sticky pin 可能在下次 prune 被丢弃，pin 只是路由偏好缓存）。测试：`sag-config` 8 例、`sag-dispatch` 5 例、`sag-router` 单元 3 例、`systemone_ingress.rs` 入口集成 5 例（chat 三入口 404 文案、混合配置 chat 200 且上游收到通配 `real_model`、`/v1/systemone` 仍走精确 route、`/v1/models` 双协议、stateful 422）
 

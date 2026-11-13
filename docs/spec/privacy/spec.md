@@ -1,6 +1,6 @@
 ---
 created: 2026-10-25
-updated: 2026-10-29
+updated: 2026-11-11
 ---
 
 # 隐私过滤 — 规格
@@ -14,7 +14,7 @@ updated: 2026-10-29
 纯算法 crate，只依赖 `regex` / `aho-corasick` / `sha2` / `serde_json` 与 `sag-config` 的类型，不持有状态、不读配置。
 
 - `sag-privacy/src/placeholder.rs` — `make`（确定性占位符）、`placeholder_len`（按 `kind.to_uppercase()` 的字节长度）、`PlaceholderMap`（占位符 → 明文反向索引，`extend` 合并、`replace_in` 单遍最长优先替换）
-- `sag-privacy/src/rules.rs` — `CompiledRule { kind, re, adj, check }`、`Adjacency { Digits, Wordish, None }`、`Checksum { Luhn, IdCardCn, Iban }`（含 `verifies_check_digit`）、`boundary_ok`、`legacy_birth_date_ok` / `days_in_month`、7 条内置 pattern 常量
+- `sag-privacy/src/rules.rs` — `CompiledRule { kind, re, adj, check }`、`Adjacency { Digits, Wordish, Dotted, None }`、`Checksum { Luhn, IdCardCn, Iban }`（含 `verifies_check_digit`）、`boundary_ok`（`Dotted` 额外按「点分串」看两侧的 `.`）、`legacy_birth_date_ok` / `days_in_month`、8 条内置 pattern 常量（`IPV4_PATTERN` 把八位组范围 `0–255` 写进 pattern 本身）
 - `sag-privacy/src/engine.rs` — `PrivacyEngine::compile`（内置 + 自定义正则 + Aho-Corasick 词表）、`scan`（候选收集 + allowlist + 贪心非重叠解析，排序键 `(start 升序, end 降序, check_digit 降序, order 升序)`）、`mask_text`、`mask_request`（Chat 请求全字段）、`mask_ir`（IR 原地脱敏，遍历层 `scrub_blocks` / `scrub_json` / `scrub_map`）、`UNSCANNED_KEYS`、`Outcome`、`MaskReport`
 - `sag-privacy/src/restore.rs` — `RestoreWriter`（SSE 逐帧还原，`FRAME_SEPS = ["\n\n", "\r\n\r\n"]`）
 - `sag-privacy/src/lib.rs` — 公开再导出
@@ -110,7 +110,7 @@ flowchart TD
     H --> I[有序、互不重叠的 span 列表]
 ```
 
-规则顺序固定（`email` → `phone` → `id_card_cn` → `bank_card` → `iban` → `api_key` → `private_key` → 自定义正则），`custom_words` 在最后追加。排序的前两个键决定「起点最左、同起点最长」；第三键 `check_digit` 让**通过了真正校验位**的规则压过只过结构过滤的规则（Luhn 合法的 15 位卡号胜过无校验位的 15 位旧式身份证）；前三个键都相等时才由 `order`（候选收集顺序 = 配置顺序）决胜，因此 18 位身份证（有校验位）与 `bank_card` 同 span 时由配置顺序定胜负。
+规则顺序固定（`email` → `phone` → `id_card_cn` → `bank_card` → `iban` → `api_key` → `private_key` → `ipv4` → 自定义正则），`custom_words` 在最后追加。排序的前两个键决定「起点最左、同起点最长」；第三键 `check_digit` 让**通过了真正校验位**的规则压过只过结构过滤的规则（Luhn 合法的 15 位卡号胜过无校验位的 15 位旧式身份证）；前三个键都相等时才由 `order`（候选收集顺序 = 配置顺序）决胜，因此 18 位身份证（有校验位）与 `bank_card` 同 span 时由配置顺序定胜负。
 
 ### 流式还原状态机
 
@@ -196,7 +196,7 @@ flowchart TD
     E -->|否| F[toml_edit::ser::to_document 序列化新节]
     E -->|是| G[PrivacyTable：Table 或 InlineTable]
     G --> H[标量：仅 enabled/mode/restore/salt 中变化者 set]
-    H --> I[builtins：七个键逐个比较]
+    H --> I[builtins：八个键逐个比较]
     I --> J[词表 items：按位置 replace/push/remove<br/>保留重复与顺序，清空即删尽旧项]
     J --> K[custom_regexes：先按完整三元组复用行<br/>剩余按位置回填，多余行删除]
     K --> L[未知键/未知子表/注释与值装饰保持]
@@ -237,6 +237,12 @@ stateDiagram-v2
 `Adjacency` 与 `Checksum` 是 `CompiledRule::accepts` 里的两次手工判定，pattern 本身不含断言。
 
 **Trade-off**：Rust `regex` 不支持 lookaround，「两侧不紧邻数字」无法写进 pattern。放弃「换成支持 lookaround 的引擎（`fancy-regex`）」，因为那会引入回溯与性能不可控。代价是 18 位身份证、16 位卡号这类宽泛数字形态必须再叠一层校验和，否则订单号、时间戳会被大量误脱敏——误报比漏检更伤（会改坏正常对话内容）。
+
+### IPv4：八位组范围写进 pattern，点分串邻接单独判定
+
+`IPV4_PATTERN` 用四份 `(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])` 把「每段 0–255、无前导零」直接写进正则，`Adjacency::Dotted` 只负责判断候选是不是更长的点分串的一段（`1.2.3.4.5`、`in-addr.arpa` 路径），并特意放过句末的 `.`。
+
+**Trade-off**：放弃「`[0-9]{1,3}(?:\.[0-9]{1,3}){3}` + 新增 `Checksum::Ipv4`」。八位组窗口不是校验位（不需要 `verifies_check_digit` 参与同 span 决胜），塞进 `Checksum` 会让那个枚举的语义从「校验位 / 结构过滤」漂成「任意后置判定」，而 pattern 里的范围是唯一入口、也更难写错。放弃「`Adjacency::Wordish` 直接复用」：那会把 `.` 无条件当邻接字符，`host 10.0.0.1.` 这类句末地址漏检；反过来只按「两侧不紧邻数字」判定（`Adjacency::Digits`）又会让 `1.2.3.4.5` 被切出 `1.2.3.4` + `.5`。代价是 `boundary_ok` 多一条只服务 `Dotted` 的分支（读右侧第二个字符），且 `1.2.3.4.5` 这种「地址 + 尾随段」无法只脱敏前四段——按「版本号误伤更贵」取舍，整段不动。
 
 ### 15 位旧式身份证以出生日期替代校验位
 
@@ -393,7 +399,9 @@ provider / auth / runtime 字段的保存若未改变 privacy，`write_privacy_s
 - allowlist 是**整段精确相等**匹配（`allowed.as_str() == matched.as_str()`），不是子串/前缀
 - `scan` 输出按 `start` 严格升序且区间互不重叠；同起点取最长；同区间按 `(check_digit 降序, order 升序)` 决胜——通过校验位的规则恒胜于只过结构过滤的规则
 - 15 位旧式身份证必须第 7-12 位为合法 `19YYMMDD`（按月长与闰年规则）；18 位身份证只校 GB 11643 校验位，不重校日期
-- 内置规则注册顺序固定为 `email`、`phone`、`id_card_cn`、`bank_card`、`iban`、`api_key`、`private_key`，自定义正则追加在后
+- 内置规则注册顺序固定为 `email`、`phone`、`id_card_cn`、`bank_card`、`iban`、`api_key`、`private_key`、`ipv4`，自定义正则追加在后
+- `IPV4_PATTERN` 自身约束四段：每段 `0–255` 且无前导零（`999.1.1.1` / `010.0.0.1` 不产生候选），`Adjacency::Dotted` 只在候选层面判定「是否属于更长的点分串」，两者不互相替代
+- `Adjacency::Dotted` 的 `.` 规则：左侧 `.` 恒拒；右侧 `.` 仅在下一个字符是 ASCII 数字时拒（`1.2.3.4.5` 不算地址，`host 10.0.0.1.` 算）；`+` / `-` 不算邻接字符，`10.0.0.1-10.0.0.5` 两端都脱敏
 - `custom_words` 空串在编译期被丢弃（空 pattern 会在每个偏移命中）；`allowlist` 同样丢弃空串
 - 只有 `PrivacyMode::Mask` 会改写请求；`warn` / `block` 的 `MaskReport.map` 恒为空
 - `mask_request` 扫描请求的每个字符串叶子：`messages[].content`（字符串或内容块里的文本叶子）、`messages[].name`、`messages[].extra`、`stop`、`metadata`、`tools`、`tool_choice`、`response_format`、`logit_bias`、`prediction`、`moderation`、`web_search_options` 等顶层字段与 `extra` 兜底字段；除 `UNSCANNED_KEYS`（`model` / `role` / `type` / id 类键、`data` / `file_data` / `url` 不透明载荷）外，其余字段必须逐字节不变；对象键名恒不扫描
@@ -422,13 +430,13 @@ provider / auth / runtime 字段的保存若未改变 privacy，`write_privacy_s
 
 ## 测试策略
 
-`cargo test -p sag-privacy` — 57 个单元测试：
+`cargo test -p sag-privacy` — 60 个单元测试：
 
 | 文件 | 数量 | 覆盖 |
 |---|---|---|
 | `sag-privacy/src/placeholder.rs` | 10 | 确定性 / salt 区分 / kind 大小写 / 12 hex 形态 / 已知摘要前缀 / 长度一致 / **非 ASCII kind 的长度（按大写后字节数）** / 多命中与相邻 / 不重扫明文 / **`extend` 合并与冲突保留** |
-| `sag-privacy/src/rules.rs` | 9 | Luhn 正反例与长度窗口 / 身份证校验位与 15 位旧式 / **15 位旧式出生日期（月/日越界、2 月 30、1900 非闰年）** / **`verifies_check_digit` 区分校验位与结构过滤** / IBAN mod-97 / `boundary_ok` 三档邻接 / 内置 pattern 形态 / `accepts` 组合 / 坏 pattern 报错 |
-| `sag-privacy/src/engine.rs` | 22 | 7 个内置检测器正反例 / 关闭后不命中 / 重叠取最长 / 同区间取具体规则 / **Luhn 合法 15 位卡号压过 15 位旧式身份证** / allowlist / 自定义词字面与大小写 / 自定义正则大小写 / 坏正则报错 / 占位符确定性复用 / `mask_request` 字段覆盖（含 name / extra / 顶层字段）/ `mask_ir` 全字段覆盖与 block 变体保持 / 四模式语义 |
+| `sag-privacy/src/rules.rs` | 11 | Luhn 正反例与长度窗口 / 身份证校验位与 15 位旧式 / **15 位旧式出生日期（月/日越界、2 月 30、1900 非闰年）** / **`verifies_check_digit` 区分校验位与结构过滤** / IBAN mod-97 / `boundary_ok` 三档邻接 / **`Dotted` 点分串邻接（句末点、CIDR、端口、区间、`1.2.3.4.5`、粘连 token）** / **IPv4 八位组窗口（越界 / 前导零 / 少段）** / 内置 pattern 形态 / `accepts` 组合 / 坏 pattern 报错 |
+| `sag-privacy/src/engine.rs` | 23 | 8 个内置检测器正反例（含 **IPv4 地址与版本号 / 越界八位组 / 句末地址 / 地址区间**）/ 关闭后不命中 / 重叠取最长 / 同区间取具体规则 / **Luhn 合法 15 位卡号压过 15 位旧式身份证** / allowlist / 自定义词字面与大小写 / 自定义正则大小写 / 坏正则报错 / 占位符确定性复用 / `mask_request` 字段覆盖（含 name / extra / 顶层字段）/ `mask_ir` 全字段覆盖与 block 变体保持 / 四模式语义 |
 | `sag-privacy/src/restore.rs` | 16 | 嵌套还原与转义 / 数组与对象 / 单帧与多帧 / 半帧缓冲 / 分隔符后立即下发 / `finish` 冲尾 / 非 JSON 与非 `data:` 透传 / 无命中字节透传 / 空 map / 跨帧占位符不还原 / **`\r\n\r\n` 帧还原与透传** / **LF+CRLF 混排** / **半截分隔符跨 chunk 不提前切** |
 
 `cargo test -p sag-dispatch` — 277 个测试，其中 7 个隐私相关（`sag-dispatch/src/dispatch/chat/tests.rs` 5 个，`build_state_with_privacy` fixture；`sag-dispatch/src/dispatch/stream.rs` 的 `mod tests` 2 个）：
@@ -466,7 +474,7 @@ provider / auth / runtime 字段的保存若未改变 privacy，`write_privacy_s
 
 关键场景清单：
 
-- 规则正反例（校验和失败、邻接字符失败、前缀长度不足）
+- 规则正反例（校验和失败、邻接字符失败、前缀长度不足、IPv4 八位组越界与点分串邻接）
 - 身份证两种形态的边界（15 位旧式出生日期、18 位校验位、同 span 与卡号的优先级）
 - 占位符确定性（同文本同 salt → 同标记；换 salt 变化）与长度精确性（非 ASCII kind）
 - 流式切分（一帧跨多 chunk、多帧在一个 chunk、尾部不完整帧、LF / CRLF 混排、半截分隔符）
@@ -484,3 +492,4 @@ provider / auth / runtime 字段的保存若未改变 privacy，`write_privacy_s
 - [0002 隐私过滤 Minor 项收敛](changes/0002-minor-fixes.md)
 - [0003 隐私边界与 `session_registry` PII 例外](changes/0003-pii-carve-out-boundary.md)
 - [0004 隐私设置管理面读写](changes/0004-admin-settings.md)
+- [0005 IPv4 内置检测器](changes/0005-ipv4-detector.md)

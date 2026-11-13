@@ -380,7 +380,8 @@ GET /api/config
       "bank_card": true,
       "iban": true,
       "api_key": true,
-      "private_key": true
+      "private_key": true,
+      "ipv4": true
     },
     "custom_regexes": [],
     "custom_words": { "items": [] },
@@ -409,7 +410,7 @@ GET /api/config
 | `enabled` | boolean | 主开关，默认 `false`（完全不过滤） |
 | `mode` | string | 命中后的处理方式：`"mask"`（默认，替换为占位符）/ `"warn"`（原样放行，只记警告与类别计数）/ `"block"`（拒绝请求） |
 | `restore` | boolean | 是否在上游响应里把占位符还原为原文，默认 `true` |
-| `builtins` | object | 七个内置检测器开关：`email` / `phone` / `id_card_cn` / `bank_card` / `iban` / `api_key` / `private_key`；每个缺键即视为 `true` |
+| `builtins` | object | 八个内置检测器开关：`email` / `phone` / `id_card_cn` / `bank_card` / `iban` / `api_key` / `private_key` / `ipv4`；每个缺键即视为 `true` |
 | `custom_regexes` | array | 自定义正则规则，每条 `{ "kind": string, "pattern": string, "case_insensitive": boolean }`；`case_insensitive` 缺省 `false` |
 | `custom_words` | object | `{ "items": [string] }`，逐字面命中的词 |
 | `allowlist` | object | `{ "items": [string] }`，整段精确相等才算放行（大小写敏感，不是子串匹配），命中的词永不被掩码 |
@@ -435,7 +436,8 @@ Content-Type: application/json
       "bank_card": true,
       "iban": true,
       "api_key": true,
-      "private_key": true
+      "private_key": true,
+      "ipv4": true
     },
     "custom_regexes": [
       { "kind": "employee_id", "pattern": "EMP-\\d{4}", "case_insensitive": true }

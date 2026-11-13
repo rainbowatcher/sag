@@ -707,9 +707,12 @@ export const zh: Record<keyof typeof en, string> = {
   "settings.privacy.builtin.api_key.hint": "sk-、ghp_、AKIA 等已知前缀后跟至少 16 个字符。",
   "settings.privacy.builtin.private_key": "PEM 私钥",
   "settings.privacy.builtin.private_key.hint": "PEM 私钥块，包含密钥正文。",
+  "settings.privacy.builtin.ipv4": "IPv4 地址",
+  "settings.privacy.builtin.ipv4.hint":
+    "点分四段的 IP 地址，例如 10.0.0.1；1.2.3.4.5 这类版本号不会命中。",
   "settings.privacy.customSectionTitle": "自定义规则与例外",
   "settings.privacy.customSectionDescription":
-    "在 7 项内置检测之外，追加敏感词、放行名单与自定义正则。",
+    "在 8 项内置检测之外，追加敏感词、放行名单与自定义正则。",
   "settings.privacy.customSectionBadge": "可选",
   "settings.privacy.customWordsTitle": "自定义敏感词",
   "settings.privacy.customWordsHint": "每行一项，空行会被忽略。命中后按当前处置模式处理。",

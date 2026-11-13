@@ -622,7 +622,7 @@ mod privacy_dto_tests {
         assert_eq!(value["enabled"], json!(true));
         assert_eq!(value["mode"], json!("block"));
         assert_eq!(value["restore"], json!(false));
-        // Nested config shapes are the wire shapes: all seven detectors, the
+        // Nested config shapes are the wire shapes: all eight detectors, the
         // `{kind, pattern, case_insensitive}` rule and the wrapped `items`.
         assert_eq!(value["builtins"]["email"], json!(true));
         assert_eq!(value["builtins"]["phone"], json!(false));

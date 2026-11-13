@@ -198,6 +198,7 @@ export interface PrivacyBuiltins {
   iban: boolean
   api_key: boolean
   private_key: boolean
+  ipv4: boolean
 }
 
 /** One user-defined regex rule (`[[privacy.custom_regexes]]`). */

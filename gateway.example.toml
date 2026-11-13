@@ -59,8 +59,8 @@ jitter = true
 # generic_secs = 60
 
 # Privacy filtering — mask / warn / block sensitive values (emails, phone
-# numbers, ID / bank card numbers, IBANs, API keys, private keys) before a
-# request reaches an upstream provider. Disabled by default.
+# numbers, ID / bank card numbers, IBANs, IPv4 addresses, API keys, private
+# keys) before a request reaches an upstream provider. Disabled by default.
 # [privacy]
 # enabled = false             # master switch; default false
 # mode = "mask"               # "mask" | "warn" | "block"; default "mask"
@@ -76,6 +76,7 @@ jitter = true
 # iban = true
 # api_key = true
 # private_key = true
+# ipv4 = true
 #
 # Custom regex detectors. `pattern` must compile (validated on load, even when
 # `enabled = false`) and `kind` labels the match — neither may be empty.

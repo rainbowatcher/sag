@@ -158,6 +158,7 @@ fn full_update(salt: Option<&str>) -> PrivacyConfigUpdate {
             iban: true,
             api_key: false,
             private_key: true,
+            ipv4: false,
         },
         custom_regexes: vec![
             PrivacyCustomRegex {
